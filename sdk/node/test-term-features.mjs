@@ -115,6 +115,13 @@ await waitFor(() => terminal.buffer.active.type === "normal", "full transcript c
 await command("/login", "Vercel sign-in failed. The current credential is unchanged.");
 await command("/resume", "Session resume is owned by the embedding SDK");
 await command("/mcp list", "MCP servers are unavailable in this host");
+for (const value of ["on", "off", "default"]) {
+  const count = () => grid().split("MCP servers are unavailable in this host").length - 1;
+  const before = count();
+  runtime.write(`/mcp set fixture ${value}\r`);
+  await waitFor(() => count() > before, `session MCP ${value} host degradation`);
+}
+assert.equal(requests.length, 2, "unavailable MCP commands must not send model requests");
 await command("/skills list", "Skills are unavailable in this host");
 
 runtime.write("/model\r");

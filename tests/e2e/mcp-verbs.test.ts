@@ -4,9 +4,10 @@ import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, rea
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
+import { contentText } from "./conditional-guidance-oracle";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
 import { logLines, onlySessionId } from "./saved-sessions";
-import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable, turnSettled } from "./tmux-helpers";
+import { fakeGatewayFinalText, fakeGatewayToolCall, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable, turnSettled } from "./tmux-helpers";
 
 // `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
@@ -523,6 +524,346 @@ describe("fx mcp", () => {
   }, 30_000);
 });
 
+describe("session-local MCP toggles", () => {
+  const model = { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] };
+  const toolName = "mcp_fixture_echo";
+  const fixtureEnv = { FX_MCP_EXPECT_ELICITATION: "both" };
+  const configBytes = (root: Root) => [root.profilePath, root.projectPath, join(root.home, ".fx", "settings.json")]
+    .map((path) => existsSync(path) ? readFileSync(path, "utf8") : null);
+
+  async function launch(root: Root, name: string, fullAccess = false) {
+    const shell = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 140,
+      height: 40,
+      stderrPath: join(root.home, `${name}.stderr`),
+      env: {
+        ...root.env,
+        FX_GATEWAY_BASE_URL: gateway!.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway!.chatUrl,
+        FX_MODEL: "openai/gpt-5",
+        FX_PERMISSION_MODE: fullAccess ? "full-access" : "ask",
+      },
+    });
+    try {
+      await shell.waitForComposer(15_000);
+      return shell;
+    } catch (error) {
+      await shell.kill();
+      throw error;
+    }
+  }
+
+  async function quit(shell: TmuxSession, root: Root, name: string) {
+    await shell.sendText("/quit");
+    await shell.waitForSessionEnd(15_000);
+    expect(shell.recordedExitStatus()).toBe(0);
+    expect(readFileSync(join(root.home, `${name}.stderr`), "utf8")).toBe("");
+  }
+
+  async function openServer(shell: TmuxSession, name: string) {
+    await shell.sendText("/mcp");
+    await shell.waitForText(/MCP servers +\d+/, 10_000);
+    await shell.sendLiteral(name);
+    await shell.sendKeys("Enter");
+    await shell.waitForText("esc back", 10_000);
+  }
+
+  async function state(shell: TmuxSession, name: string, expected: string) {
+    await openServer(shell, name);
+    await shell.waitForText(new RegExp(`status +${expected}(?:\\n|$)`), 15_000);
+    await shell.sendKeys("C-c");
+    await shell.waitForComposer(10_000);
+  }
+
+  async function set(shell: TmuxSession, value: "on" | "off" | "default") {
+    await shell.sendText(`/mcp set fixture ${value}`);
+    await shell.waitForText(value === "default"
+      ? "fixture follows its saved default for this session."
+      : `${value === "on" ? "Enabled" : "Disabled"} fixture for this session only.`, 10_000);
+  }
+
+  function result(body: string, callId: string) {
+    const request = JSON.parse(body) as { prompt: Array<{ content?: unknown }> };
+    const part = request.prompt
+      .flatMap((message) => Array.isArray(message.content) ? message.content as Array<Record<string, unknown>> : [])
+      .find((item) => item.type === "tool-result" && item.toolCallId === callId);
+    if (!part) throw new Error(`Missing tool result for ${callId}`);
+    return contentText(part.output);
+  }
+
+  function probe(n: number, got: Record<string, string>) {
+    return [
+      fakeGatewayToolCall(`toggle_open_${n}`, "toolbox", { open: toolName }),
+      (body: string) => {
+        got[`open_${n}`] = result(body, `toggle_open_${n}`);
+        return fakeGatewayToolCall(`toggle_run_${n}`, "toolbox", { run: toolName, arguments: { text: `toggle ${n}` } });
+      },
+      (body: string) => {
+        got[`run_${n}`] = result(body, `toggle_run_${n}`);
+        return fakeGatewayFinalText(`MCP_TOGGLE_PROBE_${n}`);
+      },
+    ];
+  }
+
+  test("session-local MCP: standalone set is a usage error and never writes config", async () => {
+    const root = createRoot({ mcpServers: { fixture: fixtureServer({ enabled: false }) } }, { mcpServers: {} });
+    const before = configBytes(root);
+    const ran = await mcp(root, "set", "fixture", "on");
+    expect(ran.code).toBe(2);
+    expect(ran.signal).toBeNull();
+    expect(ran.stdout).toBe("");
+    expect(ran.stderr).toContain("Run /mcp set fixture on inside a session");
+    expect(configBytes(root)).toEqual(before);
+    expect(JSON.parse((await mcp(root, "list", "--json")).stdout).servers[0].status).toBe("disabled");
+  });
+
+  test.skipIf(!tmuxAvailable())("session-local MCP: Space toggles the filtered server from the list", async () => {
+    const root = createRoot(undefined, { mcpServers: { pending: fixtureServer({ env: fixtureEnv }) } });
+    const alphaWire = join(root.home, "alpha.wire");
+    writeFileSync(root.profilePath, JSON.stringify({ mcpServers: {
+      alpha: fixtureServer({ enabled: false, env: { ...fixtureEnv, FX_MCP_WIRE_LOG: alphaWire } }),
+      fixture: fixtureServer({ enabled: false, env: fixtureEnv }),
+    } }));
+    const before = configBytes(root);
+    gateway = startFakeGateway([], model);
+    tui = await launch(root, "space");
+    await tui.sendText("/mcp");
+    await tui.waitForText("space toggle", 10_000);
+    await tui.sendLiteral("fix");
+    await tui.waitForText("MCP servers  1 of 3", 10_000);
+    await tui.waitForText(/fixture +disabled +profile/, 10_000);
+    await tui.sendKeys("Space");
+    const enabled = await tui.waitForText(/fixture +ready, 1 tool +profile/, 15_000);
+    expect(enabled).toContain("MCP servers  1 of 3");
+    expect(enabled).toContain("space toggle");
+    expect(enabled).not.toContain("esc back");
+    await tui.sendKeys("Space");
+    const disabled = await tui.waitForText(/fixture +disabled +profile/, 10_000);
+    expect(disabled).toContain("MCP servers  1 of 3");
+    expect(disabled).toMatch(/› fixture/);
+    expect(existsSync(alphaWire)).toBe(false);
+
+    await tui.sendKeys("BSpace BSpace BSpace");
+    await tui.sendLiteral("pending");
+    await tui.waitForText(/pending +waiting for approval +project/, 10_000);
+    await tui.sendKeys("Space");
+    const held = await tui.waitForText(/pending +waiting for approval +project/, 10_000);
+    expect(held).toContain("MCP servers  1 of 3");
+    expect(held).not.toContain("space toggle");
+    expect(configBytes(root)).toEqual(before);
+    await tui.sendKeys("C-c");
+    await tui.waitForComposer(10_000);
+    await quit(tui, root, "space");
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("session-local MCP: toggles use the real fixture without saving or enabling another process", async () => {
+    const root = createRoot(undefined, { mcpServers: {} });
+    const wire = join(root.home, "fixture.wire");
+    writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { fixture: fixtureServer({ enabled: false, env: { ...fixtureEnv, FX_MCP_WIRE_LOG: wire } }) } }, null, 2) + "\n");
+    writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ yolo_acknowledged: true }));
+    const before = configBytes(root);
+    const got: Record<string, string> = {};
+    gateway = startFakeGateway([...probe(1, got), ...probe(2, got)], model);
+    tui = await launch(root, "toggles", true);
+    await state(tui, "fixture", "disabled");
+    expect(existsSync(wire)).toBe(false);
+
+    await set(tui, "on");
+    await state(tui, "fixture", "ready");
+    await tui.sendText("Open and run the enabled fixture.");
+    await tui.waitForPane((pane) => pane.includes("MCP_TOGGLE_PROBE_1") && turnSettled(pane), 30_000);
+    expect(got.open_1).toContain(`"name":"${toolName}"`);
+    expect(got.run_1).toContain("MODERN_MCP_TOOL_RESULT");
+    const calls = () => readFileSync(wire, "utf8").trim().split("\n")
+      .map((line) => JSON.parse(line)).filter((entry) => entry.message.method === "tools/call");
+    expect(calls()).toHaveLength(1);
+    expect(calls()[0].message.params).toMatchObject({ name: "echo", arguments: { text: "toggle 1" } });
+    expect(configBytes(root)).toEqual(before);
+
+    const other = await launch(root, "other");
+    try {
+      await state(other, "fixture", "disabled");
+      await quit(other, root, "other");
+    } finally {
+      await other.kill();
+    }
+    await state(tui, "fixture", "ready");
+    await set(tui, "off");
+    await state(tui, "fixture", "disabled");
+    // The model remembers the tool it opened before off; both entry points must now refuse it.
+    await tui.sendText("Open and run that same tool after disabling its server.");
+    await tui.waitForPane((pane) => pane.includes("MCP_TOGGLE_PROBE_2") && turnSettled(pane), 30_000);
+    expect(got.open_2).toContain(`Nothing named ${toolName} is in the toolbox menu.`);
+    expect(got.run_2).toContain(`No tool named ${toolName} is in the toolbox.`);
+    expect(calls()).toHaveLength(1);
+
+    await openServer(tui, "fixture");
+    await tui.waitForText("Enable for this session", 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Disable for this session", 15_000);
+    await tui.waitForText(/status +ready(?:\n|$)/, 15_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Enable for this session", 15_000);
+    await tui.waitForText(/status +disabled(?:\n|$)/, 15_000);
+    await tui.sendKeys("C-c");
+    await tui.waitForComposer(10_000);
+    await set(tui, "on");
+    await state(tui, "fixture", "ready");
+    await set(tui, "default");
+    await state(tui, "fixture", "disabled");
+    expect(configBytes(root)).toEqual(before);
+    await quit(tui, root, "toggles");
+  }, 120_000);
+
+  test.skipIf(!tmuxAvailable())("session-local MCP: new, resume, and launched instances start from the saved default", async () => {
+    const root = createRoot({ mcpServers: { fixture: fixtureServer({ enabled: false, env: fixtureEnv }) } }, { mcpServers: {} });
+    const before = configBytes(root);
+    gateway = startFakeGateway([fakeGatewayFinalText("MCP_TOGGLE_SOURCE_SAVED")], model);
+    tui = await launch(root, "lifecycle");
+    await set(tui, "on");
+    await state(tui, "fixture", "ready");
+    await tui.sendText("MCP_TOGGLE_SOURCE conversation");
+    await tui.waitForPane((pane) => pane.includes("MCP_TOGGLE_SOURCE_SAVED") && turnSettled(pane), 30_000);
+
+    await tui.sendText("/new");
+    await tui.waitForPane((pane) => !pane.includes("MCP_TOGGLE_SOURCE_SAVED"), 10_000);
+    await tui.waitForComposer(10_000);
+    await state(tui, "fixture", "disabled");
+    await set(tui, "on");
+    await state(tui, "fixture", "ready");
+    await tui.sendText("/resume");
+    await tui.waitForText(/Sessions +\d+/, 15_000);
+    await tui.sendLiteral("MCP_TOGGLE_SOURCE");
+    await tui.waitForText("Sessions 1", 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("session resumed", 15_000);
+    await tui.waitForComposer(10_000);
+    await state(tui, "fixture", "disabled");
+
+    await set(tui, "on");
+    await state(tui, "fixture", "ready");
+    await tui.sendText("/launch");
+    await tui.waitForText("fx 2/2", 15_000);
+    await tui.waitForComposer(10_000);
+    await state(tui, "fixture", "disabled");
+    expect(configBytes(root)).toEqual(before);
+    await quit(tui, root, "lifecycle");
+  }, 120_000);
+
+  test.skipIf(!tmuxAvailable())("session-local MCP: disabling one instance keeps another instance usable", async () => {
+    const root = createRoot(undefined, { mcpServers: {} });
+    const wire = join(root.home, "shared.wire");
+    const pidPath = join(root.home, "shared.pid");
+    writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { fixture: fixtureServer({ enabled: true, env: {
+      ...fixtureEnv, FX_MCP_WIRE_LOG: wire, FX_MCP_PID_PATH: pidPath,
+    } }) } }));
+    writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ yolo_acknowledged: true }));
+    const before = configBytes(root);
+    const got: Record<string, string> = {};
+    gateway = startFakeGateway([...probe(1, got), ...probe(2, got)], model);
+    tui = await launch(root, "shared", true);
+    await state(tui, "fixture", "ready");
+    const firstPid = Number(readFileSync(pidPath, "utf8"));
+    expect(isRunning(firstPid)).toBe(true);
+    await set(tui, "off");
+    await state(tui, "fixture", "disabled");
+    await tui.waitForPane(() => !isRunning(firstPid), 10_000);
+
+    await tui.sendText("/launch");
+    await tui.waitForText("fx 2/2", 15_000);
+    await tui.waitForComposer(10_000);
+    await state(tui, "fixture", "ready");
+    const sharedPid = Number(readFileSync(pidPath, "utf8"));
+    expect(sharedPid).not.toBe(firstPid);
+    await tui.sendText("Run the default-on fixture in the new instance.");
+    await tui.waitForPane((pane) => pane.includes("MCP_TOGGLE_PROBE_1") && turnSettled(pane), 30_000);
+    expect(got.run_1).toContain("MODERN_MCP_TOOL_RESULT");
+
+    const switchTo = async (instance: 1 | 2) => {
+      await tui!.sendKeys("C-x");
+      await tui!.waitForText("enter switch", 10_000);
+      await tui!.sendKeys(instance === 1 ? "Up Enter" : "Down Enter");
+      await tui!.waitForPane((pane) => pane.includes(`fx ${instance}/2`) && !pane.includes("enter switch"), 10_000);
+      await tui!.waitForComposer(10_000);
+    };
+    await switchTo(1);
+    await state(tui, "fixture", "disabled");
+    await set(tui, "on");
+    await state(tui, "fixture", "ready");
+    await set(tui, "off");
+    await state(tui, "fixture", "disabled");
+    expect(Number(readFileSync(pidPath, "utf8"))).toBe(sharedPid);
+    expect(isRunning(sharedPid)).toBe(true);
+
+    await switchTo(2);
+    await state(tui, "fixture", "ready");
+    await tui.sendText("Run the shared fixture again after the other instance disables it.");
+    await tui.waitForPane((pane) => pane.includes("MCP_TOGGLE_PROBE_2") && turnSettled(pane), 30_000);
+    expect(got.run_2).toContain("MODERN_MCP_TOOL_RESULT");
+    const calls = readFileSync(wire, "utf8").trim().split("\n")
+      .map((line) => JSON.parse(line)).filter((entry) => entry.message.method === "tools/call");
+    expect(calls.map((entry) => entry.pid)).toEqual([sharedPid, sharedPid]);
+    expect(configBytes(root)).toEqual(before);
+    await quit(tui, root, "shared");
+  }, 120_000);
+
+  test.skipIf(!tmuxAvailable())("session-local MCP: closing the selected instance refreshes the remaining session's completions", async () => {
+    const root = createRoot({ mcpServers: { fixture: fixtureServer({ enabled: false, env: fixtureEnv }) } });
+    const before = configBytes(root);
+    gateway = startFakeGateway([], model);
+    tui = await launch(root, "close-owner");
+    await tui.sendText("/launch");
+    await tui.waitForText("fx 2/2", 15_000);
+    await tui.waitForComposer(10_000);
+    await set(tui, "on");
+    await state(tui, "fixture", "ready");
+    await tui.sendLiteral("/mcp set fix");
+    await tui.waitForText(/fixture +ready/, 10_000);
+    await tui.sendKeys("C-u");
+    await tui.sendText("/close");
+    await tui.waitForPane((pane) => !pane.includes("fx 2/2"), 15_000);
+    await tui.waitForComposer(10_000);
+    await tui.sendLiteral("/mcp set fix");
+    await tui.waitForText(/fixture +disabled/, 10_000);
+    await tui.sendKeys("C-u");
+    await tui.waitForComposer(10_000);
+    await state(tui, "fixture", "disabled");
+    expect(configBytes(root)).toEqual(before);
+    await quit(tui, root, "close-owner");
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("session-local MCP: enabling cannot approve pending or rejected project servers", async () => {
+    const root = createRoot({ mcpServers: {} });
+    const pendingWire = join(root.home, "pending.wire");
+    const rejectedWire = join(root.home, "rejected.wire");
+    writeFileSync(root.projectPath, JSON.stringify({ mcpServers: {
+      pending: fixtureServer({ env: { ...fixtureEnv, FX_MCP_WIRE_LOG: pendingWire } }),
+      rejected: fixtureServer({ env: { ...fixtureEnv, FX_MCP_WIRE_LOG: rejectedWire } }),
+    } }));
+    expect((await mcp(root, "reject", "rejected")).code).toBe(0);
+    const before = configBytes(root);
+    gateway = startFakeGateway([], model);
+    tui = await launch(root, "trust");
+    for (const [name, expected] of [["pending", "waiting for approval"], ["rejected", "rejected"]] as const) {
+      await state(tui, name, expected);
+      await tui.sendText(`/mcp set ${name} on`);
+      await tui.waitForText(`Approve ${name} first with /mcp approve ${name}`, 10_000);
+      await openServer(tui, name);
+      const pane = await tui.waitForText(new RegExp(`status +${expected}(?:\\n|$)`), 10_000);
+      expect(pane).not.toContain("Enable for this session");
+      expect(pane).not.toContain("Disable for this session");
+      await tui.sendKeys("C-c");
+      await tui.waitForComposer(10_000);
+    }
+    expect(existsSync(pendingWire)).toBe(false);
+    expect(existsSync(rejectedWire)).toBe(false);
+    expect(configBytes(root)).toEqual(before);
+    await quit(tui, root, "trust");
+  }, 60_000);
+});
+
 describe("/mcp in the shell", () => {
   test.skipIf(!tmuxAvailable())("/mcp list and /mcp show say when fx refused a server's tool list", async () => {
     // The shell can ask questions, so it says so to servers, and the fixture expects that.
@@ -1023,14 +1364,14 @@ describe("/mcp in the shell", () => {
     await tui.sendText("/mcp");
     await tui.waitForText("MCP servers  3", 10_000);
     await tui.waitForText(/proj +waiting for approval +project/, 5_000);
-    await tui.waitForText("↑↓ navigate     enter open     esc close", 5_000);
+    await tui.waitForText("↑↓ navigate     space toggle     enter open     esc close", 5_000);
 
     // Typing filters; Enter connects the server and lists its tools.
     await tui.sendLiteral("fix");
     await tui.waitForText("MCP servers  1 of 3", 5_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("Echo text through the modern MCP fixture", 15_000);
-    await tui.waitForText("› Remove        /mcp remove fixture", 5_000);
+    await tui.waitForText("› Disable for this session", 5_000);
     // Typing filters its tools, by name or description; the list's filter waits.
     await tui.sendLiteral("zz");
     await tui.waitForText("No tools match.", 5_000);
@@ -1038,8 +1379,8 @@ describe("/mcp in the shell", () => {
     await tui.sendLiteral("THROUGH");
     await tui.waitForText("Tools 1 of 1", 5_000);
     await tui.waitForText("Echo text through the modern MCP fixture", 5_000);
-    // ↓ goes on into the tools, where Enter has nothing to run.
-    await tui.sendKeys("Down");
+    // Skip Disable and Remove to reach the tool, where Enter has nothing to run.
+    await tui.sendKeys("Down Down");
     await tui.waitForText("↑↓ navigate     esc back", 5_000);
     // Esc goes back, then closes and clears the filter.
     await tui.sendKeys("Escape");
@@ -1054,7 +1395,7 @@ describe("/mcp in the shell", () => {
     await tui.waitForText("↑↓ navigate     enter run     esc back", 10_000);
     // ← goes back to the list like Esc, and → opens the server like Enter.
     await tui.sendKeys("Left");
-    await tui.waitForText("↑↓ navigate     enter open     esc close", 5_000);
+    await tui.waitForText("↑↓ navigate     space toggle     enter open     esc close", 5_000);
     await tui.sendKeys("Right");
     await tui.waitForText("↑↓ navigate     enter run     esc back", 10_000);
     await tui.sendKeys("C-c");
@@ -1089,6 +1430,8 @@ describe("/mcp in the shell", () => {
     await tui.waitForText("MCP servers  3", 5_000);
     // Approved, proj works and sorts between fixture and web.
     await tui.sendKeys("Down Enter");
+    await tui.waitForText("Disable for this session", 5_000);
+    await tui.sendKeys("Down");
     await tui.waitForText("› Remove        /mcp remove web", 5_000);
     await tui.sendKeys("Enter");
     // It asks on Remove's own row, with its answers; the hint line stays.

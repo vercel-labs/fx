@@ -737,6 +737,7 @@ fn rebindMcpAuthorityGeneration(
             .admission_authority_generation = scope.admission_authority_generation,
             .live = scope.live,
             .action_authority_generation = authority_generation,
+            .session_filter = scope.session_filter,
         } },
         else => access,
     };

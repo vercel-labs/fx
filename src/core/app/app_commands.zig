@@ -1215,6 +1215,7 @@ pub fn Handlers(comptime App: type) type {
 
         /// Closes every footer menu and panel, so another can open in its place.
         pub fn closeFooterMenus(app: *App) void {
+            if (comptime @hasField(App, "mcp")) app.mcp.closeHostMenu();
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
             if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
             closeHelpMenuIfPresent(app);
@@ -2889,4 +2890,23 @@ test "/version command writes dev build label and omits unresolved revision" {
     try expectVersionCommandBody(.dev, "f1862c5061f5", "0.0.17-f1862c5 (dev)");
     try expectVersionCommandBody(.dev, "unknown", "0.0.17 (dev)");
     try expectVersionCommandBody(.dev, "", "0.0.17 (dev)");
+}
+
+test "opening another footer menu closes the session-local MCP menu" {
+    const Mcp = struct {
+        closed: bool = false,
+        pub fn closeHostMenu(self: *@This()) void {
+            self.closed = true;
+        }
+    };
+    const Menu = struct {
+        pub fn close(_: *@This()) void {}
+    };
+    const App = struct {
+        mcp: Mcp = .{},
+        input_runtime: struct { settings_menu: Menu = .{} } = .{},
+    };
+    var app: App = .{};
+    Handlers(App).closeFooterMenus(&app);
+    try std.testing.expect(app.mcp.closed);
 }

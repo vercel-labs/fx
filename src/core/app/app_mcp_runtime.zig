@@ -26,6 +26,7 @@ const types = @import("../shared/types.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
+const agents = @import("../agents/agents.zig");
 
 /// The server a typed `/mcp ARGS` signs in to, or null if it isn't a valid
 /// `login`. Read by the verb's own parser, since `--no-browser` may come
@@ -98,6 +99,8 @@ pub const State = struct {
     host_mutex: std.Io.Mutex = .init,
     host_load: ?mcp_host.LoadFn = null,
     host_questions: elicitation.Capabilities = .{},
+    /// Borrowed UI selection, never read by worker threads.
+    session_owner: ?*agents.Agent = null,
     /// Where the host's owner thread and `/mcp` threads leave what they have
     /// to say. On the heap, because the app is moved after the host starts
     /// and the host keeps this address.
@@ -192,6 +195,18 @@ pub const State = struct {
         registry: tool_dispatch.Registry,
         check: RefreshCheck,
     ) bool {
+        return self.refreshHostWithSessions(alloc, home, workspace_root, registry, check, &.{});
+    }
+
+    fn refreshHostWithSessions(
+        self: *State,
+        alloc: Allocator,
+        home: ?[]const u8,
+        workspace_root: []const u8,
+        registry: tool_dispatch.Registry,
+        check: RefreshCheck,
+        settings: []const mcp_host.SessionSetting,
+    ) bool {
         if (self.host_load == null) return false;
         const requested = self.takeHostReload();
         if (!requested and check == .requested) return false;
@@ -200,7 +215,7 @@ pub const State = struct {
         if (!requested) if (self.host_config_stamp) |last| if (last == stamp) return false;
         self.host_config_stamp = stamp;
         debug_trace.logf("mcp", "MCP config loaded again reason={s}", .{if (requested) "mcp_command" else "config_files_changed"});
-        self.reloadHost(alloc, workspace_root, registry) catch |err| {
+        self.reloadHost(alloc, workspace_root, registry, settings) catch |err| {
             debug_trace.logf("mcp", "MCP reload failed err={s}", .{@errorName(err)});
             const sink = self.host_sink orelse return true;
             sink.push(std.heap.c_allocator.print("The MCP config changed, but fx couldn't load it: {s}. Your current servers are still active.", .{mcp_verbs.describe(err)}) catch return true, true);
@@ -212,15 +227,25 @@ pub const State = struct {
     /// so only a server whose config changed restarts. A new host comes only
     /// when there was none, or the last server went; calls still using an old
     /// one finish on it.
-    fn reloadHost(self: *State, alloc: Allocator, workspace_root: []const u8, registry: tool_dispatch.Registry) !void {
+    fn reloadHost(self: *State, alloc: Allocator, workspace_root: []const u8, registry: tool_dispatch.Registry, settings: []const mcp_host.SessionSetting) !void {
         const load = self.host_load orelse return;
         const sink = self.host_sink orelse return;
         const lease = self.leaseHost();
         defer if (lease) |l| l.deinit();
         const current = if (lease) |l| l.host else null;
-        const next = try load(alloc, workspace_root, registry, .{ .questions = self.host_questions, .notify = sink.notify(), .slash_commands = true, .reuse = current });
+        const next = try load(alloc, workspace_root, registry, .{ .questions = self.host_questions, .notify = sink.notify(), .slash_commands = true, .reuse = current, .session_settings = settings });
         if (next != current) self.replaceHost(next);
         self.startHostServers();
+    }
+
+    pub fn selectSession(self: *State, agent: *agents.Agent) void {
+        const owner = agent.root_instance orelse agent;
+        if (self.session_owner == owner) return;
+        if (self.host_menu.active) self.closeHostMenu();
+        self.session_owner = owner;
+        self.host_menu_at_ms = 0;
+        self.host_status_at_ms = 0;
+        self.host_completion_at_ms = 0;
     }
 
     pub fn hostStatusText(self: *const State) []const u8 {
@@ -249,6 +274,7 @@ pub const State = struct {
         const a = arena.allocator();
         // The status line never shows sign-in state, so it doesn't wait for it.
         const statuses = lease.host.runtime.statusesNow(a) catch return "";
+        self.projectSessionStatuses(lease.host, @constCast(statuses));
         sink.mutex.lockUncancelable(io_mod.getIo());
         const news: ?[]const u8 = if (sink.news) |text|
             (if (now_ms - sink.news_at_ms < mcp_menu.news_ms) a.dupe(u8, text) catch null else null)
@@ -594,6 +620,7 @@ pub const State = struct {
         .{ .full = "/mcp list", .description = "configured servers" },
         .{ .full = "/mcp show", .description = "connect to a server and list its tools" },
         .{ .full = "/mcp add", .description = "add a server" },
+        .{ .full = "/mcp set", .description = "set a server on, off, or default for this session only" },
         .{ .full = "/mcp remove", .description = "remove a server and its login" },
         .{ .full = "/mcp login", .description = "sign in to an HTTP server" },
         .{ .full = "/mcp logout", .description = "sign out of an HTTP server" },
@@ -603,7 +630,8 @@ pub const State = struct {
 
     /// On the UI thread: what `/mcp` completes, from the host's current
     /// status. Rebuilt at most twice a second.
-    pub fn refreshCompletion(self: *State) void {
+    pub fn refreshCompletion(self: *State, agent: *agents.Agent) void {
+        self.selectSession(agent);
         if (self.host_sink == null) return;
         const now = io_mod.milliTimestamp();
         if (self.host_completion.len > 0 and now - self.host_completion_at_ms < 500) return;
@@ -622,7 +650,9 @@ pub const State = struct {
         const lease = self.leaseHost() orelse return completionsFor(a, &.{});
         defer lease.deinit();
         // Rebuilt twice a second on the UI thread, so it doesn't wait for saved credentials.
-        return completionsFor(a, try lease.host.runtime.statusesNow(a));
+        const statuses = try lease.host.runtime.statusesNow(a);
+        self.projectSessionStatuses(lease.host, @constCast(statuses));
+        return completionsFor(a, statuses);
     }
 
     /// The verbs, then each verb's servers, every one described by the words the `/mcp` menu uses for its status.
@@ -634,6 +664,7 @@ pub const State = struct {
             const description = try mcp_verbs.runStatusText(a, status);
             const applies = [_]struct { verb: []const u8, ok: bool }{
                 .{ .verb = "show", .ok = true },
+                .{ .verb = "set", .ok = true },
                 .{ .verb = "remove", .ok = true },
                 .{ .verb = "login", .ok = status.transport != .stdio },
                 .{ .verb = "logout", .ok = status.transport != .stdio },
@@ -653,10 +684,82 @@ pub const State = struct {
         return self.host_reload_requested.swap(false, .acq_rel);
     }
 
+    pub fn runSessionVerbs(self: *State, owner: *agents.Agent, home: []const u8, workspace_root: []const u8, rest: []const u8) !void {
+        self.selectSession(owner);
+        var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var argv = command_lex.tokenize_argv(a, rest) catch return self.runVerbs(home, workspace_root, rest);
+        defer argv.deinit(a);
+        const args = try a.alloc([]const u8, argv.tokens.len);
+        for (argv.tokens, args) |token, *arg| arg.* = token.value;
+        const parsed = try mcp_verbs.parse(a, .shell, args);
+        if (parsed == .command and parsed.command == .set) {
+            return self.runSessionSet(self.session_owner.?, home, workspace_root, args, .transcript);
+        }
+        return self.runVerbsWithOwner(owner, home, workspace_root, rest);
+    }
+
+    const SessionVerbs = struct {
+        state: *State,
+        owner: *agents.Agent,
+
+        fn get(raw: *anyopaque, _: ?mcp_host.Notify) anyerror!?*mcp_host.Host {
+            const context: *SessionVerbs = @ptrCast(@alignCast(raw));
+            return if (context.state.leaseHost()) |lease| lease.host else null;
+        }
+
+        fn release(raw: *anyopaque, host_value: *mcp_host.Host) void {
+            const context: *SessionVerbs = @ptrCast(@alignCast(raw));
+            context.state.releaseHost(host_value);
+        }
+
+        fn changed(raw: *anyopaque) void {
+            const context: *SessionVerbs = @ptrCast(@alignCast(raw));
+            context.state.host_reload_requested.store(true, .release);
+            context.state.host_menu_at_ms = 0;
+        }
+
+        fn set(raw: *anyopaque, name: []const u8, enabled: ?bool) anyerror!void {
+            const context: *SessionVerbs = @ptrCast(@alignCast(raw));
+            try context.owner.mcp_overrides.set(std.heap.c_allocator, name, enabled);
+        }
+    };
+
+    fn runSessionSet(self: *State, owner: *agents.Agent, home: []const u8, workspace_root: []const u8, args: []const []const u8, report: VerbReport) !void {
+        // Like startVerbs, this path needs the native MCP host and its owner thread.
+        if (comptime builtin.single_threaded) return error.ThreadsUnsupported;
+        var context: SessionVerbs = .{ .state = self, .owner = owner };
+        const a = std.heap.c_allocator;
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        var err: std.Io.Writer.Allocating = .init(a);
+        defer err.deinit();
+        _ = mcp_verbs.run(.{
+            .gpa = a,
+            .out = &out.writer,
+            .err = &err.writer,
+            .surface = .shell,
+            .home = home,
+            .workspace_root = workspace_root,
+            .hosts = .{ .context = &context, .get = SessionVerbs.get, .release = SessionVerbs.release, .changed = SessionVerbs.changed, .set_session = SessionVerbs.set },
+        }, args);
+        const sink = self.host_sink orelse return;
+        for ([_]*std.Io.Writer.Allocating{ &out, &err }, [_]bool{ false, true }) |writer, warning| {
+            if (!warning and report == .warnings_only) continue;
+            const text = std.mem.trimEnd(u8, writer.written(), "\n");
+            if (text.len > 0) sink.push(try a.dupe(u8, text), warning);
+        }
+    }
+
     /// Runs `/mcp ARGS` off the UI thread, since `show` may wait for a
     /// server; what it prints and any reload it asks for reach the UI through
     /// `takeHostNotices` and `takeHostReload`.
     pub fn runVerbs(self: *State, home: []const u8, workspace_root: []const u8, rest: []const u8) !void {
+        return self.runVerbsWithOwner(null, home, workspace_root, rest);
+    }
+
+    fn runVerbsWithOwner(self: *State, owner: ?*agents.Agent, home: []const u8, workspace_root: []const u8, rest: []const u8) !void {
         const a = std.heap.c_allocator;
         var argv = command_lex.tokenize_argv(a, rest) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -675,7 +778,7 @@ pub const State = struct {
             defer arena.deinit();
             if (try typedLoginServer(arena.allocator(), args)) |server| sink.markTyped(server);
         }
-        try self.startVerbs(home, workspace_root, args, .transcript);
+        try self.startVerbs(owner, home, workspace_root, args, .transcript);
     }
 
     /// Where a `/mcp` command's report goes. A command typed in the
@@ -684,13 +787,26 @@ pub const State = struct {
     const VerbReport = enum { transcript, warnings_only };
 
     /// Runs `/mcp` with `args` off the UI thread, like `runVerbs`.
-    fn startVerbs(self: *State, home: []const u8, workspace_root: []const u8, args: []const []const u8, report: VerbReport) !void {
+    fn startVerbs(self: *State, owner: ?*agents.Agent, home: []const u8, workspace_root: []const u8, args: []const []const u8, report: VerbReport) !void {
         if (comptime builtin.single_threaded) return error.ThreadsUnsupported;
         const a = std.heap.c_allocator;
         const job = try a.create(VerbJob);
         errdefer a.destroy(job);
         job.* = .{ .state = self, .report = report };
         errdefer job.free();
+        if (owner) |agent| {
+            if (self.leaseHost()) |lease| {
+                defer lease.deinit();
+                const servers = lease.host.runtime.servers();
+                const choices = try a.alloc(mcp_host.SessionSetting, servers.len);
+                @memset(choices, .{ .name = "", .enabled = null });
+                job.session_choices = choices;
+                for (servers, choices) |server, *choice| choice.* = .{
+                    .name = try a.dupe(u8, server.name),
+                    .enabled = agent.allowsSessionMcp(server.name, server.configured_enabled),
+                };
+            }
+        }
         const owned = try a.alloc([]const u8, args.len);
         @memset(owned, "");
         job.args = owned;
@@ -709,6 +825,7 @@ pub const State = struct {
         args: []const []const u8 = &.{},
         home: []const u8 = "",
         workspace_root: []const u8 = "",
+        session_choices: []const mcp_host.SessionSetting = &.{},
 
         fn free(job: *VerbJob) void {
             const a = std.heap.c_allocator;
@@ -716,6 +833,8 @@ pub const State = struct {
             a.free(job.args);
             a.free(job.home);
             a.free(job.workspace_root);
+            for (job.session_choices) |choice| a.free(choice.name);
+            a.free(job.session_choices);
         }
 
         fn run(job: *VerbJob) void {
@@ -736,6 +855,7 @@ pub const State = struct {
                 .out = &out.writer,
                 .err = &err.writer,
                 .surface = .shell,
+                .session_choices = job.session_choices,
                 .home = job.home,
                 .workspace_root = job.workspace_root,
                 .hosts = .{ .context = self, .get = getHost, .release = putHost, .changed = configChanged, .sign_in_when_loaded = signInWhenLoaded },
@@ -906,7 +1026,12 @@ pub const State = struct {
             .run => |run| {
                 // A confirmed Remove went back to the list already.
                 if (self.host_menu.screen == .list) self.stopMenuTools();
-                try self.startVerbs(home, workspace_root, &.{ run.choice.verb(), run.server }, .warnings_only);
+                if (run.choice.value()) |value| {
+                    const owner = self.session_owner orelse return;
+                    try self.runSessionSet(owner, home, workspace_root, &.{ run.choice.verb(), run.server, value }, .warnings_only);
+                } else {
+                    try self.startVerbs(self.session_owner, home, workspace_root, &.{ run.choice.verb(), run.server }, .warnings_only);
+                }
                 // The status follows sooner than the next refresh would show it.
                 self.host_menu_at_ms = 0;
             },
@@ -953,6 +1078,22 @@ pub const State = struct {
         return true;
     }
 
+    fn projectSessionStatuses(self: *State, host_value: *mcp_host.Host, statuses: []mcp_host.Status) void {
+        const owner = self.session_owner orelse return;
+        for (statuses) |*status| {
+            for (host_value.runtime.servers()) |server| {
+                if (!std.mem.eql(u8, server.name, status.name)) continue;
+                if (!owner.allowsSessionMcp(server.name, server.configured_enabled)) {
+                    status.state = .disabled;
+                    status.tools = 0;
+                    status.needs_login = false;
+                    status.signing_in = false;
+                }
+                break;
+            }
+        }
+    }
+
     fn buildMenuRows(self: *State, a: Allocator) ![]const mcp_menu.Row {
         const lease = self.leaseHost() orelse {
             self.host_menu_notes = 0;
@@ -962,11 +1103,14 @@ pub const State = struct {
         // Right after launch, waiting for saved logins would freeze the
         // shell; the next refresh shows them once they're in.
         const statuses = try lease.host.runtime.statusesNow(a);
+        self.projectSessionStatuses(lease.host, @constCast(statuses));
         const rows = try a.alloc(mcp_menu.Row, statuses.len);
-        for (statuses, lease.host.runtime.servers(), rows) |status, server, *row| row.* = .{
-            .status = status,
-            .target = if (server.url orelse server.command) |target| try a.dupe(u8, target) else null,
-        };
+        for (statuses, lease.host.runtime.servers(), rows) |status, server, *row| {
+            row.* = .{
+                .status = status,
+                .target = if (server.url orelse server.command) |target| try a.dupe(u8, target) else null,
+            };
+        }
         self.host_menu_notes = lease.host.notes.len;
         return rows;
     }
@@ -992,6 +1136,10 @@ pub const State = struct {
             if (std.mem.eql(u8, row.status.name, name)) break row;
         } else null;
         self.host_menu_loaded = if (open) |row| MenuLoadedAs.of(row) else null;
+        if (open) |row| if (row.status.state == .disabled) {
+            self.host_menu_tools = .disabled;
+            return;
+        };
         const sink = self.host_sink orelse return;
         const a = std.heap.c_allocator;
         const job = try a.create(MenuToolsJob);
@@ -1193,6 +1341,27 @@ pub const State = struct {
         return null;
     }
 
+    pub fn serverNamesForAgent(self: *State, owner: *agents.Agent, alloc: Allocator) ![]const []const u8 {
+        const lease = self.leaseHost() orelse return &.{};
+        defer lease.deinit();
+        const names = @constCast(try lease.host.catalog.serverNames(alloc));
+        var count: usize = 0;
+        errdefer {
+            for (names[0..count]) |name| alloc.free(name);
+            alloc.free(names);
+        }
+        for (names) |name| {
+            const enabled = for (lease.host.runtime.servers()) |server| {
+                if (std.mem.eql(u8, server.name, name)) break owner.allowsSessionMcp(name, server.configured_enabled);
+            } else false;
+            if (enabled) {
+                names[count] = name;
+                count += 1;
+            } else alloc.free(name);
+        }
+        return try alloc.realloc(names, count);
+    }
+
     /// The names of the MCP servers the model may reach, for the toolbox
     /// menu. `alloc` owns the slice and each name.
     pub fn serverNames(self: *State, alloc: Allocator) ![]const []const u8 {
@@ -1243,7 +1412,7 @@ test "the /mcp completions describe an idle server with a saved login as the men
         }
         if (std.mem.eql(u8, e.full, "/mcp login proj")) proj_login = true;
     }
-    try std.testing.expectEqual(@as(usize, 4), saved_verbs);
+    try std.testing.expectEqual(@as(usize, 5), saved_verbs);
     try std.testing.expect(!proj_login);
 }
 
@@ -1424,4 +1593,140 @@ test "the host loads again when its config files change outside the session, onc
     try std.testing.expectEqual(@as(usize, 1), notices.len);
     try std.testing.expect(notices[0].warning);
     try std.testing.expectEqualStrings("The MCP config changed, but fx couldn't load it: ~/.fx/mcp.json isn't valid JSON. Your current servers are still active.", notices[0].text);
+}
+
+pub fn SessionControls(comptime App: type) type {
+    return struct {
+        pub fn refreshHost(app: *App, registry: tool_dispatch.Registry, check: State.RefreshCheck) bool {
+            if (check == .requested and !app.mcp.host_reload_requested.load(.acquire)) return false;
+            var arena: std.heap.ArenaAllocator = .init(app.alloc);
+            defer arena.deinit();
+            const settings = aggregateSettings(app, arena.allocator()) catch |err| {
+                debug_trace.logf("mcp", "MCP session admission not reloaded err={s}", .{@errorName(err)});
+                app.mcp.addHostWarning("Couldn't apply the temporary MCP choices; try the command again.");
+                return false;
+            };
+            return app.mcp.refreshHostWithSessions(app.alloc, io_mod.homeDir(), app.workspace_root, registry, check, settings);
+        }
+
+        fn aggregateSettings(app: *App, arena: Allocator) ![]const mcp_host.SessionSetting {
+            var roots: std.ArrayList(*agents.Agent) = .empty;
+            if (app.instances.first_open) try roots.append(arena, &app.main_agent);
+            for (app.child_agents.items) |child| {
+                if (child.agent.role == .instance) try roots.append(arena, &child.agent);
+            }
+            var names: std.StringHashMapUnmanaged(void) = .empty;
+            for (roots.items) |root| {
+                const choices = try root.mcp_overrides.snapshot(arena);
+                for (choices) |choice| try names.put(arena, choice.name, {});
+            }
+            const settings = try arena.alloc(mcp_host.SessionSetting, names.count());
+            var it = names.keyIterator();
+            for (settings) |*setting| {
+                const name = it.next().?.*;
+                var any_on = false;
+                var any_default = false;
+                for (roots.items) |root| accumulate(root, name, &any_on, &any_default);
+                setting.* = .{ .name = name, .enabled = if (any_on) true else if (any_default) null else false };
+            }
+            return settings;
+        }
+
+        fn accumulate(agent: *agents.Agent, name: []const u8, any_on: *bool, any_default: *bool) void {
+            if (agent.mcp_overrides.get(name)) |enabled| {
+                any_on.* = any_on.* or enabled;
+            } else any_default.* = true;
+        }
+
+        pub fn snapshotAccessView(app: *App, alloc: Allocator, owner_id: []const u8, parent_id: []const u8) !?mcp_access.View {
+            const lease = app.mcp.leaseHost() orelse return null;
+            defer lease.deinit();
+            var owner: ?*agents.Agent = null;
+            if (app.main_agent.session_persistence.v2) |v2| {
+                if (std.mem.eql(u8, v2.id(), owner_id)) owner = &app.main_agent;
+            }
+            for (app.child_agents.items) |child| {
+                if (std.mem.eql(u8, child.id, owner_id)) owner = child.agent.root_instance orelse &child.agent;
+                if (child.agent.session_persistence.v2) |v2| {
+                    if (std.mem.eql(u8, v2.id(), owner_id)) owner = child.agent.root_instance orelse &child.agent;
+                }
+            }
+            const agent = owner orelse return null;
+            return try lease.host.catalog.snapshotAccessViewFiltered(alloc, owner_id, parent_id, .{
+                .context = agent,
+                .allows_fn = allowServer,
+                .enabled_fn = allowEnabled,
+            });
+        }
+
+        pub fn snapshotToolNames(app: *App, alloc: Allocator, owner_id: []const u8) ![][]u8 {
+            var view = (try snapshotAccessView(app, alloc, owner_id, owner_id)) orelse return alloc.alloc([]u8, 0);
+            defer view.deinit(alloc);
+            const names = try alloc.alloc([]u8, view.tools.len);
+            var copied: usize = 0;
+            errdefer {
+                for (names[0..copied]) |name| alloc.free(name);
+                alloc.free(names);
+            }
+            for (view.tools, names) |tool, *name| {
+                name.* = try alloc.dupe(u8, tool.name);
+                copied += 1;
+            }
+            return names;
+        }
+
+        fn allowServer(_: *const anyopaque, _: []const u8) bool {
+            return true;
+        }
+
+        fn allowEnabled(raw: *const anyopaque, name: []const u8, configured_enabled: bool) bool {
+            const owner: *const agents.Agent = @ptrCast(@alignCast(raw));
+            return owner.allowsSessionMcp(name, configured_enabled);
+        }
+    };
+}
+
+test "session-local MCP admission preserves overrides without a host and unions live roots" {
+    const Child = struct { agent: agents.Agent = .{} };
+    const TestApp = struct {
+        main_agent: agents.Agent = .{},
+        child_agents: std.ArrayList(*Child) = .empty,
+        instances: struct { first_open: bool = true } = .{},
+    };
+    const alloc = std.testing.allocator;
+    var app: TestApp = .{};
+    defer app.main_agent.mcp_overrides.deinit(alloc);
+    defer app.child_agents.deinit(alloc);
+    var child: Child = .{};
+    defer child.agent.mcp_overrides.deinit(alloc);
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try app.main_agent.mcp_overrides.set(alloc, "temporarily-absent", true);
+    try app.main_agent.mcp_overrides.set(alloc, "off", false);
+    const alone = try SessionControls(TestApp).aggregateSettings(&app, a);
+    try std.testing.expectEqual(@as(usize, 2), alone.len);
+    for (alone) |setting| try std.testing.expectEqual(@as(?bool, !std.mem.eql(u8, setting.name, "off")), setting.enabled);
+    try app.child_agents.append(alloc, &child);
+    for (try SessionControls(TestApp).aggregateSettings(&app, a)) |setting| {
+        try std.testing.expectEqual(if (std.mem.eql(u8, setting.name, "off")) @as(?bool, null) else true, setting.enabled);
+    }
+    try child.agent.mcp_overrides.set(alloc, "off", false);
+    for (try SessionControls(TestApp).aggregateSettings(&app, a)) |setting| if (std.mem.eql(u8, setting.name, "off")) try std.testing.expectEqual(@as(?bool, false), setting.enabled);
+    app.instances.first_open = false;
+    const remaining = try SessionControls(TestApp).aggregateSettings(&app, a);
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+    try std.testing.expectEqualStrings("off", remaining[0].name);
+    try std.testing.expectEqual(@as(?bool, false), remaining[0].enabled);
+}
+
+test "changing the session closes a menu that borrowed the previous session" {
+    var first: agents.Agent = .{};
+    var second: agents.Agent = .{};
+    var state: State = .{};
+    state.selectSession(&first);
+    state.host_menu.active = true;
+    state.selectSession(&second);
+    try std.testing.expect(!state.host_menu.active);
+    try std.testing.expectEqual(&second, state.session_owner.?);
 }

@@ -454,6 +454,9 @@ pub const Reloaded = struct {
     /// A server that ran before was removed, held back, or replaced by one
     /// of the same name.
     dropped: bool,
+    /// A prior server's raw definition changed or disappeared, even while held.
+    /// Adding a server or changing only temporary admission preserves views.
+    definitions_changed: bool = true,
 };
 
 pub const Runtime = struct {
@@ -2082,6 +2085,7 @@ pub const Runtime = struct {
         const s = scratch.allocator();
         const next = try config.resolve(s, configs, inherited, r.options.workspace_root, io_mod.homeDir());
         const n = next.servers.len;
+        const definitions_changed = definitionsChanged(r.resolved.servers, next.servers);
         const routing = r.options.share != null and r.shared != null;
         // What a caller reads after the reload: the servers, and which kept running.
         const arena = r.arena.allocator();
@@ -2206,7 +2210,18 @@ pub const Runtime = struct {
         var same: usize = 0;
         for (kept) |k| same += @intFromBool(k);
         debug_trace.logf("mcp", "MCP config reloaded servers={d} kept={d} fresh={d} dropped={s}", .{ n, same, added, if (dropped) "yes" else "no" });
-        return .{ .kept = kept, .dropped = dropped };
+        return .{ .kept = kept, .dropped = dropped, .definitions_changed = definitions_changed };
+    }
+
+    fn definitionsChanged(before: []const config.Server, after: []const config.Server) bool {
+        for (before) |old| {
+            for (after) |next| {
+                if (!std.mem.eql(u8, old.name, next.name)) continue;
+                if (old.definition_key != next.definition_key) return true;
+                break;
+            } else return true;
+        }
+        return false;
     }
 
     /// A tool list asked of server `i` is asked again: whatever has its name

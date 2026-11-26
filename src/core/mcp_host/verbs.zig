@@ -54,7 +54,7 @@ pub const Surface = enum {
     }
 };
 
-pub const Verb = enum { list, show, add, remove, login, logout, approve, reject, call };
+pub const Verb = enum { list, show, add, remove, login, logout, approve, reject, call, set };
 const verb_names = names: {
     var names: [@typeInfo(Verb).@"enum".field_names.len][]const u8 = undefined;
     for (@typeInfo(Verb).@"enum".field_names, &names) |name, *slot| slot.* = name;
@@ -75,6 +75,7 @@ pub const Command = union(enum) {
     approve: ?[]const u8,
     reject: []const u8,
     call: mcp_call_client.Command,
+    set: struct { name: []const u8, enabled: ?bool },
 };
 
 pub const Parsed = union(enum) {
@@ -162,6 +163,12 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
     const n = names.items;
 
     switch (verb) {
+        .set => {
+            if (n.len != 2) return usage(arena, verb, "{s} set needs a NAME and on, off, or default.", .{p});
+            const enabled: ?bool = if (std.mem.eql(u8, n[1], "on")) true else if (std.mem.eql(u8, n[1], "off")) false else if (std.mem.eql(u8, n[1], "default")) null else return usage(arena, verb, "{s} set: invalid value '{f}'; use on, off, or default.", .{ p, text_utils.terminalSafe(n[1]) });
+            if (surface == .cli) return usage(arena, verb, "Run /mcp set {f} {s} inside a session; this command never changes saved configuration.", .{ text_utils.terminalSafe(n[0]), n[1] });
+            return .{ .command = .{ .set = .{ .name = n[0], .enabled = enabled } } };
+        },
         .list => {
             if (n.len > 0) return usage(arena, verb, "{s} list takes no server name.", .{p});
             return .{ .command = .{ .list = .{ .json = json } } };
@@ -227,7 +234,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         .logout => .{ .logout = name },
         .approve => .{ .approve = name },
         .reject => .{ .reject = name },
-        .list, .add, .call => unreachable,
+        .list, .add, .call, .set => unreachable,
     } };
 }
 
@@ -274,7 +281,7 @@ fn verbFlags(verb: Verb, surface: Surface) VerbFlags {
         .remove => verbFlagsFor(&scope_options),
         .login => verbFlagsFor(&login_options),
         .approve => verbFlagsFor(&approve_options),
-        .logout, .reject, .call => verbFlagsFor(&.{}),
+        .logout, .reject, .call, .set => verbFlagsFor(&.{}),
     };
 }
 
@@ -292,6 +299,7 @@ const overview = [_][2][]const u8{
     .{ "add NAME URL", "add an HTTP server" },
     .{ "add NAME -- CMD [ARGS...]", "add a stdio server" },
     .{ "add slack", "add Slack's server" },
+    .{ "set NAME on|off|default", "temporarily set a server in this session (/mcp only)" },
     .{ "remove NAME", "remove a server and its login" },
     .{ "login NAME", "sign in to an HTTP server" },
     .{ "logout NAME", "sign out and delete the login" },
@@ -326,6 +334,7 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
             \\  --no-login  don't sign in to an HTTP server that needs a login
             \\
         , .{ p, p, p }),
+        .set => try w.print("usage: /mcp set NAME on|off|default\n  Override this server for the current session only. default follows its saved configuration.\n  Nothing is saved; new or resumed sessions use the saved default.\n", .{}),
         .remove => try w.print("usage: {s} remove [--global | --project] NAME\n", .{p}),
         .login => try w.print("usage: {s} login [--no-browser] NAME\n  --no-browser  print the address instead of opening it\n", .{p}),
         .logout => try w.print("usage: {s} logout NAME\n", .{p}),
@@ -372,6 +381,8 @@ pub const Hosts = struct {
     /// live host loads it after `changed` and signs in once it asks for one.
     /// Null: `add` connects and signs in itself.
     sign_in_when_loaded: ?*const fn (context: *anyopaque, name: []const u8) void = null,
+    /// A user action in a live session; null on the standalone CLI.
+    set_session: ?*const fn (context: *anyopaque, name: []const u8, enabled: ?bool) anyerror!void = null,
 };
 
 pub const Context = struct {
@@ -383,6 +394,8 @@ pub const Context = struct {
     home: []const u8,
     workspace_root: []const u8,
     hosts: Hosts,
+    /// The invoking session's effective choices, copied before a background verb starts.
+    session_choices: []const @import("host.zig").SessionSetting = &.{},
     /// Ends a `show` still connecting, such as when fx quits.
     cancel: ?*const std.atomic.Value(bool) = null,
     /// How a `login` that signs in and every `logout` send the sign-outs that
@@ -488,6 +501,7 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
             try writeUsage(c.out, c.surface, verb);
             return 0;
         },
+        .set => |setting| setSession(c, arena, setting.name, setting.enabled),
         .list => |l| list(c, arena, l.json),
         .show => |s| show(c, arena, s.name, s.json),
         .add => |a| add(c, arena, a.name, a.file, a.entry, a.login),
@@ -554,6 +568,7 @@ fn refusalToken(refusal: config_file.Refusal) []const u8 {
 pub fn describe(err: anyerror) []const u8 {
     return switch (err) {
         error.OutOfMemory => "out of memory",
+        error.McpOverrideLimitReached => "too many temporary MCP choices; restore a server with /mcp set NAME default",
         error.Exists => "that name is already in the file; remove it first",
         error.BothKeys => "the file has both \"mcp\" and \"mcpServers\"; merge them into one",
         error.Unreadable => "the file isn't valid JSON, or repeats a key; fix it by hand first",
@@ -609,7 +624,13 @@ fn list(c: Context, arena: Allocator, json: bool) !u8 {
     defer if (host) |h| c.hosts.release(c.hosts.context, h);
     // A login another fx saved since counts before statuses are read.
     if (host) |h| h.runtime.pickUpLogins() catch |err| debug_trace.logf("mcp", "MCP saved logins not checked err={s}", .{@errorName(err)});
-    const statuses = if (host) |h| try h.runtime.statuses(arena) else &.{};
+    const statuses: []Status = if (host) |h| try arena.dupe(Status, try h.runtime.statuses(arena)) else &.{};
+    for (statuses) |*status| if (!sessionEnabled(c, status.name)) {
+        status.state = .disabled;
+        status.tools = 0;
+        status.needs_login = false;
+        status.signing_in = false;
+    };
     if (host) |h| try writeNotes(c, h);
     const p = try paths(c, arena);
     if (json) {
@@ -777,7 +798,16 @@ fn findStatus(statuses: []const Status, name: []const u8) ?Status {
     return null;
 }
 
+fn sessionEnabled(c: Context, name: []const u8) bool {
+    for (c.session_choices) |choice| if (std.mem.eql(u8, choice.name, name)) return choice.enabled orelse true;
+    return true;
+}
+
 fn show(c: Context, arena: Allocator, name: []const u8, json: bool) !u8 {
+    if (!sessionEnabled(c, name)) {
+        try c.err.print("{f} is disabled for this session; use /mcp set {f} on to enable it.\n", .{ text_utils.terminalSafe(name), text_utils.terminalSafe(name) });
+        return 1;
+    }
     const host = (try c.hosts.get(c.hosts.context, null)) orelse return missing(c, arena, name);
     defer c.hosts.release(c.hosts.context, host);
     try writeNotes(c, host);
@@ -1012,6 +1042,29 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
         return 1;
     }
     try c.out.print("Removed {s} from {s}{s}.\n", .{ name, fileLabel(file), if (forgot) ", and deleted its login" else "" });
+    return 0;
+}
+
+fn setSession(c: Context, arena: Allocator, name: []const u8, enabled: ?bool) !u8 {
+    const setter = c.hosts.set_session orelse {
+        try c.err.writeAll("Change a temporary MCP setting inside a session with /mcp set NAME on|off|default.\n");
+        return 2;
+    };
+    const host = (try c.hosts.get(c.hosts.context, null)) orelse return missing(c, arena, name);
+    defer c.hosts.release(c.hosts.context, host);
+    const server = findServer(host, name) orelse return missing(c, arena, name);
+    // Enabling changes admission, never project trust (R4.3).
+    if (enabled == true and server.source == .workspace and server.workspace_admission != .approved) {
+        try c.err.print("Approve {f} first with /mcp approve {f}; a session toggle doesn't approve a project server.\n", .{ text_utils.terminalSafe(name), text_utils.terminalSafe(name) });
+        return 1;
+    }
+    try setter(c.hosts.context, name, enabled);
+    c.hosts.changed(c.hosts.context);
+    if (enabled) |value| {
+        try c.out.print("{s} {f} for this session only. Saved configuration is unchanged.\n", .{ if (value) "Enabled" else "Disabled", text_utils.terminalSafe(name) });
+    } else {
+        try c.out.print("{f} follows its saved default for this session.\n", .{text_utils.terminalSafe(name)});
+    }
     return 0;
 }
 
@@ -1719,5 +1772,20 @@ test "the menu's words for a status are the list's, except that an idle server n
                 try testing.expectEqualStrings(try statusText(a, s), menu_words);
             }
         }
+    }
+}
+
+test "session-local MCP set parses explicit values without offering standalone mutation" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "on", "off", "default" }, [_]?bool{ true, false, null }) |word, value| {
+        const parsed = try parse(a, .shell, &.{ "set", "fixture", word });
+        try std.testing.expectEqualStrings("fixture", parsed.command.set.name);
+        try std.testing.expectEqual(value, parsed.command.set.enabled);
+        try std.testing.expect((try parse(a, .cli, &.{ "set", "fixture", word })) == .usage);
+    }
+    for ([_][]const []const u8{ &.{ "set", "fixture" }, &.{ "set", "fixture", "toggle" }, &.{ "set", "fixture", "on", "extra" } }) |args| {
+        try std.testing.expect((try parse(a, .shell, args)) == .usage);
     }
 }

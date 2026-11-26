@@ -1388,6 +1388,10 @@ pub fn Runtime(comptime App: type) type {
             app.input_runtime.inputResetState().resetForSession(app.alloc);
             app.terminal_input_runtime.resetEscapeDecoder();
             app_permission_runtime.Runtime(App).clearSessionGrants(app, agent);
+            if (comptime agents.hasAgentField(App, "mcp_overrides")) {
+                agent.mcp_overrides.clear(std.heap.c_allocator);
+                if (comptime @hasField(App, "mcp")) app.mcp.host_reload_requested.store(true, .release);
+            }
             app.clearPendingImages(agent);
             agent.change_tracker.clear(std.heap.c_allocator);
             diagnostics.resetSession();
@@ -5969,7 +5973,9 @@ pub fn Runtime(comptime App: type) type {
             defer if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
                 app.permission_state.authority_mutex.unlock(io_mod.getIo());
             };
-            const integrations = if (comptime @hasDecl(App, "snapshotMcpToolNames"))
+            const integrations = if (comptime @hasDecl(App, "snapshotMcpToolNamesForSession"))
+                try app.snapshotMcpToolNamesForSession(alloc, root_id)
+            else if (comptime @hasDecl(App, "snapshotMcpToolNames"))
                 try app.snapshotMcpToolNames(alloc)
             else
                 try alloc.alloc([]u8, 0);
@@ -6085,7 +6091,9 @@ pub fn Runtime(comptime App: type) type {
                 app.permission_state.authority_mutex.unlock(io_mod.getIo());
             };
             const instance = instanceWithSession(app, root_id) orelse return error.HostAuthorityUnavailable;
-            const integrations = if (comptime @hasDecl(App, "snapshotMcpToolNames"))
+            const integrations = if (comptime @hasDecl(App, "snapshotMcpToolNamesForSession"))
+                try app.snapshotMcpToolNamesForSession(alloc, root_id)
+            else if (comptime @hasDecl(App, "snapshotMcpToolNames"))
                 try app.snapshotMcpToolNames(alloc)
             else
                 try alloc.alloc([]u8, 0);

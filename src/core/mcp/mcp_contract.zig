@@ -182,6 +182,8 @@ pub const McpServerConfig = struct {
     auth: ?McpAuthConfig = null,
     allow_stored_credentials: bool = false,
     enabled: bool = true,
+    /// In-memory admission across live sessions; never read from or written to config files.
+    session_enabled: ?bool = null,
     /// Run one copy of this stdio server for every fx session whose launch
     /// config matches (`src/core/mcp_host/share_key.zig`); false keeps one
     /// copy per session, as before (`tests/tla/mcp_host/SharedServers.tla`).

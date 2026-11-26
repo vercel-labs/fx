@@ -326,6 +326,7 @@ pub fn Runtime(comptime App: type) type {
             // unfinished, as `fx --resume` does for the first one.
             if (resume_id != null) SessionRuntime.startPendingResume(app, agent);
             app.instances.launched += 1;
+            if (comptime @hasField(App, "mcp")) app.mcp.host_reload_requested.store(true, .release);
             debug_trace.eventf("host", "instance_launched", .{}, "agent={s} profile={s} instances={d} resumed={s}", .{
                 child.id,
                 name orelse "default",

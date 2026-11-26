@@ -24,10 +24,10 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
   // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget,
-  // RefreshLease, ErrorData, ConfigEdit, McpRules, Connect and SharedServers
-  // joined the four.
-  expect(count("smoke", "PASS")).toBe(expected(15, SIGNIN.smoke));
-  expect(count("stress", "PASS")).toBe(expected(15, SIGNIN.stress));
+  // RefreshLease, ErrorData, ConfigEdit, McpRules, Connect, SharedServers and
+  // SessionToggles joined the four.
+  expect(count("smoke", "PASS")).toBe(expected(16, SIGNIN.smoke));
+  expect(count("stress", "PASS")).toBe(expected(16, SIGNIN.stress));
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it

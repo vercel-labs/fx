@@ -42,6 +42,11 @@ pub const Server = struct {
     /// Signs in as fx's Slack app, whose redirect says `localhost`.
     slack_app: bool = false,
     held: ?Held = null,
+    /// The file's default, before live sessions temporarily override admission.
+    configured_enabled: bool = true,
+    workspace_admission: ?mcp_contract.WorkspaceAdmission = null,
+    /// Raw configuration and inherited environment, excluding temporary admission.
+    definition_key: u64 = 0,
     /// An editor's server whose tools go to the model every turn (ACP
     /// `_meta.fx.alwaysLoaded`).
     always_loaded: bool = false,
@@ -143,6 +148,7 @@ pub fn resolve(
     const shared = try arena.alloc(bool, configs.len);
     var engine: std.ArrayList(mcp.engine.Config) = .empty;
     var engine_server: std.ArrayList(usize) = .empty;
+    const environment_key = inheritedKey(inherited);
     for (configs, servers, shared, 0..) |*c, *s, *is_shared, i| {
         s.* = .{
             .name = try arena.dupe(u8, c.name),
@@ -153,6 +159,9 @@ pub fn resolve(
             .command = if (c.command) |command| try commandLine(arena, command, c.args) else null,
             .callback_port = if (c.auth) |a| a.callback_port else null,
             .always_loaded = c.always_loaded,
+            .configured_enabled = c.enabled,
+            .workspace_admission = c.workspace_admission,
+            .definition_key = definitionKey(c.*, environment_key, workspace_root, user_home),
             .workspace = if (c.source == .workspace) try arena.dupe(u8, workspace_root) else null,
         };
         s.held = heldFor(c);
@@ -215,6 +224,55 @@ pub fn resolve(
     return .{ .servers = servers, .shared = shared, .engine = engine.items, .engine_server = engine_server.items };
 }
 
+fn inheritedKey(inherited: *const std.process.Environ.Map) u64 {
+    var key: u64 = 0;
+    var it = inherited.iterator();
+    while (it.next()) |entry| {
+        var hash: std.hash.Wyhash = .init(0);
+        std.hash.autoHashStrat(&hash, entry.key_ptr.*, .DeepRecursive);
+        std.hash.autoHashStrat(&hash, entry.value_ptr.*, .DeepRecursive);
+        key ^= hash.final();
+    }
+    return key;
+}
+
+test "MCP definition identity ignores only temporary admission and environment order" {
+    var first: std.process.Environ.Map = .init(testing.allocator);
+    defer first.deinit();
+    var second: std.process.Environ.Map = .init(testing.allocator);
+    defer second.deinit();
+    try first.put("FIRST", "one");
+    try first.put("SECOND", "two");
+    try second.put("SECOND", "two");
+    try second.put("FIRST", "one");
+    try testing.expectEqual(inheritedKey(&first), inheritedKey(&second));
+    var raw: McpServerConfig = .{ .name = "server", .command = "sh", .args = &.{"argument"} };
+    const original = definitionKey(raw, inheritedKey(&first), "/workspace", null);
+    raw.session_enabled = false;
+    try testing.expectEqual(original, definitionKey(raw, inheritedKey(&first), "/workspace", null));
+    raw.session_enabled = true;
+    const copied_arg = try testing.allocator.dupe(u8, "argument");
+    defer testing.allocator.free(copied_arg);
+    raw.args = &.{copied_arg};
+    try testing.expectEqual(original, definitionKey(raw, inheritedKey(&second), "/workspace", null));
+    raw.enabled = false;
+    try testing.expect(original != definitionKey(raw, inheritedKey(&first), "/workspace", null));
+    raw.enabled = true;
+    try second.put("SECOND", "different");
+    try testing.expect(original != definitionKey(raw, inheritedKey(&second), "/workspace", null));
+    try testing.expect(original != definitionKey(raw, inheritedKey(&first), "/different-workspace", null));
+}
+
+fn definitionKey(raw: McpServerConfig, environment_key: u64, workspace_root: []const u8, user_home: ?[]const u8) u64 {
+    var config = raw;
+    config.session_enabled = null;
+    var hash: std.hash.Wyhash = .init(environment_key);
+    std.hash.autoHashStrat(&hash, config, .DeepRecursive);
+    std.hash.autoHashStrat(&hash, workspace_root, .DeepRecursive);
+    std.hash.autoHashStrat(&hash, user_home, .DeepRecursive);
+    return hash.final();
+}
+
 /// `servers` copied into `arena`, which outlives them: a server's strings
 /// that equal the ones its namesake in `prior` has are shared, so taking a
 /// config that changed little again costs little more than the list.
@@ -246,7 +304,7 @@ fn origin(url: []const u8) []const u8 {
 }
 
 fn heldFor(c: *const McpServerConfig) ?Held {
-    if (!c.enabled) return .disabled;
+    if (!(c.session_enabled orelse c.enabled)) return .disabled;
     if (c.source == .workspace) if (c.workspace_admission) |admission| switch (admission) {
         .pending => return .waiting_for_approval,
         .rejected => return .rejected,
@@ -260,7 +318,7 @@ fn heldFor(c: *const McpServerConfig) ?Held {
 /// and it does not opt out: one copy for every session whose launch config
 /// matches (`src/core/mcp_host/share_key.zig`).
 fn isShared(c: *const McpServerConfig, held: ?Held) bool {
-    return c.transport == .stdio and c.enabled and held == null and c.acp_server_id == null and c.shared;
+    return c.transport == .stdio and (c.session_enabled orelse c.enabled) and held == null and c.acp_server_id == null and c.shared;
 }
 
 /// What a stdio server gets of fx's environment, as the MCP SDKs give it:

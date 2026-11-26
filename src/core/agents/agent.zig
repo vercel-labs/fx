@@ -16,6 +16,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const child_run_mod = @import("child_run.zig");
 const profiles = @import("../profiles/profiles.zig");
 const tool_set = @import("../tooling/tool_set.zig");
+const mcp_overrides = @import("mcp_overrides.zig");
 
 /// How many history turns an agent's session keeps in memory.
 pub const max_history_turns: usize = 8;
@@ -54,6 +55,8 @@ pub const Agent = struct {
     /// (`copyGrants`). Only freeing it, after the instance's tree has stopped,
     /// takes no lock.
     session_grants: std.ArrayList(types.PermissionGrant) = .empty,
+    /// Temporary choices belong to the root session and never reach configuration.
+    mcp_overrides: mcp_overrides.State = .{},
     submission: submission_state.State = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     next_image_id: usize = 1,
@@ -92,4 +95,26 @@ pub const Agent = struct {
     profile: profiles.Held = .{},
     /// fx's tools narrowed to `profile`, in its arena, or null for all of them.
     profile_tools: ?tool_set.ToolSet = null,
+
+    pub fn allowsSessionMcp(self: *const Agent, server: []const u8, configured_enabled: bool) bool {
+        const root = self.root_instance orelse self;
+        return @constCast(&root.mcp_overrides).get(server) orelse configured_enabled;
+    }
 };
+
+test "subagents inherit temporary MCP choices only from their root session" {
+    const alloc = std.testing.allocator;
+    var root: Agent = .{};
+    defer root.mcp_overrides.deinit(alloc);
+    const child: Agent = .{ .role = .subagent, .root_instance = &root };
+    var other: Agent = .{};
+    defer other.mcp_overrides.deinit(alloc);
+    try std.testing.expect(!child.allowsSessionMcp("off", false));
+    try root.mcp_overrides.set(alloc, "off", true);
+    try std.testing.expect(child.allowsSessionMcp("off", false));
+    try std.testing.expect(!other.allowsSessionMcp("off", false));
+    try root.mcp_overrides.set(alloc, "on", false);
+    try std.testing.expect(!child.allowsSessionMcp("on", true));
+    try root.mcp_overrides.set(alloc, "on", null);
+    try std.testing.expect(child.allowsSessionMcp("on", true));
+}

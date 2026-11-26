@@ -1,0 +1,62 @@
+[
+  {
+    "description": "Raw disabled config vetoes an explicit root enable override",
+    "old": "IF values[r][s] = None THEN defaults[s] ELSE values[r][s]",
+    "new": "IF values[r][s] = None THEN defaults[s] ELSE defaults[s] /\\ values[r][s]",
+    "invariant": "OverrideWins"
+  },
+  {
+    "description": "The shared runtime requires every root instead of any root to enable a server",
+    "old": "RuntimeNeeds(s) == \\E r \\in Roots : Effective(r, s)",
+    "new": "RuntimeNeeds(s) == \\A r \\in Roots : Effective(r, s)",
+    "invariant": "RuntimeUnionWhenCurrent"
+  },
+  {
+    "description": "A captured child keeps using a server after its root disables it",
+    "old": "    /\\ RootMayUse(v.root, s)",
+    "new": "    /\\ Trusted(s) /\\ s \\in admitted",
+    "invariant": "ChildWithinRoot"
+  },
+  {
+    "description": "A child gains a server outside its captured access",
+    "old": "    /\\ s \\in v.access",
+    "new": "    /\\ TRUE",
+    "invariant": "ChildWithinCapturedAccess"
+  },
+  {
+    "description": "A child gains a server outside its profile",
+    "old": "    /\\ s \\in v.profile",
+    "new": "    /\\ TRUE",
+    "invariant": "ChildWithinProfile"
+  },
+  {
+    "description": "An enabled root bypasses project trust",
+    "old": "RootMayUse(r, s) == Effective(r, s) /\\ Trusted(s) /\\ s \\in admitted",
+    "new": "RootMayUse(r, s) == Effective(r, s) /\\ s \\in admitted",
+    "invariant": "ProjectTrustHolds"
+  },
+  {
+    "description": "An available MCP tool dispatches without permission approval",
+    "old": "RootCallAllowed(r, s, approved) == RootMayUse(r, s) /\\ approved",
+    "new": "RootCallAllowed(r, s, approved) == RootMayUse(r, s)",
+    "invariant": "NoApprovalBypass"
+  },
+  {
+    "description": "Changing one root rewrites every root's override for that server",
+    "old": "    /\\ overrides' = [overrides EXCEPT ![r][s] = value]",
+    "new": "    /\\ overrides' = [other \\in Roots |-> [overrides[other] EXCEPT ![s] = value]]",
+    "property": "ToggleIsRootLocal"
+  },
+  {
+    "description": "Reset, new, or resume drops another root's overrides too",
+    "old": "    /\\ overrides' = [overrides EXCEPT ![r] = EmptyOverrides]",
+    "new": "    /\\ overrides' = [other \\in Roots |-> EmptyOverrides]",
+    "property": "RootResetIsLocal"
+  },
+  {
+    "description": "A config reload discards session overrides instead of updating only their defaults",
+    "old": "    /\\ UNCHANGED <<overrides, trust, views, admitted>>",
+    "new": "    /\\ overrides' = [r \\in Roots |-> EmptyOverrides]\n    /\\ UNCHANGED <<trust, views, admitted>>",
+    "property": "ReloadPreservesOverrides"
+  }
+]

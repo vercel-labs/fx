@@ -167,6 +167,14 @@ pub fn loadHost(
     var inherited = try io_mod.cloneEnvironMap(alloc);
     defer inherited.deinit();
     try composeHostConfigs(alloc, &loaded, &.{}, &inherited);
+    for (loaded.configs.items) |*config| {
+        for (extras.session_settings) |setting| {
+            if (std.mem.eql(u8, config.name, setting.name)) {
+                config.session_enabled = setting.enabled;
+                break;
+            }
+        }
+    }
     // A host with no servers still carries the notes saying why.
     if (loaded.configs.items.len == 0 and loaded.diagnostics.items.len == 0) return null;
     if (extras.reuse) |h| {

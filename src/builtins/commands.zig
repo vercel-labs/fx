@@ -150,6 +150,7 @@ const mcp_subcommands = [_]command_specs.SubcommandDoc{
         .subcommands = &.{.{ .usage = "slack", .description = "Add Slack's server" }},
         .options = &mcp_add_options,
     },
+    .{ .usage = "set NAME <on|off|default>", .description = "Set a server's availability for this session only (/mcp)" },
     .{ .usage = "remove NAME", .description = "Remove a server and its login", .options = &mcp_scope_options },
     .{ .usage = "login NAME", .description = "Sign in to an HTTP server", .options = &mcp_login_options },
     .{ .usage = "logout NAME", .description = "Sign out and delete the login" },
@@ -742,7 +743,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|full-access|reset]", .completion_description = "choose what fx is allowed to do", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .allowlist, .command = "/allowlist", .help_entry = "/allowlist [view [effective|workspace|global]|[workspace|global] add|remove|reset ...]", .completion_description = "manage trusted commands, tools, and URLs", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .undo, .command = "/undo", .help_entry = "/undo", .completion_description = "undo the latest tracked file operation", .presentation_category = .session },
-    .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|show|add|remove|login|logout|approve|reject]", .completion_description = "manage MCP servers and their logins", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
+    .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|show|add|set|remove|login|logout|approve|reject]", .completion_description = "manage MCP servers and their logins", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills [list|add|install|show|create|remove|path] [name|url|path] ($ opens skill search)", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .copy, .command = "/copy", .help_entry = "/copy", .completion_description = "copy the last assistant response", .presentation_category = .session },
     .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },
@@ -828,6 +829,18 @@ test "fx config help names settings by their current keys" {
         }
     }
     try std.testing.expect(checked > 0);
+}
+
+test "MCP help documents its session-only server toggle" {
+    const set = for (mcp_subcommands) |subcommand| {
+        if (std.mem.eql(u8, subcommand.name(), "set")) break subcommand;
+    } else return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("set NAME <on|off|default>", set.usage);
+    try std.testing.expectEqualStrings("Set a server's availability for this session only (/mcp)", set.description);
+    try std.testing.expectEqual(@as(usize, 0), set.options.len);
+
+    const mcp = slash_registry.lookup("/mcp") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("/mcp [list|show|add|set|remove|login|logout|approve|reject]", mcp.help_entry.?);
 }
 
 test "built-in slash commands register exact active order" {
