@@ -223,6 +223,7 @@ fn nativeLoopPollTimeoutMs(
     skills_refresh_active: bool,
     transcript_page_work_active: bool,
     file_listing_hold_pending: bool,
+    pending_input_restore_active: bool,
     /// A time-bounded drain put events back: run the next iteration without
     /// waiting for input.
     next_iteration_due: bool,
@@ -232,7 +233,8 @@ fn nativeLoopPollTimeoutMs(
         auth_refresh_active or
         skills_refresh_active or
         transcript_page_work_active or
-        file_listing_hold_pending)
+        file_listing_hold_pending or
+        pending_input_restore_active)
         @min(default_timeout_ms, focused_ui_worker_poll_timeout_ms)
     else
         default_timeout_ms;
@@ -397,7 +399,7 @@ test "skill submit snapshot keeps display spans exact while agent bindings dedup
 var resize_interlock = shell_runtime.ResizeApprovalInterlock{};
 const default_context_registry = context_contract.Registry{ .default_provider = builtin_context.provider };
 const WorkspaceHostRuntime = if (host_target.is_wasm) js_host_workspace.Runtime else struct {};
-const selected_host_profile = if (host_target.is_wasm) host_runtime_profile.wasm else host_runtime_profile.native;
+const selected_host_profile = host_runtime_profile.host;
 const app_api_key_validator = if (host_target.is_wasm)
     api_key_validator.unavailable_provider
 else
@@ -1334,6 +1336,7 @@ const App = struct {
                 self.skills.refreshActive(),
                 self.fullTranscriptFocusedWorkActive(),
                 InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
+                self.pendingInputRestoreActive(),
                 self.takeDrainContinuationDue(),
             );
         }
@@ -1354,6 +1357,11 @@ const App = struct {
         return self.shell.fullTranscriptFocusedWorkActive() or
             (self.shell.fullTranscriptOpenOrOpening() and
                 self.screenAgent().session_persistence.transcript_archive_read.busy());
+    }
+
+    fn pendingInputRestoreActive(self: *App) bool {
+        if (comptime !host_profile.durable_sessions) return false;
+        return self.screenAgent().session_persistence.pending_input_restore.needsFastPoll();
     }
 
     fn processNextCooperativePrompt(self: *App, agent: *agents.Agent) !void {
@@ -3421,7 +3429,10 @@ const App = struct {
             try AuthAppRuntime.collectStartupCredentialFacts(self);
             AuthAppRuntime.collectDeferredStartupInventory(self);
         }
-        if (comptime host_profile.durable_sessions) SessionAppRuntime.collectInterruptedTurnHint(self);
+        if (comptime host_profile.durable_sessions) {
+            SessionAppRuntime.collectInterruptedTurnHint(self);
+            try SessionAppRuntime.pollPendingInputRestore(self, self.screenAgent());
+        }
         InputSubmitRuntime.collectPendingSubmissionFacts(self, self.screenAgent());
         try InputSubmitRuntime.collectLaunchPromptFacts(self, max_prompt_history);
         InputAppRuntime.collectFilePickerFacts(self, self.screenAgent());
@@ -4623,15 +4634,53 @@ test "process io connects through a reachable address while fx tasks hold every 
 }
 
 test "focused UI workers retain a bounded native poll timeout" {
-    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, true, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true, true, false));
-    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, false, false, false, false, false, true));
-    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true));
+    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, true, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, false, true, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true, false));
+    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false, true));
+    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true, true));
+}
+
+test "poll timeout is not 1 ms while only a held restore result waits" {
+    const test_session_adapter = @import("core/session/session_adapter.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    const ws = try std.testing.allocator.dupe(u8, home);
+    defer std.testing.allocator.free(ws);
+
+    var store = try test_session_adapter.Store.open(std.testing.allocator, home);
+    defer store.deinit(std.testing.allocator);
+    var model = "test-model".*;
+    const sess = try test_session_adapter.Session.create(std.testing.allocator, &store, ws, .app, .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+
+    var app = App{ .alloc = std.testing.allocator };
+    defer {
+        app.main_agent.session_persistence.pending_input_restore.deinit();
+        sess.close();
+        app.lifecycle_runtime.deinit();
+    }
+    try app.main_agent.session_persistence.pending_input_restore.queue(
+        sess.id(),
+        sess.pendingInputsReader(),
+    );
+    try app.main_agent.session_persistence.pending_input_restore.startQueued();
+    @import("core/app/restore_test_controls.zig").awaitRunning(&app.main_agent.session_persistence.pending_input_restore);
+
+    // The background task finished and is waiting for handoff (`isActive()` is still true).
+    try std.testing.expect(app.main_agent.session_persistence.pending_input_restore.isActive());
+    try std.testing.expect(!app.pendingInputRestoreActive());
+    try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
 }
 
 test "footer runtime compatibility facade exports composeFooterFrame" {

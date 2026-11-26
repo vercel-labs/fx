@@ -23,7 +23,7 @@ const AUTH_ENV_KEYS = [
   "AI_GATEWAY_API_KEY",
   "VERCEL_OIDC_TOKEN",
 ] as const;
-const DEFAULT_UNSET_ENV_KEYS = [
+export const DEFAULT_UNSET_ENV_KEYS = [
   ...AUTH_ENV_KEYS,
   "FX_TEST_GATEWAY_CHAT_URL",
   "FX_TEST_GATEWAY_MODELS_URL",
@@ -41,6 +41,28 @@ const DEFAULT_UNSET_ENV_KEYS = [
   "FX_RECORD_INPUT",
   "FX_MCP_CALL_SOCKET",
   "FX_MCP_CALL_TOKEN",
+  // fx reads its test holds in release builds, so a hold left there would
+  // stop every test's fx at it. A test that sets one passes it in `env`.
+  "FX_TEST_REPORT_DELIVERY_HELD",
+  "FX_TEST_REPORT_DELIVERY_RELEASE",
+  "FX_TEST_SESSION_WRITE_HELD",
+  "FX_TEST_SESSION_WRITE_RELEASE",
+  "FX_TEST_SUBAGENT_CLOSE_HELD",
+  "FX_TEST_SUBAGENT_CLOSE_RELEASE",
+  "FX_TEST_SUBAGENT_END_HELD",
+  "FX_TEST_SUBAGENT_END_RELEASE",
+  "FX_TEST_SUBAGENT_PUBLISH_HELD",
+  "FX_TEST_SUBAGENT_PUBLISH_RELEASE",
+  "FX_TEST_SUBAGENT_SETTLE_HELD",
+  "FX_TEST_SUBAGENT_SETTLE_RELEASE",
+  "FX_TEST_SUBAGENT_START_HELD",
+  "FX_TEST_SUBAGENT_START_RELEASE",
+  "FX_TEST_WORKSPACE_CAPTURE_START_HELD",
+  "FX_TEST_WORKSPACE_CAPTURE_START_RELEASE",
+  "FX_TEST_GREP_RELEASE",
+  "FX_TEST_ACP_PROMPT_TERMINAL_READY",
+  "FX_TEST_ACP_PROMPT_REAP_READY",
+  "FX_TEST_ACP_PROMPT_RELEASE",
 ] as const;
 const MIRRORED_ENV_KEYS = [
   "FX_GATEWAY_BASE_URL",
@@ -1370,6 +1392,21 @@ export class TmuxSession {
     } catch {
       return { dead: true, status: this.recordedExitStatus() };
     }
+  }
+
+  /// The pane's `remain-on-exit-format`, the text tmux expands into its
+  /// "Pane is dead" row. Throws on a tmux error, and when tmux finds no pane:
+  /// `display-message` then still exits 0, with an empty `pane_id`.
+  remainOnExitFormat(): string {
+    const target = `${this.name}:0.0`;
+    const raw = execFileSync(
+      "tmux",
+      this.tmuxArgs(["display-message", "-t", target, "-p", "#{pane_id}|#{remain-on-exit-format}"]),
+      { stdio: "pipe", encoding: "utf-8" },
+    ).replace(/\n$/, "");
+    const separator = raw.indexOf("|");
+    if (separator <= 0) throw new Error(`tmux found no pane ${target}: ${JSON.stringify(raw)}`);
+    return raw.slice(separator + 1);
   }
 
   isPaneAlive(): boolean {
