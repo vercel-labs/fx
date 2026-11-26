@@ -5,8 +5,8 @@
 //! before it captures. A test then knows the capture cannot be saved until
 //! it lets it go (`tests/e2e/sessions.test.ts`, "fx ask sends the turn's
 //! request while its start capture runs, and saves that capture before the
-//! tool writes, with experimental.workspace_capture"). Only that test sets
-//! the controls, so test builds and the libfx artifacts leave them out.
+//! tool writes, with experimental.workspace_capture"). Only tests set the
+//! controls, so test builds and the libfx artifacts leave them out.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
