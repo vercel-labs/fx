@@ -12,6 +12,7 @@
 (*             took                                                        *)
 (*   running   the result said running                                     *)
 (*   notice    the result carried quiet_notice                             *)
+(*   crossed   whether fx emitted a quiet_crossing event for the wait      *)
 (*   quietDue  the values quiet_ms >= the limit may take (both for a       *)
 (*             result without quiet_ms)                                    *)
 (*   output    the result carried output                                   *)
@@ -40,6 +41,7 @@ Matches(r, o) ==
     /\ r.end \in o.ends
     /\ r.running = o.running
     /\ r.notice = o.notice
+    /\ r.crossed = o.crossed
     /\ r.quietDue \in o.quietDue
     /\ outSince = o.output
 

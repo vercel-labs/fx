@@ -615,6 +615,34 @@ test("fx ask killed while its start capture is held keeps the prompt, and the re
   }
 }, TIMEOUT);
 
+test("fx ask finishes and leaves a FIFO alone when one sits at its start capture's hold marker, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-fifo-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  // Nothing ever reads this FIFO, so opening it to write the marker would
+  // block fx for good.
+  const held = join(fixture.root, "start-capture-held");
+  const release = join(fixture.root, "start-capture-release");
+  const mkfifo = Bun.spawnSync(["mkfifo", held]);
+  expect(mkfifo.exitCode).toBe(0);
+  const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FIFO_LEFT_ALONE"));
+  try {
+    const result = await runFx(["ask", "--json", "--auto", "Say done."], {
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway), FX_TEST_WORKSPACE_CAPTURE_START_HELD: held, FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: release },
+      timeoutMs: TIMEOUT,
+    });
+    expect({ code: result.code, timedOut: result.timedOut }).toEqual({ code: 0, timedOut: false });
+    expect(JSON.parse(result.stdout).output).toContain("FIFO_LEFT_ALONE");
+    expect(statSync(held).isFIFO()).toBe(true);
+    // The start capture skipped its hold and still ran.
+    expect(workspaceCaptures(fixture, JSON.parse(result.stdout).session_id).map((record) => record.phase)).toEqual(["start", "end"]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
 test("fx ask never captures a repository at the home folder that a tool writes in, with experimental.workspace_capture", async () => {
   const fixture = createFixture("fx-v2-capture-home-");
   makeCaptureRepository(fixture);

@@ -615,6 +615,8 @@ pub const FakeAgentRuntimeDeps = struct {
     continue_on_need_user: ?*std.atomic.Value(bool) = null,
     /// Presses Esc (sets the flag) when a request waits for the user.
     cancel_on_need_user: ?*std.atomic.Value(bool) = null,
+    /// Closes the sign-in (sets the flag) when a request waits for one.
+    sign_in_closed_on_sign_in_wait: ?*std.atomic.Value(bool) = null,
     /// Records prompts handed back to the composer.
     record_restored_prompt: bool = false,
     cancel_on_permission: ?*std.atomic.Value(bool) = null,
@@ -1993,6 +1995,9 @@ pub const FakeAgentRuntimeDeps = struct {
         if (status.kind == .need_user) {
             if (self.continue_on_need_user) |flag| flag.store(true, .seq_cst);
             if (self.cancel_on_need_user) |flag| flag.store(true, .seq_cst);
+            if (status.need) |need| if (need == .sign_in) {
+                if (self.sign_in_closed_on_sign_in_wait) |flag| flag.store(true, .seq_cst);
+            };
         }
         // Presses Esc while the request waits after the matching attempt.
         if (status.kind == .waiting) {
