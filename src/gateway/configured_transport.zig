@@ -5,6 +5,7 @@
 //! and the request for the server's model list. Each protocol's adapter
 //! builds the body and reads the reply.
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const client_mod = @import("client.zig");
 const chat_codec = @import("chat_completions_protocol.zig");
 const definitions = @import("../core/config/configured_provider.zig");
@@ -27,7 +28,9 @@ const max_secret_bytes = 16 * 1024;
 pub const max_models_bytes = 4 * 1024 * 1024;
 
 /// Reads a successful streamed reply. `progress` is told about each event.
-pub const ConsumeFn = *const fn (alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) anyerror!streams.Result;
+/// `secrets` are the token and header values the request sent, for a reader
+/// that cuts a reported failure short to mask first.
+pub const ConsumeFn = *const fn (alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress, secrets: []const []const u8) anyerror!streams.Result;
 
 /// The connection's extra headers with their values read from the
 /// environment, and the header its protocol needs. Free with `deinit`, which
@@ -79,21 +82,30 @@ pub const Headers = struct {
         self.* = .{};
     }
 
+    /// The bearer token and every header value, in a list the caller frees.
+    fn secrets(self: *const Headers, alloc: Allocator, token: ?[]const u8) Allocator.Error![]const []const u8 {
+        const token_count: usize = if (token != null) 1 else 0;
+        const list = try alloc.alloc([]const u8, token_count + self.owned);
+        if (token) |value| list[0] = value;
+        for (self.list[0..self.owned], list[token_count..]) |header, *slot| slot.* = header.value;
+        return list;
+    }
+
     /// `detail` with the bearer token and every header value replaced by
     /// asterisks, in the forms a server may quote them. Takes `detail` and
     /// returns owned text.
     fn mask(self: *const Headers, alloc: Allocator, detail: []u8, token: ?[]const u8) Allocator.Error![]u8 {
-        var masked = detail;
-        if (token) |value| masked = try maskOne(alloc, masked, value);
-        for (self.list[0..self.owned]) |header| masked = try maskOne(alloc, masked, header.value);
-        return masked;
+        const values = self.secrets(alloc, token) catch |err| {
+            alloc.free(detail);
+            return err;
+        };
+        defer alloc.free(values);
+        // With nothing to mask, the body stays as the server sent it.
+        if (values.len == 0) return detail;
+        defer alloc.free(detail);
+        return chat_codec.redact_error_detail_secrets(alloc, detail, values);
     }
 };
-
-fn maskOne(alloc: Allocator, detail: []u8, value: []const u8) Allocator.Error![]u8 {
-    defer alloc.free(detail);
-    return chat_codec.redact_error_detail(alloc, detail, value);
-}
 
 fn expired(deadline: std.Io.Clock.Timestamp) bool {
     return !std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io.getIo(), .awake), .lt, deadline);
@@ -216,21 +228,32 @@ fn post(
         detail = try headers.mask(alloc, detail, token);
         return .{ .failed = .{ .kind = client_mod.httpFailureKind(alloc, .fromHttpStatus(response.head.status), detail), .http_status = response.head.status, .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
-    var result = consume(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
+    const sent_secrets = try headers.secrets(alloc, token);
+    defer alloc.free(sent_secrets);
+    var result = consume(alloc, reader, request, watch.progress(), sent_secrets) catch |err| return watch.failure(err);
     if (watch.finish()) |err| {
         result.deinit(alloc);
         return err;
     }
     // A reply that reports its own failure may quote a secret, as an error
-    // body may.
-    if (result == .failed and result.failed.ownership == .owned) {
-        if (result.failed.detail) |detail| {
-            result.failed.detail = null;
-            result.failed.detail = headers.mask(alloc, @constCast(detail), token) catch |err| {
+    // body may, whether it failed to stream or streamed its failure. The
+    // reader already masked the secrets before it cut the text; this also
+    // masks the forms a server may quote them in.
+    switch (result) {
+        .failed => |*failed| if (failed.ownership == .owned) if (failed.detail) |detail| {
+            failed.detail = null;
+            failed.detail = headers.mask(alloc, detail, token) catch |err| {
                 result.deinit(alloc);
                 return err;
             };
-        }
+        },
+        .completed => |*completed| if (completed.ownership == .owned) if (completed.completion.provider_failure_detail) |detail| {
+            completed.completion.provider_failure_detail = null;
+            completed.completion.provider_failure_detail = headers.mask(alloc, @constCast(detail), token) catch |err| {
+                result.deinit(alloc);
+                return err;
+            };
+        },
     }
     return result;
 }
@@ -394,6 +417,82 @@ pub fn parseModelIds(alloc: Allocator, body: []const u8) Allocator.Error!ModelsR
         slot.key_ptr.* = owned;
     }
     return .{ .ids = ids };
+}
+
+test "Headers lists exactly the secrets the request sent, on every allocation failure" {
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            var storage = [_]std.http.Header{
+                .{ .name = "X-Short", .value = "abc" },
+                .{ .name = "X-Long", .value = "abc-def-ghi" },
+                .{ .name = "anthropic-version", .value = "2023-06-01" },
+            };
+            const Case = struct { token: ?[]const u8, owned: usize, expected: []const []const u8 };
+            const cases = [_]Case{
+                .{ .token = "token-1234", .owned = 2, .expected = &.{ "token-1234", "abc", "abc-def-ghi" } },
+                .{ .token = null, .owned = 2, .expected = &.{ "abc", "abc-def-ghi" } },
+                .{ .token = "token-1234", .owned = 0, .expected = &.{"token-1234"} },
+                .{ .token = null, .owned = 0, .expected = &.{} },
+            };
+            for (cases) |case| {
+                const headers = Headers{ .list = storage[0..], .owned = case.owned };
+                const list = try headers.secrets(alloc, case.token);
+                defer alloc.free(list);
+                try std.testing.expectEqual(case.expected.len, list.len);
+                for (case.expected, list) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Check.run, .{});
+}
+
+test "Headers keeps an error body as the server sent it when there is nothing to mask" {
+    const alloc = std.testing.allocator;
+    const headers = Headers{ .list = &.{}, .owned = 0 };
+    for ([_][]const u8{ "{\"error\": broken", "plain refusal", "{\"error\":{\"message\":\"no\"}}" }) |body| {
+        const kept = try headers.mask(alloc, try alloc.dupe(u8, body), null);
+        defer alloc.free(kept);
+        try std.testing.expectEqualStrings(body, kept);
+    }
+}
+
+test "Headers masks a secret a decoded error message quotes in its escaped spelling" {
+    const alloc = std.testing.allocator;
+    var storage = [_]std.http.Header{.{ .name = "X-Key", .value = "tok\"en-value" }};
+    const headers = Headers{ .list = storage[0..], .owned = 1 };
+    const masked = try headers.mask(alloc, try alloc.dupe(u8, "{\"error\":{\"message\":\"key tok\\\\\\\"en-value refused\"}}"), null);
+    defer alloc.free(masked);
+    try std.testing.expectEqualStrings("{\"error\":{\"message\":\"key ************* refused\"}}", masked);
+}
+
+test "Headers masks secrets that overlap at their ends whole, as written and in a JSON body" {
+    const alloc = std.testing.allocator;
+    var storage = [_]std.http.Header{
+        .{ .name = "X-First", .value = "abcdef" },
+        .{ .name = "X-Second", .value = "defghi" },
+    };
+    const headers = Headers{ .list = storage[0..], .owned = 2 };
+    const Case = struct { detail: []const u8, expected: []const u8 };
+    for ([_]Case{
+        .{ .detail = "key abcdefghi refused", .expected = "key ********* refused" },
+        .{ .detail = "{\"error\":{\"message\":\"key abcdefghi refused\"}}", .expected = "{\"error\":{\"message\":\"key ********* refused\"}}" },
+    }) |case| {
+        const masked = try headers.mask(alloc, try alloc.dupe(u8, case.detail), null);
+        defer alloc.free(masked);
+        try std.testing.expectEqualStrings(case.expected, masked);
+    }
+}
+
+test "Headers masks a secret whole when a shorter one is part of it" {
+    const alloc = std.testing.allocator;
+    var storage = [_]std.http.Header{
+        .{ .name = "X-Short", .value = "abc" },
+        .{ .name = "X-Long", .value = "abc-def-ghi" },
+    };
+    const headers = Headers{ .list = storage[0..], .owned = 2 };
+    const masked = try headers.mask(alloc, try alloc.dupe(u8, "key abc-def-ghi and abc"), null);
+    defer alloc.free(masked);
+    try std.testing.expectEqualStrings("key *********** and ***", masked);
 }
 
 test "model list ids keep the server's order, drop repeats, and skip entries with no usable id" {

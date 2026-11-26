@@ -152,7 +152,17 @@ test "an owned error body loses the credential it quotes, and stays bounded" {
 /// Caller owns the bounded diagnostic. Normalize JSON before masking so later
 /// diagnostic decoding cannot restore an escaped credential.
 pub fn redact_error_detail(alloc: Allocator, raw: []const u8, credential: []const u8) Allocator.Error![]u8 {
-    if (raw.len > 64 * 1024 or credential.len > 16 * 1024) return alloc.dupe(u8, "Provider error details exceeded the local limit");
+    return redact_error_detail_secrets(alloc, raw, &.{credential});
+}
+
+/// `redact_error_detail` for every one of `secrets`. Each decoded string is
+/// masked before the JSON is written back, so a message that quotes a secret
+/// in its escaped spelling loses it too. Caller owns the result.
+pub fn redact_error_detail_secrets(alloc: Allocator, raw: []const u8, secrets: []const []const u8) Allocator.Error![]u8 {
+    if (raw.len > 64 * 1024) return alloc.dupe(u8, "Provider error details exceeded the local limit");
+    for (secrets) |value| {
+        if (value.len > 16 * 1024) return alloc.dupe(u8, "Provider error details exceeded the local limit");
+    }
     check_json_depth(raw) catch return alloc.dupe(u8, "Provider error details exceeded the nesting limit");
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     const json_shaped = trimmed.len != 0 and (trimmed[0] == '{' or trimmed[0] == '[' or trimmed[0] == '"');
@@ -161,17 +171,25 @@ pub fn redact_error_detail(alloc: Allocator, raw: []const u8, credential: []cons
         else => if (json_shaped) return alloc.dupe(u8, "Provider error details could not be decoded") else null,
     };
     defer if (parsed) |*value| value.deinit();
+    if (parsed) |*value| try maskDecodedStrings(value.arena.allocator(), &value.value, secrets);
     const detail = if (parsed) |value| try std.json.Stringify.valueAlloc(alloc, value.value, .{}) else try alloc.dupe(u8, raw);
-    if (detail.len > 64 * 1024) {
-        defer alloc.free(detail);
-        return alloc.dupe(u8, "Provider error details exceeded the local limit");
+    defer alloc.free(detail);
+    if (detail.len > 64 * 1024) return alloc.dupe(u8, "Provider error details exceeded the local limit");
+    return text_utils.maskSecretValues(alloc, detail, secrets);
+}
+
+/// Replaces every string in `value` with a copy that has `secrets` masked.
+/// `check_json_depth` bounds how deep this recurses. `arena` owns the copies.
+fn maskDecodedStrings(arena: Allocator, value: *std.json.Value, secrets: []const []const u8) Allocator.Error!void {
+    switch (value.*) {
+        .string => |text| value.* = .{ .string = try text_utils.maskSecretValues(arena, text, secrets) },
+        .array => |*items| for (items.items) |*item| try maskDecodedStrings(arena, item, secrets),
+        .object => |*fields| {
+            var entries = fields.iterator();
+            while (entries.next()) |entry| try maskDecodedStrings(arena, entry.value_ptr, secrets);
+        },
+        else => {},
     }
-    errdefer alloc.free(detail);
-    const encoded = try std.json.Stringify.valueAlloc(alloc, credential, .{});
-    defer alloc.free(encoded);
-    text_utils.maskLiteral(detail, encoded[1 .. encoded.len - 1]);
-    text_utils.maskLiteral(detail, credential);
-    return detail;
 }
 
 test "chat completions error masking survives JSON and recovery decoding" {

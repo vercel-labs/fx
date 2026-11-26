@@ -2367,6 +2367,7 @@ fn streamGatewayCompletionCoreWithOptions(
             request.content_capture_limit,
             active_connected_watch,
             request.conversation,
+            request.api_key orelse "",
         ) catch |err| {
             debug_trace.eventf("gateway", "sse_consume_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
@@ -4356,26 +4357,44 @@ fn deinitGatewayCompletion(alloc: std.mem.Allocator, completion: *types.ModelCom
     completion.* = .{};
 }
 
-fn clippedDupe(alloc: std.mem.Allocator, text: []const u8, max_bytes: usize) ![]u8 {
-    const trimmed = std.mem.trim(u8, text, " \r\n\t");
-    const clipped = trimmed[0..@min(trimmed.len, max_bytes)];
-    return try alloc.dupe(u8, clipped);
-}
+/// A stream's provider error text, which it owns. Each text it keeps has the
+/// request's credential masked before it is cut short, so a cut never leaves
+/// the start of a key behind.
+const FailureDetail = struct {
+    text: ?[]u8 = null,
+    /// The credential the request sent, borrowed for the stream's life.
+    credential: []const u8 = "",
 
-fn replaceProviderFailureDetail(alloc: std.mem.Allocator, current: *?[]u8, text: []const u8) !void {
-    if (text.len == 0) return;
-    const owned = try clippedDupe(alloc, text, provider_failure_detail_max_bytes);
-    if (owned.len == 0) {
-        alloc.free(owned);
-        return;
+    fn deinit(self: *FailureDetail, alloc: std.mem.Allocator) void {
+        if (self.text) |text| alloc.free(text);
+        self.text = null;
     }
-    if (current.*) |old| alloc.free(old);
-    current.* = owned;
+
+    /// The kept text, which the caller then owns.
+    fn take(self: *FailureDetail) ?[]u8 {
+        const text = self.text;
+        self.text = null;
+        return text;
+    }
+
+    fn replace(self: *FailureDetail, alloc: std.mem.Allocator, text: []const u8) !void {
+        const masked = try text_utils.maskSecretValues(alloc, std.mem.trim(u8, text, " \r\n\t"), &.{self.credential});
+        defer alloc.free(masked);
+        const kept = text_utils.utf8PrefixByBytes(masked, provider_failure_detail_max_bytes);
+        if (kept.len == 0) return;
+        const owned = try alloc.dupe(u8, kept);
+        self.deinit(alloc);
+        self.text = owned;
+    }
+};
+
+fn replaceProviderFailureDetail(alloc: std.mem.Allocator, current: *FailureDetail, text: []const u8) !void {
+    try current.replace(alloc, text);
 }
 
 fn replaceProviderFailureMessage(
     alloc: std.mem.Allocator,
-    current: *?[]u8,
+    current: *FailureDetail,
     text: []const u8,
 ) !void {
     const combined = try alloc.print("provider_error: {s}", .{text});
@@ -4792,7 +4811,7 @@ fn nestedErrorObject(object: std.json.ObjectMap) ?std.json.ObjectMap {
 
 fn captureProviderFailureObject(
     alloc: std.mem.Allocator,
-    current: *?[]u8,
+    current: *FailureDetail,
     object: std.json.ObjectMap,
     include_type: bool,
 ) !bool {
@@ -4814,7 +4833,7 @@ fn captureProviderFailureObject(
 /// whichever it has.
 fn captureErrorObjectFields(
     alloc: std.mem.Allocator,
-    current: *?[]u8,
+    current: *FailureDetail,
     object: std.json.ObjectMap,
     include_type: bool,
 ) !bool {
@@ -4858,8 +4877,8 @@ fn detailCode(object: std.json.ObjectMap, include_type: bool) ?[]const u8 {
     return if (std.mem.eql(u8, kind, "error")) null else kind;
 }
 
-fn captureProviderFailureDetail(alloc: std.mem.Allocator, current: *?[]u8, root: std.json.Value) !void {
-    if (root != .object or current.* != null) return;
+fn captureProviderFailureDetail(alloc: std.mem.Allocator, current: *FailureDetail, root: std.json.Value) !void {
+    if (root != .object or current.text != null) return;
     if (try captureProviderFailureObject(alloc, current, root.object, false)) return;
     if (root.object.get("error")) |value| {
         if (jsonValueString(value)) |text| {
@@ -4891,7 +4910,7 @@ const max_rendered_detail_depth = 32;
 
 /// Renders a provider error value in which nothing named the failure, or the
 /// fixed `provider_error` label when it nests past `max_rendered_detail_depth`.
-fn replaceProviderFailureRendered(alloc: std.mem.Allocator, current: *?[]u8, value: std.json.Value) !void {
+fn replaceProviderFailureRendered(alloc: std.mem.Allocator, current: *FailureDetail, value: std.json.Value) !void {
     if (jsonNestsDeeperThan(value, max_rendered_detail_depth)) {
         debug_trace.logf("stream", "provider failure detail nests past {d} levels; using the provider_error label", .{max_rendered_detail_depth});
         try replaceProviderFailureDetail(alloc, current, "provider_error");
@@ -5040,7 +5059,7 @@ const SseFinishParseError = error{
 fn parseSseFinishEvent(
     alloc: std.mem.Allocator,
     root: std.json.Value,
-    provider_failure_detail: *?[]u8,
+    provider_failure_detail: *FailureDetail,
 ) !SseFinishEvent {
     const finish_reason = try parseSseFinishReason(root);
     if (finish_reason == .provider_error) {
@@ -5179,7 +5198,7 @@ fn consumeSseStream(
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
 ) !types.ModelCompletion {
-    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, null, cancel_flag, null, null, null, null, .{});
+    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, null, cancel_flag, null, null, null, null, .{}, "");
 }
 
 /// Decodes an AI Gateway SSE response from a transport-owned reader.
@@ -5197,6 +5216,8 @@ pub fn consumeGatewaySseStream(
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
     conversation: tool_call_ids.Conversation,
+    /// The credential the request sent, masked out of the error text it keeps.
+    credential: []const u8,
 ) !types.ModelCompletion {
     return consumeSseStreamTraced(
         alloc,
@@ -5213,6 +5234,7 @@ pub fn consumeGatewaySseStream(
         content_capture_limit,
         null,
         conversation,
+        credential,
     );
 }
 
@@ -5231,6 +5253,8 @@ fn consumeSseStreamTraced(
     content_capture_limit: ?usize,
     progress_watch: ?*ConnectedRequestWatch,
     conversation: tool_call_ids.Conversation,
+    /// The credential the request sent, masked out of the error text it keeps.
+    credential: []const u8,
 ) !types.ModelCompletion {
     var content_buf: std.ArrayList(u8) = .empty;
     defer content_buf.deinit(alloc);
@@ -5270,8 +5294,8 @@ fn consumeSseStreamTraced(
     // The finish named a gateway stream timeout.
     var finish_timeout = false;
     var error_event_class: ?ErrorEventClass = null;
-    var provider_failure_detail: ?[]u8 = null;
-    defer if (provider_failure_detail) |detail| alloc.free(detail);
+    var provider_failure_detail: FailureDetail = .{ .credential = credential };
+    defer provider_failure_detail.deinit(alloc);
     var data_event_count: usize = 0;
 
     var event_reader = sse.Reader{ .max_event_bytes = max_sse_event_line_bytes };
@@ -5376,8 +5400,7 @@ fn consumeSseStreamTraced(
             if (ErrorEventClass.decides(error_event_class, event_class)) {
                 error_event_class = event_class;
                 // The notice names the event that decided the class.
-                if (provider_failure_detail) |earlier| alloc.free(earlier);
-                provider_failure_detail = null;
+                provider_failure_detail.deinit(alloc);
             }
             try captureProviderFailureDetail(alloc, &provider_failure_detail, root);
         } else if (std.mem.eql(u8, event_type, "text-delta")) {
@@ -5732,8 +5755,7 @@ fn consumeSseStreamTraced(
     }
     completion.provider_result_identity_failure = provider_result_identity_failure;
     completion.provider_failure_cause = streamFailureCause(error_event_class, finish_reason_holder, finish_timeout);
-    completion.provider_failure_detail = provider_failure_detail;
-    provider_failure_detail = null;
+    completion.provider_failure_detail = provider_failure_detail.take();
     completion.generation_id = generation_id;
     generation_id = null;
     completion.resolved_provider = finish_resolved_provider;
@@ -5981,7 +6003,7 @@ fn fuzzGatewayChunkedStream(_: void, smith: *std.testing.Smith) !void {
     var source = fixed.limited(.unlimited, read_buffer);
     var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
     var cancelled = std.atomic.Value(bool).init(false);
-    var completion = try consumeSseStreamTraced(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, null, &cancelled, null, null, null, null, .{});
+    var completion = try consumeSseStreamTraced(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, null, &cancelled, null, null, null, null, .{}, "");
     defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
@@ -6568,6 +6590,98 @@ test "consumeSseStream takes the cause and detail from the event that decided" {
     }
 }
 
+fn testStreamOutcomeWithCredential(alloc: std.mem.Allocator, payload: []const u8, credential: []const u8) !types.ModelCompletion {
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    return consumeSseStreamTraced(alloc, &reader, undefined, Noop.chunk, null, null, null, null, &cancel_flag, null, null, null, null, .{}, credential);
+}
+
+test "consumeSseStream masks the request's credential in a streamed error before it cuts the text" {
+    const alloc = std.testing.allocator;
+    const key = "test-credential-0123456789";
+    const max = provider_failure_detail_max_bytes;
+    const Case = struct { payload: []const u8, credential: []const u8, forbidden: []const u8, masked: []const u8 };
+    const cases = [_]Case{
+        // Echoed whole.
+        .{
+            .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"key " ++ key ++ " refused\"}}\n\n",
+            .credential = key,
+            .forbidden = key[0..8],
+            .masked = "key " ++ text_utils.repeat("*", key.len) ++ " refused",
+        },
+        // Starting 10 bytes before the cut, after "invalid_request_error: ".
+        .{
+            .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"" ++ text_utils.repeat("x", (max - 10 - "invalid_request_error: ".len)) ++ key ++ " tail\"}}\n\n",
+            .credential = key,
+            .forbidden = key[0..8],
+            .masked = "x" ++ text_utils.repeat("*", 10),
+        },
+        // In the JSON-escaped form of a value fx renders because nothing in
+        // it names the failure.
+        .{
+            .payload = "data: {\"type\":\"error\",\"error\":{\"detail\":{\"key\":\"test\\\"credential\"}}}\n\n",
+            .credential = "test\"credential",
+            .forbidden = "credential",
+            .masked = "****************",
+        },
+    };
+    for (cases) |case| {
+        var completion = try testStreamOutcomeWithCredential(alloc, case.payload, case.credential);
+        defer deinitGatewayCompletion(alloc, &completion);
+        errdefer std.debug.print("payload: {s}\ndetail: {s}\n", .{ case.payload, completion.provider_failure_detail orelse "" });
+        const detail = completion.provider_failure_detail.?;
+        try std.testing.expect(detail.len <= max);
+        try std.testing.expect(std.mem.find(u8, detail, case.forbidden) == null);
+        try std.testing.expect(std.mem.find(u8, detail, case.masked) != null);
+    }
+}
+
+test "consumeSseStream masks a long escaped credential whole, wherever the text is cut" {
+    const alloc = std.testing.allocator;
+    // Each quote doubles in JSON, so the escaped form is 96 KiB.
+    const credential = try alloc.alloc(u8, 64 * 1024);
+    defer alloc.free(credential);
+    for (credential, 0..) |*byte, index| byte.* = if (index % 2 == 0) 'k' else '"';
+    const escaped = try std.json.Stringify.valueAlloc(alloc, credential, .{});
+    defer alloc.free(escaped);
+    const payload = try std.mem.concat(alloc, u8, &.{ "data: {\"type\":\"error\",\"error\":{\"detail\":{\"key\":", escaped, "}}}\n\n" });
+    defer alloc.free(payload);
+    var completion = try testStreamOutcomeWithCredential(alloc, payload, credential);
+    defer deinitGatewayCompletion(alloc, &completion);
+    const detail = completion.provider_failure_detail.?;
+    try std.testing.expect(std.mem.find(u8, detail, "k\\\"") == null);
+    try std.testing.expect(std.mem.find(u8, detail, "k\"") == null);
+}
+
+test "consumeSseStream keeps the error text whole on a character boundary" {
+    const alloc = std.testing.allocator;
+    const prefix = "invalid_request_error: ";
+    const payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"" ++
+        text_utils.repeat("x", (provider_failure_detail_max_bytes - 1 - prefix.len)) ++ "\xc3\xa9 tail\"}}\n\n";
+    var completion = try testStreamOutcomeWithCredential(alloc, payload, "");
+    defer deinitGatewayCompletion(alloc, &completion);
+    const detail = completion.provider_failure_detail.?;
+    try std.testing.expectEqual(provider_failure_detail_max_bytes - 1, detail.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(detail));
+}
+
+test "consumeSseStream frees a masked error text once on every allocation failure" {
+    const Check = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const key = "test-credential-0123456789";
+            const payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"first " ++ key ++ "\"}}\n\n" ++
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"second " ++ key ++ "\"}}\n\n";
+            var completion = try testStreamOutcomeWithCredential(alloc, payload, key);
+            defer deinitGatewayCompletion(alloc, &completion);
+            try std.testing.expect(std.mem.find(u8, completion.provider_failure_detail.?, key) == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Check.run, .{});
+}
+
 fn testStreamOutcome(payload: []const u8) !types.ModelCompletion {
     var reader = std.Io.Reader.fixed(payload);
     var cancel_flag = std.atomic.Value(bool).init(false);
@@ -6852,12 +6966,12 @@ test "captureProviderFailureDetail preserves top-level provider code and message
         .{},
     );
     defer parsed.deinit();
-    var detail: ?[]u8 = null;
-    defer if (detail) |owned| alloc.free(owned);
+    var detail: FailureDetail = .{};
+    defer detail.deinit(alloc);
 
     try captureProviderFailureDetail(alloc, &detail, parsed.value);
 
-    try std.testing.expectEqualStrings("provider_down: wafer route unavailable", detail.?);
+    try std.testing.expectEqualStrings("provider_down: wafer route unavailable", detail.text.?);
 }
 
 test "captureProviderFailureDetail preserves nested provider type and message" {
@@ -6869,14 +6983,14 @@ test "captureProviderFailureDetail preserves nested provider type and message" {
         .{},
     );
     defer parsed.deinit();
-    var detail: ?[]u8 = null;
-    defer if (detail) |owned| alloc.free(owned);
+    var detail: FailureDetail = .{};
+    defer detail.deinit(alloc);
 
     try captureProviderFailureDetail(alloc, &detail, parsed.value);
 
     try std.testing.expectEqualStrings(
         "no_available_providers: No providers are currently available",
-        detail.?,
+        detail.text.?,
     );
 }
 
@@ -7371,7 +7485,7 @@ test "Gateway separates provider message items in assistant text" {
         var reader = std.Io.Reader.fixed(payload.written());
         var cancelled = std.atomic.Value(bool).init(false);
         const first_len = "Hi! What would you like help with?".len;
-        var completion = try consumeGatewaySseStream(alloc, &reader, &chunks, Chunks.record, null, null, &cancelled, first_len + 1, .{});
+        var completion = try consumeGatewaySseStream(alloc, &reader, &chunks, Chunks.record, null, null, &cancelled, first_len + 1, .{}, "");
         defer deinitGatewayCompletion(alloc, &completion);
         try std.testing.expectEqualStrings("Hi! What would you like help with?\n", completion.content.?);
         try std.testing.expectEqualStrings(cases[0].expected, chunks.text.items);
@@ -8618,7 +8732,7 @@ fn consumeTestReply(alloc: std.mem.Allocator, payload: []const u8, conversation:
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
-    return consumeSseStreamTraced(alloc, &reader, undefined, Noop.chunk, null, null, null, null, &cancel_flag, null, null, null, null, conversation);
+    return consumeSseStreamTraced(alloc, &reader, undefined, Noop.chunk, null, null, null, null, &cancel_flag, null, null, null, null, conversation, "");
 }
 
 fn testCallIds(alloc: std.mem.Allocator, completion: types.ModelCompletion) ![]u8 {

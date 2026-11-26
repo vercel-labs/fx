@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import { completion, neverAnswers, stallsAfterFirstChunk, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
@@ -1371,6 +1371,52 @@ describe("custom connection on openai-responses: encrypted reasoning", () => {
       const sent = f.requests.filter(request => request.path === responsesFake.path);
       expect(sent.length).toBe(1);
       expect(sent[0].body.include).toEqual(include ? ["reasoning.encrypted_content"] : undefined);
+    } finally { f.close(); }
+  }, 25000);
+});
+
+// A Responses reply that fails while it streams can quote the connection's
+// token or a header's secret, as an error body can; fx masks each whole before
+// it shows, traces, or saves the failure, even where it cuts the text short.
+describe("custom connection on openai-responses: a streamed failure that echoes a secret", () => {
+  const org = "org-fixture-secret-123";
+  // The detail keeps 253 bytes and "...", so 13 bytes of the secret would show.
+  const cutPad = 253 - 13 - "invalid_prompt: Key ".length;
+  test.each([
+    { name: "the token, whole", pad: 0, secret: "token" },
+    { name: "the token, across the cut", pad: cutPad, secret: "token" },
+    { name: "a header's secret, across the cut", pad: cutPad, secret: "header" },
+  ])("$name", async ({ pad, secret }) => {
+    const f = fixture(undefined, {
+      [responsesFake.path]: body => responsesFake.failedStream(
+        body.model,
+        "invalid_prompt",
+        `${"x".repeat(pad)}Key ${secret === "token" ? f.env.FX_TEST_PROVIDER_TOKEN : org} was refused.`,
+      ),
+    });
+    try {
+      connection(f, "remote").protocol = "openai-responses";
+      connection(f, "remote").headers = { "X-Org": { env: "FX_TEST_PROVIDER_ORG" } };
+      f.save();
+      const tracePath = join(f.home, "trace.log");
+      const value = secret === "token" ? f.env.FX_TEST_PROVIDER_TOKEN : org;
+      const result = await runFx(["ask", "--json", "say hello"], {
+        cwd: f.workspace,
+        env: { ...f.env, FX_PROVIDER: "remote", FX_TEST_PROVIDER_ORG: org, FX_TRACE_LOG: tracePath },
+        timeoutMs: 20000,
+      });
+      const valueStart = value.slice(0, 8);
+
+      expect(result.code).toBe(1);
+      expect(f.requests.filter(request => request.path === responsesFake.path)).toHaveLength(1);
+      expect(result.stdout).not.toContain(valueStart);
+      expect(result.stderr).not.toContain(valueStart);
+      expect(readFileSync(tracePath, "utf8")).not.toContain(valueStart);
+      const saved = readdirSync(join(f.home, ".fx"), { recursive: true, withFileTypes: true })
+        .filter(entry => entry.isFile())
+        .map(entry => join(entry.parentPath, entry.name));
+      expect(saved.some(file => file.includes("sessions"))).toBe(true);
+      for (const file of saved) expect(readFileSync(file).toString("latin1")).not.toContain(valueStart);
     } finally { f.close(); }
   }, 25000);
 });

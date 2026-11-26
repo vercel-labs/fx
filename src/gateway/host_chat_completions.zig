@@ -104,7 +104,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
 
     var reader: host_stream.HostStreamReader = undefined;
     reader.init(transport, opened.handle, request.cancel_flag, request.deadline, request.cooperative_pulse);
-    const result = chat_completions.consume(alloc, &reader.interface, request, null) catch |err| switch (err) {
+    const result = chat_completions.consume(alloc, &reader.interface, request, null, &.{}) catch |err| switch (err) {
         error.ReadFailed => return host_stream.readFailure(&reader, request.cancel_flag),
         else => return err,
     };
