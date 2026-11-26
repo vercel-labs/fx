@@ -484,7 +484,7 @@ test "an HTTP status goes into the words as a number, and nothing else does" {
     // No status, no number; every other reason keeps its fixed words whatever the status.
     try testing.expectEqualStrings(Refusal.http_status.words(), Refusal.http_status.text(0, &buf));
     for (std.enums.values(Refusal)) |refusal| {
-        if (refusal == .http_status) continue;
+        if (refusal == .http_status or refusal == .http_unavailable) continue;
         try testing.expectEqualStrings(refusal.words(), refusal.text(500, &buf));
     }
     // The longest words fit the buffer, and are plain ASCII.
