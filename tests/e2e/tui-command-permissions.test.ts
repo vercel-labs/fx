@@ -2640,7 +2640,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Trigger the gateway schema diagnostic.");
-      await activeSession.waitForText("HTTP 400", TIMEOUT);
+      await activeSession.waitForText("The provider rejected this request", TIMEOUT);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2734,7 +2734,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(failPrompt);
-      await activeSession.waitForText("HTTP 400", TIMEOUT);
+      await activeSession.waitForText("The provider rejected this request", TIMEOUT);
       await activeSession.sendText(fillPrompt);
       await activeSession.waitForPane((pane) => pane.includes("network window filled") && turnSettled(pane), 120_000);
 
