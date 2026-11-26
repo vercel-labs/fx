@@ -2629,9 +2629,10 @@ fn shellParseRetryGuidance(output: []const u8, whole_output: bool) ?[]const u8 {
 // of the token before the first colon rather than a raw line prefix.
 // Snapshot and terminal runs pass the command to `eval`, so zsh names the
 // source `(eval)`, as it does for an `eval` inside the command. Under the
-// snapshot, bash names the script it sources from `/dev/fd/0`
-// (`snapshotScript` in shell_resolver.zig), followed by `eval:`. Anchoring
-// bash to that path keeps the `eval` errors of a script the command runs out.
+// snapshot, bash names the script it sources from `/dev/fd/0`, or from
+// `/proc/self/fd/0` where /dev/fd is missing (`snapshotInvocation` in
+// shell_resolver.zig), followed by `eval:`. Anchoring bash to those paths keeps
+// the `eval` errors of a script the command runs out.
 // bash 3.2 evaluates the snapshot script instead of sourcing it
 // (`snapshotInvocation`), so it names the shell, which the basename match
 // covers.
@@ -2640,7 +2641,8 @@ fn shellErrorFamily(line: []const u8) ?ShellFamily {
     const token = line[0..colon];
     if (token.len == 0 or std.mem.findScalar(u8, token, ' ') != null) return null;
     if (std.mem.eql(u8, token, "(eval)")) return .zsh;
-    if (std.mem.eql(u8, token, "/dev/fd/0") and std.mem.startsWith(u8, line[colon + 1 ..], " eval:")) return .line_by_line;
+    const snapshot_source = std.mem.eql(u8, token, "/dev/fd/0") or std.mem.eql(u8, token, "/proc/self/fd/0");
+    if (snapshot_source and std.mem.startsWith(u8, line[colon + 1 ..], " eval:")) return .line_by_line;
     const base = if (std.mem.findLast(u8, token, "/")) |slash| token[slash + 1 ..] else token;
     if (std.mem.eql(u8, base, "zsh")) return .zsh;
     const line_shells = [_][]const u8{ "bash", "sh", "dash" };
@@ -3984,6 +3986,13 @@ test "failure guidance detectors match only their signatures" {
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "", true));
     // A usage-looking line deep in output is not an argument rejection banner.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "line one\nline two\nline three\nline four\nusage: not a banner\n", true));
+}
+
+test "bash parse error from a replay sourced through /proc/self/fd gets line-by-line guidance" {
+    try std.testing.expectEqual(
+        line_shell_parse_retry_guidance,
+        failureRetryGuidance(2, "/proc/self/fd/0: eval: line 1: unexpected EOF while looking for matching `''\n", true),
+    );
 }
 
 test "shell snapshot keeps bounded head tail and control metadata" {
