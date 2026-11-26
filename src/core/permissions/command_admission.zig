@@ -94,7 +94,7 @@ pub const ToolExecutionAuthority = union(enum) {
     vision_paths: VisionPathExecutionAuthority,
 };
 
-pub const HumanApprovalKind = enum {
+const HumanApprovalKind = enum {
     none,
     once,
     always,

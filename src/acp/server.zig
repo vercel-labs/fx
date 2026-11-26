@@ -298,10 +298,11 @@ pub const ActiveSessionState = struct {
     staging_needed: StagedTotals = .{},
 
     pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
-        for (self.session_grants) |grant| {
-            if (permissions.grantAppliesInShellEpoch(grant, shell_epoch) and
-                std.mem.eql(u8, grant.tool_name, tool_name) and
-                std.mem.eql(u8, grant.target_path, target_path)) return;
+        for (self.session_grants) |*grant| {
+            if (!std.mem.eql(u8, grant.tool_name, tool_name) or
+                !std.mem.eql(u8, grant.target_path, target_path)) continue;
+            if (!permissions.grantAppliesInShellEpoch(grant.*, shell_epoch)) grant.shell_epoch = shell_epoch;
+            return;
         }
 
         const name_copy = try alloc.dupe(u8, tool_name);
@@ -5482,6 +5483,19 @@ test "a non-bash approval made again after a shell refresh is retained once" {
     try active.retainGrant(alloc, "edit", "/tmp/workspace/a.zig", 1);
 
     try std.testing.expectEqual(@as(usize, 1), active.session_grants.len);
+}
+
+test "a bash approval made again after a shell refresh keeps one row at the new epoch" {
+    const alloc = std.testing.allocator;
+    var active: ActiveSessionState = undefined;
+    active.session_grants = &.{};
+    defer types.freePermissionGrantSlice(alloc, active.session_grants);
+
+    try active.retainGrant(alloc, "bash", "git status", 0);
+    try active.retainGrant(alloc, "bash", "git status", 1);
+
+    try std.testing.expectEqual(@as(usize, 1), active.session_grants.len);
+    try std.testing.expectEqual(@as(u64, 1), active.session_grants[0].shell_epoch);
 }
 
 test "eb03: ACP steering records input_accepted unless session journal declares inputs_durable" {

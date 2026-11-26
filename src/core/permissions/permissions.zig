@@ -122,8 +122,9 @@ pub fn clearAllowedTools(alloc: std.mem.Allocator, grants: *std.ArrayList(types.
     grants.clearRetainingCapacity();
 }
 
-/// Records an approval made under `shell_epoch`, unless the list already holds
-/// it. A bash approval is held only in the epoch it was made in.
+/// Records an approval made under `shell_epoch`. A row for the same tool and
+/// pattern is not added twice: a bash row made in an older epoch takes the
+/// current one, since a bash approval is held only in the epoch it was made in.
 pub fn allowToolForSession(
     alloc: std.mem.Allocator,
     grants: *std.ArrayList(types.PermissionGrant),
@@ -131,10 +132,11 @@ pub fn allowToolForSession(
     pattern: []const u8,
     shell_epoch: u64,
 ) !void {
-    for (grants.items) |entry| {
-        if (std.mem.eql(u8, entry.tool_name, permission_name) and
-            std.mem.eql(u8, entry.target_path, pattern) and
-            grantAppliesInShellEpoch(entry, shell_epoch)) return;
+    for (grants.items) |*entry| {
+        if (!std.mem.eql(u8, entry.tool_name, permission_name) or
+            !std.mem.eql(u8, entry.target_path, pattern)) continue;
+        if (!grantAppliesInShellEpoch(entry.*, shell_epoch)) entry.shell_epoch = shell_epoch;
+        return;
     }
     try appendOwnedGrant(alloc, grants, permission_name, pattern, shell_epoch);
 }
@@ -3663,4 +3665,19 @@ test "a non-bash approval made again after a shell refresh adds no second row" {
 
     try std.testing.expectEqual(@as(usize, 1), grants.items.len);
     try std.testing.expect(sessionGrantAllowed(grants.items, "edit_file", "/tmp/workspace/a.zig"));
+}
+
+test "a bash approval made again after a shell refresh replaces the stale row's epoch" {
+    const alloc = std.testing.allocator;
+    var grants: std.ArrayList(types.PermissionGrant) = .empty;
+    defer {
+        clearAllowedTools(alloc, &grants);
+        grants.deinit(alloc);
+    }
+
+    try allowToolForSession(alloc, &grants, "bash", "git status", 0);
+    try allowToolForSession(alloc, &grants, "bash", "git status", 1);
+
+    try std.testing.expectEqual(@as(usize, 1), grants.items.len);
+    try std.testing.expectEqual(@as(u64, 1), grants.items[0].shell_epoch);
 }
