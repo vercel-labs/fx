@@ -27,6 +27,8 @@ pub const Fault = struct {
     next_write: ?WritePlan = null,
     /// One-shot: the next sync fails, so durability is unknown.
     fail_next_sync: bool = false,
+    /// One-shot: the next read fails, so the reader gets `fail_error`.
+    fail_next_read: bool = false,
     /// What a planned write failure or a failed sync reports: `Io` unless
     /// a test names an OS cause (D29).
     fail_error: storage.Error = error.Io,
@@ -177,6 +179,11 @@ pub const Fault = struct {
     pub fn takeSyncFailure(f: *Fault) bool {
         defer f.fail_next_sync = false;
         return f.fail_next_sync;
+    }
+
+    pub fn takeReadFailure(f: *Fault) bool {
+        defer f.fail_next_read = false;
+        return f.fail_next_read;
     }
 
     /// Before the first write to an inode, everything already in it is

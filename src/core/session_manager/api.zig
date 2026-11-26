@@ -1242,6 +1242,66 @@ const api_tests = struct {
         try testing.expectEqual(@as(usize, 0), f.recorder.count(.leader_record_not_written));
     }
 
+    var lock_hook_calls: usize = 0;
+    var lock_hook_len: usize = 0;
+
+    fn countLockWon(io_unused: std.Io, old_line: []const u8) void {
+        _ = io_unused;
+        lock_hook_calls += 1;
+        lock_hook_len = old_line.len;
+    }
+
+    test "a lock line of 1025 bytes reaches the lock hook one byte past the limit, so the takeover refuses it" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        const line = try gpa.alloc(u8, api.max_lock_line_bytes + 1);
+        defer gpa.free(line);
+        @memset(line, ' ');
+        @memcpy(line[0..dead_holder_record.len], dead_holder_record);
+        try writeLock(m, id, line);
+
+        lock_hook_calls = 0;
+        lock_hook_len = 0;
+        m.setLockWon(countLockWon);
+        const resumed = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .ask });
+        resumed.release();
+        try testing.expectEqual(@as(usize, 1), lock_hook_calls);
+        try testing.expectEqual(api.max_lock_line_bytes + 1, lock_hook_len);
+    }
+
+    test "a lock the next holder cannot read is traced as leader_lock_not_read, and the lock hook is not called" {
+        if (!storage.hooks) return error.SkipZigTest;
+        var fault: storage.Fault = .init(gpa, io, 1);
+        defer fault.deinit();
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        m.setFault(&fault);
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        try writeLock(m, id, dead_holder_record);
+        lock_hook_calls = 0;
+        m.setLockWon(countLockWon);
+        fault.fail_next_read = true;
+        const resumed = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .ask });
+        resumed.release();
+        try testing.expectEqual(@as(usize, 1), f.recorder.count(.leader_lock_not_read));
+        try testing.expectEqual(@as(usize, 0), lock_hook_calls);
+    }
+
     test "a second manager with another leader record cannot open a led session, and the first record stays" {
         var f: Fixture = undefined;
         try f.init();
