@@ -7708,6 +7708,47 @@ test "MCP dynamic tool executes after its schema was advertised" {
 
     try expectToolOutput(rt.context(), "mcp_fs_read", "{}", "mcp ok");
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
+
+    // A name the request did not advertise is refused and reaches no server.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const refused = try executeToolCall(rt.context(), arena_state.allocator(), .{
+        .id = "other",
+        .name = "mcp_other",
+        .arguments_json = "{}",
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, refused.status);
+    try expectContains(refused.model_output, "is not one of the tools in this request");
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
+}
+
+test "an MCP call that finishes after a cancel is not a cancelled command" {
+    const CancelDuringCall = struct {
+        fn call(raw: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, _: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
+            const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+            flag.store(true, .seq_cst);
+            return .{ .model_output = try arena.dupe(u8, "mcp ok") };
+        }
+    };
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const advertised = [_][]const u8{"mcp_fs_read"};
+    var rt = TestRuntime{
+        .mcp_ctx = @ptrCast(&cancel_flag),
+        .mcp_has_tool = McpFixture.hasTrue,
+        .mcp_call_tool = CancelDuringCall.call,
+        .advertised_dynamic_tool_names = &advertised,
+        .cancel_flag = &cancel_flag,
+    };
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const result = try executeToolCall(rt.context(), arena_state.allocator(), .{
+        .id = "dynamic",
+        .name = "mcp_fs_read",
+        .arguments_json = "{}",
+    });
+    try std.testing.expectEqualStrings("mcp ok", result.model_output);
+    try std.testing.expectEqual(false, result.cancelled);
 }
 
 test "MCP execution binds the last live action generation before transport" {

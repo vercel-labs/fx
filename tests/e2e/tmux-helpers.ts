@@ -87,6 +87,11 @@ export function terminalFixtureShell(): string {
   throw new Error("terminal fixtures require Bash or zsh");
 }
 
+/// The tmux option that starts a server with no config file, so a developer's
+/// tmux.conf cannot change a test's server. It acts only when the call starts
+/// the server: a server that already runs keeps the config it loaded.
+export const TMUX_NO_CONFIG = ["-f", "/dev/null"] as const;
+
 const TMUX_RAW_PASTE_FLAGS = (() => {
   try {
     const version = execFileSync("tmux", ["-V"], { encoding: "utf8" })
@@ -103,6 +108,48 @@ const TMUX_RAW_PASTE_FLAGS = (() => {
 
 export function tmuxRawPasteFlags(): readonly string[] {
   return TMUX_RAW_PASTE_FLAGS;
+}
+
+/// Whether tmux's error says that the server it was asked about does not run:
+/// its socket refuses the connection or is not there. A test's server exits
+/// once its last session ends.
+export function tmuxReportsServerGone(stderr: string): boolean {
+  return /^no server running on |^error connecting to .* \((?:No such file or directory|Connection refused)\)$/m.test(stderr);
+}
+
+const PANE_STATUS_FORMAT = "#{pane_id}:#{pane_dead}:#{pane_dead_status}";
+
+/// What tmux answered for `PANE_STATUS_FORMAT`, or the error it printed.
+export type PaneStatusReply = { output: string } | { error: string };
+
+/// Whether the pane at `target` is dead, and its command's exit status when
+/// known, from tmux's `reply`. A pane whose session or whole server is gone
+/// is dead, with `recordedStatus()`, the status the observer wrote. Any other
+/// tmux error throws: it says nothing about the pane, so it must not read as
+/// an exit.
+export function paneStatusFromTmux(
+  target: string,
+  reply: PaneStatusReply,
+  recordedStatus: () => number | null,
+): { dead: boolean; status: number | null } {
+  if ("error" in reply) {
+    if (!tmuxReportsServerGone(reply.error)) throw new Error(`tmux could not report pane ${target}: ${reply.error}`);
+    return { dead: true, status: recordedStatus() };
+  }
+  const [paneId, dead, status] = reply.output.trim().split(":");
+  // display-message exits 0 for a target it cannot find, with no pane_id.
+  if (!paneId) return { dead: true, status: recordedStatus() };
+  const parsed = status && status.length > 0 ? parseInt(status, 10) : null;
+  const parsedStatus = parsed !== null &&
+      Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= 255
+    ? parsed
+    : null;
+  return {
+    dead: dead === "1",
+    status: dead === "1" && parsedStatus === null
+      ? recordedStatus()
+      : parsedStatus,
+  };
 }
 
 export function paneExitMatches(
@@ -851,7 +898,7 @@ export class TmuxSession {
     const tmuxCommand = gatedLaunch
       ? `tmux wait-for ${shellQuote(startGate)} && exec ${observedCmd}`
       : observedCmd;
-    const tmuxPrefix = resolvedSocketName ? ["-L", resolvedSocketName] : [];
+    const tmuxPrefix = [...(resolvedSocketName ? ["-L", resolvedSocketName] : []), ...TMUX_NO_CONFIG];
     const setupSessionName = `${name}-setup`;
     const killSetupSession = () => {
       try {
@@ -1376,26 +1423,21 @@ export class TmuxSession {
   }
 
   paneStatus(): { dead: boolean; status: number | null } {
+    const target = `${this.name}:0.0`;
+    let reply: PaneStatusReply;
     try {
-      const raw = execSync(
-        `${this.tmuxCommand()} display-message -t ${this.name}:0.0 -p "#{pane_dead}:#{pane_dead_status}"`,
-        { stdio: "pipe", encoding: "utf-8" },
-      ).trim();
-      const [dead, status] = raw.split(":");
-      const parsed = status && status.length > 0 ? parseInt(status, 10) : null;
-      const parsedStatus = parsed !== null &&
-          Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= 255
-        ? parsed
-        : null;
-      return {
-        dead: dead === "1",
-        status: dead === "1" && parsedStatus === null
-          ? this.recordedExitStatus()
-          : parsedStatus,
+      reply = {
+        output: execFileSync(
+          "tmux",
+          this.tmuxArgs(["display-message", "-t", target, "-p", PANE_STATUS_FORMAT]),
+          { stdio: "pipe", encoding: "utf-8" },
+        ),
       };
-    } catch {
-      return { dead: true, status: this.recordedExitStatus() };
+    } catch (err) {
+      const stderr = String((err as { stderr?: unknown }).stderr ?? "").trim();
+      reply = { error: stderr || String(err) };
     }
+    return paneStatusFromTmux(target, reply, () => this.recordedExitStatus());
   }
 
   /// The pane's `remain-on-exit-format`, the text tmux expands into its
