@@ -94,7 +94,7 @@ CI's `TLA+ subagent and session-write models` job runs the design configs of `su
 
 ## Shell quiet notice model in CI
 
-CI's `TLA+ shell quiet notice model` job runs the design configs of `managed_execution/check.sh` (`quiet-wait` and `quiet-wait-deep`), `bun tests/tla/drivers/managed_execution/walk.ts`, and `bun tests/tla/drivers/managed_execution/binary.ts` against the built fx. It runs on `main` and on pull requests that change the quiet-wait code, its model, its drivers, or the files the drivers load. The planted bugs, `--self-check` mutants, and `drivers/managed_execution/stress.ts` run only by hand.
+CI's `TLA+ shell quiet notice model` job runs the design configs of `managed_execution/check.sh` (`quiet-wait` and `quiet-wait-deep`), `bun tests/tla/drivers/managed_execution/walk.ts` on `quiet_notice.zig` through `lab.zig`, and `bun tests/tla/drivers/managed_execution/binary.ts` against the built fx. It runs on `main` and on pull requests that change the quiet-wait code, its model, its drivers, or the files the drivers load. The planted bugs, `--self-check` mutants, and `drivers/managed_execution/stress.ts` run only by hand.
 
 ## MCP models without a driver here
 
