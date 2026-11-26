@@ -52,6 +52,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const session_event = @import("session_event.zig");
+const result_files = @import("result_files.zig");
 const result_store = @import("result_store.zig");
 const session_log = @import("session_log.zig");
 const session_codec = @import("session_codec.zig");
@@ -77,8 +78,10 @@ const PieceKind = std.meta.Tag(Event);
 /// Folder of the side files older v2 sessions kept, under `~/.fx`; a
 /// session moves out of it on its first writable open (D47).
 pub const files_dir_name = profile_paths.session_files_dir_name;
-/// Folder of v2 sessions' hosted terminal state, under `~/.fx` (D45).
+/// Hosted terminal state of v2 sessions, under `~/.fx` (D45).
 pub const terminal_dir_name = profile_paths.terminal_dir_name;
+/// Bash tool result files and index of v2 sessions, under `~/.fx` (S4-1).
+pub const results_dir_name = profile_paths.results_dir_name;
 /// The profile's home folder, opened for listing: creating `~/.fx` in it
 /// syncs it, and Linux cannot sync a folder opened any other way (`O_PATH`).
 fn openHome(home: []const u8) !io_mod.VerifiedDir {
@@ -267,9 +270,28 @@ pub const Store = struct {
         return io_mod.openOrCreateVerifiedPrivateDir(&fx, name);
     }
 
-    /// The folders of `id` outside the manager: its terminal state (D45)
-    /// and a side folder not yet moved (D47).
-    const outside_folders = [_][]const u8{ terminal_dir_name, files_dir_name };
+    /// The folders of `id` outside the manager: its terminal state (D45),
+    /// a side folder not yet moved (D47), and bash tool result files (S4-1).
+    const outside_folders = [_][]const u8{ terminal_dir_name, files_dir_name, results_dir_name };
+
+    /// Creates `~/.fx/results/{id}` with mode `0700` and returns its absolute
+    /// path. Caller owns the returned slice.
+    pub fn resultFolderPath(store: *Store, alloc: Allocator, session_id: []const u8) ![]u8 {
+        var folder = try store.openResultFolder(alloc, session_id);
+        defer folder.deinit();
+        return alloc.dupe(u8, folder.path);
+    }
+
+    /// Creates or opens `~/.fx/results/{id}` with mode `0700` as a `ResultFolder`.
+    pub fn openResultFolder(store: *Store, alloc: Allocator, session_id: []const u8) !result_files.ResultFolder {
+        try session_layout.validateSessionId(session_id);
+        var root = try store.makeProfileFolder(results_dir_name);
+        defer root.close();
+        var dir = try io_mod.openOrCreateVerifiedPrivateDir(&root, session_id);
+        errdefer dir.close();
+        const abs_path = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
+        return result_files.ResultFolder.fromVerifiedDir(alloc, abs_path, dir, .{});
+    }
 
     /// Removes the folders of `id` outside the manager; `why` names the
     /// caller in the trace.
@@ -2368,6 +2390,17 @@ pub const Session = struct {
         defer self.alloc.free(terminal_path);
         self.capability = try session_child_store.SessionChildCapability.initBlobs(self.alloc, self.host.blobs(), terminal_path, .writable);
         return &self.capability.?;
+    }
+
+    /// Creates `~/.fx/results/{id}` with mode `0700` and returns its absolute
+    /// path. Caller owns the returned slice.
+    pub fn resultFolderPath(self: *const Session, alloc: Allocator) ![]u8 {
+        return self.store.resultFolderPath(alloc, self.id());
+    }
+
+    /// Creates or opens `~/.fx/results/{id}` with mode `0700` as a `ResultFolder`.
+    pub fn openResultFolder(self: *const Session, alloc: Allocator) !result_files.ResultFolder {
+        return self.store.openResultFolder(alloc, self.id());
     }
 
     // -- turns ---------------------------------------------------------------
@@ -14722,4 +14755,102 @@ test "forkSession copies side folders, never a link, and reports when one is ski
     defer testing.allocator.free(top);
     try testing.expectEqualStrings("top", top);
     try testing.expectError(error.FileNotFound, dir.access(io, "link", .{ .follow_symlinks = false }));
+}
+
+test "forkSession copies results/ and skips symlinks" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const io = io_mod.getIo();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    {
+        var folder = try t.store.openResultFolder(testing.allocator, id);
+        defer folder.deinit();
+        var r1: std.Io.Reader = .fixed("out-1\n");
+        _ = try folder.save(1, &r1);
+        try folder.appendIndex(.{ .n = 1, .exit = .{ .code = 0 }, .bytes = 6, .lines = 1, .command = "echo 1" });
+        try folder.dir.dir.symLink(io, "/etc/hosts", "link", .{});
+    }
+
+    var forked = try forkSession(&t.store, testing.allocator, id);
+    defer forked.deinit(testing.allocator);
+    try testing.expect(!forked.files_complete);
+    const copy = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", results_dir_name, forked.id });
+    defer testing.allocator.free(copy);
+    var dir = try t.tmp.dir.openDir(io, copy, .{});
+    defer dir.close(io);
+    const out1 = try dir.readFileAlloc(io, "1.txt", testing.allocator, .limited(64));
+    defer testing.allocator.free(out1);
+    try testing.expectEqualStrings("out-1\n", out1);
+    const idx = try dir.readFileAlloc(io, result_files.index_file_name, testing.allocator, .limited(256));
+    defer testing.allocator.free(idx);
+    try testing.expectEqualStrings("n\texit\tbytes\tlines\tcommand\n1\t0\t6\t1\techo 1\n", idx);
+    try testing.expectError(error.FileNotFound, dir.access(io, "link", .{ .follow_symlinks = false }));
+}
+
+test "unsaved session removal removes results/<id> and keeps saved sessions" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+
+    const unsaved = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var unsaved_closed = false;
+    errdefer if (!unsaved_closed) unsaved.close();
+    const unsaved_id = try testing.allocator.dupe(u8, unsaved.id());
+    defer testing.allocator.free(unsaved_id);
+    const unsaved_path = try unsaved.resultFolderPath(testing.allocator);
+    defer testing.allocator.free(unsaved_path);
+    try testing.expect(std.Io.Dir.path.isAbsolute(unsaved_path));
+    unsaved.close();
+    unsaved_closed = true;
+    try testing.expect(!pathExists(&t, &.{ ".fx", results_dir_name, unsaved_id }));
+
+    const saved = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const saved_id = try testing.allocator.dupe(u8, saved.id());
+    defer testing.allocator.free(saved_id);
+    {
+        var folder = try saved.openResultFolder(testing.allocator);
+        defer folder.deinit();
+        var r1: std.Io.Reader = .fixed("kept\n");
+        _ = try folder.save(1, &r1);
+    }
+    try saved.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    saved.close();
+    try testing.expect(pathExists(&t, &.{ ".fx", results_dir_name, saved_id }));
+}
+
+test "doctor sweep counts and removes orphan results/<id> while keeping saved sessions" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    const saved_id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(saved_id);
+    s.close();
+
+    var saved_folder = try t.store.openResultFolder(testing.allocator, saved_id);
+    saved_folder.deinit();
+    const orphan_id = "20261126T000000Z-orphan01";
+    var orphan_folder = try t.store.openResultFolder(testing.allocator, orphan_id);
+    orphan_folder.deinit();
+
+    const future_ms = io_mod.milliTimestamp() + orphan_min_age_ms + 10_000;
+    var counted = try doctor(&t.store, testing.allocator, 64, future_ms, .count);
+    defer counted.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), counted.removable);
+    try testing.expect(pathExists(&t, &.{ ".fx", results_dir_name, orphan_id }));
+
+    var removed = try doctor(&t.store, testing.allocator, 64, future_ms, .remove);
+    defer removed.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), removed.removed);
+    try testing.expect(!pathExists(&t, &.{ ".fx", results_dir_name, orphan_id }));
+    try testing.expect(pathExists(&t, &.{ ".fx", results_dir_name, saved_id }));
 }

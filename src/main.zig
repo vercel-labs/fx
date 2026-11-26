@@ -5650,6 +5650,7 @@ test {
     _ = @import("core/session/session_json.zig");
     _ = @import("core/session/session_store.zig");
     _ = @import("core/session/session_adapter.zig");
+    _ = @import("core/session/result_files.zig");
     _ = @import("core/session/v1_conversion.zig");
     _ = @import("core/session/session_catalog_cache.zig");
     _ = @import("core/session/session_layout.zig");
