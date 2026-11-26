@@ -6,11 +6,12 @@ const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
+const runtime_profile = @import("../core/hosts/runtime_profile.zig");
 
-/// The headless wasm core runs host-managed sessions (`wasm_state`) and has no
-/// fx v2 session store (`sessions.zig` only compiles Wasm and libfx handlers),
-/// so v2 accepted-input records and notices compile out of `fx-core.wasm` only.
-pub const has_v2_session_store = !(host_target.is_wasm and build_options.wasm_surface == .core);
+/// Only hosts with `durable_sessions` enabled open an fx v2 session store.
+/// Every wasm surface sets `.durable_sessions = false`, so v2 accepted-input
+/// records and notices compile out of all wasm builds under that shared rule.
+pub const has_v2_session_store = runtime_profile.host.durable_sessions;
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
@@ -943,7 +944,9 @@ fn destroyActiveSession(state: *ServerState) void {
     active.session_rt.deinit(state.alloc);
     // Before the session closes: a start capture still running uses it.
     active.turn_capture.deinit();
-    if (active.v2) |v2| v2.close();
+    if (comptime has_v2_session_store) {
+        if (active.v2) |v2| v2.close();
+    }
     if (active.wasm_state) |*wasm_state| wasm_state.deinit(state.alloc);
     if (active.wasm_revision) |revision| state.alloc.free(revision);
     state.active_session = null;
@@ -2046,7 +2049,12 @@ fn handleSteeringPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonr
         error.SteeringNotActive => {
             debug_trace.logf("acp", "steering prompt arrived after the turn closed input; starting next turn", .{});
             reapActivePrompt(state, true);
-            return startPromptWithInputId(state, alloc, msg, enqueue_result.accepted_id);
+            return startPromptWithInputId(
+                state,
+                alloc,
+                msg,
+                if (comptime has_v2_session_store) enqueue_result.accepted_id else null,
+            );
         },
         else => return writeSteeringEnqueueError(state, alloc, msg.id, err),
     };
@@ -2705,7 +2713,7 @@ fn startPromptWithInputId(
         .msg = try cloneMessage(alloc, msg),
         .mode = session.mode,
         .permission_mode = session.permission_mode,
-        .v2_input_id = unused_v2_input_id,
+        .v2_input_id = if (comptime has_v2_session_store) unused_v2_input_id else null,
     };
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
 
@@ -2807,7 +2815,7 @@ fn promptWorkerMain(active: *ActivePrompt) void {
         active.mode,
         active.permission_mode,
         &active.usage,
-        active.v2_input_id,
+        if (comptime has_v2_session_store) active.v2_input_id else null,
     ) catch |err| .{
         .rpc_error = .{
             .code = ErrorCode.internal_error,

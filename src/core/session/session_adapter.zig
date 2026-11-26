@@ -69,6 +69,9 @@ const model_provider = @import("../config/model_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const history_range = @import("../shared/history_range.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
+
+const durable_sessions_enabled = runtime_profile.host.durable_sessions;
 
 const Allocator = std.mem.Allocator;
 const Event = session_event.ConversationEvent;
@@ -3113,6 +3116,7 @@ pub const Session = struct {
         text: []const u8,
         images: []const types.ImageAttachment,
     ) !u64 {
+        if (comptime !durable_sessions_enabled) return 0;
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         const known_last_seq = blk: {
@@ -3187,6 +3191,7 @@ pub const Session = struct {
 
     /// Records `input_withdrawn` for `input_id`. Allocates no returned memory.
     pub fn recordInputWithdrawn(self: *Session, input_id: u64) !void {
+        if (comptime !durable_sessions_enabled) return;
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         _ = try self.write(&.{.{ .input_withdrawn = .{ .id = input_id } }});
@@ -3195,6 +3200,7 @@ pub const Session = struct {
     /// Records `input_withdrawn` for all `ids` in one batch write. Allocates
     /// only internal scratch memory.
     pub fn recordInputsWithdrawn(self: *Session, ids: []const u64) !void {
+        if (comptime !durable_sessions_enabled) return;
         if (ids.len == 0) return;
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -3209,6 +3215,13 @@ pub const Session = struct {
     /// Retains the session's `BlobHost` and never touches `*Session`, so the
     /// session can close while the background scan runs.
     pub fn pendingInputsReader(self: *Session) PendingInputsReader {
+        if (comptime !durable_sessions_enabled) {
+            return .{
+                .store = self.store,
+                .host = self.host,
+                .up_to_seq = null,
+            };
+        }
         BlobHost.retain(self.host);
         return .{
             .store = self.store,
@@ -3222,6 +3235,7 @@ pub const Session = struct {
     /// `input_delivered` nor `input_withdrawn`. Caller owns the returned
     /// `PendingAcceptedInputs` and must call `deinit(alloc)`.
     pub fn pendingAcceptedInputs(self: *Session, alloc: Allocator) !PendingAcceptedInputs {
+        if (comptime !durable_sessions_enabled) return .{};
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         return scanPendingAcceptedInputs(self.source(), alloc, null, null);
@@ -3233,6 +3247,7 @@ pub const Session = struct {
         up_to_seq: ?u64,
         cancel_requested: ?*const std.atomic.Value(bool),
     ) !PendingAcceptedInputs {
+        if (comptime !durable_sessions_enabled) return .{};
         const AcceptedItem = struct {
             id: u64,
             text: ?[]u8 = null,
@@ -3555,10 +3570,12 @@ pub const Session = struct {
                 try batch.append(a, .{ .item = try self.itemAs(a, cancelled_wait_type, data) });
             }
             try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
-            switch (event) {
-                .user => |u| if (u.input_id) |input_id| try batch.append(a, .{ .input_delivered = .{ .id = input_id } }),
-                .steering => |s| if (s.input_id) |input_id| try batch.append(a, .{ .input_delivered = .{ .id = input_id } }),
-                else => {},
+            if (comptime durable_sessions_enabled) {
+                switch (event) {
+                    .user => |u| if (u.input_id) |input_id| try batch.append(a, .{ .input_delivered = .{ .id = input_id } }),
+                    .steering => |s| if (s.input_id) |input_id| try batch.append(a, .{ .input_delivered = .{ .id = input_id } }),
+                    else => {},
+                }
             }
             if (review) |data| try batch.append(a, .{ .item = try self.itemAs(a, file_review_type, data) });
             if (try encodeSubagentStarted(a, event)) |data| {
@@ -4890,6 +4907,10 @@ pub const PendingInputsReader = struct {
     up_to_seq: ?u64,
 
     pub fn deinit(self: *PendingInputsReader) void {
+        if (comptime !durable_sessions_enabled) {
+            self.* = undefined;
+            return;
+        }
         BlobHost.release(self.host);
         self.* = undefined;
     }
@@ -4904,12 +4925,14 @@ pub const PendingInputsReader = struct {
         alloc: Allocator,
         cancel_requested: ?*const std.atomic.Value(bool),
     ) !Session.PendingAcceptedInputs {
+        if (comptime !durable_sessions_enabled) return .{};
         return Session.scanPendingAcceptedInputs(self.source(), alloc, self.up_to_seq, cancel_requested);
     }
 };
 
 /// Writes the shared count phrase used by TUI and ACP restore notices.
 pub fn writeUndeliveredPromptPrefix(writer: *std.Io.Writer, prompt_count: usize) !void {
+    if (comptime !durable_sessions_enabled) return;
     if (prompt_count == 1) {
         try writer.writeAll("1 prompt you sent before fx stopped was not delivered");
     } else {
@@ -4919,6 +4942,7 @@ pub fn writeUndeliveredPromptPrefix(writer: *std.Io.Writer, prompt_count: usize)
 
 /// Formats the shared failure notice used when pending-input restore scanning fails.
 pub fn formatPendingRestoreFailedNotice(alloc: Allocator, err: anyerror) Allocator.Error![]u8 {
+    if (comptime !durable_sessions_enabled) return alloc.dupe(u8, "");
     var plain_buf: [96]u8 = undefined;
     return alloc.print(
         "Couldn't restore prompts sent before fx stopped: {s}.",

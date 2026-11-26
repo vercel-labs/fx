@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host_target = @import("../hosts/target.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
@@ -1116,10 +1117,12 @@ pub const PendingInputRestore = struct {
     const alloc = std.heap.c_allocator;
 
     pub fn isActive(self: *const PendingInputRestore) bool {
+        if (comptime !runtime_profile.host.durable_sessions) return false;
         return self.state != .idle;
     }
 
     pub fn needsFastPoll(self: *const PendingInputRestore) bool {
+        if (comptime !runtime_profile.host.durable_sessions) return false;
         return switch (self.state) {
             .idle => false,
             .queued => true,
@@ -1128,6 +1131,7 @@ pub const PendingInputRestore = struct {
     }
 
     pub fn readySessionId(self: *const PendingInputRestore) ?[]const u8 {
+        if (comptime !runtime_profile.host.durable_sessions) return null;
         const task = switch (self.state) {
             .running => |t| t,
             .idle, .queued => return null,
@@ -1142,6 +1146,7 @@ pub const PendingInputRestore = struct {
         session_id: []const u8,
         reader: session_adapter.PendingInputsReader,
     ) !void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
         var owned_reader = reader;
         self.abandonActive("session_changed");
         const id_copy = alloc.dupe(u8, session_id) catch |err| {
@@ -1152,6 +1157,7 @@ pub const PendingInputRestore = struct {
     }
 
     pub fn startQueued(self: *PendingInputRestore) !void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
         var queued = switch (self.state) {
             .queued => |q| q,
             .idle, .running => return,
@@ -1174,6 +1180,7 @@ pub const PendingInputRestore = struct {
     }
 
     pub fn onSessionClosed(self: *PendingInputRestore) void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
         switch (self.state) {
             .idle => {},
             .queued => self.abandonActive("session_changed"),
@@ -1182,6 +1189,7 @@ pub const PendingInputRestore = struct {
     }
 
     pub fn abandonActive(self: *PendingInputRestore, reason: []const u8) void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
         switch (self.state) {
             .idle => return,
             .queued => |*queued| {
@@ -1200,6 +1208,7 @@ pub const PendingInputRestore = struct {
     }
 
     pub fn reapRetired(self: *PendingInputRestore) void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
         var prev: ?*Task = null;
         var curr = self.retired_head;
         while (curr) |task| {
@@ -1217,6 +1226,7 @@ pub const PendingInputRestore = struct {
 
     /// Caller owns the returned `Task` and must call `task.deinit()`.
     pub fn takeCompleted(self: *PendingInputRestore) ?*Task {
+        if (comptime !runtime_profile.host.durable_sessions) return null;
         self.reapRetired();
         const task = switch (self.state) {
             .running => |t| t,
@@ -1230,6 +1240,7 @@ pub const PendingInputRestore = struct {
     }
 
     pub fn deinit(self: *PendingInputRestore) void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
         switch (self.state) {
             .idle => {},
             .queued => |*queued| {

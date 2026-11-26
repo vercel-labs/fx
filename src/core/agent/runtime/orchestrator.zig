@@ -28,6 +28,7 @@ const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig
 const io_mod = @import("../../shared/io.zig");
 const quiesce = @import("../../quiesce/quiesce.zig");
 const host_target = @import("../../hosts/target.zig");
+const runtime_profile = @import("../../hosts/runtime_profile.zig");
 const secret = @import("../../auth/secret.zig");
 const auth_transition = @import("../../auth/auth_transition.zig");
 const credentials = @import("../../auth/credentials.zig");
@@ -6027,11 +6028,13 @@ fn restorePromptAfterTerminalFailure(
         debug_trace.logf("agent", "failed to restore terminal-failure prompt err={s}", .{@errorName(err)});
         return;
     };
-    if (job.input_id) |input_id| {
-        if (deps.withdraw_accepted_input) |withdraw| {
-            withdraw(deps.ctx, input_id) catch |err| {
-                debug_trace.logf("agent", "failed to withdraw restored terminal-failure prompt err={s}", .{@errorName(err)});
-            };
+    if (comptime runtime_profile.host.durable_sessions) {
+        if (job.input_id) |input_id| {
+            if (deps.withdraw_accepted_input) |withdraw| {
+                withdraw(deps.ctx, input_id) catch |err| {
+                    debug_trace.logf("agent", "failed to withdraw restored terminal-failure prompt err={s}", .{@errorName(err)});
+                };
+            }
         }
     }
 }

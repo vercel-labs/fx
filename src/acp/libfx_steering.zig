@@ -4,6 +4,7 @@
 const std = @import("std");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
+const runtime_profile = @import("../core/hosts/runtime_profile.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
@@ -495,8 +496,11 @@ pub const Runtime = struct {
         errdefer result_alloc.free(request_ids);
         const input_ids = try result_alloc.alloc(?[]u8, count);
         errdefer result_alloc.free(input_ids);
-        const v2_input_ids = try result_alloc.alloc(?u64, count);
-        errdefer result_alloc.free(v2_input_ids);
+        const v2_input_ids: []?u64 = if (comptime runtime_profile.host.durable_sessions)
+            try result_alloc.alloc(?u64, count)
+        else
+            &.{};
+        errdefer if (comptime runtime_profile.host.durable_sessions) result_alloc.free(v2_input_ids);
         var copied: usize = 0;
         errdefer for (0..copied) |index| {
             result_alloc.free(texts[index]);
@@ -509,7 +513,9 @@ pub const Runtime = struct {
             input_ids[index] = if (entry.input_id) |id| try result_alloc.dupe(u8, id) else null;
             errdefer if (input_ids[index]) |id| result_alloc.free(id);
             request_ids[index] = if (entry.request_id) |id| try dupeRequestId(result_alloc, id) else null;
-            v2_input_ids[index] = entry.v2_input_id;
+            if (comptime runtime_profile.host.durable_sessions) {
+                v2_input_ids[index] = entry.v2_input_id;
+            }
             copied += 1;
         }
         // Capacity for every queued request was reserved at enqueue.
@@ -605,7 +611,9 @@ pub fn freeDrained(alloc: Allocator, drained: Drained) void {
     if (drained.request_ids.len > 0) alloc.free(drained.request_ids);
     for (drained.input_ids) |maybe_id| if (maybe_id) |id| alloc.free(id);
     if (drained.input_ids.len > 0) alloc.free(drained.input_ids);
-    if (drained.v2_input_ids.len > 0) alloc.free(drained.v2_input_ids);
+    if (comptime runtime_profile.host.durable_sessions) {
+        if (drained.v2_input_ids.len > 0) alloc.free(drained.v2_input_ids);
+    }
 }
 
 fn requestIdsEqual(lhs: RequestId, rhs: RequestId) bool {

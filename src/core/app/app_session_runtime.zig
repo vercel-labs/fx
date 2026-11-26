@@ -801,6 +801,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn clearAcceptedInputHooks(agent: *AppAgent) void {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             if (comptime !@hasField(AppAgent, "worker") or
                 !@hasField(@FieldType(AppAgent, "worker"), "accepted_input_hooks") or
                 !@hasDecl(@FieldType(AppAgent, "worker"), "setAcceptedInputHooks"))
@@ -1221,6 +1222,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn noteKeptQueuedPrompts(app: *App, agent: *AppAgent) !void {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             if (comptime !agents.hasAgentField(App, "session_persistence") or
                 !@hasField(@TypeOf(agent.session_persistence), "switch_kept_queued_prompts"))
             {
@@ -1318,7 +1320,8 @@ pub fn Runtime(comptime App: type) type {
 
         fn beginLiveSessionCancellation(app: *App, agent: *AppAgent) void {
             agent.worker.requestCancel();
-            if (comptime agents.hasAgentField(App, "session_persistence") and
+            if (comptime runtime_profile.allows(App, .durable_sessions) and
+                agents.hasAgentField(App, "session_persistence") and
                 @hasField(@TypeOf(agent.session_persistence), "switch_kept_queued_prompts") and
                 @hasDecl(@TypeOf(agent.worker), "countPendingAcceptedUserPrompts"))
             {
@@ -1868,11 +1871,14 @@ pub fn Runtime(comptime App: type) type {
             // A fork is a new session: it continues nothing on its own.
             if (notice != .fork) {
                 noteInterruptedRequest(agent, v2);
-                try schedulePendingAcceptedInputsRestore(agent, v2);
+                if (comptime runtime_profile.allows(App, .durable_sessions)) {
+                    try schedulePendingAcceptedInputsRestore(agent, v2);
+                }
             }
         }
 
         fn schedulePendingAcceptedInputsRestore(agent: *AppAgent, v2: *session_adapter.Session) !void {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             const reader = v2.pendingInputsReader();
             try agent.session_persistence.pending_input_restore.queue(v2.id(), reader);
         }
@@ -3737,7 +3743,9 @@ pub fn Runtime(comptime App: type) type {
         pub fn requestPersistenceShutdown(agent: *AppAgent) void {
             agent.session_persistence.session_picker_load.requestStop();
             agent.session_persistence.title_generation.requestStop();
-            agent.session_persistence.pending_input_restore.onSessionClosed();
+            if (comptime runtime_profile.allows(App, .durable_sessions)) {
+                agent.session_persistence.pending_input_restore.onSessionClosed();
+            }
         }
 
         fn LiveHistorySink(comptime SinkApp: type) type {
@@ -5839,7 +5847,9 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             discardAnyPendingCancelledCommand(app, agent, "writable_session_close");
-            agent.session_persistence.pending_input_restore.onSessionClosed();
+            if (comptime runtime_profile.allows(App, .durable_sessions)) {
+                agent.session_persistence.pending_input_restore.onSessionClosed();
+            }
             if (agent.session_persistence.v2) |v2| return closeV2Session(app, agent, v2, handoff_intent);
             return null;
         }

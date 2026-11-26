@@ -399,7 +399,7 @@ test "skill submit snapshot keeps display spans exact while agent bindings dedup
 var resize_interlock = shell_runtime.ResizeApprovalInterlock{};
 const default_context_registry = context_contract.Registry{ .default_provider = builtin_context.provider };
 const WorkspaceHostRuntime = if (host_target.is_wasm) js_host_workspace.Runtime else struct {};
-const selected_host_profile = if (host_target.is_wasm) host_runtime_profile.wasm else host_runtime_profile.native;
+const selected_host_profile = host_runtime_profile.host;
 const app_api_key_validator = if (host_target.is_wasm)
     api_key_validator.unavailable_provider
 else

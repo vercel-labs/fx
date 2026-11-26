@@ -21,6 +21,7 @@ const command_output_content = @import("../tooling/command_output_content.zig");
 const types = @import("../shared/types.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
 const model_provider = @import("../config/model_provider.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -1453,9 +1454,11 @@ pub const WorkerRuntime = struct {
                 index += 1;
                 continue;
             }
-            if (self.queued_prompts.items[index].input_id) |input_id| {
-                // Lock order: worker_mutex before write_mutex; session teardown clears hooks before locking write_mutex.
-                if (self.accepted_input_hooks) |hooks| hooks.record_withdrawn(hooks.ctx, input_id);
+            if (comptime runtime_profile.host.durable_sessions) {
+                if (self.queued_prompts.items[index].input_id) |input_id| {
+                    // Lock order: worker_mutex before write_mutex; session teardown clears hooks before locking write_mutex.
+                    if (self.accepted_input_hooks) |hooks| hooks.record_withdrawn(hooks.ctx, input_id);
+                }
             }
             const prompt = self.queued_prompts.orderedRemove(index);
             debug_trace.eventf("worker", "queued_prompt_discarded", .{ .turn_id = prompt.turn_id }, "worker={x} mail={s} remaining={d}", .{ @intFromPtr(self), @tagName(prompt.mail), self.queued_prompts.items.len });
@@ -1706,37 +1709,39 @@ pub const WorkerRuntime = struct {
             self.worker_mutex.unlock(io_mod.getIo());
             return error.RecoveryBusy;
         }
-        const accepted_hooks = self.accepted_input_hooks;
+        const accepted_hooks: ?AcceptedInputHooks = if (comptime runtime_profile.host.durable_sessions) self.accepted_input_hooks else null;
         self.worker_mutex.unlock(io_mod.getIo());
 
         // Record accepted input outside worker_mutex because the host writes to
         // storage and must not stall UI snapshots (R2.1).
-        if (queued.input_id == null and
-            queued.author == .user and
-            queued.work_id == null and
-            queued.recovery_checkpoint == null and
-            queued.recovery_resume == null)
-        {
-            if (accepted_hooks) |hooks| {
-                if (hooks.record_accepted(hooks.ctx, queued.prompt, queued.images)) |input_id| {
-                    queued.input_id = input_id;
+        if (comptime runtime_profile.host.durable_sessions) {
+            if (queued.input_id == null and
+                queued.author == .user and
+                queued.work_id == null and
+                queued.recovery_checkpoint == null and
+                queued.recovery_resume == null)
+            {
+                if (accepted_hooks) |hooks| {
+                    if (hooks.record_accepted(hooks.ctx, queued.prompt, queued.images)) |input_id| {
+                        queued.input_id = input_id;
+                    } else {
+                        debug_trace.eventf(
+                            "worker",
+                            "accepted_input_unrecorded",
+                            .{ .turn_id = queued.turn_id },
+                            "kind={s} bytes={d} reason=record_failed",
+                            .{ @tagName(queued.author), queued.prompt.len },
+                        );
+                    }
                 } else {
                     debug_trace.eventf(
                         "worker",
                         "accepted_input_unrecorded",
                         .{ .turn_id = queued.turn_id },
-                        "kind={s} bytes={d} reason=record_failed",
+                        "kind={s} bytes={d} reason=no_hook",
                         .{ @tagName(queued.author), queued.prompt.len },
                     );
                 }
-            } else {
-                debug_trace.eventf(
-                    "worker",
-                    "accepted_input_unrecorded",
-                    .{ .turn_id = queued.turn_id },
-                    "kind={s} bytes={d} reason=no_hook",
-                    .{ @tagName(queued.author), queued.prompt.len },
-                );
             }
         }
 
@@ -1800,6 +1805,7 @@ pub const WorkerRuntime = struct {
     }
 
     fn withdrawUnadmittedInput(accepted_hooks: ?AcceptedInputHooks, maybe_id: ?u64) void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
         const input_id = maybe_id orelse return;
         const hooks = accepted_hooks orelse return;
         hooks.record_withdrawn(hooks.ctx, input_id);
@@ -2487,9 +2493,11 @@ pub const WorkerRuntime = struct {
         var removed: ?QueuedPrompt = null;
         for (self.queued_prompts.items, 0..) |queued, index| {
             if (queued.turn_id != turn_id) continue;
-            if (queued.input_id) |input_id| {
-                // Lock order: worker_mutex before write_mutex; session teardown clears hooks before locking write_mutex.
-                if (self.accepted_input_hooks) |hooks| hooks.record_withdrawn(hooks.ctx, input_id);
+            if (comptime runtime_profile.host.durable_sessions) {
+                if (queued.input_id) |input_id| {
+                    // Lock order: worker_mutex before write_mutex; session teardown clears hooks before locking write_mutex.
+                    if (self.accepted_input_hooks) |hooks| hooks.record_withdrawn(hooks.ctx, input_id);
+                }
             }
             removed = self.queued_prompts.orderedRemove(index);
             break;
@@ -2544,9 +2552,11 @@ pub const WorkerRuntime = struct {
 
         const text = try alloc.dupe(u8, self.queued_prompts.items[remove_index].prompt);
         errdefer alloc.free(text);
-        if (self.queued_prompts.items[remove_index].input_id) |input_id| {
-            // Lock order: worker_mutex before write_mutex; session teardown clears hooks before locking write_mutex.
-            if (self.accepted_input_hooks) |hooks| hooks.record_withdrawn(hooks.ctx, input_id);
+        if (comptime runtime_profile.host.durable_sessions) {
+            if (self.queued_prompts.items[remove_index].input_id) |input_id| {
+                // Lock order: worker_mutex before write_mutex; session teardown clears hooks before locking write_mutex.
+                if (self.accepted_input_hooks) |hooks| hooks.record_withdrawn(hooks.ctx, input_id);
+            }
         }
         const prompt = self.queued_prompts.orderedRemove(remove_index);
         if (self.queued_prompts.items.len == 0) {
@@ -3070,12 +3080,14 @@ pub const WorkerRuntime = struct {
     }
 
     pub fn setAcceptedInputHooks(self: *WorkerRuntime, hooks: ?AcceptedInputHooks) void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         self.accepted_input_hooks = hooks;
     }
 
     pub fn countPendingAcceptedUserPrompts(self: *WorkerRuntime) usize {
+        if (comptime !runtime_profile.host.durable_sessions) return 0;
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         var count: usize = 0;

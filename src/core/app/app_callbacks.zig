@@ -425,7 +425,7 @@ pub fn Bindings(comptime App: type) type {
                 .push_route_recovery_status = agentPushRouteRecoveryStatus,
                 .save_route_recovery_status = agentSaveRouteRecoveryStatus,
                 .restore_failed_prompt = agentRestoreFailedPrompt,
-                .withdraw_accepted_input = if (comptime agents.hasAgentField(App, "session_persistence"))
+                .withdraw_accepted_input = if (comptime runtime_profile.allows(App, .durable_sessions) and agents.hasAgentField(App, "session_persistence"))
                     if (agent.session_persistence.v2 != null) agentWithdrawAcceptedInput else null
                 else
                     null,

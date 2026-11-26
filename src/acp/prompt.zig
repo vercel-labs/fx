@@ -2482,7 +2482,10 @@ fn takeSteeringBoundary(
     // An ACP client's steering is the user's own.
     const messages = try arena.alloc(worker_runtime.SteeringMessage, drained.texts.len);
     for (drained.texts, messages, 0..) |text, *message, index| {
-        const v2_input_id: ?u64 = if (index < drained.v2_input_ids.len) drained.v2_input_ids[index] else null;
+        const v2_input_id: ?u64 = if (comptime server.has_v2_session_store)
+            (if (index < drained.v2_input_ids.len) drained.v2_input_ids[index] else null)
+        else
+            null;
         message.* = .{ .text = text, .input_id = v2_input_id };
     }
     return .{ .continue_turn = messages };
