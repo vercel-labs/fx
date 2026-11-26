@@ -8081,6 +8081,25 @@ pub const TranscriptRuntime = struct {
         self.notebook.assistant_attempt_first_entry_id = self.notebook.next_entry_id;
     }
 
+    /// The text just shown is a line fx wrote between steps. Marks the text
+    /// entry that holds it, so the main screen draws the calls after it below
+    /// it, as it does after a notice.
+    pub fn markOperationalText(self: *TranscriptRuntime) void {
+        const entries = self.notebook.entries.items;
+        const last = if (entries.len == 0) null else &entries[entries.len - 1];
+        const turn = if (last) |entry| switch (entry.*) {
+            .assistant_turn => |*turn| turn,
+            else => null,
+        } else null;
+        const marked = turn orelse {
+            debug_trace.logf("transcript", "operational_text_unmarked reason=no_trailing_text entries={d}", .{entries.len});
+            return;
+        };
+        if (marked.operational) return;
+        marked.operational = true;
+        self.markTranscriptContentDirtyFrom(marked.id);
+    }
+
     /// Removes what the current answer attempt added, so a restarted answer
     /// streams in its place. That works only while none of it is final: the
     /// attempt added at most the writable assistant entry at the tail, and
@@ -15209,6 +15228,32 @@ fn frameInlineScrollBudget(resize_reflow_rows: u16, semantic_rows: u32) u16 {
         semantic_rows,
         std.math.maxInt(u32),
     );
+}
+
+test "a line fx wrote marks the text entry that shows it, and nothing else" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+
+    // A tool row is last, so there is no text to mark.
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "● Read a.txt\n", .tool_status);
+    runtime.markOperationalText();
+    try std.testing.expect(runtime.notebook.entries.items[0] == .raw_bytes);
+
+    const assistant_id = try runtime.appendAssistantTurnEntry(alloc);
+    const segments = runtime.lookupAssistantSegments(assistant_id).?;
+    try segments.text.appendSlice(alloc, "The model stopped without a reply. Asking it to continue.\n");
+    try std.testing.expect(!runtime.notebook.entries.items[1].assistant_turn.operational);
+    const revision = runtime.notebook.full_transcript_content_revision;
+    runtime.markOperationalText();
+    try std.testing.expect(runtime.notebook.entries.items[1].assistant_turn.operational);
+    // The compact view's cached rows are stale now.
+    try std.testing.expect(runtime.notebook.full_transcript_content_revision != revision);
+
+    // A snapshot keeps the mark.
+    var copy = try transcript_store.cloneEntryForSnapshot(alloc, runtime.notebook.entries.items[1]);
+    defer copy.deinit(alloc);
+    try std.testing.expect(copy.assistant_turn.operational);
 }
 
 test "pending resume publication yields after a bounded row batch" {
