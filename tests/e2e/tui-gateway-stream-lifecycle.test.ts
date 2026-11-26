@@ -1902,7 +1902,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     // The notice wraps at the pane's width.
     expect(scrollback.replace(/\s+/g, " ")).toContain("Retrying with low effort.");
     expect(scrollback).not.toContain("did not run them");
-    expect(scrollback).not.toContain("response hit provider length limit");
+    expect(scrollback).not.toContain("The response hit the provider's length limit and may be incomplete.");
     expect(scrollback).not.toContain("UnknownToolLifecycleIdentity");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
     await session!.sendText("Confirm a later prompt is still usable.");
@@ -3357,7 +3357,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session!.sendText("Trigger restricted provider.");
       // The reason goes to the transcript; the status line says what to do.
-      await session!.waitForText("API access denied · HTTP 403 · Provider: wafer", TIMEOUT);
+      await session!.waitForText("⚠ Your team has restricted access to this provider.", TIMEOUT);
       await session!.waitForText("The provider rejected this request · press Esc", TIMEOUT);
       await session!.sendKeys("Escape");
       await session!.waitForPane(
@@ -3367,10 +3367,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests.length).toBe(1);
-      expect(countOccurrences(scrollback, "API access denied · HTTP 403 · Provider: wafer")).toBe(1);
-      expect(scrollback).toContain(
-        "no_providers_available: Your team has restricted access to this",
-      );
+      const restrictedNotice = "⚠ Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer";
+      const flatScrollback = scrollback.replace(/\s+/g, " ");
+      expect(countOccurrences(flatScrollback, restrictedNotice)).toBe(1);
+      expect(scrollback).not.toContain("API access denied");
       expect(scrollback).not.toContain('{"error"');
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -3611,7 +3611,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.requests.length).toBe(4);
       expect(scrollback).not.toContain("Try again later");
-      expect(scrollback).not.toContain("request failed");
+      expect(scrollback).not.toContain("Request failed");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -4268,9 +4268,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.requests).toHaveLength(3);
       expect(scrollback).toContain("What can fx do differently?");
-      expect(scrollback).not.toContain("system: cancelled");
+      expect(scrollback).not.toContain("⊘ Cancelled");
       expect(scrollback).not.toContain("Cancelling");
-      expect(scrollback).not.toContain("request failed: ModelError");
+      expect(scrollback).not.toContain("Request failed: ModelError");
       expect(scrollback).not.toContain("must not send");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -4612,7 +4612,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // The status row never becomes transcript.
       expect(scrollback).not.toContain("Gateway error ·");
       expect(scrollback).not.toContain("What should fx do?");
-      expect(scrollback).not.toContain("request failed: ModelError");
+      expect(scrollback).not.toContain("Request failed: ModelError");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -7500,7 +7500,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       await waitForCondition(() => hold.cancelled, "stream cancellation");
       expect(afterFirst).toContain("▪ Cancelled");
-      expect(afterFirst).not.toContain("system: cancelled");
+      expect(afterFirst).not.toContain("⊘ Cancelled");
       expect(afterFirst).not.toContain("Cancelling");
       expect(session.isPaneAlive()).toBe(true);
 
@@ -7522,7 +7522,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(
         countOccurrences(scrollback, "What can fx do differently?"),
       ).toBe(1);
-      expect(scrollback).not.toContain("system: cancelled");
+      expect(scrollback).not.toContain("⊘ Cancelled");
       expect(scrollback).not.toContain("Cancelling");
       expect(countOccurrences(trace, "source=input_active_stream")).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

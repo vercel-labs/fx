@@ -658,9 +658,9 @@ fn deliverSemanticThematicRule(raw: *anyopaque, out: *std.ArrayList(u8)) !void {
 }
 
 pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, arena: Allocator, disposition: types.ProviderCompletionDisposition) !void {
+    _ = arena;
     if (disposition != .length_limited) return;
-    const line = try arena.print("response hit provider length limit; output may be incomplete", .{});
-    try hooks.push_system_notice(hooks.ctx, line);
+    try hooks.pushWarningNotice("The response hit the provider's length limit and may be incomplete.");
 }
 
 pub fn finishLengthLimitedToolCallCompletion(
@@ -2334,7 +2334,7 @@ test "emitProviderLengthNotice emits exact length notice" {
     try emitProviderLengthNotice(&hooks, arena_state.allocator(), .length_limited);
 
     try std.testing.expectEqual(@as(usize, 1), capture.notices.items.len);
-    try std.testing.expectEqualStrings("response hit provider length limit; output may be incomplete", capture.notices.items[0]);
+    try std.testing.expectEqualStrings("The response hit the provider's length limit and may be incomplete.", capture.notices.items[0]);
 }
 
 test "emitProviderLengthNotice ignores non-length finish reasons" {

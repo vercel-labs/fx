@@ -9689,7 +9689,7 @@ test.skipIf(!tmuxAvailable())(
       expect(cancelledIndex).toBeGreaterThanOrEqual(0);
       expect(resumed).toContain("▪ Cancelled");
       expect(countOccurrences(resumed, "What can fx do differently?")).toBe(1);
-      expect(resumed).not.toContain("system: cancelled");
+      expect(resumed).not.toContain("⊘ Cancelled");
       expect(resumed).not.toContain("Cancelling");
       expect(resumed).not.toContain("Interrupted by user after completing");
       expect(resumed).not.toContain("<turn_aborted>");
@@ -10713,8 +10713,8 @@ test.skipIf(!tmuxAvailable())(
       const pane = await active.waitForText("RESUMED_ANSWER_7310", TIMEOUT);
       expect(pane).toContain("Resuming the interrupted request");
       // The killed turn reads as stopped, not as a failure.
-      expect(pane).toContain("system: fx stopped before this turn finished");
-      expect(pane).not.toContain("system: failed");
+      expect(pane).toContain("⚠ fx stopped before this turn finished");
+      expect(pane).not.toContain("✗ Failed");
       // The note is for the model; the transcript never shows it.
       expect(pane).not.toContain(RESUME_NOTE);
       const resumed = gateway.requests.slice(before).find((request) => request.body.includes(RESUME_NOTE));
@@ -11050,8 +11050,8 @@ test.skipIf(!tmuxAvailable())(
       const pane = await active.capturePane();
       expect(pane).not.toContain("crashed fx twice");
       // A closed window reads as stopped, not as cancelled.
-      expect(pane).toContain("system: fx stopped before this turn finished");
-      expect(pane).not.toContain("system: cancelled");
+      expect(pane).toContain("⚠ fx stopped before this turn finished");
+      expect(pane).not.toContain("⊘ Cancelled");
       expect(readFileSync(third.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();

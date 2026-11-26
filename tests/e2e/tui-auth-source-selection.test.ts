@@ -4287,7 +4287,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     expect(Date.now() - cancelStarted).toBeLessThan(500);
     expect(cancelledPane).toContain("▪ Cancelled");
-    expect(cancelledPane).not.toContain("system: cancelled");
+    expect(cancelledPane).not.toContain("⊘ Cancelled");
     expect(cancelledPane).not.toContain("Cancelling");
     expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -7031,7 +7031,7 @@ tmuxTest(
         FX_TEST_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
       });
       await session.waitForComposer(TIMEOUT);
-      const failureVisible = session.waitForText("request failed: reply too large to read", TIMEOUT);
+      const failureVisible = session.waitForText("Request failed: reply too large to read", TIMEOUT);
       await session.sendText("Recover from a bounded Grok response.");
       await failureVisible;
       await session.sendText("Accept another prompt after recovery.");
@@ -7040,7 +7040,7 @@ tmuxTest(
       await session.waitForText("GROK_AFTER_LIMIT_OK", TIMEOUT);
 
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toContain("request failed: reply too large to read");
+      expect(scrollback).toContain("Request failed: reply too large to read");
       expect(scrollback).not.toContain("XaiGrokSseEventTooLarge");
       expect(grok.bodies).toHaveLength(3);
       expect(gateway.requests).toHaveLength(0);
@@ -7521,7 +7521,7 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
         }
       } else {
         expect(output.output).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
-        if (limited) expect(result.stderr).toContain("response hit provider length limit");
+        if (limited) expect(result.stderr).toContain("[notice] The response hit the provider's length limit and may be incomplete.");
         // A retry shows the recovery module's wording, never the provider's detail.
         else expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
         const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });

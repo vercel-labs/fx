@@ -111,10 +111,10 @@ pub fn Runtime(comptime App: type) type {
                 } else if (err == error.TurnYielded) {
                     try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = yielded_notice });
                 } else if (err != error.RouteRecoveryStopped) {
-                    const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
+                    const body = try formatErrorBody(std.heap.c_allocator, "Request failed", err);
                     defer std.heap.c_allocator.free(body);
                     try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
-                        .topic = "system",
+                        .topic = "",
                         .tone = .@"error",
                         .body = body,
                     } });
@@ -199,10 +199,10 @@ pub fn Runtime(comptime App: type) type {
 
         fn runWorkerLoop(app: *App, agent: *AppAgent) void {
             workerLoop(app, agent) catch |err| {
-                const body = formatErrorBody(std.heap.c_allocator, "worker loop crashed", err) catch return;
+                const body = formatErrorBody(std.heap.c_allocator, "fx hit an internal error", err) catch return;
                 defer std.heap.c_allocator.free(body);
                 agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
-                    .topic = "system",
+                    .topic = "",
                     .tone = .@"error",
                     .body = body,
                 } }) catch return;
@@ -223,10 +223,10 @@ pub fn Runtime(comptime App: type) type {
                     } else if (err == error.TurnYielded) {
                         try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = yielded_notice });
                     } else if (err != error.RouteRecoveryStopped) {
-                        const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
+                        const body = try formatErrorBody(std.heap.c_allocator, "Request failed", err);
                         defer std.heap.c_allocator.free(body);
                         try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
-                            .topic = "system",
+                            .topic = "",
                             .tone = .@"error",
                             .body = body,
                         } });
@@ -480,9 +480,9 @@ test "worker thread reports queued prompt failures as worker events" {
         switch (event) {
             .error_text => |notice| {
                 saw_error = true;
-                try std.testing.expectEqualStrings("system", notice.topic);
+                try std.testing.expectEqualStrings("", notice.topic);
                 try std.testing.expectEqual(types.NoticeTone.@"error", notice.tone);
-                try std.testing.expect(std.mem.find(u8, notice.body, "request failed") != null);
+                try std.testing.expect(std.mem.find(u8, notice.body, "Request failed") != null);
                 try std.testing.expect(std.mem.find(u8, notice.body, "invalid JSON syntax") != null);
                 // The raw error name goes only to the trace.
                 try std.testing.expect(std.mem.find(u8, notice.body, "SyntaxError") == null);
@@ -533,7 +533,7 @@ test "worker continues after project context selector failures" {
         for (events.items) |event| switch (event) {
             .error_text => |notice| {
                 error_count += 1;
-                try std.testing.expect(std.mem.find(u8, notice.body, "request failed") != null);
+                try std.testing.expect(std.mem.find(u8, notice.body, "Request failed") != null);
                 var words: [128]u8 = undefined;
                 const plain = types.plainErrorText(@errorName(expected_error), &words);
                 try std.testing.expect(std.mem.find(u8, notice.body, plain) != null);

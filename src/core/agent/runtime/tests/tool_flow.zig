@@ -5416,7 +5416,7 @@ test "committed file result is appended before degraded secondary publication" {
     try std.testing.expect(publish_index < status_index);
     try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
     try std.testing.expectEqualStrings(
-        "File change committed, but some secondary reporting failed.",
+        "fx saved the file change, but could not report all of it.",
         hooks.system_notices.items[0],
     );
     try expectBodyContainsInOrder(&gateway, 1, &.{

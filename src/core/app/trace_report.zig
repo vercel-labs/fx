@@ -2722,6 +2722,7 @@ fn entryText(arena: std.mem.Allocator, entry: anytype) ![]const u8 {
                 .body = e.body,
                 .visibility = e.visibility,
                 .detail = e.detail,
+                .detail_visibility = e.detail_visibility,
             },
             .{},
             std.math.maxInt(u16),
