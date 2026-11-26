@@ -32,6 +32,7 @@ const shell_runtime = @import("shell_runtime.zig");
 const shimmer_runtime = @import("transcript/shimmer_runtime.zig");
 const transcript_painter = @import("transcript/painter.zig");
 const transcript_runtime = @import("transcript/runtime.zig");
+const resume_projection = @import("transcript/resume_projection.zig");
 const full_transcript_screen = @import("full_transcript_screen.zig");
 const vt_emulator = @import("../core/terminal/engine.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
@@ -2740,6 +2741,42 @@ test "a provisional tail continues the committed text of its turn without a seco
     try std.testing.expectEqual(@as(usize, 1), try countRowsContaining(&h, "third words"));
     const second_row = try findRowContaining(&h, "second line");
     try expectRowTrimmedEquals(&h, second_row + 1, "  third words");
+}
+
+test "a provisional tail keeps the blank rows its committed text ends with" {
+    const cases = [_]struct { gap: []const u8, blank_rows: u16 }{
+        .{ .gap = "\n", .blank_rows = 0 },
+        .{ .gap = "\n\n", .blank_rows = 1 },
+        .{ .gap = "\n\n\n", .blank_rows = 2 },
+    };
+    for (cases) |case| {
+        var h = try Harness.init(std.testing.allocator, 40, 24, 4);
+        defer h.deinit();
+        try h.shell.initViewport(&h.metrics, 1);
+
+        var processor = assistant_presentation.MarkdownProcessor{};
+        defer processor.deinit(h.alloc);
+        var committed: std.ArrayList(u8) = .empty;
+        defer committed.deinit(h.alloc);
+        try processor.push(h.alloc, "First paragraph", &committed);
+        try processor.push(h.alloc, case.gap, &committed);
+        try processor.push(h.alloc, "Second", &committed);
+        _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, committed.items);
+        committed.clearRetainingCapacity();
+
+        try applyProvisionalTail(&h, &processor);
+        try h.renderTranscriptFrame();
+        try h.flush();
+        const first_row = try findRowContaining(&h, "First paragraph");
+        const open_row = try findRowContaining(&h, "Second");
+        try std.testing.expectEqual(first_row + 1 + case.blank_rows, open_row);
+
+        try processor.push(h.alloc, " paragraph\n", &committed);
+        _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, committed.items);
+        try h.renderTranscriptFrame();
+        try h.flush();
+        try std.testing.expectEqual(open_row, try findRowContaining(&h, "Second paragraph"));
+    }
 }
 
 test "a provisional tail after a user prompt keeps the footer gap of its committed text" {
@@ -10639,4 +10676,186 @@ test "a picker close past a tool finality floor keeps all rows visible during pr
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try capturePhysicalFrame(&h, &probe);
     try expectAllToolItemsVisible(alloc, &h, &probe, item_count);
+}
+
+fn expectGridExcludes(h: *Harness, needle: []const u8) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(h.alloc);
+    var r: u16 = 1;
+    while (r <= h.vt.rows) : (r += 1) {
+        buf.clearRetainingCapacity();
+        try h.vt.rowText(r, &buf);
+        try std.testing.expect(std.mem.find(u8, buf.items, needle) == null);
+    }
+}
+
+fn expectGridJoinedContains(h: *Harness, needle: []const u8) !void {
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(h.alloc);
+    var row_buf: std.ArrayList(u8) = .empty;
+    defer row_buf.deinit(h.alloc);
+    var r: u16 = 1;
+    while (r <= h.vt.rows) : (r += 1) {
+        row_buf.clearRetainingCapacity();
+        try h.vt.rowTextTrimmed(r, &row_buf);
+        if (row_buf.items.len > 0) {
+            if (joined.items.len > 0) try joined.append(h.alloc, ' ');
+            try joined.appendSlice(h.alloc, row_buf.items);
+        }
+    }
+    if (std.mem.find(u8, joined.items, needle) != null) return;
+    std.debug.print("joined grid did not contain '{s}':\n{s}\n", .{ needle, joined.items });
+    return error.TestExpectedGridText;
+}
+
+test "tall recovering resumed transcript holds pending restore until handoff, then renders notice and composer" {
+    const alloc = std.testing.allocator;
+    const app_session_runtime = @import("../core/app/app_session_runtime.zig");
+    const restore_test_controls = @import("../core/app/restore_test_controls.zig");
+    const session_adapter = @import("../core/session/session_adapter.zig");
+    const session_persistence = @import("../core/app/session_persistence.zig");
+
+    const VtRestoreApp = struct {
+        alloc: Allocator,
+        main_agent: struct {
+            session_persistence: session_persistence.Persistence = .{},
+            pending_images: std.ArrayList(types.ImageAttachment) = .empty,
+            next_image_id: usize = 1,
+        } = .{},
+        input_runtime: InputRuntime = .{},
+        shell: TranscriptRuntime,
+        metrics: Metrics = .{},
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
+
+        pub fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, flush_notice: bool) !void {
+            try self.shell.writeNotice(self.alloc, &self.metrics, notice, flush_notice);
+        }
+    };
+
+    for ([_]u16{ 40, 80, 120 }) |cols| {
+        var h = try Harness.init(alloc, cols, 24, 4);
+        defer h.deinit();
+        try h.shell.initViewport(&h.metrics, 1);
+
+        try h.tmp.dir.createDir(io_mod.getIo(), "home", .default_dir);
+        try h.tmp.dir.createDir(io_mod.getIo(), "ws", .default_dir);
+        const home = try io_mod.dirRealpathAlloc(alloc, h.tmp.dir, "home");
+        defer alloc.free(home);
+        const ws = try io_mod.dirRealpathAlloc(alloc, h.tmp.dir, "ws");
+        defer alloc.free(ws);
+
+        var store = try session_adapter.Store.open(alloc, home);
+        defer store.deinit(alloc);
+        const sid = blk: {
+            var model = "test-model".*;
+            const writer = try session_adapter.Session.create(alloc, &store, ws, .app, .{
+                .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+                .language = types.ConversationLanguage.default(),
+                .permission_state = .{},
+            });
+            defer writer.close();
+            try writer.commitTurn(.{ .assistant = .{
+                .user = .{ .text = @constCast("turn one") },
+                .assistant = @constCast("done"),
+            } }, types.ConversationLanguage.default());
+            _ = try writer.recordInputAccepted("P2");
+            _ = try writer.recordInputAccepted("P3");
+            break :blk try alloc.dupe(u8, writer.id());
+        };
+        defer alloc.free(sid);
+
+        var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &h.shell, 0, 1);
+        errdefer projection.deinit();
+        for (0..80) |i| {
+            var buf: [64]u8 = undefined;
+            const line = try std.mem.print(&buf, "resumed history line {d}\n", .{i});
+            _ = try projection.appendRawClassified(line, .unknown_raw);
+        }
+        try projection.finalize();
+        projection.install(&h.shell);
+        try std.testing.expect(h.shell.notebook.pending_resume_source != null);
+
+        const reopened = try session_adapter.Session.resumeSession(alloc, &store, .{ .id = sid }, ws, .app);
+        var vt_app = VtRestoreApp{
+            .alloc = alloc,
+            .shell = h.shell,
+        };
+        h.shell = .{ .layout = h.shell.layout };
+        defer {
+            vt_app.input_runtime.deinit(alloc);
+            for (vt_app.agent().pending_images.items) |img| types.freeImageAttachment(alloc, img);
+            vt_app.agent().pending_images.deinit(alloc);
+            vt_app.agent().session_persistence.pending_input_restore.deinit();
+            if (vt_app.agent().session_persistence.v2) |v2| v2.close();
+            h.shell = vt_app.shell;
+        }
+        vt_app.agent().session_persistence.v2 = reopened;
+        try vt_app.agent().session_persistence.pending_input_restore.queue(
+            reopened.id(),
+            reopened.pendingInputsReader(),
+        );
+
+        var approval = approval_prompt.ApprovalPrompt{};
+        defer approval.deinit(alloc);
+
+        // Paint frame 1 so the transcript enters `.recovering` and `.first_frame` clears.
+        std.mem.swap(TranscriptRuntime, &h.shell, &vt_app.shell);
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, defaultFooterContext(&vt_app.input_runtime));
+        std.mem.swap(TranscriptRuntime, &h.shell, &vt_app.shell);
+        try h.flush();
+        try std.testing.expectEqual(
+            transcript_runtime.TranscriptCommitDiagnosticState.recovering,
+            vt_app.shell.transcriptCommitDiagnostic().state,
+        );
+
+        // Start and await the background scan while still recovering.
+        try vt_app.agent().session_persistence.pending_input_restore.startQueued();
+        restore_test_controls.awaitRunning(&vt_app.agent().session_persistence.pending_input_restore);
+
+        var settled = false;
+        var frame: usize = 0;
+        while (frame < 400) : (frame += 1) {
+            try app_session_runtime.Runtime(VtRestoreApp).pollPendingInputRestore(&vt_app, vt_app.agent());
+            std.mem.swap(TranscriptRuntime, &h.shell, &vt_app.shell);
+            const render_result = renderTestFooterWithContext(&h, &approval, &h.frame_redraw, defaultFooterContext(&vt_app.input_runtime));
+            std.mem.swap(TranscriptRuntime, &h.shell, &vt_app.shell);
+            try render_result;
+            try h.flush();
+
+            const handoff_pending = vt_app.shell.pendingResumeFlow().len > 0 or
+                vt_app.shell.transcriptCommitDiagnostic().state == .recovering;
+            if (handoff_pending) {
+                try std.testing.expectEqualStrings("", vt_app.input_runtime.edit_state.input.items);
+                try expectGridExcludes(&h, "were not delivered.");
+            } else if (!vt_app.agent().session_persistence.pending_input_restore.isActive() and
+                vt_app.shell.transcriptCommitDiagnostic().state == .stable)
+            {
+                settled = true;
+                break;
+            }
+        }
+        try std.testing.expect(settled);
+
+        try std.testing.expectEqualStrings("P2\n\nP3", vt_app.input_runtime.edit_state.input.items);
+        try expectGridJoinedContains(&h, "were not delivered.");
+        try expectGridContains(&h, "P2");
+        try expectGridContains(&h, "P3");
+
+        std.mem.swap(TranscriptRuntime, &h.shell, &vt_app.shell);
+        const resize_result = h.driveResize(cols, 28, 4, true);
+        if (resize_result) |_| {
+            try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, defaultFooterContext(&vt_app.input_runtime));
+        } else |err| {
+            std.mem.swap(TranscriptRuntime, &h.shell, &vt_app.shell);
+            return err;
+        }
+        std.mem.swap(TranscriptRuntime, &h.shell, &vt_app.shell);
+        try h.flush();
+        try expectGridJoinedContains(&h, "were not delivered.");
+        try expectGridContains(&h, "P2");
+        try expectGridContains(&h, "P3");
+    }
 }

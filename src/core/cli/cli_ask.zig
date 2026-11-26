@@ -1140,6 +1140,7 @@ const AskContext = struct {
                 .capabilities = self.mcp_elicitation_capabilities,
                 .legacy_url_manual_completion = true,
                 .callback = respondToAskMcpInput,
+                .declined_notice = tellAskMcpDeclined,
             };
         }
         return tc;
@@ -3677,6 +3678,14 @@ fn reportUnapprovedMcpServers(ctx: *AskContext, h: *mcp_host.Host) !void {
         listed = true;
     }
     if (listed) try ctx.writeStderr(". Approve with fx mcp approve <name> before retrying.\n");
+}
+
+/// A question fx declined, as a warning in the transcript, where `fx ask` shows its other notices. The responder
+/// exists only for a terminal, and a terminal has a presenter.
+fn tellAskMcpDeclined(raw_ctx: *anyopaque, text: []const u8) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const presenter = ctx.presenter orelse return;
+    presenter.pushNotice(.{ .topic = "mcp", .tone = .warning, .body = text }) catch |err| debug_trace.logf("mcp", "MCP declined-question notice not sent err={s}", .{@errorName(err)});
 }
 
 fn respondToAskMcpInput(

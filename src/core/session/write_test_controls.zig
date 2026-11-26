@@ -23,6 +23,18 @@ var holds = std.atomic.Value(u32).init(0);
 /// its due records, in place of the file controls.
 pub var test_hold: if (builtin.is_test) ?*const fn (count: usize) void else void = if (builtin.is_test) null else {};
 
+/// Test builds only: an inline test sets it to inspect every batch sent by
+/// `Session.write`. `events_ptr` points to `len` `sm.Event` values when `len > 0`.
+pub var test_write_sink: if (builtin.is_test) ?*const fn (events_ptr: ?*const anyopaque, len: usize) void else void = if (builtin.is_test) null else {};
+
+/// Called by `Session.write` with the batch passed to the session manager.
+pub fn recordWriteBatch(events: anytype) void {
+    if (comptime build_options.libfx) return;
+    if (builtin.is_test) {
+        if (test_write_sink) |sink| sink(if (events.len > 0) @ptrCast(events.ptr) else null, events.len);
+    }
+}
+
 /// Called by a write that took `count` due records, before it appends them.
 pub fn holdDueRecords(count: usize) void {
     if (comptime build_options.libfx) return;
