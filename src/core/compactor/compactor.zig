@@ -35,7 +35,6 @@ const trace = @import("trace.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
-const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -455,14 +454,7 @@ fn appendItems(arena: Allocator, items: *std.ArrayList(summarize.Item), message:
 /// The user's answers in a question tool's result. None when the result does
 /// not list answers, as when the question was not answered.
 fn questionAnswers(arena: Allocator, output: []const u8) Allocator.Error![]const []const u8 {
-    const Answered = struct { answer: []const u8 };
-    const answered = json_decode.parseFromSliceLeaky([]const Answered, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return &.{},
-    };
-    const answers = try arena.alloc([]const u8, answered.len);
-    for (answers, answered) |*answer, item| answer.* = item.answer;
-    return answers;
+    return try types.questionAnswers(arena, output) orelse &.{};
 }
 
 test "a question's result gives the user's answers, not the questions" {

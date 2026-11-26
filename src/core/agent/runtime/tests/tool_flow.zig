@@ -3,6 +3,7 @@ const testing_allocator = @import("../../../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
+const ask_user_question = @import("../../../../tools/agent/ask_user_question.zig");
 const types = @import("../../../shared/types.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const session_runtime = @import("../../../session/session.zig");
@@ -7804,17 +7805,47 @@ test "a question's result is the user's answer, also when toolbox ran it" {
     var batch = runtime_tool_batch.StepBatchState{};
     var suffix: std.ArrayList(ChatMessage) = .empty;
     var completed_tool_names: std.ArrayList([]u8) = .empty;
-    const answers = "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"}]";
-    const cases = [_]struct { call: ToolCall, failed: bool = false, user_answer: bool }{
-        .{ .call = .{ .id = "direct", .name = "ask_user_question", .arguments_json = "{}" }, .user_answer = true },
-        // The call fx runs for a toolbox run, whose result goes back as toolbox's.
-        .{ .call = .{ .id = "carried", .name = "ask_user_question", .arguments_json = "{}", .carried_by = "toolbox" }, .user_answer = true },
-        .{ .call = .{ .id = "failed", .name = "ask_user_question", .arguments_json = "{}" }, .failed = true, .user_answer = false },
+    // The question tool's own results: the user's answer, or fx's note when
+    // the user cancelled, when no one can answer, or when the call is invalid.
+    const User = struct {
+        answer: ?[]const u8,
+        fn request(raw: ?*anyopaque, alloc: std.mem.Allocator, _: []const types.QuestionBatchEntry) anyerror!?[][]u8 {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            const answer = self.answer orelse return null;
+            const answers = try alloc.alloc([]u8, 1);
+            answers[0] = try alloc.dupe(u8, answer);
+            return answers;
+        }
+    };
+    const question = "{\"questions\":[{\"question\":\"Choose next step?\",\"options\":[{\"label\":\"Run tests\"},{\"label\":\"Stop\"}]}]}";
+    var answering: User = .{ .answer = "Run tests" };
+    var cancelling: User = .{ .answer = null };
+    const answered = try ask_user_question.executeWithRequester(arena, question, .{ .ctx = &answering, .response_alloc = arena, .request = User.request });
+    const cancelled = try ask_user_question.executeWithRequester(arena, question, .{ .ctx = &cancelling, .response_alloc = arena, .request = User.request });
+    const invalid = try ask_user_question.executeWithRequester(arena, "{\"questions\":", .{ .ctx = &answering, .response_alloc = arena, .request = User.request });
+    try std.testing.expectEqualStrings("[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"}]", answered);
+    try std.testing.expectEqualStrings(ask_user_question.cancel_sentinel, cancelled);
+    try std.testing.expect(std.mem.startsWith(u8, invalid, "(ask_user_question: invalid arguments"));
+
+    const direct: ToolCall = .{ .id = "direct", .name = "ask_user_question", .arguments_json = "{}" };
+    // The call fx runs for a toolbox run, whose result goes back as toolbox's.
+    const carried: ToolCall = .{ .id = "carried", .name = "ask_user_question", .arguments_json = "{}", .carried_by = "toolbox" };
+    const cases = [_]struct { call: ToolCall, output: ?[]const u8 = null, failed: bool = false, user_answer: bool }{
+        .{ .call = direct, .user_answer = true },
+        .{ .call = carried, .user_answer = true },
+        .{ .call = direct, .failed = true, .user_answer = false },
         .{ .call = .{ .id = "search", .name = "toolbox", .arguments_json = "{\"search\":\"files\"}" }, .user_answer = false },
         .{ .call = .{ .id = "read", .name = "read_file", .arguments_json = "{}" }, .user_answer = false },
+        // A note is never the user's answer, though the tool returns it as a success.
+        .{ .call = direct, .output = cancelled, .user_answer = false },
+        .{ .call = carried, .output = cancelled, .user_answer = false },
+        .{ .call = direct, .output = ask_user_question.not_available_sentinel, .user_answer = false },
+        .{ .call = carried, .output = ask_user_question.not_available_sentinel, .user_answer = false },
+        .{ .call = direct, .output = invalid, .user_answer = false },
+        .{ .call = carried, .output = invalid, .user_answer = false },
     };
     for (cases) |case| {
-        try runtime_tool_batch.appendToolResultContent(arena, &suffix, &completed_tool_names, &batch, case.call, answers, null, .{ .increment_error = case.failed });
+        try runtime_tool_batch.appendToolResultContent(arena, &suffix, &completed_tool_names, &batch, case.call, case.output orelse answered, null, .{ .increment_error = case.failed });
         const message = suffix.items[suffix.items.len - 1];
         try std.testing.expectEqualStrings(case.call.calledName(), message.tool_name.?);
         try std.testing.expectEqual(case.user_answer, message.user_answer);

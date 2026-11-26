@@ -953,6 +953,16 @@ async function reviewRequestAfterAnswer(
   await assertProcessAliveAndClean(ctx);
   const reviews = ctx.gateway.classifierRequests.filter((request) => request.body.includes(ANSWER_REVIEWED_COMMAND));
   expect(reviews).toHaveLength(1);
+  // The model gets the answer as the result of the call it made, by that
+  // call's name, as it did before fx marked the answer for the review.
+  const sent = (JSON.parse(ctx.gateway.requests[1]!.body) as { prompt: Array<{ content: unknown }> }).prompt
+    .flatMap((message) => Array.isArray(message.content) ? message.content as Array<Record<string, unknown>> : [])
+    .filter((part) => part.type === "tool-result" && part.toolCallId === questionCall.id);
+  expect(sent).toHaveLength(1);
+  expect(sent[0]).toMatchObject({
+    toolName: questionCall.name,
+    output: { type: "text", value: `[{"question":"${QUESTION_PROMPT}","answer":"Run tests"}]` },
+  });
   return reviews[0]!.body;
 }
 

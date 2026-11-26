@@ -2375,28 +2375,39 @@ test "prior tool result evidence is byte bounded unmasked and terminal safe" {
 }
 
 test "question tool answers are user answers in review evidence" {
+    const alloc = std.testing.allocator;
     const pending_calls = [_]types.ToolCall{.{ .id = "pending", .name = "shell", .arguments_json = "{}" }};
+    const answered = "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"}]";
+    const cancelled = "(user cancelled the question)";
     // Marked as fx marks a result where it makes it (`types.isUserAnswer`).
     const messages = [_]types.ChatMessage{
-        .{ .role = .tool, .content = "ANSWERED", .tool_call_id = "ask-1", .tool_name = "ask_user_question", .tool_result_status = .success, .user_answer = types.isUserAnswer("ask_user_question", .success) },
-        .{ .role = .tool, .content = "ASK_FAILED", .tool_call_id = "ask-2", .tool_name = "ask_user_question", .tool_result_status = .failure, .user_answer = types.isUserAnswer("ask_user_question", .failure) },
+        .{ .role = .tool, .content = answered, .tool_call_id = "ask-1", .tool_name = "ask_user_question", .tool_result_status = .success, .user_answer = try types.isUserAnswer(alloc, "ask_user_question", .success, answered) },
+        .{ .role = .tool, .content = "ASK_FAILED", .tool_call_id = "ask-2", .tool_name = "ask_user_question", .tool_result_status = .failure, .user_answer = try types.isUserAnswer(alloc, "ask_user_question", .failure, "ASK_FAILED") },
         .{ .role = .tool, .content = "FILE_TEXT", .tool_call_id = "read-1", .tool_name = "read_file" },
         // A question asked through toolbox: its result goes back as toolbox's.
-        .{ .role = .tool, .content = "TOOLBOX_ANSWERED", .tool_call_id = "ask-3", .tool_name = "toolbox", .tool_result_status = .success, .user_answer = types.isUserAnswer("ask_user_question", .success) },
+        .{ .role = .tool, .content = answered, .tool_call_id = "ask-3", .tool_name = "toolbox", .tool_result_status = .success, .user_answer = try types.isUserAnswer(alloc, "ask_user_question", .success, answered) },
+        // fx's note for a cancelled question is a success, but no answer.
+        .{ .role = .tool, .content = cancelled, .tool_call_id = "ask-4", .tool_name = "ask_user_question", .tool_result_status = .success, .user_answer = try types.isUserAnswer(alloc, "ask_user_question", .success, cancelled) },
         .{ .role = .assistant, .tool_calls = &pending_calls },
     };
-    const selected = try selectPriorToolResults(std.testing.allocator, &messages, "pending");
-    defer std.testing.allocator.free(selected.entries);
-    try std.testing.expectEqual(@as(usize, 4), selected.entries.len);
+    const selected = try selectPriorToolResults(alloc, &messages, "pending");
+    defer alloc.free(selected.entries);
+    try std.testing.expectEqual(@as(usize, 5), selected.entries.len);
     try std.testing.expect(selected.entries[0].user_answer);
     try std.testing.expect(!selected.entries[1].user_answer);
     try std.testing.expect(!selected.entries[2].user_answer);
     try std.testing.expect(selected.entries[3].user_answer);
+    try std.testing.expect(!selected.entries[4].user_answer);
 
-    var rendered = try renderPriorToolResult(std.testing.allocator, 0, selected.entries[0]);
-    defer rendered.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, rendered.text, "prior_tool_result[0].user_answer: ANSWERED") != null);
+    var rendered = try renderPriorToolResult(alloc, 0, selected.entries[0]);
+    defer rendered.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, rendered.text, "prior_tool_result[0].user_answer: " ++ answered) != null);
     try std.testing.expect(std.mem.find(u8, rendered.text, "content_untrusted") == null);
+
+    var rendered_cancel = try renderPriorToolResult(alloc, 4, selected.entries[4]);
+    defer rendered_cancel.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, rendered_cancel.text, "prior_tool_result[4].content_untrusted: " ++ cancelled) != null);
+    try std.testing.expect(std.mem.find(u8, rendered_cancel.text, "user_answer") == null);
 }
 
 const ProofFixture = struct {
