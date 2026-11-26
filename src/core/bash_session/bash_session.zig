@@ -268,6 +268,20 @@ pub const Session = struct {
 
     /// The folder the next program starts in, or null for the workspace root.
     /// The slice is valid until the next `refreshStartFolder` or `deinit`.
+    /// The folder a program's `$FX_OUT` names when its host gives none: `out/` in
+    /// the session folder. It is made 0700 on the first call, and removing the
+    /// session folder removes it. The caller owns the result.
+    pub fn outFolder(self: *const Session, io: std.Io, alloc: std.mem.Allocator) ![]u8 {
+        const dir = self.dir orelse return error.SessionNotPrepared;
+        const path = try alloc.print("{s}/out", .{dir});
+        errdefer alloc.free(path);
+        std.Io.Dir.cwd().createDir(io, path, .fromMode(0o700)) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        return path;
+    }
+
     pub fn startFolder(self: *const Session) ?[]const u8 {
         return self.start_folder;
     }
@@ -1036,6 +1050,27 @@ test "the script quotes the session folder, keeps the header, and installs the s
     try std.testing.expectEqualStrings("__fx_status='/tmp/a'\\''b/save-status'", lines.next().?);
     try std.testing.expect(std.mem.find(u8, script, "trap '{ __fx_save; } 2>/dev/null' EXIT\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, script, "\\builtin trap '{ __fx_save; } 2>/dev/null' EXIT\n"));
+}
+
+test "the no-save folder is out/ in the session folder, made on first use, and removed with it" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    var session = Session.init(alloc);
+    defer _ = session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables, test_fx_binary);
+    const out = try session.outFolder(io, alloc);
+    defer alloc.free(out);
+    const want = try alloc.print("{s}/out", .{session.dir.?});
+    defer alloc.free(want);
+    try std.testing.expectEqualStrings(want, out);
+    var made = try std.Io.Dir.cwd().openDir(io, out, .{});
+    made.close(io);
+    _ = session.deinit(io);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openDir(io, out, .{}));
 }
 
 test "the bash script keeps the reviewed bytes" {

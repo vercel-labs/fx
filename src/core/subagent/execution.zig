@@ -110,6 +110,21 @@ test "a hosted run's turn context leaves saving to the child's own agent" {
     try std.testing.expect(!turn.committed);
 }
 
+test "a subagent child's bash results folder is the child's own, not its parent's" {
+    const alloc = std.testing.allocator;
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const child = try parent.openChild("child-results", &.{});
+    defer child.close();
+    var turn = try TurnContext.init(alloc, child, 0);
+    defer turn.deinit();
+    const source = turn.bashResultsFolder() orelse return error.TestUnexpectedResult;
+    const folder = try source.resolve(source.context);
+    try std.testing.expectEqualStrings(try child.bashResultsPath(), folder);
+    try std.testing.expect(!std.mem.eql(u8, try parent.parent.bashResultsPath(), folder));
+}
+
 test "child compaction preserves work identity and permits final commit" {
     const alloc = std.testing.allocator;
     var parent: child_state.TestParent = undefined;
@@ -378,6 +393,13 @@ pub const TurnContext = struct {
             .bash_session = bash_session.Session.init(alloc),
             .child = null,
         };
+    }
+
+    /// The bash results folder of this turn's child session; null for a hosted run,
+    /// whose child's own agent holds the session.
+    pub fn bashResultsFolder(self: *const TurnContext) ?tool_dispatch.BashResultsFolder {
+        const child = self.child orelse return null;
+        return .{ .context = child, .resolve = session_adapter.Session.resolveBashResults };
     }
 
     fn workspaceCaptureContext(self: *TurnContext) ?turn_capture.Context {

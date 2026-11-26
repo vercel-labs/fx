@@ -243,6 +243,7 @@ pub const Context = struct {
     terminal_client: ?*terminal_client_runtime.Runtime = null,
     managed_executions: ?*managed_execution.Runtime = null,
     bash_session: ?*bash_session.Session = null,
+    bash_results_folder: ?tool_dispatch.BashResultsFolder = null,
     command_timeout_ms: ?usize = null,
     command_timeout_started_ms: ?i64 = null,
     command_replay_capture: ?*command_replay_store.Capture = null,
@@ -3064,6 +3065,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .terminal_client = ctx.terminal_client,
         .managed_executions = ctx.managed_executions,
         .bash_session = ctx.bash_session,
+        .bash_results_folder = ctx.bash_results_folder,
         .command_artifact_dir = ctx.command_artifact_dir,
         .terminal_owner_session_id = ctx.lifecycle_scope.session_id,
         .terminal_transport_role = switch (ctx.lifecycle_scope.kind) {

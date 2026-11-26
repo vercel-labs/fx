@@ -262,6 +262,14 @@ pub fn closeBashSession(session: *bash_session.Session, io: std.Io) void {
     if (left > 0) debug_trace.logf("bash", "bash session folder left behind count={d}", .{left});
 }
 
+/// A host's bash results folder, asked for when a bash program starts, so a
+/// session that runs no bash program makes no folder. `resolve` returns its
+/// absolute path, which stays valid until the host ends its session.
+pub const BashResultsFolder = struct {
+    context: *anyopaque,
+    resolve: *const fn (context: *anyopaque) anyerror![]const u8,
+};
+
 /// Context shared by core tool dispatch, validation, and execution.
 pub const DispatchContext = struct {
     allocator: Allocator,
@@ -295,6 +303,10 @@ pub const DispatchContext = struct {
     /// This agent's saved bash state for the bash tool
     /// (`src/core/bash_session/bash_session.zig`); null where the host has none.
     bash_session: ?*bash_session.Session = null,
+    /// Where the bash tool's results folder (`$FX_OUT`) comes from, asked for when a
+    /// bash program starts. Null where the host has none: bash then uses `out/` in
+    /// its session folder.
+    bash_results_folder: ?BashResultsFolder = null,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,

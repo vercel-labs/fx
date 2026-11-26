@@ -1959,6 +1959,9 @@ pub const Session = struct {
     /// `~/.fx/session-files/{id}`, owned: where an older session kept its
     /// side files, read once by the move (D47).
     files_path: []u8,
+    /// This session's bash results folder, `~/.fx/results/{id}`, owned. Made by
+    /// `bashResultsPath` on first use, and freed with the session.
+    results_path: ?[]u8 = null,
     /// The session's blobs, shared with every capability over it (D44).
     host: *BlobHost,
     capability: ?session_child_store.SessionChildCapability = null,
@@ -2356,6 +2359,7 @@ pub const Session = struct {
         if (self.instructions) |value| alloc.free(value);
         if (self.first_title) |value| alloc.free(value);
         alloc.free(self.files_path);
+        if (self.results_path) |path| alloc.free(path);
         alloc.destroy(self);
     }
 
@@ -2390,6 +2394,21 @@ pub const Session = struct {
         defer self.alloc.free(terminal_path);
         self.capability = try session_child_store.SessionChildCapability.initBlobs(self.alloc, self.host.blobs(), terminal_path, .writable);
         return &self.capability.?;
+    }
+
+    /// The absolute path of this session's bash results folder, made on the first
+    /// call and kept until the session closes.
+    pub fn bashResultsPath(self: *Session) ![]const u8 {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.results_path == null) self.results_path = try self.resultFolderPath(self.alloc);
+        return self.results_path.?;
+    }
+
+    /// `tool_dispatch.BashResultsFolder.resolve` for a v2 session.
+    pub fn resolveBashResults(context: *anyopaque) anyerror![]const u8 {
+        const self: *Session = @ptrCast(@alignCast(context));
+        return self.bashResultsPath();
     }
 
     /// Creates `~/.fx/results/{id}` with mode `0700` and returns its absolute
@@ -14755,6 +14774,21 @@ test "forkSession copies side folders, never a link, and reports when one is ski
     defer testing.allocator.free(top);
     try testing.expectEqualStrings("top", top);
     try testing.expectError(error.FileNotFound, dir.access(io, "link", .{ .follow_symlinks = false }));
+}
+
+test "the bash results folder is kept once per session and differs between sessions" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const first = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer first.close();
+    const second = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer second.close();
+    const first_path = try first.bashResultsPath();
+    try testing.expect(std.mem.endsWith(u8, first_path, first.id()));
+    try testing.expectEqual(first_path.ptr, (try first.bashResultsPath()).ptr);
+    try testing.expect(!std.mem.eql(u8, first_path, try second.bashResultsPath()));
 }
 
 test "forkSession copies results/ and skips symlinks" {

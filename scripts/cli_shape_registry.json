@@ -81,6 +81,10 @@
       "job": "internal",
       "stability": "internal"
     },
+    "FX_OUT": {
+      "job": "internal",
+      "stability": "internal"
+    },
     "FX_PERMISSION_MODE": {
       "job": "setting-override",
       "stability": "stable"

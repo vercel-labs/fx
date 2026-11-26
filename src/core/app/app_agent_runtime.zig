@@ -48,6 +48,7 @@ const tool_args = @import("../tooling/tool_args.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
 const tool_projection_mod = @import("../tooling/tool_projection.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
+const session_adapter = @import("../session/session_adapter.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const context_contract = @import("../workspace/context_contract.zig");
@@ -462,6 +463,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     null,
                 .bash_session = if (comptime agents.hasAgentField(App, "bash_session")) &agent.bash_session else null,
+                .bash_results_folder = if (comptime agents.hasAgentField(App, "session_persistence")) if (agent.session_persistence.v2) |v2| tool_dispatch.BashResultsFolder{ .context = v2, .resolve = session_adapter.Session.resolveBashResults } else null else null,
                 .ephemeral_command_replay = if (comptime agents.hasAgentField(App, "managed_executions"))
                     agent.managed_executions.replayStore()
                 else

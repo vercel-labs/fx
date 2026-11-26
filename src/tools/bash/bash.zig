@@ -3,6 +3,7 @@
 //! for the running one. The tool spec is in src/builtins/bash_tools.zig.
 const std = @import("std");
 const bash_session = @import("../../core/bash_session/bash_session.zig");
+const bash_results = @import("../../core/bash_results/bash_results.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const mem_utils = @import("../../core/shared/mem_utils.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
@@ -69,7 +70,7 @@ const send_without_action_text = "send " ++ bash_session.wait_word ++ " without 
 
 /// The variables fx adds to every bash program. The saved state never holds
 /// them, so the session skips them by these names.
-const fx_variables = [_][]const u8{managed_execution.agent_variable} ++ tool_bridge.variable_names;
+const fx_variables = [_][]const u8{ managed_execution.agent_variable, bash_results.variable_name } ++ tool_bridge.variable_names;
 
 /// How long a call waits before it reports that the program is still running.
 pub const program_yield_ms: u32 = managed_contract.default_yield_time_ms;
@@ -203,6 +204,14 @@ fn approvedFingerprint(authority: command_admission.CommandExecutionAuthority) c
     };
 }
 
+/// The folder `$FX_OUT` names for a program that starts now: the host's folder,
+/// which the host makes on its first use, else `out/` in the session folder.
+/// Borrowed from the host, or owned by `arena`.
+fn bashResultsFolder(ctx: tool_dispatch.DispatchContext, session: *bash_session.Session, arena: Allocator) anyerror![]const u8 {
+    if (ctx.bash_results_folder) |source| return source.resolve(source.context);
+    return session.outFolder(io_mod.getIo(), arena);
+}
+
 /// Starts `command` as this session's program and waits up to `yield_ms` for its
 /// result. A session whose program is still running starts no other.
 fn callRun(
@@ -263,6 +272,9 @@ fn callRun(
         .environment = environment,
     };
     if (!approvedFingerprint(authority).matches(starts_in)) return failureWithNote(ctx, folder_changed_text, notes);
+    // The folder the host gives, made now that a program starts, or else `out/` in the session folder.
+    // Before the program is set, so a folder that cannot be made starts no program.
+    const results_folder = bashResultsFolder(ctx, session, request_arena) catch |err| return runtimeFailure(ctx, err);
     var execution_id_buffer: [64]u8 = undefined;
     const execution_id = runtime.generatedId(&execution_id_buffer) catch |err| return runtimeFailure(ctx, err);
     // Set before the start, so a failed start never leaves an untracked program.
@@ -277,7 +289,12 @@ fn callRun(
         };
     } else null;
     defer if (comptime tool_bridge.supported) if (bridge_registration) |registration| tool_bridge.unregister(registration);
-    const extra_environment: []const managed_execution.EnvironmentVariable = if (bridge_registration) |registration| registration.environment() else &.{};
+    // The bridge's variables, then `$FX_OUT`. The saved state never keeps `$FX_OUT` (`fx_variables`).
+    var program_environment: std.ArrayList(managed_execution.EnvironmentVariable) = .empty;
+    if (bridge_registration) |registration| {
+        program_environment.appendSlice(request_arena, registration.environment()) catch |err| return startFailure(ctx, err, null, notes);
+    }
+    program_environment.append(request_arena, .{ .name = bash_results.variable_name, .value = results_folder }) catch |err| return startFailure(ctx, err, null, notes);
     // A save record that a program left after it ended, with its end never
     // delivered, is this program's to report. It is taken here, just before this
     // program starts, and its notice goes into this program's result.
@@ -288,7 +305,7 @@ fn callRun(
         .cwd = folder,
         .environment = environment,
         .authority = authority,
-        .extra_environment = extra_environment,
+        .extra_environment = program_environment.items,
         .after_startup = after_startup,
         .yield_hold = if (bridge_registration) |registration| &registration.hold else null,
         .max_output_bytes = ctx.max_command_output_bytes,
@@ -2133,4 +2150,99 @@ test "a program starts in the folder the session holds, not one the saved state 
     const expected = try alloc.print("{s}\n", .{bash.workspace});
     defer alloc.free(expected);
     try std.testing.expectEqualStrings(expected, try outcomeText(pwd, true));
+}
+
+/// A host's results folder for a test: a path the test made, or an error the host reports.
+const FakeResults = struct {
+    path: []const u8,
+    fail: ?anyerror = null,
+
+    fn resolve(context: *anyopaque) anyerror![]const u8 {
+        const self: *FakeResults = @ptrCast(@alignCast(context));
+        if (self.fail) |err| return err;
+        return self.path;
+    }
+
+    fn source(self: *FakeResults) tool_dispatch.BashResultsFolder {
+        return .{ .context = self, .resolve = resolve };
+    }
+};
+
+test "a bash program sees FX_OUT as the absolute folder its host gives it" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try alloc.print("{s}/results", .{bash.workspace});
+    defer alloc.free(folder);
+    try std.Io.Dir.cwd().createDir(bash.io, folder, .fromMode(0o700));
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+    const command = "echo \"$FX_OUT\"; test -d \"$FX_OUT\" && echo isdir";
+    try bash.authorize(&ctx, command);
+    const result = try callRun(ctx, command, program_yield_ms);
+    defer result.deinit(alloc);
+    const text = try outcomeText(result, true);
+    try std.testing.expect(std.mem.find(u8, text, folder) != null);
+    try std.testing.expect(std.mem.find(u8, text, "isdir") != null);
+}
+
+test "FX_OUT is not saved with the bash state, so a later program gets the current folder" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try alloc.print("{s}/results", .{bash.workspace});
+    defer alloc.free(folder);
+    try std.Io.Dir.cwd().createDir(bash.io, folder, .fromMode(0o700));
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+    const command = "export FX_OUT=/somewhere/else; y=1";
+    try bash.authorize(&ctx, command);
+    const result = try callRun(ctx, command, program_yield_ms);
+    defer result.deinit(alloc);
+    _ = try outcomeText(result, true);
+    var dir = try std.Io.Dir.cwd().openDir(bash.io, bash.session.dir.?, .{});
+    defer dir.close(bash.io);
+    const state = try dir.readFileAlloc(bash.io, "state.sh", alloc, .limited(1 << 20));
+    defer alloc.free(state);
+    try std.testing.expect(std.mem.find(u8, state, "y=") != null);
+    try std.testing.expect(std.mem.find(u8, state, "FX_OUT") == null);
+}
+
+test "without a host folder, FX_OUT is out/ in the bash session folder" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const command = "echo \"$FX_OUT\"";
+    try bash.authorize(&ctx, command);
+    const result = try callRun(ctx, command, program_yield_ms);
+    defer result.deinit(alloc);
+    const text = try outcomeText(result, true);
+    const expected = try alloc.print("{s}/out", .{bash.session.dir.?});
+    defer alloc.free(expected);
+    try std.testing.expect(std.mem.find(u8, text, expected) != null);
+    var made = try std.Io.Dir.cwd().openDir(bash.io, expected, .{});
+    made.close(bash.io);
+}
+
+test "a host folder that cannot be made refuses the call before any program starts" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    var results: FakeResults = .{ .path = "", .fail = error.AccessDenied };
+    ctx.bash_results_folder = results.source();
+    const command = "echo never";
+    try bash.authorize(&ctx, command);
+    const refused = try callRun(ctx, command, program_yield_ms);
+    defer refused.deinit(alloc);
+    const text = try outcomeText(refused, false);
+    try std.testing.expect(std.mem.startsWith(u8, text, "bash could not run the program: AccessDenied."));
+    try std.testing.expect(bash.session.program() == null);
 }

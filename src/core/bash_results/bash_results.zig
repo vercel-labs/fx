@@ -7,8 +7,11 @@ const std = @import("std");
 
 const Writer = std.Io.Writer;
 
+/// The variable that names the results folder to a bash program.
+pub const variable_name = "FX_OUT";
+
 /// The folder the model reads a saved output from, as the program and the model see it.
-pub const shown_folder = "$FX_OUT";
+pub const shown_folder = "$" ++ variable_name;
 
 /// What the model sees inline, and how much of a long output it sees.
 pub const Limits = struct {

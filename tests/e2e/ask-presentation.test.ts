@@ -1539,6 +1539,87 @@ describe("fx ask with experimental.bash_tool", () => {
     expect(toolResultText(gateway.requests[2]!.body, "bash-add")).toContain("42");
   }, TIMEOUT);
 
+  test("FX_OUT names a private results folder under the profile for a saved ask", async () => {
+    const root = createRoot();
+    const command = 'echo "$FX_OUT"; test -d "$FX_OUT" && echo isdir';
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-out", "bash", { command }),
+      fakeGatewayFinalText("Printed.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Show FX_OUT."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const text = toolResultText(gateway.requests[1]!.body, "bash-out");
+    const results = join(root.home, ".fx", "results");
+    expect(text).toContain(`${results}/`);
+    expect(text).toContain("isdir");
+    expect(existsSync(results)).toBe(true);
+  }, TIMEOUT);
+
+  test("with --no-save, FX_OUT is out/ in the bash session folder, and no results folder is made", async () => {
+    const root = createRoot();
+    const command = 'echo "$FX_OUT"; test -d "$FX_OUT" && echo isdir';
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-out", "bash", { command }),
+      fakeGatewayFinalText("Printed.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Show FX_OUT."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const text = toolResultText(gateway.requests[1]!.body, "bash-out");
+    expect(text).toMatch(/\/fx-bash-\d+-[0-9a-f]{16}\/out/);
+    expect(text).toContain("isdir");
+    expect(existsSync(join(root.home, ".fx", "results"))).toBe(false);
+  }, TIMEOUT);
+
+  test("a saved ask that runs no bash program makes no results folder", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([fakeGatewayFinalText("No tools.\n")]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Say hello."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    expect(existsSync(join(root.home, ".fx", "results"))).toBe(false);
+  }, TIMEOUT);
+
+  test("the shell tool gets no FX_OUT", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell-out", "shell", {
+        request: { action: "run", command: 'echo "[$FX_OUT]"', yield_time_ms: 30_000 },
+      }),
+      fakeGatewayFinalText("Printed.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", "--no-save", "Show FX_OUT."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    expect(toolResultText(gateway.requests[1]!.body, "shell-out")).toContain("[]");
+    expect(existsSync(join(root.home, ".fx", "results"))).toBe(false);
+  }, TIMEOUT);
+
   test("a bash state over the size cap is not saved, and the result says so", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([
