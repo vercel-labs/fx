@@ -1715,6 +1715,16 @@ const hardStopMs = 2000;
 
 const durableInternals = Symbol.for("libfx.durableInternals");
 
+// The longest bound a hand-off takes: setTimeout runs a longer delay at once.
+const maxHandOffMs = 2 ** 31 - 1;
+
+// Returns `within`, a hand-off's bound, or throws a TypeError that names it
+// as `name`. Undefined means no bound.
+export function checkHandOffBound(within, name) {
+  if (within === undefined || (Number.isFinite(within) && within >= 0 && within <= maxHandOffMs)) return within;
+  throw new TypeError(`${name} must be a number of milliseconds from 0 to ${maxHandOffMs}`);
+}
+
 // Asks a harness turn to stop at its next safe point. A turn without
 // `yield()` is cut off at the hand-off's bound instead.
 const askToYield = (turn) => {
@@ -2140,17 +2150,24 @@ class SessionWorker {
       ? setTimeout(this.stopNow, deadline - stopMargin - Date.now())
       : null;
     // A host handing this process off (agent.handOff()) stops the turn at its
-    // next safe point and starts no other; at `withinMs` it cuts the turn off
-    // as the deadline does (tests/tla/sdk/DurableHandOff.tla Yield, HDeadline).
+    // next safe point and starts no other; at `cutAt`, in ms since the epoch,
+    // it cuts the turn off as the deadline does (tests/tla/sdk/DurableHandOff.tla
+    // Yield, HDeadline). A null `cutAt` sets no bound, and the earliest
+    // `cutAt` any hand-off asked for holds.
     let handOffStop = null;
-    this.handOff = (withinMs) => {
-      if (this.handingOff) return;
-      this.handingOff = true;
-      this.yielding = askToYield(turnNow);
-      if (withinMs !== undefined) handOffStop = setTimeout(() => this.stopNow("handoff"), withinMs);
+    let handOffCutAt = null;
+    this.handOff = (cutAt) => {
+      if (!this.handingOff) {
+        this.handingOff = true;
+        this.yielding = askToYield(turnNow);
+      }
+      if (cutAt === null || (handOffCutAt !== null && handOffCutAt <= cutAt)) return;
+      handOffCutAt = cutAt;
+      clearTimeout(handOffStop);
+      handOffStop = setTimeout(() => this.stopNow("handoff"), Math.max(0, cutAt - Date.now()));
     };
     const handOffAsked = agent.handOffRequest();
-    if (handOffAsked) this.handOff(handOffAsked.within);
+    if (handOffAsked) this.handOff(handOffAsked.cutAt);
     let harness = null;
     let harnessRun = runOf(null);
     this.settled = () => (harness ? harness.settled() : Promise.resolve());
@@ -2916,6 +2933,8 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
       const worker = hold(created, message.sessionId);
       // A process handing off takes no new work: the queue delivers the message
       // again, to another process (tests/tla/sdk/DurableHandOff.tla HStart).
+      // The request that took the prompt awaits the backstop and answers its
+      // failure; with no worker to wait on it here, it is only marked handled.
       if (handOffRequest) void backstop?.catch(() => {});
       let work = handOffRequest ? Promise.resolve({ timeoutSeconds: runningBackstopSeconds }) : worker.consume(message, delivery, handoff, backstop);
       if (inRequest) {
@@ -3440,11 +3459,13 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
        * off as at its deadline. Resolves once this process let its sessions go.
        */
       async handOff({ within } = {}) {
-        if (within !== undefined && !(Number.isFinite(within) && within >= 0)) {
-          throw new TypeError("handOff() within must be a number of milliseconds, 0 or more");
-        }
-        handOffRequest ??= { within };
-        for (const worker of workers.values()) worker.handOff?.(handOffRequest.within);
+        checkHandOffBound(within, "handOff() within");
+        // The earliest cut-off any call asked for holds, so a later bound,
+        // such as SIGTERM's, still cuts off a turn an earlier call left unbounded.
+        const cutAt = within === undefined ? null : Date.now() + within;
+        handOffRequest ??= { cutAt: null };
+        if (cutAt !== null && (handOffRequest.cutAt === null || cutAt < handOffRequest.cutAt)) handOffRequest.cutAt = cutAt;
+        for (const worker of workers.values()) worker.handOff?.(handOffRequest.cutAt);
         while (active.size > 0) await Promise.allSettled([...active]);
       },
       /** Waits for the work this process is running, then lets go. */

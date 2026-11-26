@@ -397,6 +397,35 @@ if (durabilityKind !== "local") {
     await first.close();
     await second.close();
   });
+
+  test("a later hand-off's bound cuts off a step that an earlier hand-off without one left running", async () => {
+    const durability = await durabilityFor();
+    const events = [];
+    const first = createAgent({ durability, onEvent: (event) => { if (event.type === "session.handoff" || event.type === "session.deadline") events.push(event.type); } });
+    const second = createAgent({ durability });
+    const session = first.session();
+    let started;
+    const holding = new Promise((resolve) => { started = resolve; });
+    holds.set("phi2-1", { started: () => started(), released: new Promise(() => {}) });
+    const before = ran.length;
+    // An agent joins its process's queue once used.
+    await second.newSessionId();
+    const turn = session.prompt("phi2", { messageId: "turn-phi2" });
+    await holding;
+    holds.delete("phi2-1");
+    // Without a bound, the first hand-off waits on a step that never returns;
+    // the second one's bound cuts it off, as SIGTERM's does after a deploy's.
+    const unbounded = first.handOff();
+    await first.handOff({ within: 20 });
+    await unbounded;
+    assert.deepEqual(events, ["session.handoff"]);
+    const { text, result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "phi2-0 phi2-1 phi2-2");
+    assert.deepEqual(ran.slice(before), ["turn-phi2:0", "turn-phi2:1", "turn-phi2:2"], "the cut-off step ran once, in the next delivery");
+    await first.close();
+    await second.close();
+  });
 }
 
 if (durabilityKind === "local") {
@@ -446,10 +475,13 @@ test("an agent that took a hand-off sends each delivery back to the queue unread
   await agent.close();
 });
 
-test("a hand-off's bound must be a number of milliseconds", async () => {
+test("a hand-off's bound must be a number of milliseconds a timer can wait", async () => {
   const agent = createAgent({ durability: await durabilityFor() });
   await assert.rejects(agent.handOff({ within: -1 }), TypeError);
   await assert.rejects(agent.handOff({ within: "5" }), TypeError);
+  // setTimeout runs a longer delay at once, which would cut every turn off.
+  await assert.rejects(agent.handOff({ within: 2 ** 31 }), TypeError);
+  await agent.handOff({ within: 2 ** 31 - 1 });
   await agent.close();
 });
 

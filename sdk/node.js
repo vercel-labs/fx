@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { bundledAssetUrl } from "./bundled-asset.js";
 import { CoreOutput } from "./core-output.js";
 import { fetchCleanupAction, cleanupTimeoutMs, cleanupByteLimit, retryAfterSeconds } from "./fetch-cleanup.js";
-import { createDurableAgentFactory, memory, wakeHandler } from "./durable.js";
+import { checkHandOffBound, createDurableAgentFactory, memory, wakeHandler } from "./durable.js";
 import { fxHarness } from "./fx-harness.js";
 import {
   createFxEngine as createEngine,
@@ -745,11 +745,11 @@ export function createFxAgent(options = {}) {
 function sigtermBound(option) {
   if (option === false) return null;
   if (option === true) return sigtermHandOffMs;
-  if (option !== null && typeof option === "object" && !Array.isArray(option)) {
-    const { within = sigtermHandOffMs } = option;
-    if (Number.isFinite(within) && within >= 0) return within;
+  if (option === null || typeof option !== "object" || Array.isArray(option)) {
+    throw new TypeError("createFxAgent() handOffOnSigterm must be true, false, or { within }");
   }
-  throw new TypeError("createFxAgent() handOffOnSigterm must be true, false, or { within } in milliseconds");
+  const { within = sigtermHandOffMs } = option;
+  return checkHandOffBound(within, "createFxAgent() handOffOnSigterm within");
 }
 
 // The agent hands off on SIGTERM until it closes.

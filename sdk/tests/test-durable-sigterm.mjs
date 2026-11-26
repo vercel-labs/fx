@@ -259,6 +259,7 @@ test("one SIGTERM listener serves every agent, and close() removes it", async ()
     assert.equal(process.listenerCount("SIGTERM"), before);
     assert.throws(() => createFxAgent({ handOffOnSigterm: "yes" }), { name: "TypeError" });
     assert.throws(() => createFxAgent({ handOffOnSigterm: { within: -1 } }), { name: "TypeError" });
+    assert.throws(() => createFxAgent({ handOffOnSigterm: { within: 2 ** 31 } }), { name: "TypeError" });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

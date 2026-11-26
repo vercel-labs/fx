@@ -2262,13 +2262,22 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
     let finished = false;
     let cancelled = false;
     let yieldSent = null;
-    const sendYield = () => {
-      if (finished || cancelled || activeTurn !== turn || closing) return undefined;
-      if (typeof runtime.requestYield === "function") {
-        runtime.requestYield();
-        return undefined;
-      }
-      return request("libfx/yield", { sessionId }).then(() => undefined);
+    // Asks the core about this turn's running prompt: with the runtime's own
+    // `direct` call when it has one (WebAssembly), or else with `method`. It
+    // asks once the prompt starts, and not at all when the prompt never starts
+    // or the turn has ended.
+    const askCore = (direct, method) => {
+      const send = () => {
+        if (finished || cancelled || activeTurn !== turn || closing) return undefined;
+        if (typeof runtime[direct] === "function") {
+          runtime[direct]();
+          return undefined;
+        }
+        return request(method, { sessionId }).then(() => undefined);
+      };
+      return promptStarted && resolvePromptStart
+        ? promptStarted.then((started) => (started === true ? send() : undefined))
+        : Promise.resolve().then(send);
     };
     const turn = {
       // The host's id: the one it gave, or for a resumed turn, the one the
@@ -2334,9 +2343,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       // or the next agent continues it. Resolves once the core has the request.
       yield() {
         if (!journal) throw new TypeError("a yield needs persistence to keep the turn in");
-        yieldSent ??= (promptStarted && resolvePromptStart
-          ? promptStarted.then((started) => (started === true ? sendYield() : undefined))
-          : Promise.resolve().then(sendYield));
+        yieldSent ??= askCore("requestYield", "libfx/yield");
         return yieldSent;
       },
       // For libfx's session worker: a steer that cannot join the turn, such
@@ -2344,16 +2351,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       // while the model streams a reply, so that steer can run next.
       [engineInternals]: {
         endForSteer() {
-          const send = () => {
-            if (finished || cancelled || activeTurn !== turn || closing) return undefined;
-            if (typeof runtime.handOffSteering === "function") {
-              runtime.handOffSteering();
-              return undefined;
-            }
-            return request("libfx/handoff", { sessionId }).then(() => undefined);
-          };
-          const sent = promptStarted && resolvePromptStart ? promptStarted.then((started) => (started === true ? send() : undefined)) : Promise.resolve().then(send);
-          return sent.catch(() => {});
+          return askCore("handOffSteering", "libfx/handoff").catch(() => {});
         },
       },
       cancel(cancelOptions = {}) {
