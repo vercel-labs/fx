@@ -3160,17 +3160,21 @@ pub const Session = struct {
         return false;
     }
 
-    /// A copy of `execution` in which each tool result without a result file
-    /// has the one the commit gives it (`session_log.externalizeConversationTurnResults`):
-    /// the same handle, size and preview, so its streamed piece is the
-    /// committed one. A result backed only by its command replay has no file
-    /// before then. Each file is written once a turn.
+    /// A copy of `execution` in which each tool result has what the commit
+    /// gives it (`session_log.externalizeConversationTurnResults`): the same
+    /// preview, and, without a result file, the same handle and size, so its
+    /// streamed piece is the committed one. A result backed only by its
+    /// command replay has no file before then. Each file is written once a
+    /// turn.
     fn withResultFiles(self: *Session, a: Allocator, execution: types.ExecutionMemory) !types.ExecutionMemory {
         var copy = execution;
         copy.tool_steps = try a.dupe(types.ToolExecutionStep, execution.tool_steps);
         for (copy.tool_steps) |*step| {
             step.tool_results = try a.dupe(types.PersistedToolResult, step.tool_results);
             for (step.tool_results) |*result| {
+                // A result its tool already stored, such as a clipped
+                // read_tool_result page, still gets the commit's preview.
+                if (result.preview == null) result.preview = try result_store.previewText(a, result.output, result_store.preview_bytes);
                 if (result.output_handle != null) continue;
                 const handle = self.stored_results.get(result.tool_call_id) orelse blk: {
                     const stored = try result_store.storeLargeResultManaged(self.alloc, try self.capabilityLocked(), result.tool_call_id, result.tool_name, result.output);
@@ -3183,7 +3187,6 @@ pub const Session = struct {
                 // Copied: a superseded turn frees the cache before its pieces are written.
                 result.output_handle = try a.dupe(u8, handle);
                 result.stored_output_bytes = result.output.len;
-                if (result.preview == null) result.preview = try result_store.previewText(a, result.output, result_store.preview_bytes);
             }
         }
         return copy;
@@ -11286,6 +11289,34 @@ test "a turn whose result keeps its stamp commits as streamed, with that stamp" 
     try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, id, superseded_type));
     try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, "tool_result"));
     try testing.expectEqual(@as(i64, 100), try restoredStamp(&t, id));
+}
+
+test "a result its tool already stored streams with the preview its commit gives it, so the commit supersedes nothing" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("read the saved page") };
+    var calls = [_]types.ToolCall{.{ .id = "call-1", .name = "read_tool_result", .arguments_json = "{}" }};
+    // A clipped page read_tool_result stored itself: a handle and no
+    // preview, and too long for its piece to show it whole instead.
+    const page: [session_event.max_conversation_preview_bytes + 1]u8 = @splat('p');
+    var results = [_]types.PersistedToolResult{readResult("call-1", &page, 100)};
+    results[0].tool_name = @constCast("read_tool_result");
+    results[0].output_handle = @constCast("result-page.txt");
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
+    try s.appendProgress(user, execution, .{});
+    var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = execution } };
+    try s.prepareTurn(&turn);
+    defer if (results[0].preview) |preview| testing.allocator.free(preview);
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, id, superseded_type));
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, "tool_result"));
 }
 
 test "a result rebuilt with other content supersedes its stream and is written as rebuilt" {

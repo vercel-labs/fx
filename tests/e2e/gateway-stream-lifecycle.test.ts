@@ -9498,6 +9498,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         let restartReport = "";
         let summarizedFollowUp = false;
         let readCompacted = false;
+        let restartSentFollowUpRead: boolean | null = null;
         const gateway = startDynamicFakeGateway((body) => {
           const request = JSON.parse(body);
           if (request.tools.length === 0) {
@@ -9522,6 +9523,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             expect(body).toContain("compacted_conversation");
             expect(body).toContain(`Its diagnostic is ${diagnosticHandle}.`);
             expect(body).toContain("with read_tool_result");
+            restartSentFollowUpRead = hasToolResult(body, "cancel-follow-up-read");
             return fakeGatewayFinalText("CANCEL_RESTART_COMPLETE");
           }
           if (hasCurrentToolResult(body, "cancel-follow-up-read")) {
@@ -9618,8 +9620,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           }
           const calls = savedToolCallIds(history);
           expect(calls.filter((id) => id === "cancelled-history-child")).toHaveLength(1);
-          // A read the compaction took is in its record, not the saved turn.
-          expect(calls.filter((id) => id === "cancel-follow-up-read")).toHaveLength(readCompacted ? 0 : 1);
+          // The saved turn keeps the read, even one a compaction took into its
+          // record (D87); the request after the restart still leaves that one out.
+          expect(calls.filter((id) => id === "cancel-follow-up-read")).toHaveLength(1);
+          expect(restartSentFollowUpRead).not.toBeNull();
+          if (readCompacted) expect(restartSentFollowUpRead).toBe(false);
           expect(history.some((turn) => turn.assistant === "CANCEL_RESTART_COMPLETE")).toBe(true);
           await tui.sendText("/quit");
           await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 15000);
