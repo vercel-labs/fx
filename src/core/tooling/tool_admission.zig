@@ -1975,6 +1975,7 @@ fn requestFileMutationPermissionOutcomeFromAdmission(
                 &prepared.review
             else
                 return error.RequestProjectionTooLarge;
+            const shell_epoch = shell_snapshot.processOwner().approvalEpoch();
             var response = prompter.request(
                 std.heap.c_allocator,
                 request_view,
@@ -1991,7 +1992,7 @@ fn requestFileMutationPermissionOutcomeFromAdmission(
                 .execution_authority = if (response.decision.isDenied()) null else .{
                     .file_mutation = authorization,
                 },
-                .human_approval = humanApprovalProvenance(response.decision, shell_snapshot.processOwner().approvalEpoch()),
+                .human_approval = humanApprovalProvenance(response.decision, shell_epoch),
             };
             if (response.decision == .deny) {
                 outcome.denial_reason = .user_denied;
@@ -2185,6 +2186,7 @@ fn permissionOutcomeForResponse(
     call: ToolCall,
     response: *const permission_request.OwnedPermissionResponse,
     source: command_admission.ShellAuthorizationSource,
+    shell_epoch: u64,
 ) !command_admission.PermissionOutcome {
     var outcome = try permissionOutcomeForDecision(
         input,
@@ -2193,7 +2195,7 @@ fn permissionOutcomeForResponse(
         response.decision,
         source,
     );
-    outcome.human_approval = humanApprovalProvenance(response.decision, shell_snapshot.processOwner().approvalEpoch());
+    outcome.human_approval = humanApprovalProvenance(response.decision, shell_epoch);
     if (response.decision == .deny) outcome.denial_reason = .user_denied;
     outcome.feedback = try copyPermissionFeedback(arena, response);
     return outcome;
@@ -2231,9 +2233,12 @@ fn promptPermissionOutcome(
         .auto_review_result = auto_review_result,
     };
     const prompter = input.permission_prompter orelse return unavailable;
-    // The offer exists before the person answers, so it carries the epoch of the prompt.
+    // The question's epoch is read once, before the question is shown. The offer
+    // and the answer's provenance both keep it, so a refresh while the question
+    // is open makes the next call ask again.
+    const shell_epoch = shell_snapshot.processOwner().approvalEpoch();
     const grant_offer = if (try isRunCommandCall(input, arena, call))
-        try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary, shell_snapshot.processOwner().approvalEpoch())
+        try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary, shell_epoch)
     else
         null;
     var response = prompter.request(
@@ -2253,6 +2258,7 @@ fn promptPermissionOutcome(
         call,
         &response,
         if (response.decision == .always) .interactive_always else .interactive_once,
+        shell_epoch,
     );
     outcome.auto_review_result = auto_review_result;
     return outcome;
@@ -4308,6 +4314,92 @@ test "a one-time non-shell approval answered before a refresh stays allowed when
     owner.markDirty(.user_reload);
     const after_refresh = try revalidateLiveActionPermissionOutcome(input, arena, call, .ask, &.{}, .ordinary, answer);
     try std.testing.expect(!after_refresh.decision.isDenied());
+}
+
+/// The first question is answered with `decision`, and the shell approval epoch
+/// is refreshed while it is still open, before the answer returns. Any later
+/// question is answered with `later`.
+const RefreshWhileAsked = struct {
+    decision: ToolPermissionDecision,
+    later: ToolPermissionDecision = .deny,
+    calls: usize = 0,
+
+    fn request(
+        raw: *anyopaque,
+        alloc: Allocator,
+        _: permission_request.PermissionRequest,
+        _: ToolCall,
+        _: ?*const diff_mod.FileReview,
+        _: ?[]const PermissionGrant,
+    ) anyerror!permission_request.OwnedPermissionResponse {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        if (self.calls == 1) {
+            shell_snapshot.processOwner().markDirty(.user_reload);
+            return permission_request.OwnedPermissionResponse.init(alloc, self.decision, null);
+        }
+        return permission_request.OwnedPermissionResponse.init(alloc, self.later, null);
+    }
+
+    fn prompter(self: *@This()) permission_prompter.Prompter {
+        return .{ .context = @ptrCast(self), .request_fn = request };
+    }
+};
+
+test "a once shell answer given after a refresh while the question was open asks again when rechecked" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var asked = RefreshWhileAsked{ .decision = .once };
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.permission_prompter = asked.prompter();
+    const call: ToolCall = .{
+        .id = "once-refresh-while-asked",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf approved > marker.txt\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    const rechecked = try revalidateLiveActionPermissionOutcome(input, arena, call, .ask, &.{}, .ordinary, outcome.human_approval);
+    try std.testing.expectEqual(@as(usize, 2), asked.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, rechecked.decision);
+}
+
+test "an always shell answer given after a refresh while the question was open is not stored under the new epoch" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var asked = RefreshWhileAsked{ .decision = .always };
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.permission_prompter = asked.prompter();
+    const call: ToolCall = .{
+        .id = "always-refresh-while-asked",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf approved > marker.txt\"}",
+    };
+    const target = "/tmp/workspace::printf approved > marker.txt";
+
+    const outcome = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.always, outcome.decision);
+    const stored = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "run_command", target, .command_cwd, outcome.human_approval.shell_epoch);
+    try std.testing.expectEqual(false, permissions.sessionGrantAllowed(stored, "run_command", target));
 }
 
 const test_review_tool_calls = [_]ToolCall{
