@@ -5486,7 +5486,7 @@ pub const TranscriptRuntime = struct {
     /// them, because showing it again paints that flow.
     pub fn slotLeftScreen(slot: *TranscriptSlot) void {
         slot.resume_handoff_repaint_pending = false;
-        dropResumeHandoffRows(&slot.resume_handoff_rows, "transcript left the screen");
+        dropResumeHandoffRows(&slot.resume_handoff_rows, "left screen");
     }
 
     /// Frees a transcript that is not on screen.
@@ -8760,7 +8760,7 @@ pub const TranscriptRuntime = struct {
         self.reflow_clear_guard_rows = 0;
         self.resize_history_row_delta = null;
         self.viewport_clear_pending = false;
-        dropResumeHandoffRows(&self.resume_handoff_rows, "terminal reset");
+        dropResumeHandoffRows(&self.resume_handoff_rows, "reset");
         // Job-control resume (and other full resets) reanchor at row 1. Drop
         // pending clears recorded against the pre-reset footer geometry —
         // e.g. eraseCurrentFrame at owned_top mid-scrollback — or the first
@@ -11757,7 +11757,7 @@ pub const TranscriptRuntime = struct {
             transition.target_flow = &.{};
             var previous_state = self.transcript_commit_state;
             self.transcript_commit_state = .invalid;
-            dropResumeHandoffRows(&self.resume_handoff_rows, "missing borrowed source");
+            dropResumeHandoffRows(&self.resume_handoff_rows, "no source");
             previous_state.deinit(alloc);
             self.markTranscriptDirty();
         } else if (commit.stable) {
@@ -11848,7 +11848,7 @@ pub const TranscriptRuntime = struct {
                 }
                 self.markTranscriptDirty();
             } else {
-                dropResumeHandoffRows(&self.resume_handoff_rows, "stable commit");
+                dropResumeHandoffRows(&self.resume_handoff_rows, "stable");
             }
             if (!retained_body and !self.fullTranscriptActive()) {
                 self.last_visible_transcript_top_row = transition.selection.top_row;
@@ -11901,7 +11901,7 @@ pub const TranscriptRuntime = struct {
                 self.markTranscriptDirty();
             }
         } else {
-            dropResumeHandoffRows(&self.resume_handoff_rows, "recovery commit");
+            dropResumeHandoffRows(&self.resume_handoff_rows, "recovery");
             const recovery = resolveTranscriptRecoveryCommit(self, transition, result, commit);
             var previous_state = self.transcript_commit_state;
             var presentation_resume_bytes: []u8 = &.{};
@@ -15578,11 +15578,11 @@ fn frameInlineScrollBudget(resize_reflow_rows: u16, semantic_rows: u32) u16 {
 }
 
 fn dropResumeHandoffRows(rows: *?ResumeHandoffRows, reason: []const u8) void {
-    const handoff = rows.* orelse return;
+    if (rows.* == null) return;
     debug_trace.logf(
         "scroll",
-        "resume_handoff_rows_dropped history={d} screen={d} reason={s}",
-        .{ handoff.history, handoff.screen, reason },
+        "resume_handoff_rows_dropped reason={s}",
+        .{reason},
     );
     rows.* = null;
 }
