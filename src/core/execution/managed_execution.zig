@@ -158,9 +158,9 @@ pub const Snapshot = struct {
     running_ms: ?u64 = null,
     quiet_ms: ?u64 = null,
     quiet_notice: bool = false,
-    /// Set when this snapshot ends a wait at the quiet crossing: the
-    /// command still runs and its quiet spell crossed the limit during this
-    /// wait. A spell crosses once, so a later wait in it leaves this false
+    /// Set when a wait ends with the command still running past the quiet
+    /// limit after seeing it under the limit (`quiet_notice.crossedAt`). A
+    /// spell crosses once, so a later wait in it leaves this false
     /// (`tests/tla/managed_execution/QuietWait.tla`).
     quiet_crossed: bool = false,
 
@@ -785,9 +785,8 @@ pub const Runtime = struct {
         const yield_grace_ms = if (input.tool_yield_flag != null) steerYieldGraceMs() else 0;
         const poll_ms = capturedWaitPollMs();
         const zio = io_mod.getIo();
-        // The wait ends at its yield, or when the command reaches the quiet
-        // limit after the wait saw it under it, as an `interact` wait does
-        // (`quiet_notice.poll`).
+        // The wait ends at its yield, when the command ends, or at a steering
+        // yield, never early for quiet (`quiet_notice.poll`).
         const limit_ms = quietLimitMs();
         entry.mutex.lockUncancelable(zio);
         var quiet_wait = quiet_notice.beginWait(started_ms, entry.last_output_ms, input.yield_time_ms, limit_ms);
@@ -814,16 +813,16 @@ pub const Runtime = struct {
             const now_ms = io_mod.milliTimestamp();
             const elapsed = now_ms - started_ms;
             const held = if (input.yield_hold) |hold| hold.load(.acquire) > 0 else false;
-            if (elapsed >= input.yield_time_ms and !held) break;
-            if (!held and steerYieldDue(input.tool_yield_flag, started_ms, now_ms, yield_grace_ms)) {
-                debug_trace.logf("managed-execution", "run yielded for steering execution={s} elapsed_ms={d}", .{ entry.execution_id, elapsed });
-                break;
-            }
             if (!held) {
                 const step = quiet_notice.poll(quiet_wait, now_ms, last_output_ms, limit_ms);
                 quiet_wait = step.wait;
-                if (step.end == .quiet) {
-                    quiet_crossed = true;
+                if (step.end == .ceiling) {
+                    quiet_crossed = step.crossed;
+                    break;
+                }
+                if (steerYieldDue(input.tool_yield_flag, started_ms, now_ms, yield_grace_ms)) {
+                    quiet_crossed = quiet_notice.crossedAt(quiet_wait, now_ms, last_output_ms, limit_ms);
+                    debug_trace.logf("managed-execution", "run yielded for steering execution={s} elapsed_ms={d}", .{ entry.execution_id, elapsed });
                     break;
                 }
             }
@@ -831,7 +830,7 @@ pub const Runtime = struct {
         }
 
         var prepared = try self.prepareSnapshot(alloc, entry.execution_id);
-        // A command that ended as the wait crossed is no crossing.
+        // A command that ended as the wait finished is no crossing.
         if (quiet_crossed) prepared.snapshot.quiet_crossed = prepared.snapshot.quiet_notice;
         entry.mutex.lockUncancelable(zio);
         if (!entry.isTerminal()) entry.published_running = true;
@@ -1127,8 +1126,8 @@ pub const Runtime = struct {
             return error.ExecutionBusy;
         }
         entry.active_waiter = waiter_id;
-        // The wait ends at its ceiling, or when the command reaches the quiet
-        // limit after the wait saw it under it (`quiet_notice.poll`).
+        // The wait ends at its ceiling, when the command ends, or at a steering
+        // yield, never early for quiet (`quiet_notice.poll`).
         const limit_ms = quietLimitMs();
         const wait_started_ms = io_mod.milliTimestamp();
         const yield_grace_ms = if (tool_yield_flag != null) steerYieldGraceMs() else 0;
@@ -1136,6 +1135,7 @@ pub const Runtime = struct {
         entry.mutex.unlock(zio);
         defer self.clearActiveWaiter(entry, waiter_id);
         const poll_ms = capturedWaitPollMs();
+        var quiet_crossed = false;
         while (true) {
             entry.mutex.lockUncancelable(zio);
             const terminal = entry.isTerminal();
@@ -1149,23 +1149,22 @@ pub const Runtime = struct {
             }
             const now_ms = io_mod.milliTimestamp();
             if (steerYieldDue(tool_yield_flag, wait_started_ms, now_ms, yield_grace_ms)) {
+                quiet_crossed = quiet_notice.crossedAt(quiet_wait, now_ms, last_output_ms, limit_ms);
                 debug_trace.logf("managed-execution", "wait yielded for steering execution={s} elapsed_ms={d}", .{ execution_id, now_ms - wait_started_ms });
                 break;
             }
             const step = quiet_notice.poll(quiet_wait, now_ms, last_output_ms, limit_ms);
             quiet_wait = step.wait;
-            if (step.end) |end| {
-                if (end == .quiet) {
-                    var prepared = try self.prepareSnapshotForEntry(alloc, entry);
-                    // A command that ended as the wait crossed is no crossing.
-                    prepared.snapshot.quiet_crossed = prepared.snapshot.quiet_notice;
-                    return prepared;
-                }
+            if (step.end == .ceiling) {
+                quiet_crossed = step.crossed;
                 break;
             }
             entry.waitForWorkerOrPoll(zio, poll_ms);
         }
-        return self.prepareSnapshotForEntry(alloc, entry);
+        var prepared = try self.prepareSnapshotForEntry(alloc, entry);
+        // A command that ended as the wait finished is no crossing.
+        if (quiet_crossed) prepared.snapshot.quiet_crossed = prepared.snapshot.quiet_notice;
+        return prepared;
     }
 
     pub fn stop(
