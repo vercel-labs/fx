@@ -1456,6 +1456,9 @@ pub fn Runtime(comptime App: type) type {
             if (app.model_choice_target == null) return;
             if (modelPickerHolds(app)) return;
             app.model_choice_target = null;
+            // The person left the picker without a choice: the card comes
+            // back, and so does the draft the picker borrowed the composer for.
+            if (comptime @hasField(App, "input_runtime")) _ = app.input_runtime.restoreModelPickerDraft(app.alloc);
             debug_trace.eventf("host", "model_picker_target_cleared", .{}, "", .{});
         }
 
@@ -2557,6 +2560,19 @@ pub fn Runtime(comptime App: type) type {
             if (inBranch(set, app.approval_lender)) _ = returnApproval(app);
             if (inBranch(set, app.question_lender)) _ = returnQuestion(app);
             if (inBranch(set, app.wait_card_lender)) _ = returnWaitCard(app);
+            // A view's picker for one of these agents must not keep pointing at
+            // it after `dropSet` frees it (`tests/tla/subagent/ViewWaits.tla`
+            // ActionReachesOwner).
+            if (comptime @hasField(App, "model_choice_target")) {
+                if (app.model_choice_target) |target| {
+                    for (set) |entry| {
+                        if (target != &entry.agent) continue;
+                        app.model_choice_target = null;
+                        if (comptime @hasField(App, "input_runtime")) _ = app.input_runtime.restoreModelPickerDraft(app.alloc);
+                        break;
+                    }
+                }
+            }
             if (comptime agents.hasAgentField(App, "session_persistence")) {
                 if (first_host) |host| host.closeTree();
                 for (set) |entry| if (entry.agent.session_persistence.subagent_host) |host| host.closeTree();
@@ -2955,6 +2971,14 @@ pub fn Runtime(comptime App: type) type {
                 return app.shell.worker_status_state().waitsForUser();
             }
             return screenOf(app, target).transcript.notebook.worker_status.waitsForUser();
+        }
+
+        /// Whether `agent`'s request waits for the person right now, which is
+        /// when a view's picker choice continues it (`tests/tla/subagent/
+        /// ViewWaits.tla` ActionReachesOwner).
+        pub fn agentRequestWaitsForUser(app: *App, agent: *AppAgent) bool {
+            const child = hostedOf(app, agent) orelse return false;
+            return requestWaitsForUser(app, child);
         }
 
         fn nameOf(child: ?*ChildAgent) []const u8 {

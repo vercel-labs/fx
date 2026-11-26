@@ -3533,6 +3533,12 @@ const App = struct {
         return self.wait_card_lender != null;
     }
 
+    /// Whether `agent`'s request waits for the person right now, which is when
+    /// a picker's choice for it continues that request.
+    pub fn requestWaitsForUser(self: *App, agent: *agents.Agent) bool {
+        return AgentsAppRuntime.agentRequestWaitsForUser(self, agent);
+    }
+
     /// Runs the choice the person pressed on the card, in the context of the
     /// subagent that waits. False when no card shows.
     pub fn answerWaitCard(self: *App, choice: wait_card.Choice) !bool {
@@ -9456,6 +9462,160 @@ test "wait card: the card comes back with its choices once the picker closes wit
     try std.testing.expect(app.wait_card_lender == payer);
     try std.testing.expect(app.main_agent.wait_card_prompt.isActive());
     try std.testing.expectEqualStrings("payer", app.main_agent.wait_card_prompt.nameText());
+}
+
+test "wait card: the Enter after Change model reaches the /model picker the card opened" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const refuser = try addTestChildAgent(&app, "refuser-id");
+    refuser.name = try alloc.dupe(u8, "refuser");
+    defer for ([_]*agents.Agent{ &app.main_agent, &refuser.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, refuser, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+
+    // The card's "Change model" opened the picker: the Enter that picks a row
+    // there is the picker's, not the draft's the card hid.
+    try app.openModelPickerFor(&refuser.agent);
+    try std.testing.expect(app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) != null);
+    app.wait_card_enter_guard.arm();
+    const with_picker = App.InputAppRuntime.dropEnterAfterCardAnswer(&app, &app.main_agent, '\r');
+    try std.testing.expectEqual(false, with_picker);
+
+    // With no picker open, the same Enter is the draft's, and stays dropped.
+    try app.input_runtime.textReplacementState().replace(alloc, "keep me");
+    try std.testing.expect(app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) == null);
+    app.wait_card_enter_guard.arm();
+    const without_picker = App.InputAppRuntime.dropEnterAfterCardAnswer(&app, &app.main_agent, '\r');
+    try std.testing.expectEqual(true, without_picker);
+}
+
+test "wait card: a draft survives the Change model picker, through the pick and through a close" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const test_home = try TestHome.install(alloc, home);
+    defer test_home.deinit();
+
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const refuser = try addTestChildAgent(&app, "refuser-id");
+    refuser.name = try alloc.dupe(u8, "refuser");
+    try giveTestPreferences(alloc, refuser, "openai/gpt-5");
+    defer for ([_]*agents.Agent{ &app.main_agent, &refuser.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+        if (agent.session_persistence.session_preferences) |*preferences| preferences.deinit(alloc);
+    };
+    testLiveWait(&app, refuser, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+
+    // The person typed a draft, with the cursor partway through it.
+    const draft = "keep my draft";
+    try app.input_runtime.textReplacementState().replace(alloc, draft);
+    app.input_runtime.edit_state.cursor = 5;
+
+    // The card's "Change model": the picker borrows the composer as its query
+    // box. The Enter that picks ends the picker first, then the choice applies
+    // and gives the draft back exactly.
+    try app.openModelPickerFor(&refuser.agent);
+    try std.testing.expectEqualStrings("/model ", app.input_runtime.edit_state.input.items);
+    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+    try @import("core/session/session_commands.zig").Commands(App).selectModelFromPicker(
+        &app,
+        &app.main_agent,
+        "openai/gpt-5-mini",
+        .auto,
+        false,
+        false,
+    );
+    try std.testing.expectEqualStrings(draft, app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 5), app.input_runtime.edit_state.cursor);
+
+    // And the same when the person leaves the picker without a choice.
+    try app.openModelPickerFor(&refuser.agent);
+    app.input_runtime.picker.dismissInlinePicker(.model);
+    App.AgentsAppRuntime.settleModelChoiceTarget(&app);
+    try std.testing.expectEqualStrings(draft, app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 5), app.input_runtime.edit_state.cursor);
+}
+
+test "wait card: a closed subagent takes the view's model target with it" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const refuser = try addTestChildAgent(&app, "refuser-id");
+    refuser.name = try alloc.dupe(u8, "refuser");
+    // The close below frees the child, prompts included.
+    defer app.main_agent.approval_prompt.deinit(alloc);
+    defer app.main_agent.question_prompt.deinit(alloc);
+    testLiveWait(&app, refuser, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+
+    // The person has a draft, and the card's Change model opened the picker
+    // for the subagent.
+    try app.input_runtime.textReplacementState().replace(alloc, "keep me");
+    app.input_runtime.edit_state.cursor = 4;
+    try app.openModelPickerFor(&refuser.agent);
+    try std.testing.expect(app.model_choice_target == &refuser.agent);
+
+    // The parent closes the subagent while its picker is still open.
+    _ = try App.AgentsAppRuntime.stopSubagentsForSwitch(&app, &app.main_agent);
+
+    // No picker target points at the freed child, and the draft is back.
+    try std.testing.expect(app.model_choice_target == null);
+    try std.testing.expectEqualStrings("keep me", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 4), app.input_runtime.edit_state.cursor);
+}
+
+test "wait card: the picker the out-of-credits answer opens keeps the view's draft" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, payer, testWaitStatus(.quota, "Out of credits \u{b7} press Esc to end this turn"));
+
+    // The person has a draft, and the subagent's out-of-credits answer opens
+    // the picker through its worker's event.
+    try app.input_runtime.textReplacementState().replace(alloc, "keep me");
+    app.input_runtime.edit_state.cursor = 4;
+    var handlers = app_callbacks.Bindings(App).workerEventHandlers(&payer.agent);
+    try handlers.open_model_picker(handlers.ctx);
+    try std.testing.expect(app.model_choice_target == &payer.agent);
+    try std.testing.expectEqualStrings("/model ", app.input_runtime.edit_state.input.items);
+
+    // Closing the picker without a choice gives the draft back exactly.
+    app.input_runtime.picker.dismissInlinePicker(.model);
+    App.AgentsAppRuntime.settleModelChoiceTarget(&app);
+    try std.testing.expectEqualStrings("keep me", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 4), app.input_runtime.edit_state.cursor);
 }
 
 test "wait card: the view holds the subagent's item while its picker is open" {

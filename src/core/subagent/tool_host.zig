@@ -3142,9 +3142,9 @@ pub const Runtime = struct {
         const sink = self.report_sink orelse return debug_trace.logf("mailbox", "waiting note dropped child={s} reason=no_parent", .{child_id});
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        const text = waitingNoteText(arena.allocator(), reason, resend) catch return;
-        sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = text } }) catch |err|
-            debug_trace.logf("mailbox", "waiting note lost child={s} err={s}", .{ child_id, @errorName(err) });
+        const text = waitingNoteText(arena.allocator(), reason, resend) catch |err|
+            return debug_trace.logf("mailbox", "waiting note lost child={s} err={s}", .{ child_id, @errorName(err) });
+        postNote(self, sink, child_id, name, text, "waiting");
     }
 
     /// Tells the owner that child `child_id` needs the person for `reason`,
@@ -3154,9 +3154,9 @@ pub const Runtime = struct {
         const sink = self.report_sink orelse return debug_trace.logf("mailbox", "needs_user note dropped child={s} reason=no_parent", .{child_id});
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        const text = needsUserNoteText(arena.allocator(), reason) catch return;
-        sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = text } }) catch |err|
-            debug_trace.logf("mailbox", "needs_user note lost child={s} err={s}", .{ child_id, @errorName(err) });
+        const text = needsUserNoteText(arena.allocator(), reason) catch |err|
+            return debug_trace.logf("mailbox", "needs_user note lost child={s} err={s}", .{ child_id, @errorName(err) });
+        postNote(self, sink, child_id, name, text, "needs_user");
     }
 
     /// The person answered `child_id`'s request on its own screen, so its
@@ -12260,19 +12260,30 @@ test "a stop or close with nothing waiting refuses nothing" {
     try std.testing.expect(t.worker.decision == null);
 }
 
+/// Posts a note to the owner as child `child_id`'s own message, and traces one
+/// the sink lost, naming the kind of note and the error (`R3.8`).
+fn postNote(runtime: *Runtime, sink: ReportSink, child_id: []const u8, name: []const u8, text: []const u8, kind: []const u8) void {
+    sink.post(runtime, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = text } }) catch |err|
+        debug_trace.logf("mailbox", "note lost child={s} kind={s} err={s}", .{ child_id, kind, @errorName(err) });
+}
+
+/// The sentence both notes to the owner end with: the person's view is where
+/// the item is continued, so the parent tells them rather than answering.
+const needs_user_tail = "Only the user can continue it from their view, so tell them.";
+
 /// The note that tells a parent its subagent waits for the person, for the
 /// fixed `reason` of the kind. It carries no question, field value or URL.
 pub fn waitingNoteText(alloc: Allocator, reason: []const u8, resend: bool) ![]u8 {
     if (resend) {
         return alloc.print("fx: my last request failed and waits for a follow-up ({s}). A message from you sends it again.", .{reason});
     }
-    return alloc.print("fx: my last request failed and waits for the user ({s}). Only the user can continue it from their view, so tell them.", .{reason});
+    return alloc.print("fx: my last request failed and waits for the user ({s}). {s}", .{ reason, needs_user_tail });
 }
 
 /// The note for an item that needs the person without a failed request, such
 /// as an MCP server's question. `reason` names the kind only.
 pub fn needsUserNoteText(alloc: Allocator, reason: []const u8) ![]u8 {
-    return alloc.print("fx: I wait for you ({s}). Only the user can continue it from their view, so tell them.", .{reason});
+    return alloc.print("fx: I wait for you ({s}). {s}", .{ reason, needs_user_tail });
 }
 
 test "wait card: the note to main names the reason and nothing else" {

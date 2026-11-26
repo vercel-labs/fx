@@ -122,6 +122,16 @@ function cardDigit(pane: string, label: string): string {
 /** A card drawn for `name` with the refused reason. */
 const cardShows = (pane: string, name: string) => pane.includes(`${name}: The provider rejected this request`);
 
+/** Runs the check a rule stands for, so a failure starts with the rule's name
+ * (`tests/tla/subagent/ViewWaits.tla`). The check itself is unchanged. */
+function rule(name: string, check: () => void): void {
+  try {
+    check();
+  } catch (err) {
+    throw new Error(`${name}: ${(err as Error).message}`, { cause: err });
+  }
+}
+
 /** One fx under tmux with its own profile, workspace, gateway and trace. */
 class View {
   home = "";
@@ -204,10 +214,11 @@ class View {
     return this.lines().slice(this.mark);
   }
 
-  /** The events of `names` written since `newMark`, in order. The signal is
-   * fx's own write to its trace file: each change event re-reads the lines, so
-   * nothing here waits on a clock (`RULES.md` R7.3). */
-  async watch(names: string[], ms = 30_000): Promise<Obs[]> {
+  /** The events of `names` written since `newMark`, in order, under `label`,
+   * the rule they check. The signal is fx's own write to its trace file: each
+   * change event re-reads the lines, so nothing here waits on a clock
+   * (`RULES.md` R7.3). */
+  async watch(names: string[], label = names.join(", "), ms = 30_000): Promise<Obs[]> {
     const found = () => this.sinceMark().flatMap((line) =>
       names.filter((name) => line.includes(name)).map((event) => ({ event, line })),
     );
@@ -226,8 +237,8 @@ class View {
     } finally {
       events.close();
     }
-    await this.dump(`none of ${names.join(", ")} appeared in the trace`);
-    throw new Error(`none of ${names.join(", ")} appeared in the trace`);
+    await this.dump(`${label}: none of ${names.join(", ")} appeared in the trace`);
+    throw new Error(`${label}: none of ${names.join(", ")} appeared in the trace`);
   }
 
   newMark() {
@@ -238,17 +249,23 @@ class View {
     return await this.session!.capturePane();
   }
 
-  async text(value: string, ms = 30_000): Promise<string> {
-    return await this.session!.waitForText(value, ms);
+  /** Waits for the pane to show `value`, under `label`, the rule it checks. */
+  async text(value: string, ms = 30_000, label = value): Promise<string> {
+    try {
+      return await this.session!.waitForText(value, ms);
+    } catch (err) {
+      throw new Error(`${label}: ${(err as Error).message}`, { cause: err });
+    }
   }
 
-  /** Waits for a pane that matches `pattern`, dumping what is there first. */
+  /** Waits for a pane that matches `pattern`, under `what`, the rule it
+   * checks, dumping the pane first. */
   async matches(pattern: RegExp, what: string, ms = 30_000): Promise<string> {
     try {
       return await this.session!.waitForPane((pane) => pattern.test(pane), ms);
     } catch (err) {
       await this.dump(`the pane never showed ${what}`);
-      throw err;
+      throw new Error(`${what}: ${(err as Error).message}`, { cause: err });
     }
   }
 
@@ -284,20 +301,20 @@ test("ViewWaits: a hidden wait is lent as a card, and its answer reaches that su
     await view.text("VW_MAIN_DONE");
     // ShownWhenFree: the refused wait is the tree's oldest live item, so the
     // view shows it as a card named for the subagent.
-    const pane = await view.matches(/reviewer: The provider rejected this request/, "the reviewer's card");
-    expect(pane).not.toContain("reviewer needs you");
-    const lent = await view.watch([CARD_LENT]);
-    expect(lent.some((obs) => obs.line.includes("agent="))).toBe(true);
+    const pane = await view.matches(/reviewer: The provider rejected this request/, "ShownWhenFree: the refused wait is shown as its card");
+    rule("FooterQuietForShown: no needs you for the shown card", () => expect(pane).not.toContain("reviewer needs you"));
+    const lent = await view.watch([CARD_LENT], "ShownWhenFree: the card's lend in the trace");
+    rule("ShownWhenFree: the lend names the child", () => expect(lent.some((obs) => obs.line.includes("agent="))).toBe(true));
     // ActionReachesOwner: the card's answer reaches the child, and its request
     // runs again.
     await view.keys(cardDigit(pane, "Retry"));
-    const answered = await view.watch([CARD_ANSWERED]);
-    expect(answered.some((obs) => obs.line.includes("choice=retry"))).toBe(true);
+    const answered = await view.watch([CARD_ANSWERED], "ActionReachesOwner: the card's answer reaches the child");
+    rule("ActionReachesOwner: the answer is the card's retry", () => expect(answered.some((obs) => obs.line.includes("choice=retry"))).toBe(true));
     // The child's reply reaches main as its report; the view says it finished.
-    await view.matches(/reviewer finished/, "the reviewer's second turn");
-    expect(childCalls).toBe(2);
+    await view.matches(/reviewer finished/, "ActionReachesOwner: the child's request runs again");
+    rule("ActionReachesOwner: the child asked twice", () => expect(childCalls).toBe(2));
   } catch (err) {
-    await view.dump("a hidden wait is lent as a card");
+    await view.dump("ShownWhenFree and ActionReachesOwner: a hidden wait is lent as a card");
     throw err;
   } finally {
     await view.stop();
@@ -330,38 +347,39 @@ test("ViewWaits: the picker a subagent's answer opens holds its card, and the ch
     await view.start();
     await view.session!.sendText("VW_MAIN start it");
     await view.text("VW_MAIN_DONE");
-    const question = await view.matches(/Switch to another model/, "the out-of-credits picker");
-    expect(question).not.toContain("payer needs you");
+    const question = await view.matches(/Switch to another model/, "ShownWhenFree: the out-of-credits picker is shown");
+    rule("FooterQuietForShown: no needs you for the shown picker", () => expect(question).not.toContain("payer needs you"));
     // CardYieldsToPicker: from the answer that queues the picker, the card is
     // not lent for the child whose picker is open.
     view.newMark();
     await view.keys(cardDigit(question, "Switch to another model"));
     // The out-of-credits picker is the child's own question prompt, lent, so
     // its answer is recorded there and what opens is the model picker.
-    const picker = await view.text("/model");
-    expect(picker).not.toContain("payer: Out of credits");
+    const picker = await view.text("/model", 30_000, "CardYieldsToPicker: the model picker opens");
+    rule("CardYieldsToPicker: no card under the picker", () => expect(picker).not.toContain("payer: Out of credits"));
     // The picker's own list is drawn, so the frame that could have lent the
     // card has run with the picker holding the item.
-    await view.matches(/openai\/gpt-5-mini/, "the model picker's list", 25_000);
-    expect(view.sinceMark().some((line) => line.includes(CARD_LENT))).toBe(false);
+    await view.matches(/openai\/gpt-5-mini/, "CardYieldsToPicker: the picker's own list is drawn", 25_000);
+    rule("CardYieldsToPicker: no card lent while the picker holds the item", () =>
+      expect(view.sinceMark().some((line) => line.includes(CARD_LENT))).toBe(false));
     // The picker lists main's model first: the second is the payer's.
     await view.keys("Down", "Enter");
-    await view.matches(new RegExp(`payer continues with ${SECOND_MODEL}`), "the payer's model notice", 25_000);
+    await view.matches(new RegExp(`payer continues with ${SECOND_MODEL}`), "ModelChosen: the payer continues with the model the picker took", 25_000);
     // ModelChosen: the wait continued with the model the picker took.
-    await view.matches(/payer finished/, "the payer's second turn");
-    expect(childCalls).toBe(2);
+    await view.matches(/payer finished/, "ModelChosen: the payer's request runs again");
+    rule("ActionReachesOwner: the payer asked twice", () => expect(childCalls).toBe(2));
     const childModels = view.modelsOfChild("payer");
-    expect(childModels.length).toBeGreaterThanOrEqual(2);
-    expect(childModels.at(-1)).toBe(SECOND_MODEL);
-    expect(childModels.at(-1)).not.toBe(childModels[0]!);
+    rule("ModelChosen: the payer asked again on a model", () => expect(childModels.length).toBeGreaterThanOrEqual(2));
+    rule("ModelChosen: the payer's last request names the picked model", () => expect(childModels.at(-1)).toBe(SECOND_MODEL));
+    rule("ModelChosen: the payer's request changed model", () => expect(childModels.at(-1)).not.toBe(childModels[0]!));
     // And the screen's own model is untouched: main's next turn keeps it.
     const mainBefore = view.mainModels().length;
     await view.session!.sendText("VW_MAIN after it");
     await afterMain;
-    expect(view.mainModels().length).toBeGreaterThan(mainBefore);
-    expect(view.mainModels().at(-1)).toBe(helpers.FAKE_GATEWAY_MODEL);
+    rule("ModelChosen: main's next turn runs", () => expect(view.mainModels().length).toBeGreaterThan(mainBefore));
+    rule("ModelChosen: main's own model is untouched", () => expect(view.mainModels().at(-1)).toBe(helpers.FAKE_GATEWAY_MODEL));
   } catch (err) {
-    await view.dump("the picker holds the card");
+    await view.dump("CardYieldsToPicker: the picker holds the card");
     throw err;
   } finally {
     await view.stop();
@@ -381,23 +399,24 @@ test("ViewWaits: a stop while the card is lent takes it away for good", async ()
     await view.start();
     await view.session!.sendText("VW_MAIN start it");
     await view.text("VW_MAIN_DONE");
-    const pane = await view.matches(/stuck: The provider rejected this request/, "stuck's card");
+    const pane = await view.matches(/stuck: The provider rejected this request/, "ShownWhenFree: stuck's card is shown");
     view.newMark();
     await view.keys(cardDigit(pane, "Stop stuck"));
     // NoStaleShown: the card's stop closes the child, and the card is gone and
     // never lent again for it.
     const after = await view.matches(
       /^(?!.*stuck: The provider rejected this request)(?!.*Open stuck's screen).*$/s,
-      "the card to leave after the stop",
+      "NoStaleShown: the card leaves after the stop",
     );
-    expect(cardShows(after, "stuck")).toBe(false);
+    rule("NoStaleShown: the stopped child's card is gone", () => expect(cardShows(after, "stuck")).toBe(false));
     // Main's transcript carries the cancellation the stop wrote, so the pass
     // that closed the child has run and nothing lends that child's card again.
-    await view.text("stuck was cancelled", 30_000);
-    expect(view.sinceMark().some((line) => line.includes(CARD_LENT))).toBe(false);
-    expect(after).not.toContain("stuck needs you");
+    await view.text("stuck was cancelled", 30_000, "NoStaleShown: the pass that closed the child has run");
+    rule("NoStaleShown: no card lent again for the stopped child", () =>
+      expect(view.sinceMark().some((line) => line.includes(CARD_LENT))).toBe(false));
+    rule("NoStaleShown: no needs you for the stopped child", () => expect(after).not.toContain("stuck needs you"));
   } catch (err) {
-    await view.dump("a stop while the card is lent");
+    await view.dump("NoStaleShown: a stop while the card is lent");
     throw err;
   } finally {
     await view.stop();
@@ -417,17 +436,17 @@ test("ViewWaits: the alternate screen hides the card, and it comes back", async 
     await view.start();
     await view.session!.sendText("VW_MAIN start it");
     await view.text("VW_MAIN_DONE");
-    await view.matches(/hidden: The provider rejected this request/, "hidden's card");
+    await view.matches(/hidden: The provider rejected this request/, "ShownWhenFree: hidden's card is shown");
     // HeldUnderAltScreen: Ctrl+O draws the transcript with no card.
     await view.keys("C-o");
-    const transcript = await view.text("esc close · pgup/pgdn scroll");
-    expect(transcript).not.toContain("Open hidden's screen");
-    expect(transcript).not.toContain("Stop hidden");
+    const transcript = await view.text("esc close · pgup/pgdn scroll", 30_000, "HeldUnderAltScreen: the transcript owns the alternate screen");
+    rule("HeldUnderAltScreen: no card under the transcript", () => expect(transcript).not.toContain("Open hidden's screen"));
+    rule("HeldUnderAltScreen: no card's stop under the transcript", () => expect(transcript).not.toContain("Stop hidden"));
     await view.keys("C-o");
     // And the card returns once the alternate screen closes.
-    await view.matches(/hidden: The provider rejected this request/, "the card after the transcript");
+    await view.matches(/hidden: The provider rejected this request/, "HeldUnderAltScreen: the card returns when the alternate screen closes");
   } catch (err) {
-    await view.dump("the alternate screen over the card");
+    await view.dump("HeldUnderAltScreen: the alternate screen over the card");
     throw err;
   } finally {
     await view.stop();
@@ -451,20 +470,20 @@ test("ViewWaits: an instance's child shows in that instance's view only", async 
     await view.keys("Down", "Enter");
     await view.session!.sendText("VW_MAIN start it");
     await view.text("VW_MAIN_DONE");
-    await view.matches(/scoped: The provider rejected this request/, "fx 2's card");
+    await view.matches(/scoped: The provider rejected this request/, "InstanceScope: fx 2 shows its child's card");
     // Back on fx 1: InstanceScope, nothing of fx 2's item shows there.
     await view.keys("C-x");
     await view.text("enter switch", 10_000);
     await view.keys("Up", "Enter");
     const first = await view.pane();
-    expect(cardShows(first, "scoped")).toBe(false);
+    rule("InstanceScope: fx 1 shows nothing of fx 2's item", () => expect(cardShows(first, "scoped")).toBe(false));
     // fx 2 shows its card.
     await view.keys("C-x");
     await view.text("enter switch", 10_000);
     await view.keys("Down", "Enter");
-    await view.matches(/scoped: The provider rejected this request/, "the card again on fx 2");
+    await view.matches(/scoped: The provider rejected this request/, "InstanceScope: fx 2 shows its card again");
   } catch (err) {
-    await view.dump("an instance's child");
+    await view.dump("InstanceScope: an instance's child");
     throw err;
   } finally {
     await view.stop();

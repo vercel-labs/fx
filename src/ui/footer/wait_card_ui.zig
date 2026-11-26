@@ -20,7 +20,7 @@ const lead_rows: u16 = 3;
 const warning_sign = "\u{26a0} ";
 const chosen_mark = "\u{25b8} ";
 const spare_mark = "  ";
-const hint_text = "  \u{2191}\u{2193} choose   enter run   esc cancel this turn";
+const hint_text = "  \u{2191}\u{2193} choose   enter run   esc cancel this turn   type after you choose";
 
 /// The rows the card needs, never more than the block the footer has for it.
 pub fn rowCount(card: *const wait_card.WaitCardPrompt, max_rows: u16) u16 {
@@ -125,7 +125,7 @@ test "wait card: the rows name the subagent and the reason, number every choice,
     try std.testing.expectEqualStrings("    5 Stop signer", text.items);
     text.clearRetainingCapacity();
     try grid.rowTextTrimmed(9, &text);
-    try std.testing.expectEqualStrings("  \u{2191}\u{2193} choose   enter run   esc cancel this turn", text.items);
+    try std.testing.expectEqualStrings("  \u{2191}\u{2193} choose   enter run   esc cancel this turn   type after you choose", text.items);
 
     // A name that holds a control byte reaches the screen as visible text.
     var hostile: wait_card.WaitCardPrompt = .{};

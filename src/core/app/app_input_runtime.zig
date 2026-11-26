@@ -1279,7 +1279,9 @@ pub fn Runtime(comptime App: type) type {
                             if (card.highlighted()) |choice| _ = try answerWaitCard(app, choice);
                         },
                         .cancel => _ = try answerWaitCard(app, .cancel),
-                        .ignore => {},
+                        // The card keeps the keys, as a lent question does, and
+                        // says what it dropped (R3.8; the trace carries no text).
+                        .ignore => debug_trace.logf("input", "wait card dropped key reason=card_holds_keys", .{}),
                         // Ctrl+O, Ctrl+P, Ctrl+X and the rest keep their own
                         // meanings while the card shows.
                         .pass_through => return false,
@@ -1373,7 +1375,16 @@ pub fn Runtime(comptime App: type) type {
                 if (agent.wait_card_prompt.isActive()) return false;
             }
             if (provider_picker_runtime.Runtime(App).hasQuery(app)) return false;
+            if (inlinePickerTakesEnter(app)) return false;
             return !agentsMenuActive(app);
+        }
+
+        /// Whether an inline completion picker holds Enter: the `/model` list a
+        /// card's "Change model" opens, the `@` file list and the `/` menu each
+        /// select a row with it, so that Enter is theirs.
+        fn inlinePickerTakesEnter(app: *App) bool {
+            if (completion_rt.hasModelQuery(app) or completion_rt.hasFileQuery(app)) return true;
+            return app.input_runtime.picker.activeInlineSlashQuery(&app.input_runtime.edit_state) != null;
         }
 
         fn answerWaitCard(app: *App, choice: wait_card.Choice) !bool {

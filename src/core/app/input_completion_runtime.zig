@@ -1308,8 +1308,8 @@ pub fn CompletionRuntime(comptime App: type) type {
                         try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
                         try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), true, false, .fast);
                     } else {
-                        try session_commands.Commands(App).selectModelFromPicker(app, agent, model, effort, pickerFastMode(app, model), false);
                         app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                        try session_commands.Commands(App).selectModelFromPicker(app, agent, model, effort, pickerFastMode(app, model), false);
                     }
                     app.shell.render_requests.request(.footer);
                     return true;
@@ -1323,8 +1323,8 @@ pub fn CompletionRuntime(comptime App: type) type {
                         return true;
                     };
                     const effort = model_capabilities.reasoningEffortAtIndex(model_capabilities.resolveForApp(App, app, model), app.input_runtime.picker.model_picker_effort_index);
-                    try session_commands.Commands(App).selectModelFromPicker(app, agent, model, effort, speed.fast_mode, speed.ultrafast_mode);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    try session_commands.Commands(App).selectModelFromPicker(app, agent, model, effort, speed.fast_mode, speed.ultrafast_mode);
                     app.shell.render_requests.request(.footer);
                     return true;
                 },
@@ -1377,6 +1377,10 @@ pub fn CompletionRuntime(comptime App: type) type {
         /// agent's model, not the one on screen (`app.model_choice_target`).
         pub fn openModelPickerForAgent(app: *App, agent: *AppAgent) !void {
             if (comptime @hasField(App, "model_choice_target")) app.model_choice_target = agent;
+            // The picker borrows the composer as its query box. The person's
+            // draft goes back when the pick or the close is done, so a choice
+            // made for a subagent never costs them what they typed.
+            if (comptime @hasField(App, "input_runtime")) app.input_runtime.stashModelPickerDraft();
             try openCurrentModelPicker(app);
         }
 
@@ -1394,8 +1398,10 @@ pub fn CompletionRuntime(comptime App: type) type {
             const supports_speed = supports_fast or supports_ultrafast;
 
             if (!supports_effort and !supports_speed) {
-                try session_commands.Commands(App).selectModelFromPicker(app, agent, model, agent.effort, pickerFastMode(app, model), false);
+                // The query text leaves the composer first, so the choice can
+                // give the person's draft back in its place.
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                try session_commands.Commands(App).selectModelFromPicker(app, agent, model, agent.effort, pickerFastMode(app, model), false);
                 app.shell.render_requests.request(.footer);
                 return;
             }

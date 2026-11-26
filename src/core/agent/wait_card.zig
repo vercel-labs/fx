@@ -155,16 +155,19 @@ pub const EnterGuard = struct {
         self.armed = true;
     }
 
-    /// True when `byte` is the Enter to drop.
+    /// True when `byte` is the Enter to drop: a carriage return, or the line
+    /// feed some keys and pastes send for it.
     pub fn dropEnter(self: *EnterGuard, byte: u8) bool {
-        const drop = self.armed and byte == '\r';
+        const drop = self.armed and (byte == '\r' or byte == '\n');
         self.armed = false;
         return drop;
     }
 };
 
 fn copyInto(buf: []u8, text: []const u8) usize {
-    const len = @min(text.len, buf.len);
+    var len = @min(text.len, buf.len);
+    // Never end inside a character: a cut can fall in a multi-byte one.
+    while (len > 0 and len < text.len and text[len] & 0xc0 == 0x80) len -= 1;
     @memcpy(buf[0..len], text[0..len]);
     return len;
 }
@@ -279,7 +282,32 @@ test "wait card: the Enter after an answer is dropped once, and any other key di
     try std.testing.expect(!guard.dropEnter('a'));
     try std.testing.expect(!guard.dropEnter('\r'));
 
-    // A line feed is not the Enter the terminal sends for the Enter key.
+    // A line feed is the Enter some keys and pastes send, so it is dropped
+    // too: the draft it would submit is the same one.
     guard.arm();
+    try std.testing.expect(guard.dropEnter('\n'));
     try std.testing.expect(!guard.dropEnter('\n'));
+}
+
+test "wait card: a cut name and reason stay valid text" {
+    var card: WaitCardPrompt = .{};
+    // 63 ASCII bytes and a two-byte character: the 64-byte cut falls inside
+    // the character.
+    var name_buf: [name_max_bytes + 4]u8 = undefined;
+    @memset(name_buf[0..63], 'n');
+    @memcpy(name_buf[63..65], "\u{e9}");
+    // A reason that fills its text and ends on a three-byte character.
+    var reason_buf: [recovery.Text.capacity]u8 = undefined;
+    @memset(reason_buf[0 .. reason_buf.len - 3], 'r');
+    @memcpy(reason_buf[reason_buf.len - 3 ..], "\u{20ac}");
+    var status: types.RouteRecoveryStatus = .{ .kind = .need_user, .need = .rejected };
+    @memcpy(status.text.bytes[0..reason_buf.len], &reason_buf);
+    status.text.len = reason_buf.len;
+
+    _ = card.sync(3, status, name_buf[0..65]);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(card.nameText()));
+    try std.testing.expectEqual(@as(usize, 63), card.nameText().len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(card.reasonText()));
+    try std.testing.expectEqual(reason_buf.len, card.reasonText().len);
 }

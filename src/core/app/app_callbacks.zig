@@ -389,7 +389,7 @@ pub fn Bindings(comptime App: type) type {
                     agentAskOutOfCredits
                 else
                     null,
-                .current_selection = if (comptime provider_runtime.supported(App)) agentCurrentSelection else null,
+                .continue_selection = if (comptime provider_runtime.supported(App)) agentContinueSelection else null,
                 .available_model_capabilities = agentAvailableModelCapabilities,
                 .resolve_model_capabilities = agentResolveModelCapabilities,
                 .model_catalog_failure = agentModelCatalogFailure,
@@ -974,16 +974,14 @@ pub fn Bindings(comptime App: type) type {
             return model_capabilities.capabilitiesForModel(model);
         }
 
-        /// The model a continuing request uses: the agent's own choice, which
-        /// a view may have changed with the card's Change model or the
-        /// picker (`tests/tla/subagent/ViewWaits.tla` ActionReachesOwner).
-        fn agentCurrentSelection(ctx: *anyopaque) ?agent_runtime.CurrentSelection {
+        /// The provider and model a continuing request uses, as the worker
+        /// holds its own copy of them (`ViewWaits.tla` ModelChosen).
+        fn agentContinueSelection(ctx: *anyopaque, alloc: std.mem.Allocator) anyerror!?agent_runtime.CurrentSelection {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
-            const app = appOf(agent);
-            return .{
-                .provider = provider_runtime.providerOf(app, agent),
-                .model = provider_runtime.modelOf(app, agent),
-            };
+            // A test fake may keep no worker copy: it has none to read.
+            if (comptime !@hasDecl(@TypeOf(agent.worker), "continueSelection")) return null;
+            const selection = (try agent.worker.continueSelection(alloc)) orelse return null;
+            return .{ .provider = selection.provider, .model = selection.model };
         }
 
         fn agentAvailableModelCapabilities(ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities {
@@ -1666,6 +1664,9 @@ pub fn Bindings(comptime App: type) type {
                 if (comptime @hasField(App, "model_choice_target")) {
                     if (agent.role == .subagent) app.model_choice_target = agent;
                 }
+                // The picker borrows the composer as its query box; the
+                // person's draft goes back when the pick or the close is done.
+                if (comptime @hasField(App, "input_runtime")) app.input_runtime.stashModelPickerDraft();
                 try input_completion_runtime.CompletionRuntime(App).openCurrentModelPicker(app);
             }
         }

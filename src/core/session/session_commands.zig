@@ -1166,10 +1166,28 @@ pub fn Commands(comptime App: type) type {
             // screen (`tests/tla/subagent/ViewWaits.tla` ActionReachesOwner).
             // The file's own way of probing a worker member a test fake may
             // lack (`:402` does it for the session): the real worker has it.
-            if (comptime @hasDecl(@TypeOf(target.worker), "requestRecoveryContinue")) {
-                if (target != agents.screenAgentOf(app)) target.worker.requestRecoveryContinue();
+            if (comptime @hasDecl(@TypeOf(target.worker), "setContinueSelection")) {
+                // The person chose this subagent's model: its waiting request
+                // reads the copy from its own worker, under that worker's lock
+                // (`tests/tla/subagent/ViewWaits.tla` ModelChosen).
+                const waits_for_user = if (comptime @hasDecl(App, "requestWaitsForUser")) app.requestWaitsForUser(target) else false;
+                if (waits_for_user) {
+                    target.worker.setContinueSelection(std.heap.c_allocator, provider_runtime.providerOf(app, target), model) catch |err|
+                        debug_trace.logf("host", "continue selection not handed over err={s}", .{@errorName(err)});
+                    if (comptime @hasDecl(@TypeOf(target.worker), "requestRecoveryContinue")) target.worker.requestRecoveryContinue();
+                }
             }
             clearModelChoiceTarget(app);
+            // The pick is done: the draft the picker borrowed the composer for
+            // comes back exactly as the person left it.
+            restoreCardModelPickerDraft(app);
+        }
+
+        /// Gives back the draft a card's "Change model" set aside when it
+        /// opened the picker for a subagent (`openModelPickerForAgent`).
+        fn restoreCardModelPickerDraft(app: *App) void {
+            if (comptime !@hasField(App, "input_runtime")) return;
+            _ = app.input_runtime.restoreModelPickerDraft(app.alloc);
         }
 
         /// The agent the picker changes: the one a view opened it for, while

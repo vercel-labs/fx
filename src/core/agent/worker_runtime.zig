@@ -592,6 +592,13 @@ pub const HeadSegmentScan = union(enum) {
     pub const fresh: HeadSegmentScan = .{ .turn = null };
 };
 
+/// The provider and model a waiting request continues with, owned by the
+/// worker that received it.
+pub const ContinueSelection = struct {
+    provider: model_provider.ProviderId,
+    model: []u8,
+};
+
 pub const WorkerRuntime = struct {
     worker_mutex: std.Io.Mutex = .init,
     worker_cond: std.Io.Condition = .init,
@@ -640,6 +647,10 @@ pub const WorkerRuntime = struct {
     /// Set when the user answers a request that waits for them; the request's
     /// recovery reads and clears it (`RequestRecovery.continue_flag`).
     recovery_continue_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// The provider and model a view's picker chose for a waiting request,
+    /// handed over under `worker_mutex` so the worker thread never reads the
+    /// view's strings (`tests/tla/subagent/ViewWaits.tla` ModelChosen).
+    continue_selection: ?ContinueSelection = null,
     /// Set when the sign-in fx opened for a waiting request closes without
     /// a new login; the request's recovery reads and clears it
     /// (`RequestRecovery.sign_in_closed_flag`).
@@ -869,6 +880,10 @@ pub const WorkerRuntime = struct {
         if (self.queued_context_compaction) |task| freeContextCompactionTask(alloc, task);
 
         self.clearActiveToolCallsLocked();
+        if (self.continue_selection) |selection| {
+            alloc.free(selection.model);
+            self.continue_selection = null;
+        }
 
         for (self.worker_events.items) |event| freeWorkerEvent(alloc, event);
         self.worker_events.deinit(alloc);
@@ -2954,6 +2969,33 @@ pub const WorkerRuntime = struct {
         if (!self.commit_gate) return;
         debug_trace.eventf("worker", "commit_gate_finish_dropped", .{ .turn_id = self.active_turn_id }, "worker={x} count={d} unacknowledged={d} reason=events_discarded", .{ @intFromPtr(self), finishes, self.unacknowledged_finishes });
         self.releaseFinishesLocked(finishes, "events_discarded");
+    }
+
+    /// Hands this worker the provider and model its waiting request continues
+    /// with, as the view's picker chose them, so the worker thread reads its
+    /// own copy rather than the view's strings (`ViewWaits.tla` ModelChosen).
+    pub fn setContinueSelection(self: *WorkerRuntime, alloc: std.mem.Allocator, provider: model_provider.ProviderId, model: []const u8) !void {
+        const model_copy = try alloc.dupe(u8, model);
+        errdefer alloc.free(model_copy);
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.continue_selection) |old| alloc.free(old.model);
+        self.continue_selection = .{ .provider = provider, .model = model_copy };
+    }
+
+    /// A copy of the selection set above, allocated from `alloc` so it
+    /// outlives the lock. Null when the view chose none.
+    pub fn continueSelection(self: *WorkerRuntime, alloc: std.mem.Allocator) !?ContinueSelection {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        const selection = self.continue_selection orelse return null;
+        return .{ .provider = selection.provider, .model = try alloc.dupe(u8, selection.model) };
+    }
+
+    /// Whether a request that waits for the person asked to continue and has
+    /// not been read yet.
+    pub fn recoveryContinueRequested(self: *const WorkerRuntime) bool {
+        return self.recovery_continue_requested.load(.seq_cst);
     }
 
     pub fn syncQueuedPromptModel(self: *WorkerRuntime, alloc: std.mem.Allocator, model: []const u8) !void {

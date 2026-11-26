@@ -5687,6 +5687,90 @@ describe("a subagent's wait shows in the view the person is on", () => {
   );
 
   test(
+    "S2b: the card's Change model for a refused request changes the subagent's model",
+    async () => {
+      const secondModel = "openai/gpt-5-mini";
+      let childCalls = 0;
+      let childModel = "";
+      let mainModel = "";
+      const childWaits = held();
+      await withFx(
+        async (body) => {
+          if (!isMainRequest(body)) {
+            childCalls += 1;
+            if (childCalls === 1) {
+              // The card shows only after the person's draft is in place.
+              await childWaits.promise;
+              return refused();
+            }
+            return text("child_again", "WAIT_S2B_CHILD_DONE");
+          }
+          if (!body.includes('"main_s2b"')) {
+            return toolCall("main_s2b", "subagent", { request: { action: "message", agent: "refuser", message: "WAIT_S2B_CHILD" } });
+          }
+          return text("main_s2b_done", "WAIT_S2B_MAIN_DONE");
+        },
+        async (session, context) => {
+          await session.sendText("SWITCH_USER WAIT_S2B_TASK");
+          await session.waitForText("WAIT_S2B_MAIN_DONE", 30_000);
+          // Main's own draft is in the composer before the card takes the keys.
+          await session.sendLiteral("WAIT_S2B_DRAFT");
+          await session.waitForPane((pane) => composerContains(pane, "WAIT_S2B_DRAFT"), 10_000);
+          childWaits.release();
+          // A refused wait shows the card, and its "Change model" opens the
+          // picker for that subagent.
+          const card = await session.waitForPane(
+            (pane) => pane.includes("refuser: The provider rejected this request") && pane.includes("Change model"),
+            30_000,
+          );
+          expect(card).not.toContain("refuser needs you");
+          await session.sendKeys(cardDigit(card, "Change model"));
+          await session.waitForPane((pane) => pane.includes("/model"), 15_000);
+          // One Enter picks the row: the card's guard holds no Enter the
+          // picker wants.
+          await session.sendKeys("Down");
+          await session.sendKeys("Enter");
+          await session.waitForPane(
+            (pane) => pane.includes(`refuser continues with ${secondModel} (effort: default, speed: normal)`),
+            25_000,
+          );
+          // The wait resumes with the new model, as a new request.
+          const childRequests = () => context.requests.filter((request) => request.body.includes("WAIT_S2B_CHILD") && !isMainRequest(request.body));
+          await until("the subagent's next request", () => childRequests().length >= 2, 30_000);
+          // The request model rides a header, not the body.
+          const childRequest = childRequests().at(-1);
+          childModel = childRequest?.headers.get("ai-language-model-id") ?? "";
+          expect(childModel).toBe(secondModel);
+          // The choice cost the person nothing they typed.
+          expect(composerContains(await session.capturePane(), "WAIT_S2B_DRAFT")).toBe(true);
+          // Main's own next turn keeps main's model; the draft typed beside it
+          // rides along in the prompt.
+          const mainRequests = () => context.requests.filter((request) => isMainRequest(request.body));
+          const mainBefore = mainRequests().length;
+          await session.sendText("SWITCH_USER WAIT_S2B_AFTER");
+          await until("main's next request", () => mainRequests().length > mainBefore, 30_000);
+          const mainRequest = mainRequests().at(-1);
+          mainModel = mainRequest?.headers.get("ai-language-model-id") ?? "";
+          expect(mainModel).toBe(FAKE_GATEWAY_MODEL);
+          expect(mainRequest?.body.includes("WAIT_S2B_DRAFT")).toBe(true);
+        },
+        undefined,
+        false,
+        {},
+        {
+          models: [
+            { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+            { id: secondModel, type: "language", tags: ["tool-use"] },
+          ],
+        },
+      );
+      expect(childModel).toBe(secondModel);
+      expect(mainModel).toBe(FAKE_GATEWAY_MODEL);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "S3: a sign-in card signs in for that subagent, and main's composer is not submitted",
     async () => {
       const issuer = startFakeIssuer({ refresh: () => Response.json({ error: "invalid_grant" }, { status: 400 }) });

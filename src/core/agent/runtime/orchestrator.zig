@@ -5116,6 +5116,41 @@ fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: Que
 
 const UserAnswer = enum { resend, cancelled, switch_model };
 
+/// Reads the provider, model and capabilities a subagent's continued request
+/// runs with: the copy its worker holds, handed over by the view's picker
+/// (`tests/tla/subagent/ViewWaits.tla` ModelChosen). A root request keeps the
+/// copy it started with, so only a non-root origin calls this.
+fn applyContinuedSelection(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    job: *QueuedPrompt,
+    capabilities: *model_capabilities.Capabilities,
+) !void {
+    const current = deps.continue_selection orelse return;
+    const selection = (try current(deps.ctx, arena)) orelse return;
+    job.provider = selection.provider;
+    job.model = selection.model;
+    capabilities.* = deps.available_model_capabilities(deps.ctx, job.model);
+}
+
+/// A subagent's waiting request continues on the model the view's picker
+/// chose: true when the person picked one, so the caller runs the attempt
+/// again (`tests/tla/subagent/ViewWaits.tla` ModelChosen). False for a root
+/// request, which keeps its own prompt and model.
+fn continueOnPickedModel(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    job: *QueuedPrompt,
+    capabilities: *model_capabilities.Capabilities,
+    request_recovery: *runtime_request_recovery.RequestRecovery,
+    config: Config,
+) !bool {
+    if (config.origin == .root) return false;
+    if (try request_recovery.waitForSend() == null) return false;
+    try applyContinuedSelection(deps, arena, job, capabilities);
+    return true;
+}
+
 /// Reports a failure that needs the user and waits for their answer.
 fn waitForUser(
     request_recovery: *runtime_request_recovery.RequestRecovery,
@@ -9698,6 +9733,10 @@ fn processQueuedPromptLoop(
                             http_failure_notice_shown = false;
                             // The resend uses the credential the sign-in stored.
                             if (kind == .sign_in) credential_reload_pending = true;
+                            // A subagent's request continues on the model the
+                            // person chose for it while it waited
+                            // (`ViewWaits.tla` ModelChosen).
+                            if (config.origin != .root) try applyContinuedSelection(deps, arena, &job, &request_capabilities);
                             recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
                             reset_stream_for_next_attempt = true;
                             continue;
@@ -9712,30 +9751,17 @@ fn processQueuedPromptLoop(
                             // A subagent has no composer to send from again:
                             // its wait stays open across the picker, and the
                             // person's choice continues this request with the
-                            // new model, as "retry" does
-                            // (`tests/tla/subagent/ViewWaits.tla`
-                            // ModelChosen, ActionReachesOwner). Closing the
-                            // picker without a choice leaves the wait open and
-                            // the card comes back; only a cancel ends the turn.
-                            if (config.origin != .root) {
-                                if (try request_recovery.waitForSend() != null) {
-                                    // The person chose this subagent's model
-                                    // in the picker that wait opened, so this
-                                    // request continues on it.
-                                    if (deps.current_selection) |current| {
-                                        if (current(deps.ctx)) |selection| {
-                                            job.provider = selection.provider;
-                                            job.model = try arena.dupe(u8, selection.model);
-                                            request_capabilities = deps.available_model_capabilities(deps.ctx, job.model);
-                                        }
-                                    }
-                                    stream_result.deinit(arena);
-                                    stream_result_set = false;
-                                    http_failure_notice_shown = false;
-                                    recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
-                                    reset_stream_for_next_attempt = true;
-                                    continue;
-                                }
+                            // new model, as "retry" does (`ViewWaits.tla`
+                            // ModelChosen). Closing the picker without a choice
+                            // leaves the wait open and the card comes back;
+                            // only a cancel ends the turn.
+                            if (try continueOnPickedModel(deps, arena, &job, &request_capabilities, &request_recovery, config)) {
+                                stream_result.deinit(arena);
+                                stream_result_set = false;
+                                http_failure_notice_shown = false;
+                                recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
+                                reset_stream_for_next_attempt = true;
+                                continue;
                             }
                         },
                         .cancelled => {},
