@@ -16,7 +16,6 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const request_deadlines = @import("request_deadlines.zig");
 const sse = @import("sse.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
-const text_utils = @import("../core/shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 
 /// fx's own bounds, for a connection whose settings name none.
@@ -103,23 +102,17 @@ pub const Headers = struct {
     /// asterisks, in the forms a server may quote them. Takes `detail` and
     /// returns owned text.
     fn mask(self: *const Headers, alloc: Allocator, detail: []u8, token: ?[]const u8) Allocator.Error![]u8 {
-        const shown = try shownForm(alloc, detail);
-        defer alloc.free(shown);
-        const values = try self.secrets(alloc, token);
+        const values = self.secrets(alloc, token) catch |err| {
+            alloc.free(detail);
+            return err;
+        };
         defer alloc.free(values);
-        // Every span is found before any is masked, so secrets that overlap
-        // never leave part of one showing.
-        return text_utils.maskSecretValues(alloc, shown, values);
+        // With nothing to mask, the body stays as the server sent it.
+        if (values.len == 0) return detail;
+        defer alloc.free(detail);
+        return chat_codec.redact_error_detail_secrets(alloc, detail, values);
     }
 };
-
-/// `detail` as fx shows a server's error: decoded and written back when it
-/// is JSON, within the error text's limits. Takes `detail`; the caller owns
-/// the result.
-fn shownForm(alloc: Allocator, detail: []u8) Allocator.Error![]u8 {
-    defer alloc.free(detail);
-    return chat_codec.redact_error_detail(alloc, detail, "");
-}
 
 fn expired(deadline: std.Io.Clock.Timestamp) bool {
     return !std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io.getIo(), .awake), .lt, deadline);
@@ -458,6 +451,25 @@ test "Headers lists exactly the secrets the request sent, longest first, on ever
         }
     };
     try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Check.run, .{});
+}
+
+test "Headers keeps an error body as the server sent it when there is nothing to mask" {
+    const alloc = std.testing.allocator;
+    const headers = Headers{ .list = &.{}, .owned = 0 };
+    for ([_][]const u8{ "{\"error\": broken", "plain refusal", "{\"error\":{\"message\":\"no\"}}" }) |body| {
+        const kept = try headers.mask(alloc, try alloc.dupe(u8, body), null);
+        defer alloc.free(kept);
+        try std.testing.expectEqualStrings(body, kept);
+    }
+}
+
+test "Headers masks a secret a decoded error message quotes in its escaped spelling" {
+    const alloc = std.testing.allocator;
+    var storage = [_]std.http.Header{.{ .name = "X-Key", .value = "tok\"en-value" }};
+    const headers = Headers{ .list = storage[0..], .owned = 1 };
+    const masked = try headers.mask(alloc, try alloc.dupe(u8, "{\"error\":{\"message\":\"key tok\\\\\\\"en-value refused\"}}"), null);
+    defer alloc.free(masked);
+    try std.testing.expectEqualStrings("{\"error\":{\"message\":\"key ************* refused\"}}", masked);
 }
 
 test "Headers masks secrets that overlap at their ends whole, as written and in a JSON body" {
