@@ -88,8 +88,9 @@ pub fn formatHttpErrorNotice(alloc: Allocator, status: std.http.Status, detail: 
     defer if (parsed) |*value| value.deinit();
 
     const error_object = if (parsed) |value| errorObjectOf(value.value) else null;
-    const message = nonEmptyText(if (error_object) |object| stringField(object, "message") else null);
-    const code = if (error_object) |object| (stringField(object, "code") orelse stringField(object, "type")) else null;
+    const fields = if (error_object) |object| errorCodeAndMessage(object) else null;
+    const message = nonEmptyText(if (fields) |found| found.message else null);
+    const code = if (fields) |found| found.code else null;
     const provider = if (error_object) |object| (stringField(object, "provider") orelse providerFromGatewayMessage(message)) else null;
 
     const title = if (status_code == 401 or status_code == 403) "API access denied" else "API request failed";
@@ -122,6 +123,19 @@ fn errorObjectOf(root: std.json.Value) ?std.json.ObjectMap {
     const root_object = objectValue(root) orelse return null;
     const error_value = root_object.get("error") orelse return null;
     return objectValue(error_value);
+}
+
+const CodeAndMessage = struct { code: ?[]const u8, message: ?[]const u8 };
+
+/// Some providers put their code and message only under `error.param`, so each falls back to it.
+fn errorCodeAndMessage(error_object: std.json.ObjectMap) CodeAndMessage {
+    const param_object = if (error_object.get("param")) |param_value| objectValue(param_value) else null;
+    const code = stringField(error_object, "code") orelse
+        stringField(error_object, "type") orelse
+        if (param_object) |param| stringField(param, "name") else null;
+    const message = stringField(error_object, "message") orelse
+        if (param_object) |param| stringField(param, "message") else null;
+    return .{ .code = code, .message = message };
 }
 
 fn nonEmptyText(text: ?[]const u8) ?[]const u8 {
@@ -185,11 +199,9 @@ fn formatHttpDiagnostic(
         return formatFallbackBounded(alloc, status, detail, max_bytes);
     const error_object = objectValue(error_value) orelse
         return formatFallbackBounded(alloc, status, detail, max_bytes);
-    const param_object = if (error_object.get("param")) |param_value| objectValue(param_value) else null;
-    const code = stringField(error_object, "code") orelse
-        stringField(error_object, "type") orelse
-        if (param_object) |param| stringField(param, "name") else null;
-    const message = stringField(error_object, "message") orelse if (param_object) |param| stringField(param, "message") else null;
+    const fields = errorCodeAndMessage(error_object);
+    const code = fields.code;
+    const message = fields.message;
     const provider = stringField(error_object, "provider") orelse providerFromGatewayMessage(message);
 
     const raw = try formatParsedHttpMessage(
@@ -563,6 +575,30 @@ test "formatHttpErrorNotice keeps the provider message and puts Token Pass rows 
     try std.testing.expect(std.mem.find(u8, notice.body, "\n├ \x1b]8;;") != null);
     try std.testing.expect(std.mem.find(u8, notice.body, "Subscribe to Token Pass") != null);
     try std.testing.expectEqualStrings("HTTP 403 · no_providers_available", notice.codes);
+}
+
+test "formatHttpErrorNotice reads a message and name that only the param holds" {
+    const alloc = std.testing.allocator;
+    const detail =
+        \\{"error":{"param":{"name":"RestrictedProvidersError","message":"Your team has restricted access to this provider."}}}
+    ;
+    const notice = try formatHttpErrorNotice(alloc, .forbidden, detail);
+    defer notice.deinit(alloc);
+
+    try std.testing.expectEqualStrings("Your team has restricted access to this provider.", notice.body);
+    try std.testing.expectEqualStrings("HTTP 403 · RestrictedProvidersError", notice.codes);
+}
+
+test "formatHttpErrorNotice keeps Token Pass rows for a param-only denial" {
+    const alloc = std.testing.allocator;
+    const detail =
+        \\{"error":{"param":{"message":"This model requires an active Vercel Token Pass."}}}
+    ;
+    const notice = try formatHttpErrorNotice(alloc, .forbidden, detail);
+    defer notice.deinit(alloc);
+
+    try std.testing.expect(std.mem.startsWith(u8, notice.body, "This model requires an active Vercel Token Pass."));
+    try std.testing.expect(std.mem.find(u8, notice.body, "Subscribe to Token Pass") != null);
 }
 
 test "formatHttpErrorNotice names a quota code and no provider" {
