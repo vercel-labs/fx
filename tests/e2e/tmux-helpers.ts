@@ -1394,6 +1394,21 @@ export class TmuxSession {
     }
   }
 
+  /// The pane's `remain-on-exit-format`, the text tmux expands into its
+  /// "Pane is dead" row. Throws on a tmux error, and when tmux finds no pane:
+  /// `display-message` then still exits 0, with an empty `pane_id`.
+  remainOnExitFormat(): string {
+    const target = `${this.name}:0.0`;
+    const raw = execFileSync(
+      "tmux",
+      this.tmuxArgs(["display-message", "-t", target, "-p", "#{pane_id}|#{remain-on-exit-format}"]),
+      { stdio: "pipe", encoding: "utf-8" },
+    ).replace(/\n$/, "");
+    const separator = raw.indexOf("|");
+    if (separator <= 0) throw new Error(`tmux found no pane ${target}: ${JSON.stringify(raw)}`);
+    return raw.slice(separator + 1);
+  }
+
   isPaneAlive(): boolean {
     return !this.paneStatus().dead;
   }

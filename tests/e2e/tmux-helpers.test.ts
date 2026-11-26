@@ -141,6 +141,26 @@ tmuxTest("the launched process PID skips a shell that runs the pane command as a
   }
 });
 
+tmuxTest("reading the remain-on-exit format throws when tmux has no such pane or no server", async () => {
+  const socketName = `fx-roe-format-${process.pid}-${Date.now().toString(36)}`;
+  const first = await TmuxSession.create({ cmd: "sleep 30", startupWaitMs: 0, socketName });
+  const second = await TmuxSession.create({ cmd: "sleep 30", startupWaitMs: 0, socketName });
+  try {
+    expect(first.remainOnExitFormat().length).toBeGreaterThan(0);
+    // The server still runs, and tmux exits 0 for a target it cannot find.
+    await first.kill();
+    expect(() => first.remainOnExitFormat()).toThrow(`tmux found no pane ${first.name}:0.0`);
+    await second.kill();
+    expect(() => second.remainOnExitFormat()).toThrow(/no server running|error connecting/);
+  } finally {
+    await second.kill();
+    await first.kill();
+    try {
+      execFileSync("tmux", ["-L", socketName, "kill-server"], { stdio: "pipe" });
+    } catch {}
+  }
+});
+
 test("held gateway response disposes before it is requested", async () => {
   const held = heldFakeGatewayFinalText();
 
