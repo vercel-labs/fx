@@ -25,6 +25,9 @@
 (* exits 143; before the id is known, it waits for the id or ends as an    *)
 (* unknown start.                                                          *)
 (*                                                                         *)
+(* A tracked file the command deletes is gone from the sandbox. Its record *)
+(* leaves at the bring back, so the next push sends this machine's copy (V9). *)
+(*                                                                         *)
 (* Before the start request, the sandbox session may end (410). A push     *)
 (* answered that R is missing is repaired once (V5). A session call        *)
 (* answered 404 or 410 resumes the session once, then the call runs again  *)
@@ -99,6 +102,9 @@ vars == <<kind, phase, exit, macV, startV, recordV, broughtV, remoteV,
           resumeGets, posts, marked, sawGone>>
 
 NoVersion == Other + 1
+
+\* The sandbox file is gone: the command deleted it (V9). Only a tracked file takes this value.
+Gone == NoVersion
 
 Init ==
     /\ kind \in Kinds
@@ -330,6 +336,19 @@ CmdEdits ==
                    closes, mode, sessionEnded, ends, pushTries, repaired, resumed,
                    resumeGets, posts>>
 
+\* The command deletes a tracked file in the sandbox (V9). Its record stays until a
+\* bring back finds the file gone.
+CmdDeletes ==
+    /\ kind = "tracked"
+    /\ remoteCmd = "running"
+    /\ ~cmdEdited
+    /\ remoteV' = Gone
+    /\ cmdEdited' = TRUE
+    /\ UNCHANGED <<marked, sawGone, kind, otherWrote, phase, exit, macV, startV, recordV, broughtV,
+                   macEdits, userEdit, remoteCmd, sends, stopReq, killSent, overwrote,
+                   closes, mode, sessionEnded, ends, pushTries, repaired, resumed,
+                   resumeGets, posts>>
+
 CmdExits ==
     /\ remoteCmd = "running"
     /\ remoteCmd' = "exited"
@@ -387,19 +406,38 @@ RemoteChanged ==
 
 BringBack ==
     /\ phase = "bringing"
-    /\ IF RemoteChanged
-       THEN IF Unchanged \/ Bug = "overwrite_mac"
-            THEN /\ macV' = remoteV
-                 /\ overwrote' = userEdit
-                 /\ IF kind = "tracked"
-                    THEN recordV' = remoteV /\ UNCHANGED broughtV
-                    ELSE broughtV' = remoteV /\ UNCHANGED recordV
+    /\ IF kind = "tracked" /\ remoteV = Gone
+       THEN \* V9: the sandbox no longer has the file. Its record leaves, so the next push sends
+            \* this machine's copy, and the Mac file stays. The planted bug keeps the record.
+            /\ recordV' = IF Bug = "keep_gone_record" THEN recordV ELSE NoVersion
+            /\ UNCHANGED <<macV, overwrote, broughtV>>
+       ELSE IF RemoteChanged
+            THEN IF Unchanged \/ Bug = "overwrite_mac"
+                 THEN /\ macV' = remoteV
+                      /\ overwrote' = userEdit
+                      /\ IF kind = "tracked"
+                         THEN recordV' = remoteV /\ UNCHANGED broughtV
+                         ELSE broughtV' = remoteV /\ UNCHANGED recordV
+                 ELSE UNCHANGED <<marked, sawGone, macV, overwrote, recordV, broughtV>>
             ELSE UNCHANGED <<marked, sawGone, macV, overwrote, recordV, broughtV>>
-       ELSE UNCHANGED <<marked, sawGone, macV, overwrote, recordV, broughtV>>
     /\ Finish("cmd")
     /\ UNCHANGED <<marked, sawGone, kind, startV, remoteV, cmdEdited, otherWrote, macEdits, userEdit,
                    remoteCmd, sends, stopReq, killSent, closes, mode, sessionEnded, ends,
                    pushTries, repaired, resumed, resumeGets, posts>>
+
+\* V5: after the run, the next push sends every tracked file that has no manifest
+\* record, or one that differs from its record. Its record becomes this machine's version.
+NextPush ==
+    /\ phase = "done"
+    /\ exit = "cmd"
+    /\ kind = "tracked"
+    /\ (recordV = NoVersion \/ recordV # macV)
+    /\ recordV' = macV
+    /\ remoteV' = macV
+    /\ UNCHANGED <<marked, sawGone, kind, phase, exit, macV, startV, broughtV, cmdEdited,
+                   otherWrote, macEdits, userEdit, remoteCmd, sends, stopReq, killSent,
+                   overwrote, closes, mode, sessionEnded, ends, pushTries, repaired, resumed,
+                   resumeGets, posts>>
 
 \* The user edits the Mac file. For a tracked file the baseline point is the
 \* push, so an edit before it is pushed; for a bring_back output it is the
@@ -522,13 +560,14 @@ Done ==
 Next ==
     \/ Runner
     \/ SessionEnds
-    \/ CmdEdits \/ CmdExits \/ IdleClose
+    \/ CmdEdits \/ CmdDeletes \/ CmdExits \/ IdleClose
+    \/ NextPush
     \/ MacEdit \/ OtherRunBringsBack \/ OtherRunWritesRemote \/ StopRequest
     \/ Done
 
 \* The runner's steps are fair. The command may never end, and the user may
 \* never stop it. The sandbox session may end at any time before the start request.
-Spec == Init /\ [][Next]_vars /\ WF_vars(Runner)
+Spec == Init /\ [][Next]_vars /\ WF_vars(Runner) /\ WF_vars(NextPush)
 
 ---------------------------------------------------------------------------
 TypeOK ==
@@ -538,9 +577,9 @@ TypeOK ==
     /\ exit \in Exits
     /\ macV \in Versions
     /\ startV \in Versions
-    /\ recordV \in Versions
+    /\ recordV \in Versions \cup {NoVersion}
     /\ broughtV \in Versions \cup {NoVersion}
-    /\ remoteV \in Versions
+    /\ remoteV \in Versions \cup {Gone}
     /\ cmdEdited \in BOOLEAN
     /\ otherWrote \in BOOLEAN
     /\ macEdits \in 0..MaxMacEdits
@@ -595,8 +634,17 @@ MacEditsWin == ~overwrote
 \* After a successful run with no user edit, the Mac holds what the command
 \* made: a file written by an overlapping run's bring back does not block it.
 FreshBringBack ==
-    (phase = "done" /\ exit = "cmd" /\ RemoteChanged /\ ~userEdit)
+    (phase = "done" /\ exit = "cmd" /\ RemoteChanged /\ ~userEdit /\ remoteV # Gone)
         => macV = remoteV
+
+\* V9: a path the sandbox deleted keeps no record once its bring back has run, so the next
+\* push sends this machine's copy. A record left behind would make that push skip it.
+GoneRecordDropped ==
+    (phase = "done" /\ exit = "cmd" /\ kind = "tracked" /\ remoteV = Gone) => recordV = NoVersion
+
+\* A path the sandbox deleted comes back: the next push sends this machine's copy.
+GoneComesBack ==
+    (phase = "done" /\ exit = "cmd" /\ kind = "tracked" /\ remoteV = Gone) ~> (remoteV = macV)
 
 \* After a stop reported as a kill (143), the remote command is not left running.
 \* An unconfirmed stop (143u) may leave it running: that is what "could not confirm" means.

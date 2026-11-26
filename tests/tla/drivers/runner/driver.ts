@@ -55,8 +55,8 @@ const OUTCOMES = ["local", "remote", "isolated", "refused"] as const;
 const MARKING_ANSWERS: readonly string[] = ["decline", "cancel", "no_answer"];
 const EVENTS = [
   "push_ok", "push_failed", "stop_before_send", "send_ran", "send_not_run", "send_failed", "send_gone", "resumed",
-  "id_arrives", "no_id", "cmd_edits", "cmd_exits", "stream_end", "idle_close",
-  "reattach_ok", "reattach_lost", "bring_back_written", "bring_back_kept", "bring_back_nothing",
+  "id_arrives", "no_id", "cmd_edits", "cmd_deletes", "cmd_exits", "stream_end", "idle_close",
+  "reattach_ok", "reattach_lost", "bring_back_written", "bring_back_kept", "bring_back_nothing", "bring_back_gone",
   "mac_edit", "stop_requested", "kill_sent", "stop_exit",
   "exit_cmd", "exit_125", "exit_143", "exit_255",
 ] as const;
@@ -102,7 +102,8 @@ type SetupTamper =
   | "prompt-after-decline" | "write-without-accept" | "prompt-without-channel" | "p2-skipped";
 type RunTamper =
   | "resend-after-unknown" | "resend-after-close" | "overwrite-mac" | "exit-without-kill"
-  | "stop-before-id" | "early-bring-back" | "exit-code-lie" | "resend-without-resume";
+  | "stop-before-id" | "early-bring-back" | "exit-code-lie" | "resend-without-resume"
+  | "gone-record-kept";
 
 /// How --next drives a fixture's scenario. Everything else comes from the
 /// setup set's inputs.
@@ -113,6 +114,7 @@ type Drive = {
   stop?: boolean; // run in the background, then stop it
   stopWhenExecSent?: boolean; // stop once the exec request reached the fake
   file?: string; // the repository file the command may change
+  deletes?: boolean; // the command deletes `file` in the sandbox, so its bring back finds it gone (V9)
   macEdit?: boolean; // edit `file` on the Mac once the command changed it remotely
 };
 
@@ -222,6 +224,7 @@ const SETUP_TAMPERS: SetupTamper[] = [
 const RUN_TAMPERS: RunTamper[] = [
   "resend-after-unknown", "resend-after-close", "overwrite-mac", "exit-without-kill",
   "stop-before-id", "early-bring-back", "exit-code-lie", "resend-without-resume",
+  "gone-record-kept",
 ];
 
 function parseFixture(path: string): Fixture {
@@ -235,7 +238,7 @@ function parseFixture(path: string): Fixture {
   const tamperIn = keysExactly(f.tamper, [], `${name}.tamper`, ["setup", "run"]);
   expect((tamperIn.setup !== undefined) === (setup !== undefined), `${name}.tamper.setup`, "one tamper for the setup set");
   expect((tamperIn.run !== undefined) === (run !== undefined), `${name}.tamper.run`, "one tamper for the run set");
-  const drive = keysExactly(f.drive, [], `${name}.drive`, ["command", "teams", "faults", "stop", "stopWhenExecSent", "file", "macEdit"]);
+  const drive = keysExactly(f.drive, [], `${name}.drive`, ["command", "teams", "faults", "stop", "stopWhenExecSent", "file", "macEdit", "deletes"]);
   if (setup !== undefined) {
     const driveTeams = (drive as Drive).teams ?? 1;
     expect((setup.teams === "many") === (driveTeams >= 2), name, "setup.teams and drive.teams must agree");
@@ -357,6 +360,9 @@ function tamperRun(r: RunObs, kind: RunTamper): { set: RunObs; why: string } {
       e.splice(at("cmd_exits"), 0, "stream_end");
       return { set: { events: e }, why: "the stream ended before the command exited" };
     }
+    case "gone-record-kept":
+      e[at("bring_back_gone")] = "bring_back_kept";
+      return { set: { events: e }, why: "the bring back kept the record of a file the sandbox deleted" };
     case "exit-code-lie": {
       const lie: Record<string, RunEvent> = { exit_125: "exit_cmd", exit_255: "exit_125", exit_143: "exit_cmd", exit_cmd: "exit_255" };
       const last = e.at(-1)!;
@@ -1166,6 +1172,9 @@ function remoteRunEvents(
       ? (exitedAt !== null ? Math.min(seen.cmdEditAt, exitedAt) : seen.cmdEditAt)
       : (remoteEdited ? exitedAt : null);
     if (editAt !== null) add(editAt, 5, "cmd_edits");
+    // The command deleted the pushed file in the sandbox (V9): it is missing once the run has ended.
+    const deleted = f.drive.deletes === true && seen.remoteFile !== null && !existsSync(seen.remoteFile);
+    if (deleted) add(exitedAt ?? end - 2, 5, "cmd_deletes");
     if (seen.macEditAt !== null) add(seen.macEditAt, 6, "mac_edit");
     // The fake's idle close (`idleCloseAfterBytes`) ends the exec stream with this note.
     const idle = exec.notes.find((note: string) => note.startsWith("stream closed after"));
@@ -1187,7 +1196,7 @@ function remoteRunEvents(
       add(when(back) - 0.5, 11, "stream_end");
       const mac = seen.file && existsSync(seen.file) ? readFileSync(seen.file, "utf8") : seen.pushed;
       const kept = final?.text.includes("fx: kept your version of") ?? false;
-      add(when(back), 12, kept ? "bring_back_kept" : mac !== seen.pushed ? "bring_back_written" : "bring_back_nothing");
+      add(when(back), 12, deleted ? "bring_back_gone" : kept ? "bring_back_kept" : mac !== seen.pushed ? "bring_back_written" : "bring_back_nothing");
     }
   }
   timed.sort((a, b) => a.at - b.at || a.rank - b.rank);

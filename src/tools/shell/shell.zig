@@ -303,7 +303,7 @@ pub fn decode(
         ctx.allocator,
         args_json,
         ctx.session_child_capability != null,
-        ctx.sandbox_policy != null,
+        runnerFieldOn(ctx),
     ) };
 }
 
@@ -313,6 +313,13 @@ const runner_key = "runner";
 
 const runner_value_message = "runner must be \"local\" or \"remote\"";
 
+/// Whether the runner field is on for this surface. WASM never loads a sandbox policy (A4), so the field
+/// is never offered there.
+fn runnerFieldOn(ctx: tool_dispatch.DispatchContext) bool {
+    if (comptime host_target.is_wasm) return false;
+    return ctx.sandbox_policy != null;
+}
+
 fn isRunnerWord(value: std.json.Value) bool {
     return value == .string and (std.mem.eql(u8, value.string, "local") or std.mem.eql(u8, value.string, "remote"));
 }
@@ -321,6 +328,7 @@ fn isRunnerWord(value: std.json.Value) bool {
 /// `remote` is refused before anything else is read. Other actions are left to
 /// the field check, which refuses `runner` on them.
 fn runnerValueProblem(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_dispatch.DispatchError!?[]u8 {
+    if (comptime host_target.is_wasm) return null;
     if (ctx.sandbox_policy == null) return null;
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer mem_utils.deinit_arena(arena_state);
@@ -366,7 +374,7 @@ fn decode_input(
 
     var correction_scratch: ActionFieldCorrectionScratch = .{};
     defer correction_scratch.deinit(ctx.allocator);
-    const runner_field = ctx.sandbox_policy != null;
+    const runner_field = runnerFieldOn(ctx);
     if (try actionFieldCorrection(
         ctx.allocator,
         action,
@@ -405,6 +413,7 @@ fn decode_input(
 /// returns its request. Without the runner field, the field check has already
 /// refused `runner`, so nothing is removed.
 fn takeRunner(object: *std.json.ObjectMap, action: Action, runner_field: bool) ?sandbox_runner.Request {
+    if (comptime host_target.is_wasm) return null;
     if (!runner_field or action != .run) return null;
     const value = object.get(runner_key) orelse return null;
     _ = object.orderedRemove(runner_key);
@@ -599,7 +608,7 @@ fn requestCorrectionFor(alloc: Allocator, args_json: []const u8, supports_tty: b
     }
     // A suggested retry keeps a valid runner, so the retry is placed the same
     // way. An invalid one is refused with the E1 text instead.
-    if (runner_field and action == .run) {
+    if (!host_target.is_wasm and runner_field and action == .run) {
         if (object.get(runner_key)) |value| {
             if (isRunnerWord(value)) {
                 try canonical.put(arena, runner_key, value);
@@ -860,7 +869,8 @@ fn callRun(
         .refused => |result| return result,
     };
     const placed_ctx = approved_run.ctx;
-    const reason_line = try sandbox_runner.reasonLine(request_arena, approved_run.reason, @tagName(placed_ctx.placement));
+    // A run never places away from this machine on WASM (A4), so it has no reason line there.
+    const reason_line = if (comptime host_target.is_wasm) null else try sandbox_runner.reasonLine(request_arena, approved_run.reason, @tagName(placed_ctx.placement));
     var execution_id_buffer: [64]u8 = undefined;
     const execution_id = runtime.generatedId(&execution_id_buffer) catch |err|
         return runtimeFailure(ctx, err);
@@ -908,7 +918,7 @@ fn callRun(
     defer prepared.deinit(ctx.allocator);
     // The host's note for a placed run (N7, N6) goes in the notice of the call that reports its
     // end, with the reason line. `finishPrepared` leaves a run's note to this call.
-    const host_line: ?[]const u8 = if (runtime.takeHostNoteAtEnd(execution_id, prepared.snapshot.state)) |note|
+    const host_line: ?[]const u8 = if (comptime host_target.is_wasm) null else if (runtime.takeHostNoteAtEnd(execution_id, prepared.snapshot.state)) |note|
         try hostNoteLine(request_arena, note)
     else
         null;
@@ -941,6 +951,7 @@ fn hostNoteLine(alloc: Allocator, note: managed_execution.HostNote) Allocator.Er
 /// Adds the host's N6 or N7 line to a result body, when the placed command has one to report
 /// (`Runtime.takeHostNoteAtEnd`). Frees `body` only when it returns the new one.
 fn withHostNote(alloc: Allocator, runtime: *managed_execution.Runtime, execution_id: []const u8, state: managed_execution.SnapshotState, body: []u8) Allocator.Error![]u8 {
+    if (comptime host_target.is_wasm) return body;
     const note = runtime.takeHostNoteAtEnd(execution_id, state) orelse return body;
     const line = try hostNoteLine(alloc, note);
     defer alloc.free(line);

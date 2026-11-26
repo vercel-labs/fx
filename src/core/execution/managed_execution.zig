@@ -189,12 +189,14 @@ pub const HostNote = union(enum) {
 
 /// The note a timeout leaves: only a placed command has one, and only with a timeout set.
 fn timeoutNote(placement: command_environment.Placement, timeout_ms: ?usize) ?HostNote {
+    if (comptime host_target.is_wasm) return null;
     if (placement == .local) return null;
     return .{ .timed_out = timeout_ms orelse return null };
 }
 
 /// The note a force stop leaves: only a placed command has one.
 fn forceStopNote(placement: command_environment.Placement) ?HostNote {
+    if (comptime host_target.is_wasm) return null;
     return if (placement == .local) null else .force_stopped;
 }
 

@@ -32,7 +32,7 @@ pub fn prepareAuthorizedRoute(
     return switch (authority) {
         .direct_only => |fingerprint| blk: {
             if (!fingerprint.matches(command_ctx)) return error.CommandAdmissionChanged;
-            if (command_ctx.placement != .local) break :blk try placedRoute(alloc, command_ctx, null, null);
+            if (!host_target.is_wasm and command_ctx.placement != .local) break :blk try placedRoute(alloc, command_ctx, null, null);
             var admission = command_effect.plan(
                 alloc,
                 command_ctx.command,
@@ -55,7 +55,7 @@ pub fn prepareAuthorizedRoute(
             if (!shell.fingerprint.matches(command_ctx)) {
                 return error.CommandAuthorityContextMismatch;
             }
-            if (command_ctx.placement != .local) {
+            if (!host_target.is_wasm and command_ctx.placement != .local) {
                 break :blk try placedRoute(alloc, command_ctx, shell.source, shell.grant_epoch);
             }
             if (command_ctx.environment.requiresShellRoute()) {

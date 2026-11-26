@@ -27,6 +27,8 @@
 (*                                         come (send_gone)                *)
 (*   id_arrives, no_id                     IdArrives, NoId                 *)
 (*   cmd_edits, cmd_exits                  CmdEdits, CmdExits              *)
+(*   cmd_deletes                           CmdDeletes                      *)
+(*   bring_back_gone                       BringBack: tracked file gone    *)
 (*   stream_end, idle_close                StreamEnds, IdleClose           *)
 (*   reattach_ok, reattach_lost            Reattach                        *)
 (*   bring_back_written, bring_back_kept,  BringBack: wrote the sandbox's  *)
@@ -88,11 +90,13 @@ TraceStep ==
     \/ NoId /\ Emit("no_id")
     \/ Unknown /\ EmitExit
     \/ CmdEdits /\ Emit("cmd_edits")
+    \/ CmdDeletes /\ Emit("cmd_deletes")
     \/ CmdExits /\ Emit("cmd_exits")
     \/ StreamEnds /\ Emit("stream_end")
     \/ IdleClose /\ Emit("idle_close")
     \/ Reattach /\ Emit(IF phase' = "streaming" THEN "reattach_ok" ELSE "reattach_lost")
-    \/ BringBack /\ Emit(CASE RemoteChanged /\ ~Unchanged -> "bring_back_kept"
+    \/ BringBack /\ Emit(CASE kind = "tracked" /\ remoteV = Gone -> "bring_back_gone"
+                           [] RemoteChanged /\ ~Unchanged -> "bring_back_kept"
                            [] RemoteChanged -> "bring_back_written"
                            [] OTHER -> "bring_back_nothing")
     \/ MacEdit /\ Emit("mac_edit")

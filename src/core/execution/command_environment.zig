@@ -1,4 +1,5 @@
 const std = @import("std");
+const host_target = @import("../hosts/target.zig");
 
 pub const Profile = enum {
     clean,
@@ -118,6 +119,7 @@ pub fn placementPermissionCommandIdentity(
     destination: Destination,
     identity: []const u8,
 ) ![]u8 {
+    if (comptime host_target.is_wasm) return alloc.dupe(u8, identity);
     if (placement == .local) return alloc.dupe(u8, identity);
     var text: std.Io.Writer.Allocating = .init(alloc);
     defer text.deinit();

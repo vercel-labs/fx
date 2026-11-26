@@ -43,6 +43,7 @@
 #   remote-run-mutation-skip-first-resume        ResumeFirstWhenMarked
 #   remote-run-mutation-no-mark                  MarkedAfterGone
 #   remote-run-mutation-unbounded-resume          ResumeOnce
+#   remote-run-mutation-keep-gone-record          GoneComesBack
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
@@ -90,4 +91,5 @@ RemoteRun remote-run-mutation-resend-twice NoDoublePost
 RemoteRun remote-run-mutation-skip-first-resume ResumeFirstWhenMarked
 RemoteRun remote-run-mutation-no-mark MarkedAfterGone
 RemoteRun remote-run-mutation-unbounded-resume ResumeOnce
+RemoteRun remote-run-mutation-keep-gone-record temporal
 VERDICTS

@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const host_target = @import("../core/hosts/target.zig");
 const build_options = @import("build_options");
 const builtin_gateway = @import("gateway.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
@@ -542,10 +543,17 @@ const shell_process_only_runner = blk: {
 
 /// The `shell` spec for `variant`. Each of the four is built at compile time.
 pub fn shellSpecFor(variant: ShellVariant) ToolSpec {
+    // WASM never offers the runner field (A4), so only native builds reach the runner schemas.
     if (variant.process_only) {
-        return if (variant.runner) shell_process_only_runner else shell_process_only;
+        if (comptime !host_target.is_wasm) {
+            if (variant.runner) return shell_process_only_runner;
+        }
+        return shell_process_only;
     }
-    return if (variant.runner) shell_runner else shell;
+    if (comptime !host_target.is_wasm) {
+        if (variant.runner) return shell_runner;
+    }
+    return shell;
 }
 
 pub const install_skill = ToolSpec{
