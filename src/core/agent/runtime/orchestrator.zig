@@ -4661,8 +4661,11 @@ fn yieldTurn(
 
 /// Holds a turn that stopped for its host's restart until the restart
 /// goes ahead or is cancelled. A host with no hold, such as libfx or
-/// ACP, stops the turn at once.
-fn holdForRestart(deps: *const AgentRuntimeDeps) AgentRuntimeDeps.RestartHoldEnd {
+/// ACP, stops the turn at once. No WebAssembly host restarts itself, so
+/// those builds leave the hold and its cancel out
+/// (`sdk/tests/package-size-budgets.json`).
+inline fn holdForRestart(deps: *const AgentRuntimeDeps) AgentRuntimeDeps.RestartHoldEnd {
+    if (comptime host_target.is_wasm) return .stop;
     const hold = deps.hold_for_restart orelse return .stop;
     return hold(deps.ctx);
 }

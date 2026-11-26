@@ -2334,7 +2334,7 @@ pub const WorkerRuntime = struct {
     };
 
     /// What a worker's turn does now, for the restart's wait.
-    pub const TurnActivity = enum { idle, running, held_for_restart };
+    const TurnActivity = enum { idle, running, held_for_restart };
 
     /// Asks the running turn to stop at its next step boundary and holds
     /// every queued work, for an upgrade's restart. The turn then holds there

@@ -413,7 +413,8 @@ pub fn Bindings(comptime App: type) type {
                     if (agent.session_persistence.v2 != null) agentMarkTurnYielded else null
                 else
                     null,
-                .hold_for_restart = if (comptime agents.hasAgentField(App, "session_persistence"))
+                // Only a host that upgrades itself restarts, so only it holds a turn.
+                .hold_for_restart = if (comptime agents.hasAgentField(App, "session_persistence") and runtime_profile.allows(App, .auto_upgrade))
                     if (agent.session_persistence.v2 != null) agentHoldForRestart else null
                 else
                     null,
