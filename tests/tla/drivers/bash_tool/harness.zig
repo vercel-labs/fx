@@ -3,9 +3,9 @@
 //!
 //! The driver copies this file to the root of a work folder that holds a copy of
 //! src/, so each import below is a real file of this tree. The store is real:
-//! `ResultFolder` numbers, saves, and indexes each result (`nextNumber`, `save`,
-//! `appendIndex`), and `program_output` and `bash_results` build the text the
-//! model sees. `restart` drops the folder object and opens it again on the same
+//! `ResultFolder` numbers, captures, publishes, and indexes each result (`nextNumber`,
+//! `capture`, `publish`, `appendIndex`), and `program_output` and `bash_results`
+//! build the text the model sees. `restart` drops the folder object and opens it again on the same
 //! folder, as a resumed fx process does. The state of the store is read back from
 //! the folder: each result file's first bytes name its program.
 //!
@@ -28,6 +28,7 @@ const io_mod = @import("src/core/shared/io.zig");
 const result_files = @import("src/core/session/result_files.zig");
 const bash_results = @import("src/core/bash_results/bash_results.zig");
 const program_output = @import("src/tools/bash/program_output.zig");
+const text_utils = @import("src/core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -238,15 +239,32 @@ const Harness = struct {
         return true;
     }
 
-    /// The real store saves the ended program's output as the next numbered file.
-    /// A folder with no room saves nothing, and the result is ready at once.
+    /// The real store publishes the ended program's output as the next numbered file.
+    /// A number another writer takes between the pick and the publish is picked again,
+    /// once, with the same output, as program_output.save does. A folder with no room
+    /// saves nothing, and the result is ready at once.
     fn file(self: *Harness) !bool {
         if (self.phase != .ended) return false;
         const k = self.current.?;
-        const n = try self.folder.nextNumber();
+        var n = try self.folder.nextNumber();
         const content = outputOf(k);
         var reader: std.Io.Reader = .fixed(content[0..]);
-        switch (try self.folder.save(n, &reader)) {
+        var captured = try self.folder.capture(&reader);
+        defer captured.deinit(self.alloc);
+        const outcome = self.folder.publish(n, &captured) catch |err| switch (err) {
+            error.NumberTaken => taken: {
+                n = try self.folder.nextNumber();
+                break :taken self.folder.publish(n, &captured) catch |again| switch (again) {
+                    error.NumberTaken => {
+                        try self.notSaved(k, "the result number was taken twice");
+                        return true;
+                    },
+                    else => return again,
+                };
+            },
+            else => return err,
+        };
+        switch (outcome) {
             .saved => {
                 self.pending_n = n;
                 self.phase = .filed;
@@ -262,6 +280,15 @@ const Harness = struct {
             },
         }
         return true;
+    }
+
+    /// A result whose output could not be published is shown with its reason. The
+    /// model has no such step, so the state differs from the model's and the trace check fails.
+    fn notSaved(self: *Harness, k: u8, reason: []const u8) !void {
+        self.ready = k;
+        self.ready_text = try self.resultText(k, .{ .not_saved_error = reason }, self.how[k], false);
+        self.ready_file = null;
+        self.phase = .saved;
     }
 
     /// The real store adds the file's index line. A line that cannot be written
@@ -392,8 +419,9 @@ const Harness = struct {
     }
 
     /// The text the model sees for an ended program: its header, its output as
-    /// bash_results plans it, and the index notice. This follows bash.zig's
-    /// formatResult for an ended program, whose function is private.
+    /// bash_results plans it (or the binary notice), and the index notice. This follows
+    /// bash.zig's formatResult and appendBody for an ended program, whose functions are
+    /// private.
     fn resultText(self: *Harness, k: u8, saved: bash_results.Saved, kind: Kind, index_missing: bool) ![]const u8 {
         const content = outputOf(k);
         var keep = try program_output.Keep.init(self.alloc, program_output.keep_min_bytes);
@@ -420,7 +448,11 @@ const Harness = struct {
         const notice = noticeOf(saved);
         var body: std.Io.Writer.Allocating = .init(self.alloc);
         if (std.meta.activeTag(planned) == .preview) try bash_results.writeShape(&body.writer, output.stats, notice);
-        try bash_results.writePreview(&body.writer, planned, notice);
+        if (modelSafe(planned)) {
+            try bash_results.writePreview(&body.writer, planned, notice);
+        } else {
+            try bash_results.writeBinaryNotice(&body.writer, notice);
+        }
         if (body.written().len > 0) try appendLine(self.alloc, &text, body.written());
         if (index_missing) {
             var missing: std.Io.Writer.Allocating = .init(self.alloc);
@@ -461,6 +493,14 @@ const Harness = struct {
         };
     }
 };
+
+/// Whether the text the model would read is safe (bash.zig appendBody).
+fn modelSafe(planned: bash_results.Plan) bool {
+    return switch (planned) {
+        .whole => |text| text_utils.isModelSafeText(text),
+        .preview => |preview| text_utils.isModelSafeText(preview.head) and text_utils.isModelSafeText(preview.tail),
+    };
+}
 
 fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);

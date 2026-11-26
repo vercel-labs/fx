@@ -1,25 +1,25 @@
 [
   {
     "id": "number-from-index",
-    "breaks": "The next number ignores the result files, so after fx stops between a file and its index line the next result reuses that number (result_files.zig nextNumber).",
+    "breaks": "The next number ignores the result files, so after fx stops between a file and its index line the next number is taken. The save refuses it and the retry gets the same number, so the result is not saved (result_files.zig nextNumber, publish).",
     "file": "src/core/session/result_files.zig",
     "find": "if (parseResultFileNumber(entry.name)) |n| {\n                max_n = @max(max_n, n);",
     "replace": "if (parseResultFileNumber(entry.name)) |n| {\n                _ = n;",
-    "expect": "NoReuse"
+    "expect": "ConformsToSpec"
   },
   {
     "id": "overwrite",
-    "breaks": "The next number is the highest one in use, so a save replaces an existing N.txt (result_files.zig nextNumber).",
+    "breaks": "The next number is the highest one in use, so a save asks for a number that is taken. The save refuses it, and the retry asks for the same number, so the result is not saved (result_files.zig nextNumber, publish).",
     "file": "src/core/session/result_files.zig",
     "find": "return std.math.add(u64, max_n, 1);",
     "replace": "return @max(max_n, 1);",
-    "expect": "NoReuse"
+    "expect": "ConformsToSpec"
   },
   {
     "id": "index-before-file",
     "breaks": "A save that keeps the whole output reports a file that was never written, so its index line names a file that is not there (result_files.zig save, the branch without a cut).",
     "file": "src/core/session/result_files.zig",
-    "find": "            try writeSlicesAtomic(self.alloc, &self.dir, file_name, &slices);\n            return .{ .saved = .{",
+    "find": "            try writeSlicesNew(self.alloc, &self.dir, file_name, &slices);\n            return .{ .saved = .{",
     "replace": "            _ = slices;\n            return .{ .saved = .{",
     "expect": "IndexNamesFile"
   },

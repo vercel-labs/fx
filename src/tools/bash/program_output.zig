@@ -172,6 +172,9 @@ pub const Request = struct {
     replay: Replay,
     /// What the program printed since its last result. The output when `replay` has none.
     delta: []const u8,
+    /// Test seam: runs after a number is picked and before its file is published, so a test
+    /// can let another writer take the number. Null outside tests.
+    after_number: ?*const fn (folder: *result_files.ResultFolder, number: u64) void = null,
 };
 
 /// Saves a finished program's output as its next numbered file, then adds its index
@@ -190,7 +193,7 @@ pub fn save(request: Request) Allocator.Error!Output {
         return fromDelta(request.delta, .{ .not_saved_error = "the results folder could not be opened" });
     };
     defer folder.deinit();
-    const number = folder.nextNumber() catch |err| {
+    var number = folder.nextNumber() catch |err| {
         debug_trace.logf("bash", "result not saved: results folder not read err={s}", .{@errorName(err)});
         return fromDelta(request.delta, .{ .not_saved_error = "the results folder could not be read" });
     };
@@ -206,7 +209,7 @@ pub fn save(request: Request) Allocator.Error!Output {
         },
         else => &empty_source,
     };
-    const outcome = folder.save(number, source) catch |err| {
+    var captured = folder.capture(source) catch |err| {
         keep.deinit();
         if (replay_source) |adapter| {
             if (adapter.failure) |cause| {
@@ -216,6 +219,38 @@ pub fn save(request: Request) Allocator.Error!Output {
         }
         debug_trace.logf("bash", "result not saved: results folder not written n={d} err={s}", .{ number, @errorName(err) });
         return fromDelta(request.delta, .{ .not_saved_error = "the results folder could not be written" });
+    };
+    defer captured.deinit(request.alloc);
+
+    // A number another writer takes after nextNumber is picked again, once, with the same output.
+    if (request.after_number) |hook| hook(&folder, number);
+    const outcome = folder.publish(number, &captured) catch |err| switch (err) {
+        error.NumberTaken => taken: {
+            debug_trace.logf("bash", "result number taken, picking again n={d}", .{number});
+            number = folder.nextNumber() catch |again| {
+                keep.deinit();
+                debug_trace.logf("bash", "result not saved: results folder not read err={s}", .{@errorName(again)});
+                return fromDelta(request.delta, .{ .not_saved_error = "the results folder could not be read" });
+            };
+            if (request.after_number) |hook| hook(&folder, number);
+            break :taken folder.publish(number, &captured) catch |again| switch (again) {
+                error.NumberTaken => {
+                    keep.deinit();
+                    debug_trace.logf("bash", "result not saved: number taken twice n={d}", .{number});
+                    return fromDelta(request.delta, .{ .not_saved_error = "the result number was taken twice" });
+                },
+                else => {
+                    keep.deinit();
+                    debug_trace.logf("bash", "result not saved: results folder not written n={d} err={s}", .{ number, @errorName(again) });
+                    return fromDelta(request.delta, .{ .not_saved_error = "the results folder could not be written" });
+                },
+            };
+        },
+        else => {
+            keep.deinit();
+            debug_trace.logf("bash", "result not saved: results folder not written n={d} err={s}", .{ number, @errorName(err) });
+            return fromDelta(request.delta, .{ .not_saved_error = "the results folder could not be written" });
+        },
     };
     switch (outcome) {
         .full => |full| {
@@ -427,6 +462,61 @@ test "a saved file whose index line cannot be written is kept, and the output sa
     const index = try bed.read(alloc, "index.tsv");
     defer alloc.free(index);
     try std.testing.expectEqualStrings("n\texit\tbytes\tlines\tcommand\n", index);
+}
+
+/// Lets another writer take number 1, as a program writing `1.txt` itself would.
+fn takeFirstNumber(folder: *result_files.ResultFolder, number: u64) void {
+    if (number != 1) return;
+    folder.dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "1.txt",
+        .data = "written by the program\n",
+        .flags = .{ .permissions = .fromMode(0o600) },
+    }) catch unreachable;
+}
+
+/// Lets another writer take every number, so the retry is refused too.
+fn takeEveryNumber(folder: *result_files.ResultFolder, number: u64) void {
+    var buf: [32]u8 = undefined;
+    const name = std.mem.print(&buf, "{d}.txt", .{number}) catch unreachable;
+    folder.dir.dir.writeFile(std.testing.io, .{
+        .sub_path = name,
+        .data = "written by the program\n",
+        .flags = .{ .permissions = .fromMode(0o600) },
+    }) catch unreachable;
+}
+
+test "a number another writer takes before the file is published is kept, and the result is saved as the next number" {
+    const alloc = std.testing.allocator;
+    var bed: FolderBed = try .init(alloc);
+    defer bed.deinit(alloc);
+    var request = requestFor(alloc, bed.path, .empty, "");
+    request.after_number = takeFirstNumber;
+    var output = try save(request);
+    defer output.deinit();
+    try expectFile(output.saved, 2);
+    const kept = try bed.read(alloc, "1.txt");
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("written by the program\n", kept);
+    const index = try bed.read(alloc, "index.tsv");
+    defer alloc.free(index);
+    try std.testing.expectEqualStrings("n\texit\tbytes\tlines\tcommand\n2\t0\t0\t0\ttrue\n", index);
+}
+
+test "a number taken again on the retry is not saved, with a short reason, and both files are kept" {
+    const alloc = std.testing.allocator;
+    var bed: FolderBed = try .init(alloc);
+    defer bed.deinit(alloc);
+    var request = requestFor(alloc, bed.path, .empty, "");
+    request.after_number = takeEveryNumber;
+    var output = try save(request);
+    defer output.deinit();
+    try expectNotSavedError(output.saved, "the result number was taken twice");
+    for ([_][]const u8{ "1.txt", "2.txt" }) |name| {
+        const kept = try bed.read(alloc, name);
+        defer alloc.free(kept);
+        try std.testing.expectEqualStrings("written by the program\n", kept);
+    }
+    try std.testing.expectError(error.FileNotFound, bed.tmp.dir.access(std.testing.io, "results/index.tsv", .{}));
 }
 
 test "a saved file holds every frame of the replay, in order, whatever their sizes" {

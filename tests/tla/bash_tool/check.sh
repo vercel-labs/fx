@@ -34,7 +34,7 @@
 # runs of the three-program store against TraceResultStore.tla, and builds each
 # planted bug in mutations.json into its own copy of src/, which its named rule
 # must catch. It runs only when no config is named. FX_TLA_BASH_TOOL_TLC_ONLY=1
-# skips it (CI runs that way, see .github/workflows/ci.yml).
+# skips it (Build & Test runs that way, and tla-bash-tool.yml runs the driver).
 # FX_TLA_BASH_TOOL_QUICK=1 runs its quick settings.
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes, and Zig and Bun

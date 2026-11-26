@@ -150,108 +150,136 @@ pub const ResultFolder = struct {
         return total;
     }
 
-    /// Streams `source` and atomically writes `N.txt`, enforcing the per-file
-    /// and per-folder caps (`S4-5`, `S4-6`, `ResultStore.tla` `File`, `FullNoticed`).
-    pub fn save(self: *ResultFolder, n: u64, source: *std.Io.Reader) !SaveOutcome {
-        if (n == 0) return error.InvalidArgument;
-        const used_bytes = try self.folderUsageBytes();
+    /// A result's output as `capture` read it, held until `publish` writes it under a
+    /// number. A number another writer takes can then be tried again with the same output.
+    pub const Captured = struct {
+        head: std.ArrayList(u8) = .empty,
+        tail: std.ArrayList(u8) = .empty,
+        tail_pos: usize = 0,
+        cut: bool = false,
+        total_bytes: u64 = 0,
 
-        const max_file = self.limits.max_file_bytes;
-        const keep_head = max_file / 2;
-        const keep_tail = max_file - keep_head;
+        pub fn deinit(self: *Captured, alloc: Allocator) void {
+            self.head.deinit(alloc);
+            self.tail.deinit(alloc);
+            self.* = undefined;
+        }
+    };
 
-        var head: std.ArrayList(u8) = .empty;
-        defer head.deinit(self.alloc);
-        var tail: std.ArrayList(u8) = .empty;
-        defer tail.deinit(self.alloc);
-
-        var total_bytes: u64 = 0;
-        var tail_pos: usize = 0;
-        var cut = false;
+    /// Reads `source` to its end and keeps what one result file holds: its first half,
+    /// its last half, and a cut marker between them when the output is longer than the
+    /// per-file cap (`S4-5`). Writes nothing. Free the result with `Captured.deinit`.
+    pub fn capture(self: *ResultFolder, source: *std.Io.Reader) !Captured {
+        const keep_head = self.limits.max_file_bytes / 2;
+        const keep_tail = self.limits.max_file_bytes - keep_head;
+        var captured: Captured = .{};
+        errdefer captured.deinit(self.alloc);
         var chunk_buf: [64 * 1024]u8 = undefined;
 
         while (true) {
             const n_read = try source.readSliceShort(&chunk_buf);
             if (n_read == 0) break;
-            total_bytes = try std.math.add(u64, total_bytes, n_read);
+            captured.total_bytes = try std.math.add(u64, captured.total_bytes, n_read);
             var rest: []const u8 = chunk_buf[0..n_read];
 
-            if (head.items.len < keep_head) {
-                const take = @min(rest.len, keep_head - head.items.len);
-                try head.appendSlice(self.alloc, rest[0..take]);
+            if (captured.head.items.len < keep_head) {
+                const take = @min(rest.len, keep_head - captured.head.items.len);
+                try captured.head.appendSlice(self.alloc, rest[0..take]);
                 rest = rest[take..];
             }
             if (rest.len == 0) continue;
 
-            if (!cut and tail.items.len + rest.len <= keep_tail) {
-                try tail.appendSlice(self.alloc, rest);
+            if (!captured.cut and captured.tail.items.len + rest.len <= keep_tail) {
+                try captured.tail.appendSlice(self.alloc, rest);
                 continue;
             }
 
-            if (!cut) {
-                cut = true;
-                const old_len = tail.items.len;
-                try tail.resize(self.alloc, keep_tail);
-                tail_pos = if (old_len == keep_tail) 0 else old_len;
+            if (!captured.cut) {
+                captured.cut = true;
+                const old_len = captured.tail.items.len;
+                try captured.tail.resize(self.alloc, keep_tail);
+                captured.tail_pos = if (old_len == keep_tail) 0 else old_len;
             }
             if (rest.len >= keep_tail) {
                 const start = rest.len - keep_tail;
-                @memcpy(tail.items, rest[start..]);
-                tail_pos = 0;
+                @memcpy(captured.tail.items, rest[start..]);
+                captured.tail_pos = 0;
             } else {
-                const first = @min(rest.len, keep_tail - tail_pos);
-                @memcpy(tail.items[tail_pos .. tail_pos + first], rest[0..first]);
+                const first = @min(rest.len, keep_tail - captured.tail_pos);
+                @memcpy(captured.tail.items[captured.tail_pos .. captured.tail_pos + first], rest[0..first]);
                 if (first < rest.len) {
                     const rem = rest.len - first;
-                    @memcpy(tail.items[0..rem], rest[first..]);
-                    tail_pos = rem;
+                    @memcpy(captured.tail.items[0..rem], rest[first..]);
+                    captured.tail_pos = rem;
                 } else {
-                    tail_pos = (tail_pos + first) % keep_tail;
+                    captured.tail_pos = (captured.tail_pos + first) % keep_tail;
                 }
             }
         }
+        return captured;
+    }
+
+    /// Publishes `captured` as `N.txt` under number `n`, once, and never replaces a file.
+    /// When a file of that name exists, the result is `error.NumberTaken` and that file is
+    /// kept, so NoReuse holds even when another writer takes the number between
+    /// `nextNumber` and this call (`ResultStore.tla` `NoReuse`). Enforces the per-folder
+    /// cap (`S4-6`).
+    pub fn publish(self: *ResultFolder, n: u64, captured: *const Captured) !SaveOutcome {
+        if (n == 0) return error.InvalidArgument;
+        const used_bytes = try self.folderUsageBytes();
+        const keep_head = self.limits.max_file_bytes / 2;
+        const keep_tail = self.limits.max_file_bytes - keep_head;
 
         var name_buf: [64]u8 = undefined;
         const file_name = try std.mem.print(&name_buf, "{d}.txt", .{n});
 
-        if (!cut) {
-            const written_bytes = head.items.len + tail.items.len;
+        if (!captured.cut) {
+            const written_bytes = captured.head.items.len + captured.tail.items.len;
             if (try std.math.add(u64, used_bytes, written_bytes) > self.limits.max_folder_bytes) {
                 return .{ .full = .{ .used_bytes = used_bytes, .needed_bytes = written_bytes } };
             }
-            const slices = [_][]const u8{ head.items, tail.items };
-            try writeSlicesAtomic(self.alloc, &self.dir, file_name, &slices);
+            const slices = [_][]const u8{ captured.head.items, captured.tail.items };
+            try writeSlicesNew(self.alloc, &self.dir, file_name, &slices);
             return .{ .saved = .{
-                .original_bytes = total_bytes,
+                .original_bytes = captured.total_bytes,
                 .written_bytes = written_bytes,
                 .cut_bytes = 0,
             } };
         }
 
-        const kept_bytes: u64 = @as(u64, head.items.len) + @as(u64, keep_tail);
-        const cut_bytes = total_bytes - kept_bytes;
+        const kept_bytes: u64 = @as(u64, captured.head.items.len) + @as(u64, keep_tail);
+        const cut_bytes = captured.total_bytes - kept_bytes;
         var marker_buf: [96]u8 = undefined;
-        const needs_nl = head.items.len > 0 and head.items[head.items.len - 1] != '\n';
+        const needs_nl = captured.head.items.len > 0 and captured.head.items[captured.head.items.len - 1] != '\n';
         const marker = try std.mem.print(&marker_buf, "{s}[... {d} bytes cut ...]\n", .{
             if (needs_nl) "\n" else "",
             cut_bytes,
         });
-        const written_bytes = head.items.len + marker.len + keep_tail;
+        const written_bytes = captured.head.items.len + marker.len + keep_tail;
         if (try std.math.add(u64, used_bytes, written_bytes) > self.limits.max_folder_bytes) {
             return .{ .full = .{ .used_bytes = used_bytes, .needed_bytes = written_bytes } };
         }
         const slices = [_][]const u8{
-            head.items,
+            captured.head.items,
             marker,
-            tail.items[tail_pos..],
-            tail.items[0..tail_pos],
+            captured.tail.items[captured.tail_pos..],
+            captured.tail.items[0..captured.tail_pos],
         };
-        try writeSlicesAtomic(self.alloc, &self.dir, file_name, &slices);
+        try writeSlicesNew(self.alloc, &self.dir, file_name, &slices);
         return .{ .saved = .{
-            .original_bytes = total_bytes,
+            .original_bytes = captured.total_bytes,
             .written_bytes = written_bytes,
             .cut_bytes = cut_bytes,
         } };
+    }
+
+    /// Reads `source` and publishes it as `N.txt` under number `n`: `capture`, then
+    /// `publish`. The file is never replaced (see `publish`).
+    pub fn save(self: *ResultFolder, n: u64, source: *std.Io.Reader) !SaveOutcome {
+        if (n == 0) return error.InvalidArgument;
+        var captured = try self.capture(source);
+        defer captured.deinit(self.alloc);
+        return self.publish(n, &captured);
     }
 
     /// Appends one row to `index.tsv`, keeping existing rows byte for byte and
@@ -393,15 +421,48 @@ fn parseResultFileNumber(name: []const u8) ?u64 {
     return parseCanonicalPositive(name[0 .. name.len - ".txt".len]);
 }
 
-/// Writes `slices` into `target_name` inside `dir` via an exclusive private temp
-/// file, `fsync`, atomic rename, and directory sync. Every error is returned; any
-/// temp file left behind on failure is removed and any removal failure is logged
-/// with `debug_trace`.
+/// How `writeSlices` puts its finished temp file under the target name.
+const Publish = enum {
+    /// Replaces what the name holds. Used for `index.tsv`, which is rewritten whole.
+    replace,
+    /// Gives the name only when it is free, so no result file is ever replaced.
+    create_new,
+};
+
+/// Writes `slices` into `target_name` inside `dir` by an atomic rename, replacing it.
 fn writeSlicesAtomic(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
     target_name: []const u8,
     slices: []const []const u8,
+) !void {
+    try writeSlices(alloc, dir, target_name, slices, .replace);
+}
+
+/// Writes `slices` as a new file `target_name` inside `dir`. Returns `error.NumberTaken`
+/// when the name exists, and leaves that file as it is.
+fn writeSlicesNew(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    target_name: []const u8,
+    slices: []const []const u8,
+) !void {
+    try writeSlices(alloc, dir, target_name, slices, .create_new);
+}
+
+/// Writes `slices` into `target_name` inside `dir` via an exclusive private temp file,
+/// `fsync`, then `mode`, then a directory sync. Every name is a plain name inside the
+/// verified folder, so no path leaves it and no symlink on the way is followed. A
+/// `create_new` publish is a hard link from the temp name to the target: the link fails
+/// when the target exists, and the temp name is then removed. Every error is returned;
+/// any temp file left behind on failure is removed and any removal failure is logged
+/// with `debug_trace`.
+fn writeSlices(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    target_name: []const u8,
+    slices: []const []const u8,
+    mode: Publish,
 ) !void {
     const io = io_mod.getIo();
     if (target_name.len == 0 or std.mem.eql(u8, target_name, ".") or std.mem.eql(u8, target_name, "..") or
@@ -416,7 +477,10 @@ fn writeSlicesAtomic(
         else => return err,
     };
     if (existing_stat) |stat| {
-        if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
+        switch (mode) {
+            .replace => if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe,
+            .create_new => return if (stat.kind == .file) error.NumberTaken else error.DurablePathUnsafe,
+        }
     }
 
     var random_bytes: [16]u8 = undefined;
@@ -455,8 +519,26 @@ fn writeSlicesAtomic(
     file.close(io);
     file_open = false;
 
-    try dir.dir.rename(temp_name, dir.dir, target_name, io);
-    temp_exists = false;
+    switch (mode) {
+        .replace => {
+            try dir.dir.rename(temp_name, dir.dir, target_name, io);
+            temp_exists = false;
+        },
+        .create_new => {
+            std.Io.Dir.hardLink(dir.dir, temp_name, dir.dir, target_name, io, .{}) catch |err| switch (err) {
+                error.PathAlreadyExists => return error.NumberTaken,
+                else => return err,
+            };
+            dir.dir.deleteFile(io, temp_name) catch |cleanup_err| {
+                debug_trace.logf(
+                    "session",
+                    "event=result_files_temp_dropped target={s} temp={s} err={s}",
+                    .{ target_name, temp_name, @errorName(cleanup_err) },
+                );
+            };
+            temp_exists = false;
+        },
+    }
     try io_mod.syncVerifiedDir(dir.dir);
 }
 
@@ -552,6 +634,66 @@ test "save writes atomically with no temp file left behind and respects folder p
     const got = try readTestBytes(alloc, folder.dir.dir, "1.txt", 1024);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("hello world\n", got);
+}
+
+test "save never replaces a result file: a number another writer took is refused, and its file is kept" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const out_path = try std.Io.Dir.path.join(alloc, &.{ root, "taken" });
+    defer alloc.free(out_path);
+
+    var folder = try ResultFolder.init(alloc, out_path);
+    defer folder.deinit();
+
+    const number = try folder.nextNumber();
+    try std.testing.expectEqual(@as(u64, 1), number);
+    // Another writer takes the number between nextNumber and save.
+    try writeTestBytes(folder.dir.dir, "1.txt", "written by the program\n");
+
+    var reader: std.Io.Reader = .fixed("fx output\n");
+    try std.testing.expectError(error.NumberTaken, folder.save(number, &reader));
+    try expectNoTempFiles(folder.dir.dir);
+    const kept = try readTestBytes(alloc, folder.dir.dir, "1.txt", 1024);
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("written by the program\n", kept);
+    try std.testing.expectEqual(@as(u64, 2), try folder.nextNumber());
+}
+
+test "a captured output is published under the next number after its first number is taken" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const out_path = try std.Io.Dir.path.join(alloc, &.{ root, "retry" });
+    defer alloc.free(out_path);
+
+    var folder = try ResultFolder.init(alloc, out_path);
+    defer folder.deinit();
+
+    var reader: std.Io.Reader = .fixed("kept output\n");
+    var captured = try folder.capture(&reader);
+    defer captured.deinit(alloc);
+    try writeTestBytes(folder.dir.dir, "1.txt", "other writer\n");
+
+    try std.testing.expectError(error.NumberTaken, folder.publish(1, &captured));
+    const again = try folder.nextNumber();
+    try std.testing.expectEqual(@as(u64, 2), again);
+    const outcome = try folder.publish(again, &captured);
+    switch (outcome) {
+        .saved => |written| try std.testing.expectEqual(@as(usize, 12), written.written_bytes),
+        .full => return error.TestUnexpectedFull,
+    }
+    const first = try readTestBytes(alloc, folder.dir.dir, "1.txt", 1024);
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("other writer\n", first);
+    const second = try readTestBytes(alloc, folder.dir.dir, "2.txt", 1024);
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings("kept output\n", second);
+    try expectNoTempFiles(folder.dir.dir);
 }
 
 test "save enforces the 16 MiB per-file cap with exact first and last 8 MiB and one cut line" {
