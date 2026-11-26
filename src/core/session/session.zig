@@ -1804,8 +1804,10 @@ pub const SessionRuntime = struct {
     pub fn commitPreparedHistoryEntry(
         self: *SessionRuntime,
         alloc: Allocator,
-        turn: HistoryTurn,
+        prepared: HistoryTurn,
     ) void {
+        var turn = prepared;
+        core_types.dropSavedExecution(alloc, &turn);
         if (isCurrentCompactionCheckpoint(turn)) {
             self.disarmCacheWarming("history_compacted");
             // The conversation goes on after compacting: it keeps its toolbox
@@ -3928,6 +3930,23 @@ test "SessionRuntime.restore may retain earlier restored turns after later appen
     try std.testing.expectEqual(ConversationLanguage.literal("fr"), runtime.languageSnapshot());
     try std.testing.expectEqual(@as(usize, 1), runtime.historyLen());
     try std.testing.expectEqualStrings("first", runtime.agent.history.items[0].assistant.user.text);
+}
+
+test "SessionRuntime history keeps a cut turn as the model sees it, without the whole turn only the log saves (D87)" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 0 };
+    defer runtime.deinit(alloc);
+    var kept = [_]core_types.ToolExecutionStep{.{ .assistant = @constCast("kept step") }};
+    var whole = [_]core_types.ToolExecutionStep{ .{ .assistant = @constCast("folded step") }, .{ .assistant = @constCast("kept step") } };
+    try runtime.appendHistoryEntry(alloc, .{ .assistant = .{
+        .user = .{ .text = @constCast("two steps") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = &kept },
+        .saved_execution = .{ .tool_steps = &whole },
+    } });
+    const entry = runtime.agent.history.items[0].assistant;
+    try std.testing.expectEqual(@as(usize, 1), entry.execution.tool_steps.len);
+    try std.testing.expect(entry.saved_execution == null);
 }
 
 test "SessionRuntime.reset clears history and restores default language" {

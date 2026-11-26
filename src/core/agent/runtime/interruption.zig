@@ -200,6 +200,7 @@ fn persistInterruptedTurnWithPresentation(
             .cancelled_command = cancelled_command,
             .cancelled_wait = cancelled_wait,
             .cancellation_origin = cancellation_origin,
+            .saved_execution = finalization.savedExecution(full_execution),
         } };
         const finished = try types.dupeFinishedPrompt(
             std.heap.c_allocator,
@@ -244,6 +245,7 @@ fn persistInterruptedTurnWithPresentation(
         .cancelled_command = cancelled_command,
         .cancelled_wait = cancelled_wait,
         .cancellation_origin = cancellation_origin,
+        .saved_execution = finalization.savedExecution(full_execution),
     } };
 
     var propagation_error: ?anyerror = null;
@@ -316,6 +318,7 @@ fn persistFailedTurn(
         .assistant = if (std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0) @constCast(partial_assistant) else null,
         .execution = execution,
         .terminal_reason = .failed,
+        .saved_execution = finalization.savedExecution(full_execution),
     } };
     const finished = try types.dupeFinishedPrompt(
         std.heap.c_allocator,

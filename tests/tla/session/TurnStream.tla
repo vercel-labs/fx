@@ -24,7 +24,7 @@
 (* The edge cases each config may turn on:                                 *)
 (*   MissedPaths  a result enters the turn without a stamp                 *)
 (*   Compactions  compaction takes the turn's first results out of the     *)
-(*                agent's view, so the rebuild no longer lines up          *)
+(*                agent's view; the turn the log saves keeps them (D87)    *)
 (*   Recovery     fx stops mid-turn; resuming rebuilds the turn's messages *)
 (*                from its recovery checkpoint and streams a new turn      *)
 (*   Faults       a later rebuild gives a streamed result other content,   *)
@@ -34,7 +34,9 @@
 (*                closes it as superseded and writes the turn afresh       *)
 (*                                                                         *)
 (* Mutant selects the design. "none" is fx as it is; "restamp" is fx       *)
-(* before results kept their stamps; the rest are planted bugs.            *)
+(* before results kept their stamps; "cut_view" is fx before the log saved *)
+(* the results a compaction took out of the agent's view, so the rebuild   *)
+(* no longer lined up; the rest are planted bugs.                          *)
 (* TurnStreamTrace.tla replays runs of the real binary through this model. *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
@@ -42,8 +44,9 @@ EXTENDS Naturals, Sequences, FiniteSets
 CONSTANTS Calls, MaxBuilds, MissedPaths, Compactions, Recovery, Faults,
           FailedCommits, Mutant
 
-Mutants == {"none", "restamp", "lose_on_recover", "share_stamp", "bytes_only",
-            "loose_compare", "mix_on_mismatch", "prefix_only", "continue_stale"}
+Mutants == {"none", "restamp", "cut_view", "lose_on_recover", "share_stamp",
+            "bytes_only", "loose_compare", "mix_on_mismatch", "prefix_only",
+            "continue_stale"}
 
 ASSUME Mutant \in Mutants
 ASSUME MaxBuilds \in Nat
@@ -65,7 +68,6 @@ VARIABLES
   birthOf,    \* each call's stamp from when the turn took it (history)
   stampedAt,  \* calls whose result had a stamp when the turn took it
   recovered,  \* whether fx resumed the turn from its checkpoint
-  shifted,    \* whether a compaction cut the view since the last write
   supersedes, \* turns closed because their stream differed
   unexplained,\* of those, closed with no fault and no compaction behind it
   reparsed,   \* streamed pieces of stamped results samePiece had to parse
@@ -75,7 +77,7 @@ VARIABLES
   failedAt    \* the log's length when a failed commit left its turn, or 0
 
 vars == <<done, cut, changed, dropped, builds, streamed, open, log, committed,
-          final, birthOf, stampedAt, recovered, shifted, supersedes,
+          final, birthOf, stampedAt, recovered, supersedes,
           unexplained, reparsed, anyParsed, last, stale, failedAt>>
 
 Range(s) == {s[i] : i \in DOMAIN s}
@@ -101,13 +103,19 @@ Decision(phase, stood, results, count) ==
 View ==
   SelectSeq(SubSeq(done, cut + 1, Len(done)), LAMBDA r : r.call \notin dropped)
 
+(* The results the turn the log saves holds, in order: a compaction takes   *)
+(* none out (`TurnFinalizationGuard.savedExecution`, D87).                 *)
+Saved == SelectSeq(done, LAMBDA r : r.call \notin dropped)
+
+Rebuilt == IF Mutant = "cut_view" THEN View ELSE Saved
+
 (* `buildNormalExecutionMemory`: a result keeps its message's stamp. *)
 StampFor(r, n) ==
   IF r.stamped /\ Mutant # "restamp" THEN r.birth ELSE Stamp(n, r.call)
 
 (* The rebuild numbered n. *)
 Fresh(n) ==
-  LET v == View
+  LET v == Rebuilt
   IN [i \in 1..Len(v) |->
         Piece(v[i].call, IF v[i].call \in changed THEN 1 ELSE 0, StampFor(v[i], n))]
 
@@ -164,11 +172,10 @@ Decide(b, phase) ==
       count      == IF Live /\ Stands(b) THEN Cardinality(Parsed(b)) ELSE 0
       stampedOne == IF Live /\ Stands(b) THEN Cardinality(StampedParsed(b)) ELSE 0
   IN /\ supersedes' = supersedes + (IF supersede THEN 1 ELSE 0)
-     /\ unexplained' = unexplained + (IF supersede /\ Faultless /\ ~shifted THEN 1 ELSE 0)
+     /\ unexplained' = unexplained + (IF supersede /\ Faultless THEN 1 ELSE 0)
      /\ reparsed' = reparsed + stampedOne
      /\ anyParsed' = anyParsed + count
      /\ last' = Decision(phase, stands, Len(b), count)
-     /\ shifted' = FALSE
 
 Init ==
   /\ done = <<>>
@@ -184,7 +191,6 @@ Init ==
   /\ birthOf = [c \in Calls |-> NoStamp]
   /\ stampedAt = {}
   /\ recovered = FALSE
-  /\ shifted = FALSE
   /\ supersedes = 0
   /\ unexplained = 0
   /\ reparsed = 0
@@ -208,7 +214,7 @@ RunTool(c, stamped) ==
         /\ birthOf' = [birthOf EXCEPT ![c] = birth]
   /\ stampedAt' = IF stamped THEN stampedAt \cup {c} ELSE stampedAt
   /\ UNCHANGED <<cut, changed, dropped, builds, streamed, open, log, committed,
-                 final, recovered, shifted, supersedes, unexplained, reparsed,
+                 final, recovered, supersedes, unexplained, reparsed,
                  anyParsed, last, stale, failedAt>>
 
 (* Compaction takes the first k results of the view out of it. *)
@@ -217,7 +223,6 @@ Compact(k) ==
   /\ ~committed
   /\ k \in 1..(Len(done) - cut)
   /\ cut' = cut + k
-  /\ shifted' = TRUE
   /\ UNCHANGED <<done, changed, dropped, builds, streamed, open, log, committed,
                  final, birthOf, stampedAt, recovered, supersedes, unexplained,
                  reparsed, anyParsed, last, stale, failedAt>>
@@ -243,7 +248,7 @@ Recover ==
   /\ streamed' = <<>>
   /\ log' = log \o <<Interrupted>>
   /\ stale' = FALSE
-  /\ UNCHANGED <<changed, builds, committed, final, birthOf, stampedAt, shifted,
+  /\ UNCHANGED <<changed, builds, committed, final, birthOf, stampedAt,
                  supersedes, unexplained, reparsed, anyParsed, last, failedAt>>
 
 (* A later rebuild gives a streamed result other content. *)
@@ -254,7 +259,7 @@ Change(c) ==
   /\ c \in {p.call : p \in Range(streamed)}
   /\ changed' = {c}
   /\ UNCHANGED <<done, cut, dropped, builds, streamed, open, log, committed,
-                 final, birthOf, stampedAt, recovered, shifted, supersedes,
+                 final, birthOf, stampedAt, recovered, supersedes,
                  unexplained, reparsed, anyParsed, last, stale, failedAt>>
 
 (* A later rebuild no longer has a streamed result, so the rest shift. *)
@@ -265,7 +270,7 @@ Drop(c) ==
   /\ c \in {p.call : p \in Range(streamed)}
   /\ dropped' = {c}
   /\ UNCHANGED <<done, cut, changed, builds, streamed, open, log, committed,
-                 final, birthOf, stampedAt, recovered, shifted, supersedes,
+                 final, birthOf, stampedAt, recovered, supersedes,
                  unexplained, reparsed, anyParsed, last, stale, failedAt>>
 
 (* `appendProgress`: the turn so far, before the next model request. *)
@@ -310,7 +315,7 @@ FailCommit ==
   /\ stale' = TRUE
   /\ failedAt' = Len(log)
   /\ UNCHANGED <<done, cut, changed, dropped, builds, streamed, open, log,
-                 committed, final, birthOf, stampedAt, recovered, shifted,
+                 committed, final, birthOf, stampedAt, recovered,
                  supersedes, unexplained, reparsed, anyParsed, last>>
 
 Next ==
@@ -366,9 +371,14 @@ CommitIsFinal == committed => Content(LiveTurn) = Content(final)
 (* the log holds.                                                          *)
 CommitIsWritten == committed /\ AllStamped => LiveTurn = final
 
-(* A stream is superseded only when a rebuild really differs from it, or a *)
-(* compaction moved the turn's first results out of the view.              *)
+(* A stream is superseded only when a rebuild really differs from it; a    *)
+(* compaction never makes it differ.                                       *)
 SupersedeExplained == unexplained = 0
+
+(* The committed turn holds every result the turn ran, those a compaction  *)
+(* took out of the agent's view too, except one a fault dropped.          *)
+LogKeepsCutResults ==
+  committed => LiveCalls = [i \in 1..Len(Saved) |-> Saved[i].call]
 
 (* No rebuild needs samePiece's parser for a result that kept its stamp. *)
 NoReparseOfStamped == reparsed = 0

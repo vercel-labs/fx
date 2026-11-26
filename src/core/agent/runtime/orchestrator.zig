@@ -4322,10 +4322,10 @@ fn persistPromptBeforeCapture(
     const arena = scratch.allocator();
     const saved = saved: {
         const execution = runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages) catch |err| break :saved err;
-        const projected = finalization.persistedExecution(arena, execution) catch |err| break :saved err;
+        const logged = finalization.loggedExecution(arena, execution) catch |err| break :saved err;
         append(deps.ctx, .{
             .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
-            .execution = projected,
+            .execution = logged,
         }) catch |err| break :saved err;
         return;
     };
@@ -4355,7 +4355,7 @@ fn appendRunningToolCalls(
     std.debug.assert(issuing.role == .assistant and issuing.tool_calls.len == calls.len);
     try append(deps.ctx, .{
         .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
-        .execution = try finalization.persistedExecution(arena, execution),
+        .execution = try finalization.loggedExecution(arena, execution),
         .running_calls = running,
         .running_assistant = issuing.content,
     });
@@ -4513,7 +4513,7 @@ fn persistRecoveryCheckpointWithAction(
     const projected = try finalization.persistedExecution(arena, execution);
     const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author };
     // Every completed piece reaches the session before the next request.
-    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected, .recovery_record = record });
+    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = finalization.savedExecution(execution) orelse projected, .recovery_record = record });
     const effect = deps.recovery_checkpoint orelse return;
     try effect.set(deps.ctx, .{
         .turn_id = job.turn_id,
@@ -10590,6 +10590,7 @@ fn processQueuedPromptLoop(
                 .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
                 .assistant = @constCast(assistant_text),
                 .execution = try finalization.persistedExecution(arena, finish_execution),
+                .saved_execution = finalization.savedExecution(finish_execution),
             } };
             types.setHistoryTurnSummary(&turn, completed_summary);
             try deps.propagate_history_turn(deps.ctx, turn);
@@ -13669,6 +13670,7 @@ fn finishFailedTurnWithNotice(
         .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
         .assistant = @constCast(notice),
         .execution = try finalization.persistedExecution(arena, execution_memory),
+        .saved_execution = finalization.savedExecution(execution_memory),
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     try deps.propagate_history_turn(deps.ctx, turn);

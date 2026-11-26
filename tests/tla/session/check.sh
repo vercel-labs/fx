@@ -71,6 +71,7 @@ TurnStream stream-mutant-bytes-only SupersedeExplained
 TurnStream stream-mutant-loose-compare CommitIsFinal
 TurnStream stream-mutant-mix CommitIsFinal
 TurnStream stream-mutant-prefix-only CommitIsFinal
+TurnStream stream-mutant-cut-view LogKeepsCutResults
 TurnStream stream-mutant-continue-stale StaleTurnNeverContinues
 TurnStream stream-witness-supersede NeverSuperseded
 TurnStream stream-witness-commit NeverCommittedWhole

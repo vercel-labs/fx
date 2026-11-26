@@ -38,6 +38,8 @@ pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 /// Borrowed only for the call; a sink copies or serializes what it keeps.
 pub const TurnProgress = struct {
     user: types.UserTurn,
+    /// The whole turn, with the steps a compaction inside it summarized,
+    /// as the session log saves it (D87).
     execution: types.ExecutionMemory,
     /// Tool calls the model issued that have no result yet, in their saved
     /// form, so a crash while they run leaves them in the session (D28).

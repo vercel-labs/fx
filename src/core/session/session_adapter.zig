@@ -2400,7 +2400,25 @@ pub const Session = struct {
     /// Stores the turn's tool results and images as blobs and gives them
     /// handles, as v1 does at commit. A result whose blob the stream already
     /// wrote (`withResultFiles`) keeps it, unwritten a second time.
+    /// A turn with a whole execution, which only the log saves, has it
+    /// prepared too (`types.savedHistoryTurn`).
     pub fn prepareTurn(self: *Session, turn: *types.HistoryTurn) !void {
+        try self.prepareTurnExecution(turn);
+        var saved_turn = types.savedHistoryTurn(turn.*);
+        switch (turn.*) {
+            .assistant => |*entry| if (entry.saved_execution) |*whole| {
+                try self.prepareTurnExecution(&saved_turn);
+                whole.* = saved_turn.assistant.execution;
+            },
+            .interrupted => |*entry| if (entry.saved_execution) |*whole| {
+                try self.prepareTurnExecution(&saved_turn);
+                whole.* = saved_turn.interrupted.execution;
+            },
+            .compacted_summary => {},
+        }
+    }
+
+    fn prepareTurnExecution(self: *Session, turn: *types.HistoryTurn) !void {
         try self.reuseStreamedFiles(turn);
         {
             self.mutex.lockUncancelable(io_mod.getIo());
@@ -2441,7 +2459,8 @@ pub const Session = struct {
     }
 
     /// Appends a finished turn: the pieces not streamed yet, then its end,
-    /// in one durable batch. `turn` must already be prepared. Writes no
+    /// in one durable batch, from its whole execution when it has one
+    /// (`types.savedHistoryTurn`). `turn` must already be prepared. Writes no
     /// workspace capture and leaves the current capture turn as it is, so a
     /// commit of an earlier turn, such as ACP's interrupted one, never takes
     /// the next turn's captures: an open turn that holds another capture
@@ -2485,7 +2504,7 @@ pub const Session = struct {
         const a = arena.allocator();
 
         var events: std.ArrayList(Event) = .empty;
-        try session_event.appendHistoryTurnConversationEvents(a, &events, turn);
+        try session_event.appendHistoryTurnConversationEvents(a, &events, types.savedHistoryTurn(turn));
         if (events.items.len < 2) return error.InvalidConversationFrame;
         const pieces = events.items[0 .. events.items.len - 1];
         const end = events.items[events.items.len - 1];
@@ -5528,10 +5547,10 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
     var sink: RestoreSink = .{ .alloc = alloc, .history = &history, .numbers = numbers };
     try replay(src, alloc, sa, from, skip_offset, ReplaySink.init(&sink));
     if (numbers) |n| n.trim.* = .{};
-    // The cut covers steps of the turn the compaction names. When fx wrote
-    // that turn again afresh, superseding it, the copy holds only fx's view
-    // after the cut, and trimming it would drop steps the compaction never
-    // covered.
+    // The cut covers steps of the turn the compaction names. A turn
+    // superseded after the cut and written again afresh, as fx wrote one
+    // before it saved such turns whole, holds only fx's view after the cut,
+    // and trimming it would drop steps the compaction never covered.
     const cut_turn_kept = sink.first_turn == null or sink.first_turn.? == keep_from_turn;
     if ((covered.tool_steps != 0 or covered.steering != 0) and !cut_turn_kept) {
         debug_trace.logf("session", "event=sessions_v2_compaction_cut_superseded session={s} cut_turn={?d} first_kept_turn={?d} tool_steps={d} steering={d}", .{ src.id, keep_from_turn, sink.first_turn, covered.tool_steps, covered.steering });
@@ -10162,6 +10181,69 @@ test "a compaction inside a turn leaves the steps it covers out of that turn on 
     try testing.expectEqualStrings("three steps", kept.user.text);
     try testing.expectEqual(@as(usize, 0), kept.execution.tool_steps.len);
     try testing.expectEqual(@as(usize, 0), kept.execution.steering.len);
+}
+
+test "a turn an older fx wrote again after a compaction inside it resumes as that fx left it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var calls = [_]types.ToolCall{
+        .{ .id = "call-1", .name = "shell", .arguments_json = "{}" },
+        .{ .id = "call-2", .name = "shell", .arguments_json = "{}" },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("call-1"), .tool_name = @constCast("shell"), .status = .success, .output = @constCast("ok"), .output_bytes = 2, .output_handle = @constCast("result-shell-1.txt"), .stored_output_bytes = 2 },
+        .{ .tool_call_id = @constCast("call-2"), .tool_name = @constCast("shell"), .status = .success, .output = @constCast("ok"), .output_bytes = 2, .output_handle = @constCast("result-shell-2.txt"), .stored_output_bytes = 2 },
+    };
+    var steps = [_]types.ToolExecutionStep{
+        .{ .tool_calls = calls[0..1], .tool_results = results[0..1] },
+        .{ .tool_calls = calls[1..2], .tool_results = results[1..2] },
+    };
+    const user: types.UserTurn = .{ .text = @constCast("two steps") };
+    // That fx streamed the turn's first step, compacted it, then saved only
+    // the step after the cut, so the turn was superseded and written afresh.
+    try s.appendProgress(user, .{ .tool_steps = steps[0..1] }, .{});
+    var summary = "the first step".*;
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 0, .compaction_count = 1 }, true, .{ .tool_steps = 1 });
+    try s.appendProgress(user, .{ .tool_steps = steps[1..2] }, .{});
+    try s.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .tool_steps = steps[1..2] } } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, superseded_type));
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    // The model gets the turn from the cut, not cut a second time.
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings("the first step", restored.history[0].compacted_summary.summary);
+    const kept = restored.history[1].assistant;
+    try testing.expectEqual(@as(usize, 1), kept.execution.tool_steps.len);
+    try testing.expectEqualStrings("call-2", kept.execution.tool_steps[0].tool_calls[0].id);
+    // The transcript shows the turn as written afresh.
+    const Steps = struct {
+        turns: usize = 0,
+        first_call: ?[]u8 = null,
+        steps: usize = 0,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            self.turns += 1;
+            const execution = turn.assistant.execution;
+            self.steps = execution.tool_steps.len;
+            if (self.first_call) |old| testing.allocator.free(old);
+            self.first_call = try testing.allocator.dupe(u8, execution.tool_steps[0].tool_calls[0].id);
+        }
+    };
+    var shown: Steps = .{};
+    defer if (shown.first_call) |value| testing.allocator.free(value);
+    try r.visitHistory(testing.allocator, &shown);
+    try testing.expectEqual(@as(usize, 1), shown.turns);
+    try testing.expectEqual(@as(usize, 1), shown.steps);
+    try testing.expectEqualStrings("call-2", shown.first_call.?);
 }
 
 /// Two shell steps whose results name their stored bodies.

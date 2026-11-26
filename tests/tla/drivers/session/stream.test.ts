@@ -253,8 +253,12 @@ async function runTurn(scenario: Scenario, bin: string, traced: boolean): Promis
       const sent = JSON.parse(text);
       // About four bytes a token, as a provider would count the request.
       const inputTokens = Math.ceil(text.length / 4);
-      // A compaction asks for a summary with no tools; it is not a step.
-      if (sent.tools?.length === 0 && sent.toolChoice?.type === "none") {
+      // A compaction asks for a summary with no tools, or with the turn's
+      // tools kept for the cache and fx's note that the request is its own
+      // (`from_fx` in `src/core/compactor/ledger.zig`); it is not a step, and
+      // fx runs no call from its reply.
+      const summaryAsked = text.includes("This request comes from fx, not from the user");
+      if ((sent.tools?.length === 0 && sent.toolChoice?.type === "none") || summaryAsked) {
         summaries += 1;
         return sse([{ type: "text-delta", id: "summary", delta: `Summary ${summaries}: the files were read.` }], "stop", inputTokens);
       }
@@ -446,46 +450,29 @@ test(`a ${STRESS_STEPS}-step turn is a behavior of TurnStream, and no rebuild re
   console.log(JSON.stringify(report));
 }, TIMEOUT);
 
-// A turn that compacts: TLC replays it with each compaction as a hidden
-// step, and fx's own trace must also show that a stream stops standing only
-// right after a compaction cut the turn's tool steps, each of those leaves one
-// superseded marker, the live turn holds the newest results in order, and
-// nothing is reparsed. With FX_TLA_BASE_BIN set, that binary must leave the
-// same log.
-test("a turn that compacts mid-turn supersedes only where a cut shifted it, and never reparses", async () => {
+// A turn that compacts: a compaction takes results out of fx's view, not out
+// of the session log (D87). fx's own trace must show that every stream still
+// stood across the cuts and nothing was reparsed, and the turn must end with
+// every result in order and no superseded marker. TLC replays it too. With
+// FX_TLA_BASE_BIN set, that binary must leave the same log.
+test("a turn that compacts mid-turn keeps every result in its log, supersedes nothing, and never reparses", async () => {
   const run = await runTurn(compaction, binary, true);
-  expect(run.code).toBe(0);
-  expect(run.stderr).not.toMatch(/panic|reached unreachable|Segmentation fault|error\(/);
-  expect(run.result?.final_output).toBe(DONE);
-  let cut = false;
+  expectFinishedTurn(run);
   let cuts = 0;
-  let mismatches = 0;
   for (const line of run.trace.split("\n")) {
-    if (line.includes("event=sessions_v2_compaction_cut")) {
-      cut = true;
-      cuts += 1;
-    }
+    if (line.includes("event=sessions_v2_compaction_cut ")) cuts += 1;
     const [decision] = decisions(line);
     if (!decision) continue;
-    if (!decision.stood) {
-      mismatches += 1;
-      expect(cut).toBe(true);
-    }
+    expect(decision.stood).toBe(true);
     expect(decision.reparsed).toBe(0);
-    cut = false;
   }
   expect(cuts).toBeGreaterThan(0);
   const shape = logShape(run);
-  expect(shape.ended).toBe(true);
   expect(shape.compacted).toBeGreaterThan(0);
-  expect(shape.superseded).toBe(mismatches);
   const ids = run.issued.map((call) => call.id);
-  expect(shape.calls.length).toBeGreaterThan(0);
-  expect(ids.slice(ids.length - shape.calls.length)).toEqual(shape.calls);
-  expectStampsAreMadeTimes(run);
   const verdict = await checkTrace(observationsOf(run), ids, join(artifacts, "compaction-tlc"));
   expect({ verdict: verdict.verdict, detail: verdict.detail }).toMatchObject({ verdict: "ACCEPTED" });
-  writeJson(join(artifacts, "compaction.json"), { cuts, mismatches, shape });
+  writeJson(join(artifacts, "compaction.json"), { cuts, shape });
 
   const baseBin = process.env.FX_TLA_BASE_BIN;
   if (baseBin) {
@@ -502,9 +489,7 @@ for (let walk = 1; walk <= WALKS; walk++) {
     expect(run.code).toBe(0);
     expect(run.stderr).not.toMatch(/panic|reached unreachable|Segmentation fault|error\(/);
     expect(run.result?.final_output).toBe(DONE);
-    // A compacting walk may lose the call that was running at a compaction.
-    if (scenario.contextWindow === undefined) expectFinishedTurn(run);
-    else expectStampsAreMadeTimes(run);
+    expectFinishedTurn(run);
     const observations = observationsOf(run);
     expect(observations.reduce((sum, o) => sum + o.reparsed, 0)).toBe(0);
     const verdict = await checkTrace(observations, run.issued.map((call) => call.id), join(artifacts, `${scenario.name}-tlc`));

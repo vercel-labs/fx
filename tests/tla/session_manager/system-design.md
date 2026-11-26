@@ -1502,7 +1502,11 @@ Settled while removing v1 (2026-10-17):
   messages of the first kept turn that the summary covers
   (`keep_tool_steps`, `keep_steering`), and a resume leaves them out of
   that turn, as fx's history does once it compacts; a later cut inside
-  the same turn counts on from there. The converter takes the same counts
+  the same turn counts on from there. fx streams and commits such a turn
+  whole, the covered steps too (`TurnFinalizationGuard.savedExecution`),
+  so the transcript, Ctrl+O and `session/load` show the turn as it ran;
+  an older fx wrote it again from the cut, superseding the first copy,
+  and a resume reads that copy as it is. The converter takes the same counts
   from a v1 checkpoint's coverage, as v1's writer counted them, so a
   converted session shows the model the turn's prompt and the steps after
   the summary, as v1 did. A line without them, or a turn that no longer has

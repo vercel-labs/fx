@@ -34,7 +34,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { completion as configuredCompletion, createConfiguredProviderFixture } from "./fixtures/chat-completions";
-import { childLines, childWork, compactionRecordPath, copyV1Fixture, holdChildAnswer, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, withoutConversionNotice } from "./saved-sessions";
+import { childLines, childWork, compactionRecordPath, copyV1Fixture, holdChildAnswer, logLines, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, withoutConversionNotice } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -204,13 +204,10 @@ const RACE_PROMPT = "Read notes.txt until told to stop. RACE_MAIN_PROMPT";
 
 /// The records the `compaction_records` lines of session `id` list, besides
 /// each line's own map, which every such line lists too (D50). The mid-turn
-/// compaction makes fx write the turn afresh as superseded, which logLines
-/// refuses. logLinesAfterCompaction accepts that supersede only when a
-/// compaction in the same turn explains it, so this read also checks it is the
-/// designed one.
+/// compaction leaves the turn whole in the log, so no turn is superseded.
 function listedRecords(home: string, id: string): string[] {
   const listed: string[] = [];
-  for (const line of logLinesAfterCompaction(home, id) as any[]) {
+  for (const line of logLines(home, id) as any[]) {
     if (line.kind !== "set" || line.key !== "compaction_records") continue;
     expect(line.blobs).toContain(line.value.map);
     listed.push(...(line.blobs as string[]).filter((hash) => hash !== line.value.map));
