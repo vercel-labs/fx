@@ -9525,14 +9525,16 @@ pub const TranscriptRuntime = struct {
                     0
                 else
                     receipt.remaining_resize_reflow_rows;
-                // A taller footer, such as a sent prompt's card, a resent
-                // request's activity row, or a composer of several lines,
-                // moves the viewport top further down the same history flow.
-                // The rows up to the old top would then no longer fit, and
-                // every later frame would defer and lose its append base, so
-                // the first frame that sees the new top writes the rest of
-                // the history, up to that top, at once.
-                const finish_at_new_top = source_equal and
+                // While a resumed history is written, a taller footer, such
+                // as a sent prompt's card, a resent request's activity row,
+                // or a composer of several lines, moves the viewport top
+                // further down the same history flow. The rows up to the old
+                // top would then no longer fit, and every later frame would
+                // defer and lose its append base, so the first frame that
+                // sees the new top writes the rest of the history, up to that
+                // top, at once. Other recovery keeps its own pace.
+                const finish_at_new_top = self.notebook.pending_resume_source != null and
+                    source_equal and
                     recovery_progress_compatible and
                     recovery_tracks_semantic_progress and
                     receipt.remaining_semantic_progress_rows > 0 and
