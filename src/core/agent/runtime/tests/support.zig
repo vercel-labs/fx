@@ -586,6 +586,7 @@ pub const FakeAgentRuntimeDeps = struct {
     terminal_lease_cleanup_index: usize = 0,
     finish_assistant_text: ?[]u8 = null,
     finish_presentation_text: ?[]u8 = null,
+    finish_user_input_id: ?u64 = null,
     finish_summary: ?types.TurnSummary = null,
     finish_projection: ?types.FinishedPromptProjection = null,
     finish_terminal_outcome: ?types.TurnPresentationOutcome = null,
@@ -614,6 +615,8 @@ pub const FakeAgentRuntimeDeps = struct {
     continue_on_need_user: ?*std.atomic.Value(bool) = null,
     /// Presses Esc (sets the flag) when a request waits for the user.
     cancel_on_need_user: ?*std.atomic.Value(bool) = null,
+    /// Closes the sign-in (sets the flag) when a request waits for one.
+    sign_in_closed_on_sign_in_wait: ?*std.atomic.Value(bool) = null,
     /// Records prompts handed back to the composer.
     record_restored_prompt: bool = false,
     cancel_on_permission: ?*std.atomic.Value(bool) = null,
@@ -1069,7 +1072,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .continue_turn => |owned| blk: {
                 defer worker_runtime.freeSteeringMessages(self.alloc, owned);
                 const messages = try arena.alloc(worker_runtime.SteeringMessage, owned.len);
-                for (owned, messages) |message, *copy| copy.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author };
+                for (owned, messages) |message, *copy| copy.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author, .input_id = message.input_id };
                 break :blk .{ .continue_turn = messages };
             },
             .none => .none,
@@ -1861,10 +1864,14 @@ pub const FakeAgentRuntimeDeps = struct {
                 }
                 switch (finished.turn) {
                     .assistant => |entry| {
+                        self.finish_user_input_id = entry.user.input_id;
                         if (self.finish_assistant_text) |value| self.alloc.free(value);
                         self.finish_assistant_text = try self.alloc.dupe(u8, entry.assistant);
                     },
-                    .interrupted => self.interrupted_event_count += 1,
+                    .interrupted => |entry| {
+                        self.finish_user_input_id = entry.user.input_id;
+                        self.interrupted_event_count += 1;
+                    },
                     .compacted_summary => {},
                 }
                 try self.record("event:finish_prompt", .{});
@@ -1988,6 +1995,9 @@ pub const FakeAgentRuntimeDeps = struct {
         if (status.kind == .need_user) {
             if (self.continue_on_need_user) |flag| flag.store(true, .seq_cst);
             if (self.cancel_on_need_user) |flag| flag.store(true, .seq_cst);
+            if (status.need) |need| if (need == .sign_in) {
+                if (self.sign_in_closed_on_sign_in_wait) |flag| flag.store(true, .seq_cst);
+            };
         }
         // Presses Esc while the request waits after the matching attempt.
         if (status.kind == .waiting) {

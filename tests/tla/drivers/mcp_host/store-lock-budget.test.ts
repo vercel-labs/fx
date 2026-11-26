@@ -142,6 +142,98 @@ function slowReads(s: Scene, pauseFor: (n: number) => number, only?: "load" | "s
   return { first, stop: () => { stopped = true; } };
 }
 
+/** How long a stop the harness sends may take to land. */
+const STOP_LANDS_MS = 2_000;
+
+/** The process's state letters from `ps`, "" once it is gone. */
+function processState(pid: number): string {
+  return spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim();
+}
+
+/**
+ * Pure: whether a stop sent to a process has landed, from its `ps` state. A
+ * stopped process shows `T`. A stop never lands on a process that is exiting
+ * (`E`), a zombie (`Z`), or gone, and until it lands the process still runs.
+ */
+function stopLanded(state: string): "stopped" | "missed" | "pending" {
+  if (state === "" || state.startsWith("Z") || state.includes("E")) return "missed";
+  return state.startsWith("T") ? "stopped" : "pending";
+}
+
+/**
+ * Pure: why a process is not stopped inside its Keychain call, or null when
+ * it is. `state` is the `ps` state of the process the harness stopped, fx
+ * itself or only the call's child; `listed` is whether fx still lists that
+ * child. fx reaps the child before the call returns, and lets the store lock
+ * go only after that.
+ */
+function notInKeychainCall(state: string, listed: boolean): string | null {
+  const landed = stopLanded(state);
+  if (landed === "pending") return `the stop never landed (ps state "${state}")`;
+  if (landed === "missed") return `the stop missed (ps state "${state}")`;
+  return listed ? null : "the call ended before the stop";
+}
+
+/** Polls `pid`'s state until a stop lands or misses, or STOP_LANDS_MS pass, without letting a timer run. */
+function waitForStop(pid: number): string {
+  const until = Date.now() + STOP_LANDS_MS;
+  let state = processState(pid);
+  while (stopLanded(state) === "pending" && Date.now() < until) {
+    Bun.sleepSync(1);
+    state = processState(pid);
+  }
+  return state;
+}
+
+/**
+ * Stops `p` inside its first Keychain call, an `osascript` child: pauses the
+ * child for `pauseMs` and, with `freeze`, stops `p` itself. On a busy machine
+ * the harness can find the child only after its call is done, and then the
+ * stop holds nothing. So in the same step, before a timer can resume the
+ * child, it checks that the stop landed while fx still lists the child, and
+ * otherwise throws the reason; such a run never reaches TLC. Returns the
+ * child's pid.
+ */
+async function stopInKeychainCall(s: Scene, p: Proc, opts: { pauseMs: number; freeze?: boolean }): Promise<number> {
+  const passed = new Set<number>();
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    for (const pid of children(p.child.pid)) {
+      if (passed.has(pid)) continue;
+      const exe = executable(pid);
+      // Forked but not yet exec'd: still fx; look again next time.
+      if (exe === null || exe === binary || exe.endsWith("/fx")) continue;
+      passed.add(pid);
+      if (exe !== "/usr/bin/osascript") continue;
+      try { process.kill(pid, "SIGSTOP"); } catch {}
+      s.paused.add(pid);
+      s.timers.push(setTimeout(() => { try { process.kill(pid, "SIGCONT"); } catch {} s.paused.delete(pid); }, opts.pauseMs));
+      if (opts.freeze) try { process.kill(p.child.pid, "SIGSTOP"); } catch {}
+      const state = waitForStop(opts.freeze ? p.child.pid : pid);
+      const reason = notInKeychainCall(state, children(p.child.pid).includes(pid));
+      if (reason) throw new Error(`${p.label} was not stopped inside its Keychain call: ${reason}`);
+      return pid;
+    }
+    await Bun.sleep(1);
+  }
+  throw new Error(`${p.label} made no Keychain call to stop`);
+}
+
+test("a stop counts only when it landed while the Keychain call still ran", () => {
+  // Stopped with the call's child still listed: fx is inside its hold.
+  expect(notInKeychainCall("T", true)).toBeNull();
+  expect(notInKeychainCall("T+", true)).toBeNull();
+  // fx stopped after it reaped the child, so it may be letting the lock go:
+  // the order behind "VIOLATES broken=NoGiveUpOnLiveHolder" in a frozen run.
+  expect(notInKeychainCall("T", false)).toBe("the call ended before the stop");
+  // A stop sent to a child that had already ended its call.
+  expect(notInKeychainCall("Z", true)).toBe('the stop missed (ps state "Z")');
+  expect(notInKeychainCall("RE", true)).toBe('the stop missed (ps state "RE")');
+  expect(notInKeychainCall("", false)).toBe('the stop missed (ps state "")');
+  // Still running when the wait for the stop ran out.
+  expect(notInKeychainCall("S", true)).toBe('the stop never landed (ps state "S")');
+});
+
 // The same Security calls fx's osascript helper makes, for the throwaway account.
 const KEYCHAIN_SCRIPT = `
 ObjC.import("Security");
@@ -295,13 +387,11 @@ test.skipIf(!darwin)("a slow Keychain read: the waiters take the lock in turn an
 test.skipIf(!darwin)("a Keychain read that hangs past the budget is cut at it, and the waiters go on", async () => {
   const s = scene("slb-hang");
   try {
-    const slow = slowReads(s, (n) => (n === 0 ? 16_000 : 0));
     const holder = start(s, "holder");
-    await slow.first;
+    await stopInKeychainCall(s, holder, { pauseMs: 16_000 });
     await waitForTake(holder, s, 10_000);
     for (const k of [1, 2]) start(s, `waiter${k}`);
     const { verdict, seen: all } = await finish(s);
-    slow.stop();
     const h = all[0]!;
     expect(h.readFailed).toBe(true);
     // Cut by its hold's deadline, not its read's own 10 s from a later start.
@@ -372,20 +462,17 @@ test.skipIf(!darwin)("a hundred fx reading the store at once all get the lock", 
 test.skipIf(!darwin)("a frozen holder: waiters give up 12 s after they start waiting, not before", async () => {
   const s = scene("slb-frozen");
   try {
-    const slow = slowReads(s, (n) => (n === 0 ? 3_000 : 0));
     const holder = start(s, "holder");
-    await slow.first;
-    await waitForTake(holder, s, 10_000);
-    // ctrl+z: the holder itself stops, with the lock.
-    process.kill(holder.child.pid, "SIGSTOP");
+    // ctrl+z: the holder itself stops, with the lock, inside its read.
+    await stopInKeychainCall(s, holder, { pauseMs: 3_000, freeze: true });
     note(s, "freeze", { p: "holder" });
+    await waitForTake(holder, s, 10_000);
     for (const k of [1, 2]) start(s, `waiter${k}`);
     const waiters = s.procs.slice(1);
     await Promise.all(waiters.map((w) => w.done));
     process.kill(holder.child.pid, "SIGCONT");
     note(s, "thaw", { p: "holder" });
     const { verdict, seen: all } = await finish(s);
-    slow.stop();
     expect(totals(all).giveups).toBe(2);
     expect(verdict.verdict).toBe("ACCEPTED");
   } finally { cleanup(s); }
@@ -393,11 +480,10 @@ test.skipIf(!darwin)("a frozen holder: waiters give up 12 s after they start wai
 
 test.skipIf(!darwin)("a holder killed mid-hold: the next waiter takes the lock at once", async () => {
   const s = scene("slb-kill");
-  let read: { pid: number; parent: number } | null = null;
+  let read = 0;
   try {
-    const slow = slowReads(s, (n) => (n === 0 ? 30_000 : 0));
     const holder = start(s, "holder");
-    read = await slow.first;
+    read = await stopInKeychainCall(s, holder, { pauseMs: 30_000 });
     await waitForTake(holder, s, 10_000);
     for (const k of [1, 2]) start(s, `waiter${k}`);
     await Bun.sleep(2_000);
@@ -410,7 +496,6 @@ test.skipIf(!darwin)("a holder killed mid-hold: the next waiter takes the lock a
     // The store is left readable: one more list reads it.
     start(s, "after");
     const { verdict, seen: all, results } = await finish(s);
-    slow.stop();
     const firstTake = Math.min(...all.slice(1, 3).map((v) => v.takes[0]?.at ?? Infinity));
     expect(firstTake - killedAt).toBeLessThan(TOLERANCE);
     expect(totals(all).giveups).toBe(0);
@@ -418,7 +503,7 @@ test.skipIf(!darwin)("a holder killed mid-hold: the next waiter takes the lock a
     expect(verdict.verdict).toBe("ACCEPTED");
   } finally {
     cleanup(s);
-    if (read && read.pid > 1) try { process.kill(read.pid, "SIGKILL"); } catch {}
+    if (read > 1) try { process.kill(read, "SIGKILL"); } catch {}
   }
 }, 90_000);
 

@@ -615,6 +615,34 @@ test("fx ask killed while its start capture is held keeps the prompt, and the re
   }
 }, TIMEOUT);
 
+test("fx ask finishes and leaves a FIFO alone when one sits at its start capture's hold marker, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-fifo-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  // Nothing ever reads this FIFO, so opening it to write the marker would
+  // block fx for good.
+  const held = join(fixture.root, "start-capture-held");
+  const release = join(fixture.root, "start-capture-release");
+  const mkfifo = Bun.spawnSync(["mkfifo", held]);
+  expect(mkfifo.exitCode).toBe(0);
+  const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FIFO_LEFT_ALONE"));
+  try {
+    const result = await runFx(["ask", "--json", "--auto", "Say done."], {
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway), FX_TEST_WORKSPACE_CAPTURE_START_HELD: held, FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: release },
+      timeoutMs: TIMEOUT,
+    });
+    expect({ code: result.code, timedOut: result.timedOut }).toEqual({ code: 0, timedOut: false });
+    expect(JSON.parse(result.stdout).output).toContain("FIFO_LEFT_ALONE");
+    expect(statSync(held).isFIFO()).toBe(true);
+    // The start capture skipped its hold and still ran.
+    expect(workspaceCaptures(fixture, JSON.parse(result.stdout).session_id).map((record) => record.phase)).toEqual(["start", "end"]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
 test("fx ask never captures a repository at the home folder that a tool writes in, with experimental.workspace_capture", async () => {
   const fixture = createFixture("fx-v2-capture-home-");
   makeCaptureRepository(fixture);
@@ -5668,10 +5696,15 @@ test.skipIf(!tmuxAvailable())("text typed while the app answers steers that turn
     // Steering continues the turn it interrupts: one committed turn that
     // holds the steering, and nothing interrupted.
     const id = onlySessionId(fixture.home);
-    const kinds = logLines(fixture.home, id).map((line) => line.kind);
+    const lines = logLines(fixture.home, id);
+    const kinds = lines.map((line) => line.kind);
     expect(kinds.filter((kind) => kind === "turn_committed")).toHaveLength(1);
     expect(kinds).not.toContain("turn_interrupted");
-    expect(countIn(readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"), "utf8"), steering)).toBe(1);
+    expect(
+      lines.filter(
+        (line) => line.kind === "item" && JSON.stringify(line).includes(steering),
+      ),
+    ).toHaveLength(1);
 
     const resumed = await startApp(fixture, gateway, ["-c"]);
     const shown = await scrollbackContains(resumed.session, "STEERED_ANSWER");
@@ -6781,11 +6814,66 @@ function fillDisk(mountpoint: string) {
 
 type GridAttempt = { entered: boolean; said: string };
 
+const GRID_RESTORE_SINGULAR_NOTICE = "1 prompt you sent before fx stopped was not delivered. It is back in the composer.";
+
+function gridComposerText(pane: string): string {
+  const lines = pane.split("\n");
+  const lastIndex = lines.findLastIndex((line) => isComposerLine(line));
+  if (lastIndex < 0) return "";
+  let startIndex = lastIndex;
+  while (startIndex > 0 && isComposerLine(lines[startIndex - 1]!)) {
+    startIndex -= 1;
+  }
+  return lines
+    .slice(startIndex, lastIndex + 1)
+    .map((line) => {
+      const trimmedStart = line.trimStart();
+      if (trimmedStart.startsWith("┃ ")) return trimmedStart.slice(2).trimEnd();
+      if (trimmedStart.startsWith("┃")) return trimmedStart.slice(1).trimEnd();
+      if (trimmedStart.startsWith("❯ ")) return trimmedStart.slice(2).trimEnd();
+      if (trimmedStart.startsWith("> ")) return trimmedStart.slice(2).trimEnd();
+      return trimmedStart.slice(1).trimEnd();
+    })
+    .join("\n");
+}
+
+function hasPendingAcceptedPromptInLog(logPath: string, promptText: string): boolean {
+  let lines: LogLine[];
+  try {
+    lines = readFileSync(logPath, "utf8")
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .flatMap((line) => {
+        try {
+          return [JSON.parse(line) as LogLine];
+        } catch {
+          return [];
+        }
+      });
+  } catch {
+    return false;
+  }
+  const settledIds = new Set(
+    lines
+      .filter((line) => line.kind === "input_delivered" || line.kind === "input_withdrawn")
+      .map((line) => line.id),
+  );
+  return lines.some(
+    (line) =>
+      line.kind === "input_accepted" &&
+      line.text === promptText &&
+      typeof line.id === "number" &&
+      !settledIds.has(line.id),
+  );
+}
+
 /// Enters the case through `entry` and asks for `token`. Under `limit`, the
 /// host runs with that file-size limit.
-async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: string, limit?: number): Promise<GridAttempt> {
+async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: string, limit?: number, previousToken?: string): Promise<GridAttempt> {
   const prompt = `Grid token ${token}.`;
   const answer = `GRID_ANSWER_${token}`;
+  const previousPrompt = previousToken !== undefined ? `Grid token ${previousToken}.` : undefined;
+  const acceptRestoredPrior = previousPrompt !== undefined && hasPendingAcceptedPromptInLog(c.log, previousPrompt);
   switch (gridHost(entry)) {
     case "ask": {
       const args = entry === "ask-id" ? ["--resume", c.id, prompt] : entry === "ask-last" ? ["--resume", "last", prompt] : [prompt];
@@ -6805,6 +6893,10 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         cmd = join(c.harness, `limited-${token}.sh`);
         writeFileSync(cmd, `#!/bin/sh\ntrap '' XFSZ\nulimit -f ${limit}\nexec '${FX_BIN}' ${args}\n`, { mode: 0o700 });
       }
+      const paneShowsRestoredPrior = (pane: string) =>
+        acceptRestoredPrior &&
+        pane.replace(/\s+/g, " ").includes(GRID_RESTORE_SINGULAR_NOTICE) &&
+        gridComposerText(pane) === previousPrompt;
       const session = await TmuxSession.create({ cmd, cwd: c.fixture.workspace, env: { ...env(c.fixture, gateway), NO_COLOR: "1" }, stderrPath, remainOnExit: true });
       // The pane stays after fx exits, so its end is the exit status the
       // pane's wrapper records; tmux can mark the pane dead many seconds later.
@@ -6821,13 +6913,22 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         let settled = false;
         const died = (async () => {
           while (!settled && !exited()) await Bun.sleep(50);
-          return "exited";
+          return "exited" as const;
         })();
-        let started = await Promise.race([session.waitForComposer(TIMEOUT).then(() => "composer", () => "neither"), died]);
+        let started: "composer" | "restored" | "neither" | "exited" = await Promise.race([
+          acceptRestoredPrior
+            ? session.waitForPane(paneShowsRestoredPrior, TIMEOUT).then(() => "restored" as const, () => "neither" as const)
+            : session.waitForComposer(TIMEOUT).then(() => "composer" as const, () => "neither" as const),
+          died,
+        ]);
         settled = true;
         if (started === "neither" && exited()) started = "exited";
         if (started === "exited") return { entered: false, said: readFileSync(stderrPath, "utf8") };
         if (started === "neither") throw new Error(`${entry}: the app neither showed its composer nor exited`);
+        if (started === "restored") {
+          await session.sendKeys("C-u");
+          await session.waitForComposer(TIMEOUT);
+        }
         await session.waitForStableComposer(TIMEOUT, 300);
         await session.sendText(prompt);
         let screen = "";
@@ -6989,7 +7090,7 @@ async function gridRow(exit: GridExit, entry: GridEntry) {
           if (cause !== "damaged") {
             await clear();
             clear = async () => {};
-            const second = await gridEnter(entry, c, gateway, retry, limit);
+            const second = await gridEnter(entry, c, gateway, retry, limit, token);
             expect(second.entered, `${label} after the fault cleared: ${second.said}`).toBe(true);
             expectGridHistory(exit, asked(retry)!, `${label} after the fault cleared`);
           }

@@ -35,7 +35,6 @@ const trace = @import("trace.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
-const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -447,26 +446,15 @@ fn appendItems(arena: Allocator, items: *std.ArrayList(summarize.Item), message:
             .output = content,
             .saved_output = savedOutputHandle(message.tool_result_memory, content),
             .failed = message.tool_result_status == .failure,
-            .answers = if (std.mem.eql(u8, message.tool_name orelse "", question_tool)) try questionAnswers(arena, content) else &.{},
+            .answers = if (message.user_answer) try questionAnswers(arena, content) else &.{},
         } }),
     }
 }
 
-/// The tool that asks the user questions. Its result lists each question
-/// with the user's answer.
-const question_tool = "ask_user_question";
-
 /// The user's answers in a question tool's result. None when the result does
 /// not list answers, as when the question was not answered.
 fn questionAnswers(arena: Allocator, output: []const u8) Allocator.Error![]const []const u8 {
-    const Answered = struct { answer: []const u8 };
-    const answered = json_decode.parseFromSliceLeaky([]const Answered, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return &.{},
-    };
-    const answers = try arena.alloc([]const u8, answered.len);
-    for (answers, answered) |*answer, item| answer.* = item.answer;
-    return answers;
+    return try types.questionAnswers(arena, output) orelse &.{};
 }
 
 test "a question's result gives the user's answers, not the questions" {
@@ -481,14 +469,18 @@ test "a question's result gives the user's answers, not the questions" {
     try std.testing.expectEqual(@as(usize, 0), (try questionAnswers(arena, "The user dismissed the question.")).len);
     try std.testing.expectEqual(@as(usize, 0), (try questionAnswers(arena, "[{\"question\":\"Push it?\"}]")).len);
 
-    // Only the question tool's result carries answers into the turn.
+    // Only a result marked as the user's answer (`types.isUserAnswer`)
+    // carries answers into the turn.
     const result = "[{\"question\":\"Push it?\",\"answer\":\"Legitimate, push\"}]";
     var items: std.ArrayList(summarize.Item) = .empty;
-    try appendItems(arena, &items, .{ .role = .tool, .tool_call_id = "q", .tool_name = question_tool, .content = result });
+    try appendItems(arena, &items, .{ .role = .tool, .tool_call_id = "q", .tool_name = "ask_user_question", .content = result, .user_answer = true });
     try appendItems(arena, &items, .{ .role = .tool, .tool_call_id = "s", .tool_name = "shell", .content = result });
+    // A question asked through toolbox: its result goes back as toolbox's.
+    try appendItems(arena, &items, .{ .role = .tool, .tool_call_id = "t", .tool_name = "toolbox", .content = result, .user_answer = true });
     try std.testing.expectEqual(@as(usize, 1), items.items[0].tool_result.answers.len);
     try std.testing.expectEqualStrings("Legitimate, push", items.items[0].tool_result.answers[0]);
     try std.testing.expectEqual(@as(usize, 0), items.items[1].tool_result.answers.len);
+    try std.testing.expectEqual(@as(usize, 1), items.items[2].tool_result.answers.len);
 }
 
 test "a message fx sent the model on its own is a note for the summary, never the user's words" {
