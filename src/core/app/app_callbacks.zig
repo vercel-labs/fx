@@ -1443,7 +1443,14 @@ pub fn Bindings(comptime App: type) type {
                 .assistant_restarted => |text| try app_worker_runtime.Runtime(App).pushEvent(app, agent, .{
                     .assistant_presentation = .{ .attempt_restart = @constCast(text) },
                 }),
-                .operational => |text| try app_worker_runtime.Runtime(App).pushText(app, agent, text),
+                // The same text, marked once it shows, so the main screen
+                // draws the turn's later calls below it.
+                .operational => |text| {
+                    try app_worker_runtime.Runtime(App).pushText(app, agent, text);
+                    try app_worker_runtime.Runtime(App).pushEvent(app, agent, .{
+                        .assistant_presentation = .operational_text_shown,
+                    });
+                },
             }
         }
 
@@ -1892,7 +1899,7 @@ const FakeWorker = struct {
             switch (event) {
                 .assistant_presentation => |presentation| switch (presentation) {
                     .table, .code_block => return error.TestSemanticPresentationPublicationFailure,
-                    .text, .thematic_rule, .attempt_start, .attempt_restart, .assistant_tail => {},
+                    .text, .thematic_rule, .attempt_start, .operational_text_shown, .attempt_restart, .assistant_tail => {},
                 },
                 else => {},
             }
