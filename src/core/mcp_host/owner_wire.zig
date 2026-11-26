@@ -800,7 +800,9 @@ test "a count of left-out tools that is not a count, and a reason this fx does n
     kept.add(.repeated_field, 2);
     const frame = try encode(a, @as(OwnerMessage, .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = "[{\"name\":\"x\"}]", .dropped = kept } }));
     const json = frame[header_bytes..];
-    try testing.expectEqual(@as(u8, '}'), json[json.len - 1]);
+    // The frame is one JSON object: the extra fields go before its closing byte.
+    const closing = json[json.len - 1 ..];
+    const opening = json[0 .. json.len - 1];
     const cases = [_]struct { name: []const u8, extra: []const u8 }{
         .{ .name = "a reason from a newer owner", .extra = ",\"dropped_from_a_newer_owner\":5" },
         .{ .name = "negative", .extra = ",\"dropped_over_limit\":-1" },
@@ -811,15 +813,14 @@ test "a count of left-out tools that is not a count, and a reason this fx does n
         .{ .name = "every one at once", .extra = ",\"dropped_from_a_newer_owner\":5,\"dropped_unusable\":-7,\"dropped_over_limit\":[1],\"dropped_bad_header\":true,\"dropped_unnamed\":99999999999" },
     };
     for (cases) |case| {
-        const spliced = try std.mem.concat(a, u8, &.{ json[0 .. json.len - 1], case.extra, "}" });
+        const spliced = try std.mem.concat(a, u8, &.{ opening, case.extra, closing });
         const read = (try decode(a, spliced)).owner.tools;
-        errdefer std.debug.print("case: {s}\n", .{case.name});
         // The frame reads whole: the list and the count that is a count are as sent, and the bad one counts as none.
-        try testing.expectEqualStrings("[{\"name\":\"x\"}]", read.tools);
-        try testing.expectEqual(kept, read.dropped);
+        const whole = std.mem.eql(u8, read.tools, "[{\"name\":\"x\"}]") and std.meta.eql(read.dropped, kept);
+        try testing.expectEqualStrings(case.name, if (whole) case.name else "the frame read differently");
     }
     // A good count beside an ignored one is still read.
-    const mixed = try std.mem.concat(a, u8, &.{ json[0 .. json.len - 1], ",\"dropped_over_limit\":3,\"dropped_unusable\":-1}" });
+    const mixed = try std.mem.concat(a, u8, &.{ opening, ",\"dropped_over_limit\":3,\"dropped_unusable\":-1", closing });
     const got = (try decode(a, mixed)).owner.tools.dropped;
     try testing.expectEqual(@as(u32, 3), got.counts[@backingInt(mcp.tools.Drop.over_limit)]);
     try testing.expectEqual(@as(u32, 0), got.counts[@backingInt(mcp.tools.Drop.unusable)]);
