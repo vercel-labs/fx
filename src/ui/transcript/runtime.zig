@@ -5486,7 +5486,7 @@ pub const TranscriptRuntime = struct {
     /// them, because showing it again paints that flow.
     pub fn slotLeftScreen(slot: *TranscriptSlot) void {
         slot.resume_handoff_repaint_pending = false;
-        slot.resume_handoff_rows = null;
+        dropResumeHandoffRows(&slot.resume_handoff_rows, "transcript left the screen");
     }
 
     /// Frees a transcript that is not on screen.
@@ -8760,7 +8760,7 @@ pub const TranscriptRuntime = struct {
         self.reflow_clear_guard_rows = 0;
         self.resize_history_row_delta = null;
         self.viewport_clear_pending = false;
-        self.resume_handoff_rows = null;
+        dropResumeHandoffRows(&self.resume_handoff_rows, "terminal reset");
         // Job-control resume (and other full resets) reanchor at row 1. Drop
         // pending clears recorded against the pre-reset footer geometry —
         // e.g. eraseCurrentFrame at owned_top mid-scrollback — or the first
@@ -8945,7 +8945,7 @@ pub const TranscriptRuntime = struct {
 
     pub fn resetTranscriptAnchor(self: *TranscriptRuntime, reason: []const u8) void {
         self.publication_projection_invalid = false;
-        self.resume_handoff_rows = null;
+        dropResumeHandoffRows(&self.resume_handoff_rows, reason);
         const diagnostic = self.transcriptCommitDiagnostic();
         if (diagnostic.state != .invalid) {
             diagnostics.recordRenderEvent(
@@ -9471,6 +9471,42 @@ pub const TranscriptRuntime = struct {
         return facts;
     }
 
+    fn resumeHandoffScrollFacts(
+        self: *const TranscriptRuntime,
+        prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+        target_offset: u32,
+        footer_reservation_changed: bool,
+    ) ?TranscriptScrollFacts {
+        const handoff = self.resume_handoff_rows orelse return null;
+        if (footer_reservation_changed or
+            target_offset <= handoff.history or
+            target_offset - handoff.history > handoff.screen or
+            self.committed_frame_layout.terminal_cols != self.layout.cols or
+            self.committed_frame_layout.terminal_rows != self.layout.rows or
+            self.viewport_clear_pending or
+            self.resize_history_row_delta != null)
+        {
+            return null;
+        }
+        const semantic_rows: u32 = frameInlineScrollBudget(0, target_offset - handoff.history);
+        return .{
+            .source_visual_offset = handoff.history,
+            .target_visual_offset = target_offset,
+            .semantic_rows = semantic_rows,
+            .semantic_progress_rows = semantic_rows,
+            .planned_rows = self.plannedTranscriptRows(
+                prepared,
+                handoff.history,
+                0,
+                semantic_rows,
+                semantic_rows,
+            ),
+            .source_compatible = true,
+            .recovery_progress_compatible = true,
+            .recovery_tracks_semantic_progress = true,
+        };
+    }
+
     fn planTranscriptScrollForFrameUnfiltered(
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
@@ -9667,33 +9703,7 @@ pub const TranscriptRuntime = struct {
                         .recovery_tracks_semantic_progress = true,
                     };
                 }
-                if (self.resume_handoff_rows) |handoff| {
-                    if (target_offset > handoff.history and
-                        target_offset - handoff.history <= handoff.screen and
-                        self.committed_frame_layout.terminal_cols == self.layout.cols and
-                        self.committed_frame_layout.terminal_rows == self.layout.rows and
-                        !self.viewport_clear_pending and
-                        self.resize_history_row_delta == null)
-                    {
-                        const semantic_rows: u32 = frameInlineScrollBudget(0, target_offset - handoff.history);
-                        return .{
-                            .source_visual_offset = handoff.history,
-                            .target_visual_offset = target_offset,
-                            .semantic_rows = semantic_rows,
-                            .semantic_progress_rows = semantic_rows,
-                            .planned_rows = self.plannedTranscriptRows(
-                                prepared,
-                                handoff.history,
-                                0,
-                                semantic_rows,
-                                semantic_rows,
-                            ),
-                            .source_compatible = true,
-                            .recovery_progress_compatible = true,
-                            .recovery_tracks_semantic_progress = true,
-                        };
-                    }
-                }
+                if (self.resumeHandoffScrollFacts(prepared, target_offset, footer_reservation_changed)) |facts| return facts;
                 return .{
                     .target_visual_offset = target_offset,
                     .recovery_rebase = true,
@@ -11747,7 +11757,7 @@ pub const TranscriptRuntime = struct {
             transition.target_flow = &.{};
             var previous_state = self.transcript_commit_state;
             self.transcript_commit_state = .invalid;
-            self.resume_handoff_rows = null;
+            dropResumeHandoffRows(&self.resume_handoff_rows, "missing borrowed source");
             previous_state.deinit(alloc);
             self.markTranscriptDirty();
         } else if (commit.stable) {
@@ -11838,7 +11848,7 @@ pub const TranscriptRuntime = struct {
                 }
                 self.markTranscriptDirty();
             } else {
-                self.resume_handoff_rows = null;
+                dropResumeHandoffRows(&self.resume_handoff_rows, "stable commit");
             }
             if (!retained_body and !self.fullTranscriptActive()) {
                 self.last_visible_transcript_top_row = transition.selection.top_row;
@@ -11891,7 +11901,7 @@ pub const TranscriptRuntime = struct {
                 self.markTranscriptDirty();
             }
         } else {
-            self.resume_handoff_rows = null;
+            dropResumeHandoffRows(&self.resume_handoff_rows, "recovery commit");
             const recovery = resolveTranscriptRecoveryCommit(self, transition, result, commit);
             var previous_state = self.transcript_commit_state;
             var presentation_resume_bytes: []u8 = &.{};
@@ -15565,6 +15575,16 @@ fn frameInlineScrollBudget(resize_reflow_rows: u16, semantic_rows: u32) u16 {
         semantic_rows,
         std.math.maxInt(u32),
     );
+}
+
+fn dropResumeHandoffRows(rows: *?ResumeHandoffRows, reason: []const u8) void {
+    const handoff = rows.* orelse return;
+    debug_trace.logf(
+        "scroll",
+        "resume_handoff_rows_dropped history={d} screen={d} reason={s}",
+        .{ handoff.history, handoff.screen, reason },
+    );
+    rows.* = null;
 }
 
 fn resumeHandoffRows(
