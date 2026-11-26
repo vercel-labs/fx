@@ -1263,14 +1263,8 @@ fn renderPriorToolResult(
     defer scratch.deinit();
     if (try userAnswers(scratch.allocator(), entry)) |answered| {
         // Only the answers are the user's words; the model wrote the questions.
-        const answers = try scratch.allocator().alloc([]const u8, answered.len);
-        const questions = try scratch.allocator().alloc([]const u8, answered.len);
-        for (answered, answers, questions) |pair, *answer, *question| {
-            answer.* = pair.answer;
-            question.* = pair.question;
-        }
-        try writeAnsweredField(&out.writer, alloc, index, "user_answer", answers, &complete);
-        try writeAnsweredField(&out.writer, alloc, index, "questions_untrusted", questions, &complete);
+        try writeAnsweredField(&out.writer, alloc, index, .answers, answered, &complete);
+        try writeAnsweredField(&out.writer, alloc, index, .questions, answered, &complete);
     } else {
         try out.writer.print("\n" ++ prior_result_label_prefix ++ "{d}].content_untrusted: ", .{index});
         try writeBoundedValue(
@@ -1291,14 +1285,20 @@ fn writeAnsweredField(
     writer: *std.Io.Writer,
     alloc: std.mem.Allocator,
     index: usize,
-    comptime label: []const u8,
-    values: []const []const u8,
+    part: enum { answers, questions },
+    answered: []const types.QuestionAnswer,
     complete: *bool,
 ) !void {
     var list: std.Io.Writer.Allocating = .init(alloc);
     defer list.deinit();
-    try std.json.Stringify.value(values, .{}, &list.writer);
-    try writer.print("\n" ++ prior_result_label_prefix ++ "{d}]." ++ label ++ ": ", .{index});
+    try list.writer.writeByte('[');
+    for (answered, 0..) |pair, position| {
+        if (position > 0) try list.writer.writeByte(',');
+        try std.json.Stringify.value(if (part == .answers) pair.answer else pair.question, .{}, &list.writer);
+    }
+    try list.writer.writeByte(']');
+    const label = if (part == .answers) "user_answer" else "questions_untrusted";
+    try writer.print("\n" ++ prior_result_label_prefix ++ "{d}].{s}: ", .{ index, label });
     try writeBoundedValue(writer, alloc, list.written(), max_prior_tool_result_content_bytes, complete);
 }
 

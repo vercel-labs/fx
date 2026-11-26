@@ -2071,14 +2071,10 @@ pub const user_question_tool_name = "ask_user_question";
 /// that no one could answer it. Only the answers must be there; a missing
 /// question reads as empty. The strings borrow `output` or `arena`.
 pub fn answeredQuestions(arena: std.mem.Allocator, output: []const u8) std.mem.Allocator.Error!?[]const QuestionAnswer {
-    const Answered = struct { question: []const u8 = "", answer: []const u8 };
-    const answered = json_decode.parseFromSliceLeaky([]const Answered, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+    return json_decode.parseFromSliceLeaky([]const QuestionAnswer, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    const pairs = try arena.alloc(QuestionAnswer, answered.len);
-    for (pairs, answered) |*pair, item| pair.* = .{ .question = item.question, .answer = item.answer };
-    return pairs;
 }
 
 /// The user's answers in a question tool's result (`answeredQuestions`). The
@@ -2098,7 +2094,7 @@ pub fn isUserAnswer(alloc: std.mem.Allocator, ran_tool: []const u8, status: ?Per
     if (!std.mem.eql(u8, ran_tool, user_question_tool_name) or status == .failure) return false;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
-    return try questionAnswers(scratch.allocator(), output) != null;
+    return try answeredQuestions(scratch.allocator(), output) != null;
 }
 
 test "only a question's listed answers are the user's answer" {
@@ -3273,7 +3269,9 @@ pub const QuestionBatchEntry = struct {
 /// One persisted answer from an interactive question batch. The strings are
 /// borrowed from the short-lived arena that decodes the completed tool result.
 pub const QuestionAnswer = struct {
-    question: []const u8,
+    /// Empty when a saved answer list leaves the question out
+    /// (`answeredQuestions`).
+    question: []const u8 = "",
     answer: []const u8,
 };
 
