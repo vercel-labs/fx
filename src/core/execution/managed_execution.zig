@@ -40,12 +40,7 @@ fn capturedWaitPollMs() i64 {
 /// tests set with `FX_TEST_SHELL_QUIET_NOTICE_MS`. Read when a wait or a
 /// result needs it, since `Runtime.init` also runs at compile time as a
 /// default field value.
-var test_quiet_limit_ms: ?u64 = null;
-
 fn quietLimitMs() u64 {
-    if (builtin.is_test) {
-        if (test_quiet_limit_ms) |ms| return ms;
-    }
     return quiet_notice.limitFromValue(io_mod.getenv("FX_TEST_SHELL_QUIET_NOTICE_MS"));
 }
 
@@ -2472,8 +2467,11 @@ test "cancelling a run or wait past the quiet limit traces the dropped crossing 
     defer debug_trace.resetForTest();
     defer debug_trace.shutdown();
 
-    test_quiet_limit_ms = 100;
-    defer test_quiet_limit_ms = null;
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put("FX_TEST_SHELL_QUIET_NOTICE_MS", "100");
+    io_mod.setEnvironMap(&env);
+    defer io_mod.resetEnvironForTest();
 
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
