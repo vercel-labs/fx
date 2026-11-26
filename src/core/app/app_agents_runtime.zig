@@ -1744,7 +1744,7 @@ pub fn Runtime(comptime App: type) type {
                 // Only instances hold their queued work, so a subagent's runs.
                 if (child.agent.role == .subagent and worker.queuedPromptCount() > 0) return true;
             }
-            return deliveriesPending(app);
+            return deliveriesPending(app, null);
         }
 
         /// Whether a subagent runs work, has work queued, or holds events
@@ -1759,21 +1759,15 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Whether a child's report or a hand-off waits for the main loop to
-        /// deliver it (`takePosts`).
-        fn deliveriesPending(app: *App) bool {
-            app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
-            defer app.child_handoffs.mutex.unlock(io_mod.getIo());
-            return app.child_handoffs.posts.items.len > 0 or app.child_handoffs.reports.items.len > 0;
-        }
-
-        /// Whether a report for `host`, or any post, waits for the main loop to
-        /// take it. A post does not name its host, so every post counts.
-        fn deliveriesPendingFor(app: *App, host: *subagent_tool_host.Runtime) bool {
+        /// deliver it (`takePosts`): any report, or only `host`'s when given.
+        /// A hand-off does not name its host, so every one counts.
+        fn deliveriesPending(app: *App, host: ?*subagent_tool_host.Runtime) bool {
             app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
             defer app.child_handoffs.mutex.unlock(io_mod.getIo());
             if (app.child_handoffs.posts.items.len > 0) return true;
+            const wanted = host orelse return app.child_handoffs.reports.items.len > 0;
             for (app.child_handoffs.reports.items) |report| {
-                if (report.host == host) return true;
+                if (report.host == wanted) return true;
             }
             return false;
         }
@@ -1867,8 +1861,8 @@ pub fn Runtime(comptime App: type) type {
                 if (ownSubagentWorking(app, screen, child)) return true;
             }
             const host: ?*subagent_tool_host.Runtime = if (comptime agents.hasAgentField(App, "session_persistence")) screen.session_persistence.subagent_host else null;
-            const own_host = host orelse return deliveriesPending(app);
-            return !own_host.quiet() or deliveriesPendingFor(app, own_host);
+            const own_host = host orelse return false;
+            return !own_host.quiet() or deliveriesPending(app, own_host);
         }
 
         /// Main loop only.
