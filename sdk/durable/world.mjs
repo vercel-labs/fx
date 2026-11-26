@@ -1,6 +1,7 @@
 // Sessions kept in a World the app supplies: its store, streams and queue,
 // such as Workflow's Postgres World. `local()` and `vercel()` are this with
 // the World libfx bundles for each.
+import { workflowCodec } from "./workflow.mjs";
 
 const durabilityTag = Symbol.for("libfx.durability");
 
@@ -67,6 +68,7 @@ export function world(source, options = {}) {
   if (runInRequest && !queueLeases) throw new TypeError(`${name}() runInRequest needs queueLeases`);
   return {
     [durabilityTag]: true,
+    [Symbol.for("libfx.workflowCodec")]: workflowCodec,
     name,
     store,
     world: owned ? source : () => source,
