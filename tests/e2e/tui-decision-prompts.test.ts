@@ -304,6 +304,26 @@ const TOOLBOX_QUESTION_CALL = {
   input: { run: QUESTION_CALL.name, arguments: QUESTION_CALL.input },
 };
 
+// Two questions in one call; the user answers the second under "Other".
+const PUSH_PROMPT = "When may I push?";
+const TYPED_PUSH_ANSWER = "only after CI is green";
+const TWO_QUESTION_CALL = {
+  id: QUESTION_CALL.id,
+  name: QUESTION_CALL.name,
+  input: {
+    questions: [
+      ...QUESTION_CALL.input.questions,
+      {
+        question: PUSH_PROMPT,
+        options: [
+          { label: "Now", description: "Push at once." },
+          { label: "After review", description: "Wait for a review first." },
+        ],
+      },
+    ],
+  },
+};
+
 const TALL_QUESTION_PROMPT = "Who should relay events to the chat panes?";
 const TALL_QUESTION_DESCRIPTION =
   "The relay follows each session and passes its events on, so every pane keeps updating " +
@@ -940,6 +960,8 @@ const ANSWER_REVIEWED_DONE = "Reviewed after the answer.";
 async function reviewRequestAfterAnswer(
   questionCall: { id: string; name: string; input: object },
   settings: Record<string, unknown> = {},
+  answer: (activeSession: TmuxSession) => Promise<void> = (activeSession) => answerQuestions(activeSession, 1),
+  modelResult = `[{"question":"${QUESTION_PROMPT}","answer":"Run tests"}]`,
 ) {
   const ctx = await launchScenario([
     outerToolCalls([questionCall]),
@@ -948,7 +970,7 @@ async function reviewRequestAfterAnswer(
   ], "input", {}, "auto", undefined, {}, settings);
   writeFileSync(join(ctx.root.workspace, "stale-fixture.txt"), "stale\n");
   await ctx.session.sendText("Ask me, then clean up.");
-  await answerQuestions(ctx.session, 1);
+  await answer(ctx.session);
   await ctx.session.waitForText(ANSWER_REVIEWED_DONE, TIMEOUT);
   await assertProcessAliveAndClean(ctx);
   const reviews = ctx.gateway.classifierRequests.filter((request) => request.body.includes(ANSWER_REVIEWED_COMMAND));
@@ -961,7 +983,7 @@ async function reviewRequestAfterAnswer(
   expect(sent).toHaveLength(1);
   expect(sent[0]).toMatchObject({
     toolName: questionCall.name,
-    output: { type: "text", value: `[{"question":"${QUESTION_PROMPT}","answer":"Run tests"}]` },
+    output: { type: "text", value: modelResult },
   });
   return reviews[0]!.body;
 }
@@ -4051,8 +4073,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
     "the auto-mode review reads the answer to a question asked through toolbox as the user's answer",
     async () => {
       const prior = firstPriorResult(await reviewRequestAfterAnswer(TOOLBOX_QUESTION_CALL, TOOLBOX_QUESTION_SETTINGS));
-      expect(prior).toContain("prior_tool_result[0].tool: toolbox");
-      expect(prior).toContain(`prior_tool_result[0].user_answer: [{"question":"${QUESTION_PROMPT}","answer":"Run tests"}]`);
+      // The answer alone is the user's; the question is the model's.
+      expect(prior).toEqual([
+        `prior_tool_result[0].tool_call_id: ${QUESTION_CALL.id}`,
+        "prior_tool_result[0].tool: toolbox",
+        'prior_tool_result[0].user_answer: ["Run tests"]',
+        `prior_tool_result[0].questions_untrusted: ["${QUESTION_PROMPT}"]`,
+      ]);
     },
     TIMEOUT * 2,
   );
@@ -4061,8 +4088,45 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
     "the auto-mode review reads the answer to a direct question as the user's answer",
     async () => {
       const prior = firstPriorResult(await reviewRequestAfterAnswer(QUESTION_CALL));
-      expect(prior).toContain("prior_tool_result[0].tool: ask_user_question");
-      expect(prior).toContain(`prior_tool_result[0].user_answer: [{"question":"${QUESTION_PROMPT}","answer":"Run tests"}]`);
+      expect(prior).toEqual([
+        `prior_tool_result[0].tool_call_id: ${QUESTION_CALL.id}`,
+        "prior_tool_result[0].tool: ask_user_question",
+        'prior_tool_result[0].user_answer: ["Run tests"]',
+        `prior_tool_result[0].questions_untrusted: ["${QUESTION_PROMPT}"]`,
+      ]);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "the auto-mode review reads chosen and typed answers to several questions as the user's, apart from the questions",
+    async () => {
+      const prior = firstPriorResult(await reviewRequestAfterAnswer(
+        TWO_QUESTION_CALL,
+        {},
+        async (activeSession) => {
+          await activeSession.waitForText("Question 1 of 2", TIMEOUT);
+          await resolveQuestionWithSecondOption(activeSession);
+          await activeSession.waitForText("Question 2 of 2", TIMEOUT);
+          // The third row is "Other", where the user types an answer.
+          await activeSession.sendLiteralText("3");
+          await waitForQuestionPane(activeSession, "typed answer row selected", (value) =>
+            hasQuestionSelection(value, 3, ""),
+          );
+          await activeSession.sendLiteralText(TYPED_PUSH_ANSWER);
+          await waitForQuestionPane(activeSession, "typed answer shown", (value) =>
+            hasQuestionSelection(value, 3, TYPED_PUSH_ANSWER),
+          );
+          await activeSession.sendKeys("Enter");
+        },
+        `[{"question":"${QUESTION_PROMPT}","answer":"Run tests"},{"question":"${PUSH_PROMPT}","answer":"${TYPED_PUSH_ANSWER}"}]`,
+      ));
+      expect(prior).toEqual([
+        `prior_tool_result[0].tool_call_id: ${QUESTION_CALL.id}`,
+        "prior_tool_result[0].tool: ask_user_question",
+        `prior_tool_result[0].user_answer: ["Run tests","${TYPED_PUSH_ANSWER}"]`,
+        `prior_tool_result[0].questions_untrusted: ["${QUESTION_PROMPT}","${PUSH_PROMPT}"]`,
+      ]);
     },
     TIMEOUT * 2,
   );

@@ -2066,18 +2066,27 @@ pub const ChatMessage = struct {
 /// The tool that asks the user questions.
 pub const user_question_tool_name = "ask_user_question";
 
-/// The user's answers in a question tool's result, which lists each answered
-/// question. Null for any other text, such as fx's note that the user
-/// cancelled the question or that no one could answer it. The answers borrow
-/// `arena`.
-pub fn questionAnswers(arena: std.mem.Allocator, output: []const u8) std.mem.Allocator.Error!?[]const []const u8 {
-    const Answered = struct { answer: []const u8 };
+/// The answered questions in a question tool's result, in its order. Null for
+/// any other text, such as fx's note that the user cancelled the question or
+/// that no one could answer it. Only the answers must be there; a missing
+/// question reads as empty. The strings borrow `output` or `arena`.
+pub fn answeredQuestions(arena: std.mem.Allocator, output: []const u8) std.mem.Allocator.Error!?[]const QuestionAnswer {
+    const Answered = struct { question: []const u8 = "", answer: []const u8 };
     const answered = json_decode.parseFromSliceLeaky([]const Answered, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    const answers = try arena.alloc([]const u8, answered.len);
-    for (answers, answered) |*answer, item| answer.* = item.answer;
+    const pairs = try arena.alloc(QuestionAnswer, answered.len);
+    for (pairs, answered) |*pair, item| pair.* = .{ .question = item.question, .answer = item.answer };
+    return pairs;
+}
+
+/// The user's answers in a question tool's result (`answeredQuestions`). The
+/// answers borrow `output` or `arena`.
+pub fn questionAnswers(arena: std.mem.Allocator, output: []const u8) std.mem.Allocator.Error!?[]const []const u8 {
+    const pairs = try answeredQuestions(arena, output) orelse return null;
+    const answers = try arena.alloc([]const u8, pairs.len);
+    for (answers, pairs) |*answer, pair| answer.* = pair.answer;
     return answers;
 }
 
@@ -2107,6 +2116,21 @@ test "only a question's listed answers are the user's answer" {
         "(ask_user_question: invalid arguments; provide {questions})",
         "[{\"question\":\"Choose next step?\"}]",
     }) |note| try std.testing.expect(!try isUserAnswer(alloc, "ask_user_question", .success, note));
+}
+
+test "a question's result gives each question with its answer, in order" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const pairs = (try answeredQuestions(arena, "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"},{\"question\":\"When may I push?\",\"answer\":\"only after CI is green\"}]")).?;
+    try std.testing.expectEqual(@as(usize, 2), pairs.len);
+    try std.testing.expectEqualStrings("Choose next step?", pairs[0].question);
+    try std.testing.expectEqualStrings("Run tests", pairs[0].answer);
+    try std.testing.expectEqualStrings("When may I push?", pairs[1].question);
+    try std.testing.expectEqualStrings("only after CI is green", pairs[1].answer);
+    const unasked = (try answeredQuestions(arena, "[{\"answer\":\"Run tests\"}]")).?;
+    try std.testing.expectEqualStrings("", unasked[0].question);
+    try std.testing.expect(try answeredQuestions(arena, "(user cancelled the question)") == null);
 }
 
 /// Returns a caller-owned shallow projection only when incompatible replay exists.
