@@ -85,6 +85,11 @@ export function terminalFixtureShell(): string {
   throw new Error("terminal fixtures require Bash or zsh");
 }
 
+/// The tmux option that starts a server with no config file, so a developer's
+/// tmux.conf cannot change a test's server. It acts only when the call starts
+/// the server: a server that already runs keeps the config it loaded.
+export const TMUX_NO_CONFIG = ["-f", "/dev/null"] as const;
+
 const TMUX_RAW_PASTE_FLAGS = (() => {
   try {
     const version = execFileSync("tmux", ["-V"], { encoding: "utf8" })
@@ -849,7 +854,7 @@ export class TmuxSession {
     const tmuxCommand = gatedLaunch
       ? `tmux wait-for ${shellQuote(startGate)} && exec ${observedCmd}`
       : observedCmd;
-    const tmuxPrefix = resolvedSocketName ? ["-L", resolvedSocketName] : [];
+    const tmuxPrefix = [...(resolvedSocketName ? ["-L", resolvedSocketName] : []), ...TMUX_NO_CONFIG];
     const setupSessionName = `${name}-setup`;
     const killSetupSession = () => {
       try {
