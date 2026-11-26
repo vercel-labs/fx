@@ -1202,7 +1202,10 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (!mcp_loaded) app.mcp.dismissHostStatus();
             }
             switch (try installPendingSubmission(app, agent, prompt, skill_tokens)) {
-                .installed => return .pending,
+                .installed => {
+                    finishResumePublication(app);
+                    return .pending;
+                },
                 .unavailable => {},
             }
             if (!try preflightQueuedPrompt(app, agent)) return .rejected;
@@ -1211,7 +1214,16 @@ pub fn SubmitRuntime(comptime App: type) type {
             else
                 try App.enqueuePrompt(app, prompt);
             if (!accepted) return .rejected;
+            finishResumePublication(app);
             return .enqueued;
+        }
+
+        /// A sent prompt shows its turn at once, so a resumed history still
+        /// being written into scrollback is written out first.
+        fn finishResumePublication(app: *App) void {
+            if (comptime @hasDecl(@TypeOf(app.shell), "finishResumePublication")) {
+                app.shell.finishResumePublication();
+            }
         }
 
         fn installPendingSubmission(

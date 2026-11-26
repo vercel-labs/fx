@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { processAlive } from "./process-alive";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -35,6 +35,7 @@ import {
   fakeGatewayToolCall,
   fakeShellRun,
   hasEmptyComposer,
+  heldFakeGatewayFinalText,
   isEmptyComposerLine,
   isVolatileTokenStatusRow,
   paneExitMatches,
@@ -11382,3 +11383,249 @@ test.skipIf(!tmuxAvailable())(
   },
   TIMEOUT * 3,
 );
+
+// After `--resume`, fx writes the saved history into scrollback a batch of
+// rows a frame. A prompt sent before the last batch makes the footer taller,
+// and the batches used to stop there: the turn drew nothing until it ended,
+// and the history landed in scrollback with gaps and repeats. The frame after
+// the prompt now writes the rest at once.
+const DRAIN_PROMPT = "Read the three files.";
+const DRAIN_DONE = "DRAIN_ROWS_DONE_41c2";
+const DRAIN_HISTORY = /^  history line (\d{5}) /;
+const DRAIN_ROWS_PER_FRAME = 64;
+const DRAIN_TYPED = "typed while the history lands";
+
+type DrainCase = {
+  lines: number;
+  /// `launch` passes the prompt to `fx --resume`; `typed` sends it as soon
+  /// as the composer shows; `none` sends nothing.
+  send: "launch" | "typed" | "none";
+  /// Runs while the history is still being written, before a typed prompt.
+  duringDrain?: (terminal: TmuxSession, committed: () => boolean) => Promise<void>;
+  /// Types `DRAIN_TYPED` while the frame after the prompt is written.
+  typeDuringFinish?: boolean;
+  /// `duringDrain` writes the rest of the history itself, so a typed
+  /// prompt finds it written.
+  drainEndsBeforeSend?: boolean;
+};
+
+/// Each numbered history line in `scrollback`: once, in order, and above
+/// the prompt's one row.
+function drainScrollbackFacts(scrollback: string, lines: number) {
+  const rows = scrollback.split("\n");
+  const numbers: number[] = [];
+  let lastHistory = -1;
+  rows.forEach((row, index) => {
+    const match = DRAIN_HISTORY.exec(row);
+    if (!match) return;
+    numbers.push(Number(match[1]));
+    lastHistory = index;
+  });
+  const seen = new Set(numbers);
+  const missing: number[] = [];
+  for (let n = 1; n <= lines && missing.length < 5; n++) if (!seen.has(n)) missing.push(n);
+  let outOfOrder = 0;
+  for (let i = 1; i < numbers.length; i++) if (numbers[i]! <= numbers[i - 1]!) outOfOrder++;
+  const promptRows = rows.flatMap((row, index) => (row.trimEnd() === `┃ ${DRAIN_PROMPT}` ? [index] : []));
+  return {
+    history_rows: numbers.length,
+    repeats: numbers.length - seen.size,
+    out_of_order: outOfOrder,
+    first_missing: missing,
+    prompt_rows: promptRows.length,
+    prompt_below_history: promptRows.length === 1 && promptRows[0]! > lastHistory,
+  };
+}
+
+/// The publication frames in the trace: the rows each one planned before a
+/// sent prompt asked to finish, the rows the first frame after it planned,
+/// and how many frames after it still left part of the history unwritten.
+function drainFrames(trace: string) {
+  const lines = trace.split("\n");
+  const finishAt = lines.findIndex((line) => line.includes("resume_publication_finish_requested"));
+  const planned = (line: string) => Number(/transcript_transition_plan source_state=recovering .*? planned_rows=(\d+)/.exec(line)?.[1] ?? 0);
+  const before = lines.filter((line, index) => (finishAt < 0 || index < finishAt) && planned(line) > 0).map(planned);
+  const after = finishAt < 0 ? [] : lines.slice(finishAt + 1);
+  return {
+    finished: finishAt >= 0,
+    committed: lines.some((line) => line.includes("resume historical flow committed")),
+    before,
+    finish_frame_rows: after.map(planned).find((rows) => rows > 0) ?? 0,
+    partial_frames_after: after.filter((line) => line.includes("transcript_transition_commit state=recovering")).length,
+  };
+}
+
+/// Saves a session whose answer is `lines` numbered lines, resumes it, and
+/// runs one turn that reads a.txt and then waits on its second request.
+async function resumeLongHistory(options: DrainCase) {
+  const root = mkdtempSync(join(tmpdir(), "fx-resume-drain-"));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace);
+  writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
+  writeFileSync(join(workspace, "a.txt"), "alpha\n");
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false }));
+  const history = Array.from({ length: options.lines }, (_, i) => `history line ${String(i + 1).padStart(5, "0")} alpha beta gamma`);
+  const hold = heldFakeGatewayFinalText();
+  let seeding = true;
+  let steps = 0;
+  let held = false;
+  const gateway = startDynamicFakeGateway((raw) => {
+    if (seeding) {
+      if (!raw.includes('"seed-read"')) return fakeGatewayToolCall("seed-read", "read_file", { path: "seed-notes.txt" });
+      return fakeGatewaySse([
+        { type: "text-delta", id: "answer_1", delta: `${history.join("\n")}\nSEED_DONE` },
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+      ]);
+    }
+    steps++;
+    if (steps === 1) return fakeGatewayToolCall("read_a", "read_file", { path: "a.txt" });
+    held = true;
+    return hold.response;
+  }, { models: [{
+    id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"],
+    // Large enough that 18000 lines do not start a compaction.
+    context_window: 2_000_000, max_tokens: 8192,
+  }] });
+  const env = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+    TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-tui-resume-key",
+    FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1",
+    FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
+    FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  };
+  const tracePath = join(root, "resume.trace");
+  const stderrPath = join(root, "resume.stderr");
+  writeFileSync(tracePath, "");
+  let terminal: TmuxSession | undefined;
+  let passed = false;
+  try {
+    const seed = Bun.spawn([FX_BIN, "ask", "--json", "--auto", "Seed one turn."], { cwd: workspace, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const [code, out] = await Promise.all([seed.exited, new Response(seed.stdout).text()]);
+    expect(code).toBe(0);
+    seeding = false;
+    const sessionId = JSON.parse(out).session_id;
+    const terminalEnv = { ...env, FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "scroll,input,session" };
+    const prompt = options.send === "launch" ? ` ${shellQuote(DRAIN_PROMPT)}` : "";
+    const command = `/usr/bin/env -i ${Object.entries(terminalEnv).map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(FX_BIN)} --resume ${shellQuote(sessionId)}${prompt}`;
+    terminal = await TmuxSession.create({
+      cmd: command, cwd: workspace, env: { HOME: home, FX_SOUND: "0" }, isolated: true,
+      width: 100, height: 40, startupWaitMs: 0, minimumHistoryLines: options.lines + 5000, stderrPath,
+    });
+    const trace = () => readFileSync(tracePath, "utf8");
+    const committed = () => trace().includes("resume historical flow committed");
+    if (options.typeDuringFinish) {
+      // The frame after the prompt has planned the rest and is writing it.
+      await waitForCondition(() => drainFrames(trace()).finish_frame_rows > DRAIN_ROWS_PER_FRAME, "the frame after the prompt");
+      await terminal.sendLiteral(DRAIN_TYPED);
+    }
+    if (options.send !== "launch") await terminal.waitForComposer(TIMEOUT);
+    await options.duringDrain?.(terminal, committed);
+    if (options.send === "none") {
+      await waitForCondition(committed, "the resumed history in scrollback", 90_000);
+    } else {
+      if (options.send === "typed") {
+        // Unless `duringDrain` wrote it, the history is still being written,
+        // so the prompt lands in the middle of it.
+        expect(committed()).toBe(options.drainEndsBeforeSend === true);
+        await terminal.sendText(DRAIN_PROMPT);
+      }
+      await waitForCondition(() => held, "the turn's second request");
+      // The turn's rows show while it runs, not when it ends.
+      const pane = await terminal.waitForPane(
+        (text) => text.split("\n").some((row) => row.trimEnd() === `┃ ${DRAIN_PROMPT}`) && text.includes("● Read a.txt"),
+        10_000,
+      );
+      if (options.typeDuringFinish) expect(composerContains(pane, DRAIN_TYPED)).toBe(true);
+      hold.release(DRAIN_DONE);
+      await terminal.waitForPane((text) => text.includes(DRAIN_DONE) && turnSettled(text), TIMEOUT);
+    }
+    const scrollback = await terminal.captureFullScrollback();
+    const frames = drainFrames(trace());
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    passed = true;
+    return { scrollback: drainScrollbackFacts(scrollback, options.lines), frames };
+  } finally {
+    if (!passed) console.error(`resume drain evidence kept: ${root}; steps=${steps} held=${held}`);
+    hold.dispose();
+    await terminal?.kill();
+    gateway.stop();
+    if (passed) rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/// What every prompt case must show: the whole history once and in order
+/// above the prompt, and after the prompt one frame that wrote the rest.
+function expectFinishedDrain(result: Awaited<ReturnType<typeof resumeLongHistory>>, lines: number) {
+  expect(result.scrollback).toEqual({
+    history_rows: lines, repeats: 0, out_of_order: 0, first_missing: [], prompt_rows: 1, prompt_below_history: true,
+  });
+  expect(result.frames.finished).toBe(true);
+  expect(result.frames.committed).toBe(true);
+  for (const rows of result.frames.before) expect(rows).toBeLessThanOrEqual(DRAIN_ROWS_PER_FRAME);
+  expect(result.frames.finish_frame_rows).toBeGreaterThan(DRAIN_ROWS_PER_FRAME);
+  expect(result.frames.partial_frames_after).toBe(0);
+}
+
+describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is written into scrollback", () => {
+  for (const lines of [1600, 6000]) {
+    test(`fx --resume with a prompt, ${lines} lines: the turn shows while it runs, and the history lands once, in order`, async () => {
+      expectFinishedDrain(await resumeLongHistory({ lines, send: "launch" }), lines);
+    }, TIMEOUT * 4);
+
+    test(`a prompt typed before the history is written, ${lines} lines: the turn shows while it runs, and the history lands once, in order`, async () => {
+      expectFinishedDrain(await resumeLongHistory({ lines, send: "typed" }), lines);
+    }, TIMEOUT * 4);
+  }
+
+  test("fx --resume with a prompt, 18000 lines: the history lands once, in order, and keys typed during the long frame reach the composer", async () => {
+    expectFinishedDrain(await resumeLongHistory({ lines: 18_000, send: "launch", typeDuringFinish: true }), 18_000);
+  }, TIMEOUT * 6);
+
+  test("a resize while the history is written, then a prompt: the history lands once, in order", async () => {
+    // A resize clears the screen and writes the whole history in one frame,
+    // so the prompt after it has nothing left to finish.
+    const result = await resumeLongHistory({
+      lines: 6000,
+      send: "typed",
+      drainEndsBeforeSend: true,
+      duringDrain: async (terminal, committed) => {
+        expect(committed()).toBe(false);
+        await terminal.resizeWindow(100, 30);
+        await waitForCondition(committed, "the history after the resize");
+        await terminal.resizeWindow(100, 40);
+        await terminal.waitForComposer(TIMEOUT);
+      },
+    });
+    expect(result.scrollback).toEqual({
+      history_rows: 6000, repeats: 0, out_of_order: 0, first_missing: [], prompt_rows: 1, prompt_below_history: true,
+    });
+    expect(result.frames.finished).toBe(false);
+  }, TIMEOUT * 4);
+
+  test("Ctrl+O opened and closed while the history is written, then a prompt: the history lands once, in order", async () => {
+    const result = await resumeLongHistory({
+      lines: 6000,
+      send: "typed",
+      duringDrain: async (terminal, committed) => {
+        await terminal.sendKeys("C-o");
+        await terminal.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
+        await terminal.sendKeys("C-o");
+        await terminal.waitForComposer(TIMEOUT);
+        expect(committed()).toBe(false);
+      },
+    });
+    expectFinishedDrain(result, 6000);
+  }, TIMEOUT * 4);
+
+  test("a resume with no prompt still writes its history in batches, once and in order", async () => {
+    const result = await resumeLongHistory({ lines: 6000, send: "none" });
+    expect(result.scrollback).toMatchObject({ history_rows: 6000, repeats: 0, out_of_order: 0, first_missing: [] });
+    expect(result.frames.finished).toBe(false);
+    expect(result.frames.before.length).toBeGreaterThan(6000 / DRAIN_ROWS_PER_FRAME - 5);
+    for (const rows of result.frames.before) expect(rows).toBeLessThanOrEqual(DRAIN_ROWS_PER_FRAME);
+  }, TIMEOUT * 4);
+});
