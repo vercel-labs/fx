@@ -7070,16 +7070,13 @@ test "supervisor fallback force remains timeout dominant" {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    // The trap sits inside single quotes, so the command names its file relative to
-    // `workspace` rather than quote a path there.
-    const term_name = "fallback.term";
-    const term_path = try std.Io.Dir.path.join(alloc, &.{ workspace, term_name });
+    const term_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "fallback.term" });
     defer alloc.free(term_path);
-    const command = try alloc.print(
-        "trap 'printf TERM > {s}; exit 130' TERM; printf 'FALLBACK-BLOCK\n'; while :; do sleep 1; done",
-        .{term_name},
-    );
-    defer alloc.free(command);
+    // This test asserts that the file is absent, so the trap must write to the
+    // absolute path in whatever folder a login shell profile leaves the command.
+    // The path travels in the environment, which needs no quoting inside the trap.
+    const environment = [_]EnvironmentVariable{.{ .name = "FX_TEST_TERM", .value = term_path }};
+    const command = "trap 'printf TERM > \"$FX_TEST_TERM\"; exit 130' TERM; printf 'FALLBACK-BLOCK\n'; while :; do sleep 1; done";
 
     const timeout_ms: usize = 2000;
     const started_ms = io_mod.milliTimestamp();
@@ -7111,6 +7108,7 @@ test "supervisor fallback force remains timeout dominant" {
         .on_output_chunk = DelayAfterOutput.onChunk,
         .timeout_ms = timeout_ms,
         .timeout_started_ms = started_ms,
+        .extra_environment = &environment,
     }, alloc, command, workspace)) |value| {
         returned_result = value;
     } else |err| {
