@@ -1512,8 +1512,7 @@ pub fn Runtime(comptime App: type) type {
                     },
                     FixedPointTranscriptContext(App).prepareCandidate,
                     FixedPointTranscriptContext(App).resolveCandidate,
-                    footer_reservation_changed,
-                    replay_displaced_footer_history,
+                    skillsMenuRefreshPending(app),
                     &prepared_transcript,
                 );
                 const solved = fixed_point.layout;
@@ -2073,6 +2072,17 @@ pub fn Runtime(comptime App: type) type {
         fn skillsMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "skills")) return app.skills.menuVisible();
             return false;
+        }
+
+        /// `/skills` and `/skills <name>` open the skills menu when the catalog
+        /// refresh they queued lands, so the frame before that shows the plain composer.
+        fn skillsMenuRefreshPending(app: *const App) bool {
+            if (comptime !@hasField(App, "skills")) return false;
+            const pending = app.skills.pending_refresh_action orelse return false;
+            return switch (pending.action) {
+                .list, .show => true,
+                .notice, .startup_notice => false,
+            };
         }
 
         fn modelMenuActive(app: *const App) bool {

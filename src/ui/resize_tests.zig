@@ -501,8 +501,7 @@ fn solveTestFrame(
         },
         TestFrameSolveContext.prepareCandidate,
         TestFrameSolveContext.resolveCandidate,
-        footer_reservation_changed,
-        replay_displaced_footer_history,
+        false,
         prepared,
     );
 }
@@ -6987,6 +6986,50 @@ test "a footer surface closed after transcript growth leaves the composer on the
     }
 }
 
+test "a slash picker replaced by a smaller footer surface writes no scrollback clear" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 100, 20, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(
+        alloc,
+        &h.metrics,
+        "line 01\nline 02\nline 03\nline 04\nline 05\nline 06\nline 07\nline 08\n" ++
+            "line 09\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nline 16\n" ++
+            "line 17\nline 18\nline 19\nline 20\nline 21\nline 22\nline 23\nline 24\n",
+        true,
+    );
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try input.edit_state.input.appendSlice(alloc, "/");
+    input.edit_state.cursor = input.edit_state.input.items.len;
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    const picker_height = h.shell.committed_frame_layout.footer_area.height();
+
+    const replace_offset = try h.file.length(io_mod.getIo());
+    try std.testing.expect(try approval.syncRequest(alloc, .{
+        .label = "shell.run printf approval-replaces-picker",
+        .command = "printf approval-replaces-picker",
+    }));
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try std.testing.expect(h.shell.committed_frame_layout.footer_area.height() < picker_height);
+    const replace_bytes = try readEmittedSince(&h, replace_offset);
+    defer alloc.free(replace_bytes);
+    try std.testing.expect(std.mem.find(u8, replace_bytes, "\x1b[3J") == null);
+}
+
 test "slash picker dismissal resolves transcript extent before layout convergence" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 124, 75, 3);
@@ -7450,7 +7493,10 @@ test "picker growth advances history while shrink and dismissal do not" {
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, model_ctx);
     try h.flush();
 
-    try expectFooterBottomRow(&h, 37);
+    try std.testing.expectEqual(
+        slash_footer_top,
+        h.shell.committed_frame_layout.footer_area.top,
+    );
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
 
     const dismiss_offset = try h.file.length(io_mod.getIo());
