@@ -20,6 +20,7 @@ import {
   fxChildEnv,
   isVolatileTokenStatusRow,
   TITLE_GENERATION_MARKER,
+  TMUX_NO_CONFIG,
 } from "../tmux-helpers";
 import {
   ACTIVE_TOOL_MARKER,
@@ -2109,6 +2110,13 @@ export function renderLabPaneCommand(shell: string, assignments: Record<string, 
   ].join(" ");
 }
 
+/// The tmux arguments that start a render-lab session running `command`. A
+/// server they start loads no config, so a developer's tmux.conf cannot
+/// change what render-lab records.
+export function renderLabSessionArgs(name: string, width: number, height: number, cwd: string, command: string): string[] {
+  return [...TMUX_NO_CONFIG, "new-session", "-d", "-s", name, "-x", String(width), "-y", String(height), "-c", cwd, command];
+}
+
 class RenderLabTmux {
   readonly name: string;
   readonly fixture: Fixture;
@@ -2141,22 +2149,7 @@ class RenderLabTmux {
       SHELL_A_BEFORE_THIRD: opts.manifest.markers.shell[2] ?? "",
     });
 
-    tmux(
-      [
-        "new-session",
-        "-d",
-        "-s",
-        name,
-        "-x",
-        String(opts.width),
-        "-y",
-        String(opts.height),
-        "-c",
-        opts.fixture.work,
-        command,
-      ],
-      env,
-    );
+    tmux(renderLabSessionArgs(name, opts.width, opts.height, opts.fixture.work, command), env);
     const session = new RenderLabTmux(name, opts.fixture);
     await sleep(800);
     await session.waitForPane((pane) => pane.includes(PROMPT_TEXT), 10_000);

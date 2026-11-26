@@ -176,10 +176,14 @@ pub const RequestRecovery = struct {
     pub fn start(self: *RequestRecovery, fast: bool, resumed: ?Resume) !?Send {
         if (self.deps.begin_route_recovery_request) |begin| begin(self.deps.ctx);
         if (self.deps.save_recovery_record != null) register(self);
-        // A continue from before this request answers none of its questions.
-        // It is cleared before the step, which may ask, to keep a quick answer.
+        // A continue or a closed sign-in from before this request answers none
+        // of its questions. Both are cleared before the step, which may ask,
+        // to keep a quick answer.
         if (self.continue_flag) |flag| if (flag.swap(false, .seq_cst)) {
             debug_trace.eventf("recovery", "answer_dropped", self.trace_ctx, "event=user_continue origin=start reason=nothing_waits_for_it", .{});
+        };
+        if (self.sign_in_closed_flag) |flag| if (flag.swap(false, .seq_cst)) {
+            debug_trace.eventf("recovery", "answer_dropped", self.trace_ctx, "event=sign_in_closed origin=start reason=nothing_waits_for_it", .{});
         };
         const from = resumed orelse Resume{};
         return self.event(.{ .start = .{ .fast = fast, .resume_from = from.record, .stale = from.stale, .continues = from.continues } });
@@ -1550,6 +1554,54 @@ test "an Enter as soon as a request's first question shows answers it" {
 
     try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .stale = true }));
     try std.testing.expect(continue_flag.load(.seq_cst));
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(u16, 1), request.attempt());
+}
+
+/// The record a request saves while it waits for a sign-in.
+fn signInWaitRecord() recovery.Record {
+    var probe: recovery.State = .{};
+    _ = recovery.step(&probe, .{ .start = .{} }, 0);
+    return recovery.step(&probe, .{ .failed = .{ .kind = .sign_in } }, 0).save.?;
+}
+
+test "a sign-in closed before a request does not end the sign-in wait it resumes" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var closed_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.sign_in_closed_flag = &closed_flag;
+    defer request.deinit();
+
+    // The sign-in of an earlier request closed while that request's resend
+    // was on the wire, and the resend went through.
+    closed_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .record = signInWaitRecord() }));
+    try std.testing.expect(!closed_flag.load(.seq_cst));
+    try std.testing.expect(recovery.usesAnswer(&request.state, .sign_in_closed));
+    try std.testing.expectEqual(@as(u16, 0), request.attempt());
+    // The sign-in fx opens for this wait closes, and the request tries its
+    // saved login.
+    closed_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(u16, 1), request.attempt());
+}
+
+test "a sign-in that closes as soon as a resumed sign-in wait shows ends that wait" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var closed_flag = std.atomic.Value(bool).init(false);
+    fake.sign_in_closed_on_sign_in_wait = &closed_flag;
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.sign_in_closed_flag = &closed_flag;
+    defer request.deinit();
+
+    try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .record = signInWaitRecord() }));
+    try std.testing.expect(closed_flag.load(.seq_cst));
     try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
     try std.testing.expectEqual(@as(u16, 1), request.attempt());
 }

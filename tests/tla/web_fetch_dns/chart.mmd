@@ -1,0 +1,37 @@
+stateDiagram-v2
+    [*] --> Resolving
+
+    Resolving --> Resolved: Lookup finishes first
+    Resolving --> TimedOut: Hop deadline fires first
+    Resolving --> CancelledAtOnce: Turn cancel arrives (Design B walks away)
+
+    Resolving --> WaitingSelectCancel: Turn cancel arrives (Design A)
+    WaitingSelectCancel --> CancelledAfterSignal: Signal interrupts lookup
+    WaitingSelectCancel --> StuckOnLookup: Lookup ignores signals (breaks CancelIsPrompt)
+
+    Resolving --> IgnoringCancel: Turn cancel arrives (Current ignores flag)
+    IgnoringCancel --> StuckOnLookup: Lookup stays blocked (breaks CancelIsPrompt)
+
+    CancelledAtOnce --> CallerFreed: Caller returns and frees arena
+    CallerFreed --> LateLookupCleaned: Late lookup finishes into its own job and frees it (Design B)
+
+    Resolved --> [*]
+    TimedOut --> [*]
+    CancelledAfterSignal --> [*]
+    LateLookupCleaned --> [*]
+    StuckOnLookup --> [*]
+
+    note right of StuckOnLookup
+        Shortest broken path (current.cfg, 3 steps):
+        Resolving -> IgnoringCancel -> StuckOnLookup
+        Shortest broken path (design-a.cfg with signal-ignoring lookup, 4 steps):
+        Resolving -> WaitingSelectCancel -> StuckOnLookup
+        Both violate CancelIsPrompt.
+    end note
+
+    note right of LateLookupCleaned
+        Design B passes CancelIsPrompt, NoUseAfterReturn, and DeadlineStillWorks
+        even when getaddrinfo retries EINTR or ignores signals and finishes late.
+        Omitted: mutant-* configurations (b-caller-frees-early, b-non-atomic,
+        b-reads-caller-flag, b-no-deadline, a-no-check) and Ideal simulation.
+    end note

@@ -10153,7 +10153,7 @@ test "processQueuedPrompt stops nonretryable provider outcomes without releasing
     try std.testing.expectEqual(@as(usize, 0), interrupted.execution.tool_steps.len);
 }
 
-test "processQueuedPrompt spacer newline is skipped for ask first tool" {
+test "processQueuedPrompt spacer newline also ends the prose before a question" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{"Using tool"};
     const read_calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
@@ -10181,7 +10181,7 @@ test "processQueuedPrompt spacer newline is skipped for ask first tool" {
     defer ask_hooks.deinit();
     var ask_fixture = PromptFixture{};
     try runFakePrompt(&ask_gateway, &ask_hooks, ask_fixture.config(), ask_fixture.job());
-    try std.testing.expectEqual(@as(usize, 1), countText(&ask_hooks, "\n"));
+    try std.testing.expectEqual(@as(usize, 2), countText(&ask_hooks, "\n"));
 }
 
 test "processQueuedPrompt uses configured tool choice only for first call" {
@@ -10909,11 +10909,12 @@ test "tool calls after a question asked through toolbox start a new presentation
     try std.testing.expectEqual(second, startedPresentationGroup(&hooks, "call_3").?);
 }
 
-test "prose before a question asked through toolbox keeps the line break a direct question skips" {
+test "prose before a question ends its line as it does before any other tool" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("call_ask", "ask_user_question", "{\"questions\":[]}"),
         toolCall("call_ask", "toolbox", "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}"),
+        toolCall("call_read", "read_file", "{\"path\":\"a\"}"),
     };
     var line_breaks: [calls.len]usize = @splat(0);
     for (calls, &line_breaks) |call, *count| {
@@ -10935,7 +10936,9 @@ test "prose before a question asked through toolbox keeps the line break a direc
         }
     }
     // `fx ask` shows no question, so this break is what ends the prose there.
-    try std.testing.expectEqual(line_breaks[0] + 1, line_breaks[1]);
+    try std.testing.expect(line_breaks[2] > 0);
+    try std.testing.expectEqual(line_breaks[2], line_breaks[0]);
+    try std.testing.expectEqual(line_breaks[2], line_breaks[1]);
 }
 
 /// The presentation group of the call `call_id` when it started.
