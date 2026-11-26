@@ -1907,6 +1907,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
                 .id = assistant.id,
                 .created_at_ms = assistant.created_at_ms,
                 .inline_hidden = assistant.inline_hidden,
+                .operational = assistant.operational,
                 .segments = segments,
             } };
         },
@@ -2779,7 +2780,7 @@ pub fn tailEntriesFromEvents(alloc: Allocator, events: []const assistant_present
             try entries.append(alloc, .{ .assistant_code_block = .{ .id = tail_entry_id, .block = owned } });
         },
         .thematic_rule => try entries.append(alloc, .{ .assistant_thematic_rule = .{ .id = tail_entry_id } }),
-        .attempt_start, .attempt_restart, .assistant_tail => {},
+        .attempt_start, .operational_text_shown, .attempt_restart, .assistant_tail => {},
     };
     return entries.toOwnedSlice(alloc);
 }

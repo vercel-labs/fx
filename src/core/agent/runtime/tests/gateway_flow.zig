@@ -10877,6 +10877,67 @@ test "tool calls after a question start a new presentation group" {
     try std.testing.expectEqual(groups[1], groups[2]);
 }
 
+test "tool calls after a question asked through toolbox start a new presentation group" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const toolbox_ask = [_]ToolCall{toolCall(
+        "call_ask",
+        "toolbox",
+        "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}",
+    )};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const read_third = [_]ToolCall{toolCall("call_3", "read_file", "{\"path\":\"c\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &toolbox_ask },
+        .{ .tool_calls = &read_second },
+        .{ .tool_calls = &read_third },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expect(startedPresentationGroup(&hooks, "call_ask") == null);
+    const first = startedPresentationGroup(&hooks, "call_1").?;
+    const second = startedPresentationGroup(&hooks, "call_2").?;
+    try std.testing.expect(!std.meta.eql(first, second));
+    try std.testing.expectEqual(second, startedPresentationGroup(&hooks, "call_3").?);
+}
+
+test "prose before a question asked through toolbox keeps the line break a direct question skips" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("call_ask", "ask_user_question", "{\"questions\":[]}"),
+        toolCall("call_ask", "toolbox", "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}"),
+    };
+    var line_breaks: [calls.len]usize = @splat(0);
+    for (calls, &line_breaks) |call, *count| {
+        const ask = [_]ToolCall{call};
+        const completions = [_]FakeCompletion{
+            .{ .content = "One question first.", .tool_calls = &ask },
+            .{ .content = "Final" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        for (hooks.texts.items) |text| {
+            if (std.mem.eql(u8, text, "\n")) count.* += 1;
+        }
+    }
+    // `fx ask` shows no question, so this break is what ends the prose there.
+    try std.testing.expectEqual(line_breaks[0] + 1, line_breaks[1]);
+}
+
 /// The presentation group of the call `call_id` when it started.
 fn startedPresentationGroup(hooks: *const FakeAgentRuntimeDeps, call_id: []const u8) ?types.ToolPresentationGroupId {
     for (hooks.lifecycle_events.items) |event| {

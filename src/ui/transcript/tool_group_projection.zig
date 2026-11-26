@@ -185,8 +185,9 @@ const Summary = struct {
 
 const PresentationGroup = struct {
     anchor_index: usize,
-    /// How many user messages come before the group's first row.
-    user_messages_before: usize = 0,
+    /// How many entries that break a group (`breaksPresentationGroup`) come
+    /// before the group's first row.
+    breaks_before: usize = 0,
     status_indices: std.ArrayList(usize) = .empty,
     summary: Summary = .{},
 
@@ -1020,7 +1021,7 @@ fn storySafeLine(scratch: std.mem.Allocator, text: []const u8, max_bytes: usize)
     while (index < text.len) {
         const byte = text[index];
         if (byte == 0x1b) {
-            index = escapeEnd(text, index);
+            index = display_width.ansiSequenceEnd(text, index);
             continue;
         }
         if (byte < 0x20 or byte == 0x7f or byte == ' ') {
@@ -1050,17 +1051,6 @@ fn storySafeLine(scratch: std.mem.Allocator, text: []const u8, max_bytes: usize)
     return if (cut) std.mem.concat(scratch, u8, &.{ safe, "…" }) else safe;
 }
 
-/// The index right after the escape sequence that starts at `index`: a CSI
-/// sequence through its final byte, else the escape and the byte after it.
-fn escapeEnd(text: []const u8, index: usize) usize {
-    var end = index + 1;
-    if (end < text.len and text[end] == '[') {
-        end += 1;
-        while (end < text.len and (text[end] < 0x40 or text[end] > 0x7e)) : (end += 1) {}
-    }
-    return @min(end + 1, text.len);
-}
-
 test "a reason cut at its byte cap ends with an ellipsis" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1087,6 +1077,54 @@ test "a reason cut at its byte cap ends with an ellipsis" {
     defer alloc.free(text);
     const want_reason: [story_reason_max_bytes]u8 = @splat('a');
     try std.testing.expectEqualStrings("● Exited 1 sh check.sh · " ++ want_reason ++ "…", firstLineForTest(text));
+}
+
+test "a failed command's reason leaves out escapes with intermediate bytes and OSC links" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cap = story_reason_max_bytes;
+    // `tput sgr0` writes ESC ( B ESC [ m. The others pick a character set,
+    // fill the screen with a test pattern, and switch to UTF-8. The last one
+    // is cut off at the end.
+    for ([_][]const u8{ "Build failed\x1b(B\x1b[m", "\x1b)0Build failed", "\x1b#8Build failed", "\x1b%GBuild failed", "\x1b$(BBuild failed", "Build failed\x1b(" }) |line| {
+        try std.testing.expectEqualStrings("Build failed", try storySafeLine(a, line, cap));
+    }
+    // An OSC 8 link shows only its text, whether ST or BEL ends it. A link
+    // cut off at the end hides the rest of the line, as a terminal does.
+    try std.testing.expectEqualStrings("Problems found", try storySafeLine(a, "\x1b]8;;file:///x\x1b\\Problems found\x1b]8;;\x1b\\", cap));
+    try std.testing.expectEqualStrings("Problems found", try storySafeLine(a, "\x1b]8;;file:///x\x07Problems found\x1b]8;;\x07", cap));
+    try std.testing.expectEqualStrings("Problems found", try storySafeLine(a, "Problems found\x1b]8;;file:///x", cap));
+
+    // The row is the same live and after resume, and a list's heading in a
+    // link, or before a style reset, still heads its list.
+    const alloc = std.testing.allocator;
+    const Probe = struct { result: []const u8, reason: []const u8 };
+    for ([_]Probe{
+        .{ .result = "{\"output_delta\":\"\\u001b%G\\u001b)0\\u001b#8Build failed\\u001b(B\\u001b[m\\n\",\"exit_code\":1}", .reason = "Build failed" },
+        .{ .result = "\x1b]8;;file:///x\x1b\\Problems found\x1b]8;;\x1b\\\n", .reason = "Problems found" },
+        .{ .result = "\x1b]8;;file:///x\x07Problems found:\x1b]8;;\x07\nsrc/a.zig\nsrc/b.zig\n", .reason = "Problems found" },
+        .{ .result = "Problems found:\x1b(B\x1b[m\nsrc/a.zig\nsrc/b.zig\n", .reason = "Problems found" },
+    }) |probe| {
+        const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 sh build.sh\n", .class = .tool_status } }};
+        var details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"sh build.sh\"}", 1, probe.result)};
+        details[0].command_display = @constCast("sh build.sh");
+        errdefer std.debug.print("result: {f}\n", .{text_utils.terminalSafe(probe.result)});
+        const want = try std.mem.concat(alloc, u8, &.{ "● Exited 1 sh build.sh · ", probe.reason });
+        defer alloc.free(want);
+        try expectLiveAndResumedRowsForTest(alloc, &entries, &details, want);
+
+        // No escape from the output reaches the row's bytes (R4.6).
+        var projection = try build(alloc, &entries, &details, 120);
+        defer projection.deinit(alloc);
+        const row = projection.entry_actions.items[0].override.bytes;
+        var index: usize = 0;
+        while (index < row.len) {
+            if (skipSgrSequence(row, &index)) continue;
+            try std.testing.expect(row[index] != 0x1b);
+            index += 1;
+        }
+    }
 }
 
 /// A string or whole-number field of a JSON object; `.other` for any other
@@ -5453,7 +5491,7 @@ fn shownLine(line: []const u8) ?ShownLine {
     while (index < line.len) {
         const byte = line[index];
         if (byte == 0x1b) {
-            index = escapeEnd(line, index);
+            index = display_width.ansiSequenceEnd(line, index);
             continue;
         }
         if (at_start) shown.indented = byte == ' ' or byte == '\t';
@@ -8044,6 +8082,23 @@ fn statusDetail(
     return detailForEntry(details, detail_indices, entry_id, null);
 }
 
+/// Whether the calls of one presentation group before and after `entry` take
+/// separate rows. Core keeps a turn's group open across a message the user
+/// sends while it runs, across a notice the main screen shows in the middle
+/// of it, such as `✓ Context compacted`, and across a line fx writes between
+/// steps, such as the empty-reply nudge, but the calls after any of them
+/// belong below it, not in the row above it. A notice that only Ctrl+O shows
+/// draws nothing between the rows, so it keeps them together. So does the
+/// model's own text between calls of one step.
+fn breaksPresentationGroup(entry: TranscriptEntry) bool {
+    return switch (entry) {
+        .user_turn => true,
+        .semantic_notice => transcript_blocks.isEntryVisibleInCompactPresentation(entry),
+        .assistant_turn => |turn| turn.operational and !isTransparentCompactEntry(entry),
+        else => false,
+    };
+}
+
 /// Fills `projection` with every entry's action. The caller owns the state
 /// it works in and frees it.
 fn fillProjection(
@@ -8086,13 +8141,10 @@ fn fillProjection(
 
     @memset(presentation_group_indices, null);
 
-    // A message the user sends while a turn runs joins that turn, so the
-    // calls after it share the turn's group. Their rows belong after the
-    // message, not above it, so they start a new group.
-    var user_messages: usize = 0;
+    var group_breaks: usize = 0;
     for (entries, 0..) |entry, entry_index| {
         try build_checkpoint.tick(checkpoint);
-        if (entry == .user_turn) user_messages += 1;
+        if (breaksPresentationGroup(entry)) group_breaks += 1;
         if (mode == .compact and !transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, detail_indices, entry_id, stats);
@@ -8100,9 +8152,9 @@ fn fillProjection(
         const group_id = presentationGroupId(detail) orelse continue;
 
         const result = try presentation_group_by_id.getOrPut(alloc, group_id);
-        if (!result.found_existing or presentation_groups.items[result.value_ptr.*].user_messages_before != user_messages) {
+        if (!result.found_existing or presentation_groups.items[result.value_ptr.*].breaks_before != group_breaks) {
             result.value_ptr.* = presentation_groups.items.len;
-            try presentation_groups.append(alloc, .{ .anchor_index = entry_index, .user_messages_before = user_messages });
+            try presentation_groups.append(alloc, .{ .anchor_index = entry_index, .breaks_before = group_breaks });
         }
         const group_index = result.value_ptr.*;
         const group = &presentation_groups.items[group_index];
@@ -8322,6 +8374,126 @@ fn fillProjection(
     }
 
     try recapTurnSummaries(alloc, projection, entries, details, detail_indices, cols, checkpoint);
+}
+
+/// A notice both the main screen and Ctrl+O show, as the second entry.
+fn shownNoticeForTest(topic: []const u8, tone: types.NoticeTone, body: []const u8) TranscriptEntry {
+    return .{ .semantic_notice = .{ .id = 2, .topic = topic, .tone = tone, .body = body, .visibility = .compact_and_full } };
+}
+
+/// Three reads of one presentation group, as core gives a turn's silent
+/// steps, with `middle` after the first.
+fn readsAroundForTest(middle: TranscriptEntry) struct { entries: [4]TranscriptEntry, details: [3]ToolDetailRecord } {
+    var details = [_]ToolDetailRecord{
+        storyReadDetailForTest(1, "a.txt"),
+        storyReadDetailForTest(3, "b.txt"),
+        storyReadDetailForTest(4, "c.txt"),
+    };
+    for (&details) |*detail| detail.presentation_group_id = .{ .turn_id = 2, .anchor_step_id = 3 };
+    return .{
+        .entries = .{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Read a.txt\n", .class = .tool_status } },
+            middle,
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● Read b.txt\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 4, .bytes = "● Read c.txt\n", .class = .tool_status } },
+        },
+        .details = details,
+    };
+}
+
+/// Checks the main screen's rows for `readsAroundForTest(middle)`.
+fn expectReadRowsForTest(alloc: std.mem.Allocator, middle: TranscriptEntry, expected: []const u8) !void {
+    const reads = readsAroundForTest(middle);
+    const text = try groupTextForTest(alloc, &reads.entries, &reads.details);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(expected, std.mem.trim(u8, text, "\n"));
+}
+
+/// Text as the second entry, as the pacer commits it. The caller frees its
+/// segments.
+fn textEntryForTest(alloc: std.mem.Allocator, text: []const u8, operational: bool) !TranscriptEntry {
+    var segments: transcript_blocks.AssistantTurnSegments = .{};
+    try segments.text.appendSlice(alloc, text);
+    return .{ .assistant_turn = .{ .id = 2, .operational = operational, .segments = segments } };
+}
+
+test "a notice the main screen shows in the middle of a turn starts a new row for the calls after it" {
+    const alloc = std.testing.allocator;
+    const Case = struct { name: []const u8, middle: TranscriptEntry };
+    const cases = [_]Case{
+        .{ .name = "compaction", .middle = shownNoticeForTest("", .success, "Context compacted (10s)") },
+        .{ .name = "provider reason while fx waits", .middle = shownNoticeForTest("system", .warning, "API access denied · HTTP 403") },
+        .{ .name = "effort chosen during the turn", .middle = shownNoticeForTest("", .neutral, "Next turn will use reasoning effort high for acme/thinker") },
+        .{ .name = "Vision outage", .middle = shownNoticeForTest("vision", .@"error", "Tip: Vision is unavailable right now.") },
+        .{ .name = "message the user sent", .middle = .{ .user_turn = .{ .id = 2, .turn = .{ .text = @constCast("Read the rest too.") } } } },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        try expectReadRowsForTest(alloc, case.middle, "● Read a.txt\n● Read b.txt, c.txt");
+        const reads = readsAroundForTest(case.middle);
+        var projection = try build(alloc, &reads.entries, &reads.details, 120);
+        defer projection.deinit(alloc);
+        // The middle line draws between the two rows.
+        try std.testing.expect(projection.entry_actions.items[1] == .keep);
+        try std.testing.expect(projection.entry_actions.items[2] == .override);
+        try std.testing.expect(projection.entry_actions.items[3] == .hide);
+    }
+}
+
+test "a notice the main screen hides keeps the calls around it in one row" {
+    // A model call's line shows only in Ctrl+O, between every two steps.
+    const alloc = std.testing.allocator;
+    const Case = struct { name: []const u8, middle: TranscriptEntry };
+    const cases = [_]Case{
+        .{ .name = "Ctrl+O only", .middle = .{ .semantic_notice = .{ .id = 2, .topic = "model call", .tone = .neutral, .body = "21:25:41 · thinker · 0.0 s", .visibility = .full_only } } },
+        .{ .name = "hidden by a display clear", .middle = .{ .semantic_notice = .{ .id = 2, .topic = "", .tone = .success, .body = "Context compacted (10s)", .visibility = .compact_and_full, .inline_hidden = true } } },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        try expectReadRowsForTest(alloc, case.middle, "● Read a.txt, b.txt, c.txt");
+    }
+}
+
+test "a line fx writes between steps starts a new row for the calls after it" {
+    // One line from each place in orchestrator.zig that writes one with
+    // `push_text(.operational)`.
+    const alloc = std.testing.allocator;
+    const Case = struct { site: []const u8, line: []const u8 };
+    const cases = [_]Case{
+        .{ .site = "image catalog down", .line = "fx couldn't connect to the AI Gateway to load the model catalog, so images from tools aren't reaching the model until it loads. Check your network connection or firewall." },
+        .{ .site = "malformed tool call retry", .line = "The model's tool call could not be read (provider reason: MALFORMED_FUNCTION_CALL). Asking it to try again." },
+        .{ .site = "length-limited resend", .line = "The reply ran out of output tokens before any text. Retrying with a higher limit." },
+        .{ .site = "empty-reply nudge", .line = "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Asking it to continue." },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("site: {s}\n", .{case.site});
+        var middle = try textEntryForTest(alloc, case.line, true);
+        defer middle.assistant_turn.segments.deinit(alloc);
+        try expectReadRowsForTest(alloc, middle, "● Read a.txt\n● Read b.txt, c.txt");
+    }
+}
+
+test "the model's text between calls of one group keeps them in one row" {
+    // Core ends the group at the model's own text between steps, so text
+    // in the middle of one group is the model's text between calls of one
+    // step. Only a line fx wrote is marked.
+    const alloc = std.testing.allocator;
+    var middle = try textEntryForTest(alloc, "provider bridge", false);
+    defer middle.assistant_turn.segments.deinit(alloc);
+    try expectReadRowsForTest(alloc, middle, "● Read a.txt, b.txt, c.txt");
+}
+
+test "Ctrl+O still gives each call around a notice its own line, in order" {
+    const alloc = std.testing.allocator;
+    const reads = readsAroundForTest(shownNoticeForTest("", .success, "Context compacted (10s)"));
+    var expanded = try buildExpandedStyledInterruptible(alloc, &reads.entries, &reads.details, 120, null);
+    defer expanded.deinit(alloc);
+    const actions = expanded.entry_actions.items;
+    try std.testing.expect(actions[1] == .keep);
+    for ([_]usize{ 0, 2, 3 }, [_][]const u8{ "a.txt", "b.txt", "c.txt" }) |index, path| {
+        try std.testing.expect(actions[index] == .override);
+        try std.testing.expect(std.mem.find(u8, actions[index].override.bytes, path) != null);
+    }
 }
 
 /// Leads each visible turn summary with its turn's recap. A function of its

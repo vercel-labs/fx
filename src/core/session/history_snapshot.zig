@@ -176,7 +176,9 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
 /// nothing; each must be optional. Reading released caches depends on this
 /// list staying exact.
 fn absentFromCaches(comptime T: type, comptime field_name: []const u8) bool {
-    return T == types.CommittedFilePresentation and std.mem.eql(u8, field_name, "review_lines");
+    return (T == types.CommittedFilePresentation and std.mem.eql(u8, field_name, "review_lines")) or
+        (T == session_event.ConversationUser and std.mem.eql(u8, field_name, "input_id")) or
+        (T == session_event.ConversationSteering and std.mem.eql(u8, field_name, "input_id"));
 }
 
 /// Frees a decoded value tree. Only needed when decoding without an arena.
@@ -567,4 +569,96 @@ test "history snapshot verification tolerates a torn tail as a shorter prefix" {
     defer verified.deinit(alloc);
     try std.testing.expectEqual(frames, verified.frames.len);
     try std.testing.expectEqual(@as(u64, frames), verified.last_seq);
+}
+
+fn appendCacheInt(out: *std.ArrayList(u8), alloc: Allocator, value: u64) !void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, value, .little);
+    try out.appendSlice(alloc, &buf);
+}
+
+fn appendCacheBytes(out: *std.ArrayList(u8), alloc: Allocator, bytes: []const u8) !void {
+    try appendCacheInt(out, alloc, bytes.len);
+    try out.appendSlice(alloc, bytes);
+}
+
+fn appendCacheFrame(
+    out: *std.ArrayList(u8),
+    alloc: Allocator,
+    log_offset: u64,
+    line_bytes: []const u8,
+    seq: u64,
+    ts_ms: i64,
+    event_tag: std.meta.Tag(session_event.ConversationEvent),
+    text: []const u8,
+) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+    try appendCacheInt(&payload, alloc, log_offset);
+    try appendCacheInt(&payload, alloc, line_bytes.len);
+    try appendCacheInt(&payload, alloc, std.hash.Crc32.hash(line_bytes));
+    try appendCacheInt(&payload, alloc, 3); // schema_version
+    try appendCacheInt(&payload, alloc, seq);
+    try appendCacheInt(&payload, alloc, @bitCast(ts_ms));
+    try payload.append(alloc, @backingInt(event_tag));
+    switch (event_tag) {
+        .user => {
+            try appendCacheBytes(&payload, alloc, text);
+            try appendCacheInt(&payload, alloc, 0); // images.len
+            try payload.append(alloc, 0); // work_id == null; released v3 caches omit input_id
+        },
+        .steering => {
+            try appendCacheBytes(&payload, alloc, text); // released v3 caches omit input_id
+        },
+        else => unreachable,
+    }
+    var head: [8]u8 = undefined;
+    std.mem.writeInt(u32, head[0..4], @intCast(payload.items.len + 4), .little);
+    std.mem.writeInt(u32, head[4..8], std.hash.Crc32.hash(payload.items), .little);
+    try out.appendSlice(alloc, &head);
+    try out.appendSlice(alloc, payload.items);
+}
+
+test "history snapshot decodes released cache user and steering frames with null input_id" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const line1 = "{\"schema_version\":3,\"seq\":1,\"timestamp_ms\":1792257548000,\"event\":{\"user\":{\"text\":\"released prompt\",\"images\":[],\"work_id\":null}}}\n";
+    const line2 = "{\"schema_version\":3,\"seq\":2,\"timestamp_ms\":1792257548010,\"event\":{\"steering\":{\"text\":\"released steer\"}}}\n";
+    const log = line1 ++ line2;
+    try tmp.dir.writeFile(io, .{ .sub_path = "events.jsonl", .data = log });
+
+    var cache: std.ArrayList(u8) = .empty;
+    defer cache.deinit(alloc);
+    try cache.appendSlice(alloc, magic);
+    try appendCacheInt(&cache, alloc, format_version);
+    try appendCacheInt(&cache, alloc, session_event.conversation_schema_version);
+    try appendCacheBytes(&cache, alloc, fixture_session_id);
+    try appendCacheFrame(&cache, alloc, 0, line1, 1, 1792257548000, .user, "released prompt");
+    try appendCacheFrame(&cache, alloc, line1.len, line2, 2, 1792257548010, .steering, "released steer");
+    try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = cache.items });
+
+    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var log_file = try tmp.dir.openFile(io, "events.jsonl", .{});
+    defer log_file.close(io);
+
+    var verified = (try openAndVerify(alloc, &dir, fixture_session_id, log_file, log.len)).?;
+    defer verified.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), verified.frames.len);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var cursor = Cursor{ .file = verified.file, .frames = verified.frames };
+
+    const first = (try cursor.next(arena.allocator())).?;
+    try std.testing.expectEqualStrings("released prompt", first.event.user.text);
+    try std.testing.expectEqual(@as(?u64, null), first.event.user.input_id);
+
+    const second = (try cursor.next(arena.allocator())).?;
+    try std.testing.expectEqualStrings("released steer", second.event.steering.text);
+    try std.testing.expectEqual(@as(?u64, null), second.event.steering.input_id);
+
+    try std.testing.expect((try cursor.next(arena.allocator())) == null);
 }
