@@ -201,6 +201,9 @@ pub const AgentRuntimeDeps = struct {
     /// The steps of `start_workspace_capture`.
     pub const WorkspaceCaptureStep = enum { begin, capture, settle };
 
+    /// How a turn held for an upgrade's restart ends.
+    pub const RestartHoldEnd = worker_runtime.WorkerRuntime.RestartHoldEnd;
+
     /// What `wait_for_handoff_mail` ended on.
     pub const HandoffMailWait = enum {
         /// Nothing waits in the hand-off for this agent, so the call did not wait.
@@ -306,9 +309,13 @@ pub const AgentRuntimeDeps = struct {
     save_recovery_record: ?*const fn (ctx: *anyopaque, record: types.RecoveryRecordWrite) anyerror!bool = null,
     /// Marks the open turn as one that stopped between steps for its host,
     /// after its record was saved clean, so the next launch continues it as
-    /// the same turn (`tests/tla/recovery/Resume.tla` Relaunch). Null on
+    /// the same turn (`tests/tla/recovery/Resume.tla` Hold). Null on
     /// hosts that never stop a turn this way.
     mark_turn_yielded: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    /// Holds a turn that stopped for an upgrade's restart until the restart
+    /// goes ahead or is cancelled (`WorkerRuntime.holdForRestart`). Null: the
+    /// turn returns `error.TurnYielded` at once.
+    hold_for_restart: ?*const fn (ctx: *anyopaque) RestartHoldEnd = null,
     /// Called once with each main-model completion's provider usage, as soon
     /// as it arrives, so a saved session keeps the usage of every reply even
     /// when the turn never ends. A failure is traced and never fails the turn.

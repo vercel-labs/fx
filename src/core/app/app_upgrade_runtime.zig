@@ -15,6 +15,8 @@ pub const ApplyOutcome = enum {
     relaunch_requested,
     /// The relaunch waits for the running turns to stop between steps or end.
     waiting,
+    /// A second Ctrl+G cancelled the waiting restart: the turns go on.
+    restart_cancelled,
 };
 
 const CurrentExecutablePathFn = *const fn (
@@ -28,17 +30,23 @@ pub const Deps = struct {
 };
 
 /// What Ctrl+G says while the relaunch waits: a turn on the AI Gateway stops
-/// at its next step and goes on after the restart, and a turn on another
-/// provider runs to its end (`orchestrator.zig` `canStopForRestart`).
-const restart_waits_notice = "fx restarts for the upgrade when the running turns stop or end";
-const restart_waits_for_subagents_notice = "fx restarts for the upgrade when the running turns stop or end and the subagents finish";
+/// at its next step and goes on after the restart, a turn on another
+/// provider runs to its end (`orchestrator.zig` `canStopForRestart`), and
+/// the ways out of the wait.
+const restart_ways_out = "Ctrl+G cancels the restart, Esc twice interrupts the turn, /quit exits without the restart";
+const restart_waits_notice = "fx restarts for the upgrade when the running turns stop or end; " ++ restart_ways_out;
+const restart_waits_for_subagents_notice = "fx restarts for the upgrade when the running turns stop or end and the subagents finish; " ++ restart_ways_out;
+const restart_cancelled_notice = "restart cancelled; Ctrl+G restarts for the upgrade later";
+const restart_releasing_notice = "fx is restarting for the upgrade now";
 
 /// Whether `App` can stop running turns between steps for the restart.
 /// Without it, Ctrl+G still refuses while a response streams.
 /// A host that never upgrades itself, such as the browser terminal, has no restart to wait for.
 fn supportsYield(comptime App: type) bool {
     return runtime_profile.allows(App, .auto_upgrade) and @hasDecl(App, "anyTurnRunning") and @hasDecl(App, "requestTurnYields") and
-        @hasField(App, "upgrader") and @hasField(@FieldType(App, "upgrader"), "restart_waits");
+        @hasDecl(App, "anyTurnUnheld") and @hasDecl(App, "releaseTurnYields") and @hasDecl(App, "cancelTurnYields") and
+        @hasDecl(App, "cancelResumeHandoffForUpgrade") and
+        @hasField(App, "upgrader") and @hasField(@FieldType(App, "upgrader"), "restart");
 }
 
 pub fn Runtime(comptime App: type) type {
@@ -68,13 +76,24 @@ pub fn Runtime(comptime App: type) type {
             return restart_waits_notice;
         }
 
-        /// Exits for the relaunch Ctrl+G asked for once every turn has
-        /// stopped and nothing typed would be lost with the process.
+        /// Restarts for the upgrade Ctrl+G asked for, in two ticks: once every
+        /// turn holds at its step boundary or has ended, and nothing typed would
+        /// be lost, the held turns are let go; once none runs, fx exits
+        /// (`tests/tla/recovery/RestartWait.tla` Release, Exit).
         fn finishWaitingRestart(app: *App) void {
             if (comptime !supportsYield(App)) return;
-            if (!app.upgrader.restart_waits) return;
+            switch (app.upgrader.restart) {
+                .none => return,
+                .waiting => {
+                    if (app.anyTurnUnheld() or draftPending(app)) return;
+                    app.releaseTurnYields();
+                    app.upgrader.restart = .releasing;
+                    debug_trace.logf("upgrade", "event=restart_releases_held_turns", .{});
+                },
+                .releasing => {},
+            }
             if (app.anyTurnRunning() or draftPending(app)) return;
-            app.upgrader.restart_waits = false;
+            app.upgrader.restart = .none;
             if (comptime @hasDecl(App, "logHeldWorkForRestart")) app.logHeldWorkForRestart();
             debug_trace.logf("upgrade", "event=restart_after_yield", .{});
             if (comptime @hasField(App, "should_exit")) app.should_exit = true;
@@ -133,11 +152,19 @@ pub fn Runtime(comptime App: type) type {
                 try writeUpgradeNotice(app, .neutral, "auto-upgrade is disabled");
                 return .not_ready;
             }
-            // A second Ctrl+G while the relaunch waits changes nothing.
+            // A second Ctrl+G while the restart waits cancels it. Once the
+            // held turns are let go, the restart is under way.
             if (comptime supportsYield(App)) {
-                if (app.upgrader.restart_waits) {
-                    try writeUpgradeNotice(app, .neutral, restartWaitsNotice(app));
-                    return .waiting;
+                switch (app.upgrader.restart) {
+                    .none => {},
+                    .waiting => {
+                        try cancelWaitingRestart(app);
+                        return .restart_cancelled;
+                    },
+                    .releasing => {
+                        try writeUpgradeNotice(app, .neutral, restart_releasing_notice);
+                        return .waiting;
+                    },
                 }
             }
             if (upgradeUnavailableNotice(app, agent)) |notice| {
@@ -218,13 +245,14 @@ pub fn Runtime(comptime App: type) type {
             };
             app.requestResumeHandoffForUpgrade(agent);
             // Everything that can fail is done. A running turn stops at its
-            // next step boundary, saved so the relaunched fx continues it
-            // (`tests/tla/recovery/Resume.tla` Upgrade, Relaunch), and fx
-            // exits once none runs (`collectUpgradeFacts`).
+            // next step boundary and holds there, saved so the relaunched fx
+            // continues it (`tests/tla/recovery/Resume.tla` Upgrade, Hold,
+            // Relaunch), and fx exits once every turn holds or ends
+            // (`collectUpgradeFacts`).
             if (comptime supportsYield(App)) {
                 if (app.anyTurnRunning()) {
                     app.requestTurnYields();
-                    app.upgrader.restart_waits = true;
+                    app.upgrader.restart = .waiting;
                     debug_trace.logf("upgrade", "event=restart_waits_for_turns", .{});
                     try writeUpgradeNotice(app, .neutral, restartWaitsNotice(app));
                     return .waiting;
@@ -232,6 +260,28 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasField(App, "should_exit")) app.should_exit = true;
             return .relaunch_requested;
+        }
+
+        /// A second Ctrl+G while the restart waits: the held turns go on, queued
+        /// work flows again, the relaunch Ctrl+G prepared is dropped, and a later
+        /// exit is a plain one (`tests/tla/recovery/Resume.tla` CancelRestart).
+        fn cancelWaitingRestart(app: *App) !void {
+            app.upgrader.cancelRestart();
+            app.cancelTurnYields();
+            cancelUpgradeHandoffs(app);
+            debug_trace.logf("upgrade", "event=restart_cancelled", .{});
+            try writeUpgradeNotice(app, .neutral, restart_cancelled_notice);
+        }
+
+        /// Ctrl+G asked the agent on screen for a resume handoff, and that agent
+        /// may no longer be on screen, so every agent the restart asked drops it.
+        fn cancelUpgradeHandoffs(app: *App) void {
+            app.cancelResumeHandoffForUpgrade(&app.main_agent);
+            if (comptime @hasField(App, "child_agents")) {
+                for (app.child_agents.items) |child| {
+                    if (child.agent.role == .instance) app.cancelResumeHandoffForUpgrade(&child.agent);
+                }
+            }
         }
 
         fn busyPhrase(doing: app_agents_runtime.Busiest) []const u8 {
@@ -316,7 +366,8 @@ const TestUpgrader = struct {
     state: auto_upgrade.State = .idle,
     stop_count: usize = 0,
     render_dirty: bool = false,
-    restart_waits: bool = false,
+    restart: auto_upgrade.RestartWait = .none,
+    cancel_count: usize = 0,
 
     fn getState(self: *TestUpgrader) auto_upgrade.State {
         return self.state;
@@ -324,6 +375,11 @@ const TestUpgrader = struct {
 
     fn stop(self: *TestUpgrader) void {
         self.stop_count += 1;
+    }
+
+    fn cancelRestart(self: *TestUpgrader) void {
+        self.cancel_count += 1;
+        self.restart = .none;
     }
 
     pub fn takeRenderDirty(self: *TestUpgrader) bool {
@@ -398,6 +454,10 @@ const TestApp = struct {
     subagent_working: bool = false,
     yield_request_count: usize = 0,
     held_work_logs: usize = 0,
+    turn_held: bool = false,
+    release_count: usize = 0,
+    cancel_yield_count: usize = 0,
+    cancel_handoff_count: usize = 0,
 
     fn deinit(self: *TestApp) void {
         self.input_runtime.edit_state.deinit(self.alloc);
@@ -439,6 +499,22 @@ const TestApp = struct {
 
     pub fn requestTurnYields(self: *TestApp) void {
         self.yield_request_count += 1;
+    }
+
+    pub fn anyTurnUnheld(self: *TestApp) bool {
+        return self.turn_running and !self.turn_held;
+    }
+
+    pub fn releaseTurnYields(self: *TestApp) void {
+        self.release_count += 1;
+    }
+
+    pub fn cancelTurnYields(self: *TestApp) void {
+        self.cancel_yield_count += 1;
+    }
+
+    pub fn cancelResumeHandoffForUpgrade(self: *TestApp, _: anytype) void {
+        self.cancel_handoff_count += 1;
     }
 
     pub fn logHeldWorkForRestart(self: *TestApp) void {
@@ -529,7 +605,7 @@ test "app_upgrade_runtime refuses while another instance has queued prompts, and
     try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
     try std.testing.expectEqualStrings("upgrade is unavailable while fx 2 has queued prompts", app.notices.items);
     try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
-    try std.testing.expect(!app.upgrader.restart_waits);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
     try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
     try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
     try std.testing.expect(!app.should_exit);
@@ -708,7 +784,7 @@ test "app_upgrade_runtime still refuses while a response streams in an app that 
 
 const NoUpgradeUpgrader = struct {
     state: auto_upgrade.State = .ready,
-    restart_waits: bool = false,
+    restart: auto_upgrade.RestartWait = .none,
 
     fn getState(self: *NoUpgradeUpgrader) auto_upgrade.State {
         return self.state;
@@ -758,7 +834,7 @@ test "app_upgrade_runtime on a host that never upgrades itself says so and asks 
     try std.testing.expectEqual(ApplyOutcome.not_ready, outcome);
     try std.testing.expectEqualStrings("auto-upgrade is disabled", app.notices.items);
     try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
-    try std.testing.expect(!app.upgrader.restart_waits);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
     try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
 }
 
@@ -775,7 +851,7 @@ test "app_upgrade_runtime asks running turns to yield and exits once they stop" 
     const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
     try std.testing.expectEqual(ApplyOutcome.waiting, outcome);
     try std.testing.expectEqual(@as(usize, 1), app.yield_request_count);
-    try std.testing.expect(app.upgrader.restart_waits);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.waiting, app.upgrader.restart);
     try std.testing.expect(!app.should_exit);
     // Everything that can fail ran before any turn stopped.
     try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
@@ -787,22 +863,26 @@ test "app_upgrade_runtime asks running turns to yield and exits once they stop" 
     Runtime(TestApp).collectUpgradeFacts(&app);
     try std.testing.expect(!app.should_exit);
 
-    // A second Ctrl+G changes nothing.
-    const again = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
-    try std.testing.expectEqual(ApplyOutcome.waiting, again);
-    try std.testing.expectEqual(@as(usize, 1), app.yield_request_count);
-    try std.testing.expectEqual(@as(usize, 1), deps_state.path_count);
-
-    // The turns stopped, but a draft typed meanwhile holds the exit.
-    app.turn_running = false;
+    // The turn stops and holds for the restart. A draft typed meanwhile holds the release.
+    app.turn_held = true;
     try app.input_runtime.edit_state.input.appendSlice(alloc, "draft");
     Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.release_count);
     try std.testing.expect(!app.should_exit);
     app.input_runtime.edit_state.input.clearRetainingCapacity();
 
+    // The draft is gone: the held turn is let go, and fx waits for it to return.
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.release_count);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.releasing, app.upgrader.restart);
+    try std.testing.expect(!app.should_exit);
+
+    // The held turn returned.
+    app.turn_running = false;
+    app.turn_held = false;
     Runtime(TestApp).collectUpgradeFacts(&app);
     try std.testing.expect(app.should_exit);
-    try std.testing.expect(!app.upgrader.restart_waits);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
     try std.testing.expectEqual(@as(usize, 1), app.held_work_logs);
 }
 
@@ -860,6 +940,71 @@ test "app_upgrade_runtime says the restart also waits for working subagents" {
     const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
     try std.testing.expectEqual(ApplyOutcome.waiting, outcome);
     try std.testing.expectEqualStrings(restart_waits_for_subagents_notice, app.notices.items);
+}
+
+test "app_upgrade_runtime cancels the waiting restart on a second Ctrl+G" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    var deps_state = TestDepsState{};
+
+    const first = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.waiting, first);
+
+    const second = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.restart_cancelled, second);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
+    try std.testing.expectEqual(@as(usize, 1), app.upgrader.cancel_count);
+    try std.testing.expectEqual(@as(usize, 1), app.cancel_yield_count);
+    try std.testing.expectEqual(@as(usize, 1), app.cancel_handoff_count);
+    try std.testing.expect(std.mem.endsWith(u8, app.notices.items, restart_cancelled_notice));
+
+    // With the restart cancelled, a turn that holds releases nothing and fx stays.
+    app.turn_held = true;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.release_count);
+    try std.testing.expect(!app.should_exit);
+
+    const third = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.waiting, third);
+    try std.testing.expectEqual(@as(usize, 2), app.yield_request_count);
+}
+
+test "app_upgrade_runtime says the restart is under way once the held turns are let go" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    var deps_state = TestDepsState{};
+
+    const waiting = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.waiting, waiting);
+
+    app.turn_held = true;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.releasing, app.upgrader.restart);
+
+    const again = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.waiting, again);
+    try std.testing.expect(std.mem.endsWith(u8, app.notices.items, restart_releasing_notice));
+    try std.testing.expectEqual(@as(usize, 0), app.upgrader.cancel_count);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.releasing, app.upgrader.restart);
+}
+
+test "app_upgrade_runtime names the ways out of the restart wait" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    var deps_state = TestDepsState{};
+
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.waiting, outcome);
+    try std.testing.expectEqualStrings(
+        "fx restarts for the upgrade when the running turns stop or end; Ctrl+G cancels the restart, Esc twice interrupts the turn, /quit exits without the restart",
+        app.notices.items,
+    );
 }
 
 test "app_upgrade_runtime relaunches at once when no turn runs" {

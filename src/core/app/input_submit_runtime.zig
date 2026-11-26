@@ -629,13 +629,13 @@ pub fn SubmitRuntime(comptime App: type) type {
             // empty composer, so the text stays where it is. `/quit` still
             // quits.
             // A host that never upgrades itself has no restart to wait for.
-            if (comptime runtime_profile.allows(App, .auto_upgrade) and @hasField(App, "upgrader") and @hasField(@FieldType(App, "upgrader"), "restart_waits")) {
-                if (app.upgrader.restart_waits and !submitsQuit(app)) {
+            if (comptime runtime_profile.allows(App, .auto_upgrade) and @hasField(App, "upgrader") and @hasField(@FieldType(App, "upgrader"), "restart")) {
+                if (app.upgrader.restart != .none and !submitsQuit(app)) {
                     debug_trace.logf("input", "submit held reason=upgrade_restart_waits input_bytes={d}", .{app.input_runtime.edit_state.input.items.len});
                     try app.writeDomainNotice(.{
                         .topic = "upgrade",
                         .tone = .neutral,
-                        .body = "fx restarts for the upgrade once the running turns stop and the prompt is empty; send this after the restart",
+                        .body = "fx restarts for the upgrade once the running turns stop and the prompt is empty; send this after the restart, or press Ctrl+G to cancel it",
                     }, true);
                     return;
                 }

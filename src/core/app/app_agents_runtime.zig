@@ -1731,6 +1731,24 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Lets the turns held for the restart return (`WorkerRuntime.releaseYield`),
+        /// on the agents `requestYields` asked.
+        pub fn releaseYields(app: *App) void {
+            app.main_agent.worker.releaseYield();
+            for (app.child_agents.items) |child| {
+                if (child.agent.role == .instance) child.agent.worker.releaseYield();
+            }
+        }
+
+        /// Takes back `requestYields` when the restart is cancelled
+        /// (`WorkerRuntime.cancelYield`).
+        pub fn cancelYields(app: *App) void {
+            app.main_agent.worker.cancelYield();
+            for (app.child_agents.items) |child| {
+                if (child.agent.role == .instance) child.agent.worker.cancelYield();
+            }
+        }
+
         /// Whether any agent's worker runs work now or holds events the main
         /// loop has not applied, such as a finished turn's history, a
         /// subagent has work queued, or a child's report or hand-off waits
@@ -1745,6 +1763,24 @@ pub fn Runtime(comptime App: type) type {
                 if (child.agent.role == .subagent and worker.queuedPromptCount() > 0) return true;
             }
             return deliveriesPending(app);
+        }
+
+        /// As `anyTurnRunning`, with a turn held at its step boundary for the
+        /// restart counted as stopped: the restart lets the held turns return
+        /// once this is false (`tests/tla/recovery/RestartWait.tla` Release).
+        pub fn anyTurnUnheld(app: *App) bool {
+            if (runsUnheld(&app.main_agent.worker)) return true;
+            for (app.child_agents.items) |child| {
+                const worker = &child.agent.worker;
+                if (runsUnheld(worker)) return true;
+                // Only instances hold their queued work, so a subagent's runs.
+                if (child.agent.role == .subagent and worker.queuedPromptCount() > 0) return true;
+            }
+            return deliveriesPending(app);
+        }
+
+        fn runsUnheld(worker: anytype) bool {
+            return worker.turnActivity() == .running or worker.hasPendingEvents();
         }
 
         /// Whether a subagent runs work, has work queued, or holds events

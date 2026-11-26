@@ -142,6 +142,9 @@ pub const RequestRecovery = struct {
     /// `closeActive` saved the record marked clean: fx is exiting, and
     /// nothing after that may replace it.
     closed: bool = false,
+    /// What `closeForYield` replaced, so a cancelled restart can put the
+    /// request back (`reopenAfterYield`).
+    before_yield: ?BeforeYield = null,
     next_beat_ms: u64 = 0,
     /// Tests run on this virtual boot clock, so a 30-second wait takes no
     /// real time.
@@ -168,6 +171,8 @@ pub const RequestRecovery = struct {
     }
 
     pub const Resume = types.RecoveryResume;
+
+    const BeforeYield = struct { state: recovery.State, record: ?recovery.Record };
 
     /// A new request, or one resumed. `fast` is the request's Fast
     /// selection, which makes "retrying without Fast" a real option.
@@ -266,8 +271,9 @@ pub const RequestRecovery = struct {
     /// The turn stops before this request's send, between steps, for an
     /// upgrade's restart: saves the clean record `closing` returns, as
     /// SIGTERM does, so the next launch continues the request without
-    /// counting a death (`tests/tla/recovery/Resume.tla` Relaunch,
-    /// NoFalseCrashQuestion). Nothing replaces that record afterwards.
+    /// counting a death (`tests/tla/recovery/Resume.tla` Hold,
+    /// NoFalseCrashQuestion). Only a cancelled restart replaces that record
+    /// afterwards (`reopenAfterYield`).
     /// When the clean record does not land, the request stays as it was,
     /// open and with its send's record, so the turn goes on and its next
     /// boundary asks again (`Resume.tla` YieldSaveFails). Returns whether
@@ -295,9 +301,38 @@ pub const RequestRecovery = struct {
             debug_trace.eventf("recovery", "yield_close_failed", self.trace_ctx, "reason=clean_record_not_saved", .{});
             return false;
         }
+        self.before_yield = .{ .state = state_before, .record = record_before };
         self.closed = true;
         debug_trace.eventf("recovery", "closed", self.trace_ctx, "record_written=true", .{});
         return true;
+    }
+
+    pub const ReopenError = error{ NotYielded, RecordNotSaved };
+
+    /// The restart this request's turn stopped for was cancelled: the request
+    /// goes back to how it was before `closeForYield`, and its send's record
+    /// is saved again before the send, so a death during that send counts
+    /// (`tests/tla/recovery/Resume.tla` CancelRestart, CrashLoopAsks). When
+    /// the record does not land, the request stays closed with its clean
+    /// record and this fails, so no send goes out without its record.
+    /// Called on the request's own thread.
+    pub fn reopenAfterYield(self: *RequestRecovery) ReopenError!void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const before = self.before_yield orelse return error.NotYielded;
+        self.before_yield = null;
+        self.state = before.state;
+        self.record = before.record;
+        self.record_written = false;
+        self.closed = false;
+        self.writeRecordLocked();
+        if (!self.record_written) {
+            self.closed = true;
+            debug_trace.eventf("recovery", "yield_reopen_failed", self.trace_ctx, "reason=send_record_not_saved", .{});
+            return error.RecordNotSaved;
+        }
+        debug_trace.eventf("recovery", "reopened", self.trace_ctx, "reason=restart_cancelled", .{});
     }
 
     /// Whether this request's record is in the session log, so a turn
@@ -1446,6 +1481,61 @@ test "a yield whose clean record does not land leaves the request open with its 
     const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
     try std.testing.expect(plan.send != null);
     try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
+}
+
+test "a cancelled restart reopens the request and saves its send's record again" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    _ = (try request.start(false, null)).?;
+    const send_write = request.sendRecord();
+    try std.testing.expect(send_write == .save);
+    const sent = send_write.save;
+    fake.recovery_record = sent;
+    try std.testing.expect(request.closeForYield());
+    const clean = fake.recovery_record.?;
+
+    try request.reopenAfterYield();
+    try std.testing.expect(!std.mem.eql(u8, &clean, &fake.recovery_record.?));
+    try std.testing.expectEqual(sent, fake.recovery_record.?);
+    try std.testing.expect(request.recordSaved());
+}
+
+test "a reopen whose send record does not land fails and keeps the request closed" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    _ = (try request.start(false, null)).?;
+    const send_write = request.sendRecord();
+    try std.testing.expect(send_write == .save);
+    fake.recovery_record = send_write.save;
+    try std.testing.expect(request.closeForYield());
+    const clean = fake.recovery_record.?;
+
+    fake.recovery_record_save_failures = 1;
+    try std.testing.expectError(error.RecordNotSaved, request.reopenAfterYield());
+    try std.testing.expect(!request.recordSaved());
+    try std.testing.expectEqual(clean, fake.recovery_record.?);
+}
+
+test "a request that never yielded cannot be reopened" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    _ = (try request.start(false, null)).?;
+    try std.testing.expectError(error.NotYielded, request.reopenAfterYield());
 }
 
 test "closing saves a clean record for every request in flight" {
