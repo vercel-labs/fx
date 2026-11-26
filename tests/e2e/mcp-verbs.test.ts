@@ -3,10 +3,10 @@ import { processAlive as isRunning } from "./process-alive";
 import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runFx } from "../evals/eval-helpers";
+import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
 import { logLines, onlySessionId } from "./saved-sessions";
-import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable, turnSettled } from "./tmux-helpers";
+import { fakeGatewayFinalText, fakeGatewayToolCall, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable, turnSettled } from "./tmux-helpers";
 
 // `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
@@ -370,11 +370,117 @@ describe("fx mcp", () => {
     }
   }, 30_000);
 
+  // An HTTP server that answers `tools/list` with a status: 403 is refused, 429 and 503 are temporary and say so. The
+  // refusal's words are the same in `show`, its JSON, the `/mcp` screen and what the model is told. `list` never connects, so
+  // it has no list to say.
+  const listStatuses = [
+    { mode: "list_http_403", state: "tool list refused", detail: "refused", words: "the server answered the list with HTTP 403" },
+    { mode: "list_http_429", state: "tool list unavailable (HTTP 429)", detail: "unavailable", words: "the server answered the list with HTTP 429, which is temporary" },
+    { mode: "list_http_503", state: "tool list unavailable (HTTP 503)", detail: "unavailable", words: "the server answered the list with HTTP 503, which is temporary" },
+  ] as const;
+  for (const one of listStatuses) {
+    test(`says the same reason for a tool list answered with ${one.mode.replace("list_http_", "HTTP ")} in show, its JSON and what the model is told`, async () => {
+      const upstream = startModernMcpHttpFixture(one.mode);
+      try {
+        const root = createRoot({ mcpServers: { web: { type: "http", url: upstream.url } } });
+        const text = await mcp(root, "show", "web");
+        expect(text.stderr).toBe("");
+        expect(text.code).toBe(0);
+        expect(text.stdout).toStartWith(`web\n  status     ready, ${one.state}\n  tool list  ${one.detail}: ${one.words}\n`);
+        const shown = JSON.parse((await mcp(root, "show", "web", "--json")).stdout);
+        expect(shown).toMatchObject({ status: "ready", error: null, tools_error: one.words, tools: [] });
+
+        // The model is told the same words, not that the server is unavailable.
+        const activeGateway = startFakeGateway([
+          fakeGatewayToolCall("search_web", "toolbox", { search: "web tools", server: "web" }),
+          fakeGatewayToolCall("search_any", "toolbox", { search: "weather forecast" }),
+          fakeGatewayToolCall("list_web", "shell", { action: "run", command: `"${FX_BIN}" mcp call list web` }),
+          fakeGatewayFinalText("LIST_REASON_TOLD"),
+        ], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+        gateway = activeGateway;
+        const asked = await runFx(["ask", "--json", "--full-access", "--no-save", "Find the web tools."], {
+          cwd: root.workspace,
+          env: { ...root.env, FX_GATEWAY_BASE_URL: activeGateway.baseUrl, FX_GATEWAY_CHAT_URL: activeGateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+          timeoutMs: 60_000,
+        });
+        expect(asked.code).toBe(0);
+        // A search of the server, a search of every server and `fx mcp call list` each tell it the refusal's words.
+        const told = activeGateway.requests[3]?.body ?? "";
+        expect(told.split(`MCP server 'web' is unavailable: ${one.words}`).length - 1).toBeGreaterThanOrEqual(3);
+        expect(told).not.toContain("is unavailable: the server is unavailable");
+      } finally {
+        upstream.stop();
+      }
+    }, 90_000);
+
+    test.skipIf(!tmuxAvailable())(`the /mcp screen of a server whose tool list is answered with ${one.mode.replace("list_http_", "HTTP ")} says the same reason in both of its lines`, async () => {
+      const upstream = startModernMcpHttpFixture(one.mode);
+      try {
+        const root = createRoot({ mcpServers: { web: { type: "http", url: upstream.url } } });
+        gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+        tui = await TmuxSession.create({
+          isolated: true,
+          cwd: root.workspace,
+          width: 120,
+          height: 30,
+          env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+        });
+        await tui.waitForComposer(15_000);
+        await tui.sendText("/mcp");
+        await tui.waitForText("MCP servers  1", 10_000);
+        await tui.sendKeys("Enter");
+        const pane = await tui.waitForText(`Its tools couldn't load: ${one.words}`, 20_000);
+        expect(pane).toContain(`ready, ${one.state}`);
+        expect(pane).not.toContain("Its tools couldn't load: the server is unavailable");
+      } finally {
+        upstream.stop();
+      }
+    }, 90_000);
+  }
+
+  // The `/mcp` list gives each row the words of its status that fit: under 33 columns the whole words of a refused list
+  // do not, so a row says its kind in fewer, and a cut never takes the word that says it.
+  test.skipIf(!tmuxAvailable())("the /mcp list says a refused and an unavailable tool list in rows that fit at 30, 33, 60 and 200 columns", async () => {
+    const refused = startModernMcpHttpFixture("list_http_403");
+    const waiting = startModernMcpHttpFixture("list_http_503");
+    try {
+      const root = createRoot({ mcpServers: { no403: { type: "http", url: refused.url }, wait503: { type: "http", url: waiting.url } } });
+      gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+      const grid = [
+        { width: 30, refused: "list refused", waiting: "unavailable" },
+        { width: 33, refused: "tool list refused", waiting: "unavailable (503)" },
+        { width: 60, refused: "ready, tool list refused", waiting: "ready, tool list unavailable (HTTP 503)" },
+        { width: 200, refused: "ready, tool list refused", waiting: "ready, tool list unavailable (HTTP 503)" },
+      ];
+      for (const one of grid) {
+        tui = await TmuxSession.create({
+          isolated: true,
+          cwd: root.workspace,
+          width: one.width,
+          height: 20,
+          env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+        });
+        await tui.waitForComposer(15_000);
+        await tui.sendText("/mcp");
+        const rowOf = (pane: string, name: string) => pane.split("\n").find((line) => line.replace(/^[› ]+/, "").startsWith(name)) ?? "";
+        const pane = await tui.waitForPane((text) => rowOf(text, "no403").includes(one.refused) && rowOf(text, "wait503").includes(one.waiting), 20_000);
+        for (const line of pane.split("\n")) {
+          expect({ width: one.width, line, wide: [...line].length > one.width }).toMatchObject({ wide: false });
+        }
+        expect(pane).not.toContain("…");
+        await tui.kill();
+        tui = null;
+      }
+    } finally {
+      refused.stop();
+      waiting.stop();
+    }
+  }, 180_000);
+
   // The server answered `tools/list`, but not with a JSON-RPC message: a status that no other flow reads, or a page
   // that is no JSON. That is an answer fx refuses, not a server that gave none.
   const httpAnswers = [
     ["list_http_500", "the server answered the list with HTTP 500"],
-    ["list_http_429", "the server answered the list with HTTP 429"],
     ["list_html_200", "the list is not valid JSON"],
   ] as const;
   for (const [mode, why] of httpAnswers) {

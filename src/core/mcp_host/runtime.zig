@@ -114,6 +114,9 @@ pub const Status = struct {
     /// the words, so `publish` copies them into the snapshot and `statusesNow` copies them into each caller's
     /// allocator, like the other strings.
     tools_error: ?[]const u8 = null,
+    /// The HTTP status behind `tools_error` when its words say the server is temporarily unavailable (429, 503), else
+    /// 0: `fx mcp show` and the `/mcp` screen say "unavailable (HTTP n)" for it. A number, so every copy carries it.
+    tools_unavailable: u16 = 0,
     /// How many tools of the list fx left out of what the model gets, by reason, for a server that is `ready`: the ones
     /// the engine skipped (`mcp.tools.Store.addPage`) and the ones the host's reading refuses (`dropped_tools`). Plain
     /// counts, so every copy of a `Status` carries them as it is.
@@ -2452,7 +2455,10 @@ pub const Runtime = struct {
                 }
             }
             // The engine lends the words until its next refusal.
-            if (o.state == .ready and !o.needs_login) o.tools_error = if (st.list_refusal) |words| try a.dupe(u8, words) else null;
+            if (o.state == .ready and !o.needs_login) {
+                o.tools_error = if (st.list_refusal) |words| try a.dupe(u8, words) else null;
+                o.tools_unavailable = if (o.tools_error != null) st.list_unavailable else 0;
+            }
             if (o.state == .ready) {
                 o.dropped = st.dropped;
                 o.dropped.merge(r.hostDropped(i, s.name));
@@ -2721,7 +2727,17 @@ pub const Runtime = struct {
 
     fn lastError(r: *Runtime, alloc: Allocator, i: usize) Allocator.Error![]u8 {
         if (try r.unreadText(alloc, i)) |why| return why;
-        return (try r.failureText(alloc, i)) orelse try alloc.dupe(u8, "the server is unavailable");
+        if (try r.failureText(alloc, i)) |why| return why;
+        return (try r.refusalText(alloc, i)) orelse try alloc.dupe(u8, "the server is unavailable");
+    }
+
+    /// Why fx refused server `i`'s last tool list, in `alloc`: the words `Status.tools_error` has, so a screen, a
+    /// status and what the model is told all give one reason. Null when it refused none. A failure of the server
+    /// (`failureText`) is said first: it is down, whatever its list was.
+    fn refusalText(r: *Runtime, alloc: Allocator, i: usize) Allocator.Error!?[]u8 {
+        const st = r.statusOf(i) orelse return null;
+        // The engine lends the words until its next refusal.
+        return if (st.list_refusal) |words| try alloc.dupe(u8, words) else null;
     }
 
     /// Why server `i` has no login, in `alloc`, when that's because the
@@ -3420,6 +3436,20 @@ const refusing_server_script =
     \\
 ;
 
+/// A 2025 server in sh whose every tool list is no list (`tools` is a number).
+const always_refusing_server_script =
+    \\#!/bin/sh
+    \\while IFS= read -r line; do
+    \\  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    \\  case "$line" in
+    \\    *'"method":"server/discover"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
+    \\    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    \\    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":7}}\n' "$id" ;;
+    \\  esac
+    \\done
+    \\
+;
+
 /// Asks for server `fake`'s tools until its status says `want`, for up to thirty seconds: the snapshot follows the engine a moment later,
 /// and a loaded machine can take longer. It stops as soon as the status is right.
 fn statusAfterListing(r: *Runtime, arena: Allocator, want_refused: bool) !Status {
@@ -3535,6 +3565,32 @@ test "a refused tool list shows in the status beside the older list still served
     status = try statusAfterListing(&r, a, false);
     try testing.expect(status.tools_error == null);
     try testing.expectEqual(@as(usize, 1), status.tools);
+}
+
+test "a server whose tool list is refused fails the request for its tools with the refusal's words, as its status says them" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "server", .data = always_refusing_server_script, .flags = .{ .permissions = .executable_file } });
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The `/mcp` screen, the catalog and `toolbox` all read the words of this failure, so they say what the status says
+    // and not that the server is unavailable.
+    const why = switch (try r.tools(a, "fake", null)) {
+        .failed => |text| text,
+        else => return error.TestExpectedFailure,
+    };
+    try testing.expectEqualStrings("\"tools\" is not a list", why);
+    const status = try statusAfterListing(&r, a, true);
+    try testing.expectEqualStrings(why, status.tools_error orelse return error.TestExpectedRefusal);
+    try testing.expectEqual(@as(usize, 0), status.tools);
+    try testing.expectEqual(@as(u16, 0), status.tools_unavailable);
 }
 
 test "a cancelled call ends, and stopping ends a call that never answers" {
