@@ -27,7 +27,8 @@ pub fn setIo(zio: std.Io) void {
 }
 
 /// `zio` with fx's process spawn on Darwin and fx's TCP connect, and with the
-/// errno behind every `error.Unexpected` from the network kept for `/trace`.
+/// errno kept for `/trace` when a network read, write, receive, send, or DNS
+/// lookup returns `error.Unexpected`.
 fn processIo(zio: std.Io) std.Io {
     return os_errors.wrap(net_connect.wrap(process_io_for(builtin.target.os.tag, zio)));
 }
