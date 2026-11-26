@@ -69,7 +69,7 @@ test "a tool the host's reading refuses is counted by why; a good one and a repe
     const gpa = std.testing.allocator;
     const wide_schema = try wide(gpa, 5000);
     defer gpa.free(wide_schema);
-    const too_big = try std.fmt.allocPrint(gpa, "{{\"name\":\"big\",\"inputSchema\":{s}}}", .{wide_schema});
+    const too_big = try gpa.print("{{\"name\":\"big\",\"inputSchema\":{s}}}", .{wide_schema});
     defer gpa.free(too_big);
     var list = try listOf(gpa, &.{
         "{\"name\":\"good\",\"inputSchema\":{\"type\":\"object\"}}",
