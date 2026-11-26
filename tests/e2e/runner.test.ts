@@ -1626,13 +1626,13 @@ describe("login changes, first use, the model's view and include (V1, R5, AC-5, 
           await session.waitForComposer(TIMEOUT);
           await session.sendText("Run it.");
           expect(await session.waitForText("fx asks", TIMEOUT)).toContain("fx asks");
+          // A digit answers its question at once, so no Enter follows it. The optional name asks
+          // how to fill it first: Enter there picks "Enter value", and "2" picks Skip.
           await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          await session.waitForText("Another project (optional)", TIMEOUT);
-          await session.sendKeys("Enter");
+          await session.waitForText("choose how to fill", TIMEOUT);
+          await session.sendLiteral("2");
           await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
           await session.sendLiteral("1");
-          await session.sendKeys("Enter");
           await session.waitForText("First done.", TIMEOUT);
           await session.waitForStableComposer(TIMEOUT);
           expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
