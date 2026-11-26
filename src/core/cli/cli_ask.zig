@@ -1783,7 +1783,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     // while the turn runs, and waits for it only when fx has none.
     var token_pass_run: ?token_pass_check.Check = null;
     defer if (token_pass_run) |*check| check.finish(alloc, "ask_finished");
-    const token_pass_source: ?credentials.Source = if (ctx.provider == .gateway and cfg.auth_mode != .host_managed) ctx.credential_source else null;
+    // Unit tests share the real provider bundles, so a test's check would ask
+    // AI Gateway, and a request it walked away from frees into the test
+    // allocator after the test ended.
+    const token_pass_source: ?credentials.Source = if (comptime std_builtin.is_test)
+        null
+    else if (ctx.provider == .gateway and cfg.auth_mode != .host_managed)
+        ctx.credential_source
+    else
+        null;
     if (token_pass_source) |source| {
         if (token_pass_check.name(alloc, source, ctx.api_key, ctx.account_id, ctx.gateway_team)) |named| {
             token_pass_run = .{ .named = named, .home = io_mod.homeDir() };
@@ -7927,6 +7935,30 @@ test "ask usage survives normal and typed error result capture" {
             .permission_required => try std.testing.expectEqualStrings("NonInteractivePermissionRequired", parsed.value.object.get("error").?.string),
         }
     }
+}
+
+test "fx ask in a test build asks AI Gateway for no Token Pass credits" {
+    const alloc = std.testing.allocator;
+    const CountingCredits = struct {
+        var calls: std.atomic.Value(usize) = .init(0);
+
+        fn fetch(_: ?*anyopaque, _: Allocator, _: gateway_provider.CreditsLookupInput) output_contracts.CreditsSnapshot {
+            _ = calls.fetchAdd(1, .seq_cst);
+            return .{};
+        }
+    };
+    CountingCredits.calls.store(0, .seq_cst);
+    var cfg = testConfig();
+    cfg.provider_set.gateway.credits = .{ .fetch_fn = CountingCredits.fetch };
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup);
+    deps.stdout_is_tty = TestTty.no;
+
+    try std.testing.expectEqual(@as(u8, 0), try runWithDeps(alloc, &.{ "--json", "--no-save", "hello" }, cfg, deps));
+    try std.testing.expectEqual(@as(usize, 0), CountingCredits.calls.load(.seq_cst));
 }
 
 /// A saved ask whose first two turns each leave a report to start the next
