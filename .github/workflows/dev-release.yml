@@ -194,19 +194,26 @@ jobs:
 
           # Move forward only. CI on main often ends after newer commits merge,
           # so this build may be behind main and still newer than dev.json.
+          # dev.json is read through the CDN, which caches it for 60 seconds.
           # Runs go one at a time and each builds for minutes before this
-          # step, so the 60 second cache on dev.json cannot hide the previous
-          # run's write.
-          CURRENT_SHA=$(curl -fsS --max-time 30 https://releases.fx.sh/dev.json | jq -r '.commit // empty') || CURRENT_SHA=""
+          # step, so the read sees the previous run's write unless the CDN
+          # serves a copy past that age.
+          CURRENT_SHA=$(curl -fsS --max-time 30 https://releases.fx.sh/dev.json | jq -r '.commit // empty') || {
+            echo "::warning::could not read dev.json; only main's newest commit may replace it"
+            CURRENT_SHA=""
+          }
           CURRENT_KNOWN=false
-          if [ -n "$CURRENT_SHA" ] && git cat-file -e "${CURRENT_SHA}^{commit}"; then
+          if [ -n "$CURRENT_SHA" ] && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null; then
             CURRENT_KNOWN=true
           fi
-          if [ "$CURRENT_KNOWN" = true ] && git merge-base --is-ancestor "$RELEASE_SHA" "$CURRENT_SHA"; then
+          if [ "$CURRENT_KNOWN" = true ] && [ "$CURRENT_SHA" != "$RELEASE_SHA" ] &&
+            git merge-base --is-ancestor "$RELEASE_SHA" "$CURRENT_SHA"; then
             echo "dev.json names ${CURRENT_SHA}, which already includes ${RELEASE_SHA}; leaving it unchanged"
             exit 0
           elif [ "$CURRENT_KNOWN" = true ] && git merge-base --is-ancestor "$CURRENT_SHA" "$RELEASE_SHA"; then
-            echo "${RELEASE_SHA} is newer than ${CURRENT_SHA} in dev.json"
+            # Equal commits land here too, so a rerun writes dev.json again
+            # and retries the fx-web deploy.
+            echo "dev.json names ${CURRENT_SHA}; pointing it at ${RELEASE_SHA}"
           else
             # The pointer is unreadable or outside this history, so only
             # main's newest commit may replace it.
