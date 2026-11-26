@@ -35,6 +35,7 @@ import {
   paneExitMatches,
   parseSingleChildPid,
   startDynamicFakeGateway,
+  TMUX_NO_CONFIG,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -305,7 +306,7 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
   try {
     execFileSync(
       "tmux",
-      ["-L", socketName, "new-session", "-d", "-s", "fx-stale-env-seed", "sleep 60"],
+      ["-L", socketName, ...TMUX_NO_CONFIG, "new-session", "-d", "-s", "fx-stale-env-seed", "sleep 60"],
       { env: seedEnv, stdio: "pipe" },
     );
 
@@ -451,7 +452,7 @@ tmuxFxTest("test holds in the tmux server's environment never reach fx", async (
   try {
     execFileSync(
       "tmux",
-      ["-L", socketName, "new-session", "-d", "-s", "fx-held-env-seed", "sleep 60"],
+      ["-L", socketName, ...TMUX_NO_CONFIG, "new-session", "-d", "-s", "fx-held-env-seed", "sleep 60"],
       {
         env: {
           ...process.env,
@@ -593,6 +594,49 @@ tmuxTest("minimum history lines survive a fresh tmux server restart", async () =
         stdio: "pipe",
       });
     } catch {}
+  }
+});
+
+tmuxTest("a tmux server the harness starts ignores the developer's tmux config", async () => {
+  const socketName = `fx-no-config-${process.pid}-${Date.now().toString(36)}`;
+  const referenceSocket = `${socketName}-ref`;
+  const home = mkdtempSync(join(tmpdir(), "fx-tmux-hostile-home-"));
+  const hostileConfig = "set -g base-index 1\nset -g pane-base-index 1\nset -g remain-on-exit-format 'HOSTILE'\n";
+  writeFileSync(join(home, ".tmux.conf"), hostileConfig);
+  mkdirSync(join(home, ".config", "tmux"), { recursive: true });
+  writeFileSync(join(home, ".config", "tmux", "tmux.conf"), hostileConfig);
+  const savedHome = process.env.HOME;
+  const savedConfigHome = process.env.XDG_CONFIG_HOME;
+  const serverState = (socket: string, sessionName: string) => {
+    const tmux = (...args: string[]) => execFileSync("tmux", ["-L", socket, ...args], { encoding: "utf8" }).trim();
+    return {
+      indexes: tmux("display-message", "-p", "-t", sessionName, "#{window_index}.#{pane_index}"),
+      deadPaneFormat: tmux("show-options", "-gv", "remain-on-exit-format"),
+    };
+  };
+  let session: TmuxSession | undefined;
+  try {
+    process.env.HOME = home;
+    process.env.XDG_CONFIG_HOME = join(home, ".config");
+    try {
+      session = await TmuxSession.create({ cmd: "sleep 30", startupWaitMs: 0, socketName });
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = savedConfigHome;
+    }
+    // tmux's defaults, from a server that loads no config at all.
+    execFileSync("tmux", ["-L", referenceSocket, "-f", "/dev/null", "new-session", "-d", "-s", "reference", "sleep 30"]);
+    expect(serverState(socketName, session.name)).toEqual(serverState(referenceSocket, "reference"));
+  } finally {
+    await session?.kill();
+    for (const socket of [socketName, referenceSocket]) {
+      try {
+        execFileSync("tmux", ["-L", socket, "kill-server"], { stdio: "pipe" });
+      } catch {}
+    }
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
