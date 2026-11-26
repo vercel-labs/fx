@@ -42,6 +42,10 @@
 (*   view-only         the child's own screen cannot act     OwnScreenActable*)
 (*   lend-under-picker  a view lends the card under the picker it opened    *)
 (*                                                        CardYieldsToPicker *)
+(*   stale-pick       a continue keeps its pick, so a later request uses it  *)
+(*                                                          OnceForTheWait *)
+(*   own-model-keeps-pick  the child's own model does not beat an older pick  *)
+(*                                                        LatestChoiceWins *)
 (*                                                                         *)
 (* A view's `/model` picker for a subagent's wait is not an item of its own: *)
 (* it stands where the card would (src/core/app/app_agents_runtime.zig       *)
@@ -61,6 +65,19 @@
 (* for keeps it (`PickerHolds`). A picker that closes or takes a choice frees *)
 (* the view, so the next pass lends its tree's oldest waiting item again      *)
 (* (`PickerCloses`, `ModelChosen`, `OldestFirst`).                          *)
+(*                                                                         *)
+(* A pick is the model the person chose for one wait (`setContinueSelection`,*)
+(* src/core/agent/worker_runtime.zig:2984-2999). One continue takes it, under *)
+(* the worker mutex, and the worker forgets it, so no later request uses it   *)
+(* (`takeContinueSelection`, :3001-3009); a pick no continue took is dropped  *)
+(* when the next turn starts (`dropContinueSelectionLocked` in                *)
+(* `takeNextPromptLocked`, :2591, :3013-3018). A request reads the person's   *)
+(* latest choice at the time it is sent: the wait continues on its pick only  *)
+(* while no own-screen choice came after it, else the child's model as it is  *)
+(* then (`applyContinuedSelection`, src/core/agent/runtime/orchestrator.zig:  *)
+(* 5123-5135). `pick` is the pick a request can still take, so it goes when   *)
+(* its wait ends (`PickForItsWaitOnly`); `used` records what the last         *)
+(* continue ran on (`OnceForTheWait`, `LatestChoiceWins`).                    *)
 (*                                                                         *)
 (* The one-step settle is `clock` and `last_change`. A change to the items  *)
 (* (raise, end, deadline, close, stop, switch, the alternate screen, the    *)
@@ -129,7 +146,7 @@ KidsOf(v) == {k \in Kids : Tree(k) = v}
 
 ASSUME Design \in {"a", "b", "current"}
 ASSUME Mutant \in {"none", "no-wait-card", "footer-blind", "picker-to-screen",
-                   "no-settle", "lend-under-alt", "two-shown", "cross-tree",
+                   "own-model-keeps-pick", "no-settle", "lend-under-alt", "two-shown", "cross-tree",
                    "note-content", "main-answers", "view-only", "row-as-wait",
                    "lend-under-picker", "stale-pick"}
 ASSUME Hazards \in {"none", "all"}
@@ -153,7 +170,9 @@ VARIABLES
   pick,        \* each child: 0, or the asked stamp of the wait a view's
                \* picker chose a model for; that wait's continue takes it
   used,        \* each child: the model its last continue ran on: "none",
-               \* "picked" (the wait's pick) or "own" (the person's own choice)
+               \* "picked" (the wait's pick), "own" (the person's own choice),
+               \* or "beaten" when an own-screen choice had already beaten the
+               \* pick the continue ran on (a defect)
   own_seen,    \* each child: an own-screen choice came after the current pick
   clock,       \* passes and ticks
   last_change  \* the clock of the last change to the items
@@ -336,10 +355,17 @@ ChildEnds(k) ==
   /\ kind' = [kind EXCEPT ![k] = "none"]
   /\ row' = [row EXCEPT ![k] = "stale"]
   /\ asked' = [asked EXCEPT ![k] = 0]
+  (* The wait is over, so no request can take its pick: the only reader is
+     this wait's continue (`takeContinueSelection`), and the worker drops a
+     pick it never took when the next turn starts
+     (`dropContinueSelectionLocked` in `takeNextPromptLocked`,
+     src/core/agent/worker_runtime.zig:2591, :3013-3018). The model holds the
+     pick as "a pick a request can still take", so it goes here. *)
+  /\ pick' = [pick EXCEPT ![k] = 0]
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<alive, screen, alt, own_prompt, shown, served, main_did,
-                 note_text, own_blocked, picker, picker_open, pick, used, own_seen>>
+                 note_text, own_blocked, picker, picker_open, used, own_seen>>
 
 Deadline(k) == ChildEnds(k)
 
@@ -355,10 +381,12 @@ Resend(k) ==
   /\ kind' = [kind EXCEPT ![k] = "none"]
   /\ row' = [row EXCEPT ![k] = "none"]
   /\ asked' = [asked EXCEPT ![k] = 0]
+  (* Nothing waits, so its pick can never be taken. *)
+  /\ pick' = [pick EXCEPT ![k] = 0]
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<alive, screen, alt, own_prompt, shown, served, main_did,
-                 note_text, own_blocked, picker, picker_open, pick, used, own_seen>>
+                 note_text, own_blocked, picker, picker_open, used, own_seen>>
 
 \* The recovery module's own clear of a row whose wait is gone
 \* (request_recovery.zig:348-360 for a success, :419-425 for a cancel).
@@ -385,10 +413,13 @@ StopOrClose(k, how) ==
   /\ shown' = [v \in Views |-> shown[v] \ {k}]
   /\ picker' = [v \in Views |-> IF picker[v] = k THEN "none" ELSE picker[v]]
   /\ picker_open' = [v \in Views |-> IF picker[v] = k THEN FALSE ELSE picker_open[v]]
+  (* The child is gone, and with it its wait and any pick for it
+     (a closed worker is deinit'd, so the pick goes too). *)
+  /\ pick' = [pick EXCEPT ![k] = 0]
   /\ main_did' = how
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
-  /\ UNCHANGED <<screen, alt, own_prompt, served, note_text, own_blocked, pick, used, own_seen>>
+  /\ UNCHANGED <<screen, alt, own_prompt, served, note_text, own_blocked, used, own_seen>>
 
 \* The alternate screen takes and gives back the terminal.
 AltOpen ==
@@ -440,10 +471,12 @@ MainStops(k) ==
   /\ shown' = [v \in Views |-> shown[v] \ {k}]
   /\ picker' = [v \in Views |-> IF picker[v] = k THEN "none" ELSE picker[v]]
   /\ picker_open' = [v \in Views |-> IF picker[v] = k THEN FALSE ELSE picker_open[v]]
+  (* The child is gone, and with it its wait and any pick for it. *)
+  /\ pick' = [pick EXCEPT ![k] = 0]
   /\ main_did' = "stop"
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
-  /\ UNCHANGED <<screen, alt, own_prompt, served, note_text, own_blocked, pick, used, own_seen>>
+  /\ UNCHANGED <<screen, alt, own_prompt, served, note_text, own_blocked, used, own_seen>>
 
 \* A defect: main answers the item itself.
 MainAnswers(k) ==
@@ -453,11 +486,13 @@ MainAnswers(k) ==
   /\ kind' = [kind EXCEPT ![k] = "none"]
   /\ row' = [row EXCEPT ![k] = "none"]
   /\ asked' = [asked EXCEPT ![k] = 0]
+  (* Nothing waits, so its pick can never be taken. *)
+  /\ pick' = [pick EXCEPT ![k] = 0]
   /\ main_did' = "answer"
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<alive, screen, alt, own_prompt, shown, served, note_text,
-                 own_blocked, picker, picker_open, pick, used, own_seen>>
+                 own_blocked, picker, picker_open, used, own_seen>>
 
 \* The person's answer on the item (the card's Change model, or the
 \* out-of-credits picker's "Switch to another model") returns the card and
@@ -529,29 +564,39 @@ ModelChosen(v) ==
                  main_did, note_text, own_blocked, used>>
 
 \* The person sets the child's own model on its own screen, as `/model` there
-\* does. Their latest choice wins, so a pick still waiting for an older wait
-\* goes with it. A `stale-pick` keeps the pick, as the code did before a
-\* continue took it and a new turn dropped the rest.
+\* does (`replaceModelFor` writes the subagent's own preference,
+\* src/core/app/provider_runtime.zig). Their latest choice wins, so a pick
+\* still waiting for an older wait goes with it: the next request reads the
+\* child's model as it is then (`applyContinuedSelection` keeps `job.model`
+\* when the wait holds no pick, src/core/agent/runtime/orchestrator.zig:
+\* 5123-5135). `stale-pick` keeps the pick, as the code did before a continue
+\* took it and a new turn dropped the rest; `own-model-keeps-pick` is the
+\* defect where the own-screen choice does not beat the older pick.
 OwnModel(k) ==
   /\ clock < MaxClock
   /\ Hazards = "all"
   /\ alive[k] = "open"
   /\ own_seen' = [own_seen EXCEPT ![k] = TRUE]
-  /\ pick' = [pick EXCEPT ![k] = IF Mutant = "stale-pick" THEN pick[k] ELSE 0]
+  /\ pick' = [pick EXCEPT ![k] =
+       IF Mutant \in {"stale-pick", "own-model-keeps-pick"} THEN pick[k] ELSE 0]
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<kind, row, asked, alive, screen, alt, own_prompt, shown, served,
                  main_did, note_text, own_blocked, picker, picker_open, used>>
 
 \* The wait's request runs again with what the person last chose: the pick made
-\* for this wait, else the child's own model. Taking the pick clears it, so no
-\* later request can use it (`stale-pick` keeps it).
+\* for this wait only when no own-screen choice came after it, else the
+\* child's own model as it is then. Taking the pick clears it, so no later
+\* request can use it (`stale-pick` keeps it). A continue that ran on a pick an
+\* own-screen choice had already beaten is recorded as `"beaten"`, which
+\* `LatestChoiceWins` forbids.
 Continue(k) ==
   /\ clock < MaxClock
   /\ Hazards = "all"
   /\ Live(k)
   /\ row[k] = "live"
-  /\ used' = [used EXCEPT ![k] = IF pick[k] # 0 THEN "picked" ELSE "own"]
+  /\ used' = [used EXCEPT ![k] =
+       IF pick[k] # 0 THEN (IF own_seen[k] THEN "beaten" ELSE "picked") ELSE "own"]
   /\ pick' = [pick EXCEPT ![k] = IF Mutant = "stale-pick" THEN pick[k] ELSE 0]
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
@@ -597,7 +642,7 @@ TypeOK ==
   /\ note_text \in {"none", "reason", "content"}
   /\ own_blocked \in BOOLEAN
   /\ pick \in [Kids -> 0..MaxClock]
-  /\ used \in [Kids -> {"none", "picked", "own"}]
+  /\ used \in [Kids -> {"none", "picked", "own", "beaten"}]
   /\ own_seen \in [Kids -> BOOLEAN]
   /\ clock \in 0..MaxClock
   /\ last_change \in 0..MaxClock
@@ -664,7 +709,10 @@ MainOnlyTellsOrStops == main_did # "answer"
 OwnScreenActable == \A k \in Kids : (screen = k /\ Live(k)) => ~own_blocked
 
 \* A pick belongs to one wait: it is never left behind for a later request, and
-\* an own-screen choice clears it (`stale-pick` breaks both).
+\* an own-screen choice clears it (`stale-pick` breaks both). The pick a wait
+\* holds is one a request can still take, so it goes when the wait ends, as the
+\* worker drops it at the next turn start (`takeNextPromptLocked`,
+\* src/core/agent/worker_runtime.zig:2591, :3013-3018).
 PickForItsWaitOnly ==
   \A k \in Kids : pick[k] = 0 \/ pick[k] = asked[k]
 
@@ -673,9 +721,13 @@ PickForItsWaitOnly ==
 OnceForTheWait ==
   \A k \in Kids : used[k] = "picked" => pick[k] = 0
 
-\* The person's latest choice wins: a continue after their own-screen choice
-\* never runs on an older pick.
+\* The person's latest choice wins: a request reads the latest choice at the
+\* time it is sent (`Continue`), the pick only while no own-screen choice came
+\* after it, else the child's own model as it is then
+\* (`applyContinuedSelection`, src/core/agent/runtime/orchestrator.zig:
+\* 5123-5135). A continue that ran on a beaten pick records `"beaten"`, and no
+\* state may hold one: `own-model-keeps-pick` is the defect that produces it.
 LatestChoiceWins ==
-  \A k \in Kids : used[k] = "picked" => ~own_seen[k]
+  \A k \in Kids : used[k] # "beaten"
 
 =============================================================================

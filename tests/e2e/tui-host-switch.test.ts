@@ -5777,14 +5777,16 @@ describe("a subagent's wait shows in the view the person is on", () => {
       const latest = FAKE_GATEWAY_MODEL;
       let firstTaskRefused = false;
       let secondTaskRefused = false;
-      let retriedModel = "";
+      let childModels: Array<string | null> = [];
+      let mainModel = "";
+      // The card shows only after the person's draft is in place.
+      const childWaits = held();
       await withFx(
         async (body) => {
           if (!isMainRequest(body)) {
-            // Each task's first request is refused; each wait's continue runs
-            // on the model the person last chose.
             const secondTask = latestUserText(body).includes("WAIT_S2C_CHILD2");
             if (!secondTask && !firstTaskRefused) {
+              await childWaits.promise;
               firstTaskRefused = true;
               return refused();
             }
@@ -5794,6 +5796,11 @@ describe("a subagent's wait shows in the view the person is on", () => {
             }
             return text("child_done", "WAIT_S2C_CHILD_DONE");
           }
+          // Main's own turn under the first task starts the reviewer's task;
+          // a later message to main starts the second task.
+          if (latestUserText(body).includes("WAIT_S2C_SECOND") && !body.includes('"main_s2c2"')) {
+            return toolCall("main_s2c2", "subagent", { request: { action: "message", agent: "reviewer", message: "WAIT_S2C_CHILD2" } });
+          }
           if (!body.includes('"main_s2c1"')) {
             return toolCall("main_s2c1", "subagent", { request: { action: "message", agent: "reviewer", message: "WAIT_S2C_CHILD" } });
           }
@@ -5802,30 +5809,47 @@ describe("a subagent's wait shows in the view the person is on", () => {
         async (session, context) => {
           const childRequests = (marker: string) =>
             context.requests.filter((request) => request.body.includes(marker) && !isMainRequest(request.body));
+          const mainRequests = () => context.requests.filter((request) => isMainRequest(request.body));
           await session.sendText("SWITCH_USER WAIT_S2C_TASK");
           await session.waitForText("WAIT_S2C_MAIN_DONE", 30_000);
-          // The first task is refused, so its card offers Change model.
+          // Main's own draft is in the composer before the card takes the keys.
+          await session.sendLiteral("WAIT_S2C_DRAFT");
+          await session.waitForPane((pane) => composerContains(pane, "WAIT_S2C_DRAFT"), 10_000);
+          childWaits.release();
           const first = await session.waitForPane(
             (pane) => pane.includes("reviewer: The provider rejected this request") && pane.includes("Change model"),
             30_000,
           );
+          expect(first).not.toContain("reviewer needs you");
           await session.sendKeys(cardDigit(first, "Change model"));
           await session.waitForPane((pane) => pane.includes("/model"), 15_000);
           await session.sendKeys("Down");
           await session.sendKeys("Enter");
           await session.waitForPane((pane) => pane.includes(`reviewer continues with ${picked} (effort: default, speed: normal)`), 25_000);
           await until("the picked model on the wait's continue", () => childRequests("WAIT_S2C_CHILD").at(-1)?.headers.get("ai-language-model-id") === picked, 30_000);
-          // The person picks a model on the subagent's own screen, then starts
-          // its next task there; that request is refused and Enter retries it.
+          // The card leaves with the wait, and the draft is back: its Enter
+          // sends main's own next turn, which keeps main's model.
+          await session.waitForPane((pane) => composerContains(pane, "WAIT_S2C_DRAFT"), 20_000);
+          const mainBefore = mainRequests().length;
+          await session.sendKeys("Enter");
+          await until("main's next request", () => mainRequests().length > mainBefore, 30_000);
+          expect(mainRequests().at(-1)?.headers.get("ai-language-model-id")).toBe(latest);
+          // The person picks a model on the subagent's own screen.
           await showAgent(session, "reviewer");
           await session.sendText(`/model ${latest}`);
-          await session.waitForPane((pane) => pane.includes(`Switched to ${latest}`), 25_000);
-          await session.sendText("WAIT_S2C_CHILD2");
-          await session.waitForPane((pane) => pane.includes("The provider rejected this request"), 30_000);
-          const before = childRequests("WAIT_S2C_CHILD2").length;
           await session.sendKeys("Enter");
-          await until("the retried request", () => childRequests("WAIT_S2C_CHILD2").length > before, 30_000);
-          retriedModel = childRequests("WAIT_S2C_CHILD2").at(-1)?.headers.get("ai-language-model-id") ?? "";
+          await showAgent(session, "main");
+          // Main sends the second task; the reviewer's first request for it is
+          // refused, and the person presses Retry on main's card.
+          await session.sendText("SWITCH_USER WAIT_S2C_SECOND");
+          const second = await session.waitForPane(
+            (pane) => pane.includes("reviewer: The provider rejected this request") && pane.includes("Open reviewer's screen"),
+            30_000,
+          );
+          await session.sendKeys(cardDigit(second, "Retry"));
+          await until("the second task's retry", () => childRequests("WAIT_S2C_CHILD2").length >= 2, 30_000);
+          childModels = childRequests("WAIT_S2C_CHILD2").map((request) => request.headers.get("ai-language-model-id"));
+          mainModel = mainRequests().at(-1)?.headers.get("ai-language-model-id") ?? "";
         },
         undefined,
         false,
@@ -5837,7 +5861,11 @@ describe("a subagent's wait shows in the view the person is on", () => {
           ],
         },
       );
-      expect(retriedModel).toBe(latest);
+      // The second task's own request runs on the person's latest choice, and
+      // its Retry keeps it: the model picked for the first wait is not used.
+      expect(childModels[0]).toBe(latest);
+      expect(childModels[1]).toBe(latest);
+      expect(mainModel).toBe(latest);
     },
     TIMEOUT,
   );

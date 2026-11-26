@@ -295,6 +295,9 @@ TuiParentApproval tui-approval-simulate-nonideal simulate -simulate num=20000 -d
 #                                                   ShownOnlyWhileWaiting
 #     lend-under-picker a view lends the card under the picker it opened
 #                                                    CardYieldsToPicker
+#     stale-pick        a continue keeps its pick       OnceForTheWait
+#     own-model-keeps-pick  the own-screen model does not beat an older pick
+#                                                    LatestChoiceWins
 #   The simulate pair runs under ideal and non-ideal conditions.
 #
 #   view-waits-chart is the same design with one child in each tree, small enough
@@ -317,6 +320,7 @@ ViewWaits view-waits-mutant-view-only OwnScreenActable
 ViewWaits view-waits-mutant-row-as-wait ShownOnlyWhileWaiting
 ViewWaits view-waits-mutant-lend-under-picker CardYieldsToPicker
 ViewWaits view-waits-mutant-stale-pick OnceForTheWait
+ViewWaits view-waits-mutant-own-model-keeps-pick LatestChoiceWins
 ViewWaits view-waits-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
 ViewWaits view-waits-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
 VERDICTS
