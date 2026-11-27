@@ -12808,10 +12808,20 @@ describe("acp: model-independent", () => {
   const reloadChildOutcomes = (home: string, id: string): string[] =>
     (logLines(home, id) as any[]).filter((line) => line.kind === "child_finished").map((line) => line.outcome);
 
-  /** Whether a subagent's approval request is registered and its turn waits for the answer. The hook that
-   * says it asks comes earlier, while the request is still being prepared. */
-  const approvalWaitRegistered = (tracePath: string): boolean =>
-    existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("approval_wait_registered");
+  /** Reads the client's messages into `messages` until `done` holds. */
+  async function readMessagesUntilDone(client: AcpClient, messages: any[], done: () => boolean) {
+    while (!done()) messages.push(await client.readLine(TIMEOUT));
+  }
+  const approvalRequestFor = (messages: any[], name: string) =>
+    messages.find((message) => message.method === "session/request_permission" && message.params?._meta?.fx?.subagent?.name === name);
+  const approvalWithdrawn = (messages: any[], requestId: number) =>
+    messages.some((message) => message.method === "$/cancel_request" && message.params?.requestId === requestId);
+  const approvalResponseTo = (messages: any[], id: number) =>
+    messages.find((message) => message.id === id && (message.result !== undefined || message.error !== undefined));
+  const cardStatuses = (messages: any[], toolCallId: string): string[] =>
+    messages
+      .filter((message) => message.method === "session/update" && message.params?.update?.toolCallId === toolCallId)
+      .map((message) => message.params.update.status);
 
   for (const via of ["session/load", "session/resume"] as const) {
     test(
@@ -12925,26 +12935,26 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
-  // In ACP a subagent's question never goes to the client: it waits for an
-  // approval that only the terminal app's menu gives, and a cancel does not end
-  // that wait. A reload stops such a subagent, as it always did, so the session
-  // is not left with a turn that waits for ever (until #1722 closes a
-  // subagent's requests when its prompt ends).
+  // A subagent that asks for an approval asks the client through its parent
+  // session. A session/cancel or a session/load closes that prompt, which
+  // withdraws the subagent's request: its card ends failed, no action runs,
+  // and a late answer runs nothing.
   test(
-    "ACP session/load stops a subagent that waits for an approval, which session/cancel leaves waiting",
+    "a subagent's wait for an approval ends when session/cancel or session/load closes its prompt",
     async () => {
-      const seen: Record<string, { outcomesBefore: string[]; note: string; stopReason: string; requests: number }> = {};
       for (const via of ["session/cancel", "session/load"] as const) {
         const root = createIsolatedRoot("fx-acp-reload-approval-");
         const target = join(root.external, "child-write.txt");
-        const tracePath = join(root.root, "trace.log");
         writeFileSync(
           join(root.home, ".fx", "settings.json"),
           JSON.stringify({ permission: { edit: { [`${root.external}/**`]: "ask" } } }),
         );
         const gateway = startDynamicFakeGateway((body) => {
-          // The writer's one request: its write waits for an approval.
-          if (!body.includes('"name":"subagent"')) return fileToolCall("child_write", target, "blocked\n");
+          // The writer asks once to write. Once the refusal is in its conversation, it finishes.
+          if (!body.includes('"name":"subagent"')) {
+            if (body.includes("child_write")) return finalText("ACP_WRITER_FINISHED");
+            return fileToolCall("child_write", target, "blocked\n");
+          }
           if (acpLatestUserIsReport(body)) return finalText("ACP_RELOAD_APPROVAL_REPORT_SEEN");
           if (acpLatestPromptText(body).includes("Report the writer's state")) return finalText("ACP_RELOAD_APPROVAL_NOTED");
           if (body.includes("reload_approval_call")) return finalText("ACP_RELOAD_APPROVAL_PARENT_DONE");
@@ -12954,45 +12964,42 @@ describe("acp: model-independent", () => {
         });
         let acp: AcpClient | null = null;
         try {
-          acp = await AcpClient.create({
-            cwd: root.workspace,
-            env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp,subagent" },
-          });
+          acp = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          acp.setPermissionOption(null);
           const sessionId = await startAutoSession(acp, true);
+          const messages: any[] = [];
           sendPrompt(acp, 7501, "Start the writing subagent.");
-          await waitForCondition("the parent's finished turn and the writer's request", () => gateway.requests.length === 3, TIMEOUT);
-          await waitForCondition("the writer's wait for an approval", () => approvalWaitRegistered(tracePath), TIMEOUT);
+          await readMessagesUntilDone(acp, messages, () => approvalRequestFor(messages, "writer") !== undefined);
+          const request = approvalRequestFor(messages, "writer");
+          expect(request.params.sessionId).toBe(sessionId);
+          const cardId = request.params.toolCall.toolCallId;
 
           acp.send(via === "session/cancel"
             ? { jsonrpc: "2.0", id: 7502, method: "session/cancel", params: {} }
             : { jsonrpc: "2.0", id: 7502, method: "session/load", params: { sessionId, mcpServers: [] } });
-          const stopped = await readUntilResponses(acp, [7501, 7502], TIMEOUT);
-          expect(stopped.responses.get(7501).result.stopReason).toBe("cancelled");
-          expect(stopped.responses.get(7502).error).toBeUndefined();
-          expect(stopped.messages.some((message: any) => message.method === "session/request_permission")).toBe(false);
-          const outcomesBefore = reloadChildOutcomes(root.home, sessionId);
+          await readMessagesUntilDone(acp, messages, () =>
+            approvalWithdrawn(messages, request.id) &&
+            approvalResponseTo(messages, 7501) !== undefined &&
+            approvalResponseTo(messages, 7502) !== undefined);
+          expect(approvalResponseTo(messages, 7501).result.stopReason).toBe("cancelled");
+          expect(approvalResponseTo(messages, 7502).error).toBeUndefined();
+          // The card closed as failed before the prompt answered.
+          const closedAt = messages.findIndex((message) =>
+            message.params?.update?.toolCallId === cardId && message.params.update.status === "failed");
+          expect(closedAt).toBeGreaterThanOrEqual(0);
+          expect(closedAt).toBeLessThan(messages.indexOf(approvalResponseTo(messages, 7501)));
 
-          const base = gateway.requests.length;
+          // A late answer runs nothing.
+          acp.send({ jsonrpc: "2.0", id: request.id, result: { outcome: { outcome: "selected", optionId: "allow_once" } } });
           sendPrompt(acp, 7503, "Report the writer's state.");
-          await waitForCondition("the next prompt's first request", () => gateway.requests.length > base, TIMEOUT);
-          // Wherever the request puts the turn's list of subagents, it holds the writer's line.
-          const note = JSON.stringify(acpGatewayRequest(gateway.requests[base]!.body)).match(/- writer: [^\\"]*/)?.[0] ?? "";
-          if (via === "session/cancel") {
-            // The wait goes on, so the prompt does too, until the user cancels it.
-            acp.send({ jsonrpc: "2.0", id: 7504, method: "session/cancel", params: {} });
-          }
-          const ended = await readUntilResponses(acp, via === "session/cancel" ? [7503, 7504] : [7503], TIMEOUT);
+          await readMessagesUntilDone(acp, messages, () => approvalResponseTo(messages, 7503) !== undefined);
+          expect(approvalResponseTo(messages, 7503).result.stopReason).toBe("end_turn");
           expect(existsSync(target)).toBe(false);
-          seen[via] = { outcomesBefore, note, stopReason: ended.responses.get(7503).result.stopReason, requests: gateway.requests.length - base };
-          if (via === "session/load") {
-            // The prompt ended by itself: its own turn, then the writer's report, which says it was stopped.
-            const reportTurn = gateway.requests[base + 1]!.body;
-            expect(acpLatestUserIsReport(reportTurn)).toBe(true);
-            expect(reportTurn).toContain("fx stopped before it finished");
-            const trace = readFileSync(tracePath, "utf8");
-            expect(trace).toContain("event=reload_interrupted_approval_waits");
-            expect(trace).toContain("count=1");
-          }
+          expect(cardStatuses(messages, cardId).at(-1)).toBe("failed");
+          // The writer read that the prompt ended, not that anyone denied it.
+          const refusal = gateway.requests.find((seenRequest) =>
+            !seenRequest.body.includes('"name":"subagent"') && seenRequest.body.includes("child_write"));
+          expect(refusal?.body).toContain("fx could not ask because the prompt it belongs to ended or was cancelled");
           expect(acp.stderr).toBe("");
         } finally {
           await acp?.close();
@@ -13000,22 +13007,12 @@ describe("acp: model-independent", () => {
           rmSync(root.root, { recursive: true, force: true });
         }
       }
-      // A cancel leaves the writer waiting: nothing finished, and the list names it as still going. (The
-      // hook that says it asks comes just before its phase turns to waiting for an approval, so the list
-      // may still say working.)
-      const going = /^- writer: (working|waiting for an approval)\. For: Write the file\.$/;
-      expect(seen["session/cancel"]!.outcomesBefore).toEqual([]);
-      expect(seen["session/cancel"]!.note).toMatch(going);
-      // A reload ends the wait: the work ended interrupted, and the next prompt needs no cancel.
-      expect(seen["session/load"]!.outcomesBefore).toEqual(["interrupted"]);
-      expect(seen["session/load"]!.stopReason).toBe("end_turn");
-      expect(seen["session/load"]!.requests).toBe(2);
     },
     TIMEOUT * 2,
   );
 
   test(
-    "ACP session/load stops only the subagent that waits for an approval, and another one goes on and reports",
+    "ACP session/load withdraws only the request a subagent waits on, and another subagent goes on and reports",
     async () => {
       const root = createIsolatedRoot("fx-acp-reload-approval-other-");
       const target = join(root.external, "child-write.txt");
@@ -13026,8 +13023,11 @@ describe("acp: model-independent", () => {
       const holder = deferred<Response>();
       const gateway = startDynamicFakeGateway((body) => {
         if (!body.includes('"name":"subagent"')) {
-          // The writer's write waits for an approval; the other subagent's one request is held.
-          return acpPromptText(body).includes("Write the file.") ? fileToolCall("child_write", target, "blocked\n") : holder.promise;
+          // The writer asks once to write, and finishes once its refusal is in its conversation.
+          if (body.includes("child_write")) return finalText("ACP_WRITER_FINISHED");
+          return acpPromptText(body).includes("Write the file.")
+            ? fileToolCall("child_write", target, "blocked\n")
+            : holder.promise;
         }
         if (acpLatestUserIsReport(body)) return finalText("ACP_RELOAD_TWO_REPORT_SEEN");
         if (acpLatestPromptText(body).includes("Confirm the reloaded session")) return finalText("ACP_RELOAD_TWO_FOLLOWUP");
@@ -13041,39 +13041,37 @@ describe("acp: model-independent", () => {
           request: { action: "message", agent: "writer", message: "Write the file." },
         });
       });
-      const tracePath = join(root.root, "trace.log");
       let acp: AcpClient | null = null;
       try {
-        acp = await AcpClient.create({
-          cwd: root.workspace,
-          env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp,subagent" },
-        });
+        acp = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        acp.setPermissionOption(null);
         const sessionId = await startAutoSession(acp, true);
+        const messages: any[] = [];
         sendPrompt(acp, 7601, "Start both subagents.");
-        // The parent's two calls and its turn after each, the writer's request, and the held one.
-        await waitForCondition("both subagents' requests", () => gateway.requests.length === 5, TIMEOUT);
-        await waitForCondition("the writer's wait for an approval", () => approvalWaitRegistered(tracePath), TIMEOUT);
+        await readMessagesUntilDone(acp, messages, () => approvalRequestFor(messages, "writer") !== undefined);
+        await waitForCondition("the held subagent's turn", () =>
+          gateway.requests.some((seenRequest) => seenRequest.body.includes("Stay busy.")), TIMEOUT);
+        const request = approvalRequestFor(messages, "writer");
 
         acp.send({ jsonrpc: "2.0", id: 7602, method: "session/load", params: { sessionId, mcpServers: [] } });
-        const reloaded = await readUntilResponses(acp, [7601, 7602], TIMEOUT);
-        expect(reloaded.responses.get(7602).error).toBeUndefined();
-        // The writer's work ended interrupted, and the holder's goes on.
-        expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["interrupted"]);
+        await readMessagesUntilDone(acp, messages, () =>
+          approvalWithdrawn(messages, request.id) &&
+          approvalResponseTo(messages, 7601) !== undefined &&
+          approvalResponseTo(messages, 7602) !== undefined);
+        expect(approvalResponseTo(messages, 7602).error).toBeUndefined();
+        expect(cardStatuses(messages, request.params.toolCall.toolCallId).at(-1)).toBe("failed");
 
-        // The prompt runs the writer's report, then waits for the holder.
-        const base = gateway.requests.length;
+        // The writer reads its refusal. The next prompt waits for the held subagent's report, so the holder is released here.
+        await waitForCondition("the writer's refusal", () =>
+          gateway.requests.some((seenRequest) => !seenRequest.body.includes('"name":"subagent"') && seenRequest.body.includes("child_write")), TIMEOUT);
         sendPrompt(acp, 7603, "Confirm the reloaded session is usable.");
-        await waitForCondition("the prompt's turn and the writer's report", () => gateway.requests.length === base + 2, TIMEOUT);
-        expect(acpLatestUserIsReport(gateway.requests[base + 1]!.body)).toBe(true);
-        expect(gateway.requests[base + 1]!.body).toContain("fx stopped before it finished");
-        expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["interrupted"]);
-
         holder.resolve(finalText("HOLDER_DONE"));
-        const ended = await readUntilResponses(acp, [7603], TIMEOUT);
-        expect(ended.responses.get(7603).result.stopReason).toBe("end_turn");
-        expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["interrupted", "ok"]);
-        expect(gateway.requests.length).toBe(base + 3);
-        expect(gateway.requests[base + 2]!.body).toContain("HOLDER_DONE");
+        await readMessagesUntilDone(acp, messages, () => approvalResponseTo(messages, 7603) !== undefined);
+        expect(approvalResponseTo(messages, 7603).result.stopReason).toBe("end_turn");
+        // The holder's report and the writer's report both reached the parent.
+        const reports = gateway.requests.filter((seenRequest) => acpLatestUserIsReport(seenRequest.body)).map((seenRequest) => seenRequest.body);
+        expect(reports.some((body) => body.includes("HOLDER_DONE"))).toBe(true);
+        expect(reports.some((body) => body.includes("ACP_WRITER_FINISHED"))).toBe(true);
         expect(existsSync(target)).toBe(false);
         expect(acp.stderr).toBe("");
       } finally {

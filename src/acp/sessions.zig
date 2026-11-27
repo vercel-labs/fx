@@ -1106,10 +1106,9 @@ fn sameSessionId(active_session_id: []const u8, requested_session_id: []const u8
 /// the cancel flag, and the pending outbound requests of a kept child, such as
 /// an MCP elicitation, which end cancelled as they do after `session/cancel`.
 ///
-/// A child that waits on an approval is stopped, as the reload always did,
-/// since in ACP an approval reaches no client and the wait would last until
-/// the child's turn ends (#1722 changes that). Its work ends interrupted and
-/// owes its report. The other children go on.
+/// A child that waits on an approval is not stopped. The prompt's end closes
+/// its open subagent requests (`closeSubagentAsks`), so the wait is refused
+/// and the child goes on to its report. The other children go on too.
 ///
 /// What the reload may not do to a working child is destroy the MCP host its
 /// tool context holds. So a session with no working subagent swaps its host
@@ -1130,12 +1129,6 @@ fn reloadActiveSession(
     const active = &state.active_session.?;
     const session_id = active.session_id;
     server.cancelAndReapActivePrompt(state);
-    if (state.subagent_host) |subagents| {
-        const interrupted = subagents.interruptApprovalWaits();
-        if (interrupted > 0) {
-            debug_trace.logf("acp", "event=reload_interrupted_approval_waits session={s} count={d} reason=approval_reaches_no_client", .{ session_id, interrupted });
-        }
-    }
     const previous_host = active.mcp_host;
     const subagents_working = if (state.subagent_host) |subagents| !subagents.quiet() else false;
     const in_place = subagents_working and previous_host != null;
