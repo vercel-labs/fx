@@ -101,6 +101,8 @@ async function showAgentAfter(session: TmuxSession, anchor: string, name: string
 // The person types the task on the subagent's own screen, so its turn is theirs
 // and its approval is answered there.
 async function typeChildTask(session: TmuxSession, agent: string, ready: string, task: string) {
+  // Ctrl+X is ignored until another agent exists and the footer offers the switch.
+  await waitShows(session, "the agent switch shortcut", (pane) => / (?:↓|· ctrl\+x) *$/m.test(pane));
   await showNamedAgent(session, agent);
   await session.waitForPane((pane) => pane.includes(ready), 30_000);
   await session.sendText(task);
