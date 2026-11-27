@@ -2309,6 +2309,14 @@ pub fn Runtime(comptime App: type) type {
             return recoverCredentialFailure(app, agent, source, err);
         }
 
+        /// The screen `agent`'s notices show on: main's, or a subagent's own
+        /// view, named by the agent's address.
+        fn noticeScreen(app: *App, agent: *AppAgent) auth_runtime.NoticeScreen {
+            if (comptime !@hasField(App, "main_agent")) return auth_runtime.main_notice_screen;
+            if (agent == &app.main_agent) return auth_runtime.main_notice_screen;
+            return @intFromPtr(agent);
+        }
+
         fn recoverCredentialFailure(app: *App, agent: *AppAgent, source: credentials.Source, err: anyerror) !bool {
             debug_trace.logf("auth", "prompt credential refresh failed source={t} err={s}", .{ source, @errorName(err) });
             if (config_runtime.sessionConnectionNotice(err)) |notice| {
@@ -2329,7 +2337,7 @@ pub fn Runtime(comptime App: type) type {
             const notify = !compactionOwnsCredentialFeedback(app, agent);
             const should_notify = if (app.auth.credentialSource() == source and
                 comptime @hasDecl(@TypeOf(app.auth), "recordCredentialFailure"))
-                app.auth.recordCredentialFailure(failure, .{ .notify = notify })
+                app.auth.recordCredentialFailure(failure, .{ .notify = notify, .screen = noticeScreen(app, agent) })
             else
                 notify;
             if (!should_notify) return false;
@@ -2773,7 +2781,7 @@ const TestAuth = struct {
     logout_reconcile_count: usize = 0,
     source_inventory_refresh_count: usize = 0,
     credential_failure: ?auth_runtime.CredentialFailure = null,
-    credential_notice_claimed: bool = false,
+    credential_notice_screen: ?auth_runtime.NoticeScreen = null,
     picker_opened: bool = false,
     picker_provider: model_provider.ProviderId = .gateway,
     picker_closed: bool = false,
@@ -3009,7 +3017,7 @@ const TestAuth = struct {
     pub fn recordCredentialFailure(
         self: *TestAuth,
         failure: auth_runtime.CredentialFailure,
-        options: struct { notify: bool = true },
+        options: struct { notify: bool = true, screen: auth_runtime.NoticeScreen = auth_runtime.main_notice_screen },
     ) bool {
         const same_failure = if (self.credential_failure) |current|
             current.source == failure.source and current.reason == failure.reason
@@ -3017,10 +3025,10 @@ const TestAuth = struct {
             false;
         if (!same_failure) {
             self.credential_failure = failure;
-            self.credential_notice_claimed = false;
+            self.credential_notice_screen = null;
         }
-        if (!options.notify or self.credential_notice_claimed) return false;
-        self.credential_notice_claimed = true;
+        if (!options.notify or self.credential_notice_screen == options.screen) return false;
+        self.credential_notice_screen = options.screen;
         return true;
     }
 

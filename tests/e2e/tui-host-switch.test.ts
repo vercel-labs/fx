@@ -2603,6 +2603,59 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "a prompt on a subagent's screen says its sign-in refresh failed after main's screen showed the same failure",
+    async () => {
+      // A failed refresh of the saved login parks the prompt until the person
+      // retries or signs in. Main's screen already told the person once; the
+      // subagent's screen must say so too, or it shows only "Thinking".
+      const issuer = startFakeIssuer({ refresh: () => new Response("unavailable", { status: 500 }) });
+      const subagentAsked: string[] = [];
+      let mainCalls = 0;
+      try {
+        await withFx((body) => {
+          if (!isMainRequest(body)) {
+            subagentAsked.push(latestUserText(body));
+            return text(`road_${subagentAsked.length}`, "SWITCH_ROAD_DONE");
+          }
+          mainCalls += 1;
+          if (mainCalls === 1) return toolCall("main_road", "subagent", { request: { action: "message", agent: "roadmap", message: "SWITCH_ROAD_TASK" } });
+          return text(`main_${mainCalls}`, `SWITCH_MAIN_${mainCalls}`);
+        }, async (session, { home }) => {
+          await session.sendText("SWITCH_USER start the roadmap");
+          await session.waitForText("roadmap finished", 30_000);
+          await session.waitForComposer(15_000);
+
+          // The saved login is now past its refresh deadline, and the issuer
+          // cannot refresh it.
+          writeFxLogin(home, issuer.issuerUrl, "seeded-token", { expiresAtMs: Date.now() - 120_000 });
+          await session.sendText("SWITCH_MAIN_AFTER_EXPIRY");
+          await session.waitForText("credential refresh failed", 30_000);
+          // Ctrl+C drops that prompt; the failure it reported stays recorded.
+          await session.sendKeys("C-c");
+          await until("main's prompt dropped", () => traceText().includes("reason=ctrl_c_pending_submission"), 15_000);
+
+          await showAgent(session, "roadmap");
+          await session.waitForPane((pane) => pane.includes("roadmap \u00b7 "), 15_000);
+          await session.sendText("SWITCH_ROAD_PROMPT after the failure");
+          const pane = await session.waitForPane(
+            (shown) => shown.includes("SWITCH_ROAD_PROMPT") && shown.includes("credential refresh failed"),
+            30_000,
+          );
+          expect(pane).toContain("press enter to retry. Your prompt is saved.");
+          expect(subagentAsked.some((asked) => asked.includes("SWITCH_ROAD_PROMPT"))).toBe(false);
+        }, (home) => writeFxLogin(home, issuer.issuerUrl, "seeded-token"), false, {
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          AI_GATEWAY_API_KEY: undefined as unknown as string,
+        });
+      } finally {
+        issuer.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "main's status says working for a subagent whose request waits for a sign-in, and main is told only the user can continue it",
     async () => {
       const issuer = startFakeIssuer({ refresh: () => Response.json({ error: "invalid_grant" }, { status: 400 }) });
