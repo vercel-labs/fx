@@ -6182,12 +6182,16 @@ test.skipIf(!tmuxAvailable())(
 
 // What the person sends while Ctrl+G waits for a working subagent. A prompt
 // goes out at once and fx restarts once the subagent is done; `/new` leaves
-// the subagent's session, so fx restarts into the new one at once.
-for (const sent of ["prompt", "/new"] as const) {
+// the subagent's session, so fx restarts into the new one at once; `/launch`
+// after the prompt opens another instance, and fx still restarts into the
+// conversation Ctrl+G asked for.
+for (const sent of ["prompt", "/new", "/launch"] as const) {
   test.skipIf(!tmuxAvailable())(
     sent === "prompt"
       ? "upgrade ctrl-g sends a prompt typed while a subagent works at once, and restarts only when idle"
-      : "upgrade ctrl-g after /new while a subagent works restarts into the new session",
+      : sent === "/new"
+        ? "upgrade ctrl-g after /new while a subagent works restarts into the new session"
+        : "upgrade ctrl-g after /launch while a subagent works restarts into the conversation it asked for",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-send-")));
       const home = join(root, "home");
@@ -6215,6 +6219,7 @@ for (const sent of ["prompt", "/new"] as const) {
           await soloReleased;
           return fakeGatewayFinalText("SOLO_DONE");
         }
+        if (body.includes("AFTER_RELAUNCH")) return fakeGatewayFinalText("ANSWER_AFTER_RELAUNCH");
         if (body.includes("SOLO_DONE")) return fakeGatewayFinalText("MAIN_SAW_REPORT");
         if (body.includes("SEND_NOW_PROMPT")) return fakeGatewayFinalText("SENT_AT_ONCE");
         if (!body.includes('"main_solo"')) {
@@ -6254,7 +6259,7 @@ for (const sent of ["prompt", "/new"] as const) {
         await active.waitForPane((pane) => /restart (?:waits|pending)/.test(pane), TIMEOUT);
         const version = (await runFx(["--version"])).stdout.trim();
 
-        if (sent === "prompt") {
+        if (sent !== "/new") {
           // A prompt sent now goes out at once: the pending restart never holds it.
           await active.sendText("SEND_NOW_PROMPT");
           const answered = await active.waitForPane(
@@ -6270,6 +6275,12 @@ for (const sent of ["prompt", "/new"] as const) {
           await active.waitForText("update ready · restarts when idle · ctrl+g cancels", TIMEOUT);
           expect(relaunched()).toBe(false);
 
+          if (sent === "/launch") {
+            // Another instance comes on screen while the restart waits.
+            await active.sendText("/launch");
+            await active.waitForPane((pane) => pane.includes("fx 2"), TIMEOUT);
+          }
+
           // Once the subagent finishes and main reads its report, fx is idle
           // and restarts on its own. The prompt is not sent again.
           releaseSolo();
@@ -6280,10 +6291,20 @@ for (const sent of ["prompt", "/new"] as const) {
         }
         await active.waitForText(`✓ fx has been updated to v${version} (notes)`, TIMEOUT);
         expect(relaunched()).toBe(true);
-        expect(promptRequests()).toBe(sent === "prompt" ? 1 : 0);
+        expect(promptRequests()).toBe(sent === "/new" ? 0 : 1);
         const stderr = readFileSync(stderrPath, "utf8");
         expect(stderr).not.toContain("relaunch failed");
         expect(stderr).not.toContain("no validated resume handoff");
+
+        if (sent === "/launch") {
+          // The relaunch reopened main's conversation: the next prompt carries
+          // the prompt sent during the wait.
+          await active.waitForComposer(TIMEOUT);
+          await active.sendText("AFTER_RELAUNCH");
+          await active.waitForText("ANSWER_AFTER_RELAUNCH", TIMEOUT);
+          const after = gateway.requests.find((request) => request.body.includes("AFTER_RELAUNCH"));
+          expect(after?.body).toContain("SEND_NOW_PROMPT");
+        }
 
         await active.waitForComposer(TIMEOUT);
         await active.sendText("/quit");

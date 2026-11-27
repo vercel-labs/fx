@@ -136,14 +136,15 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// Asks the agent on screen for the resume handoff again, as Ctrl+G
-        /// does, since what ran while the restart waited for idle can have
-        /// switched or closed the session Ctrl+G asked (`/new`, `/resume`).
-        /// When the session cannot hand off, the restart is cancelled with a
-        /// notice rather than relaunching without it.
+        /// Keeps the resume handoff Ctrl+G asked for while some agent still
+        /// holds it. What ran while the restart waited for idle can have
+        /// closed that session (`/new`, `/resume`), which drops the handoff;
+        /// then the agent on screen is asked again, as Ctrl+G does. When it
+        /// cannot hand off, the restart is cancelled with a notice rather than
+        /// relaunching without one.
         fn handOffForIdleRestart(app: *App) bool {
+            if (anyAgentHoldsUpgradeHandoff(app)) return true;
             const agent = agents.screenAgentOf(app);
-            cancelUpgradeHandoffs(app);
             app.prepareResumeHandoffForUpgrade(agent) catch |err| {
                 app.upgrader.cancelRestart();
                 debug_trace.logf("upgrade", "event=restart_cancelled reason=handoff_unavailable err={s}", .{@errorName(err)});
@@ -160,6 +161,26 @@ pub fn Runtime(comptime App: type) type {
             };
             app.requestResumeHandoffForUpgrade(agent);
             return true;
+        }
+
+        fn anyAgentHoldsUpgradeHandoff(app: *App) bool {
+            if (holdsUpgradeHandoff(&app.main_agent)) return true;
+            if (comptime @hasField(App, "child_agents")) {
+                for (app.child_agents.items) |child| {
+                    if (holdsUpgradeHandoff(&child.agent)) return true;
+                }
+            }
+            return false;
+        }
+
+        /// Whether `agent` holds the handoff an upgrade asked for
+        /// (`requestResumeHandoffForUpgrade`). The test app keeps it as a flag.
+        fn holdsUpgradeHandoff(agent: *const AppAgent) bool {
+            if (comptime @hasField(AppAgent, "session_persistence")) {
+                return agent.session_persistence.resume_handoff_intent == .upgrade_requested;
+            }
+            if (comptime @hasField(AppAgent, "upgrade_handoff")) return agent.upgrade_handoff;
+            return false;
         }
 
         /// What the composer holds that exiting would lose, as the notice
@@ -1177,11 +1198,30 @@ test "app_upgrade_runtime lets a prompt sent while the restart waits go on, and 
     try std.testing.expect(!app.should_exit);
     app.needs_user_elsewhere = null;
 
-    // Idle: the agent on screen is asked for the handoff again, and fx
+    // Idle: the handoff Ctrl+G asked for still holds, so it is kept, and fx
     // exits for the relaunch.
     Runtime(TestApp).collectUpgradeFacts(&app);
     try std.testing.expect(app.should_exit);
     try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 1), app.request_handoff_count);
+    try std.testing.expect(app.agent().upgrade_handoff);
+}
+
+test "app_upgrade_runtime asks the agent on screen for the handoff again when a session switch dropped it" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    var deps_state = TestDepsState{};
+    _ = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expect(Runtime(TestApp).restartWhenIdleForPrompt(&app));
+
+    // `/new` closed the session Ctrl+G asked, which drops its handoff.
+    app.turn_running = false;
+    app.agent().upgrade_handoff = false;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(app.should_exit);
     try std.testing.expectEqual(@as(usize, 2), app.prepare_count);
     try std.testing.expectEqual(@as(usize, 2), app.request_handoff_count);
     try std.testing.expect(app.agent().upgrade_handoff);
@@ -1199,6 +1239,7 @@ test "app_upgrade_runtime cancels a restart put off until idle when the session 
     // A session switch while it waited, such as `/new`, closed the session
     // Ctrl+G asked; the one on screen now cannot hand off.
     app.turn_running = false;
+    app.agent().upgrade_handoff = false;
     app.prepare_error = error.SessionPersistenceUnavailable;
     Runtime(TestApp).collectUpgradeFacts(&app);
     try std.testing.expect(!app.should_exit);
