@@ -186,14 +186,10 @@ jobs:
             fi
           done
 
-      - name: Point dev channel at this commit
-        id: point-dev
+      - name: Decide whether the dev channel moves
+        id: forward
         run: |
           set -euo pipefail
-          echo "updated=false" >> "$GITHUB_OUTPUT"
-
-          # Move forward only. CI on main often ends after newer commits merge,
-          # so this build may be behind main and still newer than dev.json.
           # dev.json is read through the CDN, which caches it for 60 seconds.
           # Runs go one at a time and each builds for minutes before this
           # step, so the read sees the previous run's write unless the CDN
@@ -202,32 +198,17 @@ jobs:
           if [ -z "$CURRENT_SHA" ]; then
             echo "::warning::could not read a commit from dev.json; only main's newest commit may replace it"
           fi
-          CURRENT_KNOWN=false
-          if [ -n "$CURRENT_SHA" ] && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null; then
-            CURRENT_KNOWN=true
-          fi
-          if [ "$CURRENT_KNOWN" = true ] && [ "$CURRENT_SHA" != "$RELEASE_SHA" ] &&
-            git merge-base --is-ancestor "$RELEASE_SHA" "$CURRENT_SHA"; then
-            echo "dev.json names ${CURRENT_SHA}, which already includes ${RELEASE_SHA}; leaving it unchanged"
-            exit 0
-          elif [ "$CURRENT_KNOWN" = true ] && git merge-base --is-ancestor "$CURRENT_SHA" "$RELEASE_SHA"; then
-            # Equal commits land here too, so a rerun writes dev.json again
-            # and retries the fx-web deploy.
-            echo "dev.json names ${CURRENT_SHA}; pointing it at ${RELEASE_SHA}"
-          else
-            # The pointer is unreadable or outside this history, so only
-            # main's newest commit may replace it.
-            MAIN_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
-            if [ "$MAIN_SHA" != "$RELEASE_SHA" ]; then
-              if [ -z "$CURRENT_SHA" ]; then
-                echo "dev.json could not be read, and main advanced to ${MAIN_SHA}; leaving dev.json unchanged"
-              else
-                echo "dev.json commit ${CURRENT_SHA} is not in the history of ${RELEASE_SHA}, and main advanced to ${MAIN_SHA}; leaving dev.json unchanged"
-              fi
-              exit 0
-            fi
-          fi
+          MAIN_SHA=$(timeout 60 git ls-remote origin refs/heads/main | cut -f1) || MAIN_SHA=""
+          # The rule comes from this workflow's own commit, since the build's
+          # checkout can be older than the script.
+          git show "${GITHUB_SHA}:scripts/dev-channel-forward.sh" > "$RUNNER_TEMP/dev-channel-forward.sh"
+          bash "$RUNNER_TEMP/dev-channel-forward.sh" "$CURRENT_SHA" "$RELEASE_SHA" "$MAIN_SHA"
 
+      - name: Point dev channel at this commit
+        id: point-dev
+        if: steps.forward.outputs.move == 'true'
+        run: |
+          set -euo pipefail
           VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
           jq -n --arg version "$VERSION" --arg commit "$RELEASE_SHA" \
             '{version: $version, commit: $commit}' > /tmp/dev.json
