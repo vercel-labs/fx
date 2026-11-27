@@ -2689,7 +2689,7 @@ test "ACP interrupted history replay hides model-only abort context" {
     defer captured_file.close(io_mod.getIo());
     const captured = try io_mod.readFileToEnd(alloc, &captured_file, 16 * 1024);
     defer alloc.free(captured);
-    try std.testing.expect(std.mem.find(u8, captured, "cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "Cancelled") != null);
     try std.testing.expect(std.mem.find(u8, captured, "Interrupted by user after completing") == null);
     try std.testing.expect(std.mem.find(u8, captured, "<turn_aborted>") == null);
 }

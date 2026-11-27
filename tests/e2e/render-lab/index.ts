@@ -2138,6 +2138,7 @@ class RenderLabTmux {
     const command = renderLabPaneCommand(zshPath(), {
       FX_DISABLE_KEYCHAIN: "1",
       FX_TEST_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_WORKSPACE_TRUST: "1",
       HOME: opts.fixture.home,
       ZDOTDIR: opts.fixture.zdotdir,
       HISTFILE: opts.fixture.histfile,
@@ -2324,6 +2325,7 @@ function testEnv(fixture: Fixture, manifest: RenderLabManifest): NodeJS.ProcessE
   const env: NodeJS.ProcessEnv = fxChildEnv();
   env.FX_DISABLE_KEYCHAIN = "1";
   env.FX_TEST_SKIP_ONBOARDING = "1";
+  env.FX_TEST_SKIP_WORKSPACE_TRUST = "1";
   env.HOME = fixture.home;
   env.ZDOTDIR = fixture.zdotdir;
   env.HISTFILE = fixture.histfile;

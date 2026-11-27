@@ -555,9 +555,9 @@ pub const Runtime = struct {
         /// next is the one it had before, not a sign-in. Only the moments after the refusal count:
         /// see `refusalRecent`.
         refused_new_ms: ?i64 = null,
-        /// What `dropped_tools` counted in the list whose `fingerprint` is `dropped_key`, so a list is read once and
+        /// What `dropped_tools` made of the list whose `fingerprint` is `dropped_key`, so a list is read once and
         /// not at every status snapshot.
-        dropped_here: mcp.tools.Dropped = .{},
+        read_here: dropped_tools.Reading = .{},
         dropped_key: ?u64 = null,
     };
 
@@ -2458,7 +2458,11 @@ pub const Runtime = struct {
             }
             if (o.state == .ready) {
                 o.dropped = st.dropped;
-                o.dropped.merge(r.hostDropped(i, s.name));
+                // The tools it counts are the ones it lists and the model gets: the host's reading keeps them.
+                if (r.hostReading(i, s.name)) |read| {
+                    o.dropped.merge(read.dropped);
+                    o.tools = read.kept;
+                }
             }
             if (r.instructionsOf(s.name)) |t| o.instructions = try a.dupe(u8, t);
         }
@@ -2589,20 +2593,21 @@ pub const Runtime = struct {
         return r.engine.needTools(name);
     }
 
-    /// What the host's reading refuses in server `name`'s list now, counted again only when the list changed. A count
-    /// that ran out of memory is left for the next snapshot to try again.
-    fn hostDropped(r: *Runtime, i: usize, name: []const u8) mcp.tools.Dropped {
-        const list = r.toolListOf(name) catch return .{};
+    /// What the host's reading makes of server `name`'s list now, read again only when the list changed: the tools it
+    /// keeps and the ones it leaves out. Null when the list can't be read now, or the count ran out of memory, which
+    /// the next snapshot tries again.
+    fn hostReading(r: *Runtime, i: usize, name: []const u8) ?dropped_tools.Reading {
+        const list = r.toolListOf(name) catch return null;
         const key = list.fingerprint();
         const flags = &r.flags[i];
-        if (flags.dropped_key == key) return flags.dropped_here;
-        flags.dropped_here = dropped_tools.count(r.gpa, list) catch |err| {
+        if (flags.dropped_key == key) return flags.read_here;
+        flags.read_here = dropped_tools.reading(r.gpa, list) catch |err| {
             debug_trace.logf("mcp", "MCP left-out tools not counted server={s} err={s}", .{ name, @errorName(err) });
             flags.dropped_key = null;
-            return .{};
+            return null;
         };
         flags.dropped_key = key;
-        return flags.dropped_here;
+        return flags.read_here;
     }
 
     fn toolListOf(r: *Runtime, name: []const u8) engine.Error!*const mcp.tools.List {
@@ -2785,14 +2790,26 @@ pub const Runtime = struct {
         };
     }
 
+    /// The tools of server `name`'s list that the host keeps (`dropped_tools.read`), each copied into `alloc`. One it
+    /// leaves out is traced here and is in no list.
     fn copyTools(r: *Runtime, alloc: Allocator, name: []const u8) Allocator.Error![]Tool {
         const list = r.toolListOf(name) catch return &.{};
-        const out = try alloc.alloc(Tool, list.len());
-        for (out, 0..) |*t, k| {
+        var out: std.ArrayList(Tool) = .empty;
+        var scratch: std.heap.ArenaAllocator = .init(r.gpa);
+        defer scratch.deinit();
+        for (0..list.len()) |k| {
             const tool = list.get(k);
-            t.* = .{ .name = try alloc.dupe(u8, tool.name), .raw = try alloc.dupe(u8, tool.raw) };
+            _ = scratch.reset(.retain_capacity);
+            switch (try dropped_tools.read(scratch.allocator(), tool.raw)) {
+                .tool => {},
+                .left_out => |left_out| {
+                    debug_trace.logf("mcp", "MCP tool left out server={s} tool={s} err={s}", .{ name, tool.name, @errorName(left_out.err) });
+                    continue;
+                },
+            }
+            try out.append(alloc, .{ .name = try alloc.dupe(u8, tool.name), .raw = try alloc.dupe(u8, tool.raw) });
         }
-        return out;
+        return out.items;
     }
 
     /// A login saved since by another fx, taken in place of asking for one;
@@ -3519,11 +3536,12 @@ test "tools fx leaves out of a list show in the status by reason, and a later li
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The engine skipped the second `echo`, and the host's reading refuses `odd`: two tools are left out, for two reasons.
-    try testing.expectEqual(@as(usize, 2), (try r.tools(a, "fake", null)).tools.len);
+    // The engine skipped the second `echo`, and the host's reading refuses `odd`: two tools are left out, for two reasons,
+    // and the list and the count have the one tool that is kept.
+    try testing.expectEqual(@as(usize, 1), (try r.tools(a, "fake", null)).tools.len);
     var status = (try r.statuses(a))[0];
     try testing.expectEqual(State.ready, status.state);
-    try testing.expectEqual(@as(usize, 2), status.tools);
+    try testing.expectEqual(@as(usize, 1), status.tools);
     try testing.expectEqual(@as(u32, 2), status.dropped.total());
     try testing.expectEqual(@as(u32, 1), status.dropped.counts[@backingInt(mcp.tools.Drop.repeated_name)]);
     try testing.expectEqual(@as(u32, 1), status.dropped.counts[@backingInt(mcp.tools.Drop.unusable)]);

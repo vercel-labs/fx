@@ -4,6 +4,7 @@ const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const env_settings = @import("../config/env_settings.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const shortcut_rules = @import("../shortcuts/shortcuts.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const host = @import("../hosts/host.zig");
@@ -56,9 +57,24 @@ const alternate_mouse_tracking_enter = "\x1b[?1000h\x1b[?1006h";
 var old_sigterm_action: ?std.posix.Sigaction = null;
 var old_sighup_action: ?std.posix.Sigaction = null;
 
+/// The tty mode fx found at startup. Written once, before the close handlers
+/// are installed, and only read by them after that.
+var found_termios: ?std.posix.termios = null;
+
+/// Puts back the tty mode fx found at startup. It runs in signal context, so it
+/// uses the raw call, whose result cannot be reported from there, and TCSANOW,
+/// which does not wait for queued output the way DRAIN and FLUSH do.
+/// `tests/tla/tui_close/TuiClose.tla` `TtyRestored` pins this restore.
+fn restoreFoundTty(fd: std.posix.fd_t) void {
+    const found = found_termios orelse return;
+    _ = std.c.tcsetattr(fd, .NOW, &found);
+}
+
 /// Restores terminal state, installs the default disposition, and re-raises.
-/// Must remain async-signal-safe: only `write(2)`, `sigaction(2)`, and `raise(3)`.
+/// Must remain async-signal-safe: only `tcsetattr(3)`, `write(2)`,
+/// `sigaction(2)`, and `raise(3)`.
 fn abnormalExitHandlerWithRestore(comptime restore: []const u8, sig: std.posix.SIG) void {
+    restoreFoundTty(std.posix.STDIN_FILENO);
     // Signal context cannot recover from a failed async-signal-safe write.
     _ = std.c.write(
         std.posix.STDOUT_FILENO,
@@ -83,9 +99,10 @@ fn tmuxAbnormalExitHandler(sig: std.posix.SIG) callconv(.c) void {
     abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, sig);
 }
 
-/// SIGHUP and SIGTERM close fx: a closed window, a logout, or a reboot. The
-/// handler only wakes `closerMain`, which saves the model request in flight
-/// outside signal context, marked as a clean close, so the next launch
+/// SIGINT, SIGTERM, and SIGHUP close fx: an outside interrupt, a closed window,
+/// a logout, or a reboot. The handler only wakes `closerMain`, which saves
+/// the model request in flight outside signal context, marked as a clean
+/// close, so the next launch
 /// resumes it without counting a crash (`RequestRecovery.closeActive`,
 /// `tests/tla/recovery/Resume.tla` NoFalseCrashQuestion). It then restores
 /// the terminal and re-raises as the handler did before. Without that
@@ -160,12 +177,14 @@ fn startCloser(tmux: bool) bool {
     return true;
 }
 
-/// Install handlers for SIGTERM and SIGHUP so an externally-terminated
-/// fx saves the request in flight and restores terminal state before dying.
-/// SIGINT is not included because raw mode disables terminal-generated
-/// SIGINT.
-pub fn installAbnormalExitHandlers(tmux: ?[]const u8) void {
+/// Installs handlers for SIGINT, SIGTERM, and SIGHUP, so an externally ended
+/// fx saves the request in flight and restores the tty and the screen before
+/// dying. Raw mode turns the terminal's own Ctrl-C into a key, so a SIGINT
+/// here comes from outside. Called before raw mode turns on, with the tty
+/// mode fx found at startup.
+pub fn installAbnormalExitHandlers(tmux: ?[]const u8, found: std.posix.termios) void {
     if (!shell_runtime.supports_resize_signal) return;
+    found_termios = found;
 
     const handler: std.posix.Sigaction.handler_fn = if (startCloser(tmux != null))
         closeSignalHandler
@@ -186,8 +205,14 @@ pub fn installAbnormalExitHandlers(tmux: ?[]const u8) void {
     var old_hup: std.posix.Sigaction = undefined;
     std.posix.sigaction(std.posix.SIG.HUP, &act, &old_hup);
     old_sighup_action = old_hup;
+
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
 }
 
+/// SIGINT keeps its close handler. The shutdown guard holds SIGINT ignored
+/// while the normal shutdown runs and restores this handler when it ends, so
+/// restoring SIGINT's old action here would cut that shutdown
+/// (`tests/tla/tui_close/TuiClose.tla` `ShutdownNotCut`).
 pub fn uninstallAbnormalExitHandlers() void {
     if (!shell_runtime.supports_resize_signal) return;
 
@@ -269,6 +294,8 @@ pub const StartupState = struct {
     notification_max: bool = false,
     theme_monitor_enabled: bool = false,
     theme: ?[]const u8 = null,
+    /// `shortcuts` from the profile, read by the same settings load as the rest.
+    personal_shortcuts: shortcut_rules.Map = .{},
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
         self.workspace_access.deinit(alloc);
@@ -943,6 +970,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.statusline_workspace = settings.statusline_workspace orelse false;
     state.session_title_generation = settings.session_titles orelse true;
     state.cache_warming = settings.cache_warming orelse true;
+    state.personal_shortcuts = if (settings.shortcuts) |map| map.* else .{};
     const sound_override = soundEnvOverride();
     const sound_on_override: ?bool = if (sound_override) |level| level != .off else null;
     const max_override: ?bool = if (sound_override) |level| level == .max else null;
@@ -1011,9 +1039,9 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.terminal_title,
     );
 
+    installAbnormalExitHandlers(io_mod.getenv("TMUX"), cfg.terminal.original_termios);
     try cfg.terminal.enableRawMode();
     cfg.terminal.installResizeSignal(cfg.resize_handler);
-    installAbnormalExitHandlers(io_mod.getenv("TMUX"));
     cfg.shell.layout = try cfg.terminal.queryLayout(cfg.footer_rows);
 
     record_tape.configureFromEnv(
@@ -1079,11 +1107,15 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
             .col = 1,
         };
     };
-    const start_row = blk: {
-        var row = cursor.row;
-        if (cursor.col > 1 and row < cfg.shell.layout.rows) row += 1;
-        break :blk row;
-    };
+    const start_row = shell_runtime.normalizeStartCursor(cfg.shell.layout, cursor).row;
+    if (cursor.row == 0 or cursor.row > cfg.shell.layout.rows) {
+        debug_trace.logf("render", "launch_cursor_clamped raw_row={d} raw_col={d} clamped_row={d} rows={d}", .{
+            cursor.row,
+            cursor.col,
+            start_row,
+            cfg.shell.layout.rows,
+        });
+    }
     var launch_start_row = start_row;
     const effective_startup_min_body_rows = if (cfg.takes_over_screen) kept: {
         // Scrolling here would move the old screen up until the first frame
@@ -1691,6 +1723,15 @@ fn emitShutdownCleanupAndResume(shell: *TranscriptRuntime, metrics: *Metrics) vo
     }
     _ = writeLifecycleTerminalBytes(shell, metrics, "\x1b[?7h\x1b[0m") catch {};
 
+    // Before a frame commits, this process has not drawn on the terminal, so
+    // erasing from a clamped startup row or printing a newline would disturb
+    // the previous screen (for example during an upgrade relaunch fallback).
+    if (!shell.has_committed_frame and !shell.footer_viewport.has_frame) {
+        // Best-effort visibility restore during shutdown; caller is already exiting.
+        _ = writeLifecycleTerminalBytes(shell, metrics, "\x1b[?25h") catch {};
+        return;
+    }
+
     var cursor_buf: [32]u8 = undefined;
     if (ui_terminal.moveCursorSequence(&cursor_buf, shutdownCleanupRow(shell), 1)) |cursor| {
         _ = writeLifecycleTerminalBytes(shell, metrics, cursor) catch {};
@@ -1935,10 +1976,7 @@ fn loadStartupStatusModel(alloc: Allocator, default_model: []const u8, configure
 }
 
 fn credentialOnboardingDisabled() bool {
-    const value = io_mod.getenv("FX_TEST_SKIP_ONBOARDING") orelse return false;
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (trimmed.len == 0) return false;
-    return !std.mem.eql(u8, trimmed, "0") and !std.ascii.eqlIgnoreCase(trimmed, "false");
+    return env_settings.testSwitchOn(io_mod.getenv("FX_TEST_SKIP_ONBOARDING"));
 }
 
 fn soundEnvOverride() ?env_settings.SoundPreset {
@@ -2497,6 +2535,58 @@ test "abnormal exit restoration leaves the alternate screen" {
     try std.testing.expect(std.mem.find(u8, normal_exit_restore, "\x1b[?2031l") != null);
 }
 
+test "installed close handlers cover SIGINT as they cover SIGTERM" {
+    if (!shell_runtime.supports_resize_signal) return error.SkipZigTest;
+    var saved_int: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.INT, null, &saved_int);
+    defer std.posix.sigaction(std.posix.SIG.INT, &saved_int, null);
+
+    installAbnormalExitHandlers(null, std.mem.zeroes(std.posix.termios));
+    defer uninstallAbnormalExitHandlers();
+
+    var int_action: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.INT, null, &int_action);
+    try std.testing.expectEqual(@as(?std.posix.Sigaction.handler_fn, closeSignalHandler), int_action.handler.handler);
+}
+
+test "uninstalling the close handlers keeps SIGINT's close handler" {
+    if (!shell_runtime.supports_resize_signal) return error.SkipZigTest;
+    var saved_int: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.INT, null, &saved_int);
+    defer std.posix.sigaction(std.posix.SIG.INT, &saved_int, null);
+
+    installAbnormalExitHandlers(null, std.mem.zeroes(std.posix.termios));
+    uninstallAbnormalExitHandlers();
+
+    var int_action: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.INT, null, &int_action);
+    try std.testing.expectEqual(@as(?std.posix.Sigaction.handler_fn, closeSignalHandler), int_action.handler.handler);
+}
+
+test "the close path puts back the tty mode fx found at startup" {
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+    const pty = try shell_runtime.TestPty.open();
+    defer _ = std.c.close(pty.master);
+    defer _ = std.c.close(pty.slave);
+
+    const found = try io_mod.tcgetattr(pty.slave);
+    found_termios = found;
+    defer found_termios = null;
+
+    var raw = found;
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    raw.lflag.ISIG = false;
+    try io_mod.tcsetattr(pty.slave, .NOW, raw);
+
+    restoreFoundTty(pty.slave);
+
+    const after = try io_mod.tcgetattr(pty.slave);
+    try std.testing.expectEqual(found.lflag.ICANON, after.lflag.ICANON);
+    try std.testing.expectEqual(found.lflag.ECHO, after.lflag.ECHO);
+    try std.testing.expectEqual(found.lflag.ISIG, after.lflag.ISIG);
+}
+
 test "exit and suspend restoration clear the program status record" {
     for ([_][]const u8{
         normal_exit_restore,
@@ -2609,6 +2699,42 @@ test "prepare startup viewport uses scrollback setting for launch push only" {
     try std.testing.expectEqualStrings("", disabled_bytes);
 }
 
+test "prepare startup viewport with welcome reservation does not push ten blank lines" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "bottom.out";
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .layout = .{
+            .rows = 49,
+            .cols = 146,
+            .content_bottom = 45,
+            .divider_top_row = 46,
+            .input_row = 47,
+            .divider_bottom_row = 48,
+            .hint_row = 49,
+        },
+    };
+    defer shell.deinit(alloc);
+
+    var metrics = Metrics{};
+    var launch_row: u16 = 45;
+    _ = try prepareStartupViewport(&shell, &metrics, &launch_row, ui_render.welcome_message_reserved_rows, false);
+    shell.stdout_file.close(io_mod.getIo());
+
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 1024);
+    defer alloc.free(bytes);
+
+    try std.testing.expectEqual(@as(u16, 2), ui_render.welcome_message_reserved_rows);
+    try std.testing.expectEqual(@as(u16, 44), launch_row);
+    try std.testing.expectEqualStrings("\x1b[49;1H\n", bytes);
+}
+
 test "shutdown cleanup erases from footer frame top after frame commit" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2653,6 +2779,46 @@ test "shutdown cleanup erases from footer frame top after frame commit" {
 
     try std.testing.expect(std.mem.find(u8, bytes, "\x1b[6;1H\x1b[J") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\x1b[21;1H\x1b[J") != null);
+}
+
+test "shutdown cleanup before first frame leaves existing screen untouched" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "shutdown_unpainted.out";
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .sync_updates_enabled = false,
+        .layout = .{
+            .rows = 49,
+            .cols = 146,
+            .content_bottom = 45,
+            .divider_top_row = 46,
+            .input_row = 47,
+            .divider_bottom_row = 48,
+            .hint_row = 49,
+        },
+        .cursor_row = 35,
+        .cursor_col = 1,
+        .has_committed_frame = false,
+    };
+    defer shell.deinit(alloc);
+
+    var metrics = Metrics{};
+    emitShutdownCleanupAndResume(&shell, &metrics);
+    shell.stdout_file.close(io_mod.getIo());
+
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 1024);
+    defer alloc.free(bytes);
+
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[35;1H") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[J") == null);
+    try std.testing.expect(std.mem.findScalar(u8, bytes, '\n') == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[?25h") != null);
 }
 
 test "startup credential modes select a refresh policy, never a narrower source set" {

@@ -35,6 +35,8 @@ pub const wait_fields = [_][]const u8{ "action", "agent" };
 pub const status_fields = [_][]const u8{ "action", "agent" };
 pub const stop_fields = [_][]const u8{ "action", "agent" };
 pub const close_fields = [_][]const u8{ "action", "agent" };
+pub const approve_fields = [_][]const u8{ "action", "agent" };
+pub const deny_fields = [_][]const u8{ "action", "agent", "message" };
 
 /// Where a rejected call went wrong, so the correction can name it.
 const Problem = struct {
@@ -101,16 +103,20 @@ fn refused(ctx: tool_dispatch.DispatchContext, why: refusal.Refusal) tool_dispat
 
 /// Pure: the correction a model sees for a call that failed to decode.
 fn problemText(arena: Allocator, err: DecodeError, problem: Problem) Allocator.Error![]const u8 {
-    const fields = "message takes agent, message, instructions, report, model, effort, and profile; wait and status take an optional agent; stop and close take agent.";
+    const fields = "message takes agent, message, instructions, report, model, effort, and profile; wait and status take an optional agent; stop, close, and approve take agent; deny takes agent and an optional message.";
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.InvalidEnum => "action must be \"message\", \"wait\", \"status\", \"stop\", or \"close\".",
+        error.InvalidEnum => "action must be \"message\", \"wait\", \"status\", \"stop\", \"close\", \"approve\", or \"deny\".",
         error.MissingField => if (std.mem.eql(u8, problem.field, "action"))
-            "action is required: \"message\" with agent and message, \"wait\", \"status\", or \"stop\" or \"close\" with agent."
+            "action is required: \"message\" with agent and message, \"wait\", \"status\", or \"stop\" or \"close\" or \"approve\" or \"deny\" with agent."
         else if (std.mem.eql(u8, problem.action, "stop"))
             "stop needs agent."
         else if (std.mem.eql(u8, problem.action, "close"))
             "close needs agent."
+        else if (std.mem.eql(u8, problem.action, "approve"))
+            "approve needs agent."
+        else if (std.mem.eql(u8, problem.action, "deny"))
+            "deny needs agent."
         else
             "message needs agent and message.",
         error.UnknownField => if (problem.action.len == 0)
@@ -186,6 +192,19 @@ fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contrac
         problem.action = "close";
         try rejectOutsideAction(request, &close_fields, problem);
         return .{ .close = .{ .agent = try requiredString(request, "agent", problem) } };
+    }
+    if (std.mem.eql(u8, action, "approve")) {
+        problem.action = "approve";
+        try rejectOutsideAction(request, &approve_fields, problem);
+        return .{ .approve = .{ .agent = try requiredString(request, "agent", problem) } };
+    }
+    if (std.mem.eql(u8, action, "deny")) {
+        problem.action = "deny";
+        try rejectOutsideAction(request, &deny_fields, problem);
+        return .{ .deny = .{
+            .agent = try requiredString(request, "agent", problem),
+            .message = try optionalFilledString(request, "message", problem),
+        } };
     }
     return error.InvalidEnum;
 }
@@ -319,7 +338,7 @@ pub fn call(
 pub fn readsOnly(erased: tool_dispatch.ToolInput) bool {
     return switch (erased.as(Input).request) {
         .wait, .status => true,
-        .message, .stop, .close => false,
+        .message, .stop, .close, .approve, .deny => false,
     };
 }
 
@@ -462,7 +481,7 @@ test "a message that made its subagent marks the call's row, not what the model 
     }
 }
 
-test "decode accepts the five actions and nothing else" {
+test "decode accepts the seven actions and nothing else" {
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"instructions\":\"Review strictly.\",\"message\":\"next\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"model\":\"gpt-5.6-sol-fast\"}}", .message);
@@ -472,6 +491,9 @@ test "decode accepts the five actions and nothing else" {
     try expectRequestTag("{\"action\":\"status\",\"agent\":\"reviewer\"}", .status);
     try expectRequestTag("{\"action\":\"stop\",\"agent\":\"reviewer\"}", .stop);
     try expectRequestTag("{\"action\":\"close\",\"agent\":\"reviewer\"}", .close);
+    try expectRequestTag("{\"action\":\"approve\",\"agent\":\"reviewer\"}", .approve);
+    try expectRequestTag("{\"action\":\"deny\",\"agent\":\"reviewer\",\"message\":\"not now\"}", .deny);
+    try expectRequestTag("{\"action\":\"deny\",\"agent\":\"reviewer\"}", .deny);
     try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\"}}", "invalid_enum");
     try expectDecodeFailure("{\"request\":{\"action\":\"stop\",\"child_id\":\"01J00000000000000000000000\"}}", "unknown_field");
     try expectDecodeFailure("{\"request\":{\"action\":\"cancel\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
@@ -509,7 +531,7 @@ test "decode accepts flat calls and names what a rejected call got wrong" {
     try expectCorrection("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":7}", "invalid_field_type", "message must be a string.");
     try expectCorrection("{\"request\":null}", "invalid_field_type", "request must be an object");
     try expectCorrection("[]", "invalid_field_type", "must be a JSON object");
-    try expectCorrection("{\"action\":\"run\"}", "invalid_enum", "action must be \"message\", \"wait\", \"status\", \"stop\", or \"close\"");
+    try expectCorrection("{\"action\":\"run\"}", "invalid_enum", "action must be \"message\", \"wait\", \"status\", \"stop\", \"close\", \"approve\", or \"deny\"");
 }
 
 test "decode ignores empty fields the action does not take" {
@@ -719,6 +741,8 @@ test "every call the decoder refuses tells the model what is wrong and what to d
         .{ .args = "{\"action\":\"stop\",\"agent\":\"Ghost\"}", .code = "invalid_agent" },
         .{ .args = "{\"action\":\"stop\",\"agent\":\"parent\"}", .code = "invalid_agent" },
         .{ .args = "{\"action\":\"close\",\"agent\":\"parent\"}", .code = "invalid_agent" },
+        .{ .args = "{\"action\":\"approve\",\"agent\":\"parent\"}", .code = "invalid_agent" },
+        .{ .args = "{\"action\":\"deny\",\"agent\":\"parent\"}", .code = "invalid_agent" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"\"}", .code = "invalid_message" },
         .{ .args = "{" ++ message ++ ",\"instructions\":\"a\\u0000b\"}", .code = "invalid_instructions" },
         .{ .args = "{" ++ message ++ ",\"report\":\"often\"}", .code = "invalid_report" },

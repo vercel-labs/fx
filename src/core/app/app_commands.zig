@@ -4,6 +4,7 @@ const agents = @import("../agents/agents.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_trust_runtime = @import("app_trust_runtime.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
 const io_mod = @import("../shared/io.zig");
@@ -1031,6 +1032,9 @@ pub fn Handlers(comptime App: type) type {
                         "Skills could not be refreshed. The previous catalog was not shown as current.",
                 }, true);
                 return;
+            }
+            if (comptime @hasField(App, "trust")) {
+                try app_trust_runtime.Runtime(App).refreshFacts(app);
             }
             switch (ready.action) {
                 .startup_notice => try app_bootstrap_runtime.Runtime(App).writeSkillDiagnosticsNotice(app, agent),
