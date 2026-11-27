@@ -11,8 +11,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
+const hold_marker = @import("../shared/hold_marker.zig");
 
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 const max_hold_ms = 60_000;
 
 /// Called by a turn's start capture before it captures.
@@ -22,21 +22,11 @@ pub fn holdStartCapture() void {
     const release = io_mod.getenvAbsolutePath("FX_TEST_WORKSPACE_CAPTURE_START_RELEASE") orelse return;
     // A marker that cannot be written skips the hold; the test that set the
     // controls then fails on the missing marker.
-    writeMarker(held) catch return;
+    hold_marker.write(held, "start_capture held") catch return;
     const deadline = io_mod.milliTimestamp() + max_hold_ms;
     while (!pathExists(release) and io_mod.milliTimestamp() < deadline) {
         io_mod.sleep(std.time.ns_per_ms);
     }
-}
-
-fn writeMarker(path: []const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{
-        .truncate = true,
-        .permissions = private_file_permissions,
-    });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), "start_capture held");
-    try file.sync(io_mod.getIo());
 }
 
 fn pathExists(path: []const u8) bool {

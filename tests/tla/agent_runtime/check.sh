@@ -1,7 +1,8 @@
 #!/bin/sh
-# Model-check the empty-reply nudge and the malformed tool call feedback in
-# the agent step loop (src/core/agent/runtime/orchestrator.zig) with TLC and
-# require each config's expected verdict.
+# Model-check the empty-reply nudge, the malformed tool call feedback, and the
+# recovery after a reply cut off at its output limit in the agent step loop
+# (src/core/agent/runtime/orchestrator.zig) with TLC and require each config's
+# expected verdict.
 #
 # empty-reply.cfg and empty-reply-deep.cfg are the design and must pass.
 # empty-reply-today.cfg is fx before it, which ended an empty reply that
@@ -37,12 +38,32 @@
 # MalformedToolCallTrace.tla checks turns of the built fx binary against that
 # model; tests/tla/drivers/agent_runtime/malformed.ts runs it.
 #
+# output-limit.cfg and output-limit-deep.cfg are the design of the recovery
+# after a reply cut off at its output limit, and must pass.
+# output-limit-today.cfg is fx before it, which dropped every call of a reply
+# cut while it called tools and ended the turn (NoNeedlessFailure);
+# output-limit-today-text.cfg is fx before it too, which ended a turn whose
+# reply was cut before any tool call as completed (NoFalseSuccess). Each
+# output-limit-mutation-*.cfg plants one defect, and the rule it names must
+# catch it:
+#
+#   no-cap        a third note in a row                         EndsAfterThird
+#   no-reset      the cut count survives a step that was not cut  EveryCutGetsNote
+#   run-cut       a call the cut left unfinished runs           CutCallNeverRuns
+#   ignore-limit  a note sent with no step left                 StepsBounded
+#   no-raise      the turn keeps the limit that ran out         RaisedAfterCut
+#   drop-parts    the answer keeps only the reply that ended it AnswerHasEveryPart
+#
+# OutputLimitTrace.tla checks turns of the built fx binary against that
+# model; tests/tla/drivers/agent_runtime/output_limit.ts runs it.
+#
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
 # Usage:
 #   ./check.sh
 #   ./check.sh empty-reply empty-reply-mutation-no-reset
 #   ./check.sh malformed-tool-call malformed-tool-call-mutation-no-cap
+#   ./check.sh output-limit output-limit-mutation-no-cap
 #   TLA2TOOLS_JAR=/path/tla2tools.jar ./check.sh
 set -eu
 
@@ -70,4 +91,14 @@ MalformedToolCall malformed-tool-call-mutation-no-reset EveryStallGetsFeedback
 MalformedToolCall malformed-tool-call-mutation-run-call MalformedNeverRuns
 MalformedToolCall malformed-tool-call-mutation-reconcile-loop ReconcileMalformedStops
 MalformedToolCall malformed-tool-call-mutation-search-reconcile SearchKeepsTools
+OutputLimit output-limit -
+OutputLimit output-limit-deep -
+OutputLimit output-limit-today NoNeedlessFailure
+OutputLimit output-limit-today-text NoFalseSuccess
+OutputLimit output-limit-mutation-no-cap EndsAfterThird
+OutputLimit output-limit-mutation-no-reset EveryCutGetsNote
+OutputLimit output-limit-mutation-run-cut CutCallNeverRuns
+OutputLimit output-limit-mutation-ignore-limit StepsBounded
+OutputLimit output-limit-mutation-no-raise RaisedAfterCut
+OutputLimit output-limit-mutation-drop-parts AnswerHasEveryPart
 VERDICTS

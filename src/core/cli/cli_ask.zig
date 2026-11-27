@@ -9,6 +9,7 @@ const agent_stream_provider = @import("../agent/stream_provider.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const shared_theme = @import("../shared/theme.zig");
 const ui_render = @import("../../ui/render.zig");
+const ui_terminal = @import("../../ui/terminal/terminal.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
@@ -1370,7 +1371,13 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         .deps = deps,
     }) catch |err| {
         if (interrupt_scope.requested()) return headless_interrupt.exitCode();
-        if (err == error.OutOfMemory) return err;
+        if (err == error.OutOfMemory or
+            err == error.TerminalHungUp or
+            err == error.TerminalInputClosed or
+            err == error.OutputReaderGone)
+        {
+            return err;
+        }
         // The reason is on stderr already; JSON keeps the code it always had.
         if (err == error.SessionConversionRefused) {
             if (!options.json_output) return 1;
@@ -1973,9 +1980,23 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     // The ask ends once its whole tree is quiet: mail that waits when a turn
     // ends runs as the ask's next turn, as one wakes an idle main.
     while (ctx.subagent_host) |tree| {
-        switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag())) {
+        switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag(), true)) {
             .quiet, .stopped => break,
             .mail => {},
+            // fx ask cannot show an approval, and main had its turn: refuse
+            // what it left unanswered, so the subagents resume, report, and
+            // their reports wake main again (`ParentApproval.tla` `Fallback`).
+            .approvals_unanswered => {
+                const refused = tree.refuseUnansweredApprovals();
+                if (refused == 0) {
+                    // Nothing could be refused, so the next check would see the
+                    // same state at once: wait one poll first (RULES.md R3.8).
+                    debug_trace.eventf("mailbox", "approvals_refusal_empty", .{}, "reason=nothing_refused", .{});
+                    if (ctx.cancelFlag().load(.seq_cst)) break;
+                    _ = ctx.worker.waitForPostOrNudgeTimeout(subagent_tool_host.Runtime.cancel_poll);
+                }
+                continue;
+            },
         }
         // The take marks the turn, so mail posted from then on joins it.
         const turn_id = debug_trace.nextTurnId();
@@ -2052,6 +2073,12 @@ fn runAskTurn(
             };
         },
         else => {
+            if (err == error.TerminalHungUp or
+                err == error.TerminalInputClosed or
+                err == error.OutputReaderGone)
+            {
+                return err;
+            }
             if (!options.output_mode.capturesJson()) return err;
             var failed_result = try takePromptRunResult(ctx, alloc);
             failed_result.exit_code = 1;
@@ -2796,6 +2823,7 @@ fn executeToolCallAuthorized(
     request: agent_runtime.ToolExecutionRequest,
 ) !ToolExecutionResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    try markQuestionBreak(ctx, request.call_allocator, request.call);
     var tool_ctx = ctx.toolContext();
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
     tool_ctx.root_user_messages = request.root_user_messages;
@@ -2812,6 +2840,20 @@ fn executeToolCallAuthorized(
     };
     captureToolExecutionResult(ctx, request, result);
     return result;
+}
+
+/// Breaks the raw and JSON text after a question, direct or through toolbox,
+/// as a tool start does in `pushToolLifecycle`: a question starts no visible
+/// tool (`startToolVisibleLifecycle`), and `fx ask` never shows one, so the
+/// reply after it is a new paragraph. A question never runs in a parallel
+/// batch, so only this thread writes the break; other calls touch no state.
+fn markQuestionBreak(ctx: *AskContext, call_allocator: Allocator, call: ToolCall) !void {
+    var scratch_state = std.heap.ArenaAllocator.init(call_allocator);
+    defer scratch_state.deinit();
+    const carried = try toolbox.carriedCall(scratch_state.allocator(), call.name, call.arguments_json);
+    const ran_name = if (carried) |carried_call| carried_call.name else call.name;
+    if (!std.mem.eql(u8, ran_name, types.user_question_tool_name)) return;
+    if (ctx.raw_has_output) ctx.raw_boundary_pending = true;
 }
 
 fn captureToolExecutionError(
@@ -3206,6 +3248,7 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     v2.appendProgressWithRecord(
         progress.user,
         progress.execution,
+        progress.saved_execution,
         .{ .calls = progress.running_calls, .assistant = progress.running_assistant },
         progress.recovery_record,
     ) catch |err| {
@@ -4172,7 +4215,10 @@ fn readPromptFromReader(
     const input = reader.allocRemaining(alloc, .limited(detection_limit)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.StreamTooLong => return error.PromptResourceLimitExceeded,
-        else => return error.PromptInputReadFailed,
+        else => {
+            if (ui_terminal.terminalInputGone(std.posix.STDIN_FILENO)) return error.TerminalHungUp;
+            return error.PromptInputReadFailed;
+        },
     };
     if (input.len > resource_byte_limit) {
         alloc.free(input);
@@ -4400,7 +4446,11 @@ fn promptRealPermissionApproval(
 
     var read_buf: [256]u8 = undefined;
     var reader = std.Io.File.stdin().reader(zio, &read_buf);
-    const line = reader.interface.takeDelimiter('\n') catch return .deny;
+    const line = reader.interface.takeDelimiter('\n') catch |err| {
+        if (ui_terminal.terminalGone(std.posix.STDIN_FILENO, err)) return error.TerminalHungUp;
+        return .deny;
+    };
+    if (line == null and ui_terminal.terminalInputGone(std.posix.STDIN_FILENO)) return error.TerminalHungUp;
     const answer = std.mem.trim(u8, line orelse "", " \t\r\n");
     if (answer.len == 1 and (answer[0] == 'y' or answer[0] == 'Y')) return .approve;
     return .deny;
@@ -4418,20 +4468,27 @@ fn realStdoutIsTty(_: ?*anyopaque) bool {
     return std.Io.File.stdout().isTty(io_mod.getIo()) catch false;
 }
 
+fn classifyRealOutputError(fd: std.posix.fd_t, err: anyerror, fallback: anyerror) anyerror {
+    if (err == error.BrokenPipe) return error.OutputReaderGone;
+    if (ui_terminal.terminalGone(fd, err)) return error.TerminalHungUp;
+    return fallback;
+}
+
 /// A failed write to stdout reads "couldn't write the output"
 /// (`error.OutputWriteFailed`), and its cause goes to the trace. A reader that
 /// went away, as `head` does, gives `error.OutputReaderGone`, which ends the
-/// run quietly.
+/// run quietly; a hung-up terminal gives `error.TerminalHungUp`.
 fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
     std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text) catch |err| {
         debug_trace.logf("core", "ask output write failed err={s}", .{@errorName(err)});
-        if (err == error.BrokenPipe) return error.OutputReaderGone;
-        return error.OutputWriteFailed;
+        return classifyRealOutputError(std.posix.STDOUT_FILENO, err, error.OutputWriteFailed);
     };
 }
 
 fn writeRealStderr(_: ?*anyopaque, text: []const u8) !void {
-    try std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
+    std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text) catch |err| {
+        return classifyRealOutputError(std.posix.STDERR_FILENO, err, err);
+    };
 }
 
 const TestCapture = struct {
@@ -9354,6 +9411,50 @@ test "CLI tagged stream routes source output rendering and diagnostics by mode" 
     try std.testing.expectEqualStrings("final answer", parsed.value.object.get("final_output").?.string);
 }
 
+test "a question starts a new paragraph in raw and JSON output, as a tool does" {
+    const alloc = std.testing.allocator;
+    const question = "{\"questions\":[{\"question\":\"Choose next step?\",\"options\":[{\"label\":\"Run tests\"},{\"label\":\"Stop\"}]}]}";
+    const calls = [_]ToolCall{
+        .{ .id = "ask_1", .name = "ask_user_question", .arguments_json = question },
+        .{ .id = "ask_1", .name = "toolbox", .arguments_json = "{\"run\":\"ask_user_question\",\"arguments\":" ++ question ++ "}" },
+    };
+    for ([_]OutputMode{ .raw, .json }) |mode| {
+        for (calls) |call| {
+            var stdout_capture: TestCapture = .{};
+            defer stdout_capture.deinit(alloc);
+            var stderr_capture: TestCapture = .{};
+            defer stderr_capture.deinit(alloc);
+            var ctx = AskContext.init(
+                alloc,
+                testConfig(),
+                testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+                "/tmp/workspace",
+            );
+            defer ctx.deinit();
+            ctx.output_mode = mode;
+            const deps = agentRuntimeDeps(&ctx);
+            var arena_state = std.heap.ArenaAllocator.init(alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            try deps.push_text(deps.ctx, .{ .assistant_source = "One question first." });
+            _ = try executeToolCallAuthorized(@ptrCast(&ctx), .{
+                .call_allocator = arena,
+                .result_allocator = arena,
+                .call = call,
+                .authority = .ordinary,
+                .session_grants = &.{},
+                .advertised_dynamic_tool_names = &.{},
+                .max_tool_result_bytes = 4096,
+            });
+            try deps.push_text(deps.ctx, .{ .assistant_source = "Done after the question." });
+
+            const written = if (mode == .json) ctx.assistant_output.items else stdout_capture.bytes.items;
+            try std.testing.expectEqualStrings("One question first.\n\nDone after the question.", written);
+        }
+    }
+}
+
 test "CLI response restart preserves completed output and removes only the failed JSON preview" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
@@ -9761,4 +9862,25 @@ test "fx ask persists recovery checkpoints via save_recovery_record and append_t
     defer reopened.close();
     const interrupted = (try reopened.interruptedRequest()) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, &rec2, &(interrupted.record orelse return error.TestUnexpectedResult));
+}
+
+test "cli ask output classifier maps closed TestPty EIO to TerminalHungUp and preserves open-file write errors" {
+    const shell_runtime = @import("../../ui/shell_runtime.zig");
+    try std.testing.expectEqual(@as(anyerror, error.OutputReaderGone), classifyRealOutputError(-1, error.BrokenPipe, error.OutputWriteFailed));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "out.txt", .{ .read = true });
+    defer file.close(io_mod.getIo());
+    try std.testing.expectEqual(@as(anyerror, error.OutputWriteFailed), classifyRealOutputError(file.handle, error.InputOutput, error.OutputWriteFailed));
+
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |f| f.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+    master.?.close(io_mod.getIo());
+    master = null;
+    try std.testing.expectEqual(@as(anyerror, error.TerminalHungUp), classifyRealOutputError(slave.handle, error.InputOutput, error.OutputWriteFailed));
 }
