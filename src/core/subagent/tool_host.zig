@@ -1205,7 +1205,7 @@ pub const Runtime = struct {
             if (std.mem.eql(u8, item.child_id, child_id)) waiting += 1;
         }
         if (waiting >= max_pending_per_child) return error.QueueFull;
-        try self.ensureManagedChildSession(child_id, operation_id, effectiveDefaults(options.defaults, request.override(), resolved_model));
+        try self.ensureManagedChildSeed(child_id, effectiveDefaults(options.defaults, request.override(), resolved_model), true);
         var work = try makeManagedWork(self.alloc, operation_id, fingerprint, request, options);
         errdefer work.deinit(self.alloc);
         const owned_child = try self.alloc.dupe(u8, child_id);
@@ -1298,6 +1298,7 @@ pub const Runtime = struct {
             if (worker.waitForPostOrNudgeTimeout(recheck)) |wake| return wake;
         }
         if (self.nothingCanArrive(worker)) return null;
+        end_test_controls.noteWaitBlocking();
         return worker.waitForPostOrNudge();
     }
 
@@ -3573,11 +3574,7 @@ pub const Runtime = struct {
                     .operation_conflict,
                 );
             }
-            try self.ensureManagedChildSession(
-                existing.id,
-                operation_id,
-                defaults,
-            );
+            try self.ensureManagedChildSeed(existing.id, defaults, true);
             if (existing.last_work_id) |work_id| {
                 if (std.mem.eql(u8, work_id, operation_id)) return .{ .completed = .{
                     .child_id = try alloc.dupe(u8, existing.id),
@@ -3605,7 +3602,8 @@ pub const Runtime = struct {
                 if (registry.findPersistent(message.agent)) |child| {
                     // Closing, it takes nothing; once gone, the name starts a new one.
                     if (self.closingIndexLocked(child.id) != null) return managedAdmissionRejected(alloc, child.id, .child_closing);
-                    if (request.override().present()) {
+                    const override = request.override();
+                    if (override.present() and !try self.overrideMatchesChild(child.*, override, resolved_model)) {
                         debug_trace.logf(
                             "subagent",
                             "admission rejected operation={s} child_id={s} agent={s} code=override_after_create",
@@ -3648,7 +3646,7 @@ pub const Runtime = struct {
                     // slot is a child marked running that takes no message.
                     // A child lost before its first turn has no log to
                     // resume, so its next work starts it fresh (D33).
-                    try self.ensureManagedChildSession(started.id, active.id, defaults);
+                    try self.ensureManagedChildSeed(started.id, defaults, true);
                     var ready = try managedAdmissionReady(alloc, started.id, false);
                     errdefer ready.deinit(alloc);
                     try self.managed.state_store.save(alloc, registry);
@@ -3680,7 +3678,12 @@ pub const Runtime = struct {
                 }
                 if (message.report) |rule| try registry.setReportRule(child_id, rule);
                 // The save is the last step that can fail (see above).
-                try self.ensureManagedChildSession(child_id, active.id, defaults);
+                try self.ensureManagedChildSeed(child_id, defaults, false);
+                debug_trace.logf(
+                    "subagent",
+                    "child session reserved child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={} ultrafast_mode={}",
+                    .{ child_id, active.id, @tagName(defaults.provider), defaults.model, defaults.effort.label(), defaults.fast_mode, defaults.ultrafast_mode },
+                );
                 var ready = try managedAdmissionReady(
                     alloc,
                     registry.children[registry.children.len - 1].id,
@@ -3707,15 +3710,15 @@ pub const Runtime = struct {
         try registry.setStartedWith(alloc, child_id, started);
     }
 
-    fn ensureManagedChildSession(
+    fn ensureManagedChildSeed(
         self: *Runtime,
         child_id: []const u8,
-        work_id: []const u8,
         defaults: Defaults,
+        keep_existing: bool,
     ) !void {
         // A child reaches the disk with its first turn, under the id its
         // spawn line names (D34); until then only its settings wait here.
-        try self.children.rememberSeed(child_id, .{
+        try self.children.setSeed(child_id, .{
             .preferences = .{
                 .provider = defaults.provider,
                 .model = @constCast(defaults.model),
@@ -3724,12 +3727,7 @@ pub const Runtime = struct {
                 .ultrafast_mode = defaults.ultrafast_mode,
             },
             .language = defaults.conversation_language,
-        });
-        debug_trace.logf(
-            "subagent",
-            "child session reserved child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={} ultrafast_mode={}",
-            .{ child_id, work_id, @tagName(defaults.provider), defaults.model, defaults.effort.label(), defaults.fast_mode, defaults.ultrafast_mode },
-        );
+        }, keep_existing);
     }
 
     fn managedResultText(
@@ -3744,9 +3742,29 @@ pub const Runtime = struct {
         return @as(?[]u8, try alloc.dupe(u8, text));
     }
 
-    /// A child's saved preferences, read without opening it. Caller owns.
-    fn childPreferences(self: *Runtime, alloc: Allocator, child_id: []const u8) !session_codec.DurableSessionPreferences {
-        return self.children.parent.store.childPreferences(alloc, child_id);
+    /// True when every override field set on `override` matches the existing
+    /// child's current profile, model, and effort.
+    fn overrideMatchesChild(
+        self: *Runtime,
+        child: child_state.Child,
+        override: model_contract.Override,
+        resolved_model: ?[]const u8,
+    ) !bool {
+        if (override.profile) |requested_profile| {
+            const current_profile = child.profile orelse profiles.main_name;
+            if (!std.mem.eql(u8, requested_profile, current_profile)) return false;
+        }
+        if (override.model == null and override.effort == null) return true;
+        var current = try managed_owner.readChildPreferences(&self.managed, child.id);
+        defer current.deinit(self.managed.alloc);
+        if (override.model) |requested_model| {
+            const effective_model = resolved_model orelse requested_model;
+            if (!std.mem.eql(u8, effective_model, current.model)) return false;
+        }
+        if (override.effort) |requested_effort| {
+            if (!requested_effort.eql(current.effort)) return false;
+        }
+        return true;
     }
 
     fn encodeManaged(
@@ -4060,11 +4078,14 @@ test "a wait that the upgrade's restart ends says the reports still arrive" {
     );
 }
 
+/// Release test builds turn error tracing off (`build.zig`), so without these
+/// prints a failed test says only "failed without output".
 fn waitForRuns(fixture: *MailboxFixture, count: usize) !void {
     for (0..5000) |_| {
         if (fixture.runs.load(.seq_cst) >= count) return;
         io_mod.sleep(std.time.ns_per_ms);
     }
+    std.debug.print("waitForRuns: {d} runs did not start in time\n", .{count});
     return error.Timeout;
 }
 
@@ -7610,8 +7631,8 @@ const SettleGap = struct {
     }
 };
 
-/// A trace file for the `mailbox` scope, which a test reads to see that a
-/// `wait` has looked and is about to block (`wait_begin`).
+/// A trace file for the `mailbox` scope, which the host's trace lines go to in
+/// these tests.
 const GapTrace = struct {
     tmp: std.testing.TmpDir,
     path: []u8,
@@ -7633,14 +7654,6 @@ const GapTrace = struct {
         self.tmp.cleanup();
     }
 
-    fn waitFor(self: *const GapTrace, needle: []const u8) !void {
-        for (0..5000) |_| {
-            if (self.has(needle)) return;
-            io_mod.sleep(std.time.ns_per_ms);
-        }
-        return error.Timeout;
-    }
-
     /// Reads the first 64 KiB, which holds every line a test of this scope
     /// writes. The host appends to the file while a test polls it, so this
     /// reads from offset 0 into a fixed buffer. `readFileToEnd` sizes the file
@@ -7656,15 +7669,14 @@ const GapTrace = struct {
 };
 
 /// What every gap test builds: a parent log, main's worker, a fixture that
-/// runs the children, the host, and a trace for the `mailbox` scope. Its parts
-/// point at each other, so it stays where `init` built it.
+/// runs the children, and the host. Its parts point at each other, so it stays
+/// where `init` built it.
 const GapFixture = struct {
     arena_state: std.heap.ArenaAllocator,
     parent: child_state.TestParent,
     worker: worker_runtime.WorkerRuntime,
     fixture: MailboxFixture,
     runtime: *Runtime,
-    trace: GapTrace,
     armed: bool,
 
     const Options = struct {
@@ -7689,21 +7701,17 @@ const GapFixture = struct {
         errdefer self.fixture.deinit();
         self.runtime = try mailboxRuntime(alloc, &self.fixture, &self.parent);
         errdefer self.runtime.deinit();
-        try self.trace.init(alloc);
-        errdefer self.trace.deinit(alloc);
         self.armed = false;
         if (options.armed) self.arm();
     }
 
-    /// Releases a held host first, so the runtime can join it, and keeps the
-    /// trace until the runtime's threads are gone.
+    /// Releases a held host first, so the runtime can join it.
     fn deinit(self: *GapFixture) void {
         const alloc = std.testing.allocator;
         SettleGap.go.set(io_mod.getIo());
         if (self.armed) SettleGap.disarm();
         self.runtime.deinit();
         self.fixture.deinit();
-        self.trace.deinit(alloc);
         self.worker.deinit(alloc);
         self.parent.deinit();
         self.arena_state.deinit();
@@ -7747,6 +7755,25 @@ const GapFixture = struct {
     }
 };
 
+/// Set once a `wait` has found that something can still arrive and is about
+/// to block (`end_test_controls.noteWaitBlocking`).
+const WaitBlocking = struct {
+    var blocked: std.Io.Event = .unset;
+
+    fn arm() void {
+        blocked = .unset;
+        end_test_controls.test_wait_blocking = note;
+    }
+
+    fn disarm() void {
+        end_test_controls.test_wait_blocking = null;
+    }
+
+    fn note() void {
+        blocked.set(io_mod.getIo());
+    }
+};
+
 /// One `wait` call on its own thread, as main's worker makes it.
 const GapWait = struct {
     runtime: *Runtime,
@@ -7773,15 +7800,23 @@ const GapWait = struct {
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
-    /// Starts the wait, then waits for its trace line, which it writes once it
-    /// has read that a child works and before it blocks.
-    fn startBlocked(self: *GapWait, trace: *const GapTrace) !void {
+    /// Starts the wait, and returns once it is about to block: the host has
+    /// found that something can still arrive and sends `noteWaitBlocking`
+    /// right before it blocks. On failure the wait's thread is joined first,
+    /// then the hook is disarmed, because that thread may still read the hook
+    /// until it has returned.
+    fn startBlocked(self: *GapWait) !void {
+        WaitBlocking.arm();
+        errdefer WaitBlocking.disarm();
         try self.start();
-        trace.waitFor("wait_begin") catch {
+        WaitBlocking.blocked.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
             self.worker.requestCancel();
             self.thread.join();
-            return error.WaitNeverBegan;
+            WaitBlocking.disarm();
+            std.debug.print("wait never blocked\n", .{});
+            return error.WaitNeverBlocked;
         };
+        WaitBlocking.disarm();
     }
 
     /// Joins the wait's thread and returns what it said, which the caller
@@ -7792,6 +7827,7 @@ const GapWait = struct {
         self.done.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
             self.worker.requestCancel();
             self.thread.join();
+            std.debug.print("wait stayed blocked after the end settled\n", .{});
             return error.WaitBlockedWhileNothingWorks;
         };
         self.thread.join();
@@ -7816,11 +7852,22 @@ const gap_wait_limit: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5),
 /// (`tests/tla/subagent/WaitNudge.tla`: `wait` always returns).
 fn waitInSettleGap(gap: *GapFixture) ![]u8 {
     defer SettleGap.go.set(io_mod.getIo());
-    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
+    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
+        std.debug.print("host never reached the gap\n", .{});
+        return error.HostNeverReachedTheGap;
+    };
     var waiting = GapWait{ .runtime = gap.runtime, .worker = &gap.worker };
-    try waiting.startBlocked(&gap.trace);
+    try waiting.startBlocked();
     SettleGap.go.set(io_mod.getIo());
     return waiting.finish();
+}
+
+/// Checks that `wait` said the end left no report, and prints what it said
+/// when it did not.
+fn expectEndedWithoutReport(said: []const u8) !void {
+    if (std.mem.find(u8, said, "ended without a report") != null) return;
+    std.debug.print("wait said: {s}\n", .{said});
+    return error.TestUnexpectedResult;
 }
 
 /// One `wait` call with nothing held, returning what it said, which the
@@ -7840,7 +7887,7 @@ test "a wait that starts as a subagent's work ends with nothing to report still 
     _ = try gap.call(.{ .message = .{ .agent = "quiet", .message = "go", .report = "never" } }, "call-1");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
 }
@@ -7856,7 +7903,7 @@ test "a wait that starts as the parent's stop ends a subagent's turn still retur
     _ = try gap.call(.{ .stop = .{ .agent = "reviewer" } }, "call-2");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
 }
@@ -7870,7 +7917,7 @@ test "a wait that starts as a report its owner's sink refuses is held still retu
     _ = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "go" } }, "call-1");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
     try std.testing.expectEqual(@as(usize, 0), gap.worker.queuedPromptCount());
@@ -7886,7 +7933,7 @@ test "a wait that starts as the parent's close ends a subagent's turn still retu
     _ = try gap.call(.{ .close = .{ .agent = "reviewer" } }, "call-2");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
 }
@@ -7907,7 +7954,7 @@ test "a wait that starts as the user's turn on a subagent ends with nothing to r
     ender.join();
     const text = try said;
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.find(u8, text, "ended without a report") != null);
+    try expectEndedWithoutReport(text);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 1), gap.fixture.reportCount());
 }
@@ -7926,7 +7973,7 @@ test "a wait that starts before and after the user's turn on a closing subagent 
     defer std.testing.allocator.free(work_id);
     // The user's turn keeps the subagent working, so this wait blocks.
     var waiting = GapWait{ .runtime = gap.runtime, .worker = &gap.worker, .child_id = child_id };
-    try waiting.startBlocked(&gap.trace);
+    try waiting.startBlocked();
     // The parent closes the subagent meanwhile, and the turn then ends.
     const closed = (try gap.runtime.closeChild(child_id, .parent)).?;
     try std.testing.expect(closed.stopped);
@@ -8548,6 +8595,7 @@ fn waitUntilQuiet(runtime: *Runtime) !void {
         if (runtime.quiet()) return;
         io_mod.sleep(std.time.ns_per_ms);
     }
+    std.debug.print("runtime did not go quiet in time\n", .{});
     return error.Timeout;
 }
 
@@ -9024,6 +9072,7 @@ const OverrideResolverFixture = struct {
         self.runs += 1;
         var preferences = turn.child.?.currentPreferences(std.testing.allocator) catch return error.ProviderFailed;
         defer preferences.deinit(std.testing.allocator);
+        if (self.observed_model) |prev| std.testing.allocator.free(prev);
         self.observed_model = std.testing.allocator.dupe(u8, preferences.model) catch return error.ProviderFailed;
         if (!turn.worker.beginDirectProcessing(1)) return error.ProviderFailed;
         turn.commit(turn.active_work_id.?, .{ .assistant = .{
@@ -9158,6 +9207,197 @@ test "model override passes through for non-gateway providers" {
     try waitUntilQuiet(runtime);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs);
     try std.testing.expectEqualStrings("unknown-model", fixture.observed_model.?);
+}
+
+test "a subagent message that repeats its model and effort is accepted, while a different effort is refused" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const first = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first", .model = "openai/gpt-5", .effort = "low" } }, "call-1", null);
+    try std.testing.expect(std.mem.find(u8, first, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+
+    const repeated = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second", .model = "openai/gpt-5", .effort = "low" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, repeated, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+
+    const different_effort = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "third", .model = "openai/gpt-5", .effort = "high" } }, "call-3", null);
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"result\":\"model, effort and profile are fixed when a subagent is created, so this one keeps its own: send the message again without them. To change them, close it and start a new one, which loses its conversation.\",\"error_code\":\"override_after_create\"}",
+        different_effort,
+    );
+
+    // An effort equal to the child's default (.auto) is also accepted.
+    const auto_first = try callTool(runtime, arena, .{ .message = .{ .agent = "default-kid", .message = "first", .model = "openai/gpt-5" } }, "call-4", null);
+    try std.testing.expect(std.mem.find(u8, auto_first, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+    const auto_repeated = try callTool(runtime, arena, .{ .message = .{ .agent = "default-kid", .message = "second", .model = "openai/gpt-5", .effort = "default" } }, "call-5", null);
+    try std.testing.expect(std.mem.find(u8, auto_repeated, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+}
+
+test "a subagent message that repeats its profile is accepted, while a different profile is refused" {
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    try parent.tmp.dir.createDirPath(io, ".fx/agents/session-reviewer");
+    var settings = try parent.tmp.dir.createFile(io, ".fx/agents/session-reviewer/profile.json", .{});
+    defer settings.close(io);
+    try settings.writeStreamingAll(io, "{\"description\": \"Reads the session workspace\", \"tools\": [\"read_file\"]}");
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const first = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "look", .profile = "session-reviewer" } }, "call-1", null);
+    try std.testing.expect(std.mem.find(u8, first, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+
+    const repeated = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again", .profile = "session-reviewer" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, repeated, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+
+    const different = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "switch", .profile = "main" } }, "call-3", null);
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"result\":\"model, effort and profile are fixed when a subagent is created, so this one keeps its own: send the message again without them. To change them, close it and start a new one, which loses its conversation.\",\"error_code\":\"override_after_create\"}",
+        different,
+    );
+}
+
+test "a subagent message whose model query resolves to the child's model is accepted" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = OverrideResolverFixture{};
+    defer if (fixture.observed_model) |model| alloc.free(model);
+    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const options = ExecuteOptions{
+        .caller_id = parent.parent.id(),
+        .invocation_id = "override-repeat-1",
+        .defaults = .{ .provider = .gateway, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .model_override_resolver = .{ .context = &fixture, .resolve_fn = OverrideResolverFixture.resolveModel },
+    };
+
+    var first_req = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "first", .model = "openai/gpt-5.6-terra-fast" } });
+    defer first_req.deinit(alloc);
+    const first = try runtime.executeManaged(arena, &first_req, options);
+    try std.testing.expect(first.success);
+    try waitUntilQuiet(runtime);
+
+    var second_req = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "second", .model = "terra-fast" } });
+    defer second_req.deinit(alloc);
+    var second_opts = options;
+    second_opts.invocation_id = "override-repeat-2";
+    const second = try runtime.executeManaged(arena, &second_req, second_opts);
+    try std.testing.expect(second.success);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs);
+
+    var third_req = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "third", .model = "astra" } });
+    defer third_req.deinit(alloc);
+    var third_opts = options;
+    third_opts.invocation_id = "override-repeat-3";
+    const third = try runtime.executeManaged(arena, &third_req, third_opts);
+    try std.testing.expect(!third.success);
+    try std.testing.expect(std.mem.find(u8, third.body, "\"error_code\":\"override_after_create\"") != null);
+}
+
+test "queuing a message after the parent changes model keeps the child's startup seed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    var req1 = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "first", .model = "model-a" } });
+    defer req1.deinit(alloc);
+    const first = try runtime.executeManaged(arena, &req1, .{
+        .caller_id = parent.parent.id(),
+        .invocation_id = "seed-keep-1",
+        .defaults = .{ .provider = .gateway, .model = "model-a", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+    });
+    try std.testing.expect(first.success);
+    const child_id = try reviewerId(runtime, arena);
+    try waitForRuns(&fixture, 1);
+
+    // Change the parent's model to model-b before queuing a follow-up while the
+    // child still has no log on disk.
+    var model_b = "model-b".*;
+    try parent.parent.setPreferences(.{ .provider = .gateway, .model = &model_b, .effort = .auto, .fast_mode = false });
+    const parent_b_options = ExecuteOptions{
+        .caller_id = parent.parent.id(),
+        .invocation_id = "seed-keep-2",
+        .defaults = .{ .provider = .gateway, .model = "model-b", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 2,
+    };
+    var req2 = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "second" } });
+    defer req2.deinit(alloc);
+    const queued = try runtime.executeManaged(arena, &req2, parent_b_options);
+    try std.testing.expect(queued.success);
+    try std.testing.expect(std.mem.find(u8, queued.body, "is busy") != null);
+
+    var seed = (try runtime.children.seedFor(alloc, child_id)).?;
+    defer seed.preferences.deinit(alloc);
+    try std.testing.expectEqualStrings("model-a", seed.preferences.model);
+
+    var prefs = try managed_owner.readChildPreferences(&runtime.managed, child_id);
+    defer prefs.deinit(runtime.managed.alloc);
+    try std.testing.expectEqualStrings("model-a", prefs.model);
+
+    var req3 = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "third", .model = "model-a" } });
+    defer req3.deinit(alloc);
+    var repeat_opts = parent_b_options;
+    repeat_opts.invocation_id = "seed-keep-3";
+    const repeat = try runtime.executeManaged(arena, &req3, repeat_opts);
+    try std.testing.expect(repeat.success);
+    try std.testing.expect(std.mem.find(u8, repeat.body, "is busy") != null);
+
+    var req4 = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "fourth", .model = "model-b" } });
+    defer req4.deinit(alloc);
+    var changed_opts = parent_b_options;
+    changed_opts.invocation_id = "seed-keep-4";
+    const changed = try runtime.executeManaged(arena, &req4, changed_opts);
+    try std.testing.expect(!changed.success);
+    try std.testing.expect(std.mem.find(u8, changed.body, "\"error_code\":\"override_after_create\"") != null);
+
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+    try std.testing.expect(std.mem.find(u8, fixture.began_contents.items[1], "second") != null);
+    try std.testing.expect(std.mem.find(u8, fixture.began_contents.items[1], "third") != null);
 }
 
 fn formatFailedResult(alloc: Allocator, failure: ?[]const u8, partial: ?[]const u8) ![]u8 {

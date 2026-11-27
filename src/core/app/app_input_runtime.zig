@@ -7,6 +7,8 @@ const wait_card = @import("../agent/wait_card.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
+const personal_shortcut_runtime = @import("personal_shortcut_runtime.zig");
+const shortcut_rules = @import("../shortcuts/shortcuts.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_trust_runtime = @import("app_trust_runtime.zig");
 const app_workspace_runtime = @import("app_workspace_runtime.zig");
@@ -48,6 +50,7 @@ const usage = @import("../../usage/usage.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const file_index = @import("../workspace/file_index.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
+const command_router = @import("../slash_commands/command_router.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
@@ -174,6 +177,14 @@ fn validateExplicitModelSelection(selection: ExplicitModelSelection, capabilitie
     return .{ .selection = selection };
 }
 
+test "chord unregistered command text is unknown and never routed" {
+    const builtin_commands = @import("../../builtins/commands.zig");
+    const parsed = command_router.parse(builtin_commands.slash_registry, "/no-such-command");
+    try std.testing.expect(parsed == .unknown);
+    const status = command_router.parse(builtin_commands.slash_registry, "/status");
+    try std.testing.expectEqual(command_router.ChordCommandRoute.run_now, command_router.chordCommandRoute(status));
+}
+
 /// What a keystroke means while the wait card holds the keys. The card's own
 /// keys arrive as question actions; every other control byte belongs to its
 /// own handler (Ctrl+O, Ctrl+P, Ctrl+X, Esc), and typed text is ignored so it
@@ -202,6 +213,7 @@ pub fn Runtime(comptime App: type) type {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         const history_rt = input_history_runtime.HistoryRuntime(App);
         const completion_rt = input_completion_runtime.CompletionRuntime(App);
+        const personal_shortcut_rt = personal_shortcut_runtime.Runtime(App);
         const provider_picker_rt = provider_picker_runtime.Runtime(App);
         const paste_rt = input_paste_runtime.PasteEditRuntime(App);
         const submit_rt = input_submit_runtime.SubmitRuntime(App);
@@ -612,10 +624,37 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        /// True when no surface sits above the composer: trust, paste, approval,
+        /// question, transcript, agents, pickers, menus, and an open model
+        /// picker all keep their own keys.
+        fn composerOwnsKeyboard(app: *App, agent: *AppAgent) bool {
+            if (comptime @hasField(AppAgent, "wait_card_prompt")) {
+                if (agent.wait_card_prompt.isActive()) return false;
+            }
+            if (comptime @hasField(App, "trust")) {
+                if (app.trust.asking()) return false;
+            }
+            if (terminalPasteActive(app)) return false;
+            if (agent.question_prompt.isActive() or approvalOwnsCurrentSurface(app, agent)) return false;
+            if (agentsMenuActive(app) or modelPickerShortcutBlocked(app, agent)) return false;
+            if (modelMenuActive(app) or app.input_runtime.model_picker_draft != null) return false;
+            if (completion_rt.hasModelQuery(app) or app.input_runtime.effort_menu.active or
+                completion_rt.slashCompletionCount(app, agent) > 0) return false;
+            return activeCompactCommandMenu(app) == null;
+        }
+
         pub fn prepareTerminalDecode(app: *App, agent: *AppAgent) !?input_action.TerminalDecodeContext {
             if (!try app_worker_runtime.Runtime(App).authorizeInteractiveAdmission(app, agent)) return null;
             const paste_active = terminalPasteActive(app);
             return terminalDecodeContext(app, agent, paste_active);
+        }
+
+        fn ingressCancelPending(ingress: input_action.TerminalInputIngress) bool {
+            const event = ingress.event orelse return false;
+            return switch (event) {
+                .action => |decoded| decoded.cancel_pending,
+                else => false,
+            };
         }
 
         pub fn handleTerminalInputIngressWithLimits(
@@ -662,6 +701,13 @@ pub fn Runtime(comptime App: type) type {
             // is a preview.
             if (ingress.event) |event| {
                 if (try routeAgentsMenuInput(app, event)) return ingress.replay_byte_after_routing;
+            }
+
+            // A chord the profile binds claims its key before the original
+            // event routes. A replayed byte arrives as its own ingress without
+            // a chord, so a byte such as 6 never reads as Ctrl+F here.
+            if (ingress.chord) |chord| {
+                if (!ingressCancelPending(ingress) and try routeBoundChord(app, agents.screenAgentOf(app), chord)) return null;
             }
 
             var replay_byte = ingress.replay_byte_after_routing;
@@ -797,7 +843,7 @@ pub fn Runtime(comptime App: type) type {
                 );
                 const replay = replay_byte orelse return;
                 context = try prepareTerminalDecode(app, agents.screenAgentOf(app)) orelse return;
-                ingress = app.terminal_input_runtime.decodeTerminalByte(replay, context);
+                ingress = app.terminal_input_runtime.decodeReplayedTerminalByte(replay, context);
             }
         }
 
@@ -1170,23 +1216,7 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     }
                 },
-                .open_model_catalog => {
-                    if (comptime @hasField(App, "model_cache")) {
-                        // A second Ctrl+P backs out of the shortcut's flow
-                        // from the catalog or its inline effort and fast stages.
-                        if (exitModelPickerShortcutIfActive(app)) return .done;
-                        if (modelMenuActive(app)) {
-                            _ = closeModelMenu(app, true);
-                            app.shell.render_requests.request(.footer);
-                            return .done;
-                        }
-                        if (modelPickerShortcutBlocked(app, agents.screenAgentOf(app))) return .done;
-                        // Before the draft is set aside: the query is the
-                        // menu's, not a draft to give back.
-                        _ = cancelEffortMenu(app, "model_menu_opened");
-                        try openModelPickerShortcut(app);
-                    }
-                },
+                .open_model_catalog => try openModelCatalogKey(app, agents.screenAgentOf(app)),
                 .cycle_effort => {
                     // Ctrl+T sets the effort of the agent on screen, as
                     // `/effort` does.
@@ -2327,6 +2357,79 @@ pub fn Runtime(comptime App: type) type {
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             app.shell.render_requests.request(.footer);
+        }
+
+        /// Ctrl+P and a personal shortcut bound to `/model` share this path.
+        fn openModelCatalogKey(app: *App, agent: *AppAgent) !void {
+            if (comptime !@hasField(App, "model_cache")) return;
+            // A second Ctrl+P backs out of the shortcut's flow
+            // from the catalog or its inline effort and fast stages.
+            if (exitModelPickerShortcutIfActive(app)) return;
+            if (modelMenuActive(app)) {
+                _ = closeModelMenu(app, true);
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+            if (modelPickerShortcutBlocked(app, agent)) return;
+            // Before the draft is set aside: the query is the menu's, not a
+            // draft to give back.
+            _ = cancelEffortMenu(app, "model_menu_opened");
+            try openModelPickerShortcut(app);
+        }
+
+        /// A personal shortcut with no binding does nothing, as an unbound
+        /// Ctrl+digit always has. A preset never runs while a picker or menu
+        /// owns the keyboard, so the preset path never borrows the composer.
+        /// Runs the profile's binding for `chord` when the composer owns the
+        /// keyboard. Returns false when nothing ran, so the original event
+        /// routes exactly as before (unbound chords, other focus, prompts).
+        fn routeBoundChord(app: *App, agent: *AppAgent, chord: shortcut_rules.Chord) !bool {
+            if (comptime !@hasField(App, "personal_shortcuts")) return false;
+            const entry = app.personal_shortcuts.map.find(chord) orelse return false;
+            if (!composerOwnsKeyboard(app, agent)) return false;
+            // fx keeps reserved keys for itself (shortcut_rules.reserved). The loader
+            // refuses them; this is the same rule at the dispatch point.
+            if (chord.reservedReason() != null) return false;
+            switch (entry.action) {
+                .select_model => |*preset| try personal_shortcut_rt.applyPreset(app, agent, preset),
+                .command => |*command| try runBoundCommand(app, agent, command.text()),
+            }
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        /// A bound command is a slash command the router recognizes, never the
+        /// shell and never prompt text. Read-only and reversible commands run
+        /// from the key and keep the draft. `/model` alone opens the native
+        /// catalog. Only commands explicitly classified for preview enter an empty
+        /// composer, and run only on Enter through the normal submit path with
+        /// its confirmations. An existing draft is never replaced.
+        fn runBoundCommand(app: *App, agent: *AppAgent, text: []const u8) !void {
+            if (comptime !@hasDecl(App, "handleCommand")) return;
+            const parsed = command_router.parse(app.slashRegistry(), text);
+            switch (command_router.chordCommandRoute(parsed)) {
+                .refuse => return refuseBoundChord(app, "this command is not available from shortcuts; nothing ran"),
+                .run_now => try app.handleCommand(text),
+                .open_catalog => try openModelCatalogKey(app, agent),
+                .preview => {
+                    if (draftHasState(app, agent)) {
+                        return refuseBoundChord(app, "clear the draft to use this shortcut's command; nothing changed");
+                    }
+                    try app.input_runtime.textReplacementState().replace(app.alloc, text);
+                    app.shell.render_requests.request(.footer);
+                },
+            }
+        }
+
+        fn writeShortcutRefusal(app: *App, body: []const u8) !void {
+            try app.writeDomainNotice(.{ .topic = "shortcut", .tone = .warning, .body = body }, true);
+        }
+
+        /// A bound key already took the key, so the refusal says why nothing ran.
+        /// The trace holds the fixed reason only, never the command text.
+        fn refuseBoundChord(app: *App, body: []const u8) !void {
+            debug_trace.logf("shortcut", "bound chord took the key, then refused: {s}", .{body});
+            return writeShortcutRefusal(app, body);
         }
 
         /// Ctrl+P opens the same catalog `/model` opens, but the composer is
