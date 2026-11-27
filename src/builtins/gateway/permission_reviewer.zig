@@ -474,7 +474,7 @@ test "gateway review offers the read tool only when the review has stored answer
         .tool_name = "ask_user_question",
         .content = "[{\"question\":\"Delete?\",\"answer\":\"Yes\"}]",
         .user_answer = true,
-        .stored_answers = .{ .handle = "answers-1", .bytes = 40 },
+        .stored_answers = .{ .handle = "answers-1", .read_handle = "answers-1", .bytes = 40 },
     }};
     var with_answers = testRequest();
     with_answers.prior_tool_results = .{ .entries = &entries };

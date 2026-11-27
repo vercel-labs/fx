@@ -187,9 +187,11 @@ pub const PriorToolResultEntry = struct {
 };
 
 /// A question's answers that fx stored outside the session: the stored
-/// result's handle and its size in bytes.
+/// result's real handle, its size in bytes, and the short handle the reviewer
+/// reads it by (`answers-N`, set by `numberStoredAnswers`).
 pub const StoredAnswers = struct {
     handle: []const u8,
+    read_handle: []const u8,
     bytes: usize,
 };
 
@@ -261,17 +263,31 @@ pub fn selectPriorToolResults(
         });
     }
     std.mem.reverse(PriorToolResultEntry, selected.items);
+    try numberStoredAnswers(arena, selected.items);
     return .{
         .entries = try selected.toOwnedSlice(arena),
         .older_entries_omitted = older_entries_omitted,
     };
 }
 
-/// The stored answers of a question's result fx kept behind a preview.
+/// Gives each stored list the short handle its reviewer reads it by: `answers-N`,
+/// where N counts the review's stored lists from 1 in prior-result order.
+fn numberStoredAnswers(arena: std.mem.Allocator, entries: []PriorToolResultEntry) std.mem.Allocator.Error!void {
+    var place: usize = 0;
+    for (entries) |*entry| {
+        if (entry.stored_answers) |*stored| {
+            place += 1;
+            stored.read_handle = try arena.print("answers-{d}", .{place});
+        }
+    }
+}
+
+/// The stored answers of a question's result fx kept behind a preview. The
+/// short handle is empty until `numberStoredAnswers` sets it.
 fn storedAnswers(message: types.ChatMessage) ?StoredAnswers {
     if (!message.stored_user_answer) return null;
     const memory = message.tool_result_memory orelse return null;
-    return .{ .handle = memory.output_handle orelse return null, .bytes = memory.stored_output_bytes };
+    return .{ .handle = memory.output_handle orelse return null, .read_handle = "", .bytes = memory.stored_output_bytes };
 }
 
 pub const ProvenBindings = struct {
@@ -1028,7 +1044,16 @@ pub const StoredReads = struct {
         return false;
     }
 
-    fn find(self: *const StoredReads, handle: []const u8) ?*Entry {
+    /// The entry the reviewer reads by its short handle.
+    fn find(self: *const StoredReads, read_handle: []const u8) ?*Entry {
+        for (self.entries) |*entry| {
+            if (std.mem.eql(u8, entry.stored.read_handle, read_handle)) return entry;
+        }
+        return null;
+    }
+
+    /// The entry of a stored result by its real handle.
+    fn findStored(self: *const StoredReads, handle: []const u8) ?*Entry {
         for (self.entries) |*entry| {
             if (std.mem.eql(u8, entry.stored.handle, handle)) return entry;
         }
@@ -1093,14 +1118,14 @@ pub const StoredReads = struct {
         self.bytes += end - start;
         try entry.shown.append(arena, text[start..end]);
         const shown = try text_utils.encodeTerminalSafe(arena, text[start..end], std.math.maxInt(usize));
-        return arena.print("<stored_answers handle=\"{s}\" start_byte=\"{d}\" end_byte=\"{d}\" total_bytes=\"{d}\">\n{s}\n</stored_answers>", .{ entry.stored.handle, start + 1, end, text.len, shown.bytes });
+        return arena.print("<stored_answers handle=\"{s}\" start_byte=\"{d}\" end_byte=\"{d}\" total_bytes=\"{d}\">\n{s}\n</stored_answers>", .{ entry.stored.read_handle, start + 1, end, text.len, shown.bytes });
     }
 
     /// Sends the text around each match of a literal query. A query marks
     /// no bytes sent: only ranges show the answers whole.
     fn readQuery(self: *StoredReads, arena: std.mem.Allocator, entry: *Entry, text: []const u8, query: []const u8, room: usize) ![]const u8 {
         var out: std.Io.Writer.Allocating = .init(arena);
-        try out.writer.print("<stored_answers_query handle=\"{s}\" total_bytes=\"{d}\">\n", .{ entry.stored.handle, text.len });
+        try out.writer.print("<stored_answers_query handle=\"{s}\" total_bytes=\"{d}\">\n", .{ entry.stored.read_handle, text.len });
         var used: usize = 0;
         var matches: usize = 0;
         var from: usize = 0;
@@ -1175,7 +1200,7 @@ fn appendQuestionSources(alloc: std.mem.Allocator, arena: std.mem.Allocator, unt
 /// The untrusted text of stored answers: their questions once the reviewer
 /// read all of them, and until then all it was shown of them.
 fn appendStoredSources(alloc: std.mem.Allocator, arena: std.mem.Allocator, untrusted: *std.ArrayList([]const u8), reads: ?*const StoredReads, entry: PriorToolResultEntry) error{OutOfMemory}!void {
-    const stored = if (reads) |all| all.find(entry.stored_answers.?.handle) else null;
+    const stored = if (reads) |all| all.findStored(entry.stored_answers.?.handle) else null;
     if (stored) |found| {
         if (try StoredReads.answers(found, arena)) |answered| return appendQuestionSources(alloc, arena, untrusted, answered);
     }
@@ -1625,7 +1650,7 @@ fn renderPriorToolResult(
         try out.writer.print("\n" ++ prior_result_label_prefix ++ "{d}].stored_answers_untrusted: ", .{index});
         try writeBoundedValue(&out.writer, alloc, entry.content, max_prior_tool_result_content_bytes, &complete);
         try out.writer.print("\n" ++ prior_result_label_prefix ++ "{d}].stored_answers_handle: ", .{index});
-        try writeBoundedValue(&out.writer, alloc, stored.handle, max_prior_tool_result_field_bytes, &complete);
+        try writeBoundedValue(&out.writer, alloc, stored.read_handle, max_prior_tool_result_field_bytes, &complete);
         try out.writer.print("\n" ++ prior_result_label_prefix ++ "{d}].stored_answers_bytes: {d}", .{ index, stored.bytes });
     } else if (try userAnswers(scratch.allocator(), entry)) |answered| {
         try writeAnsweredFields(&out.writer, scratch.allocator(), index, entry.tool_call_id, answered, &complete);
@@ -2894,6 +2919,7 @@ test "a prior question's stored answers reach the review by handle and size, and
     try std.testing.expectEqual(@as(usize, 2), selected.entries.len);
     const stored = selected.entries[0].stored_answers orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("answers-1", stored.handle);
+    try std.testing.expectEqualStrings("answers-1", stored.read_handle);
     try std.testing.expectEqual(@as(usize, 57843), stored.bytes);
     try std.testing.expect(selected.entries[1].stored_answers == null);
 }
@@ -3493,7 +3519,10 @@ test "a proven caution holds only when a second review confirms it" {
     }
 }
 
-const stored_test_handle = "answers-1";
+/// A real stored-result handle of the live shape: `result-`, 64 hex digits, `.txt`.
+const stored_test_handle = "result-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.txt";
+/// The short handle the reviewer reads `stored_test_handle` by.
+const stored_test_read_handle = "answers-1";
 const stored_test_preview_bytes: usize = 4096;
 
 /// A question's answers as one stored result of about 57 KB: twenty answers
@@ -3520,6 +3549,7 @@ const StoredFixture = struct {
 
     steps: []const Step,
     text: []const u8,
+    handle: []const u8 = stored_test_handle,
     read_fails: bool = false,
     next: usize = 0,
     builds: usize = 0,
@@ -3576,7 +3606,7 @@ const StoredFixture = struct {
 
     fn readStored(raw: *anyopaque, alloc: std.mem.Allocator, handle: []const u8) anyerror![]u8 {
         const self: *StoredFixture = @ptrCast(@alignCast(raw));
-        if (self.read_fails or !std.mem.eql(u8, handle, stored_test_handle)) return error.StoredResultMissing;
+        if (self.read_fails or !std.mem.eql(u8, handle, self.handle)) return error.StoredResultMissing;
         return alloc.dupe(u8, self.text);
     }
 };
@@ -3590,7 +3620,7 @@ fn runStoredReview(fixture: *StoredFixture, reads_stored_results: bool) !ParseOu
         .tool_name = "ask_user_question",
         .content = fixture.text[0..@min(stored_test_preview_bytes, fixture.text.len)],
         .user_answer = true,
-        .stored_answers = .{ .handle = stored_test_handle, .bytes = fixture.text.len },
+        .stored_answers = .{ .handle = fixture.handle, .read_handle = stored_test_read_handle, .bytes = fixture.text.len },
     }};
     var request = ProofFixture.request;
     request.prior_tool_results = .{ .entries = &entries };
@@ -3650,11 +3680,16 @@ const TraceFile = struct {
     /// Stops the trace and checks that it holds the line for one held review:
     /// its reads, the bytes the reviewer was sent, and the reason.
     fn expectHoldLine(self: *TraceFile, read_bytes: usize, stored_bytes: usize, reads: usize, reason: []const u8) !void {
+        try self.expectHoldLineFor(stored_test_handle, read_bytes, stored_bytes, reads, reason);
+    }
+
+    /// As `expectHoldLine`, for the stored answers under `handle`, their real handle.
+    fn expectHoldLineFor(self: *TraceFile, handle: []const u8, read_bytes: usize, stored_bytes: usize, reads: usize, reason: []const u8) !void {
         const trace = try self.readAll();
         defer self.alloc.free(trace);
         const line = try self.alloc.print(
             "event=auto_review_answers_unread call_id=ask handle={s} read_bytes={d} stored_bytes={d} reads={d} reason={s} target_call_id=pending",
-            .{ stored_test_handle, read_bytes, stored_bytes, reads, reason },
+            .{ handle, read_bytes, stored_bytes, reads, reason },
         );
         defer self.alloc.free(line);
         try std.testing.expect(std.mem.find(u8, trace, line) != null);
@@ -3804,7 +3839,7 @@ test "two reads that end mid-character stay inside the byte caps" {
         .tool_name = "ask_user_question",
         .content = text[0..stored_test_preview_bytes],
         .user_answer = true,
-        .stored_answers = .{ .handle = stored_test_handle, .bytes = text.len },
+        .stored_answers = .{ .handle = stored_test_handle, .read_handle = stored_test_read_handle, .bytes = text.len },
     }};
     var request = ProofFixture.request;
     request.prior_tool_results = .{ .entries = &entries };
@@ -3853,7 +3888,7 @@ test "a read across a split character leaves no gap and the list stays clear" {
             .tool_name = "ask_user_question",
             .content = text[0..stored_test_preview_bytes],
             .user_answer = true,
-            .stored_answers = .{ .handle = stored_test_handle, .bytes = text.len },
+            .stored_answers = .{ .handle = stored_test_handle, .read_handle = stored_test_read_handle, .bytes = text.len },
         }};
         var request = ProofFixture.request;
         request.prior_tool_results = .{ .entries = &entries };
@@ -3876,7 +3911,7 @@ test "the read tool is withdrawn when the review's read time runs out" {
     const arena = arena_state.allocator();
     var entries = [_]StoredReads.Entry{.{
         .call_id = "ask",
-        .stored = .{ .handle = stored_test_handle, .bytes = 100 },
+        .stored = .{ .handle = stored_test_handle, .read_handle = stored_test_read_handle, .bytes = 100 },
         .sent = try .initEmpty(arena, 100),
     }};
     var reads: StoredReads = .{ .entries = &entries };
@@ -4136,6 +4171,147 @@ test "the preview and a query do not count as reading stored answers" {
     }
 }
 
+const second_stored_test_handle = "result-fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210.txt";
+
+/// Two stored lists under their own real handles.
+const TwoStoredLists = struct {
+    first: []const u8,
+    second: []const u8,
+
+    fn readStored(raw: *anyopaque, alloc: std.mem.Allocator, handle: []const u8) anyerror![]u8 {
+        const self: *TwoStoredLists = @ptrCast(@alignCast(raw));
+        if (std.mem.eql(u8, handle, stored_test_handle)) return alloc.dupe(u8, self.first);
+        if (std.mem.eql(u8, handle, second_stored_test_handle)) return alloc.dupe(u8, self.second);
+        return error.StoredResultMissing;
+    }
+};
+
+test "a long real handle is read by its short handle, and a full read clears" {
+    const alloc = std.testing.allocator;
+    const text = try storedAnswersText(alloc, null);
+    defer alloc.free(text);
+    try std.testing.expectEqual(@as(usize, 75), stored_test_handle.len);
+    const steps = [_]StoredFixture.Step{
+        .{ .read = "{\"handle\":\"answers-1\",\"start_byte\":1,\"byte_count\":32768}" },
+        .{ .read = "{\"handle\":\"answers-1\",\"start_byte\":32769}" },
+        .{ .decide = "{\"decision\":\"clear\"}" },
+    };
+    var fixture = StoredFixture{ .steps = &steps, .text = text, .handle = stored_test_handle };
+    var outcome = try runStoredReview(&fixture, true);
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .valid);
+    try std.testing.expectEqual(Decision.clear, outcome.valid.decision);
+    try std.testing.expectEqual(steps.len, fixture.next);
+    try std.testing.expect(!fixture.saw_foreign_handle);
+}
+
+test "a read by the real handle is refused and covers no bytes" {
+    const alloc = std.testing.allocator;
+    const text = try storedAnswersText(alloc, null);
+    defer alloc.free(text);
+    const real_read = try alloc.print("{{\"handle\":\"{s}\",\"start_byte\":1,\"byte_count\":32768}}", .{stored_test_handle});
+    defer alloc.free(real_read);
+    const steps = [_]StoredFixture.Step{
+        .{ .read = real_read },
+        .{ .decide = "{\"decision\":\"clear\"}" },
+    };
+    var trace = try TraceFile.start(alloc);
+    defer trace.finish();
+    var fixture = StoredFixture{ .steps = &steps, .text = text, .handle = stored_test_handle };
+    var outcome = try runStoredReview(&fixture, true);
+    defer outcome.deinit(alloc);
+    try expectHeldUnread(outcome);
+    try std.testing.expect(fixture.saw_foreign_handle);
+    try trace.expectHoldLineFor(stored_test_handle, 0, text.len, 1, "not_read");
+}
+
+test "two stored lists are read by their own short handles" {
+    const alloc = std.testing.allocator;
+    const first_text = "[{\"question\":\"Which branch?\",\"answer\":\"list one\"}]";
+    const second_text = "[{\"question\":\"Which tests?\",\"answer\":\"list two\"}]";
+    var lists = TwoStoredLists{ .first = first_text, .second = second_text };
+    const entries = [_]PriorToolResultEntry{
+        .{
+            .tool_call_id = "ask-1",
+            .tool_name = "ask_user_question",
+            .content = first_text,
+            .user_answer = true,
+            .stored_answers = .{ .handle = stored_test_handle, .read_handle = stored_test_read_handle, .bytes = first_text.len },
+        },
+        .{
+            .tool_call_id = "ask-2",
+            .tool_name = "ask_user_question",
+            .content = second_text,
+            .user_answer = true,
+            .stored_answers = .{ .handle = second_stored_test_handle, .read_handle = "answers-2", .bytes = second_text.len },
+        },
+    };
+    var request = ProofFixture.request;
+    request.prior_tool_results = .{ .entries = &entries };
+    request.stored_results = .{ .context = &lists, .read_fn = TwoStoredLists.readStored };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var reads = try StoredReads.init(arena, request, true);
+    var follow_up: std.ArrayList(types.ChatMessage) = .empty;
+    const calls = [_]types.ToolCall{
+        .{ .id = "read_2", .name = read_tool_name, .arguments_json = "{\"handle\":\"answers-2\",\"start_byte\":1,\"byte_count\":1000}" },
+        .{ .id = "read_1", .name = read_tool_name, .arguments_json = "{\"handle\":\"answers-1\",\"start_byte\":1,\"byte_count\":1000}" },
+    };
+    try reads.answer(arena, .{ .tool_calls = &calls }, &follow_up);
+    try std.testing.expectEqual(@as(usize, 3), follow_up.items.len);
+    try std.testing.expect(std.mem.find(u8, follow_up.items[1].content orelse "", "list two") != null);
+    try std.testing.expect(std.mem.find(u8, follow_up.items[2].content orelse "", "list one") != null);
+    try std.testing.expectEqual(second_text.len, reads.entries[1].sent.count());
+    try std.testing.expectEqual(first_text.len, reads.entries[0].sent.count());
+}
+
+test "stored lists are numbered in the order the review lists them" {
+    const alloc = std.testing.allocator;
+    const first_text = "[{\"question\":\"First?\",\"answer\":\"one\"}]";
+    const second_text = "[{\"question\":\"Second?\",\"answer\":\"two\"}]";
+    const pending_calls = [_]types.ToolCall{.{ .id = "pending", .name = "shell", .arguments_json = "{}" }};
+    const messages = [_]types.ChatMessage{
+        .{
+            .role = .tool,
+            .content = first_text,
+            .tool_call_id = "stored-1",
+            .tool_name = "ask_user_question",
+            .tool_result_memory = .{ .output_handle = stored_test_handle, .stored_output_bytes = first_text.len },
+            .stored_user_answer = true,
+        },
+        .{
+            .role = .tool,
+            .content = second_text,
+            .tool_call_id = "stored-2",
+            .tool_name = "ask_user_question",
+            .tool_result_memory = .{ .output_handle = second_stored_test_handle, .stored_output_bytes = second_text.len },
+            .stored_user_answer = true,
+        },
+        .{ .role = .assistant, .content = "CURRENT_PROSE", .tool_calls = &pending_calls },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const selected = try selectPriorToolResults(arena_state.allocator(), &messages, "pending");
+    try std.testing.expectEqual(@as(usize, 2), selected.entries.len);
+    var first = try renderPriorToolResult(alloc, 0, selected.entries[0]);
+    defer first.deinit(alloc);
+    var second = try renderPriorToolResult(alloc, 1, selected.entries[1]);
+    defer second.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, first.text, "\nprior_tool_result[0].stored_answers_handle: answers-1\n") != null);
+    try std.testing.expect(std.mem.find(u8, second.text, "\nprior_tool_result[1].stored_answers_handle: answers-2\n") != null);
+
+    var lists = TwoStoredLists{ .first = first_text, .second = second_text };
+    var request = ProofFixture.request;
+    request.prior_tool_results = selected;
+    request.stored_results = .{ .context = &lists, .read_fn = TwoStoredLists.readStored };
+    var reads = try StoredReads.init(arena_state.allocator(), request, true);
+    var follow_up: std.ArrayList(types.ChatMessage) = .empty;
+    const calls = [_]types.ToolCall{.{ .id = "read_2", .name = read_tool_name, .arguments_json = "{\"handle\":\"answers-2\",\"start_byte\":1,\"byte_count\":1000}" }};
+    try reads.answer(arena_state.allocator(), .{ .tool_calls = &calls }, &follow_up);
+    try std.testing.expect(std.mem.find(u8, follow_up.items[1].content orelse "", "Second?") != null);
+}
+
 test "a reviewer that cannot read tools holds a clear after stored answers" {
     const alloc = std.testing.allocator;
     const text = try storedAnswersText(alloc, null);
@@ -4161,7 +4337,7 @@ test "each reason stored answers do not count is named" {
     const reader: StoredResults = .{ .context = &fixture, .read_fn = StoredFixture.readStored };
     var entry: StoredReads.Entry = .{
         .call_id = "ask",
-        .stored = .{ .handle = stored_test_handle, .bytes = text.len },
+        .stored = .{ .handle = stored_test_handle, .read_handle = stored_test_read_handle, .bytes = text.len },
         .sent = try .initEmpty(arena, text.len),
     };
     var reads: StoredReads = .{ .entries = &.{}, .reader = reader, .offered = true };
@@ -4264,7 +4440,7 @@ fn fuzzStoredAnswerReads(_: void, smith: *std.testing.Smith) anyerror!void {
         .tool_name = "ask_user_question",
         .content = text[0..@min(stored_test_preview_bytes, text.len)],
         .user_answer = true,
-        .stored_answers = .{ .handle = stored_test_handle, .bytes = stored_bytes },
+        .stored_answers = .{ .handle = stored_test_handle, .read_handle = stored_test_read_handle, .bytes = stored_bytes },
     }};
     var request = ProofFixture.request;
     request.prior_tool_results = .{ .entries = &entries };
@@ -4294,7 +4470,7 @@ fn fuzzReadArguments(picks: *std.testing.Smith, arena: std.mem.Allocator) ![]con
         const raw = try arena.alloc(u8, fuzz_max_argument_bytes);
         return raw[0..picks.slice(raw)];
     }
-    const handle = if (picks.value(bool)) stored_test_handle else fuzz_foreign_handle;
+    const handle = if (picks.value(bool)) stored_test_read_handle else fuzz_foreign_handle;
     if (picks.value(bool)) {
         const query = fuzz_query_texts[picks.index(fuzz_query_texts.len)];
         return arena.print("{{\"handle\":\"{s}\",\"query\":\"{s}\"}}", .{ handle, query });
