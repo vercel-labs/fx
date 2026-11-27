@@ -33,7 +33,7 @@ fn settleCompactionWorkFailure(worker: *worker_runtime.WorkerRuntime, work: work
 /// upgrade's restart. As an `error_text` event it also ends the screen's
 /// turn, which no finished prompt does for a turn that yielded.
 const yielded_notice: types.SemanticNotice = .{
-    .topic = "upgrade",
+    .topic = "update",
     .tone = .neutral,
     .body = "stopped between steps for the update; this turn goes on after fx restarts",
 };
@@ -565,7 +565,7 @@ test "worker continues after project context selector failures" {
     }
 }
 
-test "a turn that yielded ends with a neutral upgrade notice" {
+test "a turn that yielded ends with a neutral update notice" {
     try std.testing.expectEqual(types.NoticeTone.neutral, yielded_notice.tone);
-    try std.testing.expectEqualStrings("upgrade", yielded_notice.topic);
+    try std.testing.expectEqualStrings("update", yielded_notice.topic);
 }

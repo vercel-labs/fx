@@ -739,7 +739,7 @@ test "statusLabel failed shows update failed" {
     try std.testing.expectEqualStrings("update failed", label);
 }
 
-test "footer statuses for downloading, ready and failed all say updat" {
+test "footer statuses for downloading, ready and failed all say update" {
     var au = AutoUpgrade{};
     au.setLatestVersion("v0.3.0");
     var buf: [64]u8 = undefined;

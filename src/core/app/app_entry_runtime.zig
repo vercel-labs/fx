@@ -480,7 +480,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         } else {
             writeStderr(
                 deps,
-                "fx: upgrade installed, but no validated resume handoff was available. Your conversation remains on disk; run `fx doctor`.\n",
+                "fx: update installed, but no validated resume handoff was available. Your conversation remains on disk; run `fx doctor`.\n",
             );
         }
         return .{ .exit = 1 };
@@ -1542,6 +1542,10 @@ test "app entry never relaunches without a validated handoff" {
         capture.stderr.written(),
         "no validated resume handoff",
     ) != null);
+    try std.testing.expectEqualStrings(
+        "fx: update installed, but no validated resume handoff was available. Your conversation remains on disk; run `fx doctor`.\n",
+        capture.stderr.written(),
+    );
 }
 
 test "app entry ignores resume handoff stdout failures" {

@@ -163,7 +163,7 @@ pub const resumed_request_notice: core_types.SemanticNotice = .{
 /// What the transcript shows, in place of `resumed_request_notice`, when a
 /// turn that stopped for an upgrade's restart goes on after it.
 pub const continued_turn_notice: core_types.SemanticNotice = .{
-    .topic = "upgrade",
+    .topic = "update",
     .tone = .neutral,
     .body = "continuing the turn after the update",
 };

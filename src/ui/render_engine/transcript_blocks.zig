@@ -3578,7 +3578,7 @@ test "semantic notice glyph grid regression locks tone markers and lowercase top
     }{
         .{ .tone = .neutral, .topic = "session", .body = "renamed to \"custom models\"", .row_text = "* session: renamed to \"custom models\"", .label_fg = 7 },
         .{ .tone = .information, .topic = "background", .body = "command #7 started", .row_text = "i background: command #7 started", .label_fg = 6 },
-        .{ .tone = .success, .topic = "upgrade", .body = "fx has been updated to v9.9.9", .row_text = "✓ upgrade: fx has been updated to v9.9.9", .label_fg = 2 },
+        .{ .tone = .success, .topic = "update", .body = "fx has been updated to v9.9.9", .row_text = "✓ update: fx has been updated to v9.9.9", .label_fg = 2 },
         .{ .tone = .warning, .topic = "skills", .body = "1 discovery issue", .row_text = "! skills: 1 discovery issue", .label_fg = 3 },
         .{ .tone = .@"error", .topic = "session", .body = "usage: /rename <title>", .row_text = "✗ session: usage: /rename <title>", .label_fg = 1 },
         .{ .tone = .cancelled, .topic = "system", .body = "cancelled", .row_text = "⊘ system: cancelled", .label_fg = 8 },
