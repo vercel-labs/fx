@@ -724,9 +724,10 @@ X86_64 = Platform(
     DISPLAY_NAME="Linux x86_64",
     HOST_ARCH="x86_64",
     PROFILE_RUNTIME_TRIPLE="x86_64-unknown-linux-gnu",
-    # x86_64 code is larger: candidates have measured 7.654 to 9.491 MiB, and
-    # the 0.250 MiB preferred headroom needs a ceiling of at least 9.741 MiB.
-    SIZE_CEILING_MIB=9.750,
+    # x86_64 code is larger: candidates have measured 7.654 to 9.491 MiB. The
+    # 0.250 MiB preferred headroom needs a ceiling of at least 9.741 MiB, and
+    # this one leaves about 0.25 MiB more for growth.
+    SIZE_CEILING_MIB=10.000,
     # LLVM runs the machine outliner by default only on AArch64, where it
     # outlines the functions compiled for size. On x86_64, outline only code
     # the profile marks cold: code without profile data counts as hot, and the

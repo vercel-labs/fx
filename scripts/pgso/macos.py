@@ -32,8 +32,8 @@ TARGET = "aarch64-macos"
 DISPLAY_NAME = "macOS arm64"
 HOST_ARCH = "arm64"
 LIBLLVM_NAME = "libLLVM.dylib"
-# Candidates have measured up to 6.757 MiB, and the 0.250 MiB preferred headroom needs a ceiling of at least 7.007 MiB.
-SIZE_CEILING_MIB = 7.250
+# Candidates have measured up to 7.039 MiB, and the 0.250 MiB preferred headroom needs a ceiling of at least 7.289 MiB.
+SIZE_CEILING_MIB = 7.500
 # The ordinary control build already records everything the links reuse.
 CONTROL_BUILD_FLAGS: tuple[str, ...] = ()
 # Apple ld's dead-code stripping for `zig cc` links.

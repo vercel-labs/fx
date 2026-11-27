@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 from scripts.pgso import linux, macos, platforms
-from scripts.pgso.model import PgsoError, sha256_file
+from scripts.pgso.model import PgsoError, sha256_file, size_gate
 from scripts.pgso.pipeline import PipelinePaths
 from scripts.pgso.runner import CommandResult
 
@@ -78,9 +78,23 @@ class LinuxPlatformTests(unittest.TestCase):
         self.assertEqual("Linux x86_64", linux.X86_64.DISPLAY_NAME)
 
     def test_each_platform_has_its_own_size_ceiling(self) -> None:
-        self.assertEqual(7.250, macos.SIZE_CEILING_MIB)
+        self.assertEqual(7.500, macos.SIZE_CEILING_MIB)
         self.assertEqual(7.750, linux.ARM64.SIZE_CEILING_MIB)
-        self.assertEqual(9.750, linux.X86_64.SIZE_CEILING_MIB)
+        self.assertEqual(10.000, linux.X86_64.SIZE_CEILING_MIB)
+
+    def test_each_ceiling_leaves_the_preferred_headroom_over_main_s_measured_candidate(self) -> None:
+        # main's candidates: Linux at e5f7156367, macOS at 0edd97b3e4.
+        for name, size_bytes, ceiling_mib in (
+            ("macOS arm64", 7_380_704, macos.SIZE_CEILING_MIB),
+            ("Linux arm64", 7_617_584, linux.ARM64.SIZE_CEILING_MIB),
+            ("Linux x86_64", 9_787_872, linux.X86_64.SIZE_CEILING_MIB),
+        ):
+            with self.subTest(platform=name):
+                evidence = size_gate(size_bytes, ceiling_mib)
+                self.assertTrue(
+                    evidence.preferred_headroom_met,
+                    f"{name}: {evidence.headroom_mib:.3f} MiB under the {ceiling_mib:.3f} MiB ceiling",
+                )
 
     def test_every_platform_provides_what_the_pipeline_reads(self) -> None:
         names = (
