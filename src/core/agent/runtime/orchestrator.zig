@@ -4629,7 +4629,7 @@ fn canStopForRestart(
 /// record is saved: marked clean, as a closing fx saves it, so the next
 /// launch resumes it without counting a death, and the session marks the turn
 /// as yielded, so the launch continues it as the same turn
-/// (`tests/tla/recovery/Resume.tla` Relaunch, NoFalseCrashQuestion).
+/// (`tests/tla/recovery/Resume.tla` Hold, NoFalseCrashQuestion).
 /// Its start capture is settled first, so it never lands after the marker.
 /// Only a turn `canStopForRestart` allows gets here. When the clean record does
 /// not land, nothing is marked and it returns false: the request is still
@@ -4659,6 +4659,17 @@ fn yieldTurn(
     }
     debug_trace.eventf("agent", "turn_yielded", trace_ctx, "record_saved=true marked={}", .{marked});
     return true;
+}
+
+/// Holds a turn that stopped for its host's restart until the restart
+/// goes ahead or is cancelled. A host with no hold, such as libfx or
+/// ACP, stops the turn at once. No WebAssembly host restarts itself, so
+/// those builds leave the hold and its cancel out
+/// (`sdk/tests/package-size-budgets.json`).
+inline fn holdForRestart(deps: *const AgentRuntimeDeps) AgentRuntimeDeps.RestartHoldEnd {
+    if (comptime host_target.is_wasm) return .stop;
+    const hold = deps.hold_for_restart orelse return .stop;
+    return hold(deps.ctx);
 }
 
 /// A checkpoint `persistFinalReplyCheckpoint` saved holds the reply its turn
@@ -9180,7 +9191,9 @@ fn processQueuedPromptLoop(
             // prompt has sent its first request. Only the gateway path saves
             // the turn before its send, so only it stops here, and only when
             // the next launch can continue it (`canStopForRestart`); any
-            // other turn goes on, and the restart waits for it to end.
+            // other turn goes on, and the restart waits for it to end. It then
+            // holds there until the restart goes ahead or is cancelled
+            // (`holdForRestart`).
             const stop_requested = if (config.yield_flag) |flag| flag.load(.seq_cst) else false;
             if (job.provider == .gateway and quiesce.step(&turn_quiesce, .{ .boundary = .{
                 .now_ms = io_mod.milliTimestamp(),
@@ -9189,7 +9202,24 @@ fn processQueuedPromptLoop(
             } }) == .yield and canStopForRestart(deps, &request_recovery, &yield_skip_traced, step_ctx)) {
                 // A stop whose clean record does not land leaves the turn
                 // going on; the next boundary asks again.
-                if (yieldTurn(deps, &request_recovery, step_ctx)) return error.TurnYielded;
+                if (yieldTurn(deps, &request_recovery, step_ctx)) switch (holdForRestart(deps)) {
+                    .stop => return error.TurnYielded,
+                    // The restart was cancelled: the request goes out after
+                    // all, once its send's record is saved again.
+                    .go_on => try request_recovery.reopenAfterYield(),
+                    .cancelled => {
+                        // As at every cancel, steering that waits goes on
+                        // in place of the request that never went out.
+                        if (try append_immediate_steering_after_cancel(deps, arena, &within_turn_suffix, turn_id, "")) {
+                            reset_recovery_after_immediate_steering(&recovery_strategy, &recovery_cause, &preserved_tool_evidence);
+                            continue :agent_steps_loop;
+                        }
+                        runtime_telemetry.traceCancelObserved(step_ctx, false);
+                        try persistCancelledTurn(deps, finalization, job, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                        finish_trace.finish("interrupted");
+                        return;
+                    },
+                };
             }
 
             disarmCacheWarming(deps);

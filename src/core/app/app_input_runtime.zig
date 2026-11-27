@@ -12756,6 +12756,8 @@ const FakeSubmitApp = struct {
     on_subagent_screen: bool = false,
     /// Works those submits opened.
     opened_turn_works: usize = 0,
+    /// Whether fx waits to restart for an upgrade, which holds a submit.
+    upgrader: struct { restart: auto_upgrade.RestartWait = .none } = .{},
 
     pub fn slashRegistry(_: *const FakeSubmitApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
@@ -13330,6 +13332,31 @@ test "app_input_runtime submit resolves slash completion through core command sp
     try std.testing.expect(app.last_prompt == null);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "app_input_runtime submit holds a prompt while the upgrade restart waits, and names Ctrl+G only while it cancels" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "after the restart");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    app.upgrader.restart = .waiting;
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+    try std.testing.expect(app.last_prompt == null);
+    try std.testing.expect(app.agent().submission.pending == null);
+    try std.testing.expectEqualStrings("after the restart", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(std.mem.endsWith(u8, app.notice_body.items, "; send this after the restart, or press Ctrl+G to cancel it"));
+
+    // Once the held turns are let go, Ctrl+G no longer cancels the restart.
+    app.upgrader.restart = .releasing;
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+    try std.testing.expect(app.last_prompt == null);
+    try std.testing.expect(app.agent().submission.pending == null);
+    try std.testing.expectEqualStrings("after the restart", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(std.mem.endsWith(u8, app.notice_body.items, "; send this after the restart"));
+    try std.testing.expect(std.mem.find(u8, app.notice_body.items, "Ctrl+G") == null);
+    try std.testing.expectEqual(@as(usize, 2), app.notice_count);
 }
 
 test "app_input_runtime idle submit commits its frame before credential preflight" {
