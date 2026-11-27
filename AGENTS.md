@@ -460,10 +460,11 @@ Releases are prepared by hand in a release PR. The maintainer controls the chang
 
 To prepare a release:
 
-1. Create a branch (e.g. `prepare-v0.3.0`)
-2. Bump `pub const version` in `src/main.zig`
-3. Write the changelog entry in `CHANGELOG.md` at the top, under a new `## <version>` heading, wrapped in `<!-- release:start -->` and `<!-- release:end -->` markers. Remove the markers from the previous release entry so only the new release has them.
-4. Open a PR and merge to `main`
+1. Run the validate-only release on the `main` commit the release will ship: `gh workflow run release.yml --ref main -f validate_only=true`. It takes about as long as a release build and publishes nothing. A failure means a PGSO training, behavior, size, or performance gate failed on code that would ship. Fix it on `main` and run it again, and continue only when it passes.
+2. Create a branch (e.g. `prepare-v0.3.0`)
+3. Bump `pub const version` in `src/main.zig`
+4. Write the changelog entry in `CHANGELOG.md` at the top, under a new `## <version>` heading, wrapped in `<!-- release:start -->` and `<!-- release:end -->` markers. Remove the markers from the previous release entry so only the new release has them.
+5. Open a PR and merge to `main`
 
 When the PR merges, CI compares the version tag to what exists in git. If the tag is missing, it builds all platform binaries, creates the git tag, and publishes a GitHub Release with the binaries attached. Only the push that changes the version starts a release. To retry a failed release after a fix, run the Release workflow on `main` by hand with `validate_only` off. The release body is extracted from the content between the `<!-- release:start -->` and `<!-- release:end -->` markers in `CHANGELOG.md`.
 

@@ -326,6 +326,14 @@ Maintainers prepare each release in a pull request that bumps `pub const version
 
 To check release artifacts without publishing anything, run **Actions > Release** on `main` with `validate_only` enabled. The run builds every target, runs the PGSO qualification, and notarizes the macOS binaries. It creates no tag or GitHub Release, uploads nothing to the CDN, and changes no update channel.
 
+Before you open a release pull request, run that validate-only release on the `main` commit the release will ship:
+
+```bash
+gh workflow run release.yml --ref main -f validate_only=true
+```
+
+It takes about as long as a release build. A failure means a PGSO training, behavior, size, or performance gate failed on code that would ship. Fix what failed, run it again, and open the release pull request only after it passes.
+
 After CI passes on `main`, the dev release workflow publishes binaries for that commit. Run `fx upgrade --channel dev` to follow those builds, and `fx upgrade --channel stable` to go back to tagged releases.
 
 ## License
