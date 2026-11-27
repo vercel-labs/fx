@@ -325,6 +325,13 @@ pub const FileMutationPreparation = union(enum) {
     not_file_mutation,
 };
 
+pub const FileMutationExecutionPreparation = union(enum) {
+    prepared: PreparedFileMutationCall,
+    target_resolution_failure: []const u8,
+    tool_failure: []const u8,
+    not_file_mutation,
+};
+
 const FileMutationDecodeResult = union(enum) {
     input: file_mutation_contract.FileMutationInput,
     failure: []const u8,
@@ -397,6 +404,19 @@ pub fn prepareFileMutationCall(
     call: ToolCall,
     request: FileMutationPreparationRequest,
 ) !FileMutationPreparation {
+    return switch (try prepareFileMutationCallForExecution(alloc, call, request)) {
+        .prepared => |value| .{ .prepared = value },
+        .target_resolution_failure => |reason| .{ .tool_failure = reason },
+        .tool_failure => |reason| .{ .tool_failure = reason },
+        .not_file_mutation => .not_file_mutation,
+    };
+}
+
+pub fn prepareFileMutationCallForExecution(
+    alloc: Allocator,
+    call: ToolCall,
+    request: FileMutationPreparationRequest,
+) !FileMutationExecutionPreparation {
     var input = switch (try decodeFileMutationInput(
         alloc,
         request.tool_registry,
@@ -415,7 +435,7 @@ pub fn prepareFileMutationCall(
         request.workspace_root,
         input,
     )) {
-        .target_resolution_failure => |failure| return .{ .tool_failure = try alloc.print(
+        .target_resolution_failure => |failure| return .{ .target_resolution_failure = try alloc.print(
             "file mutation target resolution failed: {s}",
             .{@tagName(failure)},
         ) },
@@ -3631,6 +3651,32 @@ test "file mutation preparation returns semantic failures before permission eval
     );
     try std.testing.expectEqual(@as(usize, 1), file_mutation_decode_count);
     try std.testing.expectEqual(@as(usize, 1), file_mutation_resolution_count);
+
+    const exec_malformed = try prepareFileMutationCallForExecution(arena, .{
+        .id = "exec-malformed",
+        .name = "write_file",
+        .arguments_json = "{",
+    }, .{
+        .tool_registry = test_admission_registry,
+        .workspace_root = workspace,
+    });
+    try std.testing.expectEqual(
+        @as(std.meta.Tag(FileMutationExecutionPreparation), .tool_failure),
+        std.meta.activeTag(exec_malformed),
+    );
+
+    const exec_missing_edit = try prepareFileMutationCallForExecution(arena, .{
+        .id = "exec-missing-edit",
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\"missing.txt\",\"old_string\":\"before\",\"new_string\":\"after\"}",
+    }, .{
+        .tool_registry = test_admission_registry,
+        .workspace_root = workspace,
+    });
+    try std.testing.expectEqual(
+        @as(std.meta.Tag(FileMutationExecutionPreparation), .target_resolution_failure),
+        std.meta.activeTag(exec_missing_edit),
+    );
 }
 
 fn checkFileMutationPreparationAllocationFailures(alloc: Allocator, workspace: []const u8) !void {
@@ -4009,6 +4055,13 @@ test "file mutation decode steps aside for a host tool reusing a reserved name" 
         .arguments_json = "{\"path\":\"note.txt\",\"content\":\"hi\"}",
     }, .{ .tool_registry = .{ .tools = tools[0..] }, .workspace_root = "/tmp" });
     try std.testing.expect(prepared == .not_file_mutation);
+
+    const exec_host = try prepareFileMutationCallForExecution(arena, .{
+        .id = "host-write",
+        .name = "write_file",
+        .arguments_json = "{\"path\":\"note.txt\",\"content\":\"hi\"}",
+    }, .{ .tool_registry = .{ .tools = tools[0..] }, .workspace_root = "/tmp" });
+    try std.testing.expect(exec_host == .not_file_mutation);
 }
 
 test "file mutation decode rejects a registered tool that is not a mutation" {

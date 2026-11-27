@@ -1414,6 +1414,7 @@ pub const scoped_instructions_pending_tool_result_output = "Not executed: new sc
 pub const target_changed_tool_result_output = "Not executed: an earlier call in this step changed the target of this call. Reissue the call to run it on the current target.";
 pub const target_unavailable_tool_result_output = "Not executed: the target of this call was deleted or can no longer be resolved after an earlier call in this step. Reissue the call if you still want to run it.";
 pub const file_mutation_target_changed_tool_result_output = "Not executed: an earlier call in this step changed the file target of this mutation. Reissue the call to prepare and run it on the current target.";
+pub const non_file_mutation_tool_result_output = "Not executed: this tool does not use built-in file-mutation target verification.";
 
 pub fn isContextDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
@@ -1427,7 +1428,8 @@ pub fn isDeferredToolResult(result: PersistedToolResult) bool {
             std.mem.eql(u8, result.output, scoped_instructions_pending_tool_result_output) or
             std.mem.eql(u8, result.output, target_changed_tool_result_output) or
             std.mem.eql(u8, result.output, target_unavailable_tool_result_output) or
-            std.mem.eql(u8, result.output, file_mutation_target_changed_tool_result_output));
+            std.mem.eql(u8, result.output, file_mutation_target_changed_tool_result_output) or
+            std.mem.eql(u8, result.output, non_file_mutation_tool_result_output));
 }
 
 test "persisted deferred tool result classifier is exact" {
@@ -1477,6 +1479,7 @@ test "persisted deferred tool result classifier is exact" {
         target_changed_tool_result_output,
         target_unavailable_tool_result_output,
         file_mutation_target_changed_tool_result_output,
+        non_file_mutation_tool_result_output,
     }) |output| {
         result.output = @constCast(output);
         try std.testing.expect(isDeferredToolResult(result));

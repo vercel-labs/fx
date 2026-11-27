@@ -4247,6 +4247,74 @@ test "same-batch target deletion or kind change explains why read_file did not r
     );
 }
 
+test "same-batch file mutation target deletion reports target unavailable" {
+    const alloc = std.testing.allocator;
+    defer EmptyApplicableContext.reset();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "workspace/target.txt", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "before\n");
+    }
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const target_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "target.txt" });
+    defer alloc.free(target_path);
+
+    const DeleteTargetOnExecute = struct {
+        target_path: []const u8,
+        fn run(raw: *anyopaque, request: runtime_tool_contracts.ToolExecutionRequest) !runtime_tool_contracts.ToolExecutionResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, request.call.name, "terminal")) {
+                try std.Io.Dir.cwd().deleteFile(io_mod.getIo(), self.target_path);
+                return .{ .model_output = "deleted" };
+            }
+            return .{ .model_output = "unexpected" };
+        }
+    };
+    var delete_override = DeleteTargetOnExecute{ .target_path = target_path };
+
+    const calls = [_]ToolCall{
+        toolCall("delete_target", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
+        toolCall(
+            "stale_edit",
+            "edit_file",
+            "{\"path\":\"target.txt\",\"old_string\":\"before\",\"new_string\":\"after\"}",
+        ),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls, .streamed_tool_starts = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.context_enabled = true;
+    hooks.context_registry = EmptyApplicableContext.registry;
+    hooks.tool_execution_override = .{
+        .context = &delete_override,
+        .execute_fn = DeleteTargetOnExecute.run,
+    };
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.index);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), execution.tool_steps[0].tool_results.len);
+    try std.testing.expectEqualStrings("deleted", execution.tool_steps[0].tool_results[0].output);
+    try std.testing.expectEqualStrings(
+        types.target_unavailable_tool_result_output,
+        execution.tool_steps[0].tool_results[1].output,
+    );
+}
+
 test "same-batch missing target defers newly resolvable scope until reissue" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
