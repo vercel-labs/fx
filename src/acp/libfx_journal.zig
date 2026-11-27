@@ -844,30 +844,14 @@ fn finishedResult(finished: []const journal.Finished, id: []const u8) ?journal.F
 /// `finished` and the turn's text; allocates in `scratch`.
 fn answerRunning(scratch: Allocator, turn: *session_codec.RecoveryCheckpoint, calls: []types.ToolCall, finished: []const journal.Finished) Allocator.Error!void {
     if (calls.len == 0) return;
-    const unfinished = session_adapter.unfinished_tool_output;
     const results = try scratch.alloc(types.PersistedToolResult, calls.len);
     for (calls, results) |call, *result| {
-        const recorded = finishedResult(finished, call.id);
-        result.* = switch (continuation.answer(recorded != null)) {
-            .recorded => .{
-                .tool_call_id = @constCast(call.id),
-                .tool_name = @constCast(call.name),
-                .status = if (recorded.?.failed) .failure else .success,
-                .output = @constCast(recorded.?.output),
-                .tool_images = recorded.?.images,
-                .output_bytes = recorded.?.output.len,
-                .stored_output_bytes = recorded.?.output.len,
-            },
-            .may_have_partly_run => .{
-                .tool_call_id = @constCast(call.id),
-                .tool_name = @constCast(call.name),
-                .status = .failure,
-                .output = @constCast(unfinished),
-                .tool_images = &.{},
-                .output_bytes = unfinished.len,
-                .stored_output_bytes = unfinished.len,
-            },
-        };
+        const recorded: ?session_codec.RecordedResult = if (finishedResult(finished, call.id)) |value| .{
+            .failed = value.failed,
+            .output = value.output,
+            .images = value.images,
+        } else null;
+        result.* = session_codec.answeredResult(call.id, call.name, recorded);
     }
     const old = turn.execution.tool_steps;
     const steps = try scratch.alloc(types.ToolExecutionStep, old.len + 1);

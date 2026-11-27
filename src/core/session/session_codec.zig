@@ -248,6 +248,32 @@ fn holdsResumeNotice(steering: []const types.PersistedSteering) bool {
     return false;
 }
 
+/// A result that a turn saved as its call finished. Borrows its strings and images.
+pub const RecordedResult = struct {
+    failed: bool,
+    output: []const u8,
+    images: []types.ToolImage = &.{},
+};
+
+/// The result that answers a call a stop left running (`continuation.answer`):
+/// its recorded result, or a failed result saying it may have partly run. Borrows
+/// `call_id`, `call_name` and `recorded`; a caller that keeps the result copies it.
+pub fn answeredResult(call_id: []const u8, call_name: []const u8, recorded: ?RecordedResult) types.PersistedToolResult {
+    const value: RecordedResult = switch (continuation.answer(recorded != null)) {
+        .recorded => recorded.?,
+        .may_have_partly_run => .{ .failed = true, .output = continuation.unfinished_call_output },
+    };
+    return .{
+        .tool_images = value.images,
+        .tool_call_id = @constCast(call_id),
+        .tool_name = @constCast(call_name),
+        .status = if (value.failed) .failure else .success,
+        .output = @constCast(value.output),
+        .output_bytes = value.output.len,
+        .stored_output_bytes = value.output.len,
+    };
+}
+
 /// The checkpoint that goes on from an interrupted history turn: its user
 /// turn and finished steps, with no partial reply and nothing sent yet.
 /// Owned by `alloc`; the caller calls `deinit`.
@@ -385,6 +411,25 @@ test "a turn resumed again keeps its one resume notice where the model first saw
     try std.testing.expectEqual(@as(usize, 2), yielded.execution.steering.len);
     try std.testing.expectEqualStrings(continuation.resume_notice, yielded.execution.steering[0].text);
     try std.testing.expectEqualStrings("steer", yielded.execution.steering[1].text);
+}
+
+test "an answered call keeps its recorded result, or says it may have partly run" {
+    var images = [_]types.ToolImage{.{ .data = @constCast("png-bytes"), .mime_type = @constCast("image/png") }};
+    const recorded = answeredResult("call-1", "read", .{ .failed = false, .output = "done", .images = &images });
+    try std.testing.expectEqualStrings("call-1", recorded.tool_call_id);
+    try std.testing.expectEqualStrings("read", recorded.tool_name);
+    try std.testing.expectEqual(types.PersistedToolStatus.success, recorded.status);
+    try std.testing.expectEqualStrings("done", recorded.output);
+    try std.testing.expectEqual(@as(usize, 4), recorded.stored_output_bytes);
+    try std.testing.expectEqual(@as(usize, 1), recorded.tool_images.len);
+
+    const partly_run = answeredResult("call-2", "bash", null);
+    try std.testing.expectEqualStrings("call-2", partly_run.tool_call_id);
+    try std.testing.expectEqualStrings("bash", partly_run.tool_name);
+    try std.testing.expectEqual(types.PersistedToolStatus.failure, partly_run.status);
+    try std.testing.expectEqualStrings(continuation.unfinished_call_output, partly_run.output);
+    try std.testing.expectEqual(continuation.unfinished_call_output.len, partly_run.output_bytes);
+    try std.testing.expectEqual(@as(usize, 0), partly_run.tool_images.len);
 }
 
 pub const DurableSessionState = struct {
