@@ -14,6 +14,7 @@ const permission_request = @import("../permissions/permission_request.zig");
 const notification_contract = @import("../notifications/notification_contract.zig");
 const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
+const continuation = @import("../continuation/continuation.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const compactor = @import("../compactor/compactor.zig");
@@ -133,17 +134,6 @@ pub const SteeringBoundaryResult = union(enum) {
     interrupt,
 };
 
-/// How the turn a queued prompt continues was stopped.
-pub const ContinuedTurn = enum {
-    /// Between steps, for an upgrade's restart: nothing went out for the
-    /// next request, so it sends with no new attempt and no status
-    /// (`recovery.Start.continues`).
-    yielded,
-    /// By a crash or a closed window: the turn goes on with fx's resume notice,
-    /// and its request goes out again as a resume.
-    stopped,
-};
-
 pub const QueuedPrompt = struct {
     turn_id: u64 = 0,
     input_id: ?u64 = null,
@@ -200,7 +190,7 @@ pub const QueuedPrompt = struct {
     /// `recovery_checkpoint`, as the same turn: the user's own message and the
     /// turn's pieces, never a note in place of the user's message. `recovery_resume`
     /// still decides whether the first request goes at once.
-    continuation: ?ContinuedTurn = null,
+    continuation: ?continuation.Stop = null,
     /// True when this output surface already contains the checkpoint's
     /// assistant source. Recovery still restores the source for overlap and
     /// persistence, but publishes only novel continuation text.

@@ -222,7 +222,7 @@ pub fn resumedCheckpoint(
     var view = pending;
     const old = view.execution.steering;
     const after = view.execution.tool_steps.len;
-    const notice = continuation.notice(stop, holdsResumeNotice(old));
+    const notice = continuation.notice(stop, if (holdsResumeNotice(old)) .told else .untold);
     if (stop == .interrupted and notice == .none) {
         debug_trace.logf("session", "event=resume_notice_kept steering={d}", .{old.len});
     }
@@ -238,6 +238,12 @@ pub fn resumedCheckpoint(
     view.execution.steering = steering;
     view.consumed_provider_attempts = 0;
     view.outstanding_reservation = false;
+    // A stop between steps has no call to answer. A confirmed result is already a
+    // finished step in the history. A call that never ran is not in it, so its
+    // response's partial text goes too, as the CLI's resume does, and the model
+    // cannot read a claim that the call ran.
+    if (view.tool_state == .proven_unexecuted) view.assistant_source = @constCast("");
+    view.tool_state = .none;
     return view.dupe(alloc);
 }
 
@@ -259,7 +265,7 @@ pub const RecordedResult = struct {
 /// its recorded result, or a failed result saying it may have partly run. Borrows
 /// `call_id`, `call_name` and `recorded`; a caller that keeps the result copies it.
 pub fn answeredResult(call_id: []const u8, call_name: []const u8, recorded: ?RecordedResult) types.PersistedToolResult {
-    const value: RecordedResult = switch (continuation.answer(recorded != null)) {
+    const value: RecordedResult = switch (continuation.answer(if (recorded == null) .unrecorded else .recorded)) {
         .recorded => recorded.?,
         .may_have_partly_run => .{ .failed = true, .output = continuation.unfinished_call_output },
     };
@@ -430,6 +436,30 @@ test "an answered call keeps its recorded result, or says it may have partly run
     try std.testing.expectEqualStrings(continuation.unfinished_call_output, partly_run.output);
     try std.testing.expectEqual(continuation.unfinished_call_output.len, partly_run.output_bytes);
     try std.testing.expectEqual(@as(usize, 0), partly_run.tool_images.len);
+}
+
+test "a resumed turn that stopped between steps carries no tool-state prompt" {
+    const alloc = std.testing.allocator;
+    var steps = [_]types.ToolExecutionStep{.{}};
+    for ([_]RecoveryToolState{ .confirmed, .proven_unexecuted }) |state| {
+        const pending: RecoveryCheckpoint = .{
+            .turn_id = 1,
+            .user = .{ .text = @constCast("work") },
+            .assistant_source = @constCast("Let me check."),
+            .execution = .{ .tool_steps = &steps },
+            .cause = .network_interrupted,
+            .action = .retrying_request,
+            .tool_state = state,
+            .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+            .requested_fast_mode = false,
+            .fast_mode = false,
+            .max_provider_attempts = 3,
+            .consumed_provider_attempts = 0,
+        };
+        var resumed = try resumedCheckpoint(alloc, pending, .interrupted, &.{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(RecoveryToolState.none, resumed.tool_state);
+    }
 }
 
 pub const DurableSessionState = struct {

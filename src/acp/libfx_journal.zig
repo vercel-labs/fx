@@ -1202,6 +1202,17 @@ test "a turn resumed again keeps its one resume notice where it was" {
     try std.testing.expectEqual(@as(usize, 0), yielded.execution.steering[0].after_tool_step_count);
 }
 
+test "a resumed turn that stopped between steps carries no confirmed-tool prompt" {
+    const alloc = std.testing.allocator;
+    var progress = try testProgress(alloc);
+    defer progress.deinit(alloc);
+    progress.tool_state = .confirmed;
+
+    var resumed = try resumeCheckpoint(alloc, progress, &.{}, false);
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(session_codec.RecoveryToolState.none, resumed.tool_state);
+}
+
 test "a resumed turn runs again the calls the host asks for and leaves the rest to the model" {
     const alloc = std.testing.allocator;
     var calls = [_]types.ToolCall{

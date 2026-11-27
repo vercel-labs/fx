@@ -2261,8 +2261,7 @@ pub fn Runtime(comptime App: type) type {
             defer checkpoint.deinit(app.alloc);
             const v2 = agent.session_persistence.v2;
             if (v2) |v2_session| v2_session.setContinuesYielded(&entry.execution);
-            const kind: worker_runtime.ContinuedTurn = if (stop == .yielded) .yielded else .stopped;
-            app.queueContinuedTurn(agent, &checkpoint, resumed, kind) catch |err| {
+            app.queueContinuedTurn(agent, &checkpoint, resumed, stop) catch |err| {
                 if (v2) |v2_session| v2_session.setContinuesYielded(null);
                 return err;
             };
@@ -6886,7 +6885,7 @@ const TestApp = struct {
     } = .{},
     mcp_tool_names: std.ArrayList([]u8) = .empty,
     continued: ?session_codec.RecoveryCheckpoint = null,
-    continued_kind: ?worker_runtime.ContinuedTurn = null,
+    continued_kind: ?continuation.Stop = null,
     continued_count: usize = 0,
     continue_error: ?anyerror = null,
 
@@ -6902,7 +6901,7 @@ const TestApp = struct {
         _: anytype,
         checkpoint: *const session_codec.RecoveryCheckpoint,
         _: types.RecoveryResume,
-        kind: worker_runtime.ContinuedTurn,
+        kind: continuation.Stop,
     ) !void {
         if (self.continue_error) |err| return err;
         self.continued_count += 1;
@@ -7465,7 +7464,7 @@ test "a crash-stopped turn resumes as the same turn with the resume notice" {
     Runtime(TestApp).startPendingResume(&app, agent);
 
     try std.testing.expectEqual(@as(usize, 1), app.continued_count);
-    try std.testing.expectEqual(worker_runtime.ContinuedTurn.stopped, app.continued_kind.?);
+    try std.testing.expectEqual(continuation.Stop.interrupted, app.continued_kind.?);
     const checkpoint = app.continued.?;
     try std.testing.expectEqualStrings("work", checkpoint.user.text);
     const steering = checkpoint.execution.steering;
@@ -7495,7 +7494,7 @@ test "a yielded turn still resumes with no notice" {
     Runtime(TestApp).startPendingResume(&app, agent);
 
     try std.testing.expectEqual(@as(usize, 1), app.continued_count);
-    try std.testing.expectEqual(worker_runtime.ContinuedTurn.yielded, app.continued_kind.?);
+    try std.testing.expectEqual(continuation.Stop.yielded, app.continued_kind.?);
     try std.testing.expectEqual(@as(usize, 0), app.continued.?.execution.steering.len);
 }
 
@@ -7544,7 +7543,7 @@ test "a libfx terminal session continues the turn its reload stopped" {
     Runtime(TestApp).startPendingResume(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 1), app.continued_count);
-    try std.testing.expectEqual(worker_runtime.ContinuedTurn.stopped, app.continued_kind.?);
+    try std.testing.expectEqual(continuation.Stop.interrupted, app.continued_kind.?);
     const checkpoint = app.continued.?;
     try std.testing.expectEqualStrings("reloaded work", checkpoint.user.text);
     const steering = checkpoint.execution.steering;
