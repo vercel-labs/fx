@@ -10,6 +10,7 @@ const bp = @import("presentation/block_parse.zig");
 const payload = @import("presentation/payload.zig");
 const inline_render = @import("presentation/inline_render.zig");
 pub const builds_previews = inline_render.builds_previews;
+pub const bareUrlEnd = inline_render.bareUrlEnd;
 const block_render = @import("presentation/block_render.zig");
 
 /// Prevents OSC 8 hyperlinks from coalescing across wrapped terminal rows.

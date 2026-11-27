@@ -31,21 +31,21 @@ const compact_recent_messages_note = "Recent conversation turns are preserved ve
 const compact_direct_resume_instruction = "Continue the conversation from where it left off without asking the user to repeat context. Resume directly.";
 
 pub const interrupted_turn_notice: core_types.SemanticNotice = .{
-    .topic = "system",
+    .topic = "",
     .tone = .cancelled,
-    .body = "cancelled",
+    .body = "Cancelled",
 };
 
 pub const failed_turn_notice: core_types.SemanticNotice = .{
-    .topic = "system",
+    .topic = "",
     .tone = .@"error",
-    .body = "failed",
+    .body = "Failed",
 };
 
 /// A turn fx itself stopped, by crashing or closing, which the next launch
 /// sends again.
 pub const stopped_turn_notice: core_types.SemanticNotice = .{
-    .topic = "system",
+    .topic = "",
     .tone = .warning,
     .body = "fx stopped before this turn finished",
 };
@@ -685,9 +685,9 @@ test "a turn fx stopped by crashing or closing reads as stopped, not failed or c
     try std.testing.expectEqual(core_types.NoticeTone.warning, interruptedTurnNotice(stopped).tone);
     // Esc and a turn that failed keep their own notices.
     const cancelled: InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .terminal_reason = .cancelled };
-    try std.testing.expectEqualStrings("cancelled", interruptedTurnNotice(cancelled).body);
+    try std.testing.expectEqualStrings("Cancelled", interruptedTurnNotice(cancelled).body);
     const failed: InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .terminal_reason = .failed };
-    try std.testing.expectEqualStrings("failed", interruptedTurnNotice(failed).body);
+    try std.testing.expectEqualStrings("Failed", interruptedTurnNotice(failed).body);
 }
 
 test "legacy image repair rewrites repeated per-turn ordinals to stable session ids" {
