@@ -142,12 +142,22 @@ fn leaderPathOf(socket_path: []const u8) ?LeaderPath {
     const base = folder[0..name_at];
     const name = folder[name_at + 1 ..];
     if (base.len == 0 or base[0] != '/') return null;
+    if (hasDotPart(base)) return null;
     if (name.len != folder_prefix.len + hex_len) return null;
     if (!std.mem.startsWith(u8, name, folder_prefix)) return null;
     for (name[folder_prefix.len..]) |c| {
         if (!isLowerHex(c)) return null;
     }
     return .{ .base = base, .name = name };
+}
+
+/// True when a path has a `.` or `..` part, so its folders are not spelled out.
+fn hasDotPart(path: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return true;
+    }
+    return false;
 }
 
 fn isLowerHex(c: u8) bool {
@@ -386,6 +396,12 @@ test "a socket path counts as a leader's only in the leader's shape" {
     const long = try testing.allocator.print("/{s}/fx-leader-0123456789abcdef/s", .{ninety[0..]});
     defer testing.allocator.free(long);
     try testing.expect(leaderPathOf(long) == null);
+}
+
+test "a socket path whose base has a . or .. part is not a leader's shape, and a name that starts with dots is" {
+    try testing.expect(leaderPathOf("/tmp/../tmp/fx-leader-0123456789abcdef/s") == null);
+    try testing.expect(leaderPathOf("/tmp/./fx-leader-0123456789abcdef/s") == null);
+    try testing.expect(leaderPathOf("/tmp/..x/fx-leader-0123456789abcdef/s") != null);
 }
 
 test "a folder owned by another user is kept, and an unknown owner is kept" {
