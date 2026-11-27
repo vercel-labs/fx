@@ -336,6 +336,7 @@ pub const PromptRunResult = struct {
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     recovery: ?types.RouteRecoveryStatus = null,
     usage: types.Usage = .{},
+    billed_usage: types.Usage = .{},
     /// Owned. What each subagent that did work in the run used, in the order
     /// each first ran; empty when none did. Not part of `usage`, which is
     /// main's alone.
@@ -715,6 +716,9 @@ const AskContext = struct {
     /// running turn's, and each turn starts it over, so the run's total is
     /// kept here (`takeTurnUsage`).
     usage_total: types.Usage = .{},
+    side_usage: types.Usage = .{},
+    side_usage_mutex: std.Io.Mutex = .init,
+    title_task: ?*session_title_generation.Task = null,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
@@ -847,6 +851,28 @@ const AskContext = struct {
     fn takeTurnUsage(self: *AskContext) void {
         self.usage_total.add(self.session.agent.turn_usage);
         self.session.agent.turn_usage = .{};
+    }
+
+    fn addSideUsage(self: *AskContext, usage: types.Usage) void {
+        const io = io_mod.getIo();
+        self.side_usage_mutex.lockUncancelable(io);
+        defer self.side_usage_mutex.unlock(io);
+        self.side_usage.add(usage);
+    }
+
+    fn billedUsage(self: *AskContext) types.Usage {
+        const io = io_mod.getIo();
+        var total = self.usage_total;
+        self.side_usage_mutex.lockUncancelable(io);
+        defer self.side_usage_mutex.unlock(io);
+        total.add(self.side_usage);
+        return total;
+    }
+
+    fn finishTitleTask(self: *AskContext) void {
+        const task = self.title_task orelse return;
+        self.title_task = null;
+        completeAskTitleTask(self, task);
     }
 
     fn processInterruptRequested(self: *const AskContext) bool {
@@ -1928,13 +1954,13 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     const deps = agentRuntimeDeps(&ctx);
     const semantic_presentation = if (ctx.presenter) |value| value.semanticSink() else null;
     try ctx.checkCancellation();
-    const title_task = maybeStartAskTitleTask(
+    ctx.title_task = maybeStartAskTitleTask(
         &ctx,
         startup.session_title_generation,
         owned_prompt,
         options.save_session and ctx.requested_resume == null,
     );
-    defer if (title_task) |task| completeAskTitleTask(&ctx, task);
+    defer ctx.finishTitleTask();
     var toolbox_arena_state = std.heap.ArenaAllocator.init(alloc);
     defer toolbox_arena_state.deinit();
     const toolbox_mcp_servers = try toolboxMcpServerNames(toolbox_arena_state.allocator(), &ctx);
@@ -2036,6 +2062,7 @@ fn runAskTurn(
     ctx.takeTurnUsage();
     processed catch |err| switch (err) {
         error.NonInteractivePermissionRequired => {
+            ctx.finishTitleTask();
             const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
             errdefer alloc.free(assistant_output);
             const subagents = try takeSubagentUsage(ctx, alloc);
@@ -2048,6 +2075,7 @@ fn runAskTurn(
                 .tool_calls = tool_calls,
                 .error_code = "NonInteractivePermissionRequired",
                 .usage = ctx.usage_total,
+                .billed_usage = ctx.billedUsage(),
                 .subagents = subagents,
             };
         },
@@ -2116,6 +2144,7 @@ fn maybeStartAskTitleTask(
 fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) void {
     defer task.destroy();
     task.joinOrCancel(ctx.cancelFlag(), session_title_generation.after_turn_grace_ms);
+    ctx.addSideUsage(task.usage);
     const title = task.takeTitle() orelse return;
     defer std.heap.c_allocator.free(title);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -2143,6 +2172,7 @@ fn writeShellSnapshotNotice(ctx: *AskContext) void {
 }
 
 fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
+    ctx.finishTitleTask();
     writeShellSnapshotNotice(ctx);
     const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
     errdefer alloc.free(assistant_output);
@@ -2191,6 +2221,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .auth_failure = ctx.auth_failure,
         .recovery = ctx.last_recovery_status,
         .usage = ctx.usage_total,
+        .billed_usage = ctx.billedUsage(),
         .subagents = subagents,
     };
 }
@@ -2248,6 +2279,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .save_recovery_record = if (ctx.v2 != null) saveRecoveryRecord else null,
         .save_route_recovery_status = if (ctx.v2 != null) saveRouteRecoveryStatus else null,
         .record_usage = if (ctx.v2 != null) recordUsage else null,
+        .record_side_usage = recordSideUsage,
         .save_prompt_images = if (ctx.v2 != null) savePromptImages else null,
         .start_workspace_capture = if (ctx.workspaceCaptureContext() != null) startWorkspaceCapture else null,
         .reach_workspace = if (ctx.workspaceCaptureContext() != null) reachWorkspace else null,
@@ -3250,6 +3282,11 @@ fn recordUsage(raw_ctx: *anyopaque, usage: types.Usage) !void {
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const v2 = ctx.v2 orelse return;
     try v2.recordUsage(usage);
+}
+
+fn recordSideUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.addSideUsage(usage);
 }
 
 /// `AgentRuntimeDeps.save_route_recovery_status` on v2: a recovery status
@@ -4265,6 +4302,8 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     }
     try out.writer.writeAll("],\"usage\":");
     try writeUsageJson(&out.writer, result.usage);
+    try out.writer.writeAll(",\"billed_usage\":");
+    try writeUsageJson(&out.writer, result.billed_usage);
     // Present only when a subagent did work, so a run without one prints the
     // same JSON as before the field existed. `name` is null only for a child
     // saved with no name (see `usage_ledger.Entry`).
@@ -5998,14 +6037,14 @@ test "stdin prompt errors keep exact structured names" {
     const overflow = try renderErrorJsonResult(alloc, "PromptResourceLimitExceeded", 1);
     defer alloc.free(overflow);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptResourceLimitExceeded\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"billed_usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptResourceLimitExceeded\"}\n",
         overflow,
     );
 
     const read_failure = try renderErrorJsonResult(alloc, "PromptInputReadFailed", 1);
     defer alloc.free(read_failure);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"billed_usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
         read_failure,
     );
 }
@@ -6022,7 +6061,7 @@ test "image preparation failure has stable text and JSON contracts" {
     const json = try renderErrorJsonResult(alloc, @errorName(error.ImagePreparationFailed), 1);
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ImagePreparationFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"billed_usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ImagePreparationFailed\"}\n",
         json,
     );
 }
@@ -6051,7 +6090,7 @@ test "unresolved image capability has actionable text and stable JSON code" {
     );
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ModelImageCapabilityUnavailable\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"billed_usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ModelImageCapabilityUnavailable\"}\n",
         json,
     );
 }
@@ -6082,7 +6121,7 @@ test "stdin read failure has distinct text and JSON output contracts" {
         try runWithDeps(alloc, &.{"--json"}, testConfig(), deps),
     );
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"billed_usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
         stdout_capture.bytes.items,
     );
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
@@ -8097,6 +8136,37 @@ test "ask usage JSON distinguishes unavailable totals from reported zero" {
     try std.testing.expect(usage.get("output_tokens").? == .null);
 }
 
+test "ask JSON billed_usage sums main usage and record_side_usage while keeping usage main-only" {
+    const alloc = std.testing.allocator;
+    const Process = struct {
+        fn run(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, _: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+            agent.startTurn();
+            agent.observeUsage(.{ .input_tokens = 100, .output_tokens = 10 });
+            deps.sideUsageSink().?.record(.{ .input_tokens = 200, .output_tokens = 20, .cache_read_tokens = 50 });
+            deps.sideUsageSink().?.record(.{ .input_tokens = 300, .output_tokens = 30 });
+            try testPushAssistantText(deps, "ok");
+        }
+    };
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var deps = testPromptRunDepsWithProcess(&stdout_capture, &stderr_capture, Process.run);
+    deps.stdout_is_tty = TestTty.no;
+    const exit_code = try runWithDeps(alloc, &.{ "--json", "--no-save", "hello" }, testConfig(), deps);
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
+    defer parsed.deinit();
+    const usage = parsed.value.object.get("usage").?.object;
+    try std.testing.expectEqual(@as(i64, 100), usage.get("input_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), usage.get("output_tokens").?.integer);
+    try std.testing.expect(usage.get("cache_read_tokens") == null);
+    const billed = parsed.value.object.get("billed_usage").?.object;
+    try std.testing.expectEqual(@as(i64, 600), billed.get("input_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 60), billed.get("output_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 50), billed.get("cache_read_tokens").?.integer);
+}
+
 test "ask JSON lists each subagent with its own usage in the shape of the result's usage" {
     const alloc = std.testing.allocator;
     var alpha_id = "child_a".*;
@@ -8110,12 +8180,14 @@ test "ask JSON lists each subagent with its own usage in the shape of the result
         .exit_code = 0,
         .assistant_output = &.{},
         .usage = .{ .input_tokens = 1, .output_tokens = 2 },
+        .billed_usage = .{ .input_tokens = 1, .output_tokens = 2 },
         .subagents = &entries,
     });
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[]," ++
             "\"usage\":{\"input_tokens\":1,\"output_tokens\":2}," ++
+            "\"billed_usage\":{\"input_tokens\":1,\"output_tokens\":2}," ++
             "\"subagents\":[{\"name\":\"alpha\",\"id\":\"child_a\",\"usage\":{\"input_tokens\":7000,\"output_tokens\":70,\"cache_read_tokens\":700,\"cache_write_tokens\":0}}," ++
             "{\"name\":null,\"id\":\"child_b\",\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}]}\n",
         json,
@@ -8128,11 +8200,12 @@ test "ask JSON has no subagents field when no subagent worked" {
         .exit_code = 0,
         .assistant_output = &.{},
         .usage = .{ .input_tokens = 1, .output_tokens = 2 },
+        .billed_usage = .{ .input_tokens = 1, .output_tokens = 2 },
     });
     defer alloc.free(json);
     try std.testing.expect(std.mem.find(u8, json, "subagents") == null);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2},\"billed_usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
         json,
     );
 }
@@ -8158,7 +8231,7 @@ test "render final JSON preserves shape escaping order and newline" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"hello \\\"zig\\\"\\n\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model-x\",\"resolved_provider\":null,\"session_id\":\"123\",\"steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
+        "{\"output\":\"hello \\\"zig\\\"\\n\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model-x\",\"resolved_provider\":null,\"session_id\":\"123\",\"steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"billed_usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
         json,
     );
 }
@@ -8175,7 +8248,7 @@ test "render final JSON emits empty tool call array" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"billed_usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
         json,
     );
 }
@@ -8921,7 +8994,7 @@ test "json run with missing API key prints diagnostic then final object" {
     try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expectEqualStrings("fx ask: " ++ credentials.missing_credential_message ++ "\n", stderr_capture.bytes.items);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"MissingCredentials\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"billed_usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"MissingCredentials\"}\n",
         stdout_capture.bytes.items,
     );
 }
@@ -9080,8 +9153,8 @@ test "default fx ask preserves project context gathering error mappings" {
         json: ?[]const u8,
     }{
         .{ .err = error.OutOfMemory, .json = null },
-        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"NoSpaceLeft\"}\n" },
-        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"WriteFailed\"}\n" },
+        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"billed_usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"NoSpaceLeft\"}\n" },
+        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"billed_usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"WriteFailed\"}\n" },
     };
 
     for (cases) |case| {
@@ -9135,7 +9208,7 @@ test "quiet suppresses streaming while quiet json captures final output" {
     const json_exit = try runWithDeps(alloc, &.{ "--quiet", "--json", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup));
     try std.testing.expectEqual(@as(u8, 0), json_exit);
     try std.testing.expect(std.mem.startsWith(u8, stdout_capture.bytes.items, "{\"output\":\"assistant text\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model\",\"resolved_provider\":null,\"session_id\":\""));
-    try std.testing.expect(std.mem.endsWith(u8, stdout_capture.bytes.items, "\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n"));
+    try std.testing.expect(std.mem.endsWith(u8, stdout_capture.bytes.items, "\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"billed_usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n"));
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
 

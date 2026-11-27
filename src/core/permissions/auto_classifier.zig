@@ -267,6 +267,7 @@ pub const ReviewTurnContext = struct {
     /// Borrowed current-turn messages used only to derive compact host
     /// provenance before provider review. Their content is never serialized.
     current_turn_untrusted_messages: []const types.ChatMessage = &.{},
+    side_usage: ?types.UsageSink = null,
 };
 
 pub const ReviewRequest = struct {
@@ -687,6 +688,7 @@ pub const Reviewer = struct {
                 },
                 .completion => |*owned| {
                     defer owned.deinit(alloc);
+                    if (review_turn.side_usage) |sink| sink.record(owned.completion.usage);
                     checkBudget(send_deadline, cancel_flag) catch |err| return constructionFailure(err);
                     const parsed = try parseCompletion(alloc, owned.completion);
                     if (attempt_log) |log| log.add(if (parsed == .invalid and parsed.invalid.is_malformed_completion()) .malformed else .answered, send_started_ms);
@@ -3741,4 +3743,79 @@ test "expired review budget fails closed before transport" {
 
     try std.testing.expectEqual(std.meta.Tag(ParseOutcome).invalid, std.meta.activeTag(outcome));
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "automatic review forwards usage for initial and retry completions" {
+    const Sink = struct {
+        total: types.Usage = .{},
+
+        fn record(raw: *anyopaque, usage: types.Usage) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.total.add(usage);
+        }
+    };
+    const RetryingTransport = struct {
+        calls: usize = 0,
+
+        fn send(
+            raw: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: std.Io.Clock.Timestamp,
+            _: *std.atomic.Value(bool),
+        ) anyerror!TransportOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 1) {
+                return .{ .completion = .{ .completion = .{
+                    .content = "Not a tool call.",
+                    .usage = .{ .input_tokens = 30, .output_tokens = 3 },
+                } } };
+            }
+            return .{ .completion = .{ .completion = .{
+                .tool_calls = &.{.{
+                    .id = "perm_1",
+                    .name = tool_name,
+                    .arguments_json = "{\"risk\":\"low\",\"decision\":\"clear\",\"rationale\":\"safe\"}",
+                }},
+                .usage = .{ .input_tokens = 40, .output_tokens = 4 },
+            } } };
+        }
+    };
+
+    var sink = Sink{};
+    var transport = RetryingTransport{};
+    const reviewer = Reviewer.withTransport(.{
+        .context = @ptrCast(&transport),
+        .send_fn = RetryingTransport.send,
+        .build_fn = buildTestReviewPayload,
+    }, null, 1_000);
+    var outcome = try reviewer.review(std.testing.allocator, .{
+        .review_turn = .{
+            .model = "openai/gpt-5",
+            .pending_assistant = .{ .role = .assistant, .tool_calls = &.{.{
+                .id = "target",
+                .name = "run_command",
+                .arguments_json = "{}",
+            }} },
+            .target_call_id = "target",
+            .origin = .root,
+            .trusted_root_context = "current_request: Run this.\n",
+            .side_usage = .{ .context = &sink, .record_fn = Sink.record },
+        },
+        .targets = &.{},
+        .action = .{ .command = .{
+            .command = "true",
+            .resolved_cwd = "/tmp/workspace",
+            .background = false,
+            .target_os = .linux,
+        } },
+    });
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), transport.calls);
+    try std.testing.expectEqual(Decision.clear, outcome.valid.decision);
+    try std.testing.expectEqual(@as(?u64, 70), sink.total.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 7), sink.total.output_tokens);
 }

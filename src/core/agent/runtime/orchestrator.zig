@@ -7113,6 +7113,7 @@ fn containsImageId(image_ids: []const usize, candidate: usize) bool {
 }
 
 fn buildReviewTurnContext(
+    deps: *const AgentRuntimeDeps,
     config: Config,
     model: []const u8,
     root_user_intent_context: []const u8,
@@ -7137,6 +7138,7 @@ fn buildReviewTurnContext(
         },
         .trusted_root_context = trusted_root_context,
         .current_turn_untrusted_messages = current_turn_messages,
+        .side_usage = deps.sideUsageSink(),
     };
 }
 
@@ -9013,6 +9015,7 @@ fn processQueuedPromptLoop(
                     var summary_model: runtime_text_completion.CompactorCaller = .{
                         .observer = deps.observer,
                         .model_calls = turn_model_calls.sink(job.provider.label()),
+                        .side_usage = deps.sideUsageSink(),
                         .stream_provider = deps.agent_stream_provider,
                         .cooperative_transport_pulse = deps.cooperative_transport_pulse,
                         .provider = job.provider,
@@ -11529,6 +11532,7 @@ fn processQueuedPromptLoop(
                     const parallel_review_attempt_available = root_action_permission_mode != .auto or
                         turn_review_cache.reviewAttemptAvailable(parallel_call);
                     const parallel_review_context = buildReviewTurnContext(
+                        deps,
                         config,
                         successful_gateway_model,
                         root_user_intent_context,
@@ -12510,6 +12514,7 @@ fn processQueuedPromptLoop(
             const review_attempt_available = action_permission_mode != .auto or
                 turn_review_cache.reviewAttemptAvailable(execution_call);
             const review_context = buildReviewTurnContext(
+                deps,
                 config,
                 successful_gateway_model,
                 root_user_intent_context,

@@ -2189,6 +2189,15 @@ pub const Usage = struct {
     }
 };
 
+pub const UsageSink = struct {
+    context: *anyopaque,
+    record_fn: *const fn (context: *anyopaque, usage: Usage) void,
+
+    pub fn record(self: UsageSink, usage: Usage) void {
+        self.record_fn(self.context, usage);
+    }
+};
+
 /// Absolute per-turn token totals. Input covers only user-submitted prompt text
 /// and stays estimated; output may become exact from provider usage.
 pub const TurnTokenProgress = struct {
