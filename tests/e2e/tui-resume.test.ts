@@ -11665,7 +11665,7 @@ for (const [signal, expectedStatus] of [
         await active.sendText("/exit");
         await waitForMarkerFile(heldPath, TIMEOUT);
         process.kill(singleWrapperChildPid(active), signal);
-        await waitForMarkerFile(run.statusPath, TIMEOUT);
+        await run.session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT);
         expect(Number(readFileSync(run.statusPath, "utf8").trim())).toBe(expectedStatus);
         expect(enabledTtyFlags(readFileSync(run.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
         expect(alternateScreenOn(active)).toBe(false);
@@ -11701,7 +11701,7 @@ test.skipIf(!tmuxAvailable())(
       await first.session.sendText("/exit");
       await waitForMarkerFile(heldPath, TIMEOUT);
       process.kill(singleWrapperChildPid(first.session), "SIGTERM");
-      await waitForMarkerFile(first.statusPath, TIMEOUT);
+      await first.session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT);
       expect(Number(readFileSync(first.statusPath, "utf8").trim())).toBe(143);
       expect(enabledTtyFlags(readFileSync(first.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
       expect(alternateScreenOn(first.session)).toBe(false);
@@ -11748,7 +11748,7 @@ test.skipIf(!tmuxAvailable())(
       active = run.session;
       await waitForMarkerFile(heldPath, TIMEOUT);
       process.kill(singleWrapperChildPid(active), "SIGTERM");
-      await waitForMarkerFile(run.statusPath, TIMEOUT);
+      await run.session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT);
       expect(Number(readFileSync(run.statusPath, "utf8").trim())).toBe(143);
       expect(enabledTtyFlags(readFileSync(run.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
       expect(alternateScreenOn(active)).toBe(false);
@@ -11780,7 +11780,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("/exit");
       await waitForMarkerFile(heldPath, TIMEOUT);
       writeFileSync(releasePath, "go");
-      await waitForMarkerFile(run.statusPath, TIMEOUT);
+      await run.session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT);
       expect(Number(readFileSync(run.statusPath, "utf8").trim())).toBe(0);
       expect(enabledTtyFlags(readFileSync(run.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
       expect(alternateScreenOn(active)).toBe(false);
@@ -11813,7 +11813,7 @@ test.skipIf(!tmuxAvailable())(
       await waitForMarkerFile(heldPath, TIMEOUT);
       process.kill(singleWrapperChildPid(active), "SIGINT");
       writeFileSync(releasePath, "go");
-      await waitForMarkerFile(run.statusPath, TIMEOUT);
+      await run.session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT);
       expect(Number(readFileSync(run.statusPath, "utf8").trim())).toBe(0);
       expect(enabledTtyFlags(readFileSync(run.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
       expect(alternateScreenOn(active)).toBe(false);
