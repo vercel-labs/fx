@@ -277,4 +277,16 @@ test "a test build notes a blocking wait only through its hook" {
     // Without a hook the host's call returns at once.
     try std.testing.expect(test_wait_blocking == null);
     noteWaitBlocking();
+
+    const Notes = struct {
+        var count: usize = 0;
+        fn note() void {
+            count += 1;
+        }
+    };
+    Notes.count = 0;
+    test_wait_blocking = Notes.note;
+    defer test_wait_blocking = null;
+    noteWaitBlocking();
+    try std.testing.expectEqual(@as(usize, 1), Notes.count);
 }
