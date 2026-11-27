@@ -80,12 +80,15 @@ pub const PendingFold = struct {
     /// Takes one more line. Its strings must outlive the fold.
     pub fn step(self: *PendingFold, alloc: Allocator, line: session_adapter.ReportLine) error{OutOfMemory}!void {
         switch (line) {
-            .spawned => |spawned| if (child_state.spawnNamesRule(spawned.data)) {
-                try self.started.append(alloc, .{
-                    .child_id = spawned.child,
-                    .work_id = spawned.work_id,
-                    .started_by = child_state.spawnStartedBy(spawned.data),
-                });
+            .spawned => |spawned| {
+                self.dropReplaced(spawned.child, spawned.data);
+                if (child_state.spawnNamesRule(spawned.data)) {
+                    try self.started.append(alloc, .{
+                        .child_id = spawned.child,
+                        .work_id = spawned.work_id,
+                        .started_by = child_state.spawnStartedBy(spawned.data),
+                    });
+                }
             },
             .finished => |finished| {
                 const started = self.takeStarted(finished.child, finished.work_id);
@@ -107,6 +110,22 @@ pub const PendingFold = struct {
             .taken => |taken| if (self.findPending(taken.child, taken.work_id)) |index| {
                 _ = self.pending.orderedRemove(index);
             },
+        }
+    }
+
+    /// Forgets the owed reports of the works that `data` continues on
+    /// `child_id`: the continuation reports for the task. A continuation is
+    /// spawned after the work it replaces has finished, so that finish is
+    /// already folded when this line comes.
+    fn dropReplaced(self: *PendingFold, child_id: []const u8, data: ?[]const u8) void {
+        var index: usize = 0;
+        while (index < self.pending.items.len) {
+            const item = self.pending.items[index];
+            if (std.mem.eql(u8, item.child_id, child_id) and child_state.spawnReplaces(data, item.work_id)) {
+                _ = self.pending.orderedRemove(index);
+            } else {
+                index += 1;
+            }
         }
     }
 
@@ -646,6 +665,77 @@ test "pending reports are the owed ones not yet taken, in the order they became 
     defer alloc.free(after);
     try std.testing.expectEqual(@as(usize, 1), after.len);
     try std.testing.expectEqualStrings("w3", after[0].work_id);
+}
+
+const spawn_replacing_w1 = "{\"fingerprint\":\"ab\",\"report\":\"final\",\"replaces\":\"w1\"}";
+const spawn_replacing_w2 = "{\"fingerprint\":\"ab\",\"report\":\"final\",\"replaces\":\"w2\"}";
+
+test "a work a later spawn replaces owes no report, even when its finish says it does" {
+    const alloc = std.testing.allocator;
+    const L = session_adapter.ReportLine;
+    var lines = [_]L{
+        .{ .spawned = .{ .child = "c1", .work_id = "w1", .data = marked_spawn } },
+        .{ .finished = .{ .child = "c1", .work_id = "w1", .outcome = .cancelled, .data = "{\"report\":true,\"by\":\"user\",\"cause\":\"fx_quit\"}" } },
+        .{ .spawned = .{ .child = "c1", .work_id = "w2", .data = spawn_replacing_w1 } },
+    };
+    const pending = try pendingReports(alloc, &lines);
+    defer alloc.free(pending);
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
+}
+
+test "a continuation's own owed report is the only one pending" {
+    const alloc = std.testing.allocator;
+    const L = session_adapter.ReportLine;
+    var lines = [_]L{
+        .{ .spawned = .{ .child = "c1", .work_id = "w1", .data = marked_spawn } },
+        .{ .finished = .{ .child = "c1", .work_id = "w1", .outcome = .cancelled, .data = "{\"report\":true,\"by\":\"user\",\"cause\":\"fx_quit\"}" } },
+        .{ .spawned = .{ .child = "c1", .work_id = "w2", .data = spawn_replacing_w1 } },
+        .{ .finished = .{ .child = "c1", .work_id = "w2", .outcome = .ok, .data = "{\"report\":true}" } },
+    };
+    const pending = try pendingReports(alloc, &lines);
+    defer alloc.free(pending);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqualStrings("w2", pending[0].work_id);
+}
+
+test "a chain of continuations owes one report, from its last work" {
+    const alloc = std.testing.allocator;
+    const L = session_adapter.ReportLine;
+    var lines = [_]L{
+        .{ .spawned = .{ .child = "c1", .work_id = "w1", .data = marked_spawn } },
+        .{ .finished = .{ .child = "c1", .work_id = "w1", .outcome = .interrupted, .data = "{\"report\":true}" } },
+        .{ .spawned = .{ .child = "c1", .work_id = "w2", .data = spawn_replacing_w1 } },
+        .{ .finished = .{ .child = "c1", .work_id = "w2", .outcome = .interrupted, .data = "{\"report\":true}" } },
+        .{ .spawned = .{ .child = "c1", .work_id = "w3", .data = spawn_replacing_w2 } },
+        .{ .finished = .{ .child = "c1", .work_id = "w3", .outcome = .ok, .data = "{\"report\":true}" } },
+    };
+    const pending = try pendingReports(alloc, &lines);
+    defer alloc.free(pending);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqualStrings("w3", pending[0].work_id);
+
+    // Until the last work finishes, the chain owes nothing.
+    const before_last_finish = try pendingReports(alloc, lines[0 .. lines.len - 1]);
+    defer alloc.free(before_last_finish);
+    try std.testing.expectEqual(@as(usize, 0), before_last_finish.len);
+}
+
+test "a spawn that replaces nothing leaves the owed reports as they are" {
+    const alloc = std.testing.allocator;
+    const L = session_adapter.ReportLine;
+    var lines = [_]L{
+        .{ .spawned = .{ .child = "c1", .work_id = "w1", .data = marked_spawn } },
+        .{ .finished = .{ .child = "c1", .work_id = "w1", .outcome = .ok, .data = "{\"report\":true}" } },
+        .{ .spawned = .{ .child = "c1", .work_id = "w2", .data = marked_spawn } },
+        .{ .finished = .{ .child = "c1", .work_id = "w2", .outcome = .ok, .data = "{\"report\":true}" } },
+        // Another child's continuation names w1 of c1, so it changes nothing here.
+        .{ .spawned = .{ .child = "c2", .work_id = "w9", .data = spawn_replacing_w1 } },
+    };
+    const pending = try pendingReports(alloc, &lines);
+    defer alloc.free(pending);
+    try std.testing.expectEqual(@as(usize, 2), pending.len);
+    try std.testing.expectEqualStrings("w1", pending[0].work_id);
+    try std.testing.expectEqualStrings("w2", pending[1].work_id);
 }
 
 /// Pending reports by another route: per work, counters instead of the

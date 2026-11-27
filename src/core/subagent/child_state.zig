@@ -78,6 +78,10 @@ pub const ActiveWork = struct {
     /// Who started the work: its parent's message, or a turn the user typed
     /// on the child's screen or its own child's report woke.
     started_by: reports.StartedBy = .parent,
+    /// The work this one continues, as its parent's spawn named it. The
+    /// report for that work is not owed (`reports.PendingFold`). Null for a
+    /// work that continues none. Owned.
+    replaces: ?[]const u8 = null,
 
     pub fn deinit(self: *ActiveWork, alloc: Allocator) void {
         alloc.free(self.id);
@@ -86,6 +90,7 @@ pub const ActiveWork = struct {
             alloc.free(self.root_user_intent_context);
         }
         freeStrings(alloc, self.root_user_messages);
+        if (self.replaces) |value| alloc.free(value);
         self.* = undefined;
     }
 
@@ -96,6 +101,8 @@ pub const ActiveWork = struct {
         errdefer alloc.free(message);
         const context = try alloc.dupe(u8, self.root_user_intent_context);
         errdefer alloc.free(context);
+        const replaces = if (self.replaces) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (replaces) |value| alloc.free(value);
         return .{
             .id = id,
             .request_fingerprint = self.request_fingerprint,
@@ -106,6 +113,7 @@ pub const ActiveWork = struct {
             .permission_mode = self.permission_mode,
             .created_at_ms = self.created_at_ms,
             .started_by = self.started_by,
+            .replaces = replaces,
         };
     }
 
@@ -137,6 +145,34 @@ pub const ActiveWork = struct {
             .root_user_messages = try cloneStrings(alloc, self.root_user_messages),
             .root_user_evidence_complete = self.root_user_evidence_complete,
             .created_at_ms = self.created_at_ms,
+        };
+    }
+};
+
+/// The admission a child's last work ran under, as its spawn line saved it.
+/// A continuation of that work copies it. Owned.
+pub const Admission = struct {
+    started_by: reports.StartedBy = .parent,
+    permission_mode: types.PermissionMode,
+    root_user_intent_context: []u8 = &.{},
+    root_user_messages: [][]u8 = &.{},
+    root_user_evidence_complete: bool = false,
+
+    fn deinit(self: *Admission, alloc: Allocator) void {
+        if (self.root_user_intent_context.len > 0) alloc.free(self.root_user_intent_context);
+        freeStrings(alloc, self.root_user_messages);
+        self.* = undefined;
+    }
+
+    fn clone(self: Admission, alloc: Allocator) !Admission {
+        const context = try alloc.dupe(u8, self.root_user_intent_context);
+        errdefer alloc.free(context);
+        return .{
+            .started_by = self.started_by,
+            .permission_mode = self.permission_mode,
+            .root_user_intent_context = context,
+            .root_user_messages = try cloneStrings(alloc, self.root_user_messages),
+            .root_user_evidence_complete = self.root_user_evidence_complete,
         };
     }
 };
@@ -177,6 +213,11 @@ pub const Child = struct {
     /// recorded on each spawn line, so it survives a restart. Null for a
     /// child from before it. Owned.
     purpose: ?[]u8 = null,
+    /// The admission the last work ran under, which a continuation of that
+    /// work copies. Null for a line from before the admission was saved,
+    /// since such a line names no permission mode, and a continuation must
+    /// not run under a guessed one. Owned.
+    last_admission: ?Admission = null,
 
     pub fn deinit(self: *Child, alloc: Allocator) void {
         alloc.free(self.id);
@@ -189,6 +230,7 @@ pub const Child = struct {
         }
         if (self.active) |*active| active.deinit(alloc);
         if (self.last_work_id) |id| alloc.free(id);
+        if (self.last_admission) |*admission| admission.deinit(alloc);
         self.* = undefined;
     }
 
@@ -211,6 +253,8 @@ pub const Child = struct {
         errdefer if (started_with) |started| started_with_mod.free(alloc, started);
         const purpose = if (self.purpose) |text| try alloc.dupe(u8, text) else null;
         errdefer if (purpose) |text| alloc.free(text);
+        var last_admission = if (self.last_admission) |value| try value.clone(alloc) else null;
+        errdefer if (last_admission) |*value| value.deinit(alloc);
         return .{
             .id = id,
             .kind = kind,
@@ -227,6 +271,7 @@ pub const Child = struct {
             .last_report_owed = self.last_report_owed,
             .last_end = self.last_end,
             .report_rule = self.report_rule,
+            .last_admission = last_admission,
         };
     }
 
@@ -792,13 +837,27 @@ const SpawnData = struct {
     /// What the child is for (`Child.purpose`). Older fx never writes it
     /// and skips it.
     purpose: ?[]const u8 = null,
+    /// The work this one continues (`ActiveWork.replaces`). Absent on a
+    /// work that continues none, and on every line before continuations.
+    replaces: ?[]const u8 = null,
+    /// The admission the work ran under (`ActiveWork`). Absent on a line from
+    /// before it was saved; a continuation then has no admission to copy.
+    /// A string, so a mode a later fx wrote still parses: `savedAdmission`
+    /// converts it and gives none for a mode this fx does not know.
+    permission_mode: ?[]const u8 = null,
+    root_user_intent_context: ?[]const u8 = null,
+    root_user_messages: ?[]const []const u8 = null,
+    root_user_evidence_complete: ?bool = null,
 };
 
 /// A spawn line's data. `rule` is null only for a converted v1 session,
 /// whose works owe no report, and then the line is written as before
-/// report rules existed.
-fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, profile: ?[]const u8, rule: ?reports.Rule, by: reports.StartedBy, purpose: ?[]const u8, started: ?started_with_mod.StartedWith) ![]const u8 {
-    const base = try stringifyAlloc(arena, SpawnData{
+/// report rules existed. `work` is the work the line opens; its admission
+/// and what it continues go on the line, and null writes neither.
+fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, profile: ?[]const u8, rule: ?reports.Rule, by: reports.StartedBy, purpose: ?[]const u8, started: ?started_with_mod.StartedWith, work: ?ActiveWork) ![]const u8 {
+    // The members that are older than the admission fields, written as before:
+    // a null one is written as null, so the line keeps its bytes.
+    const base = try stringifyAlloc(arena, .{
         .agent = agent,
         .fingerprint = fingerprint,
         .profile = profile,
@@ -806,15 +865,46 @@ fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, prof
         .by = if (by == .parent) null else @tagName(by),
         .purpose = purpose,
     });
-    const block = started orelse return base;
+    const with_work = try withMembers(arena, base, try workMembers(arena, work));
+    const block = started orelse return with_work;
     // What the profile set goes in after the rest, only when there is any, so
     // a spawn of a child with none is written as before.
     const text = try started_with_mod.encode(arena, block);
     if (!started_with_mod.fits(text)) {
         debug_trace.logf("subagent", "saved profile left out of a spawn line profile={s} bytes={d} limit={d}", .{ profile orelse "", text.len, started_with_mod.max_bytes });
-        return base;
+        return with_work;
     }
-    return std.mem.concat(arena, u8, &.{ base[0 .. base.len - 1], ",\"" ++ started_with_mod.key ++ "\":", text, "}" });
+    return std.mem.concat(arena, u8, &.{ with_work[0 .. with_work.len - 1], ",\"" ++ started_with_mod.key ++ "\":", text, "}" });
+}
+
+/// The admission and continuation fields of `work` as a JSON object. A field
+/// that is null or empty is left off, so a work without them adds nothing.
+fn workMembers(arena: Allocator, work: ?ActiveWork) ![]const u8 {
+    const saved = work orelse return "{}";
+    return stringifyOmittingNulls(arena, .{
+        .replaces = nonEmptyText(saved.replaces),
+        .permission_mode = @tagName(saved.permission_mode),
+        .root_user_intent_context = nonEmptyText(saved.root_user_intent_context),
+        .root_user_messages = if (saved.root_user_messages.len == 0) null else saved.root_user_messages,
+        .root_user_evidence_complete = saved.root_user_evidence_complete,
+    });
+}
+
+fn nonEmptyText(text: ?[]const u8) ?[]const u8 {
+    const value = text orelse return null;
+    return if (value.len == 0) null else value;
+}
+
+/// `json` with the members of the JSON object `members` added after its own.
+fn withMembers(arena: Allocator, json: []const u8, members: []const u8) ![]const u8 {
+    if (members.len <= 2) return json;
+    return std.mem.concat(arena, u8, &.{ json[0 .. json.len - 1], ",", members[1 .. members.len - 1], "}" });
+}
+
+fn stringifyOmittingNulls(arena: Allocator, value: anytype) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(value, .{ .emit_null_optional_fields = false }, &out.writer);
+    return out.written();
 }
 
 /// The longest purpose a child keeps, its ellipsis included.
@@ -947,6 +1037,19 @@ pub fn spawnNamesRule(data: ?[]const u8) bool {
     return wire.report != null;
 }
 
+/// Whether a `child_spawned` line's data says the work it opens replaces
+/// `work_id`. Unreadable data replaces nothing. It compares inside the parse,
+/// since a parsed escaped string would not outlive its buffer.
+pub fn spawnReplaces(data: ?[]const u8, work_id: []const u8) bool {
+    const bytes = data orelse return false;
+    var buf: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const Wire = struct { replaces: ?[]const u8 = null };
+    const wire = std.json.parseFromSliceLeaky(Wire, fba.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return false;
+    const replaces = wire.replaces orelse return false;
+    return std.mem.eql(u8, replaces, work_id);
+}
+
 /// A `child_finished` line's `report` flag: true when its work owes a
 /// report, false when the line says it owes none, and null when the line
 /// carries no fx data, as a finish the manager's crash repair writes.
@@ -1021,7 +1124,7 @@ fn closeLines(arena: Allocator, child: Child, work_id: []const u8) ![2]session_a
         .{ .spawned = .{
             .child = child.id,
             .work_id = work_id,
-            .data = try spawnData(arena, child.agentName(), fingerprint, child.profile, null, .parent, null, child.started_with),
+            .data = try spawnData(arena, child.agentName(), fingerprint, child.profile, null, .parent, null, child.started_with, null),
         } },
         .{ .finished = .{ .child = child.id, .work_id = work_id, .outcome = .ok, .data = "{\"closed\":true}" } },
     };
@@ -1198,14 +1301,140 @@ test "a spawn saves who started a work its parent didn't" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     for ([_]reports.StartedBy{ .user, .child, .parent }) |by| {
-        try std.testing.expectEqual(by, spawnStartedBy(try spawnData(arena, "reviewer", "ab", null, .final, by, null, null)));
+        try std.testing.expectEqual(by, spawnStartedBy(try spawnData(arena, "reviewer", "ab", null, .final, by, null, null, null)));
     }
     // The parent's own work names no one in `by`.
-    try std.testing.expect(std.mem.find(u8, try spawnData(arena, "reviewer", "ab", null, .final, .parent, null, null), "\"by\":\"") == null);
+    try std.testing.expect(std.mem.find(u8, try spawnData(arena, "reviewer", "ab", null, .final, .parent, null, null, null), "\"by\":\"") == null);
     // An older fx's line, a value this fx doesn't know, and no data read as the parent's.
     try std.testing.expectEqual(reports.StartedBy.parent, spawnStartedBy("{\"fingerprint\":\"ab\",\"report\":\"final\"}"));
     try std.testing.expectEqual(reports.StartedBy.parent, spawnStartedBy("{\"by\":\"robot\"}"));
     try std.testing.expectEqual(reports.StartedBy.parent, spawnStartedBy(null));
+}
+
+test "a spawn line saves a work's admission and what it continues, and a folded child keeps it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var messages = [_][]u8{ @constCast("fix the bug"), @constCast("then review") };
+    const work: ActiveWork = .{
+        .id = @constCast("work-2"),
+        .message = @constCast("review"),
+        .root_user_intent_context = @constCast("ship it"),
+        .root_user_messages = &messages,
+        .root_user_evidence_complete = true,
+        .permission_mode = .ask,
+        .created_at_ms = 1,
+        .started_by = .user,
+        .replaces = "work-1",
+    };
+    const line = try spawnData(arena, "reviewer", text_utils.repeat("ab", 32), null, .final, .user, null, null, work);
+    const spawn = try std.json.parseFromSliceLeaky(SpawnData, arena, line, .{});
+    try std.testing.expectEqualStrings("work-1", spawn.replaces.?);
+    try std.testing.expectEqualStrings("ask", spawn.permission_mode.?);
+    try std.testing.expectEqualStrings("ship it", spawn.root_user_intent_context.?);
+    try std.testing.expectEqual(@as(usize, 2), spawn.root_user_messages.?.len);
+    try std.testing.expectEqualStrings("then review", spawn.root_user_messages.?[1]);
+    try std.testing.expect(spawn.root_user_evidence_complete.?);
+
+    const folded: session_adapter.Child = .{
+        .id = @constCast("01J00000000000000000000001"),
+        .work_id = @constCast("work-2"),
+        .open = false,
+        .outcome = .cancelled,
+        .spawn_data = @constCast(line),
+        .finish_data = @constCast("{\"report\":true,\"by\":\"user\",\"cause\":\"fx_quit\"}"),
+        .seq = 3,
+    };
+    var child = try childFromFolded(alloc, folded);
+    defer child.deinit(alloc);
+    const admission = child.last_admission.?;
+    try std.testing.expectEqual(reports.StartedBy.user, admission.started_by);
+    try std.testing.expectEqual(types.PermissionMode.ask, admission.permission_mode);
+    try std.testing.expectEqualStrings("ship it", admission.root_user_intent_context);
+    try std.testing.expectEqual(@as(usize, 2), admission.root_user_messages.len);
+    try std.testing.expectEqualStrings("fix the bug", admission.root_user_messages[0]);
+    try std.testing.expect(admission.root_user_evidence_complete);
+}
+
+test "a spawn line from before the admission was saved parses with the new fields null" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const fingerprint = text_utils.repeat("ab", 32);
+    const old_line = "{\"agent\":\"reviewer\",\"fingerprint\":\"" ++ fingerprint ++ "\",\"profile\":null,\"report\":\"final\",\"by\":\"user\"}";
+    const spawn = try std.json.parseFromSliceLeaky(SpawnData, arena_state.allocator(), old_line, .{});
+    try std.testing.expect(spawn.replaces == null);
+    try std.testing.expect(spawn.permission_mode == null);
+    try std.testing.expect(spawn.root_user_intent_context == null);
+    try std.testing.expect(spawn.root_user_messages == null);
+    try std.testing.expect(spawn.root_user_evidence_complete == null);
+
+    const folded: session_adapter.Child = .{
+        .id = @constCast("01J00000000000000000000001"),
+        .work_id = @constCast("work-1"),
+        .open = false,
+        .outcome = .ok,
+        .spawn_data = @constCast(old_line),
+        .finish_data = null,
+        .seq = 1,
+    };
+    var child = try childFromFolded(alloc, folded);
+    defer child.deinit(alloc);
+    try std.testing.expect(child.last_admission == null);
+}
+
+test "a spawn line with a permission mode this fx does not know parses and folds with no admission" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const fingerprint = text_utils.repeat("ab", 32);
+    const line = "{\"agent\":\"reviewer\",\"fingerprint\":\"" ++ fingerprint ++ "\",\"profile\":null,\"report\":\"final\",\"by\":\"user\",\"permission_mode\":\"some_future_mode\",\"root_user_evidence_complete\":true}";
+    const spawn = try std.json.parseFromSliceLeaky(SpawnData, arena_state.allocator(), line, .{});
+    try std.testing.expectEqualStrings("some_future_mode", spawn.permission_mode.?);
+
+    const folded: session_adapter.Child = .{
+        .id = @constCast("01J00000000000000000000001"),
+        .work_id = @constCast("work-1"),
+        .open = false,
+        .outcome = .ok,
+        .spawn_data = @constCast(line),
+        .finish_data = null,
+        .seq = 1,
+    };
+    var child = try childFromFolded(alloc, folded);
+    defer child.deinit(alloc);
+    try std.testing.expectEqualStrings("reviewer", child.agentName().?);
+    try std.testing.expect(child.last_admission == null);
+}
+
+test "a spawn line names the work it replaces, and only that work" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const work: ActiveWork = .{ .id = @constCast("work-2"), .message = @constCast("m"), .created_at_ms = 1, .replaces = "work-1" };
+    const line = try spawnData(arena, "reviewer", "ab", null, .final, .parent, null, null, work);
+    try std.testing.expect(spawnReplaces(line, "work-1"));
+    try std.testing.expect(!spawnReplaces(line, "work-2"));
+    try std.testing.expect(!spawnReplaces(null, "work-1"));
+    try std.testing.expect(!spawnReplaces("not json", "work-1"));
+}
+
+test "a work without the admission fields writes its spawn line as before" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const plain = try spawnData(arena, "reviewer", "ab", null, .final, .parent, null, null, null);
+    try std.testing.expectEqualStrings("{\"agent\":\"reviewer\",\"fingerprint\":\"ab\",\"profile\":null,\"report\":\"final\",\"by\":null,\"purpose\":null}", plain);
+
+    // A work writes its permission mode and evidence flag, and the rest only when set.
+    const bare: ActiveWork = .{ .id = @constCast("work-1"), .message = @constCast("review"), .created_at_ms = 1 };
+    const line = try spawnData(arena, "reviewer", "ab", null, .final, .parent, null, null, bare);
+    try std.testing.expect(std.mem.find(u8, line, "\"permission_mode\":\"yolo\"") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\"root_user_evidence_complete\":false") != null);
+    for ([_][]const u8{ "replaces", "root_user_intent_context", "root_user_messages" }) |key| {
+        try std.testing.expect(std.mem.find(u8, line, key) == null);
+    }
 }
 
 /// What the profile of folded child `entry` set when it started, from its
@@ -1302,12 +1531,16 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
     const purpose = if (spawn.purpose) |text| if (savedPurpose(text)) try alloc.dupe(u8, text) else null else null;
     errdefer if (purpose) |text| alloc.free(text);
     const started_with = try savedStartedWith(alloc, sa, entry, profile);
+    errdefer if (started_with) |started| started_with_mod.free(alloc, started);
+    const last_admission = try savedAdmission(alloc, entry.id, spawn);
+    errdefer if (last_admission) |*admission| admission.deinit(alloc);
     return .{
         .id = id,
         .kind = kind,
         .profile = profile,
         .started_with = started_with,
         .purpose = purpose,
+        .last_admission = last_admission,
         .phase = switch (last_outcome) {
             .interrupted, .lost => .interrupted,
             .completed, .failed, .cancelled => switch (kind) {
@@ -1323,6 +1556,39 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
         .last_report_owed = finish.report orelse false,
         .last_end = if (finish.report orelse false) endFactsOf(finish.by, finish.cause) else .{},
         .report_rule = if (spawn.report) |name| std.meta.stringToEnum(reports.Rule, name) orelse .final else .final,
+    };
+}
+
+/// The admission a spawn line saved for its work, copied into `alloc`, or
+/// null when the line names no permission mode, or one this fx does not
+/// know: a later fx wrote it, and a continuation never runs under a guessed
+/// mode (see `Child.last_admission`).
+fn savedAdmission(alloc: Allocator, child_id: []const u8, spawn: SpawnData) !?Admission {
+    const mode_name = spawn.permission_mode orelse return null;
+    const permission_mode = std.meta.stringToEnum(types.PermissionMode, mode_name) orelse {
+        debug_trace.logf("subagent", "saved permission mode unknown child={s}", .{child_id});
+        return null;
+    };
+    const messages = spawn.root_user_messages orelse &.{};
+    if (messages.len > domain.max_admission_items) return error.InvalidState;
+    const context = try alloc.dupe(u8, spawn.root_user_intent_context orelse "");
+    errdefer alloc.free(context);
+    const copies = try alloc.alloc([]u8, messages.len);
+    var built: usize = 0;
+    errdefer {
+        for (copies[0..built]) |message| alloc.free(message);
+        alloc.free(copies);
+    }
+    for (messages) |message| {
+        copies[built] = try alloc.dupe(u8, message);
+        built += 1;
+    }
+    return .{
+        .started_by = endFactsOf(spawn.by, null).started_by,
+        .permission_mode = permission_mode,
+        .root_user_intent_context = context,
+        .root_user_messages = copies,
+        .root_user_evidence_complete = spawn.root_user_evidence_complete orelse false,
     };
 }
 
@@ -1355,7 +1621,7 @@ fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter
                 try lines.append(arena, .{ .spawned = .{
                     .child = after.id,
                     .work_id = work_id,
-                    .data = try spawnData(arena, after.agentName(), &fingerprint, after.profile, after.report_rule, after.active.?.started_by, after.purpose, after.started_with),
+                    .data = try spawnData(arena, after.agentName(), &fingerprint, after.profile, after.report_rule, after.active.?.started_by, after.purpose, after.started_with, after.active),
                 } });
             }
         }
@@ -1389,7 +1655,7 @@ pub fn v1ImportLines(arena: Allocator, registry: Registry, has_log: []const bool
         try lines.append(arena, .{ .spawned = .{
             .child = child.id,
             .work_id = work_id,
-            .data = try spawnData(arena, child.agentName(), fingerprint, null, null, .parent, null, null),
+            .data = try spawnData(arena, child.agentName(), fingerprint, null, null, .parent, null, null, null),
         } });
         try lines.append(arena, .{ .finished = .{
             .child = child.id,
@@ -2302,7 +2568,7 @@ test "a folded child keeps a saved purpose only when it is one line fx would wri
             .work_id = try arena.dupe(u8, "work"),
             .open = false,
             .outcome = .ok,
-            .spawn_data = try arena.dupe(u8, try spawnData(arena, "reviewer", &fingerprint, null, null, .parent, case.saved, null)),
+            .spawn_data = try arena.dupe(u8, try spawnData(arena, "reviewer", &fingerprint, null, null, .parent, case.saved, null, null)),
             .finish_data = null,
             .seq = 1,
         };
@@ -2319,7 +2585,7 @@ test "only open children count toward the registry's limit" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const spawn = try spawnData(arena, "reviewer", &std.fmt.bytesToHex(@as([32]u8, @splat(0)), .lower), null, null, .parent, null, null);
+    const spawn = try spawnData(arena, "reviewer", &std.fmt.bytesToHex(@as([32]u8, @splat(0)), .lower), null, null, .parent, null, null, null);
     const folded = try arena.alloc(session_adapter.Child, max_children + 1);
     for (folded, 0..) |*entry, i| entry.* = .{
         .id = try arena.dupe(u8, try arena.print("1786460757753-{d:0>4}", .{i})),
@@ -2348,10 +2614,10 @@ test "a spawn line saves what the profile set only when there is something to sa
     const started: started_with_mod.StartedWith = .{ .source = .home, .permission_mode = .auto, .tools = &.{ "read_file", "!shell" }, .mcp_servers = &.{"github"} };
 
     // A spawn without a block is written as it was before blocks.
-    const plain = try spawnData(arena, "reviewer", &fingerprint, "main", .final, .parent, null, null);
+    const plain = try spawnData(arena, "reviewer", &fingerprint, "main", .final, .parent, null, null, null);
     try std.testing.expect(std.mem.find(u8, plain, started_with_mod.key) == null);
     // One with a block ends with it, and nothing else of the line changes.
-    const saved = try spawnData(arena, "reviewer", &fingerprint, "reviewer", .final, .parent, null, started);
+    const saved = try spawnData(arena, "reviewer", &fingerprint, "reviewer", .final, .parent, null, started, null);
     try std.testing.expect(std.mem.endsWith(u8, saved, ",\"started_with\":{\"v\":1,\"from\":\"home\",\"permission_mode\":\"auto\",\"tools\":[\"read_file\",\"!shell\"],\"mcp_servers\":[\"github\"]}}"));
     // The line stays JSON that a reader built before blocks takes, and the
     // fingerprint and name it needs are where they were.
@@ -2408,7 +2674,7 @@ test "a spawn line saves what the profile set only when there is something to sa
     // A block over its budget is left out of the line, not cut.
     var long: [40][]const u8 = undefined;
     for (&long, 0..) |*slot, index| slot.* = try arena.print("{s}{d}", .{ text_utils.repeat("t", 90), index });
-    const too_big = try spawnData(arena, "reviewer", &fingerprint, "reviewer", .final, .parent, null, .{ .source = .home, .tools = &long });
+    const too_big = try spawnData(arena, "reviewer", &fingerprint, "reviewer", .final, .parent, null, .{ .source = .home, .tools = &long }, null);
     try std.testing.expect(std.mem.find(u8, too_big, started_with_mod.key) == null);
     try std.testing.expect(too_big.len < 400);
 }
@@ -2507,7 +2773,7 @@ test "a fork's copy of a child carries what its profile set, byte for byte (D97)
     const arena = arena_state.allocator();
     const started: started_with_mod.StartedWith = .{ .source = .home, .permission_mode = .auto, .tools = &.{"read_file"} };
     const fingerprint = std.fmt.bytesToHex(@as([32]u8, @splat(0)), .lower);
-    const spawn = try spawnData(arena, "helper", &fingerprint, "reviewer", .final, .parent, null, started);
+    const spawn = try spawnData(arena, "helper", &fingerprint, "reviewer", .final, .parent, null, started, null);
     const entry: session_adapter.Child = .{
         .id = @constCast("kid"),
         .work_id = @constCast("w1"),

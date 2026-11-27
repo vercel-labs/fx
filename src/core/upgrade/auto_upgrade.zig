@@ -118,7 +118,7 @@ pub const RestartWait = enum {
     releasing,
 };
 
-const restart_wait_label = "restart waits: ctrl+g to cancel";
+const restart_wait_label = "restart pending · ctrl+g cancel";
 
 pub const AutoUpgrade = struct {
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@backingInt(State.idle)),
@@ -710,9 +710,9 @@ test "a waiting restart says how to cancel it" {
     var au = AutoUpgrade{};
     var buf: [64]u8 = undefined;
     au.restart = .waiting;
-    try std.testing.expectEqualStrings("restart waits: ctrl+g to cancel", au.statusLabel(&buf));
+    try std.testing.expectEqualStrings("restart pending · ctrl+g cancel", au.statusLabel(&buf));
     au.restart = .none;
-    try std.testing.expect(!std.mem.eql(u8, "restart waits: ctrl+g to cancel", au.statusLabel(&buf)));
+    try std.testing.expect(!std.mem.eql(u8, "restart pending · ctrl+g cancel", au.statusLabel(&buf)));
 }
 
 test "statusLabel waiting returns empty" {

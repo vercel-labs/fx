@@ -2211,7 +2211,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// Notes the request the newest turn left unfinished, if a crash or a
         /// close ended it (`tests/tla/recovery/Resume.tla` AutoResumes).
-        fn noteInterruptedRequest(agent: *AppAgent, v2: *session_adapter.Session) void {
+        pub fn noteInterruptedRequest(agent: *AppAgent, v2: *session_adapter.Session) void {
             agent.session_persistence.pending_request_resume = null;
             agent.session_persistence.pending_resume_yielded = false;
             const found = (v2.interruptedRequest() catch |err| {
@@ -2271,7 +2271,7 @@ pub fn Runtime(comptime App: type) type {
         /// history and queues a turn that goes on from its pieces. The
         /// session's next turn then says it continues the yielded one, so a
         /// later replay drops that one (`session_adapter.Session.setContinuesYielded`).
-        fn continueYieldedTurn(app: *App, agent: *AppAgent, resumed: types.RecoveryResume) !void {
+        pub fn continueYieldedTurn(app: *App, agent: *AppAgent, resumed: types.RecoveryResume) !void {
             if (comptime !@hasDecl(App, "queueYieldedTurn")) return error.YieldedTurnUnsupported;
             const v2 = agent.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
             const taken = agent.session.takeNewestTurn() orelse return error.YieldedTurnMissing;
@@ -5941,7 +5941,12 @@ pub fn Runtime(comptime App: type) type {
                 children,
                 subagentAuthorityResolver(app),
                 if (comptime @hasDecl(App, "runSubagentChild"))
-                    .{ .context = app, .bind_fn = App.bindSubagentWorker, .run_fn = App.runSubagentChild }
+                    .{
+                        .context = app,
+                        .bind_fn = App.bindSubagentWorker,
+                        .run_fn = App.runSubagentChild,
+                        .restarting_fn = if (comptime runtime_profile.allows(App, .auto_upgrade) and @hasDecl(App, "subagentRestarting")) App.subagentRestarting else null,
+                    }
                 else
                     .{},
             ) catch |err| {
@@ -5960,6 +5965,9 @@ pub fn Runtime(comptime App: type) type {
                 // and its children are as deep as fx nests.
                 host.owner_has_parent = agent.role == .subagent;
                 host.authority_resolver.children_nest = agent.role != .subagent;
+                if (comptime runtime_profile.allows(App, .auto_upgrade)) {
+                    host.continueYieldedWorks();
+                }
                 // What a restart left owed reaches this agent now.
                 host.resumeReports(v2);
             }

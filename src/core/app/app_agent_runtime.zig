@@ -1507,7 +1507,12 @@ pub fn Runtime(comptime App: type) type {
             var run = try prepareChildRun(app, turn, message, admission);
             var completion: agents.ChildRunCompletion = .{};
             run.completion = &completion;
-            var post = app_agents_runtime.Post{ .turn = turn, .run = run, .message = message.content };
+            var post = app_agents_runtime.Post{
+                .turn = turn,
+                .run = run,
+                .message = message.content,
+                .continues_yielded = if (comptime runtime_profile.allows(App, .auto_upgrade)) message.continues_yielded else false,
+            };
             defer if (post.run) |*unsent| {
                 unsent.completion = null;
                 unsent.turn = null;

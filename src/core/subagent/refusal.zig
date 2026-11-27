@@ -51,6 +51,7 @@ pub const Refusal = union(enum) {
     child_unavailable: Unavailable,
     child_not_persistent,
     child_cancelled,
+    child_restarting,
     state_unavailable,
     operation_conflict,
     queue_full: QueueFault,
@@ -94,6 +95,7 @@ pub const Refusal = union(enum) {
             },
             .child_not_persistent => try writer.writeAll("That subagent comes from an older session and takes no messages. Message a new name to start another."),
             .child_cancelled => try writer.writeAll("The subagent's turn was cancelled before it took the message, so it was not sent. Call status, then send it again."),
+            .child_restarting => try writer.writeAll("This subagent is pausing for an upgrade restart. Send again after the restart."),
             .state_unavailable => try writer.writeAll("fx could not reach the subagent's turn, so the message was not sent. Call status, then send it again."),
             .operation_conflict => try writer.writeAll("This call reuses the id of an earlier call that carried different content, so nothing was sent. Send the message again."),
             .queue_full => |fault| try writer.writeAll(switch (fault) {
@@ -279,6 +281,7 @@ const samples = [_]Refusal{
     .{ .child_unavailable = .finished },
     .child_not_persistent,
     .child_cancelled,
+    .child_restarting,
     .state_unavailable,
     .operation_conflict,
     .{ .queue_full = .subagent },
@@ -378,6 +381,11 @@ test "a refusal says what to do next for the case it names" {
     out.clearRetainingCapacity();
     try (Refusal{ .invalid_agent = .name }).sentence(&out.writer);
     try std.testing.expectEqualStrings("agent must be a name of 1 to 64 characters: lowercase letters, digits, \"_\" or \"-\", starting with a letter or digit.", out.written());
+
+    const restarting: Refusal = .child_restarting;
+    out.clearRetainingCapacity();
+    try restarting.sentence(&out.writer);
+    try std.testing.expectEqualStrings("This subagent is pausing for an upgrade restart. Send again after the restart.", out.written());
 
     const busy: Refusal = .child_busy;
     out.clearRetainingCapacity();

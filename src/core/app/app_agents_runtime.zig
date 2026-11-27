@@ -21,6 +21,7 @@ const agents_menu_presentation = @import("../../ui/footer/agents_menu_presentati
 const session_mod = @import("../session/session.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_process_runtime = @import("app_process_runtime.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const profiles = @import("../profiles/profiles.zig");
@@ -692,6 +693,9 @@ pub const Post = struct {
     run: ?agents.ChildRun = null,
     /// The message, sent to the agent as if typed. Borrowed.
     message: []const u8 = "",
+    /// Whether this run resumes a turn that yielded for an upgrade restart
+    /// instead of sending a new message.
+    continues_yielded: bool = false,
     state: std.atomic.Value(State) = .init(.posted),
     /// Set once the main loop holds the run back while a turn of its child's
     /// is going or a scrollback handoff is pending. Only the main loop reads
@@ -1703,27 +1707,44 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// The first open agent other than the one on screen whose queued
-        /// work an upgrade's restart would drop: main or another instance,
-        /// which hold their queues while they yield (`requestYields`). A
-        /// subagent's queue runs, and the restart waits for it
-        /// (`anyTurnRunning`). Null when none holds any. Its name may use
-        /// `buf`. Main loop only.
+        /// work an upgrade's restart would drop: main, another instance, or a
+        /// subagent, each of which holds its queue while it yields
+        /// (`requestYields`). A child also counts when a message from its
+        /// parent waits for it to start its next work. Null when none holds
+        /// any. Its name may use `buf`. Main loop only.
         pub fn queuedWorkElsewhere(app: *App, buf: []u8) ?[]const u8 {
             if (app.agent_on_screen != null and firstOpen(app) and app.main_agent.worker.queuedPromptCount() > 0) {
                 return noteName(app, null, buf);
             }
             for (app.child_agents.items) |child| {
-                if (child == app.agent_on_screen or child.agent.role != .instance) continue;
-                if (child.agent.worker.queuedPromptCount() > 0) return noteName(app, child, buf);
+                if (child == app.agent_on_screen) continue;
+                if (child.agent.worker.queuedPromptCount() > 0 or childHasWaitingMessage(app, child)) return noteName(app, child, buf);
             }
             return null;
         }
 
-        /// Asks the running turns of the main agent and of other instances
-        /// to stop at their next step boundary, and holds their queued work,
-        /// for an upgrade's restart (`WorkerRuntime.requestYield`). Subagents
-        /// keep working: the restart waits until they finish
-        /// (`anyTurnRunning`), so an upgrade loses none of their work.
+        fn childHasWaitingMessage(app: *App, child: *const ChildAgent) bool {
+            const host = hostOf(app, child) orelse return false;
+            return host.hasWaitingMessage(child.id);
+        }
+
+        /// Whether the worker of child `child_id` is asked to stop for an
+        /// upgrade's restart. Read on the parent's thread under the authority
+        /// lock, which guards the list of children, as `reserveMessagePlace`
+        /// reads a receiver.
+        pub fn childRestarting(app: *App, child_id: []const u8) bool {
+            app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            const child = findChild(app, child_id) orelse return false;
+            return child.agent.worker.yield_requested.load(.seq_cst);
+        }
+
+        /// Asks the running turns of main, the other instances, and the
+        /// subagents to stop at their next step boundary, and holds their
+        /// queued work, for an upgrade's restart (`WorkerRuntime.requestYield`).
+        /// A turn on a provider that cannot stop there runs to its end, and
+        /// the restart waits for it (`anyTurnRunning`), so an upgrade loses
+        /// none of their work.
         pub fn requestYields(app: *App) void {
             yieldStepOnRestartAgents(app, .request);
         }
@@ -1743,12 +1764,10 @@ pub fn Runtime(comptime App: type) type {
         const YieldStep = enum { request, release, cancel };
 
         /// Takes `step` on the workers an upgrade's restart stops between
-        /// steps: main's and the other instances'.
+        /// steps: main's, the other instances', and the subagents'.
         fn yieldStepOnRestartAgents(app: *App, comptime step: YieldStep) void {
             yieldStep(&app.main_agent.worker, step);
-            for (app.child_agents.items) |child| {
-                if (child.agent.role == .instance) yieldStep(&child.agent.worker, step);
-            }
+            for (app.child_agents.items) |child| yieldStep(&child.agent.worker, step);
         }
 
         fn yieldStep(worker: anytype, comptime step: YieldStep) void {
@@ -1760,10 +1779,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Whether any agent's worker runs work now or holds events the main
-        /// loop has not applied, such as a finished turn's history, a
-        /// subagent has work queued, or a child's report or hand-off waits
-        /// for the main loop to deliver it. An upgrade's restart waits until
-        /// none does.
+        /// loop has not applied, such as a finished turn's history, or a
+        /// child's report or hand-off waits for the main loop to deliver it.
+        /// Queued prompts do not count: every agent holds them while it
+        /// yields. An upgrade's restart waits until none runs.
         pub fn anyTurnRunning(app: *App) bool {
             return anyTurnBusy(app, false);
         }
@@ -1780,8 +1799,6 @@ pub fn Runtime(comptime App: type) type {
             for (app.child_agents.items) |child| {
                 const worker = &child.agent.worker;
                 if (workerBusy(worker, held_counts_as_stopped)) return true;
-                // Only instances hold their queued work, so a subagent's runs.
-                if (child.agent.role == .subagent and worker.queuedPromptCount() > 0) return true;
             }
             return deliveriesPending(app, null);
         }
@@ -1789,17 +1806,6 @@ pub fn Runtime(comptime App: type) type {
         fn workerBusy(worker: anytype, comptime held_counts_as_stopped: bool) bool {
             const runs = if (held_counts_as_stopped) worker.turnActivity() == .running else worker.isProcessing();
             return runs or worker.hasPendingEvents();
-        }
-
-        /// Whether a subagent runs work, has work queued, or holds events
-        /// the main loop has not applied. Main loop only.
-        pub fn anySubagentWorking(app: *App) bool {
-            for (app.child_agents.items) |child| {
-                if (child.agent.role != .subagent) continue;
-                const worker = &child.agent.worker;
-                if (worker.isProcessing() or worker.hasPendingEvents() or worker.queuedPromptCount() > 0) return true;
-            }
-            return false;
         }
 
         /// Whether a child's report or a hand-off waits for the main loop to
@@ -1821,7 +1827,7 @@ pub fn Runtime(comptime App: type) type {
         /// work refuses Ctrl+G (`queuedWorkElsewhere`), a prompt sent during
         /// the wait stays in the composer, and a message is refused
         /// (`reserveMessagePlace`, `WorkerRuntime.postMailWith`). Each report
-        /// stays owed in its child's log and comes again after the restart.
+        /// stays owed in its parent's log and comes again after the restart.
         pub fn logHeldWork(app: *App) void {
             var name_buf: [32]u8 = undefined;
             const main_queued = app.main_agent.worker.queuedPromptCount();
@@ -3263,7 +3269,35 @@ pub fn Runtime(comptime App: type) type {
             // turn carries main's work id, so it is saved with it.
             agent.prompt_work_id = start.child.agent.child_run.?.work_id;
             defer agent.prompt_work_id = null;
+            if (comptime runtime_profile.allows(App, .auto_upgrade)) {
+                if (post.continues_yielded) {
+                    try continueChildYieldedTurn(app, agent, start.child);
+                    return;
+                }
+            }
             if (!try app.enqueuePrompt(agent, post.message)) return error.PromptNotAdmitted;
+        }
+
+        fn continueChildYieldedTurn(app: *App, agent: *agents.Agent, child: *ChildAgent) !void {
+            const SessionRuntime = app_session_runtime.Runtime(App);
+            const work_id = child.agent.child_run.?.work_id;
+            const v2 = agent.session_persistence.v2 orelse {
+                debug_trace.eventf("host", "child_continue_failed", .{}, "agent={s} work_id={s} reason=continue_failed", .{ child.id, work_id });
+                return error.YieldedTurnMissing;
+            };
+            SessionRuntime.noteInterruptedRequest(agent, v2);
+            const resumed = agent.session_persistence.pending_request_resume;
+            const yielded = agent.session_persistence.pending_resume_yielded;
+            agent.session_persistence.pending_request_resume = null;
+            agent.session_persistence.pending_resume_yielded = false;
+            if (!yielded or resumed == null) {
+                debug_trace.eventf("host", "child_continue_failed", .{}, "agent={s} work_id={s} reason=continue_failed", .{ child.id, work_id });
+                return error.YieldedTurnMissing;
+            }
+            SessionRuntime.continueYieldedTurn(app, agent, resumed.?) catch |err| {
+                debug_trace.eventf("host", "child_continue_failed", .{}, "agent={s} work_id={s} reason=continue_failed err={s}", .{ child.id, work_id, @errorName(err) });
+                return err;
+            };
         }
 
         /// The agent for child session `id`, its worker started on first use.

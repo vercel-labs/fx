@@ -23,6 +23,7 @@ pub const QueuedMessage = struct {
     root_user_intent_context: []u8 = &.{},
     root_user_messages: [][]u8 = &.{},
     root_user_evidence_complete: bool = false,
+    continues_yielded: bool = false,
     created_at_ms: i64,
 
     pub fn deinit(self: *QueuedMessage, alloc: Allocator) void {
