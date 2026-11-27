@@ -230,7 +230,7 @@ test "isKeyName accepts the documented key names and rejects others" {
     }) |name| try std.testing.expect(!isKeyName(name));
 }
 
-test "the name patterns in sh-fx.schema.json equal the patterns that the name checks use" {
+test "the name patterns in sh-fx.schema.json equal this file's pattern constants" {
     const parsed = try parseSpecFile(fx_schema);
     defer parsed.deinit();
     const defs = field(parsed.value, "$defs") orelse return error.TestUnexpectedResult;
@@ -255,7 +255,7 @@ fn expectCapabilityValue(value: std.json.Value) !void {
     try std.testing.expectEqualStrings("#/$defs/Capability", stringField(value, "$ref") orelse "");
 }
 
-test "the capability maps in sh-fx.schema.json take sh.fx capability names with object values" {
+test "the capability maps in sh-fx.schema.json check sh.fx keys and leave other keys open" {
     const parsed = try parseSpecFile(fx_schema);
     defer parsed.deinit();
     const defs = field(parsed.value, "$defs") orelse return error.TestUnexpectedResult;
@@ -273,9 +273,15 @@ test "the capability maps in sh-fx.schema.json take sh.fx capability names with 
             try expectCapabilityValue(value);
         }
 
+        const property_names = field(def, "propertyNames") orelse return error.TestUnexpectedResult;
+        const if_pattern = stringField(field(property_names, "if") orelse .null, "pattern") orelse "";
+        const then_pattern = stringField(field(property_names, "then") orelse .null, "pattern") orelse "";
+        try std.testing.expectEqualStrings("^sh\\.fx/", if_pattern);
+        try std.testing.expectEqualStrings(key_name_pattern, then_pattern);
+
         const pattern_properties = field(def, "patternProperties") orelse return error.TestUnexpectedResult;
         try std.testing.expect(pattern_properties == .object and pattern_properties.object.count() == 1);
-        try std.testing.expectEqualStrings(key_name_pattern, pattern_properties.object.keys()[0]);
+        try std.testing.expectEqualStrings("^sh\\.fx/", pattern_properties.object.keys()[0]);
         try expectCapabilityValue(pattern_properties.object.values()[0]);
     }
     const capability = field(defs, "Capability") orelse return error.TestUnexpectedResult;
@@ -297,7 +303,10 @@ fn expectMetaKeyNames(value: std.json.Value) !void {
 }
 
 fn expectMetaObjectKeys(meta: std.json.Value) !void {
-    if (meta != .object) return;
+    if (meta != .object) {
+        std.debug.print("sh-fx.md has a _meta value that is not a JSON object\n", .{});
+        return error.TestUnexpectedResult;
+    }
     for (meta.object.keys()) |key| {
         if (!isKeyName(key)) {
             std.debug.print("sh-fx.md has the _meta key {s}, which is not an sh.fx key name\n", .{key});
