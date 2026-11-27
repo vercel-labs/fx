@@ -9,6 +9,7 @@ const jsonrpc = @import("jsonrpc.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const json_decode = @import("../core/shared/json_decode.zig");
+const net_connect = @import("../core/shared/net_connect.zig");
 const leader_mod = @import("leader.zig");
 
 const testing = std.testing;
@@ -33,7 +34,6 @@ const NoopRunner = struct {
 const probe_timeout_ms: i64 = 200;
 /// The pause between two connection attempts to the same socket.
 const probe_retry_ms: u64 = 10;
-const nonblock_flag: c_int = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
 /// The most bytes of a lock line a takeover takes as a record. The lock hook is
 /// registered with this limit (server.zig), so the session passes a longer line on
 /// one byte past it, and the takeover refuses it.
@@ -210,10 +210,10 @@ fn connectOnce(socket_path: []const u8) Attempt {
     if (socket_path.len >= address.path.len) return .unknown;
     const fd = std.c.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     if (fd < 0) return .unknown;
-    if (!setNonBlocking(fd)) {
+    net_connect.setNonblocking(fd) catch {
         _ = std.c.close(fd);
         return .unknown;
-    }
+    };
     address.family = posix.AF.UNIX;
     @memcpy(address.path[0..socket_path.len], socket_path);
     const rc = std.c.connect(fd, @ptrCast(&address), @sizeOf(@TypeOf(address)));
@@ -224,12 +224,6 @@ fn connectOnce(socket_path: []const u8) Attempt {
         .AGAIN, .INPROGRESS, .ALREADY, .INTR => .busy,
         else => .unknown,
     };
-}
-
-fn setNonBlocking(fd: std.c.fd_t) bool {
-    const flags = std.c.fcntl(fd, posix.F.GETFL);
-    if (flags < 0) return false;
-    return std.c.fcntl(fd, posix.F.SETFL, flags | nonblock_flag) >= 0;
 }
 
 /// Opens the leader's folder for removal, or says why it must stay. The folder
