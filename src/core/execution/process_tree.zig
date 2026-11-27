@@ -857,6 +857,55 @@ fn endSessionWith(
     return summary;
 }
 
+/// Whether no live process but the session's leader and this process belongs
+/// to `session`. Once that is true, nothing can join the session: a process
+/// enters a session only by being started by a member. A zombie member counts
+/// as gone, and a member whose session cannot be read counts as alive. A
+/// process list is not a snapshot: a member can start a process that a list
+/// already read past and then exit before the list reaches it. So the list is
+/// read twice, and both reads must find no member.
+pub fn sessionIsEmpty(alloc: Allocator, session: std.posix.pid_t) !bool {
+    return sessionIsEmptyWith(alloc, session, SystemSignalEffects);
+}
+
+fn sessionIsEmptyWith(
+    alloc: Allocator,
+    session: std.posix.pid_t,
+    comptime Effects: type,
+) !bool {
+    if (session <= 1) return false;
+    for (0..2) |_| {
+        if (try sessionHasLiveMemberWith(alloc, session, Effects)) return false;
+    }
+    return true;
+}
+
+fn sessionHasLiveMemberWith(
+    alloc: Allocator,
+    session: std.posix.pid_t,
+    comptime Effects: type,
+) !bool {
+    var pids: std.ArrayList(std.posix.pid_t) = .empty;
+    defer pids.deinit(alloc);
+    try Effects.list(alloc, &pids);
+    const own = Effects.ownPid();
+    for (pids.items) |pid| {
+        if (pid <= 1 or pid == own or pid == session) continue;
+        switch (Effects.session(pid)) {
+            .found => |value| if (value != session) continue,
+            .vanished => continue,
+            .unavailable => return true,
+        }
+        const snapshot = Effects.capture(alloc, pid) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            if (err == error.ProcessNotFound) continue;
+            return true;
+        };
+        if (!snapshot.zombie) return true;
+    }
+    return false;
+}
+
 fn inSessionWith(
     pid: std.posix.pid_t,
     session: std.posix.pid_t,
@@ -1093,14 +1142,14 @@ test "an exited child that is not collected yet is found by its start time" {
     });
     defer child.kill(io);
     const pid = child.id.?;
-    const started_us = (try captureSnapshot(alloc, pid)).started_at_us;
+    const started_us = (try captureSnapshot(alloc, pid)).started_at_us orelse return error.TestNoStartTime;
     const token = try testMacOSToken(started_us);
     const other_start = try testMacOSToken(started_us + 1);
     try std.testing.expect(!exitedUncollectedSince(pid, token));
 
     child.stdin.?.close(io);
     child.stdin = null;
-    try waitUntilExitedUncollected(pid);
+    _ = try waitUntilExitedUncollected(pid);
     try std.testing.expect(exitedUncollectedSince(pid, token));
     try std.testing.expect(!exitedUncollectedSince(pid, other_start));
 
@@ -1118,17 +1167,66 @@ fn testMacOSToken(started_us: u64) !process_identity.ProcessInstanceToken {
     ));
 }
 
-/// Blocks until the child `pid` has exited, and leaves it uncollected.
-fn waitUntilExitedUncollected(pid: std.posix.pid_t) !void {
-    const wait = struct {
-        extern "c" fn waitid(id_type: c_uint, id: c_uint, info: *std.c.siginfo_t, options: c_int) c_int;
-    };
-    const wait_for_pid: c_uint = 1; // P_PID
-    const wait_exited: c_int = 0x4; // WEXITED
-    const wait_leave_waitable: c_int = 0x20; // WNOWAIT
+/// How a child of this process ended.
+pub const ChildEnd = union(enum) {
+    exited: u8,
+    /// Killed by a signal, whether or not it dumped core: the signal's number.
+    signaled: u32,
+};
+
+extern "c" fn waitid(id_type: c_uint, id: c_uint, info: *std.c.siginfo_t, options: c_int) c_int;
+
+const wait_for_pid: c_uint = 1; // P_PID
+const wait_no_hang: c_int = 0x1; // WNOHANG
+const wait_exited: c_int = 0x4; // WEXITED
+/// WNOWAIT: report the child and leave it uncollected.
+const wait_leave_waitable: c_int = if (builtin.target.os.tag == .linux) 0x1000000 else 0x20;
+const child_exited_code: i32 = 1; // CLD_EXITED
+
+/// Blocks until `pid`, a child of this process, has ended, and tells how. The
+/// child stays uncollected: it remains a process table entry, so its pid, its
+/// process group id and its session id stay reserved for it until the owner
+/// collects it with `std.process.Child.wait`. Only that call may collect it.
+pub fn waitUntilExitedUncollected(pid: std.posix.pid_t) !ChildEnd {
+    if (comptime builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) {
+        return error.ProcessTreeUnsupported;
+    }
     var info: std.c.siginfo_t = undefined;
-    const result = wait.waitid(wait_for_pid, @intCast(pid), &info, wait_exited | wait_leave_waitable);
-    if (result != 0) return error.TestWaitForChildFailed;
+    @memset(std.mem.asBytes(&info), 0);
+    while (true) {
+        const result = waitid(wait_for_pid, @intCast(pid), &info, wait_exited | wait_leave_waitable);
+        switch (std.c.errno(result)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.WaitForChildFailed,
+        }
+    }
+    const status: u32 = @bitCast(switch (builtin.target.os.tag) {
+        .linux => info.fields.common.second.sigchld.status,
+        else => info.status,
+    });
+    if (info.code == child_exited_code) return .{ .exited = @truncate(status) };
+    return .{ .signaled = status };
+}
+
+/// Whether `pid` is a child of this process that has ended and is not
+/// collected yet. It collects nothing.
+pub fn exitedChildIsUncollected(pid: std.posix.pid_t) bool {
+    if (comptime builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return false;
+    var info: std.c.siginfo_t = undefined;
+    @memset(std.mem.asBytes(&info), 0);
+    const result = waitid(
+        wait_for_pid,
+        @intCast(pid),
+        &info,
+        wait_exited | wait_leave_waitable | wait_no_hang,
+    );
+    if (result != 0) return false;
+    const reported = switch (builtin.target.os.tag) {
+        .linux => info.fields.common.first.piduid.pid,
+        else => info.pid,
+    };
+    return reported == pid;
 }
 
 test "Linux proc helpers treat missing process data as vanished" {
@@ -1670,6 +1768,14 @@ const FakeSessionTable = struct {
     /// The pid is taken over right after its session is read once, so the identity read next is already the new process's.
     var swapped_pid: ?std.posix.pid_t = null;
     var swapped_reads: usize = 0;
+    /// The session of this pid cannot be read.
+    var unreadable_pid: ?std.posix.pid_t = null;
+    /// A process of `late_member_session` that exists only once the
+    /// `late_member_after_list`th list has been returned, as one that starts
+    /// while the list is read.
+    var late_member_pid: std.posix.pid_t = 0;
+    var late_member_session: std.posix.pid_t = 0;
+    var late_member_after_list: usize = 0;
 
     fn reset() void {
         count = 0;
@@ -1684,6 +1790,8 @@ const FakeSessionTable = struct {
         reused_reads = 0;
         swapped_pid = null;
         swapped_reads = 0;
+        unreadable_pid = null;
+        late_member_after_list = 0;
     }
 
     fn add(pid: std.posix.pid_t, session_id: std.posix.pid_t, zombie: bool) void {
@@ -1712,11 +1820,13 @@ const FakeSessionTable = struct {
     fn list(alloc: Allocator, out: *std.ArrayList(std.posix.pid_t)) !void {
         list_calls += 1;
         for (entries[0..count]) |entry| try out.append(alloc, entry.pid);
+        if (list_calls == late_member_after_list) add(late_member_pid, late_member_session, false);
     }
 
     fn session(pid: std.posix.pid_t) SessionState {
         if (pid == own_pid) return own_session;
         const index = find(pid) orelse return .vanished;
+        if (unreadable_pid == pid) return .unavailable;
         if (reused_pid == pid and reused_reads > 1) return .{ .found = 999 };
         if (swapped_pid == pid) {
             swapped_reads += 1;
@@ -1867,6 +1977,53 @@ test "ending a session never signals a pid that another process took over after 
     try std.testing.expectEqual(@as(usize, 1), summary.delivered);
 }
 
+test "a session is empty only when no live member is left" {
+    const table = FakeSessionTable;
+    table.reset();
+    // The leader, this process, init, a process of another session and a
+    // member that is a zombie do not count.
+    table.add(1, 200, false);
+    table.add(100, 200, false);
+    table.add(200, 200, false);
+    table.add(203, 200, true);
+    table.add(300, 300, false);
+    try std.testing.expect(try sessionIsEmptyWith(std.testing.allocator, 200, table));
+
+    table.add(201, 200, false);
+    try std.testing.expect(!try sessionIsEmptyWith(std.testing.allocator, 200, table));
+
+    // Init's session and a negative id are never empty, and nothing is signalled.
+    try std.testing.expect(!try sessionIsEmptyWith(std.testing.allocator, 1, table));
+    try std.testing.expect(!try sessionIsEmptyWith(std.testing.allocator, 0, table));
+    try std.testing.expect(!try sessionIsEmptyWith(std.testing.allocator, -1, table));
+    try std.testing.expectEqual(@as(usize, 0), table.killed_count);
+}
+
+test "a session with a member whose session cannot be read is not empty" {
+    const table = FakeSessionTable;
+    table.reset();
+    table.add(200, 200, false);
+    table.add(201, 200, false);
+    table.unreadable_pid = 201;
+    try std.testing.expect(!try sessionIsEmptyWith(std.testing.allocator, 200, table));
+    // Without the unreadable member the same table is empty.
+    table.unreadable_pid = null;
+    table.entries[1].session = 300;
+    try std.testing.expect(try sessionIsEmptyWith(std.testing.allocator, 200, table));
+}
+
+test "a session is read twice before it counts as empty" {
+    const table = FakeSessionTable;
+    table.reset();
+    table.add(200, 200, false);
+    // A member that starts while the first list is read is not in that list.
+    table.late_member_pid = 401;
+    table.late_member_session = 200;
+    table.late_member_after_list = 1;
+    try std.testing.expect(!try sessionIsEmptyWith(std.testing.allocator, 200, table));
+    try std.testing.expectEqual(@as(usize, 2), table.list_calls);
+}
+
 test "the process list holds this process and a child it starts" {
     if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -1947,6 +2104,98 @@ test "ending a real session leaves the leader and a setsid daemon alone" {
     try std.testing.expectEqual(@as(usize, 0), try std.posix.read(reports, &line));
     try std.testing.expect(try processIsAlive(alloc, leader_pid));
     try std.testing.expect(try processIsAlive(alloc, daemon_pid));
+}
+
+test "a child that ended stays uncollected until its owner collects it" {
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", "exit 7" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer if (child.id != null) child.kill(io);
+    const pid = child.id.?;
+
+    try std.testing.expectEqual(ChildEnd{ .exited = 7 }, try waitUntilExitedUncollected(pid));
+    // Reporting the end collected nothing: the entry is still there, and asking again says the same.
+    try std.testing.expect(exitedChildIsUncollected(pid));
+    try std.testing.expectEqual(ChildEnd{ .exited = 7 }, try waitUntilExitedUncollected(pid));
+
+    const term = try child.wait(io);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 7 }, term);
+    try std.testing.expect(!exitedChildIsUncollected(pid));
+    try std.testing.expectError(error.WaitForChildFailed, waitUntilExitedUncollected(pid));
+}
+
+test "a child killed by a signal is reported as signaled and stays uncollected" {
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sleep", "30" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer if (child.id != null) child.kill(io);
+    const pid = child.id.?;
+    // A child that is still running is not an ended one.
+    try std.testing.expect(!exitedChildIsUncollected(pid));
+
+    try std.posix.kill(pid, std.posix.SIG.KILL);
+    try std.testing.expectEqual(
+        ChildEnd{ .signaled = @backingInt(std.posix.SIG.KILL) },
+        try waitUntilExitedUncollected(pid),
+    );
+    try std.testing.expect(exitedChildIsUncollected(pid));
+    _ = try child.wait(io);
+    try std.testing.expect(!exitedChildIsUncollected(pid));
+}
+
+test "a real session is empty once its last member is gone" {
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    // The leader starts a session and one member, and reports the member's pid.
+    const script =
+        \\import os, signal, sys
+        \\os.setsid()
+        \\member = os.fork()
+        \\if member == 0:
+        \\    os.close(1)
+        \\    signal.alarm(30); signal.pause()
+        \\    os._exit(0)
+        \\sys.stdout.write("%d\n" % member); sys.stdout.flush()
+        \\os.close(1)
+        \\signal.alarm(30); signal.pause()
+    ;
+    var leader = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "-c", script },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer leader.kill(io);
+    const leader_pid = leader.id.?;
+    const reports = leader.stdout.?.handle;
+    var line: [32]u8 = undefined;
+    try waitReadable(reports, 15_000);
+    const line_len = try std.posix.read(reports, &line);
+    const member_pid = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, line[0..line_len], "\n"), 10);
+
+    try std.testing.expect(!try sessionIsEmpty(alloc, leader_pid));
+    // The member is a child of the leader, which does not collect it, so it
+    // stays as a zombie, and a zombie does not count.
+    try std.posix.kill(member_pid, std.posix.SIG.KILL);
+    const deadline = io_mod.milliTimestamp() + 15_000;
+    while (!try sessionIsEmpty(alloc, leader_pid)) {
+        if (io_mod.milliTimestamp() > deadline) return error.TestTimedOut;
+        io_mod.sleep(10 * std.time.ns_per_ms);
+    }
 }
 
 fn waitReadable(fd: std.posix.fd_t, timeout_ms: i32) !void {
