@@ -7,11 +7,15 @@
 (* queued for the parent, when no child can still post, or when its call   *)
 (* is canceled. It never takes the mail. The mail joins the parent's turn  *)
 (* only while fx is not inside the bash call, so the model reads it after  *)
-(* the call returns. While a bridge call runs, the bash call does not      *)
-(* yield, on the first call and on `wait_more`. The program can exit or be *)
-(* killed at any step. Its socket then closes, and the bridge cancels the  *)
-(* wait. The bash call returns, and the next program starts, only after    *)
-(* the bridge's calls for the last program have ended.                     *)
+(* the call returns.                                                       *)
+(*                                                                         *)
+(* The bridge serves a program only during its first bash call. Once that  *)
+(* call yields, the bridge is gone, and a later wait is refused at once.   *)
+(* While a bridge call runs, the first call does not yield. The program    *)
+(* can exit or be killed at any step. Its socket then closes, and the      *)
+(* bridge cancels the wait. The bash call returns, and the next program    *)
+(* starts, only after the bridge's calls for the last program have ended,  *)
+(* because the bridge's teardown waits for them.                           *)
 (***************************************************************************)
 EXTENDS Naturals
 
@@ -70,13 +74,13 @@ WaitMore ==
     /\ bash' = "more"
     /\ UNCHANGED <<prog, programs, call, waits, working, posted, queued, joined, lost, told>>
 
-\* The yield time passes. A bridge call that runs holds the bash call.
-\* Today `wait_more` ignores the hold (`managed_execution.zig` `waitOrYield`).
+\* The yield time passes. A bridge call that runs holds the first call
+\* (`managed_execution.zig` `yield_hold`). After the yield the bridge is gone.
 Yield ==
     /\ Inside
     /\ prog = "running"
     /\ \/ call = "none"
-       \/ Mutation = "more-ignores-hold" /\ bash = "more"
+       \/ Mutation = "yield-while-held"
     /\ bash' = "yielded"
     /\ UNCHANGED <<prog, programs, call, waits, working, posted, queued, joined, lost, told>>
 
@@ -94,14 +98,17 @@ Gone ==
     /\ prog' = "gone"
     /\ UNCHANGED <<programs, call, waits, bash, working, posted, queued, joined, lost, told>>
 
-\* The program sends `fx tool agent wait`. It returns at once when mail is
-\* queued or no child works, as the subagent tool's wait does.
+\* The program sends `fx tool agent wait`. After its first call yielded, no
+\* bridge is there, and the client exits at once. Otherwise the wait returns
+\* at once when mail is queued or no child works, as the subagent tool's
+\* wait does, and else it waits.
 StartWait ==
     /\ prog = "running"
     /\ call = "none"
     /\ waits < MaxWaits
     /\ waits' = waits + 1
-    /\ IF queued > 0 THEN call' = "none" /\ told' = "mail"
+    /\ IF bash # "first" THEN call' = "none" /\ told' = "unavailable"
+       ELSE IF queued > 0 THEN call' = "none" /\ told' = "mail"
        ELSE IF ~working THEN call' = "none" /\ told' = "quiet"
        ELSE call' = "waiting" /\ told' = told
     /\ UNCHANGED <<prog, programs, bash, working, posted, queued, joined, lost>>
@@ -185,10 +192,11 @@ TypeOK ==
     /\ working \in BOOLEAN
     /\ posted \in 0..MaxPosts
     /\ {queued, joined, lost} \subseteq 0..MaxPosts
-    /\ told \in {"none", "mail", "quiet", "canceled"}
+    /\ told \in {"none", "mail", "quiet", "canceled", "unavailable"}
 
-\* A wait runs only for a program that sent it, and only one at a time.
-WaitHasProgram == call = "waiting" => prog \in {"running", "gone"}
+\* A wait runs only for a program that sent it, and only inside the first
+\* bash call, which the bridge belongs to.
+WaitHasProgram == call = "waiting" => prog \in {"running", "gone"} /\ bash = "first"
 
 \* Every posted mail is in one place: queued, or with the parent model.
 MailKept == posted = queued + joined + lost
@@ -217,7 +225,7 @@ NeverQuiet == told # "quiet"
 \* A wait ended on mail, and the mail later reached the parent model.
 NeverMailAfterWait == ~(told = "mail" /\ joined > 0)
 
-\* A `wait_more` call was held by a running wait.
-NeverHeldOnMore == ~(bash = "more" /\ call = "waiting")
+\* A program sent a wait after its first call yielded, and was refused.
+NeverUnavailable == told # "unavailable"
 
 =============================================================================
