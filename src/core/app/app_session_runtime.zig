@@ -3234,6 +3234,12 @@ pub fn Runtime(comptime App: type) type {
             try v2.savePromptImages(alloc, images);
         }
 
+        /// Writes `patch` to `agent`'s own session, and for main to the
+        /// person's settings as well. A subagent's model choice is kept in its
+        /// own session alone, so a choice made for it from any view, with the
+        /// card, the picker or `/model` on its screen, never changes the
+        /// person's settings (`src/core/app/provider_runtime.zig`
+        /// `subagentPreferences`).
         pub fn commitRuntimePreferences(
             app: *App,
             agent: *AppAgent,
@@ -3247,25 +3253,27 @@ pub fn Runtime(comptime App: type) type {
                 agent.session_persistence.fast_mode_model_bound =
                     patch.model != null and patch.fast_mode != null;
             }
-
-            var settings_attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
-                patch.userSettingsPatch(),
-            );
-            switch (settings_attempt) {
-                .outcome => |outcome| {
-                    result.settings_outcome = outcome;
-                    settings_attempt = undefined;
-                },
-                .failure => |failure| {
-                    result.settings_error = failure.err;
-                    result.settings_failure_cleanup = failure.cleanup;
-                    settings_attempt = undefined;
-                },
-            }
-            // A subagent keeps no workspace seed for new sessions: its
+            // A subagent keeps no workspace seed for new sessions either: its
             // preferences live in its own session alone.
             const subagent = if (comptime @hasField(App, "screen_owner")) agent.role == .subagent else false;
+
+            if (!subagent) {
+                var settings_attempt = config_runtime.attemptUserPreferences(
+                    app.alloc,
+                    patch.userSettingsPatch(),
+                );
+                switch (settings_attempt) {
+                    .outcome => |outcome| {
+                        result.settings_outcome = outcome;
+                        settings_attempt = undefined;
+                    },
+                    .failure => |failure| {
+                        result.settings_error = failure.err;
+                        result.settings_failure_cleanup = failure.cleanup;
+                        settings_attempt = undefined;
+                    },
+                }
+            }
             if (result.settings_error == null and !subagent) {
                 applyPreferencePatch(
                     app.alloc,

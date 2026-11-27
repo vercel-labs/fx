@@ -8,6 +8,7 @@ const session_codec = @import("../../session/session_codec.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const model_provider = @import("../../config/model_provider.zig");
 const model_catalog = @import("../../gateway/model_catalog.zig");
 const types = @import("../../shared/types.zig");
 const worker_runtime = @import("../worker_runtime.zig");
@@ -200,6 +201,13 @@ pub const RefreshedGatewayCredential = struct {
     gateway_team: ?[]u8 = null,
     /// That team's slug, which fx shows the user.
     gateway_team_label: ?[]u8 = null,
+};
+
+/// The provider and model a waiting request continues with, as the worker
+/// holds them: its own copy, set under that worker's lock.
+pub const CurrentSelection = struct {
+    provider: model_provider.ProviderId,
+    model: []u8,
 };
 
 pub const AgentRuntimeDeps = struct {
@@ -398,6 +406,10 @@ pub const AgentRuntimeDeps = struct {
     /// Asks the user what to do when the account is out of credits, and
     /// blocks until they answer. Only the TUI sets it.
     ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,
+    /// The provider and model a waiting request continues with, taken once
+    /// from the worker's own copy so the worker thread never touches the
+    /// view's strings. Null: the request keeps the job's model.
+    continue_selection: ?*const fn (ctx: *anyopaque, alloc: Allocator) anyerror!?CurrentSelection = null,
     /// A request that waited for a sign-in found the login another fx
     /// process stored, and sends again with no answer from the host. The TUI
     /// marks the turn as working for Herdr. Null: nothing marks it.

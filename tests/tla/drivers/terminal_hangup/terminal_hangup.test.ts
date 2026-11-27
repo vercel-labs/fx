@@ -193,6 +193,7 @@ async function runPtyScenario(
     HOME: home,
     TERM: "xterm-256color",
     FX_TEST_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_WORKSPACE_TRUST: "1",
     FX_THEME: "dark",
     ...(options.gateway
       ? {

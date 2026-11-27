@@ -545,12 +545,21 @@ const AcpContext = struct {
         defer if (parsed_arguments) |*parsed| parsed.deinit();
         const raw_input = if (parsed_arguments) |*parsed| parsed.value else null;
 
+        // A check for another agent's call says whose it is, so main's screen
+        // never shows it as main's own.
+        var titled: std.Io.Writer.Allocating = .init(arena);
+        defer titled.deinit();
+        const title = if (subagentCardAgent(call.id)) |agent| blk: {
+            try titled.writer.print("{s}: {s}", .{ agent, presentation.title });
+            break :blk titled.writer.buffered();
+        } else presentation.title;
+
         try self.published_tool_calls.ensureUnusedCapacity(self.alloc, 1);
         const owned_id = try self.alloc.dupe(u8, call.id);
         errdefer self.alloc.free(owned_id);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeToolCall(&out.writer, owned_id, name, presentation.title, kind, .pending, raw_input, presentation.meta);
+        try acp_types.writeToolCall(&out.writer, owned_id, name, title, kind, .pending, raw_input, presentation.meta);
         try self.sendUpdate(out.writer.buffered());
         self.published_tool_calls.putAssumeCapacity(
             owned_id,
@@ -2913,6 +2922,18 @@ const TestReviewTurn = struct {
     }
 };
 
+/// The subagent whose call `call_id` is, for a check the parent answers
+/// (`SubagentApprovalCheck` builds `subagent:<name>:<call>`), or null for
+/// main's own call.
+fn subagentCardAgent(call_id: []const u8) ?[]const u8 {
+    const prefix = "subagent:";
+    if (!std.mem.startsWith(u8, call_id, prefix)) return null;
+    const rest = call_id[prefix.len..];
+    const end = std.mem.findScalar(u8, rest, ':') orelse return null;
+    if (end == 0) return null;
+    return rest[0..end];
+}
+
 fn requestAcpPermission(
     raw_ctx: *anyopaque,
     alloc: Allocator,
@@ -2940,6 +2961,11 @@ fn requestAcpPermission(
 
     var pending_arena = std.heap.ArenaAllocator.init(alloc);
     defer pending_arena.deinit();
+    // A card the call already has (a shell call's, for `fx mcp call`) is
+    // finished by that call's own transport; a card this check creates is
+    // finished here, with the answer.
+    const had_card = ctx.published_tool_calls.getKey(call.id) != null;
+    const for_subagent = subagentCardAgent(call.id) != null;
     const tool_call_id = try ctx.sendToolCallPending(pending_arena.allocator(), call);
 
     var params: std.Io.Writer.Allocating = .init(alloc);
@@ -2971,6 +2997,16 @@ fn requestAcpPermission(
         params.writer.buffered(),
     );
     const decision = server.awaitPermissionDecision(ctx.state, request_id);
+    if (for_subagent and !had_card) {
+        switch (decision) {
+            // A failed update costs only the card's status: the answer is
+            // already decided, and the child reads it either way.
+            .once, .always => ctx.sendToolCallCompletedWithCommandResult(tool_call_id, "The parent's check allowed this call.", null) catch |err|
+                debug_trace.logf("acp", "approval check card not finished call_id={s} err={s}", .{ tool_call_id, @errorName(err) }),
+            else => ctx.sendToolCallError(tool_call_id, "The parent's check refused this call.") catch |err|
+                debug_trace.logf("acp", "approval check card not failed call_id={s} err={s}", .{ tool_call_id, @errorName(err) }),
+        }
+    }
     return permission_request.OwnedPermissionResponse.init(alloc, decision, null);
 }
 
@@ -3529,9 +3565,12 @@ fn runReportTurns(
 ) !?TerminalOutcome {
     const tree = state.subagent_host orelse return null;
     while (true) {
-        switch (tree.awaitMailOrQuiet(&state.worker, &session.cancel_flag)) {
+        switch (tree.awaitMailOrQuiet(&state.worker, &session.cancel_flag, false)) {
             .quiet, .stopped => return null,
             .mail => {},
+            // ACP never asks for the fallback: a person can still answer the
+            // approval there, so it keeps waiting.
+            .approvals_unanswered => {},
         }
         const next = state.worker.takeQueuedPrompt(std.heap.c_allocator) orelse continue;
         defer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, next);

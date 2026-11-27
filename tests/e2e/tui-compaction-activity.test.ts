@@ -153,6 +153,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
     TERM: "xterm-256color", AI_GATEWAY_API_KEY: "synthetic-compaction-key",
     FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_WORKSPACE_TRUST: "1",
     FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
@@ -372,6 +373,7 @@ async function foldedReadAfterReopen(trigger: "auto" | "overflow") {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
     TERM: "xterm-256color", AI_GATEWAY_API_KEY: "synthetic-compaction-key",
     FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_WORKSPACE_TRUST: "1",
     FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
@@ -998,6 +1000,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
       TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
       FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_TEST_SKIP_WORKSPACE_TRUST: "1",
       FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_PERMISSION_MODE: "full-access",
       FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
@@ -1097,6 +1100,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
       TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
       FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_TEST_SKIP_WORKSPACE_TRUST: "1",
       FX_SOUND: "0", FX_AUTO_UPGRADE: "0", NO_COLOR: "1",
       FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
@@ -1243,11 +1247,16 @@ const NOTICE_PROMPT = "Read the three files.";
 const NOTICE_DONE = "NOTICE_ROWS_DONE_7c1a";
 const NOTICE_REJECTION = "REJECTED_9d2e";
 const NOTICE_HANDOFF = "Facts:\nF1: NOTICE_ROWS_HANDOFF_51aa: the user asked to read three files.";
-// fx estimates the turn's first request at about 5k to 6k tokens and the
-// next one, with a.txt's preview of one-letter words, at about 7k to 8k.
-// Compaction starts at 10% of the usable input: the window less the 8192
-// tokens kept for output, so 6.7k, between the two.
-const NOTICE_AUTO_CONTEXT_WINDOW = 67_000 + 8192;
+// fx measures a request as a whole, tool catalog included, and compacts when
+// that estimate reaches 10% of the usable input: the window less the 8192
+// tokens kept for output. This turn must compact once, after a.txt's preview
+// and before the calls that follow, so the point sits between them. Measured
+// here: about 6.4k for the turn's first request, 8.5k with a.txt's preview of
+// one-letter words, and 6.2k to 6.8k for the requests after the compaction.
+// The point, 7.6k, is about 0.9k from either side, so a tool catalog that
+// grows by less than that still yields one compaction.
+const NOTICE_AUTO_COMPACT_AT_TOKENS = 7_600;
+const NOTICE_AUTO_CONTEXT_WINDOW = NOTICE_AUTO_COMPACT_AT_TOKENS * 10 + 8192;
 const NOTICE_CLOCK = /\((?:\d+h)?(?:\d+m)?\d+s\)/g;
 
 type NoticeMiddle = "overflow" | "auto" | "provider-error" | "effort" | "empty-reply";
@@ -1342,6 +1351,7 @@ async function readAroundNotice(middle: NoticeMiddle) {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
     TERM: "xterm-256color", AI_GATEWAY_API_KEY: "synthetic-notice-key",
     FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_WORKSPACE_TRUST: "1",
     FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
