@@ -560,6 +560,8 @@ export const DEFAULT_UNSET_ENV_KEYS = [
   "FX_TEST_ACP_PROMPT_TERMINAL_READY",
   "FX_TEST_ACP_PROMPT_REAP_READY",
   "FX_TEST_ACP_PROMPT_RELEASE",
+  "FX_TEST_ACP_PERMISSION_READY",
+  "FX_TEST_ACP_PERMISSION_RELEASE",
 ] as const;
 
 /// The environment a test starts fx with: `inherited` without

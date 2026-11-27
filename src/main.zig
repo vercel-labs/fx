@@ -904,7 +904,8 @@ const App = struct {
         NotificationAppRuntime.queue(self, notification);
     }
 
-    pub fn notificationPresentationFinished(self: *App) void {
+    /// Plays turn-end cues once the reply is shown and the work on screen is done.
+    fn releaseHeldNotifications(self: *App) void {
         NotificationAppRuntime.presentationFinished(self);
     }
 
@@ -966,6 +967,14 @@ const App = struct {
 
     pub fn anySubagentWorking(self: *App) bool {
         return AgentsAppRuntime.anySubagentWorking(self);
+    }
+
+    pub fn screenSubagentsWorking(self: *App) bool {
+        return AgentsAppRuntime.screenSubagentsWorking(self);
+    }
+
+    pub fn screenWorkGoing(self: *App) bool {
+        return AgentsAppRuntime.screenWorkGoing(self);
     }
 
     /// Logs the queued work fx drops as it exits for an upgrade's restart.
@@ -3126,7 +3135,7 @@ const App = struct {
     pub fn pacerFinish(ctx: *anyopaque, finished: types.FinishedPrompt) anyerror!assistant_pacer.FinishResult {
         const self: *App = @ptrCast(@alignCast(ctx));
         const result = try app_callbacks.Bindings(App).finishPromptPresentation(self, self.screenAgent(), finished);
-        if (result == .committed) self.notificationPresentationFinished();
+        if (result == .committed) self.releaseHeldNotifications();
         return result;
     }
 
@@ -3597,6 +3606,7 @@ const App = struct {
         // its own context.
         try AgentsAppRuntime.tickChildren(self, {}, tickAgentInContext);
         AgentsAppRuntime.noteFinishedTurns(self);
+        self.releaseHeldNotifications();
         AgentsAppRuntime.settleChildRuns(self);
         AgentsAppRuntime.settleLentQuestion(self);
         AgentsAppRuntime.lendPrompt(self);
@@ -5913,6 +5923,32 @@ test "the busiest agent wins herdr's state: an approval over work, work over idl
     app.main_agent.worker.worker_processing = false;
 }
 
+test "the screen's subagents count as working until their host is quiet" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+
+    // Only the fields `quiet` reads are set: a busy child keeps the host open.
+    var busy_host: subagent_tool_host.Runtime = undefined;
+    busy_host.admission_mutex = .init;
+    busy_host.pending = .empty;
+    busy_host.busy = .empty;
+    defer {
+        for (busy_host.busy.items) |id| alloc.free(id);
+        busy_host.busy.deinit(alloc);
+    }
+    try busy_host.busy.append(alloc, try alloc.dupe(u8, "reviewer"));
+    app.main_agent.session_persistence.subagent_host = &busy_host;
+    defer app.main_agent.session_persistence.subagent_host = null;
+
+    try std.testing.expect(app.screenSubagentsWorking());
+    alloc.free(busy_host.busy.swapRemove(0));
+    try std.testing.expect(!app.screenSubagentsWorking());
+}
+
 test "an upgrade waits for agents that need the user, stops instances between steps, and lets subagents finish" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
@@ -7713,6 +7749,43 @@ test "the footer indicator names the agent on screen and the key that opens the 
     try std.testing.expectEqualStrings("main · ctrl+x", app.footerAgentLabel());
     try App.AgentsAppRuntime.show(&app, writer);
     try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
+}
+
+test "an open_agent_list key that opens no list says why in the trace" {
+    const alloc = std.testing.allocator;
+    const agent_test_support = @import("core/agent/runtime/tests/support.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "open-agent-list.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+
+    // One agent open, so the list has nothing to switch to.
+    try sendTerminalBytes(&app, "\x18");
+    try std.testing.expect(!App.AgentsAppRuntime.menuActive(&app));
+    // The full transcript holds the screen, which the list would cover.
+    _ = try app.shell.setTranscriptPresentationDepth(alloc, .full);
+    try sendTerminalBytes(&app, "\x18");
+    debug_trace.shutdown();
+
+    const trace = try agent_test_support.readTraceFile(alloc, trace_path, 8192);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "open_agent_list refused reason=no_other_agent") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "open_agent_list refused reason=full_transcript") != null);
 }
 
 /// What the tests of a subagent's end build: an app that writes its tab title
