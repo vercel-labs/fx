@@ -281,6 +281,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_SKIP_WORKSPACE_TRUST": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SLACK_ORIGIN": {
       "job": "test",
       "stability": "internal"
