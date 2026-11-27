@@ -11290,49 +11290,90 @@ test.skipIf(!tmuxAvailable())(
   TIMEOUT * 3,
 );
 
+/// The notice fx shows when a turn has crashed fx three times
+/// (`src/core/recovery/recovery.zig` crash_loop_notice).
+const LOOP_NOTICE = "This turn crashed fx three times, so fx stopped it. Send a message to go on.";
+
 test.skipIf(!tmuxAvailable())(
-  "a request that crashed fx twice asks first, and Esc there ends it for good",
+  "a turn that crashes fx three times stops with the reason and asks nothing",
   async () => {
     const fixture = resumeFixture("fx-auto-resume-loop-");
-    const { gateway, heldAtLeast, held } = holdingGateway("Crash me.");
+    const prompt = "Crash me three times.";
+    const next = "Now a new question.";
+    const countOf = (text: string, needle: string) => text.split(needle).length - 1;
+    let onWire = 0;
+    let continuations = 0;
+    let notify: () => void = () => {};
+    const holdOnWire = () => {
+      onWire += 1;
+      notify();
+      return new Promise<Response>(() => {});
+    };
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(next)) return fakeGatewayFinalText("LOOP_NEXT_8812");
+      if (body.includes(RESUME_NOTE)) {
+        continuations += 1;
+        // The first continuation holds on the wire. The second runs a slow
+        // step, so the third kill lands while a tool runs.
+        return continuations === 1 ? holdOnWire() : fakeShellRun("loop-slow-1", "sleep 30");
+      }
+      if (body.includes(prompt)) return holdOnWire();
+      return fakeGatewayFinalText("UNRELATED");
+    });
     let active: TmuxSession | null = null;
     try {
+      // Kill 1: the first request is on the wire.
       active = (await launchFx(fixture, gateway, "", "first")).session;
-      await active.sendText("Crash me.");
-      await heldAtLeast(1);
+      await active.sendText(prompt);
+      await waitForCondition(() => onWire >= 1, "the first request on the wire");
       await endFx(active, "SIGKILL");
-      // One crash resends on its own.
+
+      // Relaunch 1 continues at once. Kill 2 lands with its request on the wire.
       active = (await launchFx(fixture, gateway, "-c", "second")).session;
-      await heldAtLeast(2);
+      await waitForCondition(() => onWire >= 2, "the first continuation on the wire");
       await endFx(active, "SIGKILL");
 
-      // The second crash with the send in flight asks before sending.
+      // Relaunch 2 continues at once and runs the slow step. Kill 3 lands while it runs.
       active = (await launchFx(fixture, gateway, "-c", "third")).session;
-      await active.waitForText("This request crashed fx twice", TIMEOUT);
-      await Bun.sleep(300);
-      expect(held()).toBe(2);
-      await active.sendKeys("Escape");
-      await active.waitForComposer(TIMEOUT);
-      await active.kill();
+      await active.waitForText("sleep 30", TIMEOUT);
+      await endFx(active, "SIGKILL");
 
-      // Esc ended it: the next launch sends nothing.
-      const last = await launchFx(fixture, gateway, "-c", "fourth");
-      active = last.session;
+      // Relaunch 3 is the guard: the reason, no key hint, and no request.
+      const beforeGuard = gateway.requests.length;
+      const guarded = await launchFx(fixture, gateway, "-c", "guard");
+      active = guarded.session;
+      const pane = await active.waitForText(LOOP_NOTICE, TIMEOUT);
+      const noticeLine = pane.split("\n").find((line) => line.includes(LOOP_NOTICE)) ?? "";
+      expect(noticeLine).not.toMatch(/Enter|Esc/);
+      expect(pane).not.toContain("request failed");
       await Bun.sleep(1_000);
-      expect(held()).toBe(2);
-      const replayed = await active.captureFullScrollback();
-      expect(replayed).not.toContain("Resuming the interrupted request · attempt");
-      // The earlier resumes replay as their line, never as fx's note.
-      expect(replayed).toContain("Resuming the interrupted request");
-      expect(replayed).not.toContain(RESUME_NOTE);
-      expect(readFileSync(last.stderrPath, "utf8")).toBe("");
+      expect(gateway.requests.length).toBe(beforeGuard);
+      expect(readFileSync(guarded.stderrPath, "utf8")).toBe("");
+
+      // Relaunch 4 finds no interrupted turn: no notice, and nothing resumes.
+      await endFx(active, "SIGHUP");
+      const fourth = await launchFx(fixture, gateway, "-c", "fourth");
+      active = fourth.session;
+      await Bun.sleep(1_000);
+      expect(await active.capturePane()).not.toContain("crashed fx three times");
+      expect(gateway.requests.length).toBe(beforeGuard);
+
+      // A new message goes on from the stopped turn, and its request holds the turn's work once.
+      await active.sendText(next);
+      await active.waitForText("LOOP_NEXT_8812", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      const sent = gateway.requests.slice(beforeGuard).find((request) => request.body.includes(next));
+      expect(sent).toBeTruthy();
+      expect(countOf(sent!.body, prompt)).toBe(1);
+      expect(countOf(sent!.body, "sleep 30")).toBe(1);
+      expect(readFileSync(fourth.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();
       gateway.stop();
       rmSync(fixture.root, { recursive: true, force: true });
     }
   },
-  TIMEOUT * 4,
+  TIMEOUT * 5,
 );
 
 /// The gateway's answer to a request that has no credit left to run on.
@@ -11347,20 +11388,32 @@ test.skipIf(!tmuxAvailable())(
   async () => {
     const fixture = resumeFixture("fx-auto-resume-early-enter-");
     let payments = 0;
-    const { gateway, heldAtLeast, held } = holdingGateway("Crash me.", (body) => {
+    let crashSends = 0;
+    let onWire = 0;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes("Crash me.")) {
+        crashSends += 1;
+        // The first two sends are killed on the wire. The send after /resume
+        // meets out of credits, so the question it asks is the later one.
+        if (crashSends <= 2) {
+          onWire += 1;
+          return new Promise<Response>(() => {});
+        }
+        return crashSends === 3 ? outOfCredits() : fakeGatewayFinalText("RESUMED_AFTER_CREDITS_5522");
+      }
       if (!body.includes("Pay me.")) return fakeGatewayFinalText("UNRELATED");
       payments += 1;
       return payments === 1 ? outOfCredits() : fakeGatewayFinalText("PAID_ANSWER_5521");
     });
     let active: TmuxSession | null = null;
     try {
-      // Two crashes with the send in flight, so the next resume asks first.
+      // Two kills with the send on the wire, then a resume that goes on at once.
       active = (await launchFx(fixture, gateway, "", "first")).session;
       await active.sendText("Crash me.");
-      await heldAtLeast(1);
+      await waitForCondition(() => onWire >= 1, "the first send on the wire");
       await endFx(active, "SIGKILL");
       active = (await launchFx(fixture, gateway, "-c", "second")).session;
-      await heldAtLeast(2);
+      await waitForCondition(() => onWire >= 2, "the second send on the wire");
       await endFx(active, "SIGKILL");
 
       // "1" picks the picker's retry, and the Enter right after it reaches
@@ -11378,16 +11431,19 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       expect(payments).toBe(2);
 
-      // The crashed request, resumed in the same fx, still asks first.
+      // The crashed request resumes at once, and its own out-of-credits answer
+      // asks. The earlier Enter must not have answered that question.
       await active.sendText("/resume");
       await waitForSessionPicker(active);
       await active.sendKeys("Enter");
-      await active.waitForText("This request crashed fx twice · Enter to retry, Esc to cancel", TIMEOUT);
-      expect(held()).toBe(2);
-      // The user's own Enter answers it.
-      await active.sendKeys("Enter");
-      await heldAtLeast(3);
-      await active.waitForText("Resuming the interrupted request · attempt", TIMEOUT);
+      await waitForCondition(() => crashSends === 3, "the resumed send");
+      await active.waitForText("Out of credits. What should fx do?", TIMEOUT);
+      await Bun.sleep(500);
+      expect(crashSends).toBe(3);
+      // The user's own answer retries it.
+      await active.sendKeys("1 Enter");
+      await active.waitForText("RESUMED_AFTER_CREDITS_5522", TIMEOUT);
+      expect(crashSends).toBe(4);
       // The early Enter did reach the request's continue, and the resumed
       // request dropped it.
       expect(readFileSync(tracePath, "utf8")).toMatch(/event=answer_dropped .*event=user_continue origin=start/);
@@ -11420,7 +11476,7 @@ test.skipIf(!tmuxAvailable())(
       active = third.session;
       await heldAtLeast(3);
       const pane = await active.capturePane();
-      expect(pane).not.toContain("crashed fx twice");
+      expect(pane).not.toContain(LOOP_NOTICE);
       // A closed window reads as stopped, not as cancelled.
       expect(pane).toContain("system: fx stopped before this turn finished");
       expect(pane).not.toContain("system: cancelled");
@@ -11432,6 +11488,71 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   TIMEOUT * 4,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a turn closed three times goes on and is not stopped as a crash loop",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-closed-loop-");
+    const prompt = "Close me three times.";
+    let onWire = 0;
+    let continuations = 0;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) {
+        continuations += 1;
+        // The first continuation holds on the wire. The second runs a slow
+        // step, so the third close lands while a tool runs.
+        if (continuations === 1) {
+          onWire += 1;
+          return new Promise<Response>(() => {});
+        }
+        if (continuations === 2) return fakeShellRun("closed-slow-1", "sleep 30");
+        return fakeGatewayFinalText("CLOSED_RESUMED_3381");
+      }
+      if (body.includes(prompt)) {
+        onWire += 1;
+        return new Promise<Response>(() => {});
+      }
+      return fakeGatewayFinalText("UNRELATED");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      // Close 1: the request is on the wire.
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText(prompt);
+      await waitForCondition(() => onWire >= 1, "the first request on the wire");
+      const id = sessionIdFromHome(fixture.home);
+      await endFx(active, "SIGHUP");
+
+      // Relaunch 1 continues at once. Close 2 lands with its request on the wire.
+      active = (await launchFx(fixture, gateway, "-c", "second")).session;
+      await waitForCondition(() => onWire >= 2, "the first continuation on the wire");
+      expect(await active.capturePane()).not.toContain(LOOP_NOTICE);
+      await endFx(active, "SIGHUP");
+
+      // Relaunch 2 continues at once and runs the slow step. Close 3 lands while it runs.
+      active = (await launchFx(fixture, gateway, "-c", "third")).session;
+      await active.waitForText("sleep 30", TIMEOUT);
+      expect(await active.capturePane()).not.toContain(LOOP_NOTICE);
+      await endFx(active, "SIGHUP");
+
+      // Relaunch 3 continues at once, and its request answers.
+      const fourth = await launchFx(fixture, gateway, "-c", "fourth");
+      active = fourth.session;
+      const pane = await active.waitForText("CLOSED_RESUMED_3381", TIMEOUT);
+      expect(pane).not.toContain(LOOP_NOTICE);
+      await active.waitForComposer(TIMEOUT);
+      expect(continuations).toBe(3);
+      // None of the three closes counted as a death: every continuation's marker says 0.
+      expect(continuedCrashes(fixture.home, id)).toEqual([0, 0, 0]);
+      expect(readFileSync(fourth.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 5,
 );
 
 test.skipIf(!tmuxAvailable())(
@@ -11714,12 +11835,13 @@ function retryAfterUnavailable(seconds: number): Response {
   });
 }
 
-type SavedRecord = { phase: number; clean: boolean; attempt: number; deaths: number };
+type SavedRecord = { phase: number; clean: boolean; attempt: number };
 
 /// The records session `id` saved, oldest first, read from the layout
 /// `src/core/recovery/recovery.zig` documents: byte 1 the phase (1 sending,
-/// 2 waiting), byte 2 bit 0 a clean exit, bytes 4 and 5 the attempt, byte 7
-/// the abrupt deaths. A cleared record reads as null.
+/// 2 waiting), byte 2 bit 0 a clean exit, bytes 4 and 5 the attempt. The
+/// abrupt deaths are not in the record; see `continuedCrashes`. A cleared
+/// record reads as null.
 function savedRecords(home: string, id: string): (SavedRecord | null)[] {
   return savedItems(home, id)
     .filter((item) => "recovery" in item)
@@ -11727,8 +11849,16 @@ function savedRecords(home: string, id: string): (SavedRecord | null)[] {
       const hex = item.recovery?.record;
       if (typeof hex !== "string") return null;
       const bytes = Buffer.from(hex, "hex");
-      return { phase: bytes[1]!, clean: (bytes[2]! & 1) !== 0, attempt: bytes.readUInt16LE(4), deaths: bytes[7]! };
+      return { phase: bytes[1]!, clean: (bytes[2]! & 1) !== 0, attempt: bytes.readUInt16LE(4) };
     });
+}
+
+/// The abrupt deaths each continuation of session `id` counted, oldest first:
+/// the `crashes` of its `turn_continued` marker (0 without one).
+function continuedCrashes(home: string, id: string): number[] {
+  return savedItems(home, id)
+    .filter((item) => "turn_continued" in item)
+    .map((item) => item.turn_continued?.crashes ?? 0);
 }
 
 /// Cuts session `id`'s log inside line `index`, as a crash while writing it
@@ -11751,7 +11881,7 @@ function lastRecoveryLine(home: string, id: string): number {
 }
 
 test.skipIf(!tmuxAvailable())(
-  "a crash that cuts a retry's save short resumes the request without counting a crash",
+  "a crash that cuts a retry's save short still counts the crash, as every abrupt death does",
   async () => {
     const fixture = resumeFixture("fx-auto-resume-torn-send-");
     let sends = 0;
@@ -11783,10 +11913,9 @@ test.skipIf(!tmuxAvailable())(
       active = (await launchFx(fixture, gateway, "-c", "second")).session;
       await active.waitForText("TORN_SEND_RESUMED_4417", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
-      // fx read the wait's save, which no send followed, so the resumed
-      // send counts no crash.
-      const resumed = savedRecords(fixture.home, id).filter((record) => record !== null).at(-1);
-      expect(resumed).toMatchObject({ phase: 1, deaths: 0 });
+      // fx read the wait's save, which no send followed, but the turn still
+      // ended in a crash, so its marker counts that death.
+      expect(continuedCrashes(fixture.home, id).at(-1)).toBe(1);
     } finally {
       await active?.kill();
       gateway.stop();
@@ -11823,7 +11952,7 @@ test.skipIf(!tmuxAvailable())(
       // The crash cuts the wait's save in half, so nothing after it, such as
       // its status line, was written, and the save before it, the first send's,
       // is what the next launch reads.
-      expect(savedRecords(fixture.home, id).at(-2)).toMatchObject({ phase: 1, attempt: 1, deaths: 0 });
+      expect(savedRecords(fixture.home, id).at(-2)).toMatchObject({ phase: 1, attempt: 1 });
       const torn = tearLogAt(fixture.home, id, lastRecoveryLine(fixture.home, id));
       expect(torn).toMatchObject({ kind: "item", type: "recovery" });
 
@@ -11831,9 +11960,9 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("TORN_WAIT_RESUMED_6203", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       // fx can no longer tell the failed send from one in flight, so it
-      // counts the crash: one too many at worst, never one too few.
-      const resumed = savedRecords(fixture.home, id).filter((record) => record !== null).at(-1);
-      expect(resumed).toMatchObject({ phase: 1, deaths: 1 });
+      // counts the crash: one too many at worst, never one too few. The count
+      // is the newest turn_continued marker's, since the record keeps none.
+      expect(continuedCrashes(fixture.home, id).at(-1)).toBe(1);
       expect(sends).toBe(1);
     } finally {
       await active?.kill();

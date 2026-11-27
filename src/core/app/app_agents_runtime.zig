@@ -409,19 +409,18 @@ fn turnInFlight(agent: *agents.Agent) bool {
 }
 
 /// Whether a request that waits for `need` is one a subagent's parent may
-/// send again: a refused or a day-old one. A sign-in, credits, the content
-/// filter, a request too long, or one that crashed fx twice is the user's.
+/// send again: a refused one. A sign-in, credits, the content filter, or a
+/// request too long is the user's.
 fn parentMayResend(need: @FieldType(types.RouteRecoveryStatus, "need")) bool {
     return switch (need orelse return false) {
-        .rejected, .stale => true,
-        .sign_in, .quota, .content_filter, .too_long, .crash_loop => false,
+        .rejected => true,
+        .sign_in, .quota, .content_filter, .too_long => false,
     };
 }
 
-test "a subagent's parent may send again only a refused or a day-old request" {
+test "a subagent's parent may send again only a refused request" {
     try std.testing.expect(parentMayResend(.rejected));
-    try std.testing.expect(parentMayResend(.stale));
-    for ([_]@FieldType(types.RouteRecoveryStatus, "need"){ null, .sign_in, .quota, .content_filter, .too_long, .crash_loop }) |need| {
+    for ([_]@FieldType(types.RouteRecoveryStatus, "need"){ null, .sign_in, .quota, .content_filter, .too_long }) |need| {
         try std.testing.expect(!parentMayResend(need));
     }
 }

@@ -11,6 +11,7 @@ const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
+const recovery_rules = @import("../core/recovery/recovery.zig");
 const token_pass = @import("../core/gateway/token_pass.zig");
 const token_pass_team = @import("../core/gateway/token_pass_team.zig");
 const js_host_tools = if (host_target.is_wasm)
@@ -185,6 +186,14 @@ test "a libfx prompt holds at most its limit of images and image bytes" {
     try std.testing.expect(!fitsLibfxPrompt(&over));
 }
 
+/// The abrupt deaths a journal resume counts for its turn: the death it
+/// resumes from, unless the turn yielded or its host stopped it, saturating at
+/// the count's byte.
+fn journalResumeCrashes(pending_crashes: u8, yielded: bool, host_stopped: bool) u8 {
+    if (yielded or host_stopped) return pending_crashes;
+    return pending_crashes +| 1;
+}
+
 fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
     return switch (err) {
         error.ModelImageCapabilityUnavailable,
@@ -192,6 +201,12 @@ fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
         => .{ .rpc_error = .{
             .code = ErrorCode.invalid_params,
             .message = "Image prompts are unavailable for the selected model",
+        } },
+        // The guard's notice is the message; `crash_loop` tells a client why.
+        error.CrashLoop => .{ .rpc_error = .{
+            .code = ErrorCode.invalid_params,
+            .message = recovery_rules.crash_loop_notice,
+            .data = .{ .code = "crash_loop" },
         } },
         else => err,
     };
@@ -1418,7 +1433,7 @@ pub fn handlePromptWithInputId(
     var native_taken: ?session_runtime.SessionRuntime.TakenTurn = null;
     defer if (native_taken) |taken| {
         session.session_rt.returnNewestTurn(taken);
-        session.v2.?.setContinuesYielded(null);
+        session.v2.?.setContinuesYielded(null, 0);
     };
     if (session.journal) |*journal| {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -1440,6 +1455,9 @@ pub fn handlePromptWithInputId(
         defer journal_events.freePendingInputs(state.alloc, inputs);
         recovery_checkpoint = try libfx_journal.resumeCheckpoint(alloc, pending, inputs, journal.pending_resume_yielded);
         const answered_step = journal.pending_resume_answered;
+        const yielded_turn = journal.pending_resume_yielded;
+        // The host stopped the turn itself, as a close, so that stop is not a death.
+        const crashes = journalResumeCrashes(journal.pending_resume_crashes, yielded_turn, prompt_input.host_stopped);
         {
             session.session_write_mutex.lockUncancelable(io_mod.getIo());
             defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -1447,12 +1465,18 @@ pub fn handlePromptWithInputId(
             defer alloc.free(ids);
             for (inputs, ids) |input, *id| id.* = input.id;
             try journal.notePlaced(state.alloc, ids);
+            // Stored before a rerun or a send, so a death after it still counts.
+            try journal.noteResumed(state.alloc, session.session_id, crashes);
         }
         journal.dropPendingResume(state.alloc);
+        recovery_resume = .{ .crashes = crashes };
+        continued_turn = if (yielded_turn) .yielded else .stopped;
+        // At the crash-loop guard the turn ends with no rerun and no send.
+        const rerun_step = if (recovery_rules.stopsTurn(crashes)) null else answered_step;
         // Calls the crash left running that the host asked to run again do
         // so before the turn continues, and their results replace the answer
         // that they may have partly run.
-        if (answered_step) |step| if (prompt_input.rerun_call_ids.len > 0) {
+        if (rerun_step) |step| if (prompt_input.rerun_call_ids.len > 0) {
             if (ctx.observer) |observer| observer.beginTurn(recovery_checkpoint.?.user.text, true);
             _ = try libfx_journal.rerunCalls(alloc, &recovery_checkpoint.?, step, ResumeRerun{
                 .ctx = &ctx,
@@ -1482,10 +1506,9 @@ pub fn handlePromptWithInputId(
             if (found.yielded) .yielded else .interrupted,
         );
         // The log holds the turn's own pieces; the continuation writes only the notice.
-        v2.setContinuesYielded(&entry.execution);
+        v2.setContinuesYielded(&entry.execution, found.crashes);
         continued_turn = if (found.yielded) .yielded else .stopped;
-        // No age is passed, so a turn of any age continues at once.
-        recovery_resume = .{ .record = found.record, .stale = false };
+        recovery_resume = .{ .record = found.record, .crashes = found.crashes };
     } else if (prompt_input.continue_recovery) {
         return .{
             .rpc_error = .{
@@ -2007,6 +2030,9 @@ const max_host_time_ms: i64 = (1 << 53) - 1;
 const ParsedPromptInput = struct {
     text: []u8,
     continue_recovery: bool = false,
+    /// A resume whose host stopped the turn itself, as a close or a deadline
+    /// cut-off (`_meta.fx.hostStopped`).
+    host_stopped: bool = false,
     /// A resume whose host holds none of the turn's earlier output, such as
     /// an engine in a new process: the turn sends its saved reply again.
     fresh_output: bool = false,
@@ -2212,6 +2238,7 @@ fn parsePromptInputWithFirstImageId(
     if (parsed.value != .object) return .{ .text = try alloc.dupe(u8, "") };
 
     const continue_recovery = acp_types.fxMetaBool(parsed.value.object, "continueRecovery") orelse false;
+    const host_stopped = acp_types.fxMetaBool(parsed.value.object, "hostStopped") orelse false;
     const fresh_output = acp_types.fxMetaBool(parsed.value.object, "freshOutput") orelse false;
     const input_id: ?[]const u8 = if (acp_types.fxMetaField(parsed.value.object, "inputId")) |value|
         if (value == .string and libfx_steering.validInputId(value.string)) value.string else null
@@ -2230,8 +2257,8 @@ fn parsePromptInputWithFirstImageId(
         null;
 
     const prompt_arr = parsed.value.object.get("prompt") orelse
-        return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery, .fresh_output = fresh_output };
-    if (prompt_arr != .array) return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery, .fresh_output = fresh_output };
+        return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery, .host_stopped = host_stopped, .fresh_output = fresh_output };
+    if (prompt_arr != .array) return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery, .host_stopped = host_stopped, .fresh_output = fresh_output };
 
     var text_buf: std.ArrayList(u8) = .empty;
     defer text_buf.deinit(alloc);
@@ -2360,6 +2387,7 @@ fn parsePromptInputWithFirstImageId(
     var result = ParsedPromptInput{
         .text = try alloc.dupe(u8, text_buf.items),
         .continue_recovery = continue_recovery,
+        .host_stopped = host_stopped,
         .fresh_output = fresh_output,
         .input_accepted = input_accepted,
         .yield_at_ms = yield_at_ms,
@@ -4564,6 +4592,28 @@ test "mapToolKind maps common tools" {
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("unknown_tool"));
 }
 
+test "a journal resume's crash count adds the death it resumes from unless the turn yielded or its host stopped it, and saturates" {
+    try std.testing.expectEqual(@as(u8, 1), journalResumeCrashes(0, false, false));
+    try std.testing.expectEqual(@as(u8, 3), journalResumeCrashes(2, false, false));
+    try std.testing.expectEqual(@as(u8, 2), journalResumeCrashes(2, true, false));
+    try std.testing.expectEqual(@as(u8, 2), journalResumeCrashes(2, false, true));
+    try std.testing.expectEqual(@as(u8, 255), journalResumeCrashes(255, false, false));
+}
+
+test "ACP ends a turn stopped at the crash-loop guard with the notice and its code" {
+    const outcome = try promptExecutionFailure(error.CrashLoop);
+    switch (outcome) {
+        .rpc_error => |rpc_error| {
+            try std.testing.expectEqual(ErrorCode.invalid_params, rpc_error.code);
+            try std.testing.expectEqualStrings(recovery_rules.crash_loop_notice, rpc_error.message);
+            try std.testing.expectEqualStrings("crash_loop", rpc_error.data.?.code);
+            try std.testing.expect(rpc_error.data.?.model == null);
+            try std.testing.expect(rpc_error.data.?.capability == null);
+        },
+        .stop_reason => return error.UnexpectedStopReason,
+    }
+}
+
 test "ACP maps selected-model image capability failures to one stable error" {
     const failures = [_]anyerror{
         error.ModelImageCapabilityUnavailable,
@@ -4643,6 +4693,19 @@ test "parsePromptInput reads whether a resume's host holds the turn's earlier ou
     defer result.deinit(alloc);
     try std.testing.expect(result.continue_recovery);
     try std.testing.expect(result.fresh_output);
+}
+
+test "parsePromptInput reads whether the host stopped a resumed turn itself, as a close" {
+    const alloc = std.testing.allocator;
+    const params =
+        "{\"sessionId\":\"s1\",\"prompt\":[],\"_meta\":{\"fx\":{\"continueRecovery\":true,\"hostStopped\":true}}}";
+    var stopped = try parsePromptInput(alloc, params);
+    defer stopped.deinit(alloc);
+    try std.testing.expect(stopped.continue_recovery);
+    try std.testing.expect(stopped.host_stopped);
+    var plain = try parsePromptInput(alloc, "{\"sessionId\":\"s1\",\"prompt\":[],\"_meta\":{\"fx\":{\"continueRecovery\":true}}}");
+    defer plain.deinit(alloc);
+    try std.testing.expect(!plain.host_stopped);
 }
 
 test "parsePromptInput keeps the call ids a resume runs again and drops the rest" {

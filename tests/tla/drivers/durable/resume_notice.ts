@@ -96,18 +96,19 @@ const hang: Life = { interrupt: { kind: "hang" } };
 const tail: Life = { interrupt: { kind: "tail" } };
 const ends: Life = {};
 
-// The edge cases, by name.
+// The edge cases, by name. Three crashes of one turn end at the guard with
+// `crash_loop`, rerunning nothing and sending no model request.
 const named: Scenario[] = [
   { name: "resumed twice", turns: [{ steps: 0, lives: [kill(1), kill(1), ends] }] },
-  { name: "resumed three times with a step between", turns: [{ steps: 2, lives: [kill(1), kill(2), kill(2), ends] }] },
+  { name: "resumed three times with a step between (hits guard)", turns: [{ steps: 2, lives: [kill(1), kill(2), kill(2), ends] }] },
   { name: "yielded, then resumed", turns: [{ steps: 2, lives: [{ yield: true }, ends] }] },
   { name: "resumed after a crash, yielded, resumed", turns: [{ steps: 3, lives: [kill(1), { yield: true }, ends] }] },
   { name: "yielded, resumed, crashed after a step", turns: [{ steps: 3, lives: [{ yield: true }, kill(2), ends] }] },
   { name: "yielded, then resumed after two crashes", turns: [{ steps: 3, lives: [{ yield: true }, kill(2), kill(1), ends] }] },
-  { name: "crashed before the resumed turn's first progress, twice", turns: [{ steps: 1, lives: [kill(1), hang, hang, ends] }] },
+  { name: "crashed before the resumed turn's first progress", turns: [{ steps: 1, lives: [kill(1), hang, ends] }] },
   { name: "crashed after the final reply was saved", turns: [{ steps: 1, lives: [kill(1), tail, ends] }] },
   { name: "a second turn gets its own notice", turns: [{ steps: 1, lives: [kill(2), kill(1), ends] }, { steps: 0, lives: [kill(1), ends] }] },
-  { name: "fenced twice", turns: [{ steps: 2, lives: [kill(1), fence(2), fence(1), ends] }] },
+  { name: "fenced twice (hits guard)", turns: [{ steps: 2, lives: [kill(1), fence(2), fence(1), ends] }] },
   { name: "a dropped request asked again, then a crash", turns: [{ steps: 1, lives: [kill(1), { drop: 1, interrupt: { kind: "kill", at: 3 } }, ends] }] },
 ];
 
@@ -377,6 +378,11 @@ async function runScenario(helpers: any, scenario: Scenario, scratch: string): P
       ended = "yield";
       return;
     }
+    if (done.errorCode === "crash_loop") {
+      if (state.requests.length > 0) throw new HarnessError(`a guard-stopped resume sent ${state.requests.length} model request(s)`);
+      ended = "crash_loop";
+      return;
+    }
     if (done.stop !== "end_turn") throw new HarnessError(`a life ended ${JSON.stringify(done)}: ${(await stderr).slice(-300)}`);
     if (state.requests.length > 0) act("FinishReply");
     if (plan.interrupt?.kind === "tail") {
@@ -400,10 +406,10 @@ async function runScenario(helpers: any, scenario: Scenario, scratch: string): P
     for (const [t, turn] of scenario.turns.entries()) {
       for (const [l, plan] of turn.lives.entries()) {
         await runLife(plan, l === 0 ? `turn ${t + 1} needs ${turn.steps} lookups` : null);
-        if (ended === "clean") break;
+        if (ended === "clean" || ended === "crash_loop") break;
       }
       // A turn whose planned lives all stopped it is ended before the next starts.
-      for (let attempt = 0; ended !== "clean"; attempt++) {
+      for (let attempt = 0; ended !== "clean" && ended !== "crash_loop"; attempt++) {
         if (attempt === 3) throw new HarnessError(`turn ${t + 1} of "${scenario.name}" did not end after three more resumes`);
         await runLife(ends, null);
       }

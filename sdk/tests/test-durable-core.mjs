@@ -38,6 +38,18 @@ const stopping = new Set(["halting"]);
 // stops right after the turn's end lands.
 const doomed = "doomed";
 const stopsAfterEnd = new Set(["omega"]);
+// An input whose engine dies on each of its first two starts, then answers
+// with the crash-loop guard's error, as fx does on the third crash.
+const crashing = "crashing";
+const crashStarts = new Map();
+// How many times a harness was asked to resume a turn, and for each resume
+// its turn and whether the resume followed a deadline cut-off.
+const resumes = { count: 0, calls: [] };
+// An input whose step is cut off at the deadline each time it runs. Its
+// harness counts a crash for each resume that does not follow a cut-off, as
+// fx counts a death, and the third ends the turn with the guard's error.
+const cutting = "cutting";
+const crashedResumes = new Map();
 // An input whose engine stops each time it continues its started turn unless
 // the turn is being cancelled, one whose engine stops even then, and one
 // whose end record is still landing when its engine stops.
@@ -96,6 +108,13 @@ function scriptedHarness({ steps = 3 } = {}) {
         }, () => { handedOff = true; }, () => { asked.yield = true; });
       };
       const steps_ = async (turnId, input, yieldAt, push, signal, asked) => {
+        if (input === crashing) {
+          const starts = (crashStarts.get(turnId) ?? 0) + 1;
+          crashStarts.set(turnId, starts);
+          if (starts <= 2) throw harnessStopped("the engine exited mid-turn");
+          await append({ turnId, end: true }, [{ end: true }]);
+          throw Object.assign(new Error("This turn crashed fx three times, so fx stopped it. Send a message to go on."), { code: "crash_loop" });
+        }
         if (input === brittle || input === shattered) {
           // The engine dies at its next model request, which a cancel that
           // arrives first avoids, as fx's kernel does.
@@ -151,8 +170,19 @@ function scriptedHarness({ steps = 3 } = {}) {
           const started = append({ turnId, start: true, input }, [{ start: turnId }]);
           return chain(started, () => run(turnId, input, yieldAt));
         },
-        resume({ yieldAt } = {}) {
+        resume({ yieldAt, afterCutoff, rerun } = {}) {
+          resumes.count += 1;
           const open = openTurn();
+          resumes.calls.push({ turnId: open.id, afterCutoff: afterCutoff === true });
+          if (open.input === cutting && afterCutoff !== true) crashedResumes.set(open.id, (crashedResumes.get(open.id) ?? 0) + 1);
+          if ((crashedResumes.get(open.id) ?? 0) >= 3) return crashLoopTurn(open.id, append);
+          // Cut off three times in a row, the turn's step is not run again: it ends cancelled.
+          if (open.input === cutting && rerun === false) {
+            return scriptedTurn(async () => {
+              await append({ turnId: open.id, end: true }, [{ end: true }]);
+              return { stopReason: "cancelled" };
+            }, () => {});
+          }
           return run(open.id, open.input, yieldAt);
         },
         get openTurn() {
@@ -174,6 +204,14 @@ function scriptedHarness({ steps = 3 } = {}) {
   });
 }
 
+// A turn that ends with the crash-loop guard's error, as the engine answers it.
+function crashLoopTurn(turnId, append) {
+  return scriptedTurn(async () => {
+    await append({ turnId, end: true }, [{ end: true }]);
+    throw Object.assign(new Error("This turn crashed fx three times, so fx stopped it. Send a message to go on."), { code: "crash_loop" });
+  }, () => {});
+}
+
 // A turn: its events as an async iterable, its `result`, and `cancel()`; a
 // handoff stops it and stores nothing more.
 function scriptedTurn(body, onHandoff, onYield = () => {}) {
@@ -185,7 +223,7 @@ function scriptedTurn(body, onHandoff, onYield = () => {}) {
   const result = body((event) => { queue.push(event); wake?.(); }, controller.signal)
     .catch((error) => {
       // A stopped harness is not a turn's outcome; it reaches the core as is.
-      if (error?.code === "FX_HARNESS_STOPPED") throw error;
+      if (error?.code === "FX_HARNESS_STOPPED" || error?.code === "crash_loop") throw error;
       return cancelled ? { stopReason: "cancelled" } : { stopReason: "error", error: { name: "Error", message: String(error?.message ?? error) } };
     })
     .finally(() => { finished = true; wake?.(); });
@@ -911,6 +949,43 @@ test("a turn whose engine stops after its end landed still ends for its viewers"
   assert.equal(result.stopReason, "unknown");
   assert.equal(text, "omega-0 omega-1 omega-2");
   assert.equal((await session.prompt("after", { messageId: "turn-after" }).result).stopReason, "end_turn");
+  await agent.close();
+});
+
+test("a turn whose engine crashes three times ends with crash_loop, and is not resumed again", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  const session = agent.session();
+  const before = resumes.count;
+  const ended = await session.prompt(crashing, { messageId: "turn-crash" }).result;
+  assert.equal(ended.stopReason, "error");
+  assert.equal(ended.error?.code, "crash_loop");
+  assert.equal(resumes.count - before, 2, "the turn was resumed after each of its first two stops");
+  assert.equal((await session.prompt("after", { messageId: "turn-after" }).result).stopReason, "end_turn");
+  assert.equal(resumes.count - before, 2, "the ended turn is not resumed again");
+  await agent.close();
+});
+
+test("a turn cut off at the deadline three times ends cancelled, as durable's cut-off policy says, and not as a crash loop", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  const session = agent.session();
+  const entered = { count: 0 };
+  holds.set(`${cutting}-1`, { started: () => { entered.count += 1; }, released: new Promise(() => {}) });
+  const durable = agent[Symbol.for("libfx.durableInternals")];
+  const callsBefore = resumes.calls.length;
+  const turn = textOf(session.prompt(cutting, { messageId: "turn-cutting" })).then((value) => value, (error) => ({ error }));
+  for (let cut = 1; cut <= 3; cut += 1) {
+    for (let waited = 0; entered.count < cut && waited < 4000; waited += 1) await sleep(5);
+    assert.equal(entered.count, cut, `the held step was reached for cut-off ${cut}`);
+    durable.stopAtDeadline(session.id);
+  }
+  holds.delete(`${cutting}-1`);
+  const { text, result, error } = await turn;
+  assert.equal(error, undefined, `the turn was stopped as an error: ${error?.message}`);
+  assert.equal(result.stopReason, "cancelled");
+  assert.equal(text, "cutting-0");
+  const flags = resumes.calls.slice(callsBefore).filter((call) => call.turnId === "turn-cutting").map((call) => call.afterCutoff);
+  assert.deepEqual(flags, [true, true, true], "each resume follows a cut-off");
+  assert.deepEqual(ran.filter((step) => step.startsWith("turn-cutting:")), ["turn-cutting:0"], "the cut-off step never ran");
   await agent.close();
 });
 

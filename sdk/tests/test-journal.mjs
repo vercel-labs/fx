@@ -290,8 +290,9 @@ function assertContiguous(events) {
   let turn = 1;
   events.forEach((event, index) => {
     // Version 2 only where an event needs it, so an older libfx still loads
-    // a journal without such events.
-    assert.equal(event.v, event.type === "tool_result" || event.base !== undefined ? 2 : 1, JSON.stringify(event).slice(0, 200));
+    // a journal without such events; a resumed turn's count is version 5.
+    const version = event.type === "turn_resumed" ? 5 : event.type === "tool_result" || event.base !== undefined ? 2 : 1;
+    assert.equal(event.v, version, JSON.stringify(event).slice(0, 200));
     assert.equal(event.seq, index + 1, `event ${index} has seq ${event.seq}`);
     assert.equal(event.turn, turn, `event ${event.seq} has turn ${event.turn}`);
     if (event.type === "turn_committed") turn += 1;
@@ -581,7 +582,9 @@ test("a turn resumed after each of several crashes tells the model once", async 
   const step = journal.events.findIndex((event) => event.type === "tool_result");
   let events = journal.events.slice(0, journal.events.findIndex((event, index) => index > step && event.type === "turn_progress") + 1);
   const isNotice = (message) => message.role === "user" && textOf(message) === notice;
-  for (const resume of [1, 2, 3]) {
+  // Two resumes are two crashes; a third would be the crash-loop guard, which
+  // the crash-loop test below checks.
+  for (const resume of [1, 2]) {
     const store = eventJournal(events);
     const resumed = await createFxEngine(options(targetBackend, store));
     requests.length = 0;
@@ -593,10 +596,11 @@ test("a turn resumed after each of several crashes tells the model once", async 
     assert.equal(prompt.filter(isNotice).length, 1, `resume ${resume} tells the model once`);
     assert.ok(prompt.findIndex(isNotice) > prompt.findIndex((message) => message.role === "tool"), "after the step it followed");
     // The process died again during that resume's first request: only the
-    // progress before it, which holds the notice, was stored.
-    assert.equal(store.events[events.length].type, "turn_progress");
-    events = store.events.slice(0, events.length + 1);
-    if (resume === 3) assertContiguous(store.events);
+    // resume's count and the progress before it, which holds the notice, were stored.
+    assert.equal(store.events[events.length].type, "turn_resumed");
+    assert.equal(store.events[events.length + 1].type, "turn_progress");
+    events = store.events.slice(0, events.length + 2);
+    if (resume === 2) assertContiguous(store.events);
   }
 });
 
@@ -911,7 +915,7 @@ test("a journal that does not fold is refused", async () => {
   const invalid = (pattern) => (error) => pattern.test(error.message) && error.code === "FX_JOURNAL_INVALID";
   const duplicated = eventJournal([...journal.events, journal.events.at(-1)]);
   await assert.rejects(createFxEngine(options(targetBackend, duplicated)), invalid(/libfx journal events are out of order/));
-  const newer = eventJournal([{ ...journal.events[0], v: 5 }]);
+  const newer = eventJournal([{ ...journal.events[0], v: 6 }]);
   await assert.rejects(createFxEngine(options(targetBackend, newer)), /libfx journal was written by a newer fx/);
   const garbled = eventJournal([{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: { kind: "nope" } }]);
   await assert.rejects(createFxEngine(options(targetBackend, garbled)), invalid(/Invalid libfx journal/));
@@ -1287,7 +1291,7 @@ test("a turn left open resumes under the tools the new agent has", async () => {
 });
 
 test("a journal from a newer libfx is refused", async () => {
-  const future = eventJournal([{ v: 5, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
+  const future = eventJournal([{ v: 6, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
   const newer = (error) => error instanceof FxJournalVersionError && error.code === "FX_JOURNAL_VERSION";
   await assert.rejects(createFxEngine(options(sourceBackend, future)), newer);
   const record = (format) => ({
@@ -2324,6 +2328,168 @@ test("a yield needs persistence to keep the turn in", async () => {
   assert.equal((await turn.result).stopReason, "end_turn");
   await agent.close();
 });
+// The journal a process that died during a resumed turn leaves: the events up
+// to the resume's count, and nothing the resumed turn did after it.
+const diedAfterResume = (events) => events.slice(0, events.findLastIndex((event) => event.type === "turn_resumed") + 1);
+const resumeCounts = (events) => events.filter((event) => event.type === "turn_resumed").map((event) => event.data.crashes);
+
+test("a resumed turn stores turn_resumed with its count before any request goes out", async () => {
+  const journal = eventJournal();
+  const agent = await createFxEngine(options(sourceBackend, journal));
+  await run(agent, "first");
+  await run(agent, "remember plums");
+  await agent.close();
+  const crashed = eventJournal(crashDuringRequest(journal.events));
+  const base = persisted(crashed);
+  const before = requests.length;
+  let requestsWhenStored = null;
+  const watched = {
+    load: base.load,
+    async append(batch) {
+      if (requestsWhenStored === null && decodeRecord(batch.data).some((event) => event.type === "turn_resumed")) requestsWhenStored = requests.length - before;
+      return base.append(batch);
+    },
+  };
+  const resumed = await createFxEngine(options(targetBackend, undefined, { persistence: watched }));
+  const turn = resumed.resume();
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
+  assert.equal(requestsWhenStored, 0, "the count is stored before the resumed turn sends its request");
+  assert.deepEqual(resumeCounts(crashed.events), [1]);
+  assertContiguous(crashed.events);
+});
+
+test("an old journal with no turn_resumed resumes with count 1", async () => {
+  const journal = eventJournal();
+  const agent = await createFxEngine(options(sourceBackend, journal));
+  await run(agent, "first");
+  await run(agent, "remember plums");
+  await agent.close();
+  const crashed = eventJournal(crashDuringRequest(journal.events));
+  assert.deepEqual(resumeCounts(crashed.events), [], "the journal predates turn_resumed");
+  const resumed = await createFxEngine(options(targetBackend, crashed));
+  const turn = resumed.resume();
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
+  assert.deepEqual(resumeCounts(crashed.events), [1]);
+});
+
+test("crash, resume, crash, resume counts 1 then 2", async () => {
+  const journal = eventJournal();
+  const agent = await createFxEngine(options(sourceBackend, journal));
+  await run(agent, "first");
+  await run(agent, "remember plums");
+  await agent.close();
+  let events = crashDuringRequest(journal.events);
+  const stores = [];
+  for (let resume = 0; resume < 2; resume += 1) {
+    const store = eventJournal(events);
+    const resumed = await createFxEngine(options(targetBackend, store));
+    const turn = resumed.resume();
+    for await (const _ of turn) {}
+    assert.equal((await turn.result).stopReason, "end_turn");
+    await resumed.close();
+    stores.push(store);
+    events = diedAfterResume(store.events);
+  }
+  assert.deepEqual(resumeCounts(stores[0].events), [1]);
+  assert.deepEqual(resumeCounts(stores[1].events), [1, 2]);
+  assertContiguous(stores[1].events);
+});
+
+test("a turn that crashes three times ends with crash_loop, reruns nothing, and sends no request", async () => {
+  let lookups = 0;
+  const counted = { ...lookup, execute: async (input) => { lookups += 1; return lookup.execute(input); } };
+  const journal = eventJournal();
+  const agent = await createFxEngine(options(sourceBackend, journal, { tools: [counted] }));
+  await run(agent, "use the tool");
+  await agent.close();
+  lookups = 0;
+  // The process died while the tool's call ran: its intent is stored, its result is not.
+  const intent = journal.events.findIndex((event) => event.type === "tool_intent");
+  let events = journal.events.slice(0, intent + 1);
+  for (let resume = 0; resume < 2; resume += 1) {
+    const store = eventJournal(events);
+    const resumed = await createFxEngine(options(targetBackend, store, { tools: [counted] }));
+    const turn = resumed.resume();
+    for await (const _ of turn) {}
+    assert.equal((await turn.result).stopReason, "end_turn");
+    await resumed.close();
+    events = diedAfterResume(store.events);
+  }
+  const store = eventJournal(events);
+  const resumed = await createFxEngine(options(targetBackend, store, { tools: [counted] }));
+  requests.length = 0;
+  const turn = resumed.resume({ onAmbiguous: () => "rerun" });
+  const failed = (error) => error.code === "crash_loop" && /crashed fx three times/.test(error.message);
+  await assert.rejects((async () => { for await (const _ of turn) {} })(), failed);
+  await assert.rejects(turn.result, failed);
+  await resumed.close();
+  assert.equal(lookups, 0, "the guard reruns no call");
+  assert.equal(requests.length, 0, "the guard sends no model request");
+  assert.deepEqual(resumeCounts(store.events), [1, 2, 3]);
+  const last = store.events.at(-1);
+  assert.equal(last.type, "turn_committed", "the guard ends the open turn");
+  assert.equal(last.data.kind, "interrupted");
+  const later = await createFxEngine(options(targetBackend, store, { tools: [counted] }));
+  assert.equal(later.resume(), null, "a later open has no pending resume");
+  await later.close();
+});
+
+test("a yielded turn resumed and then crashed counts that crash once, not the yield", async () => {
+  let turn;
+  // Asked while its tool runs, the turn yields before its next request.
+  const asking = { ...lookup, execute: async (input) => { await turn.yield(); return lookup.execute(input); } };
+  const journal = eventJournal();
+  const agent = await createFxEngine(options(sourceBackend, journal, { tools: [asking] }));
+  turn = agent.prompt("use the tool");
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "yielded");
+  await agent.close();
+  const yielded = eventJournal(journal.events);
+  const resumed = await createFxEngine(options(targetBackend, yielded));
+  const continued = resumed.resume();
+  for await (const _ of continued) {}
+  assert.equal((await continued.result).stopReason, "end_turn");
+  await resumed.close();
+  assert.deepEqual(resumeCounts(yielded.events), [0], "the resume of a yield counts no death");
+  const crashed = eventJournal(diedAfterResume(yielded.events));
+  const again = await createFxEngine(options(targetBackend, crashed));
+  const retried = again.resume();
+  for await (const _ of retried) {}
+  assert.equal((await retried.result).stopReason, "end_turn");
+  await again.close();
+  assert.deepEqual(resumeCounts(crashed.events), [0, 1], "the crash after it counts once");
+});
+
+// The internal resume option a deadline cut-off sets (`resumeAfterCutoff` in engine.js).
+const afterCutoff = Symbol.for("libfx.resumeAfterCutoff");
+
+test("a resume after the host stopped the turn itself does not count that stop as a crash", async () => {
+  const journal = eventJournal();
+  const agent = await createFxEngine(options(sourceBackend, journal));
+  await run(agent, "first");
+  await run(agent, "remember plums");
+  await agent.close();
+  const cut = eventJournal(crashDuringRequest(journal.events));
+  const stopped = await createFxEngine(options(targetBackend, cut));
+  const turn = stopped.resume({ [afterCutoff]: true });
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await stopped.close();
+  assert.deepEqual(resumeCounts(cut.events), [0], "the host's stop counts no death");
+  const died = eventJournal(diedAfterResume(cut.events));
+  const again = await createFxEngine(options(targetBackend, died));
+  const retried = again.resume();
+  for await (const _ of retried) {}
+  assert.equal((await retried.result).stopReason, "end_turn");
+  await again.close();
+  assert.deepEqual(resumeCounts(died.events), [0, 1], "a resume without the stop counts its death");
+  assertContiguous(died.events);
+});
+
 try {
   for (const { name, body } of cases) {
     await body();

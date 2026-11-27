@@ -109,6 +109,8 @@ pub const RequestRecovery = struct {
     /// `registry_mutex`, not `mutex`.
     registry_node: std.DoublyLinkedList.Node = .{},
     registered: bool = false,
+    /// Set by `start` when the request ends at the crash-loop guard.
+    stopped_by_crash_loop: bool = false,
 
     mutex: std.Io.Mutex = .init,
     // Everything below is guarded by `mutex`.
@@ -191,7 +193,14 @@ pub const RequestRecovery = struct {
             debug_trace.eventf("recovery", "answer_dropped", self.trace_ctx, "event=sign_in_closed origin=start reason=nothing_waits_for_it", .{});
         };
         const from = resumed orelse Resume{};
-        return self.event(.{ .start = .{ .fast = fast, .resume_from = from.record, .stale = from.stale, .continues = from.continues } });
+        return self.event(.{ .start = .{ .fast = fast, .resume_from = from.record, .crashes = from.crashes, .continues = from.continues } });
+    }
+
+    /// Whether `start` ended the request at the crash-loop guard. Only `start`
+    /// finishes a request that way, on the turn's own thread, so that thread
+    /// reads it after `start` returns.
+    pub fn stoppedByCrashLoop(self: *const RequestRecovery) bool {
+        return self.stopped_by_crash_loop;
     }
 
     /// The record for the write just before a send: the module's save for
@@ -210,7 +219,7 @@ pub const RequestRecovery = struct {
     /// The record for the write that saves a response: a complete response
     /// clears it there, before its pieces reach the turn, so a death after
     /// that is not a death with a send in flight
-    /// (`tests/tla/recovery/Resume.tla` NoFalseCrashQuestion).
+    /// (`tests/tla/recovery/Resume.tla` NoFalseCrash).
     pub fn responseRecord(self: *RequestRecovery, complete: bool) types.RecoveryRecordWrite {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
@@ -232,7 +241,7 @@ pub const RequestRecovery = struct {
     /// SIGHUP, SIGTERM, or a terminal that hangs up: delivers `closing` to
     /// every registered request and writes the clean record each returns, so
     /// the next launch resumes them without counting a death
-    /// (`tests/tla/recovery/Resume.tla` NoFalseCrashQuestion). Main, its
+    /// (`tests/tla/recovery/Resume.tla` NoFalseCrash). Main, its
     /// subagents and other instances can each have a request in flight.
     /// Waits at most `close_wait_ms` for each lock. Returns how many records
     /// were written.
@@ -276,7 +285,7 @@ pub const RequestRecovery = struct {
     /// upgrade's restart: saves the clean record `closing` returns, as
     /// SIGTERM does, so the next launch continues the request without
     /// counting a death (`tests/tla/recovery/Resume.tla` Hold,
-    /// NoFalseCrashQuestion). Only a cancelled restart replaces that record
+    /// NoFalseCrash). Only a cancelled restart replaces that record
     /// afterwards (`reopenAfterYield`).
     /// When the clean record does not land, the request stays as it was,
     /// open and with its send's record, so the turn goes on and its next
@@ -316,7 +325,7 @@ pub const RequestRecovery = struct {
     /// The restart this request's turn stopped for was cancelled: the request
     /// goes back to how it was before `closeForYield`, and its send's record
     /// is saved again before the send, so a death during that send counts
-    /// (`tests/tla/recovery/Resume.tla` CancelRestart, CrashLoopAsks). When
+    /// (`tests/tla/recovery/Resume.tla` CancelRestart, CrashLoopStops). When
     /// the record does not land, the request stays closed with its clean
     /// record and this fails, so no send goes out without its record.
     /// Called on the request's own thread.
@@ -692,6 +701,10 @@ pub const RequestRecovery = struct {
             },
             // The turn ends cancelled, which ends its record too.
             .cancelled => self.recovery_shown = false,
+            .crash_loop => {
+                self.recovery_shown = false;
+                self.stopped_by_crash_loop = true;
+            },
         };
         return plan.send;
     }
@@ -1401,7 +1414,6 @@ test "closing saves a clean record that resumes without a death, and nothing rep
     var probe: recovery.State = .{};
     const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
     try std.testing.expect(plan.send != null);
-    try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
 }
 
 test "a yield saves a clean record that resumes without a death" {
@@ -1426,7 +1438,6 @@ test "a yield saves a clean record that resumes without a death" {
     var probe: recovery.State = .{};
     const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
     try std.testing.expect(plan.send != null);
-    try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
 }
 
 test "a request reports its record saved from its send until it is closed" {
@@ -1484,7 +1495,6 @@ test "a yield whose clean record does not land leaves the request open with its 
     var probe: recovery.State = .{};
     const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
     try std.testing.expect(plan.send != null);
-    try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
 }
 
 test "a cancelled restart reopens the request and saves its send's record again" {
@@ -1576,36 +1586,43 @@ test "closing saves a clean record for every request in flight" {
         var probe: recovery.State = .{};
         const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
         try std.testing.expect(plan.send != null);
-        try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
     }
     try std.testing.expectEqual(@as(usize, 0), RequestRecovery.closeActive());
 }
 
-test "a resumed start that must ask first sends nothing" {
+test "a resumed start at the crash-loop guard sends nothing and ends the request" {
     var fake = recordingFake();
     defer fake.deinit();
     const deps = fake.deps();
     var cancel_flag = std.atomic.Value(bool).init(false);
 
-    // The turn that continues the request is not on disk yet.
-    fake.recovery_turn_written = false;
-    // Two deaths with the send in flight.
     var probe: recovery.State = .{};
-    const first = recovery.step(&probe, .{ .start = .{} }, 0).save.?;
-    probe = .{};
-    const second = recovery.step(&probe, .{ .start = .{ .resume_from = first } }, 0).save.?;
-    {
-        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
-        defer request.deinit();
-        try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .record = second }));
-        // The question's record waits for the turn's first write.
-        try std.testing.expect(request.sendRecord() == .save);
-    }
-    {
-        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
-        defer request.deinit();
-        try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .stale = true }));
-    }
+    const record = recovery.step(&probe, .{ .start = .{} }, 0).save.?;
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+    try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .record = record, .crashes = 3 }));
+    try std.testing.expect(request.stoppedByCrashLoop());
+}
+
+test "a request that resumes below the crash-loop guard is not ended as one" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    var probe: recovery.State = .{};
+    const record = recovery.step(&probe, .{ .start = .{} }, 0).save.?;
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+    try std.testing.expectEqual(Send{}, (try request.start(false, .{ .record = record, .crashes = 2 })).?);
+    try std.testing.expect(!request.stoppedByCrashLoop());
+}
+
+/// A record waiting for the user on a quota question.
+fn quotaRecord() recovery.Record {
+    var probe: recovery.State = .{};
+    _ = recovery.step(&probe, .{ .start = .{} }, 0);
+    return recovery.step(&probe, .{ .failed = .{ .kind = .quota } }, 0).save.?;
 }
 
 test "a continue from before a request does not answer the question it starts with" {
@@ -1621,7 +1638,7 @@ test "a continue from before a request does not answer the question it starts wi
     // An Enter that reached no waiting request, such as one typed just
     // after the out-of-credits picker's retry.
     continue_flag.store(true, .seq_cst);
-    try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .stale = true }));
+    try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .record = quotaRecord() }));
     try std.testing.expect(!continue_flag.load(.seq_cst));
     try std.testing.expect(recovery.usesAnswer(&request.state, .user_continue));
     try std.testing.expectEqual(@as(u16, 0), request.attempt());
@@ -1642,7 +1659,7 @@ test "an Enter as soon as a request's first question shows answers it" {
     request.continue_flag = &continue_flag;
     defer request.deinit();
 
-    try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .stale = true }));
+    try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .record = quotaRecord() }));
     try std.testing.expect(continue_flag.load(.seq_cst));
     try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
     try std.testing.expectEqual(@as(u16, 1), request.attempt());

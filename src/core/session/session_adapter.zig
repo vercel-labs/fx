@@ -47,6 +47,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const write_test_controls = @import("write_test_controls.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
+const recovery_rules = @import("../recovery/recovery.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
@@ -1941,6 +1942,67 @@ pub fn hasInterruptedTurn(store: *Store, alloc: Allocator, workspace: []const u8
     return last.turn == state.last_turn and (last.reason == .crash or last.reason == .closed);
 }
 
+/// How long the closer waits for a lock before it skips what it holds. Mirrors
+/// `request_recovery.zig`'s `close_wait_ms`, which the closer also uses.
+const close_wait_ms: u64 = 1_000;
+
+fn lockWithin(mutex: *std.Io.Mutex, ms: u64) bool {
+    var waited_ms: u64 = 0;
+    while (!mutex.tryLock()) {
+        if (waited_ms >= ms) return false;
+        io_mod.getIo().sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
+        waited_ms += 5;
+    }
+    return true;
+}
+
+/// The sessions with an open v2 turn in this process, for the closer. Each
+/// links itself through `open_node`, so registering never allocates. A
+/// session takes this lock after its own; the closer takes it first and
+/// waits on each session only `close_wait_ms`, so the two cannot deadlock.
+var open_registry_mutex: std.Io.Mutex = .init;
+var open_registry: std.DoublyLinkedList = .{};
+
+fn registerOpenTurn(session: *Session) void {
+    const io = io_mod.getIo();
+    open_registry_mutex.lockUncancelable(io);
+    defer open_registry_mutex.unlock(io);
+    if (session.open_registered) return;
+    open_registry.append(&session.open_node);
+    session.open_registered = true;
+}
+
+fn unregisterOpenTurn(session: *Session) void {
+    const io = io_mod.getIo();
+    open_registry_mutex.lockUncancelable(io);
+    defer open_registry_mutex.unlock(io);
+    if (!session.open_registered) return;
+    open_registry.remove(&session.open_node);
+    session.open_node = .{};
+    session.open_registered = false;
+}
+
+/// Marks every open v2 turn in this process as closed by fx's close, for the
+/// closer in `app_lifecycle.zig`. Each turn gets one `turn_closing` item and
+/// stays open, so a worker that still writes after the mark continues it. A
+/// session the closer cannot lock in time is skipped and traced. Returns how
+/// many turns it marked.
+pub fn closeOpenTurns() usize {
+    const io = io_mod.getIo();
+    if (!lockWithin(&open_registry_mutex, close_wait_ms)) {
+        debug_trace.logf("session", "event=sessions_v2_closing_skipped reason=registry_busy", .{});
+        return 0;
+    }
+    defer open_registry_mutex.unlock(io);
+    var marked: usize = 0;
+    var node = open_registry.first;
+    while (node) |current| : (node = current.next) {
+        const session: *Session = @fieldParentPtr("open_node", current);
+        if (session.markClosing()) marked += 1;
+    }
+    return marked;
+}
+
 pub const Session = struct {
     alloc: Allocator,
     store: *Store,
@@ -1986,6 +2048,12 @@ pub const Session = struct {
     /// closes it as superseded instead of continuing it (D98).
     turn_stale: bool = false,
     turn_open: bool = false,
+    /// The open turn already carries a `turn_closing` mark (`markClosing`).
+    turn_closing_marked: bool = false,
+    /// Links this session into `open_registry` while its turn is open.
+    /// Guarded by `open_registry_mutex`.
+    open_node: std.DoublyLinkedList.Node = .{},
+    open_registered: bool = false,
     /// Highest turn number started; the manager numbers turns the same way.
     last_turn: u64 = 0,
     /// The next turn this session opens continues the turn that yielded
@@ -1996,6 +2064,10 @@ pub const Session = struct {
     continued_base: std.ArrayList(PieceIdentity) = .empty,
     /// The continuation's base is not empty, so its marker says `extends`.
     continued_extends: bool = false,
+    /// The abrupt deaths of the continued turn so far, as its marker counts
+    /// them. Kept for the whole continued turn, so a supersede copy writes the
+    /// same count, and cleared when the turn commits.
+    continued_crashes: u8 = 0,
     /// The yielded turn's log number, taken out of `turn_numbers` by
     /// `setContinuesYielded`: the number an `extends` continuation keeps
     /// (RULES R1.8). Null when none was taken. Cleared when the turn commits.
@@ -2364,6 +2436,7 @@ pub const Session = struct {
     }
 
     fn destroyInner(self: *Session) void {
+        unregisterOpenTurn(self);
         const alloc = self.alloc;
         if (self.capability) |*capability| capability.deinit();
         BlobHost.release(self.host);
@@ -2431,10 +2504,12 @@ pub const Session = struct {
     fn openTurnLocked(self: *Session, opener: u64) !void {
         if (self.turn_open and !self.turn_stale) return;
         if (self.turn_open) try self.supersedeOpenTurn("failed_turn");
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
         var batch: std.ArrayList(sm.Event) = .empty;
         defer batch.deinit(self.alloc);
         try batch.append(self.alloc, .turn_started);
-        if (self.continues_yielded) try batch.append(self.alloc, continuedItem(self.continued_extends));
+        if (self.continues_yielded) try batch.append(self.alloc, try continuedItem(arena.allocator(), self.continued_extends, self.continued_crashes));
         try self.appendHeldStarts(self.alloc, &batch, opener);
         _ = try self.write(batch.items);
         self.startedTurn(opener);
@@ -2622,8 +2697,10 @@ pub const Session = struct {
         const number = if (self.open_extends) self.continued_from orelse self.last_turn else self.last_turn;
         self.clearContinuedBase();
         self.continued_from = null;
+        self.continued_crashes = 0;
         self.turn_numbers.appendAssumeCapacity(number);
         self.turn_open = false;
+        unregisterOpenTurn(self);
         self.open_extends = false;
         self.open_continued = false;
         self.open_cut_copy = false;
@@ -2810,7 +2887,7 @@ pub const Session = struct {
         }
         // The record goes out in the same write as the pieces before its
         // send, so a turn's first write already carries it
-        // (`tests/tla/recovery/Resume.tla` CrashLoopAsks).
+        // (`tests/tla/recovery/Resume.tla` CrashLoopStops).
         var tail: std.ArrayList(sm.Event) = .empty;
         if (try self.recoveryItem(a, record)) |piece| try tail.append(a, .{ .item = piece });
         if (!self.turn_open or start < pieces.encoded.len) {
@@ -3098,6 +3175,25 @@ pub const Session = struct {
         return true;
     }
 
+    /// Writes the close mark into the open turn, once, and leaves the turn
+    /// open. Called by `closeOpenTurns` under the registry lock. Returns
+    /// whether it wrote the mark.
+    fn markClosing(self: *Session) bool {
+        const io = io_mod.getIo();
+        if (!lockWithin(&self.mutex, close_wait_ms)) {
+            debug_trace.logf("session", "event=sessions_v2_closing_skipped session={s} reason=session_busy", .{self.id()});
+            return false;
+        }
+        defer self.mutex.unlock(io);
+        if (!self.turn_open or self.turn_stale or self.turn_closing_marked) return false;
+        _ = self.write(&.{.{ .item = .{ .type = closing_type, .data = "{}" } }}) catch |err| {
+            debug_trace.logf("session", "event=sessions_v2_closing_failed session={s} err={s}", .{ self.id(), @errorName(err) });
+            return false;
+        };
+        self.turn_closing_marked = true;
+        return true;
+    }
+
     /// Says the next turn this session opens continues the turn that yielded
     /// before it, whose execution `base` is as the yielded checkpoint holds
     /// it; null says it continues nothing. Those pieces are in the log
@@ -3105,12 +3201,15 @@ pub const Session = struct {
     /// only what follows (`continuedSkip`). A yielded checkpoint's results
     /// already have output handles, so `withResultFiles` stores no blob here.
     /// A base that cannot be read leaves the copy format, which is always safe.
-    pub fn setContinuesYielded(self: *Session, base: ?*const types.ExecutionMemory) void {
+    /// `crashes` is the continued turn's abrupt deaths so far, which its marker
+    /// carries (`continued_crashes`).
+    pub fn setContinuesYielded(self: *Session, base: ?*const types.ExecutionMemory, crashes: u8) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         self.clearContinuedBase();
         const execution = base orelse {
             self.continues_yielded = false;
+            self.continued_crashes = 0;
             // The caller put the yielded turn back into the history, so its number returns too (RULES R1.8).
             if (self.continued_from) |number| self.turn_numbers.append(self.alloc, number) catch |err|
                 debug_trace.logf("session", "event=sessions_v2_continued_number_lost session={s} err={s}", .{ self.id(), @errorName(err) });
@@ -3118,6 +3217,7 @@ pub const Session = struct {
             return;
         };
         self.continues_yielded = true;
+        self.continued_crashes = crashes;
         // The caller took the yielded turn out of the history, so its number
         // leaves `turn_numbers` too (RULES R1.8). Taken even in the copy format,
         // which then numbers its own turn.
@@ -3533,6 +3633,7 @@ pub const Session = struct {
         var found: InterruptedRequest = .{ .record = null, .saved_ms = 0 };
         var record_seen = false;
         var has_prompt = false;
+        var marked_closed = false;
         var newest_item = true;
         var from: sm.From = .end;
         scan: while (true) {
@@ -3545,13 +3646,17 @@ pub const Session = struct {
                     .item => |piece| {
                         // A request's recovery status says nothing of how the
                         // turn ended, so a yield marker before one still counts.
-                        if (newest_item and !std.mem.eql(u8, piece.type, model_recovery_type)) {
+                        if (newest_item and !std.mem.eql(u8, piece.type, model_recovery_type) and !std.mem.eql(u8, piece.type, closing_type)) {
                             newest_item = false;
                             found.yielded = std.mem.eql(u8, piece.type, yielded_type);
                         }
                         if (found.saved_ms == 0) found.saved_ms = entry.ts_ms;
                         if (std.mem.eql(u8, piece.type, itemType(.turn_completed).?)) return null;
                         if (std.mem.eql(u8, piece.type, itemType(.user).?)) has_prompt = true;
+                        if (std.mem.eql(u8, piece.type, closing_type)) marked_closed = true;
+                        if (std.mem.eql(u8, piece.type, continued_type)) {
+                            found.crashes = continuedCrashes(page.arena.allocator(), try self.source().pieceData(page.arena.allocator(), piece));
+                        }
                         if (record_seen or !std.mem.eql(u8, piece.type, recovery_type)) continue;
                         record_seen = true;
                         found.saved_ms = entry.ts_ms;
@@ -3562,7 +3667,12 @@ pub const Session = struct {
             }
             from = .{ .at = page.next orelse break };
         }
-        return if (has_prompt) found else null;
+        if (!has_prompt) return null;
+        // A crash ends the turn one death further on. A close or a yield does
+        // not: a close marks the turn, or saves its request clean.
+        const clean_close = if (found.record) |record| recovery_rules.closedCleanly(record) else false;
+        if (ended.reason == .crash and !found.yielded and !marked_closed and !clean_close) found.crashes +|= 1;
+        return found;
     }
 
     /// See `interruptedRequest`.
@@ -3574,6 +3684,9 @@ pub const Session = struct {
         /// The turn's newest item is the yield marker: it stopped between
         /// steps for an upgrade's restart, and continues as the same turn.
         yielded: bool = false,
+        /// The turn's abrupt deaths so far, this one included when it crashed.
+        /// Saturates at 255 (`tests/tla/recovery/Recovery.tla` CrashLoopStops).
+        crashes: u8 = 0,
     };
 
     /// The step whose calls are running: its calls in their saved form, and
@@ -3659,7 +3772,7 @@ pub const Session = struct {
         var batch: std.ArrayList(sm.Event) = .empty;
         if (!self.turn_open) {
             try batch.append(a, .turn_started);
-            if (self.continues_yielded) try batch.append(a, continuedItem(self.continued_extends));
+            if (self.continues_yielded) try batch.append(a, try continuedItem(a, self.continued_extends, self.continued_crashes));
             // Held start captures go with the line that starts the turn (D98).
             try self.appendHeldStarts(a, &batch, opener);
             const needs_blob = for (encoded, reviews) |bytes, review| {
@@ -3710,6 +3823,8 @@ pub const Session = struct {
     fn startedTurn(self: *Session, opener: u64) void {
         self.last_turn += 1;
         self.turn_open = true;
+        self.turn_closing_marked = false;
+        registerOpenTurn(self);
         self.turn_token = opener;
         // The marker was written with this turn when it continues a yielded one.
         self.open_extends = self.continues_yielded and self.continued_extends;
@@ -3727,9 +3842,15 @@ pub const Session = struct {
 
     /// A continuation's marker: `extends` when the yielded turn's pieces are in
     /// the log before it; otherwise `{}`, the copy format, where the turn's
-    /// pieces follow in full.
-    fn continuedItem(extends: bool) sm.Event {
-        return .{ .item = .{ .type = continued_type, .data = if (extends) continued_extends_data else "{}" } };
+    /// pieces follow in full. A count above 0 adds `"crashes":N`, which older
+    /// readers ignore (`continuedExtends`, `continuedCrashes`). `a` owns the data.
+    fn continuedItem(a: Allocator, extends: bool, crashes: u8) !sm.Event {
+        if (crashes == 0) return .{ .item = .{ .type = continued_type, .data = if (extends) continued_extends_data else "{}" } };
+        const data = if (extends)
+            try a.print("{{\"extends\":true,\"crashes\":{d}}}", .{crashes})
+        else
+            try a.print("{{\"crashes\":{d}}}", .{crashes});
+        return .{ .item = .{ .type = continued_type, .data = data } };
     }
 
     /// The identities of the pieces `base` builds, as its yielded turn wrote
@@ -3848,6 +3969,7 @@ pub const Session = struct {
         };
         try self.writePieces(a, events, encoded, &.{end}, author, 0);
         self.turn_open = false;
+        unregisterOpenTurn(self);
         self.open_extends = false;
         self.open_continued = false;
         self.open_cut_copy = false;
@@ -3896,6 +4018,7 @@ pub const Session = struct {
         });
         self.supersedes += 1;
         self.turn_open = false;
+        unregisterOpenTurn(self);
         self.turn_stale = false;
         self.open_extends = false;
         self.open_continued = false;
@@ -6471,6 +6594,15 @@ fn continuedExtends(a: Allocator, data: []const u8) bool {
     return marker.extends;
 }
 
+/// The crashes a `turn_continued` marker counts: 0 for a marker without one
+/// and for data that does not decode, and capped at 255, the most
+/// `InterruptedRequest.crashes` holds.
+fn continuedCrashes(a: Allocator, data: []const u8) u8 {
+    const Marker = struct { crashes: u64 = 0 };
+    const marker = json_decode.parseFromSliceLeaky(Marker, a, data, .{ .ignore_unknown_fields = true }) catch return 0;
+    return @intCast(@min(marker.crashes, std.math.maxInt(u8)));
+}
+
 /// A finished turn as the replay reports it, with its log number.
 const JoinedTurn = struct {
     turn: types.HistoryTurn,
@@ -6693,7 +6825,8 @@ noinline fn replay(
                     // nothing of what that turn continues. A request's recovery
                     // status (`saveModelRecovery`) decides nothing either.
                     const is_record = std.mem.eql(u8, piece.type, recovery_type) or
-                        std.mem.eql(u8, piece.type, model_recovery_type);
+                        std.mem.eql(u8, piece.type, model_recovery_type) or
+                        std.mem.eql(u8, piece.type, closing_type);
                     if (!is_record) yield_item = false;
                     // The next turn's first piece is not its prompt: the held
                     // turn was not continued. Its workspace captures, which its
@@ -6708,6 +6841,8 @@ noinline fn replay(
                     }
                     // The recovery module's record, which only a launch reads.
                     if (std.mem.eql(u8, piece.type, recovery_type)) continue;
+                    // A close's mark, which only a launch reads.
+                    if (std.mem.eql(u8, piece.type, closing_type)) continue;
                     // A workspace capture, evidence beside the conversation (D98).
                     if (std.mem.eql(u8, piece.type, workspace_capture_type)) continue;
                     // A model request's recovery status, for reading the log.
@@ -7177,6 +7312,9 @@ const yielded_type = "turn_yielded";
 /// drops the yielded turn, whose pieces this turn repeats.
 const continued_type = "turn_continued";
 const continued_extends_data = "{\"extends\":true}";
+/// The mark the closer writes into an open turn when fx is closed (`closeOpenTurns`).
+/// A launch reads it as a close, not a death (`interruptedRequest`).
+const closing_type = "turn_closing";
 
 /// `execution` without its display-only records: the model and bridge calls, which a continuation's rebuild never carries and the yielded turn keeps in its own log turn.
 fn withoutDisplayRecords(execution: types.ExecutionMemory) types.ExecutionMemory {
@@ -8809,12 +8947,300 @@ test "a continuing turn starts with its marker, once" {
     var model = "m".*;
     const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
     defer s.close();
-    s.setContinuesYielded(&types.ExecutionMemory{});
+    s.setContinuesYielded(&types.ExecutionMemory{}, 0);
     try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
     try testing.expect(!s.continues_yielded);
     try s.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("work") }, .assistant = @constCast("done") } }, types.ConversationLanguage.default());
     try s.appendProgress(.{ .text = @constCast("next") }, .{}, .{});
     try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, s.id(), continued_type));
+}
+
+/// The user piece of a log turn written by hand, as its item.
+fn userItem(a: Allocator) !sm.Event {
+    const data = try encodePiece(a, .{ .user = .{ .text = "go" } });
+    return .{ .item = .{ .type = itemType(.user).?, .data = data } };
+}
+
+/// A `turn_continued` marker item with `data` as its JSON.
+fn markerItem(data: []const u8) sm.Event {
+    return .{ .item = .{ .type = continued_type, .data = data } };
+}
+
+/// Writes session `id` as one log turn of `events`, the way a crash or an import leaves it.
+fn importTurn(t: *TestHome, id: []const u8, events: []const sm.Event) !void {
+    const imported = try t.store.manager.openImport(.{ .id = id, .workspace = "/w", .host = .ask, .created_ms = 1000 });
+    _ = try imported.appendAt(events, 2000);
+    try imported.publishImport();
+    imported.release();
+}
+
+/// What `interruptedRequest` finds in session `id`.
+fn interruptedOf(t: *TestHome, id: []const u8) !Session.InterruptedRequest {
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    return (try r.interruptedRequest()).?;
+}
+
+/// What a resume restores of session `id`, owned by the caller.
+fn restoredOf(t: *TestHome, id: []const u8) !Restored {
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    return try r.restore(testing.allocator);
+}
+
+/// A `recovery` item holding a record a request saved, clean or not, with
+/// its checksum as `recovery.zig` writes it: the first request's sending phase.
+fn recordItem(a: Allocator, clean: bool) !sm.Event {
+    var record: [32]u8 = @splat(0);
+    record[0] = 1;
+    record[1] = 1;
+    record[2] = @intFromBool(clean);
+    record[4] = 1;
+    std.mem.writeInt(u32, record[28..32], std.hash.Crc32.hash(record[0..28]), .little);
+    const data = try a.print("{{\"record\":\"{x}\"}}", .{&record});
+    return .{ .item = .{ .type = recovery_type, .data = data } };
+}
+
+test "a crashed turn with no marker counts one crash" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const id = "1786460757753-crash-plain";
+    try importTurn(&t, id, &.{ .turn_started, try userItem(arena.allocator()), .{ .turn_interrupted = .crash } });
+    try testing.expectEqual(@as(u8, 1), (try interruptedOf(&t, id)).crashes);
+}
+
+test "closing an open turn marks it once, and the turn stays open and commits" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    _ = closeOpenTurns();
+    _ = closeOpenTurns();
+    try testing.expect(s.turn_open);
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, s.id(), closing_type));
+    try s.commitTurn(assistantTurn("work", "done"), types.ConversationLanguage.default());
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, s.id(), closing_type));
+}
+
+test "a crashed turn that holds a closing mark counts no crash" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const id = "1786460757753-closing-mark";
+    const closing: sm.Event = .{ .item = .{ .type = "turn_closing", .data = "{}" } };
+    try importTurn(&t, id, &.{ .turn_started, try userItem(arena.allocator()), closing, .{ .turn_interrupted = .crash } });
+    try testing.expectEqual(@as(u8, 0), (try interruptedOf(&t, id)).crashes);
+}
+
+test "a crashed turn whose newest record is clean counts no crash" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const id = "1786460757753-clean-record";
+    try importTurn(&t, id, &.{ .turn_started, try userItem(arena.allocator()), try recordItem(arena.allocator(), true), .{ .turn_interrupted = .crash } });
+    try testing.expectEqual(@as(u8, 0), (try interruptedOf(&t, id)).crashes);
+}
+
+test "a crashed turn whose newest record is not clean still counts one crash" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const id = "1786460757753-unclean-record";
+    try importTurn(&t, id, &.{ .turn_started, try userItem(arena.allocator()), try recordItem(arena.allocator(), false), .{ .turn_interrupted = .crash } });
+    try testing.expectEqual(@as(u8, 1), (try interruptedOf(&t, id)).crashes);
+}
+
+test "a closing mark is not part of the replayed turn" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plain_id = "1786460757753-replay-plain";
+    const marked_id = "1786460757753-replay-marked";
+    const closing: sm.Event = .{ .item = .{ .type = "turn_closing", .data = "{}" } };
+    try importTurn(&t, plain_id, &.{ .turn_started, try userItem(a), .{ .turn_interrupted = .crash } });
+    try importTurn(&t, marked_id, &.{ .turn_started, try userItem(a), closing, .{ .turn_interrupted = .crash } });
+    var plain = try restoredOf(&t, plain_id);
+    defer plain.deinit(testing.allocator);
+    var marked = try restoredOf(&t, marked_id);
+    defer marked.deinit(testing.allocator);
+    try testing.expectEqual(plain.history.len, marked.history.len);
+    try testing.expectEqualStrings(plain.history[0].interrupted.user.text, marked.history[0].interrupted.user.text);
+    try testing.expectEqual(plain.history[0].interrupted.terminal_reason, marked.history[0].interrupted.terminal_reason);
+}
+
+test "a continuation whose marker counts one crash counts two when it crashes again" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const id = "1786460757753-crash-again";
+    try importTurn(&t, id, &.{ .turn_started, markerItem("{\"crashes\":1}"), try userItem(arena.allocator()), .{ .turn_interrupted = .crash } });
+    try testing.expectEqual(@as(u8, 2), (try interruptedOf(&t, id)).crashes);
+}
+
+test "a continuation whose marker counts two counts two when it is closed" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const id = "1786460757753-crash-closed";
+    try importTurn(&t, id, &.{ .turn_started, markerItem("{\"crashes\":2}"), try userItem(arena.allocator()), .{ .turn_interrupted = .closed } });
+    try testing.expectEqual(@as(u8, 2), (try interruptedOf(&t, id)).crashes);
+}
+
+test "a yielded continuation keeps its crash count without adding one" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const id = "1786460757753-crash-yielded";
+    const yielded: sm.Event = .{ .item = .{ .type = yielded_type, .data = "{}" } };
+    try importTurn(&t, id, &.{ .turn_started, markerItem("{\"crashes\":1}"), try userItem(arena.allocator()), yielded, .{ .turn_interrupted = .crash } });
+    const found = try interruptedOf(&t, id);
+    try testing.expect(found.yielded);
+    try testing.expectEqual(@as(u8, 1), found.crashes);
+}
+
+test "an old turn marker with no crash count reads as no crashes" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try importTurn(&t, "1786460757753-old-empty", &.{ .turn_started, markerItem("{}"), try userItem(a), .{ .turn_interrupted = .closed } });
+    try testing.expectEqual(@as(u8, 0), (try interruptedOf(&t, "1786460757753-old-empty")).crashes);
+    try importTurn(&t, "1786460757753-old-extends", &.{ .turn_started, markerItem(continued_extends_data), try userItem(a), .{ .turn_interrupted = .closed } });
+    try testing.expectEqual(@as(u8, 0), (try interruptedOf(&t, "1786460757753-old-extends")).crashes);
+}
+
+/// A turn with one tool step that yielded, as `writeThreeYields` starts it. Returns its session id, owned by the caller.
+fn yieldedTurn(t: *TestHome, a: Allocator) ![]u8 {
+    var model = "m".*;
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 1) }, .{});
+    try testing.expect(try s.markYielded());
+    const id = try testing.allocator.dupe(u8, s.id());
+    errdefer testing.allocator.free(id);
+    s.close();
+    return id;
+}
+
+/// Continues the yielded turn `id` with `base` and `crashes`, writes one more step, and yields
+/// it again. Returns the continuation's marker data, owned by the caller.
+fn continuationMarker(t: *TestHome, a: Allocator, id: []const u8, base: *const types.ExecutionMemory, crashes: u8) ![]u8 {
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    c.setContinuesYielded(base, crashes);
+    try c.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 2) }, .{});
+    try testing.expect(try c.markYielded());
+    c.close();
+    return lastItemData(t.store.manager, id, continued_type);
+}
+
+test "a continuation writes its crash count into its marker, in both formats" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const extends_id = try yieldedTurn(&t, a);
+    defer testing.allocator.free(extends_id);
+    const base: types.ExecutionMemory = .{ .tool_steps = try stepsUpTo(a, 1) };
+    const extends_marker = try continuationMarker(&t, a, extends_id, &base, 2);
+    defer testing.allocator.free(extends_marker);
+    try testing.expectEqualStrings("{\"extends\":true,\"crashes\":2}", extends_marker);
+
+    const copy_id = try yieldedTurn(&t, a);
+    defer testing.allocator.free(copy_id);
+    const empty: types.ExecutionMemory = .{};
+    const copy_marker = try continuationMarker(&t, a, copy_id, &empty, 2);
+    defer testing.allocator.free(copy_marker);
+    try testing.expectEqualStrings("{\"crashes\":2}", copy_marker);
+}
+
+test "a continuation with no crashes writes its marker exactly as before" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const extends_id = try yieldedTurn(&t, a);
+    defer testing.allocator.free(extends_id);
+    const base: types.ExecutionMemory = .{ .tool_steps = try stepsUpTo(a, 1) };
+    const extends_marker = try continuationMarker(&t, a, extends_id, &base, 0);
+    defer testing.allocator.free(extends_marker);
+    try testing.expectEqualStrings(continued_extends_data, extends_marker);
+
+    const copy_id = try yieldedTurn(&t, a);
+    defer testing.allocator.free(copy_id);
+    const empty: types.ExecutionMemory = .{};
+    const copy_marker = try continuationMarker(&t, a, copy_id, &empty, 0);
+    defer testing.allocator.free(copy_marker);
+    try testing.expectEqualStrings("{}", copy_marker);
+}
+
+test "a supersede copy of a continuation keeps its marker's crash count" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    const id = try yieldedTurn(&t, a);
+    defer testing.allocator.free(id);
+
+    // As `supersedeAfterCut`: a cut inside the continuation makes its streamed steps stale.
+    const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    var restored = try c.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    c.setContinuesYielded(&restored.history[restored.history.len - 1].interrupted.execution, 2);
+    try c.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 3) }, .{});
+    var summary = "summary".*;
+    try c.commitCompaction(.{ .summary = &summary, .removed_turn_count = 1, .compaction_count = 1 }, true, .{ .turns = 1, .tool_steps = 1 });
+    try c.appendProgress(user, .{ .tool_steps = (try stepsUpTo(a, 3))[1..] }, .{});
+    try testing.expect(c.supersedes > 0);
+    c.close();
+
+    const marker = try lastItemData(t.store.manager, id, continued_type);
+    defer testing.allocator.free(marker);
+    try testing.expectEqualStrings("{\"crashes\":2}", marker);
+}
+
+test "a finished continuation clears its crash count" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    s.setContinuesYielded(&types.ExecutionMemory{}, 2);
+    try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    try testing.expectEqual(@as(u8, 2), s.continued_crashes);
+    try s.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("work") }, .assistant = @constCast("done") } }, types.ConversationLanguage.default());
+    try testing.expectEqual(@as(u8, 0), s.continued_crashes);
 }
 
 /// The inline data of the last item of `item_type`. Caller owns it.
@@ -8866,7 +9292,7 @@ fn writeThreeYields(t: *TestHome, a: Allocator) ![]u8 {
     for (1..4) |continued| {
         const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
         const base: types.ExecutionMemory = .{ .tool_steps = try stepsUpTo(a, continued) };
-        c.setContinuesYielded(&base);
+        c.setContinuesYielded(&base, 0);
         try c.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, continued + 1) }, .{});
         try testing.expect(try c.markYielded());
         c.close();
@@ -8908,7 +9334,7 @@ test "a continuation skips its base even when the yielded turn holds model-call 
     // The continuation's rebuild has no model-call record: the yielded turn keeps its own.
     const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
     const base: types.ExecutionMemory = .{ .tool_steps = try stepsUpTo(a, 1), .model_calls = &calls };
-    c.setContinuesYielded(&base);
+    c.setContinuesYielded(&base, 0);
     try c.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 2) }, .{});
     try testing.expect(try c.markYielded());
     c.close();
@@ -8963,7 +9389,7 @@ test "a continuation whose first write differs from its base writes a full copy"
     base_steps[0].tool_calls[0].id = "call_other";
     const base: types.ExecutionMemory = .{ .tool_steps = base_steps };
     const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
-    c.setContinuesYielded(&base);
+    c.setContinuesYielded(&base, 0);
     try c.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 2) }, .{});
     try c.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .tool_steps = try stepsUpTo(a, 2) } } }, types.ConversationLanguage.default());
     c.close();
@@ -8998,7 +9424,7 @@ test "an old-format continuation, marked without extends, replays as one turn" {
     s.close();
 
     const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
-    c.setContinuesYielded(&types.ExecutionMemory{});
+    c.setContinuesYielded(&types.ExecutionMemory{}, 0);
     try c.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 2) }, .{});
     try c.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .tool_steps = try stepsUpTo(a, 2) } } }, types.ConversationLanguage.default());
     c.close();
@@ -9065,13 +9491,13 @@ fn writeNotesScenario(t: *TestHome, a: Allocator, copy: bool) ![]u8 {
     s.close();
 
     const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
-    c.setContinuesYielded(if (copy) &empty else &first);
+    c.setContinuesYielded(if (copy) &empty else &first, 0);
     try c.appendProgress(user, second, .{});
     try testing.expect(try c.markYielded());
     c.close();
 
     const d = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
-    d.setContinuesYielded(if (copy) &empty else &second);
+    d.setContinuesYielded(if (copy) &empty else &second, 0);
     try d.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = second } }, types.ConversationLanguage.default());
     d.close();
     return id;
@@ -9152,7 +9578,7 @@ test "the turn that continues a yielded one takes its place on resume" {
     s.close();
 
     const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
-    c.setContinuesYielded(&types.ExecutionMemory{});
+    c.setContinuesYielded(&types.ExecutionMemory{}, 0);
     try c.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
     try c.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("work") }, .assistant = @constCast("done") } }, types.ConversationLanguage.default());
     c.close();
@@ -9178,7 +9604,7 @@ test "a continuing turn's start capture does not bring the yielded turn back (D9
     s.close();
 
     const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
-    c.setContinuesYielded(&types.ExecutionMemory{});
+    c.setContinuesYielded(&types.ExecutionMemory{}, 0);
     // Held: the turn is not open yet, so the capture goes with its first line.
     try testing.expect(!try saveCapture(c, capture_start_a, .start));
     try c.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
@@ -9213,7 +9639,7 @@ test "a yielded turn stays when the next turn is another prompt" {
 
     // Even a turn marked as continuing keeps it when its prompt differs.
     const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
-    c.setContinuesYielded(&types.ExecutionMemory{});
+    c.setContinuesYielded(&types.ExecutionMemory{}, 0);
     try c.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("other") }, .assistant = @constCast("done") } }, types.ConversationLanguage.default());
     c.close();
 
@@ -9261,7 +9687,7 @@ test "the turn that continues a closed one takes its place on resume" {
     const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
     var restored = try c.restore(testing.allocator);
     defer restored.deinit(testing.allocator);
-    c.setContinuesYielded(&restored.history[restored.history.len - 1].interrupted.execution);
+    c.setContinuesYielded(&restored.history[restored.history.len - 1].interrupted.execution, 0);
     try c.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
     try c.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("work") }, .assistant = @constCast("done") } }, types.ConversationLanguage.default());
     c.close();
@@ -9316,7 +9742,7 @@ test "the turn that continues a crashed one, with a call left running, keeps tha
         .{ .tool_calls = &new_call, .tool_results = &new_results },
     };
     const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
-    c.setContinuesYielded(&crashed.execution);
+    c.setContinuesYielded(&crashed.execution, 0);
     try c.appendProgress(.{ .text = @constCast("build it") }, execution, .{});
     // As the app saves it: the results' files while the turn runs, then the commit.
     var turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("build it") }, .assistant = @constCast("done"), .execution = execution } };
@@ -9350,7 +9776,7 @@ test "a closed turn stays when the next turn is another prompt" {
     s.close();
 
     const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
-    c.setContinuesYielded(&types.ExecutionMemory{});
+    c.setContinuesYielded(&types.ExecutionMemory{}, 0);
     try c.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("other") }, .assistant = @constCast("done") } }, types.ConversationLanguage.default());
     c.close();
 
@@ -9380,7 +9806,7 @@ test "a closed turn continued twice replays as one turn" {
     const first = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
     var first_restored = try first.restore(testing.allocator);
     defer first_restored.deinit(testing.allocator);
-    first.setContinuesYielded(&first_restored.history[0].interrupted.execution);
+    first.setContinuesYielded(&first_restored.history[0].interrupted.execution, 0);
     try first.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
     first.close();
 
@@ -9388,7 +9814,7 @@ test "a closed turn continued twice replays as one turn" {
     var second_restored = try second.restore(testing.allocator);
     defer second_restored.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), second_restored.history.len);
-    second.setContinuesYielded(&second_restored.history[0].interrupted.execution);
+    second.setContinuesYielded(&second_restored.history[0].interrupted.execution, 0);
     try second.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
     try second.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("work") }, .assistant = @constCast("done") } }, types.ConversationLanguage.default());
     second.close();
@@ -9445,7 +9871,7 @@ fn resumeContinuing(t: *TestHome, id: []const u8) !*Session {
     defer restored.deinit(testing.allocator);
     const yielded = restored.history[restored.history.len - 1].interrupted;
     try testing.expect(yielded.yielded);
-    c.setContinuesYielded(&yielded.execution);
+    c.setContinuesYielded(&yielded.execution, 0);
     return c;
 }
 
@@ -9458,7 +9884,7 @@ fn resumeContinuingStopped(t: *TestHome, id: []const u8) !*Session {
     defer restored.deinit(testing.allocator);
     const stopped = restored.history[restored.history.len - 1].interrupted;
     try testing.expect(stopped.stopped_by_exit and !stopped.yielded);
-    c.setContinuesYielded(&stopped.execution);
+    c.setContinuesYielded(&stopped.execution, 0);
     return c;
 }
 

@@ -516,6 +516,8 @@ The engine sends one `append()` at a time, and everything that happens while one
 
 `prompt()` and `resume()` take `yieldAt`, a time in milliseconds since the epoch: the turn stops before its next model request after that time, with the stop reason `yielded`, and the next `resume()` continues it without telling the model it was interrupted. `turn.yield()` stops a running turn the same way at any time: at its next safe point, before a model request after the turn's first, with the stop reason `yielded`. It needs `persistence`.
 
+A turn that crashes the engine three times ends with a `turn_end` whose `stopReason` is `"error"` and whose `error.code` is `"crash_loop"`. fx sends no model request for it and runs no tool again, and `resume()` never continues it. Each resume counts the crash it resumes from, except that a yield or a close is not a crash.
+
 A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`. `createMemoryPersistence()` is a reference store for tests.
 
 ## Runtimes

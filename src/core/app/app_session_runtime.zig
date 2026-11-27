@@ -534,28 +534,6 @@ pub const PreferenceCommitResult = struct {
     }
 };
 
-/// A request saved this long ago, or dated this far in the future, asks
-/// before it is sent again (`tests/tla/recovery/Resume.tla` OldAsks).
-const resume_max_age_ms: i64 = 24 * std.time.ms_per_hour;
-const resume_clock_slack_ms: i64 = 5 * std.time.ms_per_min;
-
-fn resumeIsStale(now_ms: i64, saved_ms: u64) bool {
-    const saved = std.math.cast(i64, saved_ms) orelse return true;
-    return now_ms -| saved > resume_max_age_ms or saved -| now_ms > resume_clock_slack_ms;
-}
-
-test "a resumed request older than a day, or dated ahead, asks first" {
-    const now: i64 = 10 * std.time.ms_per_day;
-    const now_u: u64 = @intCast(now);
-    try std.testing.expect(!resumeIsStale(now, now_u));
-    try std.testing.expect(!resumeIsStale(now, now_u - 23 * std.time.ms_per_hour));
-    try std.testing.expect(resumeIsStale(now, now_u - 25 * std.time.ms_per_hour));
-    // A clock a little ahead is noise; a record from the future is not.
-    try std.testing.expect(!resumeIsStale(now, now_u + std.time.ms_per_min));
-    try std.testing.expect(resumeIsStale(now, now_u + 10 * std.time.ms_per_min));
-    try std.testing.expect(resumeIsStale(now, std.math.maxInt(u64)));
-}
-
 /// Whether a saved result's file change shows after a resume as it did live,
 /// with its counts and its diff: a change that `call`, the call fx ran, made
 /// with edit_file or write_file. A toolbox run of one saves its result under
@@ -1582,7 +1560,6 @@ pub fn Runtime(comptime App: type) type {
 
             // A checkpoint is a turn the page reloaded during: it stopped, and
             // the resume sends its request again once the session is up.
-            const resend_saved_ms: u64 = std.math.cast(u64, loaded.state.updated_at_ms) orelse 0;
             const resend = loaded.state.recovery_checkpoint != null;
             if (resend) {
                 appendCheckpointInterruptedTurn(app, &loaded.state) catch |err| {
@@ -1616,9 +1593,9 @@ pub fn Runtime(comptime App: type) type {
             loaded = undefined;
             try app.commitStartupResumeReplayAnchor();
             if (resend) {
+                // A reload here reads as a close: this host keeps no session log to count crashes in.
                 agent.session_persistence.pending_request_resume = .{
                     .record = null,
-                    .stale = resumeIsStale(io_mod.milliTimestamp(), resend_saved_ms),
                     .continues = false,
                 };
             }
@@ -2190,10 +2167,9 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }) orelse return;
             const now_ms = io_mod.milliTimestamp();
-            const stale = resumeIsStale(now_ms, found.saved_ms);
-            agent.session_persistence.pending_request_resume = .{ .record = found.record, .stale = stale };
+            agent.session_persistence.pending_request_resume = .{ .record = found.record, .crashes = found.crashes };
             agent.session_persistence.pending_resume_yielded = found.yielded;
-            debug_trace.logf("recovery", "event=resume_pending record={} stale={} yielded={} saved_ms={d} now_ms={d}", .{ found.record != null, stale, found.yielded, found.saved_ms, now_ms });
+            debug_trace.logf("recovery", "event=resume_pending record={} yielded={} saved_ms={d} now_ms={d}", .{ found.record != null, found.yielded, found.saved_ms, now_ms });
         }
 
         /// Sends the noted request again: the turn a previous process stopped
@@ -2260,10 +2236,10 @@ pub fn Runtime(comptime App: type) type {
             );
             defer checkpoint.deinit(app.alloc);
             const v2 = agent.session_persistence.v2;
-            if (v2) |v2_session| v2_session.setContinuesYielded(&entry.execution);
+            if (v2) |v2_session| v2_session.setContinuesYielded(&entry.execution, resumed.crashes);
             const kind: worker_runtime.ContinuedTurn = if (stop == .yielded) .yielded else .stopped;
             app.queueContinuedTurn(agent, &checkpoint, resumed, kind) catch |err| {
-                if (v2) |v2_session| v2_session.setContinuesYielded(null);
+                if (v2) |v2_session| v2_session.setContinuesYielded(null, 0);
                 return err;
             };
             taken_owned_elsewhere = true;

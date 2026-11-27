@@ -33,10 +33,13 @@
 (* The turn loop routes each request's network, gateway, and rate-limit    *)
 (* failures through the module, and fx saves the module's record with the  *)
 (* session, so a closed window or a crash resumes on the next launch       *)
-(* (Resume.tla models that side). fx adds no stop of its own, so           *)
-(* NeverGivesUp holds for every transient failure fx reports, unclear ones *)
-(* included. tests/tla/drivers/recovery/driver.ts walks recovery.zig along *)
-(* this model.                                                             *)
+(* (Resume.tla models that side). Each host counts abrupt deaths of the    *)
+(* turn at any point in it and passes that count in `start`. At            *)
+(* CrashLoopAfter crashes the module ends the request as `crash_loop`      *)
+(* before decoding, saving, or sending (CrashLoopStops). Otherwise fx adds *)
+(* no stop of its own, so NeverGivesUp holds for every transient failure   *)
+(* fx reports, unclear ones included. tests/tla/drivers/recovery/driver.ts *)
+(* walks recovery.zig along this model.                                    *)
 (*                                                                         *)
 (* Bug selects one planted defect. Each is a bug fx has had or a promise   *)
 (* the API makes; check.sh names the rule that must catch it.              *)
@@ -49,7 +52,7 @@ CONSTANTS
     Bug          \* "none", or the name of one planted defect
 
 Bugs == {"none", "stall_stop", "no_wake", "stale_socket", "frozen_status",
-         "no_closing", "never_ask", "hot_retry", "send_without_save",
+         "no_closing", "no_guard", "hot_retry", "send_without_save",
          "poll_reopens", "poll_drop_reasks", "yield_retry_status",
          "filter_unbounded", "filter_asks_early", "cannot_ask_resends",
          "asking_host_resends", "filter_answer_keeps_count",
@@ -63,8 +66,9 @@ Min(a, b) == IF a < b THEN a ELSE b
 
 \* done_failed: fx ended the turn on its own error, because the request
 \* needs the user on a host that cannot ask.
+\* done_crash_loop: a start found the turn at CrashLoopAfter abrupt deaths.
 Phases   == {"working", "waiting", "need_user", "done_ok", "done_cancel",
-             "done_failed", "stopped"}
+             "done_failed", "done_crash_loop", "stopped"}
 Active   == {"working", "waiting", "need_user"}
 Terminal == Phases \ Active
 \* failed: fx's own terminal status, which replaces the module's.
@@ -73,6 +77,7 @@ Statuses == {"clear", "waiting", "retrying", "need_user", "stopped", "failed",
 Alarms   == {"waiting", "retrying", "need_user", "stopped", "failed"}
 MaxAttempt == 3   \* attempts saturate here; status only distinguishes 1 from >1
 FilterResends == 3   \* recovery.zig content_filter_resends
+CrashLoopAfter == 3   \* recovery.zig crash_loop_after
 
 VARIABLES
     phase,          \* the request's phase inside the module
@@ -84,8 +89,8 @@ VARIABLES
     lastSendWaited, \* the latest send came after a wait, a relaunch, the user, or a block
     savedInflight,  \* the saved record says a send is outstanding
     savedClean,     \* the saved record was written by `closing`
-    seenDeaths,     \* abrupt in-flight deaths the module counted from records
-    deaths,         \* world truth: abrupt deaths with a send in flight
+    hostCrashes,    \* abrupt deaths of the turn the host passes to `start`
+    deaths,         \* world truth: abrupt deaths of the turn in any active phase
     cleanExit,      \* world truth: the last exit was SIGHUP or SIGTERM
     net,            \* world: is the network path up
     gateway,        \* world: ok | broken
@@ -101,7 +106,7 @@ VARIABLES
     yielded         \* 0; 1 while fx is down after stopping the request for its own restart; 2 once it continued
 
 vars == <<phase, status, inflight, flowing, attempt, sameFail, lastSendWaited,
-          savedInflight, savedClean, seenDeaths, deaths, cleanExit, net,
+          savedInflight, savedClean, hostCrashes, deaths, cleanExit, net,
           gateway, needUser, faults, alive, cancelled, askedSignIn, polling,
           unattended, filterRun, blocked, yielded>>
 
@@ -118,7 +123,7 @@ TypeOK ==
     /\ lastSendWaited \in BOOLEAN
     /\ savedInflight \in BOOLEAN
     /\ savedClean \in BOOLEAN
-    /\ seenDeaths \in 0..MaxFaults
+    /\ hostCrashes \in 0..MaxFaults
     /\ deaths \in 0..MaxFaults
     /\ cleanExit \in BOOLEAN
     /\ net \in {"up", "down"}
@@ -145,7 +150,7 @@ Init ==
     /\ lastSendWaited = TRUE
     /\ savedInflight = TRUE
     /\ savedClean = FALSE
-    /\ seenDeaths = 0
+    /\ hostCrashes = 0
     /\ deaths = 0
     /\ cleanExit = FALSE
     /\ net = "up"
@@ -235,7 +240,7 @@ Responding ==
     /\ status' = IF Bug = "frozen_status" THEN status ELSE "clear"
     /\ askedSignIn' = FALSE /\ polling' = FALSE
     /\ UNCHANGED <<phase, inflight, attempt, sameFail, lastSendWaited,
-                   savedInflight, savedClean, seenDeaths, deaths, cleanExit,
+                   savedInflight, savedClean, hostCrashes, deaths, cleanExit,
                    net, gateway, needUser, faults, alive, cancelled>>
     /\ UNCHANGED filterVars
     /\ UNCHANGED yielded
@@ -248,7 +253,7 @@ HandOff ==
     /\ alive /\ phase = "working" /\ inflight /\ ~flowing /\ status = "retrying"
     /\ status' = "clear"
     /\ UNCHANGED <<phase, inflight, flowing, attempt, sameFail, lastSendWaited,
-                   savedInflight, savedClean, seenDeaths, deaths, cleanExit,
+                   savedInflight, savedClean, hostCrashes, deaths, cleanExit,
                    net, gateway, needUser, faults, alive, cancelled,
                    askedSignIn, polling>>
     /\ UNCHANGED filterVars
@@ -263,7 +268,7 @@ Respond ==
          [] needUser             -> OnFail("need_user")
          [] gateway = "broken"   -> OnFail("server")
          [] OTHER                -> flowing /\ ~blocked /\ OnSuccess
-    /\ UNCHANGED <<savedClean, seenDeaths, deaths, cleanExit, net, gateway,
+    /\ UNCHANGED <<savedClean, hostCrashes, deaths, cleanExit, net, gateway,
                    needUser, faults, alive, cancelled, unattended, blocked>>
     /\ UNCHANGED yielded
 
@@ -289,7 +294,7 @@ Blocked ==
                      /\ savedInflight' = FALSE
                      /\ askedSignIn' = FALSE /\ polling' = FALSE
                      /\ UNCHANGED <<attempt, lastSendWaited>>
-    /\ UNCHANGED <<savedClean, seenDeaths, deaths, cleanExit, net, gateway,
+    /\ UNCHANGED <<savedClean, hostCrashes, deaths, cleanExit, net, gateway,
                    needUser, faults, alive, cancelled, unattended, blocked>>
     /\ UNCHANGED yielded
 
@@ -298,7 +303,7 @@ Drop ==
     /\ alive /\ inflight /\ faults < MaxFaults
     /\ faults' = faults + 1
     /\ OnFail("dropped")
-    /\ UNCHANGED <<savedClean, seenDeaths, deaths, cleanExit, net, gateway,
+    /\ UNCHANGED <<savedClean, hostCrashes, deaths, cleanExit, net, gateway,
                    needUser, alive, cancelled, unattended, blocked>>
     /\ UNCHANGED yielded
 
@@ -309,7 +314,7 @@ StaleSocket ==
     /\ alive /\ inflight
     /\ net = "up" /\ gateway = "ok" /\ ~needUser
     /\ OnFail("dropped")
-    /\ UNCHANGED <<savedClean, seenDeaths, deaths, cleanExit, net, gateway,
+    /\ UNCHANGED <<savedClean, hostCrashes, deaths, cleanExit, net, gateway,
                    needUser, faults, alive, cancelled, unattended, blocked>>
     /\ UNCHANGED yielded
 
@@ -318,7 +323,7 @@ TimerFires ==
     /\ alive /\ phase = "waiting"
     /\ Bug # "no_wake"
     /\ SendNow(TRUE)
-    /\ UNCHANGED <<sameFail, savedClean, seenDeaths, deaths, cleanExit, net,
+    /\ UNCHANGED <<sameFail, savedClean, hostCrashes, deaths, cleanExit, net,
                    gateway, needUser, faults, alive, cancelled>>
     /\ UNCHANGED filterVars
     /\ UNCHANGED yielded
@@ -339,7 +344,7 @@ SignInPoll ==
     /\ savedInflight' = TRUE
     /\ status' = IF Bug = "poll_reopens" THEN "retrying" ELSE "need_user"
     /\ polling' = TRUE
-    /\ UNCHANGED <<askedSignIn, sameFail, savedClean, seenDeaths, deaths,
+    /\ UNCHANGED <<askedSignIn, sameFail, savedClean, hostCrashes, deaths,
                    cleanExit, net, gateway, needUser, faults, alive, cancelled>>
     /\ UNCHANGED filterVars
     /\ UNCHANGED yielded
@@ -351,7 +356,7 @@ NetDown ==
     /\ net = "up" /\ faults < MaxFaults
     /\ net' = "down" /\ faults' = faults + 1
     /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
-                   lastSendWaited, savedInflight, savedClean, seenDeaths,
+                   lastSendWaited, savedInflight, savedClean, hostCrashes,
                    deaths, cleanExit, gateway, needUser, alive, cancelled,
                    askedSignIn, polling>>
     /\ UNCHANGED filterVars
@@ -361,7 +366,7 @@ NetUp ==
     /\ net = "down"
     /\ net' = "up"
     /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
-                   lastSendWaited, savedInflight, savedClean, seenDeaths,
+                   lastSendWaited, savedInflight, savedClean, hostCrashes,
                    deaths, cleanExit, gateway, needUser, faults, alive,
                    cancelled, askedSignIn, polling>>
     /\ UNCHANGED filterVars
@@ -371,7 +376,7 @@ GatewayBreak ==
     /\ gateway = "ok" /\ faults < MaxFaults
     /\ gateway' = "broken" /\ faults' = faults + 1
     /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
-                   lastSendWaited, savedInflight, savedClean, seenDeaths,
+                   lastSendWaited, savedInflight, savedClean, hostCrashes,
                    deaths, cleanExit, net, needUser, alive, cancelled,
                    askedSignIn, polling>>
     /\ UNCHANGED filterVars
@@ -381,7 +386,7 @@ GatewayHeal ==
     /\ gateway = "broken"
     /\ gateway' = "ok"
     /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
-                   lastSendWaited, savedInflight, savedClean, seenDeaths,
+                   lastSendWaited, savedInflight, savedClean, hostCrashes,
                    deaths, cleanExit, net, needUser, faults, alive, cancelled,
                    askedSignIn, polling>>
     /\ UNCHANGED filterVars
@@ -393,7 +398,7 @@ NeedUserFault ==
     /\ ~needUser /\ ~unattended /\ faults < MaxFaults
     /\ needUser' = TRUE /\ faults' = faults + 1
     /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
-                   lastSendWaited, savedInflight, savedClean, seenDeaths,
+                   lastSendWaited, savedInflight, savedClean, hostCrashes,
                    deaths, cleanExit, net, gateway, alive, cancelled,
                    askedSignIn, polling>>
     /\ UNCHANGED filterVars
@@ -405,7 +410,7 @@ TroubleClears ==
     /\ needUser
     /\ needUser' = FALSE
     /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
-                   lastSendWaited, savedInflight, savedClean, seenDeaths,
+                   lastSendWaited, savedInflight, savedClean, hostCrashes,
                    deaths, cleanExit, net, gateway, faults, alive, cancelled,
                    askedSignIn, polling>>
     /\ UNCHANGED filterVars
@@ -416,7 +421,7 @@ FilterFault ==
     /\ ~blocked /\ faults < MaxFaults
     /\ blocked' = TRUE /\ faults' = faults + 1
     /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
-                   lastSendWaited, savedInflight, savedClean, seenDeaths,
+                   lastSendWaited, savedInflight, savedClean, hostCrashes,
                    deaths, cleanExit, net, gateway, needUser, alive, cancelled,
                    askedSignIn, polling, unattended, filterRun>>
     /\ UNCHANGED yielded
@@ -427,7 +432,7 @@ FilterClears ==
     /\ blocked
     /\ blocked' = FALSE
     /\ UNCHANGED <<phase, status, inflight, flowing, attempt, sameFail,
-                   lastSendWaited, savedInflight, savedClean, seenDeaths,
+                   lastSendWaited, savedInflight, savedClean, hostCrashes,
                    deaths, cleanExit, net, gateway, needUser, faults, alive,
                    cancelled, askedSignIn, polling, unattended, filterRun>>
     /\ UNCHANGED yielded
@@ -437,62 +442,69 @@ FilterClears ==
 (* send and the screen do not. Only a host that can ask keeps the record   *)
 (* and resumes a request.                                                  *)
 
-\* A crash: no event reaches the module.
+\* A crash: no event reaches the module. Counts as an abrupt death in any
+\* active phase (sending, waiting, or waiting for the user).
 Crash ==
     /\ alive /\ ~unattended /\ phase \in Active /\ faults < MaxFaults
     /\ faults' = faults + 1
     /\ alive' = FALSE
     /\ cleanExit' = FALSE
-    /\ deaths' = IF inflight THEN Min(deaths + 1, MaxFaults) ELSE deaths
+    /\ deaths' = Min(deaths + 1, MaxFaults)
+    /\ hostCrashes' = Min(hostCrashes + 1, MaxFaults)
     /\ inflight' = FALSE /\ flowing' = FALSE /\ status' = "none"
     /\ polling' = FALSE
     /\ UNCHANGED <<phase, attempt, sameFail, lastSendWaited, savedInflight,
-                   savedClean, seenDeaths, net, gateway, needUser, cancelled,
+                   savedClean, net, gateway, needUser, cancelled,
                    askedSignIn>>
     /\ UNCHANGED filterVars
     /\ UNCHANGED yielded
 
 \* SIGHUP or SIGTERM: fx sends `closing` and saves the plan before exiting.
+\* A close does not count as an abrupt death. Planted defect no_closing:
+\* the exit is not marked clean, and the host counts it as a crash.
 Close ==
     /\ alive /\ ~unattended /\ phase \in Active /\ faults < MaxFaults
     /\ faults' = faults + 1
     /\ alive' = FALSE
     /\ cleanExit' = TRUE
-    \* Planted defect no_closing: the exit is not marked, so it looks like a crash.
     /\ savedClean' = IF Bug = "no_closing" THEN savedClean ELSE TRUE
+    /\ hostCrashes' = IF Bug = "no_closing"
+                         THEN Min(hostCrashes + 1, MaxFaults)
+                         ELSE hostCrashes
     /\ inflight' = FALSE /\ flowing' = FALSE /\ status' = "none"
     /\ polling' = FALSE
     /\ UNCHANGED <<phase, attempt, sameFail, lastSendWaited, savedInflight,
-                   seenDeaths, deaths, net, gateway, needUser, cancelled,
+                   deaths, net, gateway, needUser, cancelled,
                    askedSignIn>>
     /\ UNCHANGED filterVars
     /\ UNCHANGED yielded
 
-\* start(record). An abrupt death with a send in flight counts toward the
-\* crash-loop guard; the second one asks the user once. Otherwise: save, send.
-\* The record keeps the run of blocks; the host passes its own kind again.
+\* start(record, crashes). At CrashLoopAfter abrupt deaths, the module ends
+\* the request as `crash_loop` before decoding, saving, or sending. Otherwise
+\* a request that was waiting for the user keeps waiting; any other record
+\* resends at once. Planted defect no_guard: the guard is off and the
+\* request resumes forever.
 Relaunch ==
     /\ ~alive /\ phase \in Active
     /\ yielded # 1
     /\ alive' = TRUE
     /\ savedClean' = FALSE
-    /\ LET abrupt == savedInflight /\ ~savedClean
-           seen   == IF abrupt THEN Min(seenDeaths + 1, MaxFaults) ELSE seenDeaths
-           ask    == (seen >= 2 /\ Bug # "never_ask") \/ phase = "need_user"
-       IN /\ seenDeaths' = seen
-          /\ IF ask
-                THEN /\ phase' = "need_user" /\ status' = "need_user"
-                     /\ inflight' = FALSE /\ flowing' = FALSE
-                     /\ savedInflight' = FALSE
-                     \* A saved sign-in wait stays one; the crash-loop
-                     \* question is not a sign-in.
-                     /\ askedSignIn' = (askedSignIn /\ phase = "need_user"
-                                        /\ ~(seen >= 2 /\ Bug # "never_ask"))
-                     /\ polling' = FALSE
-                     /\ UNCHANGED <<attempt, lastSendWaited>>
-                ELSE SendNow(TRUE)
-    /\ UNCHANGED <<sameFail, deaths, cleanExit, net, gateway, needUser,
-                   faults, cancelled>>
+    /\ LET atGuard == hostCrashes >= CrashLoopAfter /\ Bug # "no_guard" IN
+       IF atGuard
+          THEN /\ phase' = "done_crash_loop" /\ status' = "clear"
+               /\ inflight' = FALSE /\ flowing' = FALSE
+               /\ savedInflight' = FALSE
+               /\ askedSignIn' = FALSE /\ polling' = FALSE
+               /\ UNCHANGED <<attempt, lastSendWaited>>
+          ELSE IF phase = "need_user"
+          THEN /\ phase' = "need_user" /\ status' = "need_user"
+               /\ inflight' = FALSE /\ flowing' = FALSE
+               /\ savedInflight' = FALSE
+               /\ polling' = FALSE
+               /\ UNCHANGED <<attempt, lastSendWaited, askedSignIn>>
+          ELSE SendNow(TRUE)
+    /\ UNCHANGED <<sameFail, hostCrashes, deaths, cleanExit, net, gateway,
+                   needUser, faults, cancelled>>
     /\ UNCHANGED filterVars
     /\ UNCHANGED yielded
 
@@ -511,55 +523,58 @@ Yield ==
     /\ savedClean' = TRUE
     /\ inflight' = FALSE /\ flowing' = FALSE /\ status' = "none"
     /\ UNCHANGED <<phase, attempt, sameFail, lastSendWaited, savedInflight,
-                   seenDeaths, deaths, net, gateway, needUser, faults,
+                   hostCrashes, deaths, net, gateway, needUser, faults,
                    cancelled, askedSignIn, polling>>
     /\ UNCHANGED filterVars
 
-\* The new fx continues the stopped turn: start(record, continues). The
-\* record's questions and death count apply as for a relaunch; otherwise
-\* the send the yield stopped goes out as planned, with the same attempt
-\* and nothing on the status line (recovery.zig sendPlanned). Planted
-\* defect yield_retry_status: it resumes as a retry, the way fx showed
-\* "Resuming the interrupted request" and "attempt 2".
+\* The new fx continues the stopped turn: start(record, crashes, continues).
+\* At the guard, the module ends the request as `crash_loop`; otherwise a
+\* saved question still applies, and any other send goes out as planned, with
+\* the same attempt and nothing on the status line (recovery.zig
+\* sendPlanned). Planted defect yield_retry_status: it resumes as a retry,
+\* the way fx showed "Resuming the interrupted request" and "attempt 2".
 Continue ==
     /\ ~alive /\ yielded = 1 /\ phase \in Active
     /\ yielded' = 2
     /\ alive' = TRUE
     /\ savedClean' = FALSE
-    /\ LET abrupt == savedInflight /\ ~savedClean
-           seen   == IF abrupt THEN Min(seenDeaths + 1, MaxFaults) ELSE seenDeaths
-           ask    == (seen >= 2 /\ Bug # "never_ask") \/ phase = "need_user"
-       IN /\ seenDeaths' = seen
-          /\ IF ask
-                THEN /\ phase' = "need_user" /\ status' = "need_user"
-                     /\ inflight' = FALSE /\ flowing' = FALSE
-                     /\ savedInflight' = FALSE
-                     /\ askedSignIn' = FALSE /\ polling' = FALSE
-                     /\ UNCHANGED <<attempt, lastSendWaited>>
-             ELSE IF Bug = "yield_retry_status"
-                THEN SendNow(TRUE)
-             ELSE /\ phase' = "working"
-                  /\ inflight' = TRUE /\ flowing' = FALSE
-                  /\ savedInflight' = TRUE
-                  /\ status' = "clear"
-                  /\ lastSendWaited' = TRUE
-                  /\ askedSignIn' = FALSE /\ polling' = FALSE
-                  /\ UNCHANGED attempt
-    /\ UNCHANGED <<sameFail, deaths, cleanExit, net, gateway, needUser,
-                   faults, cancelled>>
+    /\ LET atGuard == hostCrashes >= CrashLoopAfter /\ Bug # "no_guard" IN
+       IF atGuard
+          THEN /\ phase' = "done_crash_loop" /\ status' = "clear"
+               /\ inflight' = FALSE /\ flowing' = FALSE
+               /\ savedInflight' = FALSE
+               /\ askedSignIn' = FALSE /\ polling' = FALSE
+               /\ UNCHANGED <<attempt, lastSendWaited>>
+          ELSE IF phase = "need_user"
+          THEN /\ phase' = "need_user" /\ status' = "need_user"
+               /\ inflight' = FALSE /\ flowing' = FALSE
+               /\ savedInflight' = FALSE
+               /\ askedSignIn' = FALSE /\ polling' = FALSE
+               /\ UNCHANGED <<attempt, lastSendWaited>>
+          ELSE IF Bug = "yield_retry_status"
+          THEN SendNow(TRUE)
+          ELSE /\ phase' = "working"
+               /\ inflight' = TRUE /\ flowing' = FALSE
+               /\ savedInflight' = TRUE
+               /\ status' = "clear"
+               /\ lastSendWaited' = TRUE
+               /\ askedSignIn' = FALSE /\ polling' = FALSE
+               /\ UNCHANGED attempt
+    /\ UNCHANGED <<sameFail, hostCrashes, deaths, cleanExit, net, gateway,
+                   needUser, faults, cancelled>>
     /\ UNCHANGED filterVars
 
 -----------------------------------------------------------------------------
 (* The user, and fx's own end of a request nobody can answer.              *)
 
 \* `user_cancel`: Esc, or quitting fx. The only way to end without success
-\* on a host that can ask.
+\* on a host that can ask, other than the crash-loop guard.
 UserCancels ==
     /\ alive /\ phase \in Active
     /\ phase' = "done_cancel" /\ status' = "clear" /\ cancelled' = TRUE
     /\ inflight' = FALSE /\ flowing' = FALSE /\ savedInflight' = FALSE
     /\ askedSignIn' = FALSE /\ polling' = FALSE
-    /\ UNCHANGED <<attempt, sameFail, lastSendWaited, savedClean, seenDeaths,
+    /\ UNCHANGED <<attempt, sameFail, lastSendWaited, savedClean, hostCrashes,
                    deaths, cleanExit, net, gateway, needUser, faults, alive>>
     /\ UNCHANGED filterVars
     /\ UNCHANGED yielded
@@ -567,24 +582,18 @@ UserCancels ==
 \* `user_continue`: Enter or a successful /login after fixing what was asked,
 \* such as a rephrased request after a block. Only a host that can ask has a
 \* user to answer; planted defect cannot_ask_resends resends on one that
-\* cannot, as if it had. Only answering the crash-loop question starts the death
-\* count over (recovery.zig onUserContinue): a sign-in says nothing about
-\* crashes. Two counted deaths while waiting for the user mean the
-\* crash-loop question.
-\* The answer also starts the content filter's run of blocks over
+\* cannot, as if it had. Answering a request's own question keeps the turn's
+\* crash count, and starts the content filter's run of blocks over
 \* (recovery.zig onUserContinue); planted defect filter_answer_keeps_count
 \* keeps it, as fx did before, so a block after the answer asks at once.
 UserActs ==
-    LET loop == seenDeaths >= 2 IN
     /\ alive /\ (~unattended \/ Bug = "cannot_ask_resends") /\ phase = "need_user"
     /\ needUser' = FALSE
     /\ blocked' = FALSE
-    /\ seenDeaths' = IF loop THEN 0 ELSE seenDeaths
-    /\ deaths' = IF loop THEN 0 ELSE deaths
     /\ filterRun' = IF Bug = "filter_answer_keeps_count" THEN filterRun ELSE 0
     /\ SendNow(TRUE)
-    /\ UNCHANGED <<sameFail, savedClean, cleanExit, net, gateway, faults,
-                   alive, cancelled, unattended>>
+    /\ UNCHANGED <<sameFail, savedClean, hostCrashes, deaths, cleanExit, net,
+                   gateway, faults, alive, cancelled, unattended>>
     /\ UNCHANGED yielded
 
 \* The request needs the user on a host that cannot ask, which happens only
@@ -596,7 +605,7 @@ HostEnds ==
     /\ alive /\ unattended /\ phase = "need_user"
     /\ phase' = "done_failed" /\ status' = "failed"
     /\ UNCHANGED <<inflight, flowing, attempt, sameFail, lastSendWaited,
-                   savedInflight, savedClean, seenDeaths, deaths, cleanExit,
+                   savedInflight, savedClean, hostCrashes, deaths, cleanExit,
                    net, gateway, needUser, faults, alive, cancelled,
                    askedSignIn, polling>>
     /\ UNCHANGED filterVars
@@ -608,7 +617,7 @@ HostResends ==
     /\ Bug = "asking_host_resends"
     /\ alive /\ ~unattended /\ phase = "need_user" /\ ~askedSignIn
     /\ SendNow(TRUE)
-    /\ UNCHANGED <<sameFail, savedClean, seenDeaths, deaths, cleanExit, net,
+    /\ UNCHANGED <<sameFail, savedClean, hostCrashes, deaths, cleanExit, net,
                    gateway, needUser, faults, alive, cancelled>>
     /\ UNCHANGED filterVars
     /\ UNCHANGED yielded
@@ -643,15 +652,20 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 -----------------------------------------------------------------------------
 (* The rules the module and fx keep together.                             *)
 
-\* Only Esc or quitting ends a request without success, except on a host
-\* that cannot ask, where fx ends one that needs the user on its own error.
+\* Only Esc, quitting, or the crash-loop guard ends a request without
+\* success, except on a host that cannot ask, where fx ends one that needs
+\* the user on its own error.
 NeverGivesUp ==
     /\ phase # "stopped"
     /\ (phase = "done_cancel" => cancelled)
     /\ (phase = "done_failed" => unattended)
+    /\ (phase = "done_crash_loop" =>
+           /\ ~inflight
+           /\ hostCrashes >= CrashLoopAfter
+           /\ (Bug # "no_closing" => deaths >= CrashLoopAfter))
 
 \* Once disruptions stop, every request finishes.
-Heals == <>(phase \in {"done_ok", "done_cancel", "done_failed"})
+Heals == <>(phase \in {"done_ok", "done_cancel", "done_failed", "done_crash_loop"})
 
 \* On a world that never misbehaved, nothing alarming is shown.
 NoFalseAlarm == (status \in Alarms) => faults > 0
@@ -669,14 +683,19 @@ StatusHonest ==
                            ELSE {"clear"})
         /\ (phase = "working" /\ flowing => status = "clear")
 
-\* After SIGHUP or SIGTERM, the request resumes without asking.
+\* After SIGHUP or SIGTERM, the request resumes without stopping or asking.
 ResumesAfterClose ==
-    [][(Relaunch /\ cleanExit /\ phase # "need_user") => phase' # "need_user"]_vars
+    [][(Relaunch /\ cleanExit /\ phase # "need_user")
+         => (phase' = "working" /\ inflight')]_vars
 
-\* The one exception: two abrupt deaths with a send in flight ask once.
-CrashLoopAsks ==
-    [][(Relaunch /\ ~cleanExit /\ deaths >= 2 /\ phase # "need_user")
-         => phase' = "need_user"]_vars
+\* At the guard (CrashLoopAfter abrupt deaths), a relaunch or continuation
+\* ends the request as `done_crash_loop`, sends nothing after it, and never
+\* opens a question for a crash or age.
+CrashLoopStops ==
+    [][(Relaunch \/ Continue) =>
+         /\ (deaths >= CrashLoopAfter =>
+                phase' = "done_crash_loop" /\ ~inflight' /\ ~savedInflight')
+         /\ (phase # "need_user" => phase' # "need_user")]_vars
 
 \* A retry after a transient failure always waits first.
 NoHotRetry == lastSendWaited

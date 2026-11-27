@@ -11,6 +11,12 @@ const compaction_activity = @import("../output/compaction_activity.zig");
 const compactor = @import("../compactor/compactor.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 
+/// Errors whose notice the turn already showed, so the worker adds no error
+/// line. `CrashLoop` is the crash-loop guard's notice (`recovery.crash_loop_notice`).
+fn isNoticeOnlyError(err: anyerror) bool {
+    return err == error.RouteRecoveryStopped or err == error.CrashLoop;
+}
+
 fn compactionErrorHandled(work: worker_runtime.WorkItem, provenance: ?compaction_activity.ErrorProvenance, err: anyerror) bool {
     const failure = provenance orelse return false;
     if (failure.err != err) return false;
@@ -116,7 +122,7 @@ pub fn Runtime(comptime App: type) type {
                     compactor.traceLog(true, "interactive error retained err={s}", .{@errorName(err)});
                 } else if (err == error.TurnYielded) {
                     try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = yielded_notice });
-                } else if (err != error.RouteRecoveryStopped) {
+                } else if (!isNoticeOnlyError(err)) {
                     const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
                     defer std.heap.c_allocator.free(body);
                     try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
@@ -232,7 +238,7 @@ pub fn Runtime(comptime App: type) type {
                         compactor.traceLog(true, "interactive error retained err={s}", .{@errorName(err)});
                     } else if (err == error.TurnYielded) {
                         try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = yielded_notice });
-                    } else if (err != error.RouteRecoveryStopped) {
+                    } else if (!isNoticeOnlyError(err)) {
                         const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
                         defer std.heap.c_allocator.free(body);
                         try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{

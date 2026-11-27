@@ -325,6 +325,10 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   const failed = new Map();
   // Deadline cut-offs in a row of the open turn's step.
   let cut = noCutoffs;
+  // The turn the last release cut off at its deadline, and the one the latest
+  // lease's claim found, so that claim resumes a close, not a crash.
+  let releasedCutoff = null;
+  let claimedCutoff = null;
   let maxCursor = 0;
   const consume = (id) => {
     if (consumed.has(id)) return;
@@ -365,9 +369,12 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
         if (entry.k === "lease") {
           lease = { holder: entry.holder, epoch: entry.epoch, expiresAt: entry.expiresAt ?? null, pid: entry.pid, host: entry.host, delivery: entry.delivery, cursor };
           if (Number.isSafeInteger(entry.epoch) && entry.epoch > epoch) epoch = entry.epoch;
+          claimedCutoff = releasedCutoff;
+          releasedCutoff = null;
         } else if (entry.k === "release") {
           if (lease?.holder === entry.holder) lease = null;
-          if (typeof entry.cutoff === "string" && entry.cutoff === openTurn?.id) cut = afterCutoff(cut);
+          releasedCutoff = typeof entry.cutoff === "string" ? entry.cutoff : null;
+          if (releasedCutoff !== null && releasedCutoff === openTurn?.id) cut = afterCutoff(cut);
         } else {
           cut = afterRecord(cut, entry.marks);
           records.push({ cursor, data: entry.data });
@@ -504,6 +511,8 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     openTurn,
     cut: openTurn === null ? noCutoffs : cut,
     cutoffs: openTurn === null ? 0 : cut.cutoffs,
+    // The turn the release before the latest lease cut off at its deadline.
+    previousCutoff: claimedCutoff,
     openFailed,
     lastTurnId,
     agent,
@@ -2270,7 +2279,9 @@ class SessionWorker {
           // cancelled, as a turn whose engine keeps stopping does.
           spent = state.openTurn?.id === messageId && state.cutoffs >= maxCutoffs;
           try {
-            turn = harness.resume({ yieldAt, ...(spent ? { rerun: false } : {}) });
+            // A previous worker cut this turn off at its deadline: a close, not a crash.
+            const cutOff = state.previousCutoff === messageId;
+            turn = harness.resume({ yieldAt, ...(spent ? { rerun: false } : {}), ...(cutOff ? { afterCutoff: true } : {}) });
           } catch (error) {
             await log.append({ k: "stopped", messageId });
             return unusable(error);

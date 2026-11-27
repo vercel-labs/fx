@@ -47,6 +47,8 @@ Reset ==
     /\ turn' = "none"
     /\ turns' = 0
     /\ crashesInTurn' = 0
+    /\ savedCrashes' = 0
+    /\ pendingCrashes' = 0
     /\ autoResumes' = 0
     /\ asked' = FALSE
     /\ notices' = 0
@@ -63,6 +65,9 @@ Reset ==
     /\ run' = <<>>
     /\ yielded' = FALSE
     /\ yields' = 0
+    /\ canRerun' = FALSE
+    /\ sentAfterGuard' = FALSE
+    /\ rerunAfterGuard' = FALSE
 
 \* The next scenario starts over in a fresh session.
 Advance ==

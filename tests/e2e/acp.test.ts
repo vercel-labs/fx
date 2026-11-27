@@ -3051,6 +3051,90 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP continueRecovery stops a turn that crashed fx three times, with the reason",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-crash-loop-");
+      const prompt = "ACP crash loop prompt";
+      const notice = "Resuming from unexpected session interruption.";
+      const stopNotice = "This turn crashed fx three times, so fx stopped it. Send a message to go on.";
+      // Every request of the turn stays on the wire, so each kill lands mid-request.
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (body.includes(prompt) || body.includes(notice)) return new Promise<Response>(() => {});
+        return finalText("UNRELATED");
+      });
+      const spawnFx = () => {
+        const proc = nodeSpawn(FX_BIN, ["acp"], {
+          cwd: root.workspace,
+          env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        return { proc, client: new AcpClient(proc) };
+      };
+      type Launch = ReturnType<typeof spawnFx>;
+      const killFx = async (launch: Launch) => {
+        const exited = launch.client.waitForExit();
+        launch.proc.kill("SIGKILL");
+        await exited;
+        expect(launch.proc.signalCode).toBe("SIGKILL");
+      };
+      const restartFx = async (sessionId: string, id: number) => {
+        const launch = spawnFx();
+        await launch.client.request("initialize", { protocolVersion: 1 }, id);
+        const loaded = await launch.client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, id + 1) as any;
+        expect(loaded.error).toBeUndefined();
+        return launch;
+      };
+      const continueTurn = (launch: Launch, id: number) => {
+        launch.client.send({
+          jsonrpc: "2.0",
+          id,
+          method: "session/prompt",
+          params: { prompt: [], _meta: { fx: { continueRecovery: true } } },
+        });
+      };
+      let launch = spawnFx();
+      try {
+        const sessionId = await startAutoSession(launch.client);
+        sendPrompt(launch.client, 40, prompt);
+        await waitForCondition("the first request", () => gateway.requests.length === 1, TIMEOUT);
+        await killFx(launch);
+
+        // The first two continues go on; each kill lands on the request it sent.
+        launch = await restartFx(sessionId, 10);
+        continueTurn(launch, 12);
+        await waitForCondition("the first continued request", () => gateway.requests.length === 2, TIMEOUT);
+        await killFx(launch);
+
+        launch = await restartFx(sessionId, 20);
+        continueTurn(launch, 22);
+        await waitForCondition("the second continued request", () => gateway.requests.length === 3, TIMEOUT);
+        await killFx(launch);
+
+        // The third continue is the guard: the reason as the RPC error, and no request.
+        launch = await restartFx(sessionId, 30);
+        continueTurn(launch, 32);
+        const stopped = await readResponse(launch.client, 32, TIMEOUT) as any;
+        expect(stopped.error.message).toBe(stopNotice);
+        expect(stopped.error.data).toEqual({ code: "crash_loop" });
+        expect(gateway.requests).toHaveLength(3);
+
+        // A fourth continue finds nothing to resume.
+        continueTurn(launch, 33);
+        const refused = await readResponse(launch.client, 33, TIMEOUT) as any;
+        expect(refused.error.code).toBe(-32602);
+        expect(refused.error.message).toBe("No interrupted turn to resume");
+        expect(gateway.requests).toHaveLength(3);
+        expect(launch.client.stderr).toBe("");
+      } finally {
+        await launch.client.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
     "ACP reload after a crash during a retry shows the finished tool result once and a new prompt goes on",
     async () => {
       const root = createIsolatedRoot("fx-acp-reload-model-recovery-");

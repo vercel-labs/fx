@@ -27,6 +27,8 @@
 //!   interrupted
 //! - `tool_result`: one call of the running batch finished, with what the
 //!   model sees, so a crash before the next progress leaves it answered
+//! - `turn_resumed`: a crashed turn resumed, with the abrupt deaths libfx
+//!   counted for it, stored before the resume reruns or sends anything
 //!
 //! A `turn_progress` after the turn's first may carry only what is new since
 //! the one before it, named by its `seq` in `base`: `data` then leaves out
@@ -38,7 +40,8 @@
 //! that reads only version 1 still loads a journal without them.
 //! An event that names an image instead of holding its bytes, one the host
 //! stored or one the session dropped, is version 3, so an fx that reads only
-//! up to version 2 refuses it as newer.
+//! up to version 2 refuses it as newer. A `turn_resumed` is version 5, so an
+//! fx that reads only up to version 4 reports it as newer too.
 //!
 //! A `turn_progress` event lists the inputs its model request carries for
 //! the first time in `inputs`, so placement is stored with the text it
@@ -57,7 +60,7 @@ const compactor = @import("../../compactor/compactor.zig");
 const Allocator = std.mem.Allocator;
 
 /// The newest event version this fx reads and writes.
-pub const version: u8 = 4;
+pub const version: u8 = resumed_version;
 /// The version of an event that needs none of the later additions.
 const plain_version: u8 = 1;
 /// The version of a `tool_result` and of a progress that extends another.
@@ -71,6 +74,9 @@ const naming_version: u8 = 3;
 /// runtime context (D93, D94), whatever else it holds, so an fx that reads
 /// only up to version 3 reports a newer journal instead of an invalid one.
 const notes_version: u8 = 4;
+/// The version of a `turn_resumed` event, so an fx that reads only up to
+/// version 4 reports a newer journal instead of an invalid one.
+const resumed_version: u8 = 5;
 /// The most event bytes one load accepts, and the most bytes one snapshot
 /// holds: each travels as one host attachment, and an attachment holds at
 /// most one kernel checkpoint. Longer sessions need snapshots.
@@ -91,6 +97,7 @@ const EventType = enum {
     input_withdrawn,
     turn_yielded,
     tool_result,
+    turn_resumed,
 };
 
 const InputKind = enum { steer, follow_up };
@@ -147,6 +154,8 @@ pub const Event = union(EventType) {
     input_withdrawn: []const u8,
     turn_yielded,
     tool_result: ToolResult,
+    /// The abrupt deaths counted for the open turn when libfx resumed it.
+    turn_resumed: u8,
 
     /// The version `Cursor.write` gives the event: `notes_version` when it
     /// holds a turn with context notes or a saved runtime context, and
@@ -157,6 +166,7 @@ pub const Event = union(EventType) {
         if (eventNamesImages(self, stored)) return naming_version;
         return switch (self) {
             .tool_result => delta_version,
+            .turn_resumed => resumed_version,
             .turn_progress => |progress| if (progress.delta != null) delta_version else plain_version,
             else => plain_version,
         };
@@ -267,6 +277,7 @@ pub const Cursor = struct {
                 }
                 try writer.writeByte('}');
             },
+            .turn_resumed => |crashes| try writer.print(",\"data\":{{\"crashes\":{d}}}", .{crashes}),
         }
         try writer.writeByte('}');
         return .{
@@ -285,7 +296,7 @@ fn eventUsesNotesSchema(event: Event) bool {
         .history_replaced => |history| for (history) |turn| {
             if (session_codec.turnUsesNotesSchema(turn)) break true;
         } else false,
-        .tool_result, .tool_intent, .turn_progress_cleared, .input_accepted, .input_withdrawn, .turn_yielded => false,
+        .tool_result, .tool_intent, .turn_progress_cleared, .input_accepted, .input_withdrawn, .turn_yielded, .turn_resumed => false,
     };
 }
 
@@ -301,7 +312,7 @@ fn eventNamesImages(event: Event, stored: ?*const session_codec.StoredImages) bo
             if (session_codec.turnNamesImages(turn, stored)) break true;
         } else false,
         .tool_result => |result| session_codec.toolImagesNameImages(result.images, stored),
-        .tool_intent, .turn_progress_cleared, .input_accepted, .input_withdrawn, .turn_yielded => false,
+        .tool_intent, .turn_progress_cleared, .input_accepted, .input_withdrawn, .turn_yielded, .turn_resumed => false,
     };
 }
 
@@ -516,6 +527,9 @@ pub const Folded = struct {
     /// The open turn stopped at the time the host gave it, with nothing
     /// after: it continues without being told it was interrupted.
     yielded: bool = false,
+    /// The abrupt deaths the newest `turn_resumed` counted for the open turn,
+    /// or 0. A snapshot does not keep the count, so a turn it holds starts at 0.
+    open_crashes: u8 = 0,
     cursor: Cursor,
 
     pub fn deinit(self: *Folded, alloc: Allocator) void {
@@ -698,6 +712,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
     var open_id: ?[]const u8 = null;
     var last_id: ?[]const u8 = base.last_turn_id;
     var yielded = false;
+    var crashes: u8 = 0;
     var cursor = base.cursor;
     if (base.open_turn) |text| {
         // The snapshot's turn stays open and yielded until the events after
@@ -730,6 +745,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
                     return err;
                 };
                 open = null;
+                crashes = 0;
                 open_seq = null;
                 last_id = open_id;
                 open_id = null;
@@ -777,6 +793,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
             .turn_progress_cleared => {
                 if (event.data != null) return error.InvalidJournal;
                 open = null;
+                crashes = 0;
                 open_seq = null;
                 last_id = open_id;
                 open_id = null;
@@ -824,6 +841,12 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
                 // Only an open turn yields.
                 if (open == null) return error.InvalidJournal;
                 yielded = true;
+            },
+            .turn_resumed => {
+                const data = event.data orelse return error.InvalidJournal;
+                // Only an open turn is resumed.
+                if (open == null) return error.InvalidJournal;
+                crashes = try crashesOf(data);
             },
             .history_replaced => {
                 const data = event.data orelse return error.InvalidJournal;
@@ -887,6 +910,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
         .open_turn_id = open_turn_id,
         .last_turn_id = last_turn_id,
         .yielded = yielded and open_turn != null,
+        .open_crashes = crashes,
         .cursor = cursor,
     };
 }
@@ -1022,6 +1046,14 @@ fn integerField(object: std.json.ObjectMap, name: []const u8) LoadError!u64 {
     const value = object.get(name) orelse return error.InvalidJournal;
     if (value != .integer or value.integer < 0) return error.InvalidJournal;
     return @intCast(value.integer);
+}
+
+/// The abrupt deaths a `turn_resumed` event holds: one byte, so a larger
+/// count is not one fx wrote.
+fn crashesOf(data: std.json.Value) LoadError!u8 {
+    if (data != .object) return error.InvalidJournal;
+    const count = try integerField(data.object, "crashes");
+    return std.math.cast(u8, count) orelse error.InvalidJournal;
 }
 
 /// A current compaction summary stands for every turn before it.
@@ -1419,6 +1451,108 @@ test "a yield stands until the open turn does anything more, and needs an open t
     try std.testing.expectError(error.InvalidJournal, fold(alloc, orphan));
 }
 
+test "a journal with a turn_resumed event is version 5 and folds back its count" {
+    const alloc = std.testing.allocator;
+    var progress = try testProgress(alloc, "long task");
+    defer progress.deinit(alloc);
+
+    const resumed = try testJournal(alloc, &.{
+        .{ .turn_progress = .{ .checkpoint = progress } },
+        .{ .turn_resumed = 2 },
+    });
+    defer alloc.free(resumed);
+    try std.testing.expect(std.mem.find(u8, resumed, "{\"v\":5,\"seq\":2,\"turn\":1,\"type\":\"turn_resumed\",\"data\":{\"crashes\":2}}") != null);
+    var folded = try fold(alloc, resumed);
+    defer folded.deinit(alloc);
+    try std.testing.expect(folded.open_turn != null);
+    try std.testing.expectEqual(@as(u8, 2), folded.open_crashes);
+}
+
+test "a journal keeps the newest turn_resumed count of the open turn" {
+    const alloc = std.testing.allocator;
+    var progress = try testProgress(alloc, "long task");
+    defer progress.deinit(alloc);
+
+    const counted = try testJournal(alloc, &.{
+        .{ .turn_progress = .{ .checkpoint = progress } },
+        .{ .turn_resumed = 1 },
+        .{ .turn_progress = .{ .checkpoint = progress } },
+        .{ .turn_resumed = 3 },
+    });
+    defer alloc.free(counted);
+    var folded = try fold(alloc, counted);
+    defer folded.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 3), folded.open_crashes);
+}
+
+test "a journal turn that ends after a turn_resumed leaves the next turn at zero" {
+    const alloc = std.testing.allocator;
+    var progress = try testProgress(alloc, "long task");
+    defer progress.deinit(alloc);
+    const turn = try testTurn(alloc, "long task", "done");
+    defer types.freeHistoryTurn(alloc, turn);
+
+    const committed = try testJournal(alloc, &.{
+        .{ .turn_progress = .{ .checkpoint = progress } },
+        .{ .turn_resumed = 2 },
+        .{ .turn_committed = turn },
+        .{ .turn_progress = .{ .checkpoint = progress } },
+    });
+    defer alloc.free(committed);
+    var next = try fold(alloc, committed);
+    defer next.deinit(alloc);
+    try std.testing.expect(next.open_turn != null);
+    try std.testing.expectEqual(@as(u8, 0), next.open_crashes);
+
+    const cleared = try testJournal(alloc, &.{
+        .{ .turn_progress = .{ .checkpoint = progress } },
+        .{ .turn_resumed = 2 },
+        .turn_progress_cleared,
+        .{ .turn_progress = .{ .checkpoint = progress } },
+    });
+    defer alloc.free(cleared);
+    var after_clear = try fold(alloc, cleared);
+    defer after_clear.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), after_clear.open_crashes);
+}
+
+test "a journal without a turn_resumed event reads zero crashes" {
+    const alloc = std.testing.allocator;
+    var progress = try testProgress(alloc, "long task");
+    defer progress.deinit(alloc);
+    const bytes = try testJournal(alloc, &.{.{ .turn_progress = .{ .checkpoint = progress } }});
+    defer alloc.free(bytes);
+    var folded = try fold(alloc, bytes);
+    defer folded.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), folded.open_crashes);
+}
+
+test "a journal refuses a turn_resumed event with no open turn or a count past one byte" {
+    const alloc = std.testing.allocator;
+    var progress = try testProgress(alloc, "long task");
+    defer progress.deinit(alloc);
+    const turn = try testTurn(alloc, "long task", "done");
+    defer types.freeHistoryTurn(alloc, turn);
+
+    const orphan = try testJournal(alloc, &.{.{ .turn_resumed = 1 }});
+    defer alloc.free(orphan);
+    try std.testing.expectError(error.InvalidJournal, fold(alloc, orphan));
+
+    const after_commit = try testJournal(alloc, &.{
+        .{ .turn_progress = .{ .checkpoint = progress } },
+        .{ .turn_committed = turn },
+        .{ .turn_resumed = 1 },
+    });
+    defer alloc.free(after_commit);
+    try std.testing.expectError(error.InvalidJournal, fold(alloc, after_commit));
+
+    const progress_only = try testJournal(alloc, &.{.{ .turn_progress = .{ .checkpoint = progress } }});
+    defer alloc.free(progress_only);
+    const too_big = try alloc.print("{s},{{\"v\":5,\"seq\":2,\"turn\":1,\"type\":\"turn_resumed\",\"data\":{{\"crashes\":256}}}}]", .{progress_only[0 .. progress_only.len - 1]});
+    defer alloc.free(too_big);
+    try std.testing.expectError(error.InvalidJournal, fold(alloc, too_big));
+}
+
 test "an empty journal is a new session" {
     var folded = try fold(std.testing.allocator, "[]");
     defer folded.deinit(std.testing.allocator);
@@ -1446,7 +1580,7 @@ test "a journal from a newer fx or with a malformed event is rejected" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(
         error.UnsupportedJournalVersion,
-        fold(alloc, "[{\"v\":5,\"seq\":1,\"turn\":1,\"type\":\"turn_progress_cleared\"}]"),
+        fold(alloc, "[{\"v\":6,\"seq\":1,\"turn\":1,\"type\":\"turn_progress_cleared\"}]"),
     );
     const malformed = [_][]const u8{
         "{}",

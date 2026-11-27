@@ -276,8 +276,24 @@ pub fn persistFailedPartialTurnOnce(
     current_turn_messages: []const types.ChatMessage,
     terminal_materializing: *bool,
 ) !void {
-    if (persisted.*) return;
     if (partial_assistant.len == 0) return;
+    try persistFailedTurnOnce(hooks, finalization, job, partial_assistant, persisted, trace_ctx, current_turn_messages, terminal_materializing);
+}
+
+/// Saves the turn as interrupted with a failed terminal reason, with or
+/// without partial text. The crash-loop guard saves with none, as the cancel
+/// path does for a resumed request that sends nothing.
+pub fn persistFailedTurnOnce(
+    hooks: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    partial_assistant: []const u8,
+    persisted: *bool,
+    trace_ctx: TraceContext,
+    current_turn_messages: []const types.ChatMessage,
+    terminal_materializing: *bool,
+) !void {
+    if (persisted.*) return;
 
     const full_execution = try runtime_execution_memory.buildInterruptedExecutionMemory(
         std.heap.c_allocator,

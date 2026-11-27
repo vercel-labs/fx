@@ -784,11 +784,10 @@ test "a turn asked to yield stops at its next step boundary after the first requ
     // One request went out; the tool ran; the second request never did.
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.turn_yielded_marks);
-    // The record the yield left resumes without counting a death.
+    // The record the yield left resumes and sends.
     var probe: recovery.State = .{};
     const plan = recovery.step(&probe, .{ .start = .{ .resume_from = hooks.recovery_record.? } }, 0);
     try std.testing.expect(plan.send != null);
-    try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
 }
 
 test "a turn held for a cancelled restart sends its request in the same turn" {
@@ -1040,11 +1039,10 @@ test "a failed marker write still leaves the yielded turn resumable" {
 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.turn_yielded_marks);
-    // The record the yield left resumes without counting a death.
+    // The record the yield left resumes and sends.
     var probe: recovery.State = .{};
     const plan = recovery.step(&probe, .{ .start = .{ .resume_from = hooks.recovery_record.? } }, 0);
     try std.testing.expect(plan.send != null);
-    try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
 }
 
 test "a turn on a provider other than the gateway goes on to its end when asked to yield" {
@@ -1140,11 +1138,10 @@ test "a turn whose closing save fails goes on and stops at the next boundary" {
     // The refused stop let the second request go out; the next boundary stopped the turn.
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.turn_yielded_marks);
-    // The record the yield left resumes without counting a death.
+    // The record the yield left resumes and sends.
     var probe: recovery.State = .{};
     const plan = recovery.step(&probe, .{ .start = .{ .resume_from = hooks.recovery_record.? } }, 0);
     try std.testing.expect(plan.send != null);
-    try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
 }
 
 test "a turn whose closing saves all fail runs to its end and is never marked" {
@@ -1259,6 +1256,25 @@ test "a resumed request that continues no yielded turn sends the resume note" {
 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
     try std.testing.expect(std.mem.find(u8, gateway.request_bodies.items[0], "session_resumed") != null);
+}
+
+test "a resumed request at the crash-loop guard sends nothing and ends the turn with the notice" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "final" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var job = fixture.job();
+    job.recovery_resume = .{ .crashes = recovery.crash_loop_after };
+
+    try std.testing.expectError(error.CrashLoop, runFakePrompt(&gateway, &hooks, fixture.config(), job));
+
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
+    try std.testing.expectEqualStrings(recovery.crash_loop_notice, hooks.system_notices.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_event_count);
 }
 
 test "a turn that continues a yielded resume projects the stopped turn without its abort note" {

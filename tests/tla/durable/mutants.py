@@ -107,46 +107,73 @@ MUTANTS = [
 
     # Resumption.tla
     ("Resumption", "fx -c asks the user after an unclean exit",
-     [("THEN /\\ autoResumes' = autoResumes + 1\n"
-       "            /\\ IF reply = \"saved\"\n"
-       "               THEN /\\ delivered' = delivered + 1\n"
-       "                    /\\ UNCHANGED notices\n"
-       "               ELSE /\\ notices' = notices + 1\n"
-       "                    /\\ UNCHANGED delivered\n"
-       "            /\\ UNCHANGED asked",
-       "THEN /\\ asked' = TRUE\n"
-       "            /\\ UNCHANGED <<autoResumes, notices, delivered>>")],
+     [("               THEN /\\ savedCrashes' = next\n"
+       "                    /\\ pendingCrashes' = next\n"
+       "                    /\\ autoResumes' = autoResumes + 1\n"
+       "                    /\\ canRerun' = (reply = \"none\")\n"
+       "                    /\\ IF reply = \"saved\"\n"
+       "                       THEN /\\ delivered' = delivered + 1\n"
+       "                            /\\ UNCHANGED notices\n"
+       "                       ELSE /\\ notices' = notices + 1\n"
+       "                            /\\ UNCHANGED delivered\n"
+       "                    /\\ UNCHANGED asked",
+       "               THEN /\\ asked' = TRUE\n"
+       "                    /\\ canRerun' = FALSE\n"
+       "                    /\\ UNCHANGED <<savedCrashes, pendingCrashes, autoResumes, notices, delivered>>")],
      "NeverAsks"),
-    ("Resumption", "a crash-loop guard: stop resuming after the first resume",
-     [("IF turn = \"open\" /\\ ~yielded\n       THEN",
-       "IF turn = \"open\" /\\ ~yielded /\\ autoResumes < 1\n       THEN")],
-     "EveryCrashResumed"),
+    ("Resumption", "no crash-loop guard: keep resuming past three crashes",
+     [("        stops == turn = \"open\" /\\ ~yielded /\\ next >= CrashLoopAfter\n",
+       "        stops == FALSE\n")],
+     "CrashLoopStops"),
+    ("Resumption", "save the crash count only after the rerun, with the next request",
+     [("               THEN /\\ savedCrashes' = next\n",
+       "               THEN /\\ UNCHANGED savedCrashes\n")],
+     "CrashLoopStops"),
+    ("Resumption", "count a yield as a crash",
+     [("               ELSE /\\ canRerun' = FALSE\n"
+       "                    /\\ UNCHANGED <<savedCrashes, pendingCrashes, autoResumes,\n"
+       "                                   notices, delivered, asked>>",
+       "               ELSE /\\ canRerun' = FALSE\n"
+       "                    /\\ savedCrashes' = IF turn = \"open\" THEN next ELSE savedCrashes\n"
+       "                    /\\ UNCHANGED <<pendingCrashes, autoResumes,\n"
+       "                                   notices, delivered, asked>>")],
+     "FirstCrashResumes"),
     ("Resumption", "resume a turn the user stopped",
-     [("IF turn = \"open\" /\\ ~yielded\n       THEN",
-       "IF turn \\in {\"open\", \"user_stopped\"} /\\ ~yielded\n       THEN")],
+     [("            /\\ IF turn = \"open\" /\\ ~yielded\n",
+       "            /\\ IF turn \\in {\"open\", \"user_stopped\"} /\\ ~yielded\n")],
      "NeverResumeFinishedTurn"),
     ("Resumption", "resume without telling the model",
      [("/\\ notices' = notices + 1", "/\\ notices' = notices")],
      "ModelToldEveryTime"),
     ("Resumption", "resume restarts a reply it saved and asks the model again",
-     [("            /\\ IF reply = \"saved\"\n", "            /\\ IF FALSE\n"),
-      ("ELSE IF reply = \"saved\" THEN saved", "ELSE IF FALSE THEN saved"),
-      ("    /\\ UNCHANGED <<turn, turns, crashesInTurn, crashes, reply, ending,\n",
-       "    /\\ reply' = \"none\"\n    /\\ UNCHANGED <<turn, turns, crashesInTurn, crashes, ending,\n")],
+     [("                       THEN /\\ delivered' = delivered + 1\n",
+       "                       THEN /\\ notices' = notices + 1\n"),
+      ("                            /\\ UNCHANGED notices\n"
+       "                       ELSE /\\ notices' = notices + 1\n"
+       "                            /\\ UNCHANGED delivered",
+       "                            /\\ UNCHANGED delivered\n"
+       "                       ELSE /\\ notices' = notices + 1\n"
+       "                            /\\ UNCHANGED delivered"),
+      ("                      ELSE IF reply = \"saved\" THEN saved\n",
+       "                      ELSE IF FALSE THEN saved\n"),
+      ("    /\\ UNCHANGED <<turns, crashesInTurn, crashes, reply, ending, resolved,\n"
+       "                   replySaved, askedAgain, earlyResult, saved, yielded, yields,\n"
+       "                   sentAfterGuard, rerunAfterGuard>>",
+       "    /\\ reply' = \"none\"\n"
+       "    /\\ UNCHANGED <<turns, crashesInTurn, crashes, ending, resolved,\n"
+       "                   replySaved, askedAgain, earlyResult, saved, yielded, yields,\n"
+       "                   sentAfterGuard, rerunAfterGuard>>")],
      "SavedAnswerNotRequested"),
     ("Resumption", "a resume after a yield tells the model it was interrupted",
-     [("ELSE IF yielded THEN Continued(saved)", "ELSE IF yielded THEN Resumed(saved)")],
+     [("                      ELSE IF yielded THEN Continued(saved)", "                      ELSE IF yielded THEN Resumed(saved)")],
      "NoticeOnlyAfterInterruption"),
     ("Resumption", "turn.result resolves while the turn's end is still being stored",
      [("    /\\ turn = \"committed\"\n    /\\ resolved' = TRUE",
        "    /\\ (turn = \"committed\" \\/ ending)\n    /\\ resolved' = TRUE")],
      "ResultOnlyAfterDurableEnd"),
     ("Resumption", "fault injection: a crash loses the saved reply",
-     [("    /\\ ending' = FALSE\n    /\\ UNCHANGED <<turn, turns, autoResumes, asked, notices, delivered,\n"
-       "                   badResume, reply, resolved,",
-       "    /\\ ending' = FALSE\n    /\\ reply' = \"none\"\n"
-       "    /\\ UNCHANGED <<turn, turns, autoResumes, asked, notices, delivered,\n"
-       "                   badResume, resolved,")],
+     [("    /\\ ending' = FALSE\n    /\\ canRerun' = FALSE\n    /\\ UNCHANGED <<turn, turns, savedCrashes, pendingCrashes, autoResumes, asked,\n                   notices, delivered, badResume, reply, resolved, replySaved,",
+       "    /\\ ending' = FALSE\n    /\\ canRerun' = FALSE\n    /\\ reply' = \"none\"\n    /\\ UNCHANGED <<turn, turns, savedCrashes, pendingCrashes, autoResumes, asked,\n                   notices, delivered, badResume, resolved, replySaved,")],
      "SavedAnswerNotRequested"),
     # Witness: no code change; NoDelivery is added to the .cfg and must be
     # violated, proving that a resume really delivers a saved reply.
