@@ -7,9 +7,9 @@
 (* still open.                                                             *)
 (*                                                                         *)
 (* Each core event is one action with the same name: Started, Stopped,     *)
-(* OwnerAdded, OwnerRemoved, Request, Authorized, CallFinished, ReplyDone, *)
-(* and ClientGone. The environment acts through the values those events    *)
-(* carry and through Crash:                                                *)
+(* OwnerAdded, Follow, Unfollow, OwnerRemoved, Request, Authorized,        *)
+(* CallFinished, ReplyDone, and ClientGone. The environment acts through   *)
+(* the values those events carry and through Crash:                        *)
 (*   - a client can present any token: the current one, one revoked by a  *)
 (*     restart or a subagent's end, or a forged one, and any version;      *)
 (*   - every answer the shell owes can be late, duplicated, or name a      *)
@@ -20,10 +20,10 @@
 (* A second process is not modeled: the core lives in one fx process, and  *)
 (* a second fx process has its own bridge, socket, and tokens.             *)
 (*                                                                         *)
-(* open, registered, next, and entries are `abstract(state)` in the code.  *)
-(* out is the effects the step returned, and act is the event the step     *)
-(* took, recorded so the laws can name it. Tokens are names here; in the   *)
-(* code they are 32 random bytes the shell makes.                          *)
+(* open, registered, followed, next, and entries are `abstract(state)` in  *)
+(* the code. out is the effects the step returned, and act is the event    *)
+(* the step took, recorded so the laws can name it. Tokens are names here; *)
+(* in the code they are 32 random bytes the shell makes.                   *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -39,7 +39,7 @@ Ids == 0..(MaxIds - 1)
 Stages == {"authorizing", "calling", "replying", "abandoned_auth", "abandoned_call"}
 Outcomes == {"ok", "tool_error", "failed"}
 ReplyOutcomes == Outcomes \cup {"denied"}
-Reasons == {"closed", "unauthorized", "unsupported_version", "busy"}
+Reasons == {"closed", "unauthorized", "unsupported_version", "not_followed", "busy"}
 Drops == {"stale", "result_dropped", "reply_lost"}
 
 Entries == [id: Ids, owner: Owners, stage: Stages]
@@ -54,6 +54,8 @@ Effects == [kind: {"refuse"}, reason: Reasons]
 Acts == [name: {"Init", "Stopped", "Crash"}]
         \cup [name: {"Started"}, token: Tokens]
         \cup [name: {"OwnerAdded"}, owner: Owners, token: Tokens]
+        \cup [name: {"Follow"}, owner: Owners]
+        \cup [name: {"Unfollow"}, owner: Owners, cancel: BOOLEAN]
         \cup [name: {"OwnerRemoved"}, owner: Owners]
         \cup [name: {"Request"}, token: Presented, version: Versions]
         \cup [name: {"Authorized"}, id: Ids, allow: BOOLEAN]
@@ -61,9 +63,9 @@ Acts == [name: {"Init", "Stopped", "Crash"}]
         \cup [name: {"ReplyDone"}, id: Ids, delivered: BOOLEAN]
         \cup [name: {"ClientGone"}, id: Ids]
 
-VARIABLES open, registered, next, entries, out, act
+VARIABLES open, registered, followed, next, entries, out, act
 
-vars == <<open, registered, next, entries, out, act>>
+vars == <<open, registered, followed, next, entries, out, act>>
 
 EntryIds == {e.id : e \in entries}
 Entry(i) == CHOOSE e \in entries : e.id = i
@@ -92,17 +94,21 @@ AbandonAll(S) ==
     /\ entries' = {IF e \in S THEN Abandon(e) ELSE e : e \in entries}
     /\ out' = UNION {LetGo(e) : e \in S}
 
+IsFollowed(o) == o = "main" \/ o \in followed
+
 \* `refusal`: the first check a request fails, or "none".
 FirstRefusal(t, v) ==
     CASE ~open -> "closed"
       [] t \notin InUse -> "unauthorized"
       [] v # 1 -> "unsupported_version"
+      [] ~IsFollowed(TokenOwner(t)) -> "not_followed"
       [] Cardinality(entries) >= MaxInFlight -> "busy"
       [] OTHER -> "none"
 
 Init ==
     /\ open = FALSE
     /\ registered = {}
+    /\ followed = {}
     /\ next = 0
     /\ entries = {}
     /\ out = {}
@@ -114,9 +120,10 @@ Started(t) ==
     /\ act' = [name |-> "Started", token |-> t]
     /\ out' = {}
     /\ IF open
-       THEN UNCHANGED <<open, registered>>
+       THEN UNCHANGED <<open, registered, followed>>
        ELSE /\ open' = TRUE
             /\ registered' = {[owner |-> "main", token |-> t]}
+            /\ followed' = {}
     /\ UNCHANGED <<next, entries>>
 
 \* The session ends (quit, /new, /resume): every token is revoked and all
@@ -125,30 +132,56 @@ Stopped ==
     /\ act' = [name |-> "Stopped"]
     /\ IF open
        THEN /\ open' = FALSE
+            /\ followed' = {}
             /\ registered' = {}
             /\ AbandonAll(entries)
        ELSE /\ out' = {}
-            /\ UNCHANGED <<open, registered, entries>>
+            /\ UNCHANGED <<open, registered, followed, entries>>
     /\ UNCHANGED next
 
-\* A subagent starts and gets its own token.
+\* A subagent or command starts and gets its own token, initially unfollowed.
 OwnerAdded(o, t) ==
     /\ act' = [name |-> "OwnerAdded", owner |-> o, token |-> t]
     /\ out' = {}
     /\ IF open /\ o \notin RegOwners /\ t \notin InUse
        THEN registered' = registered \cup {[owner |-> o, token |-> t]}
        ELSE UNCHANGED registered
-    /\ UNCHANGED <<open, next, entries>>
+    /\ UNCHANGED <<open, followed, next, entries>>
 
-\* A subagent ends: its token is revoked and its work let go. The session's
+\* A shell call now follows this owner and lends its permission check.
+Follow(o) ==
+    /\ act' = [name |-> "Follow", owner |-> o]
+    /\ out' = {}
+    /\ IF o # "main" /\ o \in RegOwners
+       THEN followed' = followed \cup {o}
+       ELSE UNCHANGED followed
+    /\ UNCHANGED <<open, registered, next, entries>>
+
+\* A shell call stopped following this owner; with `cancel`, its work is let
+\* go, while keeping the owner and its token.
+Unfollow(o, cancel) ==
+    /\ act' = [name |-> "Unfollow", owner |-> o, cancel |-> cancel]
+    /\ IF o # "main" /\ o \in RegOwners
+       THEN /\ registered' = registered
+            /\ followed' = followed \ {o}
+            /\ IF cancel
+               THEN AbandonAll({e \in entries : e.owner = o})
+               ELSE /\ out' = {}
+                    /\ UNCHANGED entries
+       ELSE /\ out' = {}
+            /\ UNCHANGED <<registered, followed, entries>>
+    /\ UNCHANGED <<open, next>>
+
+\* A command ends: its token is revoked and its work let go. The session's
 \* own owner leaves only with Stopped.
 OwnerRemoved(o) ==
     /\ act' = [name |-> "OwnerRemoved", owner |-> o]
     /\ IF o # "main" /\ o \in RegOwners
        THEN /\ registered' = {r \in registered : r.owner # o}
+            /\ followed' = followed \ {o}
             /\ AbandonAll({e \in entries : e.owner = o})
        ELSE /\ out' = {}
-            /\ UNCHANGED <<registered, entries>>
+            /\ UNCHANGED <<registered, followed, entries>>
     /\ UNCHANGED <<open, next>>
 
 \* A client sent one complete request line.
@@ -158,12 +191,12 @@ Request(t, v) ==
     /\ LET reason == FirstRefusal(t, v) IN
        IF reason # "none"
        THEN /\ out' = {[kind |-> "refuse", reason |-> reason]}
-            /\ UNCHANGED <<open, registered, next, entries>>
+            /\ UNCHANGED <<open, registered, followed, next, entries>>
        ELSE LET e == [id |-> next, owner |-> TokenOwner(t), stage |-> "authorizing"] IN
             /\ entries' = entries \cup {e}
             /\ next' = next + 1
             /\ out' = {[kind |-> "authorize", id |-> e.id, owner |-> e.owner]}
-            /\ UNCHANGED <<open, registered>>
+            /\ UNCHANGED <<open, registered, followed>>
 
 \* The permission check answered.
 Authorized(i, allow) ==
@@ -180,7 +213,7 @@ Authorized(i, allow) ==
          [] OTHER ->
               /\ entries' = entries
               /\ out' = {Log(i, "stale")}
-    /\ UNCHANGED <<open, registered, next>>
+    /\ UNCHANGED <<open, registered, followed, next>>
 
 \* The MCP call ended. A call cancelled before it finished ends "failed".
 CallFinished(i, o) ==
@@ -194,7 +227,7 @@ CallFinished(i, o) ==
          [] OTHER ->
               /\ entries' = entries
               /\ out' = {Log(i, "stale")}
-    /\ UNCHANGED <<open, registered, next>>
+    /\ UNCHANGED <<open, registered, followed, next>>
 
 \* The shell finished writing a reply, or could not.
 ReplyDone(i, delivered) ==
@@ -204,7 +237,7 @@ ReplyDone(i, delivered) ==
             /\ out' = IF delivered THEN {} ELSE {Log(i, "reply_lost")}
        ELSE /\ entries' = entries
             /\ out' = {Log(i, "stale")}
-    /\ UNCHANGED <<open, registered, next>>
+    /\ UNCHANGED <<open, registered, followed, next>>
 
 \* The client's connection closed: the command ended or was cancelled.
 ClientGone(i) ==
@@ -214,7 +247,7 @@ ClientGone(i) ==
             /\ out' = LetGo(Entry(i))
        ELSE /\ entries' = entries
             /\ out' = {}
-    /\ UNCHANGED <<open, registered, next>>
+    /\ UNCHANGED <<open, registered, followed, next>>
 
 \* The process dies; the next one starts from the core's zero state. Its
 \* clients' connections die with it.
@@ -222,6 +255,7 @@ Crash ==
     /\ act' = [name |-> "Crash"]
     /\ open' = FALSE
     /\ registered' = {}
+    /\ followed' = {}
     /\ next' = 0
     /\ entries' = {}
     /\ out' = {}
@@ -230,6 +264,8 @@ Next ==
     \/ \E t \in Tokens : Started(t)
     \/ Stopped
     \/ \E o \in Owners, t \in Tokens : OwnerAdded(o, t)
+    \/ \E o \in Owners : Follow(o)
+    \/ \E o \in Owners, c \in BOOLEAN : Unfollow(o, c)
     \/ \E o \in Owners : OwnerRemoved(o)
     \/ \E t \in Presented, v \in Versions : Request(t, v)
     \/ \E i \in Ids, a \in BOOLEAN : Authorized(i, a)
@@ -268,6 +304,7 @@ IdEvents == {"Authorized", "CallFinished", "ReplyDone", "ClientGone"}
 TypeOK ==
     /\ open \in BOOLEAN
     /\ registered \subseteq Registrations
+    /\ followed \subseteq (Owners \ {"main"})
     /\ next \in 0..MaxIds
     /\ entries \subseteq Entries
     /\ out \subseteq Effects
@@ -278,7 +315,7 @@ TypeOK ==
 Bounded ==
     /\ Cardinality(entries) <= MaxInFlight
     /\ Cardinality(out) <= MaxInFlight
-    /\ Cardinality(out) > 1 => act.name \in {"Stopped", "OwnerRemoved"}
+    /\ Cardinality(out) > 1 => act.name \in {"Stopped", "Unfollow", "OwnerRemoved"}
     /\ \A i \in EntryIds : Cardinality({e \in entries : e.id = i}) = 1
     /\ \A o \in Owners : Cardinality({r \in registered : r.owner = o}) <= 1
     /\ \A t \in Tokens : Cardinality({r \in registered : r.token = t}) <= 1
@@ -295,10 +332,10 @@ EffectsCarryEntryOwner ==
 LiveWorkHasOwner == \A x \in entries : x.stage \in Live => x.owner \in {r.owner : r \in registered}
 
 \* L10: a closed bridge holds no token and starts no prompt or call.
-ClosedIsQuiet == ~open => (registered = {} /\ \A e \in out : e.kind \notin {"authorize", "call"})
+ClosedIsQuiet == ~open => (registered = {} /\ followed = {} /\ \A e \in out : e.kind \notin {"authorize", "call"})
 
 \* L14: a new process starts from nothing.
-CrashResets == act.name \in {"Init", "Crash"} => (~open /\ registered = {} /\ next = 0 /\ entries = {} /\ out = {})
+CrashResets == act.name \in {"Init", "Crash"} => (~open /\ registered = {} /\ followed = {} /\ next = 0 /\ entries = {} /\ out = {})
 
 \* L1: a request is admitted only on an open bridge, with a token in force,
 \* the supported version, and a free slot. Its entry waits for the permission
@@ -315,19 +352,22 @@ AdmitOnlyValid ==
                                  /\ \E r \in registered : r.token = act'.token /\ r.owner = e.owner]_vars
 
 \* L2: a refused request changes nothing and gets one reason, the first check
-\* it failed in the order closed, unauthorized, version, busy. A client without
-\* a token in force learns nothing about versions or load.
+\* it failed in the order closed, unauthorized, version, not_followed, busy. A
+\* client without a token in force learns nothing about versions, followers, or load.
 RefusalsAreQuiet ==
     [][(\E e \in out' : e.kind = "refuse") =>
           /\ act'.name = "Request"
           /\ Cardinality(out') = 1
-          /\ UNCHANGED <<open, registered, next, entries>>
+          /\ UNCHANGED <<open, registered, followed, next, entries>>
           /\ LET reason == (CHOOSE e \in out' : TRUE).reason
                  known == \E r \in registered : r.token = act'.token
+                 owner == TokenOwner(act'.token)
+                 ok_follow == owner = "main" \/ owner \in followed
              IN /\ (reason = "closed") <=> ~open
                 /\ (reason = "unauthorized") <=> (open /\ ~known)
                 /\ (reason = "unsupported_version") => (open /\ known /\ act'.version # 1)
-                /\ (reason = "busy") => (open /\ known /\ act'.version = 1 /\ Cardinality(entries) >= MaxInFlight)]_vars
+                /\ (reason = "not_followed") => (open /\ known /\ act'.version = 1 /\ ~ok_follow)
+                /\ (reason = "busy") => (open /\ known /\ act'.version = 1 /\ ok_follow /\ Cardinality(entries) >= MaxInFlight)]_vars
 
 \* L3: each admission takes the next id, and only an admission or a new
 \* process moves it.
@@ -369,7 +409,7 @@ ReplyMatchesOutcome ==
 \* disconnect after the work ended is expected and says nothing.
 StaleIsQuiet ==
     [][(act'.name \in IdEvents /\ ~\E x \in entries : x.id = act'.id /\ <<act'.name, x.stage>> \in Expected) =>
-          /\ UNCHANGED <<open, registered, next, entries>>
+          /\ UNCHANGED <<open, registered, followed, next, entries>>
           /\ out' = IF act'.name = "ClientGone" THEN {} ELSE {[kind |-> "log", id |-> act'.id, what |-> "stale"]}]_vars
 
 \* L12: user data the core drops is logged with its request id: a result for
@@ -383,4 +423,18 @@ DroppedStateIsLogged ==
 \* L15: every request the core admits leaves the table, given the answers the
 \* shell owes.
 Drained == \A i \in Ids : (i \in EntryIds) ~> (i \notin EntryIds)
+
+\* L16: an admission happens only for main or a followed owner.
+AdmitOnlyFollowed ==
+    [][\A i \in {e.id : e \in entries'} \ EntryIds :
+          \E e \in entries' : e.id = i /\ (e.owner = "main" \/ e.owner \in followed)]_vars
+
+\* L17: Unfollow never removes the owner or revokes its token.
+UnfollowKeepsOwner ==
+    [][act'.name = "Unfollow" => registered' = registered]_vars
+
+\* L18: after Unfollow with cancel, no entry of that owner is authorizing or calling.
+CancelLetsGo ==
+    [][(act'.name = "Unfollow" /\ act'.owner # "main" /\ act'.cancel) =>
+          ~\E e \in entries' : e.owner = act'.owner /\ e.stage \in Live]_vars
 =============================================================================
