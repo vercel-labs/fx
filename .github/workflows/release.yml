@@ -14,8 +14,8 @@ permissions:
   contents: read
 
 # Every push to main starts Release, and check-version skips the pushes that
-# do not change the version. queue: max keeps all waiting runs in order, so a
-# later push can never replace a waiting version-bump run.
+# do not change the version. queue: max keeps up to 100 waiting runs in order,
+# so a later push can never replace a waiting version-bump run.
 concurrency:
   group: stable-release
   cancel-in-progress: false
