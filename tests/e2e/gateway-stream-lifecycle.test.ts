@@ -17178,4 +17178,79 @@ describe("fx ask --json error_kind", () => {
       rmSync(root.root, { recursive: true, force: true });
     }
   });
+
+  test("step_limit turn followed by subagent-mail follow-up keeps error_kind step_limit", async () => {
+    const root = createFixtureRoot("error-kind-step-limit-followup");
+    const tracePath = join(root.root, "trace.log");
+    let sawFollowUp = false;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (isSubagentRequest(body, "worker")) {
+        return fakeGatewayFinalText("WORKER_REPORT_READY");
+      }
+      if (latestUserMessage(body).includes(REPORT_HEADER)) {
+        sawFollowUp = true;
+        return fakeGatewayFinalText("FOLLOWUP_AFTER_STEP_LIMIT");
+      }
+      return fakeGatewayToolCall("msg_worker", "subagent", {
+        request: { action: "message", agent: "worker", message: "Report back." },
+      });
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Start worker and stop at step limit."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MAX_AGENT_STEPS: "1",
+          },
+          timeoutMs: 30_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      expect(sawFollowUp).toBe(true);
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBeUndefined();
+      expect(json.error_kind).toBe("step_limit");
+      expect(json.output).toContain("FOLLOWUP_AFTER_STEP_LIMIT");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("malformed tool-call exhaustion leaves error_kind absent", async () => {
+    const root = createFixtureRoot("error-kind-malformed-exhausted");
+    const tracePath = join(root.root, "trace.log");
+    const malformed = () =>
+      fakeGatewaySse([
+        { type: "finish", finishReason: { unified: "error", raw: "MALFORMED_FUNCTION_CALL" } },
+      ]);
+    const responses = [malformed(), malformed(), malformed()];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Trigger malformed tool-call exhaustion."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBeUndefined();
+      expect(Object.prototype.hasOwnProperty.call(json, "error_kind")).toBe(false);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
 });
