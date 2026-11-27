@@ -29,6 +29,7 @@ const scripts = [
   "test-native-host-tool-frame-limit.mjs",
   "test-native-core-cancel-before-fetch.mjs",
   "test-native-core-cancel.mjs",
+  "test-native-core-libfx-new-reap.mjs",
   "test-native-host-tool-late-settle.mjs",
   "test-default-import.mjs",
   "test-list-models.mjs",
