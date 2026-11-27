@@ -52,6 +52,8 @@ esac""")
             "llvm-profdata",
             "llvm-ar",
             "llvm-nm",
+            "llvm-link",
+            "llvm-split",
         ):
             self.write_llvm_tool(name)
         self.write_clang()
@@ -252,6 +254,18 @@ case "$3" in
 esac""",
         )
         with self.assertRaisesRegex(PgsoError, "invalid macOS SDK version"):
+            self.discover()
+
+    def test_discover_resolves_llvm_link_and_llvm_split_inside_the_root(self) -> None:
+        toolchain = self.discover()
+
+        self.assertEqual((self.llvm_bin / "llvm-link").resolve(), toolchain.llvm_link)
+        self.assertEqual((self.llvm_bin / "llvm-split").resolve(), toolchain.llvm_split)
+
+    def test_discover_rejects_a_missing_llvm_split(self) -> None:
+        (self.llvm_bin / "llvm-split").unlink()
+
+        with self.assertRaisesRegex(PgsoError, "missing executable: llvm-split"):
             self.discover()
 
 
