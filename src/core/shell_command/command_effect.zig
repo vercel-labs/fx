@@ -1246,14 +1246,22 @@ fn expectArgv(expected: []const []const u8, actual: []const []const u8) !void {
     }
 }
 
+/// Appends `value` as one single-quoted shell word. Single quotes cannot be
+/// escaped inside single quotes, so each one closes the word, adds an escaped
+/// quote, and reopens it.
 fn appendShellSingleQuoted(
     list: *std.ArrayList(u8),
     alloc: std.mem.Allocator,
     value: []const u8,
 ) !void {
-    std.debug.assert(std.mem.findScalar(u8, value, '\'') == null);
     try list.append(alloc, '\'');
-    try list.appendSlice(alloc, value);
+    for (value) |byte| {
+        if (byte == '\'') {
+            try list.appendSlice(alloc, "'\\''");
+        } else {
+            try list.append(alloc, byte);
+        }
+    }
     try list.append(alloc, '\'');
 }
 
@@ -1271,6 +1279,12 @@ fn buildPrintfCommand(
         try appendShellSingleQuoted(&command, alloc, value);
     }
     return command.toOwnedSlice(alloc);
+}
+
+test "shell quoting writes a single quote as close, escaped quote, reopen" {
+    const command = try buildPrintfCommand(std.testing.allocator, "%s", &.{"it's"});
+    defer std.testing.allocator.free(command);
+    try std.testing.expectEqualStrings("printf '%s' 'it'\\''s'", command);
 }
 
 fn expectNativePrintfEquivalent(command: []const u8, target_os: std.Target.Os.Tag) !void {
