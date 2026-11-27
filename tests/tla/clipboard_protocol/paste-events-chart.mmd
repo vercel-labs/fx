@@ -1,0 +1,62 @@
+stateDiagram-v2
+    [*] --> IdleWithPasteModeOn: fx starts outside tmux and turns on paste events
+    [*] --> ImageDroppedToday: Today's code never turns on paste events [breaks PasteWithImageAttaches]
+
+    IdleWithPasteModeOn --> ReadingMimeList: You paste (terminal sends OK with password)
+    ReadingMimeList --> WaitingForReply: Listing finishes; fx requests image (composer) or text (composer or modal)
+    ReadingMimeList --> IdleWithPasteModeOn: Decision prompt or empty/unknown list (no read; notice or drop)
+
+    WaitingForReply --> ReceivingPayload: Terminal starts reply with OK
+    WaitingForReply --> IdleWithPasteModeOn: Terminal denies (EPERM) or reply times out (notice)
+    ReceivingPayload --> IdleWithPasteModeOn: Payload finishes (image attached or text pasted) or stalls (notice)
+
+    IdleWithPasteModeOn --> BusyReadOpen: You press Ctrl+V (a read is open)
+    BusyReadOpen --> IdleWithPasteModeOn: Ctrl+V read finishes, or incoming paste listing dropped with busy notice
+
+    IdleWithPasteModeOn --> Suspended: You press Ctrl+Z (paste events turned off)
+    Suspended --> IdleWithPasteModeOn: You resume fx (paste events turned back on)
+    IdleWithPasteModeOn --> Exited: Normal exit, signal, or hangup (paste events turned off)
+    Exited --> [*]
+
+    ReceivingPayload --> WrongOwnerText: Mutant paste_uses_current_owner routes text after owner key change [breaks PasteTextToRecordedOwner]
+    IdleWithPasteModeOn --> ModeLeftOnAfterExit: Mutant no_exit_mode_reset leaves paste events on at exit or Ctrl+Z [breaks ModeOffAfterExit]
+    ReadingMimeList --> ModalImageAttach: Mutant paste_attach_in_modal requests image in modal [breaks NoImageOutsideComposer]
+    BusyReadOpen --> OverlappingReadAccepted: Mutant listing_while_busy_accepted accepts paste while read open [breaks OneRequestAtATime]
+    WaitingForReply --> HungWaitingForReply: Mutant no_reply_deadline stalls forever [breaks EveryPasteEventSettles]
+
+    note right of WrongOwnerText
+        Shortest broken path (paste_uses_current_owner):
+        IdleWithPasteModeOn -> ReadingMimeList (recorded composer) -> key switches to modal -> ReceivingPayload -> WrongOwnerText
+    end note
+
+    note right of ModeLeftOnAfterExit
+        Shortest broken path (no_exit_mode_reset):
+        IdleWithPasteModeOn -> ModeLeftOnAfterExit (1 step on exit or suspend)
+    end note
+
+    note right of ModalImageAttach
+        Shortest broken path (paste_attach_in_modal):
+        IdleWithPasteModeOn (modal) -> ReadingMimeList -> ModalImageAttach
+    end note
+
+    note right of OverlappingReadAccepted
+        Shortest broken path (listing_while_busy_accepted):
+        IdleWithPasteModeOn -> BusyReadOpen (Ctrl+V) -> OverlappingReadAccepted (you paste)
+    end note
+
+    note right of HungWaitingForReply
+        Shortest broken path (no_reply_deadline):
+        IdleWithPasteModeOn -> ReadingMimeList -> WaitingForReply -> HungWaitingForReply (terminal stalls)
+    end note
+
+    note right of ImageDroppedToday
+        Shortest broken path (current-today):
+        [*] -> ImageDroppedToday (you paste image in composer while mode 5522 is off)
+    end note
+
+    %% Omitted from chart (folded into existing transitions):
+    %%   - Keys arriving between packets that do not change the prompt owner
+    %%   - Suspend/Resume or Exit occurring mid-listing or mid-reply (turns off mode 5522 the same way)
+    %%   - Terminal returning too-large payload (shares stall/notice settlement path)
+    %%   - Second read reusing a spent single-use password (shares terminal EPERM notice path)
+    %%   - Busy listing arriving while an earlier paste read (not Ctrl+V) is open (shares BusyReadOpen path)

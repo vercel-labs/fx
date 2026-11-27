@@ -25,4 +25,11 @@ ClipboardRead ClipboardRead-no_mode_deadline temporal -deadlock
 ClipboardRead ClipboardRead-resync_timeout NoReplyInComposer -deadlock
 ClipboardRead ClipboardRead-type_stalled_start NoReplyInComposer -deadlock
 ClipboardRead ClipboardRead-no_start_resync NoReplyInComposer -deadlock
+PasteEvents PasteEvents - -deadlock
+PasteEvents PasteEvents-paste_uses_current_owner PasteTextToRecordedOwner -deadlock
+PasteEvents PasteEvents-no_exit_mode_reset ModeOffAfterExit -deadlock
+PasteEvents PasteEvents-paste_attach_in_modal NoImageOutsideComposer -deadlock
+PasteEvents PasteEvents-listing_while_busy_accepted OneRequestAtATime -deadlock
+PasteEvents PasteEvents-no_reply_deadline temporal -deadlock
+PasteEvents PasteEvents-current-today temporal -deadlock
 CHECKS
