@@ -9568,7 +9568,7 @@ test "processQueuedPrompt sends a refused request again with the team a reload r
     try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
     try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "not allowed for this team") != null);
     try std.testing.expectEqualStrings(
-        "fx sent this request for the Vercel team team-a. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+        "fx sent this request for the Vercel team team-a.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.",
         hooks.system_notices.items[1],
     );
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
@@ -9621,7 +9621,7 @@ test "processQueuedPrompt names a refused login's team by its id when the login 
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
-    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[1], "for the Vercel team team_a. If that is the wrong team") != null);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[1], "for the Vercel team team_a.\n└ Wrong team?") != null);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
@@ -9654,7 +9654,7 @@ test "processQueuedPrompt names a refused login's team by its id when its slug i
 
     try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
     try std.testing.expectEqualStrings(
-        "fx sent this request for the Vercel team team_a. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+        "fx sent this request for the Vercel team team_a.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.",
         hooks.system_notices.items[1],
     );
 }
@@ -9687,7 +9687,7 @@ test "processQueuedPrompt names no team for a refused login whose slug and id ar
 
     try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
     try std.testing.expectEqualStrings(
-        "fx sent this request for this login's Vercel team. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+        "fx sent this request for this login's Vercel team.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.",
         hooks.system_notices.items[1],
     );
 }

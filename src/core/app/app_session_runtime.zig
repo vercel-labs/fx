@@ -10885,7 +10885,7 @@ test "resumeRequestedSession preserves failed partial terminal reason" {
 
     try std.testing.expect(std.mem.find(u8, app.assistant_text.items, "partial response") != null);
     try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
-    try std.testing.expectEqualStrings("✗ system: failed", app.notices.items[1]);
+    try std.testing.expectEqualStrings("✗ Failed", app.notices.items[1]);
     try std.testing.expect(std.mem.find(u8, app.notices.items[1], "cancelled") == null);
 }
 

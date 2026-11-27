@@ -1078,6 +1078,12 @@ fn codeSpanUrlEnd(content: []const u8) ?usize {
     return end;
 }
 
+/// End of the bare http(s) URL that starts at `start`, or null, by the rules assistant text links bare URLs with.
+pub fn bareUrlEnd(text: []const u8, start: usize) ?usize {
+    const link = parseBareUrl(text, start, false) orelse return null;
+    return link.end;
+}
+
 /// Bare URL starting at `start`, or null. The extent does not depend on any
 /// emphasis state: it ends at whitespace or a closing bracket, and trailing
 /// punctuation, including `*`, `_`, and `~`, is left outside the link the
