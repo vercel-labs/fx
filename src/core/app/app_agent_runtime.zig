@@ -2618,9 +2618,8 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     };
     try app.permission_engine.allow(alloc, "run_command", "/tmp/workspace::zig build");
 
-    const web_search_model_before = app.web_search_runtime.workerModel();
-    const web_search_retry_before = app.web_search_runtime.gateway_retry_count;
-    const web_search_url_before = app.web_search_runtime.gatewayChatUrl();
+    var web_search_before = try app.web_search_runtime.inputsSnapshot(alloc);
+    defer web_search_before.deinit(alloc);
     const ctx = testToolContext(&app);
     try std.testing.expectEqualStrings("/tmp/workspace", ctx.workspace_root);
     // The call's sign-in comes from its own lease (`applyCredentialLease`), so
@@ -2661,9 +2660,11 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     // call configures it from its own sign-in when it runs
     // (`src/core/app/app_agent_runtime.zig` "a tool call keeps the sign-in a
     // refresh replaces, and web search follows the app's").
-    try std.testing.expectEqualStrings(web_search_model_before, app.web_search_runtime.workerModel());
-    try std.testing.expectEqual(web_search_retry_before, app.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(web_search_url_before, app.web_search_runtime.gatewayChatUrl());
+    var web_search_after = try app.web_search_runtime.inputsSnapshot(alloc);
+    defer web_search_after.deinit(alloc);
+    try std.testing.expectEqualStrings(web_search_before.worker_model, web_search_after.worker_model);
+    try std.testing.expectEqual(web_search_before.gateway_retry_count, web_search_after.gateway_retry_count);
+    try std.testing.expectEqualStrings(web_search_before.gateway_chat_url, web_search_after.gateway_chat_url);
     try std.testing.expectEqualStrings("/models", ctx.gateway_models_path);
     try std.testing.expectEqual(@as(usize, 4096), ctx.max_tool_result_bytes);
     try std.testing.expectEqual(types.ToolChoice.none, ctx.first_call_tool_choice);
@@ -2802,7 +2803,11 @@ test "app prompt projection configures web search then blocks native execution" 
     try Runtime(FakeApp).appendStaticContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try app.appendRuntimeContextMessage(app.agent(), arena, &messages);
 
-    try std.testing.expectEqualStrings("stale-key", app.web_search_runtime.apiKey());
+    {
+        var live = try app.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("stale-key", live.api_key);
+    }
 
     const validation = try app.validateToolCall(app.agent(), arena, .{
         .id = "search",
@@ -2814,10 +2819,14 @@ test "app prompt projection configures web search then blocks native execution" 
     // borrowed, so the runtime keeps what it was last given
     // (`src/core/app/app_agent_runtime.zig` "a tool call keeps the sign-in a
     // refresh replaces, and web search follows the app's").
-    try std.testing.expectEqualStrings("stale-key", app.web_search_runtime.apiKey());
-    try std.testing.expectEqualStrings("stale-model", app.web_search_runtime.workerModel());
-    try std.testing.expectEqual(@as(usize, 99), app.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings("https://stale.invalid/chat", app.web_search_runtime.gatewayChatUrl());
+    {
+        var live = try app.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("stale-key", live.api_key);
+        try std.testing.expectEqualStrings("stale-model", live.worker_model);
+        try std.testing.expectEqual(@as(usize, 99), live.gateway_retry_count);
+        try std.testing.expectEqualStrings("https://stale.invalid/chat", live.gateway_chat_url);
+    }
 
     // The call configures it from the turn's own copy of the sign-in, which its
     // queued prompt owns.
@@ -2837,12 +2846,31 @@ test "app prompt projection configures web search then blocks native execution" 
         .max_tool_result_bytes = 2048,
         .credential = .{ .direct = .{ .secret_bytes = turn_key, .source = .ai_gateway_api_key } },
     });
-    try std.testing.expectEqualStrings(turn_key, app.web_search_runtime.apiKey());
-    try std.testing.expectEqualStrings(app.selected_model.items, app.web_search_runtime.workerModel());
-    try std.testing.expectEqual(@as(usize, 2), app.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(test_gateway_chat_url, app.web_search_runtime.gatewayChatUrl());
+    {
+        var live = try app.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings(turn_key, live.api_key);
+        try std.testing.expectEqualStrings(app.selected_model.items, live.worker_model);
+        try std.testing.expectEqual(@as(usize, 2), live.gateway_retry_count);
+        try std.testing.expectEqualStrings(test_gateway_chat_url, live.gateway_chat_url);
+    }
     try std.testing.expectEqual(.failure, execution.status);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
+}
+
+test "a host-managed lease leaves the call and web search without a key" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    var ctx = testToolContext(&app);
+    Runtime(FakeApp).applyCredentialLease(&app, app.agent(), &ctx, .host_managed, 2, test_gateway_chat_url);
+
+    try std.testing.expectEqual(@as(usize, 0), ctx.api_key.len);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, ctx.credential_source.?);
+    var live = try app.web_search_runtime.inputsSnapshot(alloc);
+    defer live.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), live.api_key.len);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, live.credential_source.?);
 }
 
 test "app ChatGPT route removes Gateway-backed auxiliary capabilities" {
@@ -2908,8 +2936,12 @@ test "a tool call keeps the sign-in a refresh replaces, and web search follows t
     // The call still sends the sign-in it started with, and the runtime it
     // pointed at holds that sign-in as its own copy, not as the lease's slice.
     try std.testing.expectEqualStrings("first-token", ctx.api_key);
-    try std.testing.expectEqualStrings("first-token", app.web_search_runtime.apiKey());
-    try std.testing.expect(app.web_search_runtime.apiKey().ptr != turn_token.ptr);
+    {
+        var live = try app.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("first-token", live.api_key);
+        try std.testing.expect(live.api_key.ptr != turn_token.ptr);
+    }
 }
 
 test "app agent runtime tool context combines active settings with live permission mode" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const js_host_auth = @import("../auth/js_host_auth.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const io_mod = @import("../shared/io.zig");
@@ -43,11 +44,13 @@ pub const Config = struct {
 
 pub const Inputs = web_search_provider.Inputs;
 
-/// The largest value each configured text may hold. The key matches the cap
-/// the sign-in entry uses (`src/core/auth/auth_runtime.zig`
-/// `max_api_key_entry_bytes`); a team slug, a model ID and a gateway URL are
-/// far shorter.
-const max_api_key_bytes = 8 * 1024;
+/// The largest value each configured text may hold. The key's bound is the one
+/// that already caps the largest credential fx stores: the OAuth session
+/// snapshot (`src/core/auth/js_host_auth.zig` `max_session_bytes`), which the
+/// native auth file read shares (`src/core/auth/oauth_session.zig`
+/// `max_auth_file_bytes`). A team slug, a model ID and a gateway URL are far
+/// shorter.
+const max_api_key_bytes = js_host_auth.max_session_bytes;
 const max_gateway_team_bytes = 128;
 const max_worker_model_bytes = 128;
 const max_gateway_chat_url_bytes = 512;
@@ -87,7 +90,9 @@ fn OwnedText(comptime capacity: usize) type {
     };
 }
 
-const OwnedInputs = struct {
+/// What one snapshot of the runtime's texts copies: the sign-in, the team, the
+/// model and the URL. The caller frees it with `deinit`.
+pub const OwnedInputs = struct {
     api_key: []u8,
     credential_source: ?types.CredentialSource = null,
     gateway_team: ?[]u8 = null,
@@ -96,7 +101,7 @@ const OwnedInputs = struct {
     gateway_chat_url: []u8,
     // The usage pointer and allocator borrow the parent session's lifetime.
 
-    fn deinit(self: *OwnedInputs, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedInputs, alloc: Allocator) void {
         alloc.free(self.api_key);
         if (self.gateway_team) |team| alloc.free(team);
         alloc.free(self.worker_model);
@@ -139,8 +144,7 @@ pub const Runtime = struct {
             .credential_source = config.credential_source,
             .gateway_retry_count = config.gateway_retry_count,
         };
-        // No lock: nothing else can see the runtime before `init` returns, and
-        // a `const` runtime is built at comptime.
+        // No lock: nothing else can see the runtime before `init` returns.
         runtime.api_key_text.set(config.api_key, "api_key");
         if (config.gateway_team) |team| runtime.gateway_team_text.set(team, "gateway_team");
         runtime.worker_model_text.set(config.worker_model, "worker_model");
@@ -167,37 +171,6 @@ pub const Runtime = struct {
         self.worker_model_text.set(inputs.worker_model, "worker_model");
         self.gateway_retry_count = inputs.gateway_retry_count;
         self.gateway_chat_url_text.set(inputs.gateway_chat_url, "gateway_chat_url");
-    }
-
-    // The four readers below are for tests. Each returns a view into the
-    // runtime's buffer after its lock is released, so a `configure` on another
-    // thread can rewrite those bytes under the caller. Code that sends uses
-    // `inputsSnapshot`, which copies under the lock.
-
-    /// The sign-in it sends.
-    pub fn apiKey(self: *Runtime) []const u8 {
-        self.config_mutex.lockUncancelable(io_mod.getIo());
-        defer self.config_mutex.unlock(io_mod.getIo());
-        return self.api_key_text.slice();
-    }
-
-    pub fn gatewayTeam(self: *Runtime) ?[]const u8 {
-        self.config_mutex.lockUncancelable(io_mod.getIo());
-        defer self.config_mutex.unlock(io_mod.getIo());
-        if (self.gateway_team_text.len == 0) return null;
-        return self.gateway_team_text.slice();
-    }
-
-    pub fn workerModel(self: *Runtime) []const u8 {
-        self.config_mutex.lockUncancelable(io_mod.getIo());
-        defer self.config_mutex.unlock(io_mod.getIo());
-        return self.worker_model_text.slice();
-    }
-
-    pub fn gatewayChatUrl(self: *Runtime) []const u8 {
-        self.config_mutex.lockUncancelable(io_mod.getIo());
-        defer self.config_mutex.unlock(io_mod.getIo());
-        return self.gateway_chat_url_text.slice();
     }
 
     pub fn dispatchBackend(self: *Runtime) tool_dispatch.WebSearchBackend {
@@ -292,7 +265,10 @@ pub const Runtime = struct {
         };
     }
 
-    fn inputsSnapshot(self: *Runtime, alloc: Allocator) !OwnedInputs {
+    /// What the requests that follow send, owned by the caller: every text is
+    /// copied under the config lock, so a `configure` on another thread cannot
+    /// rewrite them. The caller frees the result.
+    pub fn inputsSnapshot(self: *Runtime, alloc: Allocator) !OwnedInputs {
         self.config_mutex.lockUncancelable(io_mod.getIo());
         defer self.config_mutex.unlock(io_mod.getIo());
         const api_key = try alloc.dupe(u8, self.api_key_text.slice());
@@ -911,10 +887,12 @@ test "web_search runtime updates its worker model during configuration" {
         .gateway_chat_url = "https://gateway.test/chat",
     });
 
-    try std.testing.expectEqualStrings("provider/model", runtime.workerModel());
-    try std.testing.expectEqualStrings("key", runtime.apiKey());
+    var live = try runtime.inputsSnapshot(std.testing.allocator);
+    defer live.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("provider/model", live.worker_model);
+    try std.testing.expectEqualStrings("key", live.api_key);
     try std.testing.expectEqual(@as(usize, 2), runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings("https://gateway.test/chat", runtime.gatewayChatUrl());
+    try std.testing.expectEqualStrings("https://gateway.test/chat", live.gateway_chat_url);
 }
 
 test "web_search input snapshots stay coherent during parallel reconfiguration" {
@@ -971,15 +949,26 @@ test "web search keeps its own copy of what it is configured with" {
         .gateway_retry_count = 3,
         .gateway_chat_url = "https://gateway.test/chat",
     });
-    try std.testing.expectEqualStrings("caller-key", runtime.apiKey());
-    try std.testing.expect(runtime.apiKey().ptr != caller_key.ptr);
+    var live = try runtime.inputsSnapshot(alloc);
+    defer live.deinit(alloc);
+    try std.testing.expectEqualStrings("caller-key", live.api_key);
+    try std.testing.expect(live.api_key.ptr != caller_key.ptr);
     alloc.free(caller_key);
-    try std.testing.expectEqualStrings("caller-key", runtime.apiKey());
-    try std.testing.expectEqualStrings("team-b", runtime.gatewayTeam().?);
+    try std.testing.expectEqualStrings("caller-key", live.api_key);
+    try std.testing.expectEqualStrings("team-b", live.gateway_team.?);
 }
 
 test "a value too long for the runtime clears it instead of keeping the old one" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(tmp_root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ tmp_root, "trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "web_search");
+    defer debug_trace.resetForTest();
     var runtime = Runtime.init(.{
         .api_key = "first-key",
         .worker_model = "first-model",
@@ -1002,6 +991,67 @@ test "a value too long for the runtime clears it instead of keeping the old one"
     try std.testing.expectEqual(@as(usize, 0), snapshot.api_key.len);
     try std.testing.expectEqual(@as(usize, 0), snapshot.worker_model.len);
     try std.testing.expectEqualStrings("https://gateway.test/chat", snapshot.gateway_chat_url);
+
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "configured api_key too long bytes=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "configured worker_model too long bytes=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, " cleared") != null);
+}
+
+fn readTraceFileForTest(alloc: Allocator, trace_path: []const u8) ![]u8 {
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    return io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
+}
+
+test "a value exactly at the cap is kept, for the key and the model" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(.{});
+    defer runtime.deinit();
+    const key_at_cap = try alloc.alloc(u8, max_api_key_bytes);
+    defer alloc.free(key_at_cap);
+    @memset(key_at_cap, 'k');
+    const model_at_cap = try alloc.alloc(u8, max_worker_model_bytes);
+    defer alloc.free(model_at_cap);
+    @memset(model_at_cap, 'm');
+
+    runtime.configure(.{
+        .api_key = key_at_cap,
+        .worker_model = model_at_cap,
+        .gateway_retry_count = 3,
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+
+    var live = try runtime.inputsSnapshot(alloc);
+    defer live.deinit(alloc);
+    try std.testing.expectEqual(max_api_key_bytes, live.api_key.len);
+    try std.testing.expectEqual(max_worker_model_bytes, live.worker_model.len);
+    try std.testing.expectEqual(key_at_cap[0], live.api_key[0]);
+    try std.testing.expectEqual(model_at_cap[0], live.worker_model[0]);
+}
+
+test "a configure with a null team leaves the runtime holding no team" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(.{
+        .api_key = "key",
+        .gateway_team = "team-a",
+        .worker_model = "m",
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+    defer runtime.deinit();
+
+    runtime.configure(.{
+        .api_key = "key",
+        .gateway_team = null,
+        .worker_model = "m",
+        .gateway_retry_count = 3,
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+
+    var live = try runtime.inputsSnapshot(alloc);
+    defer live.deinit(alloc);
+    try std.testing.expect(live.gateway_team == null);
 }
 
 test "a configure and a snapshot share the runtime's own copy" {

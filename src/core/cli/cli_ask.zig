@@ -294,10 +294,18 @@ fn runAskChild(
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
+    // The child copies the sign-in its run owns: the parent's next refresh
+    // frees the token `ctx.toolContext()` points at
+    // (`src/core/cli/cli_ask.zig` "an ask subagent keeps the sign-in a refresh
+    // replaces").
+    var sign_in = ChildSignIn.capture(ctx.alloc, ctx) catch return error.OutOfMemory;
+    defer sign_in.deinit(ctx.alloc);
+    var tool_context = ctx.toolContext();
+    sign_in.apply(&tool_context);
     return subagent_agent_adapter.run(.{
         .toolbox_behind = ctx.toolbox_behind.slice(),
         .host = ctx.subagent_host orelse return error.ProviderFailed,
-        .tool_context = ctx.toolContext(),
+        .tool_context = tool_context,
         .provider_set = ctx.cfg.provider_set,
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(admission.model),
@@ -615,12 +623,58 @@ const StdinSource = union(enum) {
 
 const stdin_prompt_resource_byte_limit: usize = 8 * 1024 * 1024;
 
+/// The sign-in one ask subagent run owns. A parent refresh replaces the key
+/// `AskContext` points at and frees the one it held, while the child still
+/// runs, so the child copies the three values under `credential_mutex`, which
+/// `adoptRefreshedAskCredential` holds while it replaces and frees them
+/// (`src/core/cli/cli_ask.zig` "an ask subagent keeps the sign-in a refresh
+/// replaces").
+const ChildSignIn = struct {
+    api_key: []u8,
+    credential_source: ?types.CredentialSource,
+    account_id: ?[]u8,
+    gateway_team: ?[]u8,
+
+    fn capture(alloc: Allocator, ctx: *AskContext) !ChildSignIn {
+        ctx.credential_mutex.lockUncancelable(io_mod.getIo());
+        defer ctx.credential_mutex.unlock(io_mod.getIo());
+        const api_key = try alloc.dupe(u8, ctx.api_key);
+        errdefer secret.zeroAndFree(alloc, api_key);
+        const account_id = if (ctx.account_id) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (account_id) |value| alloc.free(value);
+        const gateway_team = if (ctx.gateway_team) |value| try alloc.dupe(u8, value) else null;
+        return .{
+            .api_key = api_key,
+            .credential_source = ctx.credential_source,
+            .account_id = account_id,
+            .gateway_team = gateway_team,
+        };
+    }
+
+    /// The child's context sends and reports these copies.
+    fn apply(self: ChildSignIn, tool_ctx: *tool_runtime.Context) void {
+        tool_ctx.api_key = self.api_key;
+        tool_ctx.credential_source = self.credential_source;
+        tool_ctx.account_id = self.account_id;
+        tool_ctx.gateway_team = self.gateway_team;
+    }
+
+    fn deinit(self: *ChildSignIn, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.api_key);
+        if (self.account_id) |value| alloc.free(value);
+        if (self.gateway_team) |value| alloc.free(value);
+    }
+};
+
 const AskContext = struct {
     alloc: Allocator,
     cfg: Config,
     deps: RunDeps,
     workspace_root: []const u8,
     workspace_access: workspace_access.WorkspaceAccess = .{},
+    /// Guards the fields below against a refresh on the turn's thread while a
+    /// subagent's slot thread copies them (`ChildSignIn.capture`).
+    credential_mutex: std.Io.Mutex = .init,
     api_key: []const u8 = "",
     gateway_team: ?[]const u8 = null,
     credential_source: ?types.CredentialSource = null,
@@ -2341,6 +2395,8 @@ fn adoptRefreshedAskCredential(
     worker_alloc: Allocator,
     refreshed: *credentials.Credential,
 ) ![]u8 {
+    ctx.credential_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.credential_mutex.unlock(io_mod.getIo());
     if (ctx.credential_source != refreshed.source) return error.CredentialAuthorityChanged;
     if (!optionalCredentialFieldEqual(ctx.account_id, refreshed.accountId()) or
         !optionalCredentialFieldEqual(ctx.gateway_team, refreshed.gatewayTeam()))
@@ -4763,9 +4819,13 @@ fn testProcessQueuedPromptChecksTimeout(_: *agent_runtime.Agent, deps: *const ag
     try std.testing.expect(tool_ctx.web_fetch_runtime.? == &ctx.web_fetch_runtime);
     try std.testing.expect(tool_ctx.web_fetch_progress_ctx != null);
     try std.testing.expect(tool_ctx.on_web_fetch_progress != null);
-    try std.testing.expectEqualStrings(ctx.model, ctx.web_search_runtime.workerModel());
-    try std.testing.expectEqual(ctx.cfg.gateway_retry_count, ctx.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, ctx.web_search_runtime.gatewayChatUrl());
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(std.testing.allocator);
+        defer live.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(ctx.model, live.worker_model);
+        try std.testing.expectEqual(ctx.cfg.gateway_retry_count, live.gateway_retry_count);
+        try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, live.gateway_chat_url);
+    }
     try std.testing.expect(ctx.web_search_runtime.provider.?.execute_fn == ctx.cfg.provider_set.gateway.fx_search.?.execute_fn);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
     try testPushAssistantText(deps, "assistant text");
@@ -5304,7 +5364,11 @@ test "CLI prompt projection configures web search then blocks native execution" 
     try append_static(deps.ctx, arena, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
-    try std.testing.expectEqualStrings("stale-key", ctx.web_search_runtime.apiKey());
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("stale-key", live.api_key);
+    }
 
     const validate = deps.validate_tool_call orelse return error.TestExpectedEqual;
     const validation = try validate(deps.ctx, arena, .{
@@ -5313,10 +5377,14 @@ test "CLI prompt projection configures web search then blocks native execution" 
         .arguments_json = "{\"query\":\"x\"}",
     });
     try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", validation.failure);
-    try std.testing.expectEqualStrings(ctx.api_key, ctx.web_search_runtime.apiKey());
-    try std.testing.expectEqualStrings(ctx.model, ctx.web_search_runtime.workerModel());
-    try std.testing.expectEqual(ctx.cfg.gateway_retry_count, ctx.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, ctx.web_search_runtime.gatewayChatUrl());
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings(ctx.api_key, live.api_key);
+        try std.testing.expectEqualStrings(ctx.model, live.worker_model);
+        try std.testing.expectEqual(ctx.cfg.gateway_retry_count, live.gateway_retry_count);
+        try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, live.gateway_chat_url);
+    }
 
     const execute = deps.execute_tool_call;
     const execution = try execute(deps.ctx, .{
@@ -5332,10 +5400,14 @@ test "CLI prompt projection configures web search then blocks native execution" 
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = ctx.max_tool_result_bytes,
     });
-    try std.testing.expectEqualStrings(ctx.api_key, ctx.web_search_runtime.apiKey());
-    try std.testing.expectEqualStrings(ctx.model, ctx.web_search_runtime.workerModel());
-    try std.testing.expectEqual(ctx.cfg.gateway_retry_count, ctx.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, ctx.web_search_runtime.gatewayChatUrl());
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings(ctx.api_key, live.api_key);
+        try std.testing.expectEqualStrings(ctx.model, live.worker_model);
+        try std.testing.expectEqual(ctx.cfg.gateway_retry_count, live.gateway_retry_count);
+        try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, live.gateway_chat_url);
+    }
     try std.testing.expectEqual(.failure, execution.status);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
 }

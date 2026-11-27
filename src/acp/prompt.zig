@@ -668,28 +668,47 @@ const AcpContext = struct {
     fn toolSignIn(self: *AcpContext, alloc: Allocator) !ToolSignIn {
         self.state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
         defer self.state.subagent_authority_mutex.unlock(io_mod.getIo());
+        return self.toolSignInLocked(alloc);
+    }
+
+    /// The same copy with `subagent_authority_mutex` already held. A turn with
+    /// a route copies the route it owns; every other turn copies the session's
+    /// sign-in the way `TurnSignIn.captureLocked` does.
+    fn toolSignInLocked(self: *AcpContext, alloc: Allocator) !ToolSignIn {
         const session = if (self.state.active_session) |*active| active else unreachable;
-        const api_key: []const u8 = if (self.route) |route| route.api_key else session.api_key;
-        const credential_source: ?types.CredentialSource = if (self.route) |route| route.credential_source else session.credential_source;
-        const account_id: ?[]const u8 = if (self.route) |route| route.account_id else session.account_id;
-        const gateway_team: ?[]const u8 = if (self.route) |route| route.gateway_team else self.state.gateway_team;
+        if (self.route) |route| {
+            const api_key = try alloc.dupe(u8, route.api_key);
+            errdefer secret.zeroAndFree(alloc, api_key);
+            const account_id = if (route.account_id) |value| try alloc.dupe(u8, value) else null;
+            errdefer if (account_id) |value| alloc.free(value);
+            const gateway_team = if (route.gateway_team) |value| try alloc.dupe(u8, value) else null;
+            return .{
+                .api_key = api_key,
+                .credential_source = route.credential_source,
+                .account_id = account_id,
+                .gateway_team = gateway_team,
+            };
+        }
+        const captured = try TurnSignIn.captureLocked(alloc, self.state, session);
         return .{
-            .api_key = try alloc.dupe(u8, api_key),
-            .credential_source = credential_source,
-            .account_id = if (account_id) |value| try alloc.dupe(u8, value) else null,
-            .gateway_team = if (gateway_team) |value| try alloc.dupe(u8, value) else null,
+            .api_key = captured.api_key,
+            .credential_source = captured.credential_source,
+            .account_id = captured.account_id,
+            .gateway_team = captured.gateway_team,
         };
     }
 
     /// The tool context a call uses, whose sign-in belongs to `alloc`.
+    ///
+    /// The shared web search runtime is configured inside the same locked
+    /// section, because a refresh publishes and re-points it under
+    /// `subagent_authority_mutex` (`server.publishRefreshedCredential`): a
+    /// configure after the unlock would overwrite that newer key with this
+    /// older copy.
     fn toolContext(self: *AcpContext, alloc: Allocator) !tool_runtime.Context {
-        return self.toolContextWithSignIn(try self.toolSignIn(alloc));
-    }
-
-    /// The tool context a call uses, with a sign-in the caller already owns:
-    /// a subagent's turn passes its own route copy, which lives as long as the
-    /// run and is zeroed when it ends (`ModelRoute.deinit`).
-    fn toolContextWithSignIn(self: *AcpContext, sign_in: ToolSignIn) tool_runtime.Context {
+        self.state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer self.state.subagent_authority_mutex.unlock(io_mod.getIo());
+        const sign_in = try self.toolSignInLocked(alloc);
         const session = if (self.state.active_session) |*active| active else unreachable;
         const route = self.routeView(session);
         const provider_capabilities = self.state.cfg.provider_set.select(route.provider).capabilities;
@@ -707,6 +726,16 @@ const AcpContext = struct {
                 .gateway_chat_url = self.state.cfg.gateway_chat_url,
             });
         }
+        return self.toolContextWithSignIn(sign_in);
+    }
+
+    /// The tool context a call uses, with a sign-in the caller already owns:
+    /// a subagent's turn passes its own route copy, which lives as long as the
+    /// run and is zeroed when it ends (`ModelRoute.deinit`).
+    fn toolContextWithSignIn(self: *AcpContext, sign_in: ToolSignIn) tool_runtime.Context {
+        const session = if (self.state.active_session) |*active| active else unreachable;
+        const route = self.routeView(session);
+        const provider_capabilities = self.state.cfg.provider_set.select(route.provider).capabilities;
         var tc: tool_runtime.Context = .{
             .observer = self.observer,
             .workspace_root = self.state.workspace_root,
@@ -1226,6 +1255,12 @@ const TurnSignIn = struct {
     fn capture(alloc: Allocator, state: *server.ServerState, session: *const server.ActiveSessionState) !TurnSignIn {
         state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
         defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+        return captureLocked(alloc, state, session);
+    }
+
+    /// The same copy with `subagent_authority_mutex` already held, for a caller
+    /// that must copy and act under one lock.
+    fn captureLocked(alloc: Allocator, state: *server.ServerState, session: *const server.ActiveSessionState) !TurnSignIn {
         const api_key = try alloc.dupe(u8, session.api_key);
         errdefer secret.zeroAndFree(alloc, api_key);
         const account_id = if (session.account_id) |value| try alloc.dupe(u8, value) else null;
@@ -2735,7 +2770,10 @@ fn resolveModelCapabilities(
     const bundle = ctx.state.cfg.provider_set.select(route.provider);
     var sign_in_arena = std.heap.ArenaAllocator.init(ctx.state.alloc);
     defer sign_in_arena.deinit();
-    const sign_in = ctx.toolSignIn(sign_in_arena.allocator()) catch return bundle.fallbackModelCapabilities(model);
+    const sign_in = ctx.toolSignIn(sign_in_arena.allocator()) catch |err| {
+        debug_trace.logf("acp", "event=model_capabilities_fallback reason=sign_in_copy_failed err={s}", .{@errorName(err)});
+        return bundle.fallbackModelCapabilities(model);
+    };
     return ctx.capabilityResolver().resolveWithin(
         ctx.state.alloc,
         bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model),
@@ -6238,6 +6276,24 @@ test "ACP deps reject malformed native web_search calls" {
     try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", result.failure);
 }
 
+const web_search_runtime_mod = @import("../core/tooling/web_search_runtime.zig");
+
+/// What the runtime holds now, read the way a request reads it: one owned
+/// snapshot taken under the config lock.
+fn expectWebSearchInputs(alloc: Allocator, runtime: *web_search_runtime_mod.Runtime, want: struct {
+    api_key: []const u8,
+    worker_model: []const u8,
+    gateway_retry_count: usize,
+    gateway_chat_url: []const u8,
+}) !void {
+    var live = try runtime.inputsSnapshot(alloc);
+    defer live.deinit(alloc);
+    try std.testing.expectEqualStrings(want.api_key, live.api_key);
+    try std.testing.expectEqualStrings(want.worker_model, live.worker_model);
+    try std.testing.expectEqual(want.gateway_retry_count, live.gateway_retry_count);
+    try std.testing.expectEqualStrings(want.gateway_chat_url, live.gateway_chat_url);
+}
+
 test "ACP prompt projection configures web search then blocks native execution" {
     const alloc = std.testing.allocator;
     const web_search_contract = @import("../core/tooling/web_search_contract.zig");
@@ -6292,7 +6348,11 @@ test "ACP prompt projection configures web search then blocks native execution" 
     try append_static(deps.ctx, arena, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
-    try std.testing.expectEqualStrings("stale-key", state.web_search_runtime.apiKey());
+    {
+        var live = try state.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("stale-key", live.api_key);
+    }
 
     const validate = deps.validate_tool_call orelse return error.TestExpectedEqual;
     const validation = try validate(deps.ctx, arena, .{
@@ -6302,10 +6362,12 @@ test "ACP prompt projection configures web search then blocks native execution" 
     });
     const session = state.active_session orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", validation.failure);
-    try std.testing.expectEqualStrings(session.api_key, state.web_search_runtime.apiKey());
-    try std.testing.expectEqualStrings(session.model, state.web_search_runtime.workerModel());
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gatewayChatUrl());
+    try expectWebSearchInputs(alloc, &state.web_search_runtime, .{
+        .api_key = session.api_key,
+        .worker_model = session.model,
+        .gateway_retry_count = state.cfg.gateway_retry_count,
+        .gateway_chat_url = state.cfg.gateway_chat_url,
+    });
 
     const execute = deps.execute_tool_call;
     const execution = try execute(deps.ctx, .{
@@ -6321,10 +6383,12 @@ test "ACP prompt projection configures web search then blocks native execution" 
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = session.max_tool_result_bytes,
     });
-    try std.testing.expectEqualStrings(session.api_key, state.web_search_runtime.apiKey());
-    try std.testing.expectEqualStrings(session.model, state.web_search_runtime.workerModel());
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gatewayChatUrl());
+    try expectWebSearchInputs(alloc, &state.web_search_runtime, .{
+        .api_key = session.api_key,
+        .worker_model = session.model,
+        .gateway_retry_count = state.cfg.gateway_retry_count,
+        .gateway_chat_url = state.cfg.gateway_chat_url,
+    });
     try std.testing.expectEqual(.failure, execution.status);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
 }
@@ -6832,10 +6896,14 @@ test "ACP prompt agent config carries request options from active session" {
     try std.testing.expect(state.web_search_runtime.provider.?.preferred_backends_fn == state.cfg.provider_set.gateway.fx_search.?.preferred_backends_fn);
     try std.testing.expect(tool_ctx.web_fetch_runtime.? == &state.web_fetch_runtime);
     try std.testing.expectEqualStrings("team_123", tool_ctx.gateway_team.?);
-    try std.testing.expectEqualStrings("team_123", state.web_search_runtime.gatewayTeam().?);
-    try std.testing.expectEqualStrings(session.model, state.web_search_runtime.workerModel());
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gatewayChatUrl());
+    {
+        var live = try state.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("team_123", live.gateway_team.?);
+        try std.testing.expectEqualStrings(session.model, live.worker_model);
+        try std.testing.expectEqual(state.cfg.gateway_retry_count, live.gateway_retry_count);
+        try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, live.gateway_chat_url);
+    }
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
     try std.testing.expect(tool_ctx.ultrafast_mode);
 }
