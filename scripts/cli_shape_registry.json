@@ -466,6 +466,7 @@
     "PATH",
     "SHELL",
     "SSH_CONNECTION",
+    "SSH_TTY",
     "TERM",
     "TERM_PROGRAM",
     "TMPDIR",

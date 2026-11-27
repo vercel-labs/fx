@@ -10,9 +10,18 @@
 //! `theme_monitor.Monitor` sees every terminal reply first and reports where a
 //! clipboard reply starts. `Reader` then owns the packet bytes that follow and
 //! the state of the one outstanding request.
+//!
+//! The input stream keeps its order, so a network stall inside a reply delays
+//! the keys typed after it too; nothing lands inside a reply. A reply start
+//! that can only be a clipboard reply (`replyStartIsCertain`) is held through
+//! a stall of up to `packet_idle_timeout_ms`, then dropped with its rest. A
+//! stall within a reply's first bytes, which may still be a key such as
+//! Escape, is handled like any other partial terminal reply: after the theme
+//! monitor's short timeout those bytes reach fx as keys.
 
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const io_mod = @import("../../core/shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -77,6 +86,16 @@ pub fn classifyReplyStart(candidate: []const u8) ReplyStart {
     } };
 }
 
+/// Whether a candidate that `classifyReplyStart` holds as pending can only be
+/// a clipboard reply: `ESC ] 55` or `ESC [ ? 55` and on. A shorter start may
+/// still be a key, such as Escape or Alt+], or another reply, such as OSC 52
+/// or the primary device attributes, so the theme monitor treats it like any
+/// other partial reply.
+pub fn replyStartIsCertain(candidate: []const u8) bool {
+    if (candidate.len >= 4 and std.mem.startsWith(u8, packet_prefix, candidate[0..4])) return true;
+    return candidate.len >= 5 and std.mem.startsWith(u8, mode_report_prefix, candidate[0..5]);
+}
+
 pub const Outcome = union(enum) {
     /// The PNG bytes the terminal sent.
     image: std.ArrayList(u8),
@@ -122,10 +141,11 @@ const InputOwner = enum {
     none,
     /// A packet started; every byte up to its terminator is the reader's.
     packet,
-    /// A packet timed out. Bytes that can be its late rest are dropped until
-    /// its terminator, a byte that cannot be packet text, or the packet size.
-    /// It has no timer: the rest comes whenever the network delivers it, and
-    /// a timer would let a longer stall type it into the composer
+    /// A packet, or the start of a reply, timed out. Bytes that can be its
+    /// late rest are dropped until its terminator, a byte that cannot be
+    /// reply text, or the packet size. It has no timer: the rest comes
+    /// whenever the network delivers it, and a timer would let a longer stall
+    /// type it into the composer
     /// (`tests/tla/clipboard_protocol/ClipboardRead.tla`, mutation
     /// `resync_timeout`).
     resync,
@@ -173,7 +193,7 @@ pub const Reader = struct {
     pub fn begin(self: *Reader, now_ms: i64, max_image_bytes: usize) error{RequestPending}!void {
         if (self.pending()) return error.RequestPending;
         self.max_image_bytes = max_image_bytes;
-        self.phase = .{ .awaiting_mode = deadline(now_ms, mode_report_timeout_ms) };
+        self.phase = .{ .awaiting_mode = io_mod.addMillis(now_ms, mode_report_timeout_ms) };
     }
 
     /// Ends a request whose bytes could not be written.
@@ -185,7 +205,7 @@ pub const Reader = struct {
     pub fn noteModeReport(self: *Reader, alloc: Allocator, support: ModeSupport, now_ms: i64) void {
         switch (self.phase) {
             .awaiting_mode => switch (support) {
-                .supported => self.phase = .{ .awaiting_reply = deadline(now_ms, reply_timeout_ms) },
+                .supported => self.phase = .{ .awaiting_reply = io_mod.addMillis(now_ms, reply_timeout_ms) },
                 .unsupported => self.finish(alloc, .unsupported),
             },
             else => debug_trace.logf(
@@ -198,10 +218,22 @@ pub const Reader = struct {
 
     /// Whether the reader takes input bytes before anything else: a packet has
     /// started and not ended, or the late rest of a timed-out packet may still
-    /// come. No byte of a reply reaches the composer
+    /// come. No byte of a reply after its first few reaches the composer
     /// (`tests/tla/clipboard_protocol/ClipboardRead.tla` NoReplyInComposer).
     pub fn ownsInput(self: *const Reader) bool {
         return self.owner != .none;
+    }
+
+    /// The theme monitor dropped the start of a reply that stalled for
+    /// `packet_idle_timeout_ms` (`replyStartIsCertain`). Its rest may still
+    /// come, so it is dropped like the rest of a stalled packet, and the open
+    /// request ends (`tests/tla/clipboard_protocol/ClipboardRead.tla`
+    /// StartTimeout).
+    pub fn dropReplyStart(self: *Reader, alloc: Allocator, now_ms: i64) void {
+        if (self.owner != .none) return;
+        self.owner = .resync;
+        self.resync_dropped_bytes = 0;
+        self.fail(alloc, .timed_out, now_ms);
     }
 
     /// Starts a packet after its prefix, which the theme monitor consumed.
@@ -215,7 +247,7 @@ pub const Reader = struct {
             debug_trace.logf("clipboard", "clipboard packet buffer unavailable reason=out_of_memory", .{});
             self.packet_invalid = true;
         };
-        self.owner_deadline_ms = deadline(now_ms, packet_idle_timeout_ms);
+        self.owner_deadline_ms = io_mod.addMillis(now_ms, packet_idle_timeout_ms);
     }
 
     /// Takes one input byte while `ownsInput`. Returns false when the byte is
@@ -263,9 +295,10 @@ pub const Reader = struct {
             .awaiting_reply => |deadline_ms| if (now_ms >= deadline_ms) {
                 self.finish(alloc, .timed_out);
             },
+            // The rest of a stalled transfer may still come; `fail` consumes
+            // it until it ends.
             .receiving => |deadline_ms| if (now_ms >= deadline_ms) {
                 self.fail(alloc, .timed_out, now_ms);
-                self.phase = .idle;
             },
             .discarding => |deadline_ms| if (now_ms >= deadline_ms) {
                 self.phase = .idle;
@@ -281,7 +314,7 @@ pub const Reader = struct {
 
     /// Takes one byte of the current packet. BEL or `ESC \` ends it.
     fn feedPacketByte(self: *Reader, alloc: Allocator, byte: u8, now_ms: i64) void {
-        self.owner_deadline_ms = deadline(now_ms, packet_idle_timeout_ms);
+        self.owner_deadline_ms = io_mod.addMillis(now_ms, packet_idle_timeout_ms);
         if (self.packet_escape) {
             self.packet_escape = false;
             if (byte != '\\') {
@@ -309,7 +342,7 @@ pub const Reader = struct {
         }
     }
 
-    /// Drops a byte that can be the late rest of a timed-out packet. A BEL
+    /// Drops a byte that can be the late rest of a timed-out reply. A BEL
     /// ends the packet and is dropped too. Any other byte, ESC included, ends
     /// the resync and stays ordinary input: the decoder ignores a bare `ESC \`.
     fn feedResyncByte(self: *Reader, byte: u8) bool {
@@ -318,7 +351,7 @@ pub const Reader = struct {
             self.endResync("terminator");
             return true;
         }
-        if (!isPacketTextByte(byte)) {
+        if (!isReplyTextByte(byte)) {
             self.endResync("other_byte");
             return false;
         }
@@ -358,11 +391,15 @@ pub const Reader = struct {
         const continues = std.mem.eql(u8, status, "OK") or std.mem.eql(u8, status, "DATA");
         switch (self.phase) {
             .idle => {
-                debug_trace.logf("clipboard", "clipboard packet dropped status={s} reason=no_request", .{status});
+                debug_trace.logf(
+                    "clipboard",
+                    "clipboard packet dropped status={s} reason=no_request",
+                    .{traceStatus(status)},
+                );
                 return;
             },
             .discarding => {
-                self.phase = if (continues) .{ .discarding = deadline(now_ms, transfer_idle_timeout_ms) } else .idle;
+                self.phase = if (continues) .{ .discarding = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) } else .idle;
                 return;
             },
             .awaiting_mode, .awaiting_reply, .receiving => {},
@@ -370,10 +407,10 @@ pub const Reader = struct {
 
         if (std.mem.eql(u8, status, "OK")) {
             if (self.phase == .receiving) return self.fail(alloc, .malformed, now_ms);
-            self.phase = .{ .receiving = deadline(now_ms, transfer_idle_timeout_ms) };
+            self.phase = .{ .receiving = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
         } else if (std.mem.eql(u8, status, "DATA")) {
             if (self.phase != .receiving) return self.fail(alloc, .malformed, now_ms);
-            self.phase = .{ .receiving = deadline(now_ms, transfer_idle_timeout_ms) };
+            self.phase = .{ .receiving = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
             // fx asks only for PNG; a terminal may still send other types.
             const mime = packet.mime orelse return;
             if (!std.mem.eql(u8, mime, png_mime_base64)) return;
@@ -390,7 +427,7 @@ pub const Reader = struct {
         } else if (std.mem.eql(u8, status, "ENOSYS")) {
             self.finish(alloc, .unsupported);
         } else {
-            debug_trace.logf("clipboard", "clipboard packet unknown status={s}", .{status});
+            debug_trace.logf("clipboard", "clipboard packet unknown status_bytes={d}", .{status.len});
             self.fail(alloc, .malformed, now_ms);
         }
     }
@@ -434,7 +471,7 @@ pub const Reader = struct {
             );
         }
         self.finish(alloc, outcome);
-        self.phase = .{ .discarding = deadline(now_ms, transfer_idle_timeout_ms) };
+        self.phase = .{ .discarding = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
     }
 };
 
@@ -467,17 +504,24 @@ fn parsePacket(body: []const u8) ?Packet {
     };
 }
 
-/// Whether `byte` can appear in a packet body: base64 and the metadata's
-/// `key=value` fields.
-fn isPacketTextByte(byte: u8) bool {
+/// Whether `byte` can appear in the rest of a reply: a packet body's base64
+/// and `key=value` metadata, or a mode report's `5522;2$y`.
+fn isReplyTextByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or switch (byte) {
-        '+', '/', '=', ':', ';', '_', '-' => true,
+        '+', '/', '=', ':', ';', '_', '-', '$' => true,
         else => false,
     };
 }
 
-fn deadline(now_ms: i64, duration_ms: i64) i64 {
-    return std.math.add(i64, now_ms, duration_ms) catch std.math.maxInt(i64);
+/// The statuses the protocol defines. The terminal sends the status, so a
+/// trace line names only one of these, never the raw bytes.
+const known_statuses = [_][]const u8{ "OK", "DATA", "DONE", "EPERM", "EBUSY", "ENOSYS" };
+
+fn traceStatus(status: []const u8) []const u8 {
+    for (known_statuses) |known| {
+        if (std.mem.eql(u8, status, known)) return known;
+    }
+    return "unknown";
 }
 
 const testing = std.testing;
@@ -538,6 +582,15 @@ test "classifyReplyStart leaves other terminal input alone" {
     };
     for (others) |bytes| {
         try testing.expectEqual(ReplyStart.none, classifyAll(bytes));
+    }
+}
+
+test "only a reply start that no key or other reply shares is certain" {
+    for ([_][]const u8{ "\x1b]55", "\x1b]5522", "\x1b[?55", "\x1b[?5522;2$" }) |start| {
+        try testing.expect(replyStartIsCertain(start));
+    }
+    for ([_][]const u8{ "\x1b", "\x1b]", "\x1b]5", "\x1b[", "\x1b[?", "\x1b[?5" }) |start| {
+        try testing.expect(!replyStartIsCertain(start));
     }
 }
 
@@ -756,6 +809,56 @@ test "a stalled packet drops at most one packet of late bytes" {
     try testing.expect(!reader.ownsInput());
 }
 
+test "a dropped reply start ends the request and drops the rest of its packet" {
+    var reader: Reader = .{};
+    defer reader.deinit(testing.allocator);
+    try reader.begin(0, 1024);
+    reader.noteModeReport(testing.allocator, .supported, 1);
+    reader.dropReplyStart(testing.allocator, 1 + packet_idle_timeout_ms);
+    try expectOutcome(&reader, .timed_out);
+
+    const now = 2 + packet_idle_timeout_ms;
+    for ("22;type=read:status=OK") |byte| try testing.expect(reader.feedOwnedByte(testing.allocator, byte, now));
+    try testing.expect(!reader.feedOwnedByte(testing.allocator, 0x1b, now));
+    try testing.expect(!reader.ownsInput());
+
+    // The later packets of the transfer give no second outcome.
+    try deliverData(&reader, test_png, now + 1);
+    deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", now + 2);
+    try testing.expect(reader.takeOutcome() == null);
+    try testing.expect(!reader.pending());
+}
+
+test "a dropped mode report start drops the rest of the report" {
+    var reader: Reader = .{};
+    defer reader.deinit(testing.allocator);
+    try reader.begin(0, 1024);
+    reader.dropReplyStart(testing.allocator, packet_idle_timeout_ms);
+    try expectOutcome(&reader, .timed_out);
+    for ("22;2$y") |byte| try testing.expect(reader.feedOwnedByte(testing.allocator, byte, packet_idle_timeout_ms + 1));
+    try testing.expect(!reader.feedOwnedByte(testing.allocator, '\r', packet_idle_timeout_ms + 2));
+    try testing.expect(!reader.ownsInput());
+}
+
+test "a transfer that stalls between packets consumes its late packets" {
+    var reader: Reader = .{};
+    defer reader.deinit(testing.allocator);
+    try reader.begin(0, 1024);
+    reader.noteModeReport(testing.allocator, .supported, 1);
+    deliverPacket(&reader, "type=read:status=OK", "\x1b\\", 2);
+    reader.poll(testing.allocator, 2 + transfer_idle_timeout_ms);
+    try expectOutcome(&reader, .timed_out);
+
+    // A new request waits for the old transfer, whose late packets give no
+    // outcome.
+    const late = 3 + transfer_idle_timeout_ms;
+    try testing.expectError(error.RequestPending, reader.begin(late, 1024));
+    try deliverData(&reader, test_png, late + 1);
+    deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", late + 2);
+    try testing.expect(reader.takeOutcome() == null);
+    try testing.expect(!reader.pending());
+}
+
 test "reader consumes a reply that arrives without a request" {
     var reader: Reader = .{};
     defer reader.deinit(testing.allocator);
@@ -813,6 +916,7 @@ test "the clipboard reader stays bounded and gives one outcome per request on fu
             "\x1b[?5522;2$y\x1b]5522;type=read:status=OK\x07\x1b]5522;type=read:status=DA\x00TA;AAAA\x07abc",
             "\x16\x1b]5522;type=read:status=DATA:mime=" ++ png_mime_base64 ++ ";!!!!\x1b\\\x16",
             "\x1b]5522;\x1b[A\x00\x1b[?5522;2$y\x16",
+            "\x1b[?5522;2$y\x1b]55\x0022;type=read:status=OK\x1b\\abc\x16\x1b[?55\x0022;2$y\r",
         }) ++ @import("fuzz_corpus").terminal_clipboard_reply.*),
     });
 }
@@ -831,7 +935,7 @@ fn fuzzReaderOnTerminalInput(_: void, smith: *std.testing.Smith) !void {
 
     for (input[0..len]) |byte| {
         if (byte == 0) {
-            drive.flushCandidate();
+            drive.pause();
             drive.now_ms += reply_timeout_ms + 1;
         } else {
             drive.now_ms += 1;
@@ -842,7 +946,7 @@ fn fuzzReaderOnTerminalInput(_: void, smith: *std.testing.Smith) !void {
     // A long silence ends every request. A packet that timed out leaves a
     // resync, which the next key that cannot be packet text ends.
     for (0..3) |_| {
-        drive.flushCandidate();
+        drive.pause();
         drive.now_ms += reply_timeout_ms + 1;
         try drive.settle();
     }
@@ -869,6 +973,7 @@ const FuzzDrive = struct {
     fn route(self: *FuzzDrive, byte: u8) !void {
         if (self.reader.ownsInput() and self.reader.feedOwnedByte(testing.allocator, byte, self.now_ms)) return;
         if (self.candidate_len == 0 and byte != 0x1b) return self.typed(byte);
+        const clipboard_start = replyStartIsCertain(self.candidate[0..self.candidate_len]);
         self.candidate[self.candidate_len] = byte;
         self.candidate_len += 1;
         switch (classifyReplyStart(self.candidate[0..self.candidate_len])) {
@@ -881,7 +986,15 @@ const FuzzDrive = struct {
                 self.candidate_len = 0;
                 self.reader.noteModeReport(testing.allocator, support, self.now_ms);
             },
-            .none => self.flushCandidate(),
+            .none => {
+                self.flushCandidate();
+                // The theme monitor drops a broken clipboard reply start and
+                // reads the byte on its own.
+                if (!clipboard_start) return;
+                if (byte != 0x1b) return self.typed(byte);
+                self.candidate[0] = byte;
+                self.candidate_len = 1;
+            },
         }
     }
 
@@ -891,9 +1004,18 @@ const FuzzDrive = struct {
         self.requests += 1;
     }
 
-    /// The theme monitor gives up a partial reply after its idle timeout and
-    /// hands the bytes on as keys.
+    /// The theme monitor hands a partial reply on as keys when it stops
+    /// matching.
     fn flushCandidate(self: *FuzzDrive) void {
+        self.candidate_len = 0;
+    }
+
+    /// A pause past every deadline. The theme monitor drops a certain reply
+    /// start, and the reader then drops its rest; it types any other start.
+    fn pause(self: *FuzzDrive) void {
+        if (replyStartIsCertain(self.candidate[0..self.candidate_len])) {
+            self.reader.dropReplyStart(testing.allocator, self.now_ms + packet_idle_timeout_ms);
+        }
         self.candidate_len = 0;
     }
 

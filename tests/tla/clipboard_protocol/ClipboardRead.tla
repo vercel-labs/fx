@@ -11,18 +11,24 @@
 (*                                                                         *)
 (*   - The terminal first answers the mode query (DECRQM 5522), or         *)
 (*     ignores it, as tmux does. Then it may answer the read with packets: *)
-(*     OK, DATA, DONE, or an error. A packet is three tokens: its start    *)
-(*     (the prefix the theme monitor recognizes), its body, and its        *)
-(*     terminator. The terminal writes a packet in one piece, so no key    *)
-(*     lands inside one, but the network may stall between its tokens,     *)
-(*     and the terminal may stop for good in the middle of one.            *)
+(*     OK, DATA, DONE, or an error. A packet is four tokens: the head of   *)
+(*     its prefix, which no key starts with (`ESC ] 55`), the rest of the  *)
+(*     prefix, its body, and its terminator. The theme monitor holds the   *)
+(*     head until the rest of the prefix comes. The terminal writes a      *)
+(*     packet in one piece and the stream keeps its order, so no key lands *)
+(*     inside one, but the network may stall between its tokens, and the   *)
+(*     terminal may stop for good in the middle of one.                    *)
 (*   - Every deadline is an action that may fire at any time, so replies   *)
 (*     can arrive after fx gave up on them, and stale replies of an old    *)
 (*     request can meet a new one. The protocol carries no request id, so  *)
 (*     fx cannot tell them apart; the model only requires that each        *)
 (*     request ends with exactly one outcome.                              *)
 (*   - Keys are whole tokens. A key that starts with ESC can end a packet  *)
-(*     early in the code, which this model does not split.                 *)
+(*     early in the code, which this model does not split. The first bytes *)
+(*     of a reply, which may still be a key such as Escape, are outside    *)
+(*     the model too: the theme monitor types them after its short         *)
+(*     timeout, as it does for every terminal reply. The mode report's     *)
+(*     head is handled like a packet's in the code and is not split here.  *)
 (*                                                                         *)
 (* `Mutation` enables one deliberately broken rule:                        *)
 (*   "no_resync"           a timed-out packet gives input back at once, so *)
@@ -36,6 +42,11 @@
 (*   "resync_timeout"      the resync after a timed-out packet ends on a   *)
 (*                         timer, so a longer stall types the packet's     *)
 (*                         rest into the composer.                         *)
+(*   "type_stalled_start"  the theme monitor types a held head that        *)
+(*                         stalled, as it types a partial reply that may   *)
+(*                         be a key.                                       *)
+(*   "no_start_resync"     the theme monitor drops a stalled head but the  *)
+(*                         reader does not drop the rest of its packet.    *)
 (*                                                                         *)
 (* Ctrl+V is a key like any other: fx starts a request when it reads the   *)
 (* key with no reply owning input and no request pending.                  *)
@@ -50,7 +61,7 @@ ASSUME MaxChunks \in Nat
 ASSUME MaxImage \in Nat \ {0}
 ASSUME Mutation \in {"none", "no_resync", "accept_idle_packets",
                      "no_mode_deadline", "no_size_check", "ask_while_pending",
-                     "resync_timeout"}
+                     "resync_timeout", "type_stalled_start", "no_start_resync"}
 
 Kinds == {"OK", "DATA", "DONE", "EPERM", "ENOSYS", "BAD"}
 Outcomes == {"image", "no_image", "unsupported", "denied", "timed_out",
@@ -70,12 +81,13 @@ Replies ==
 Tokens ==
     {<<"key", c>> : c \in {"letter", "other", "ctrl_v"}}
     \cup {<<"mode", m>> : m \in {"yes", "no"}}
-    \cup {<<"start">>, <<"end">>}
+    \cup {<<"head">>, <<"start">>, <<"end">>}
     \cup {<<"body", k>> : k \in Kinds}
 
 VARIABLES
     phase,      \* the reader's request phase
     own,        \* who takes input first: "none", "packet", or "resync"
+    held,       \* the theme monitor holds a packet's head: "none" or "head"
     body,       \* the body kind of the packet being read, or "none"
     image,      \* DATA packets of the open transfer
     presses,    \* Ctrl+V presses so far
@@ -87,12 +99,13 @@ VARIABLES
     wire,       \* tokens on their way to fx
     keys        \* keys typed so far
 
-vars == <<phase, own, body, image, presses, requests, outcomes, leaked, term,
-          sending, wire, keys>>
+vars == <<phase, own, held, body, image, presses, requests, outcomes, leaked,
+          term, sending, wire, keys>>
 
 TypeOK ==
     /\ phase \in Phases
     /\ own \in {"none", "packet", "resync"}
+    /\ held \in {"none", "head"}
     /\ body \in Kinds \cup {"none"}
     /\ image \in Nat
     /\ presses \in 0..MaxRequests
@@ -107,6 +120,7 @@ TypeOK ==
 Init ==
     /\ phase = "idle"
     /\ own = "none"
+    /\ held = "none"
     /\ body = "none"
     /\ image = 0
     /\ presses = 0
@@ -175,14 +189,14 @@ PressCtrlV ==
     /\ sending = <<>>
     /\ wire' = Append(wire, <<"key", "ctrl_v">>)
     /\ presses' = presses + 1
-    /\ UNCHANGED <<phase, own, body, image, requests, outcomes, leaked, term, sending, keys>>
+    /\ UNCHANGED <<phase, own, held, body, image, requests, outcomes, leaked, term, sending, keys>>
 
 TypeKey ==
     /\ keys < MaxKeys
     /\ sending = <<>>
     /\ \E c \in {"letter", "other"} : wire' = Append(wire, <<"key", c>>)
     /\ keys' = keys + 1
-    /\ UNCHANGED <<phase, own, body, image, presses, requests, outcomes, leaked, term, sending>>
+    /\ UNCHANGED <<phase, own, held, body, image, presses, requests, outcomes, leaked, term, sending>>
 
 -----------------------------------------------------------------------------
 (* The terminal.                                                           *)
@@ -193,30 +207,30 @@ SendMode ==
     /\ Head(term) \in {"mode_yes", "mode_no"}
     /\ wire' = Append(wire, <<"mode", IF Head(term) = "mode_yes" THEN "yes" ELSE "no">>)
     /\ term' = Tail(term)
-    /\ UNCHANGED <<phase, own, body, image, presses, requests, outcomes, leaked, sending, keys>>
+    /\ UNCHANGED <<phase, own, held, body, image, presses, requests, outcomes, leaked, sending, keys>>
 
 StartPacket ==
     /\ sending = <<>>
     /\ term # <<>>
     /\ Head(term) \in Kinds
-    /\ sending' = <<<<"start">>, <<"body", Head(term)>>, <<"end">>>>
+    /\ sending' = <<<<"head">>, <<"start">>, <<"body", Head(term)>>, <<"end">>>>
     /\ term' = Tail(term)
-    /\ UNCHANGED <<phase, own, body, image, presses, requests, outcomes, leaked, wire, keys>>
+    /\ UNCHANGED <<phase, own, held, body, image, presses, requests, outcomes, leaked, wire, keys>>
 
 SendToken ==
     /\ sending # <<>>
     /\ wire' = Append(wire, Head(sending))
     /\ sending' = Tail(sending)
-    /\ UNCHANGED <<phase, own, body, image, presses, requests, outcomes, leaked, term, keys>>
+    /\ UNCHANGED <<phase, own, held, body, image, presses, requests, outcomes, leaked, term, keys>>
 
 \* The terminal stops for good in the middle of a packet, as when it or the
 \* SSH connection dies; nothing it still owed is sent.
 StopMidPacket ==
     /\ sending # <<>>
-    /\ Len(sending) < 3
+    /\ Len(sending) < 4
     /\ sending' = <<>>
     /\ term' = <<>>
-    /\ UNCHANGED <<phase, own, body, image, presses, requests, outcomes, leaked, wire, keys>>
+    /\ UNCHANGED <<phase, own, held, body, image, presses, requests, outcomes, leaked, wire, keys>>
 
 -----------------------------------------------------------------------------
 (* fx reads one token.                                                     *)
@@ -229,33 +243,49 @@ StartRequest ==
     /\ UNCHANGED <<image, outcomes>>
 
 \* Input that nobody owns: the theme monitor routes replies, and keys go to
-\* the composer. The decoder ignores a bare terminator. Called from a resync
-\* too, which this token ends.
+\* the composer. The decoder ignores a bare terminator. Called from a resync,
+\* or after the monitor drops a broken head, too, which this token ends.
 ReadUnowned(tok) ==
     CASE tok = <<"key", "ctrl_v">> ->
             /\ own' = "none"
+            /\ held' = "none"
             /\ IF phase = "idle" \/ Mutation = "ask_while_pending"
                THEN StartRequest
                ELSE UNCHANGED <<phase, image, requests, outcomes, term>>
             /\ UNCHANGED <<body, leaked>>
       [] tok[1] = "key" ->
             /\ own' = "none"
+            /\ held' = "none"
             /\ UNCHANGED <<phase, body, image, requests, outcomes, leaked, term>>
       [] tok[1] = "mode" ->
             /\ own' = "none"
+            /\ held' = "none"
             /\ ApplyMode(tok[2])
             /\ UNCHANGED <<body, requests, leaked, term>>
-      [] tok[1] = "start" ->
-            /\ own' = "packet"
-            /\ body' = "none"
-            /\ UNCHANGED <<phase, image, requests, outcomes, leaked, term>>
-      [] tok[1] = "body" ->
+      [] tok[1] = "head" ->
             /\ own' = "none"
+            /\ held' = "head"
+            /\ UNCHANGED <<phase, body, image, requests, outcomes, leaked, term>>
+      [] tok[1] \in {"start", "body"} ->
+            /\ own' = "none"
+            /\ held' = "none"
             /\ leaked' = TRUE
             /\ UNCHANGED <<phase, body, image, requests, outcomes, term>>
       [] tok[1] = "end" ->
             /\ own' = "none"
+            /\ held' = "none"
             /\ UNCHANGED <<phase, body, image, requests, outcomes, leaked, term>>
+
+\* The theme monitor holds a packet's head. The rest of the prefix starts the
+\* packet; anything else means the head was a broken reply, so the monitor
+\* drops it and reads the token on its own.
+ReadHeld(tok) ==
+    IF tok[1] = "start"
+    THEN /\ own' = "packet"
+         /\ held' = "none"
+         /\ body' = "none"
+         /\ UNCHANGED <<phase, image, requests, outcomes, leaked, term>>
+    ELSE ReadUnowned(tok)
 
 \* Inside a packet every token is the packet's.
 ReadInPacket(tok) ==
@@ -270,26 +300,28 @@ ReadInPacket(tok) ==
          [] OTHER ->
             /\ body' = "BAD"
             /\ UNCHANGED <<phase, own, image, outcomes, leaked>>
-    /\ UNCHANGED <<requests, term>>
+    /\ UNCHANGED <<held, requests, term>>
 
-\* After a packet timed out: packet text and letters are dropped, the
-\* terminator ends the resync, and anything else ends it and is read as
-\* unowned input. The resync has no timer, so the next key that cannot be
-\* packet text, such as Enter or Ctrl+V, always gets through.
+\* After a packet or its head timed out: the rest of its prefix, packet text,
+\* and letters are dropped, the terminator ends the resync, and anything else
+\* ends it and is read as unowned input. The resync has no timer, so the next
+\* key that cannot be packet text, such as Enter or Ctrl+V, always gets
+\* through.
 ReadInResync(tok) ==
-    CASE tok[1] = "body" \/ tok = <<"key", "letter">> ->
-            UNCHANGED <<phase, own, body, image, requests, outcomes, leaked, term>>
+    CASE tok[1] \in {"start", "body"} \/ tok = <<"key", "letter">> ->
+            UNCHANGED <<phase, own, held, body, image, requests, outcomes, leaked, term>>
       [] tok[1] = "end" ->
             /\ own' = "none"
-            /\ UNCHANGED <<phase, body, image, requests, outcomes, leaked, term>>
+            /\ UNCHANGED <<phase, held, body, image, requests, outcomes, leaked, term>>
       [] OTHER -> ReadUnowned(tok)
 
 Read ==
     /\ wire # <<>>
     /\ LET tok == Head(wire) IN
-        CASE own = "none" -> ReadUnowned(tok)
-          [] own = "packet" -> ReadInPacket(tok)
+        CASE own = "packet" -> ReadInPacket(tok)
           [] own = "resync" -> ReadInResync(tok)
+          [] held = "head" -> ReadHeld(tok)
+          [] OTHER -> ReadUnowned(tok)
     /\ wire' = Tail(wire)
     /\ UNCHANGED <<presses, sending, keys>>
 
@@ -301,39 +333,59 @@ ModeTimeout ==
     /\ own # "packet"
     /\ phase = "await_mode"
     /\ Finish
-    /\ UNCHANGED <<own, body, presses, requests, leaked, term, sending, wire, keys>>
+    /\ UNCHANGED <<own, held, body, presses, requests, leaked, term, sending, wire, keys>>
 
+\* No status packet at all ends the request; a transfer that stops between
+\* packets fails, so its late packets are consumed.
 ReplyTimeout ==
     /\ own # "packet"
     /\ phase \in {"await_reply", "receiving"}
-    /\ Finish
-    /\ UNCHANGED <<own, body, presses, requests, leaked, term, sending, wire, keys>>
+    /\ IF phase = "await_reply" THEN Finish ELSE Fail
+    /\ UNCHANGED <<own, held, body, presses, requests, leaked, term, sending, wire, keys>>
 
 DiscardTimeout ==
     /\ own # "packet"
     /\ phase = "discarding"
     /\ phase' = "idle"
-    /\ UNCHANGED <<own, body, image, presses, requests, outcomes, leaked, term, sending, wire, keys>>
+    /\ UNCHANGED <<own, held, body, image, presses, requests, outcomes, leaked, term, sending, wire, keys>>
 
 PacketTimeout ==
     /\ own = "packet"
     /\ own' = IF Mutation = "no_resync" THEN "none" ELSE "resync"
     /\ body' = "none"
     /\ Fail
-    /\ UNCHANGED <<presses, requests, leaked, term, sending, wire, keys>>
+    /\ UNCHANGED <<held, presses, requests, leaked, term, sending, wire, keys>>
+
+\* The head stalled for the packet timeout. The monitor drops it, and the
+\* reader drops the rest of its packet and ends the request
+\* (`Reader.dropReplyStart`).
+StartTimeout ==
+    /\ held = "head"
+    /\ held' = "none"
+    /\ CASE Mutation = "type_stalled_start" ->
+            /\ leaked' = TRUE
+            /\ UNCHANGED <<phase, own, body, image, outcomes>>
+         [] Mutation = "no_start_resync" ->
+            /\ Fail
+            /\ UNCHANGED <<own, body, leaked>>
+         [] OTHER ->
+            /\ own' = "resync"
+            /\ Fail
+            /\ UNCHANGED <<body, leaked>>
+    /\ UNCHANGED <<presses, requests, term, sending, wire, keys>>
 
 ResyncTimeout ==
     /\ Mutation = "resync_timeout"
     /\ own = "resync"
     /\ own' = "none"
-    /\ UNCHANGED <<phase, body, image, presses, requests, outcomes, leaked, term, sending, wire, keys>>
+    /\ UNCHANGED <<phase, held, body, image, presses, requests, outcomes, leaked, term, sending, wire, keys>>
 
 -----------------------------------------------------------------------------
 
 FxNext ==
     \/ Read
     \/ ModeTimeout \/ ReplyTimeout \/ DiscardTimeout
-    \/ PacketTimeout \/ ResyncTimeout
+    \/ PacketTimeout \/ StartTimeout \/ ResyncTimeout
 
 Next ==
     \/ PressCtrlV \/ TypeKey
@@ -348,6 +400,7 @@ Fairness ==
     /\ WF_vars(ReplyTimeout)
     /\ WF_vars(DiscardTimeout)
     /\ WF_vars(PacketTimeout)
+    /\ WF_vars(StartTimeout)
     /\ WF_vars(ResyncTimeout)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
@@ -374,5 +427,8 @@ EveryRequestEnds == (requests > outcomes) ~> (requests = outcomes)
 \* A packet never holds input for good. A resync holds it only until the
 \* next byte that cannot be packet text.
 PacketEnds == (own = "packet") ~> (own # "packet")
+
+\* The theme monitor never holds a head for good.
+HeadEnds == (held = "head") ~> (held = "none")
 
 =============================================================================

@@ -23,4 +23,6 @@ ClipboardRead ClipboardRead-no_size_check ImageBounded -deadlock
 ClipboardRead ClipboardRead-ask_while_pending OneOutcomePerRequest -deadlock
 ClipboardRead ClipboardRead-no_mode_deadline temporal -deadlock
 ClipboardRead ClipboardRead-resync_timeout NoReplyInComposer -deadlock
+ClipboardRead ClipboardRead-type_stalled_start NoReplyInComposer -deadlock
+ClipboardRead ClipboardRead-no_start_resync NoReplyInComposer -deadlock
 CHECKS

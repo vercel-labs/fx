@@ -1,7 +1,7 @@
 //! The standard variables that describe the user's terminal: `NO_COLOR`
 //! (no-color.org) and `TERM=dumb`. Every output path asks these, so help,
-//! `fx ask`, and the interactive session agree. `SSH_CONNECTION`, `SSH_TTY`,
-//! and `TMUX` say where the terminal is: on another machine, or behind tmux.
+//! `fx ask`, and the interactive session agree. `SSH_CONNECTION` and
+//! `SSH_TTY` say that the terminal is on another machine.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -9,8 +9,7 @@ const io_mod = @import("io.zig");
 
 /// `NO_COLOR` set to anything but the empty string turns color off.
 pub fn noColorValue(value: ?[]const u8) bool {
-    const set = value orelse return false;
-    return set.len > 0;
+    return nonEmpty(value);
 }
 
 /// `TERM=dumb` names a terminal without color or cursor movement.
@@ -21,7 +20,7 @@ pub fn dumbTerminalValue(value: ?[]const u8) bool {
 
 /// sshd sets `SSH_CONNECTION` for every session and `SSH_TTY` when it
 /// allocates a terminal.
-pub fn sshSessionValues(connection: ?[]const u8, tty: ?[]const u8) bool {
+fn sshSessionValues(connection: ?[]const u8, tty: ?[]const u8) bool {
     return nonEmpty(connection) or nonEmpty(tty);
 }
 
@@ -69,12 +68,6 @@ fn terminalColumns(fd: std.posix.fd_t) ?usize {
 /// another machine.
 pub fn sshSession() bool {
     return sshSessionValues(io_mod.getenv("SSH_CONNECTION"), io_mod.getenv("SSH_TTY"));
-}
-
-/// Whether fx runs inside tmux, which answers or drops many terminal queries
-/// itself.
-pub fn insideTmux() bool {
-    return nonEmpty(io_mod.getenv("TMUX"));
 }
 
 fn nonEmpty(value: ?[]const u8) bool {

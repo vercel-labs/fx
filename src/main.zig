@@ -3918,12 +3918,13 @@ const App = struct {
         const now_ms = io_mod.milliTimestamp();
         switch (self.terminal_input_runtime.terminal_theme_monitor.feed(byte, now_ms)) {
             .pending, .consumed => {},
-            .clipboard_packet => self.terminal_input_runtime.terminal_clipboard_reader.beginPacket(self.alloc, now_ms),
-            .clipboard_mode => |support| self.terminal_input_runtime.terminal_clipboard_reader.noteModeReport(
-                self.alloc,
-                support,
-                now_ms,
-            ),
+            // The WebAssembly hosts never ask for the clipboard.
+            .clipboard_packet => if (comptime !host_target.is_wasm) {
+                self.terminal_input_runtime.terminal_clipboard_reader.beginPacket(self.alloc, now_ms);
+            },
+            .clipboard_mode => |support| if (comptime !host_target.is_wasm) {
+                self.terminal_input_runtime.terminal_clipboard_reader.noteModeReport(self.alloc, support, now_ms);
+            },
             .forward => |forwarded| {
                 for (forwarded.slice()) |forwarded_byte| {
                     try self.handleAfterThemeMonitorByte(forwarded_byte);
@@ -3951,8 +3952,9 @@ const App = struct {
 
         // A clipboard reply takes its bytes before anything else, so none of
         // it reaches the composer. A byte it declines is ordinary input.
-        if (self.terminal_input_runtime.terminal_clipboard_reader.ownsInput()) {
-            if (self.terminal_input_runtime.terminal_clipboard_reader.feedOwnedByte(
+        const clipboard_reader = &self.terminal_input_runtime.terminal_clipboard_reader;
+        if (comptime !host_target.is_wasm) {
+            if (clipboard_reader.ownsInput() and clipboard_reader.feedOwnedByte(
                 self.alloc,
                 byte,
                 io_mod.milliTimestamp(),
@@ -3962,6 +3964,7 @@ const App = struct {
         switch (ui_input.terminalInputOwner(
             &self.terminal_input_runtime.terminal_theme_monitor,
             InputAppRuntime.terminalPasteActive(self),
+            !host_target.is_wasm and clipboard_reader.pending(),
         )) {
             .theme_monitor => {
                 try self.handleThemeMonitorByte(byte);

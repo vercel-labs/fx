@@ -9,7 +9,7 @@ const edit_contract = @import("../input/editor_state.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 
 const clipboard_protocol = @import("../../ui/terminal/clipboard_protocol.zig");
-const terminal_env = @import("../shared/terminal_env.zig");
+const io_mod = @import("../shared/io.zig");
 
 const InsertImageResult = enum { inserted, rejected, input_full };
 const ImageSourceLifetime = enum { retained, temporary };
@@ -115,26 +115,12 @@ pub fn Commands(comptime App: type) type {
         /// why there is none. The caller keeps ownership of `outcome`.
         pub fn attachTerminalClipboardOutcome(app: *App, outcome: clipboard_protocol.Outcome) !void {
             const notice: types.SemanticNotice = switch (outcome) {
-                .image => |image| {
-                    var loaded = image_attachments.clipboardImageAttachmentFromBytes(app.alloc, image.items) catch |err| {
-                        return switch (err) {
-                            error.UnsupportedImageType => app.writeDomainNotice(.{
-                                .topic = "images",
-                                .tone = .@"error",
-                                .body = "unsupported image type",
-                            }, true),
-                            error.ImageTooLarge => writeImageTooLargeNotice(app),
-                            else => writeClipboardPasteFailure(app, err),
-                        };
-                    };
-                    defer loaded.deinit(app.alloc);
-                    return insertClipboardImage(app, &loaded);
-                },
+                .image => |image| return attachTerminalClipboardImage(app, image.items),
                 .no_image => .{ .topic = "images", .tone = .neutral, .body = no_clipboard_image_notice },
                 .unsupported => .{
                     .topic = "images",
                     .tone = .@"error",
-                    .body = if (terminal_env.insideTmux())
+                    .body = if (io_mod.getenv("TMUX") != null)
                         "tmux can't pass clipboard images to fx; run fx outside tmux, or attach a file with /image <path>"
                     else
                         "this terminal can't send clipboard images; use kitty or Ghostty 1.4+, or attach a file with /image <path>",
@@ -146,6 +132,20 @@ pub fn Commands(comptime App: type) type {
                 .malformed => .{ .topic = "images", .tone = .@"error", .body = "terminal sent an unreadable clipboard image; paste again" },
             };
             try app.writeDomainNotice(notice, true);
+        }
+
+        fn attachTerminalClipboardImage(app: *App, bytes: []const u8) !void {
+            var loaded = image_attachments.clipboardImageAttachmentFromBytes(app.alloc, bytes) catch |err| return switch (err) {
+                error.UnsupportedImageType => app.writeDomainNotice(.{
+                    .topic = "images",
+                    .tone = .@"error",
+                    .body = "unsupported image type",
+                }, true),
+                error.ImageTooLarge => writeImageTooLargeNotice(app),
+                else => writeClipboardPasteFailure(app, err),
+            };
+            defer loaded.deinit(app.alloc);
+            try insertClipboardImage(app, &loaded);
         }
 
         fn insertClipboardImage(app: *App, loaded: *image_attachments.ClipboardImageAttachment) !void {
@@ -1063,6 +1063,7 @@ test "attachClipboard asks the terminal where fx cannot read the clipboard" {
 
     try std.testing.expectEqual(@as(usize, 1), app.terminal_clipboard_requests);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
 }
 

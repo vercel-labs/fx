@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const clipboard_protocol = @import("clipboard_protocol.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const io_mod = @import("../../core/shared/io.zig");
 const mode_rearm = @import("mode_rearm.zig");
 const theme_protocol = @import("theme_protocol.zig");
 
@@ -8,6 +10,9 @@ const theme_protocol = @import("theme_protocol.zig");
 // the cursor probe's full 100 ms delay on a standalone Escape key.
 pub const response_idle_timeout_ms: i64 = 75;
 pub const background_response_timeout_ms: i64 = 200;
+/// The WebAssembly hosts never ask the terminal for the clipboard, so their
+/// monitor does not look for its replies.
+const clipboard_replies = builtin.target.os.tag != .wasi;
 
 const max_candidate_bytes = 64;
 
@@ -68,6 +73,9 @@ pub const Monitor = struct {
     settled_update: ?ThemeUpdate = null,
     /// When fx next turns theme notifications (DEC mode 2031) on again.
     rearm: mode_rearm.Schedule = .{},
+    /// `poll` dropped the start of a clipboard reply that stalled; the
+    /// clipboard reader must drop its rest (`takeDroppedClipboardStart`).
+    dropped_clipboard_start: bool = false,
 
     pub fn start(self: *Monitor) void {
         self.enabled = true;
@@ -112,14 +120,16 @@ pub const Monitor = struct {
         if (!self.enabled) return forwardByte(byte);
         if (self.candidate_len == 0 and byte != 0x1b) return forwardByte(byte);
         if (self.candidate_len == 1 and byte == 0x1b) {
-            self.candidate_deadline_ms = addMillis(now_ms, response_idle_timeout_ms);
+            self.candidate_deadline_ms = io_mod.addMillis(now_ms, response_idle_timeout_ms);
             return forwardByte(byte);
         }
         if (self.candidate_len == self.candidate.len) return self.forwardCandidateWith(byte);
 
+        const clipboard_start = clipboard_replies and
+            clipboard_protocol.replyStartIsCertain(self.candidate[0..self.candidate_len]);
         self.candidate[self.candidate_len] = byte;
         self.candidate_len += 1;
-        self.candidate_deadline_ms = addMillis(now_ms, response_idle_timeout_ms);
+        self.candidate_deadline_ms = io_mod.addMillis(now_ms, response_idle_timeout_ms);
 
         const candidate = self.candidate[0..self.candidate_len];
         if (std.mem.eql(u8, candidate, dark_response)) {
@@ -140,19 +150,39 @@ pub const Monitor = struct {
 
         // Clipboard replies share the ESC prefix with every other terminal
         // reply, so the monitor that sees replies first hands them off.
-        switch (clipboard_protocol.classifyReplyStart(candidate)) {
-            .none => {},
-            .pending => return .pending,
-            .packet => {
-                self.candidate_len = 0;
-                self.candidate_deadline_ms = 0;
-                return .clipboard_packet;
-            },
-            .mode => |support| {
-                self.candidate_len = 0;
-                self.candidate_deadline_ms = 0;
-                return .{ .clipboard_mode = support };
-            },
+        if (comptime clipboard_replies) {
+            switch (clipboard_protocol.classifyReplyStart(candidate)) {
+                // A clipboard reply start that stops matching is a broken reply,
+                // not keys; the new byte is read on its own.
+                .none => if (clipboard_start) {
+                    debug_trace.logf(
+                        "theme",
+                        "theme clipboard reply start dropped bytes={d} reason=broken_reply",
+                        .{self.candidate_len - 1},
+                    );
+                    self.candidate_len = 0;
+                    self.candidate_deadline_ms = 0;
+                    return self.feed(byte, now_ms);
+                },
+                .pending => {
+                    // No key starts this way, and the rest of the reply comes
+                    // before any later key, so a stall cannot type it.
+                    if (clipboard_protocol.replyStartIsCertain(candidate)) {
+                        self.candidate_deadline_ms = io_mod.addMillis(now_ms, clipboard_protocol.packet_idle_timeout_ms);
+                    }
+                    return .pending;
+                },
+                .packet => {
+                    self.candidate_len = 0;
+                    self.candidate_deadline_ms = 0;
+                    return .clipboard_packet;
+                },
+                .mode => |support| {
+                    self.candidate_len = 0;
+                    self.candidate_deadline_ms = 0;
+                    return .{ .clipboard_mode = support };
+                },
+            }
         }
 
         switch (theme_protocol.classifyPrimaryDeviceAttributes(candidate)) {
@@ -204,6 +234,16 @@ pub const Monitor = struct {
                 );
                 self.candidate_len = 0;
                 self.candidate_deadline_ms = 0;
+            } else if (clipboard_replies and clipboard_protocol.replyStartIsCertain(candidate)) {
+                // The clipboard reader drops the rest when it comes.
+                debug_trace.logf(
+                    "theme",
+                    "theme clipboard reply start dropped bytes={d} reason=idle_timeout",
+                    .{self.candidate_len},
+                );
+                self.candidate_len = 0;
+                self.candidate_deadline_ms = 0;
+                self.dropped_clipboard_start = true;
             } else {
                 self.deferCandidate();
             }
@@ -224,14 +264,14 @@ pub const Monitor = struct {
             .idle => {
                 if (!self.theme_dirty) return null;
                 self.query_state = .{
-                    .awaiting_response_fence = addMillis(now_ms, background_response_timeout_ms),
+                    .awaiting_response_fence = io_mod.addMillis(now_ms, background_response_timeout_ms),
                 };
                 return .response_fence;
             },
             .background_ready => {
                 self.theme_dirty = false;
                 self.query_state = .{ .awaiting_background = .{
-                    .deadline_ms = addMillis(now_ms, background_response_timeout_ms),
+                    .deadline_ms = io_mod.addMillis(now_ms, background_response_timeout_ms),
                 } };
                 return .background;
             },
@@ -243,6 +283,15 @@ pub const Monitor = struct {
         _ = now_ms;
         if (self.query_state == .idle) return;
         self.settleNotificationFallback();
+    }
+
+    /// Whether `poll` dropped the start of a clipboard reply since the last
+    /// call. The caller then calls `clipboard_protocol.Reader.dropReplyStart`
+    /// before it reads more input.
+    pub fn takeDroppedClipboardStart(self: *Monitor) bool {
+        const dropped = self.dropped_clipboard_start;
+        self.dropped_clipboard_start = false;
+        return dropped;
     }
 
     pub fn takeSettledUpdate(self: *Monitor) ?ThemeUpdate {
@@ -335,10 +384,6 @@ const dark_response = "\x1b[?997;1n";
 const light_response = "\x1b[?997;2n";
 const response_fence = "\x1b[?1;2c";
 const osc11_prefix = "\x1b]11;rgb:";
-
-fn addMillis(now_ms: i64, duration_ms: i64) i64 {
-    return std.math.add(i64, now_ms, duration_ms) catch std.math.maxInt(i64);
-}
 
 fn forwardByte(byte: u8) FeedResult {
     var forwarded = ForwardBytes{};
@@ -540,7 +585,6 @@ test "theme monitor forwards malformed primary device attributes" {
 
 test "theme monitor discards incomplete OSC 11 on idle timeout with one trace" {
     const alloc = std.testing.allocator;
-    const io_mod = @import("../../core/shared/io.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -575,7 +619,6 @@ test "theme monitor discards incomplete OSC 11 on idle timeout with one trace" {
 
 test "theme monitor idle discard does not swallow CSI partials" {
     const alloc = std.testing.allocator;
-    const io_mod = @import("../../core/shared/io.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -604,7 +647,6 @@ test "theme monitor idle discard does not swallow CSI partials" {
 }
 
 fn readTraceFileForTest(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
-    const io_mod = @import("../../core/shared/io.zig");
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
     defer file.close(io_mod.getIo());
     return try io_mod.readFileToEnd(alloc, &file, 8192);
@@ -764,4 +806,77 @@ test "theme monitor keeps forwarding OSC 52 and fencing beside clipboard replies
         .consumed, .clipboard_packet, .clipboard_mode => return error.TestExpectedForward,
     };
     try std.testing.expectEqualStrings(osc52, forwarded[0..forwarded_len]);
+}
+
+test "theme monitor holds a stalled clipboard reply start, then drops it" {
+    var monitor = Monitor{};
+    monitor.start();
+
+    // Past the short reply timeout the start is still held, not typed, and
+    // its late rest completes the packet.
+    for ("\x1b]55") |byte| try std.testing.expect(monitor.feed(byte, 0) == .pending);
+    monitor.poll(response_idle_timeout_ms + 1);
+    try std.testing.expect(monitor.hasPendingInput());
+    try std.testing.expect(monitor.takeDeferredByte() == null);
+    for ("22") |byte| try std.testing.expect(monitor.feed(byte, 500) == .pending);
+    try std.testing.expect(monitor.feed(';', 500) == .clipboard_packet);
+    try std.testing.expect(!monitor.takeDroppedClipboardStart());
+
+    // A start that stalls for the whole packet timeout is dropped, not typed.
+    for ("\x1b[?55") |byte| try std.testing.expect(monitor.feed(byte, 1000) == .pending);
+    monitor.poll(1000 + clipboard_protocol.packet_idle_timeout_ms - 1);
+    try std.testing.expect(monitor.hasPendingInput());
+    monitor.poll(1000 + clipboard_protocol.packet_idle_timeout_ms);
+    try std.testing.expect(!monitor.hasPendingInput());
+    try std.testing.expect(monitor.takeDeferredByte() == null);
+    try std.testing.expect(monitor.takeDroppedClipboardStart());
+    try std.testing.expect(!monitor.takeDroppedClipboardStart());
+}
+
+test "theme monitor drops a broken clipboard reply start and reads the next byte" {
+    var monitor = Monitor{};
+    monitor.start();
+    for ("\x1b]55") |byte| try std.testing.expect(monitor.feed(byte, 0) == .pending);
+    const forwarded = switch (monitor.feed('a', 1)) {
+        .forward => |bytes| bytes,
+        .pending, .consumed, .clipboard_packet, .clipboard_mode => return error.TestExpectedForward,
+    };
+    try std.testing.expectEqualStrings("a", forwarded.slice());
+    try std.testing.expect(!monitor.hasPendingInput());
+
+    for ("\x1b[?5522;2$") |byte| try std.testing.expect(monitor.feed(byte, 2) == .pending);
+    try std.testing.expect(monitor.feed(0x1b, 3) == .pending);
+    try std.testing.expectEqual(@as(u8, 1), monitor.candidate_len);
+}
+
+test "theme monitor types a short start that may be a key after the short timeout" {
+    const starts = [_][]const u8{ "\x1b", "\x1b]", "\x1b]5", "\x1b[?", "\x1b[?5" };
+    for (starts) |start| {
+        var monitor = Monitor{};
+        monitor.start();
+        for (start) |byte| try std.testing.expect(monitor.feed(byte, 0) == .pending);
+        monitor.poll(response_idle_timeout_ms);
+        try std.testing.expect(!monitor.takeDroppedClipboardStart());
+        var typed: usize = 0;
+        while (monitor.takeDeferredByte()) |_| {
+            typed += 1;
+            try std.testing.expect(monitor.consumeDeferredInputDispatch());
+        }
+        try std.testing.expectEqual(start.len, typed);
+    }
+}
+
+test "theme monitor passes an Escape key right before a clipboard reply on once" {
+    var monitor = Monitor{};
+    monitor.start();
+    try std.testing.expect(monitor.feed(0x1b, 0) == .pending);
+    // The reply's ESC comes before the key's timeout: one ESC goes on as the
+    // key, and the other starts the reply.
+    const forwarded = switch (monitor.feed(0x1b, 10)) {
+        .forward => |bytes| bytes,
+        .pending, .consumed, .clipboard_packet, .clipboard_mode => return error.TestExpectedForward,
+    };
+    try std.testing.expectEqualStrings("\x1b", forwarded.slice());
+    for ("]5522") |byte| try std.testing.expect(monitor.feed(byte, 10) == .pending);
+    try std.testing.expect(monitor.feed(';', 10) == .clipboard_packet);
 }

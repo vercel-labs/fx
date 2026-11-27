@@ -34,10 +34,15 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.logf("clipboard", "clipboard image requested from terminal", .{});
         }
 
-        /// Applies the reader's deadlines and handles a finished request.
+        /// Applies the reader's deadlines and handles a finished request. It
+        /// runs after the theme monitor's `poll` and before more input.
         pub fn collectFacts(app: *App) !void {
             const reader = &app.terminal_input_runtime.terminal_clipboard_reader;
-            reader.poll(app.alloc, io_mod.milliTimestamp());
+            const now_ms = io_mod.milliTimestamp();
+            if (app.terminal_input_runtime.terminal_theme_monitor.takeDroppedClipboardStart()) {
+                reader.dropReplyStart(app.alloc, now_ms);
+            }
+            reader.poll(app.alloc, now_ms);
             var outcome = reader.takeOutcome() orelse return;
             defer outcome.deinit(app.alloc);
             debug_trace.logf("clipboard", "clipboard reply outcome={s}", .{@tagName(outcome)});
