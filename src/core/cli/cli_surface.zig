@@ -1489,7 +1489,7 @@ fn activateProviderSelectionFallible(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .gateway => "configure a Gateway credential first",
-                .configured => "configure the provider auth environment variable first",
+                .configured => "configure the connection's auth in ~/.fx/settings.json first",
             },
         );
         return false;
@@ -1874,7 +1874,7 @@ fn runNonInteractiveWithDeps(
                 },
                 .codex => try writeStdout(deps, "Signed in with Codex.\n"),
                 .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-                .configured => try writeStdout(deps, "Configured providers use settings.json authentication.\n"),
+                .configured => try writeStdout(deps, "Custom connections configure auth in ~/.fx/settings.json.\n"),
             }
             return .handled_success;
         },

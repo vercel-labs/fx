@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, fxChildEnv, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import { completion, neverAnswers, stallsAfterFirstChunk, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
 import * as messagesFake from "./fixtures/anthropic-messages";
 import * as responsesFake from "./fixtures/responses";
 import { holdChildAnswer, logLines, rootSessionIds } from "./saved-sessions";
-import { reviewedActionEvidence } from "./tmux-helpers";
+import { TmuxSession, reviewedActionEvidence, tmuxAvailable } from "./tmux-helpers";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
   const prefix = deltas.map(delta => `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`).join("");
@@ -1602,5 +1603,375 @@ describe("custom connection errors name the setting", () => {
       expect(f.requests).toHaveLength(2);
       expect(f.requests[1].headers["x-org"]).toBe("org-fixture-123");
     } finally { f.close(); }
+  }, 30000);
+});
+
+function installCommandHelper(home: string, name: string, scriptBody: string): string {
+  const dir = join(home, "helpers");
+  mkdirSync(dir, { recursive: true });
+  const scriptPath = join(dir, name);
+  writeFileSync(scriptPath, `#!/bin/sh\n${scriptBody}\n`);
+  chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+function collectFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    const st = statSync(full);
+    if (st.isDirectory()) out.push(...collectFiles(full));
+    else if (st.isFile()) out.push(full);
+  }
+  return out;
+}
+
+async function waitForCondition(check: () => boolean, timeoutMs: number, stepMs = 25): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return true;
+    await Bun.sleep(stepMs);
+  }
+  return check();
+}
+
+describe("custom connection command auth", () => {
+  test("1. helper token and header go out and helper runs once across tool call and answer", async () => {
+    const f = fixture(body => body.messages.some((message: any) => message.role === "tool")
+      ? completion(body.model, "done")
+      : toolCompletion(body.model, "read_file", { path: "note.txt" }));
+    try {
+      const countFile = join(f.home, "count");
+      const helper = installCommandHelper(
+        f.home,
+        "once.sh",
+        `n=$(cat "${countFile}" 2>/dev/null || echo 0)\nn=$((n+1))\necho "$n" > "${countFile}"\nprintf '{"token":"tok-%s","headers":{"X-Helper-Header":"helper-hdr-val"}}\\n' "$n"`,
+      );
+      writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+      connection(f).auth = { type: "command", command: [helper] };
+      f.save();
+
+      const result = await runFx(["ask", "--json", "--no-save", "Read note.txt"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).output).toBe("done");
+      expect(readFileSync(countFile, "utf8").trim()).toBe("1");
+      expect(f.requests).toHaveLength(2);
+      for (const req of f.requests) {
+        expect(req.authorization).toBe("Bearer tok-1");
+        expect(req.headers["x-helper-header"]).toBe("helper-hdr-val");
+      }
+    } finally { f.close(); }
+  }, 25000);
+
+  test("2. 401 on first token replays once with a second helper run and succeeds", async () => {
+    const f = fixture(body => {
+      const req = f.requests.at(-1)!;
+      if (req.authorization !== "Bearer tok-2") {
+        return Response.json({ error: { message: "unauthorized" } }, { status: 401 });
+      }
+      return completion(body.model, "replayed ok");
+    });
+    try {
+      const countFile = join(f.home, "count");
+      const helper = installCommandHelper(
+        f.home,
+        "rotate.sh",
+        `n=$(cat "${countFile}" 2>/dev/null || echo 0)\nn=$((n+1))\necho "$n" > "${countFile}"\nprintf '{"token":"tok-%s"}\\n' "$n"`,
+      );
+      connection(f).auth = { type: "command", command: [helper] };
+      f.save();
+
+      const result = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).output).toBe("replayed ok");
+      expect(readFileSync(countFile, "utf8").trim()).toBe("2");
+      expect(f.requests.map(r => r.authorization)).toEqual(["Bearer tok-1", "Bearer tok-2"]);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("3. every token refused runs helper twice and ends with credential refusal message", async () => {
+    const f = fixture(() => Response.json({ error: { message: "unauthorized" } }, { status: 401 }));
+    try {
+      const countFile = join(f.home, "count");
+      const helper = installCommandHelper(
+        f.home,
+        "always-refused.sh",
+        `n=$(cat "${countFile}" 2>/dev/null || echo 0)\nn=$((n+1))\necho "$n" > "${countFile}"\nprintf '{"token":"tok-%s"}\\n' "$n"`,
+      );
+      connection(f).auth = { type: "command", command: [helper] };
+      f.save();
+
+      const result = await runFx(["ask", "--no-save", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(result.code).not.toBe(0);
+      expect(readFileSync(countFile, "utf8").trim()).toBe("2");
+      expect(f.requests).toHaveLength(2);
+      expect(result.stderr).toContain("authentication failed");
+      expect(result.stderr).toContain("HTTP 401");
+    } finally { f.close(); }
+  }, 25000);
+
+  test("4. helper non-zero exit names connection, program, stderr line, and omits helper args", async () => {
+    const f = fixture();
+    try {
+      const helper = installCommandHelper(f.home, "fail.sh", `printf 'no session\\n' >&2\nexit 3`);
+      connection(f).auth = { type: "command", command: [helper, "--secret=SEKRET-ARG-1234"] };
+      f.save();
+
+      const result = await runFx(["ask", "--no-save", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain("connection local");
+      expect(result.stderr).toContain(helper);
+      expect(result.stderr).toContain("no session");
+      expect(result.stdout + result.stderr).not.toContain("SEKRET-ARG-1234");
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("5. helper stderr escape sequences emit no raw ESC byte", async () => {
+    const f = fixture();
+    try {
+      const helper = installCommandHelper(f.home, "esc.sh", `printf '\\033[2J\\033]0;x\\007bad session\\n' >&2\nexit 3`);
+      connection(f).auth = { type: "command", command: [helper] };
+      f.save();
+
+      const result = await runFx(["ask", "--no-save", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(result.code).not.toBe(0);
+      expect(result.stdout + result.stderr).not.toContain("\x1b");
+      expect(result.stdout + result.stderr).not.toContain("\x07");
+      expect(result.stderr).toContain("bad session");
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("6. relative program path with slash is refused at load and helper never runs", async () => {
+    const f = fixture();
+    try {
+      const marker = join(f.workspace, "relative-ran.marker");
+      mkdirSync(join(f.workspace, "bin"), { recursive: true });
+      const relScript = join(f.workspace, "bin", "helper");
+      writeFileSync(relScript, `#!/bin/sh\ntouch "${marker}"\nprintf '{"token":"tok-rel"}\\n'\n`);
+      chmodSync(relScript, 0o755);
+
+      connection(f).auth = { type: "command", command: ["bin/helper"] };
+      f.save();
+
+      const result = await runFx(["ask", "--no-save", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain('auth is {"type": "none"}, {"type": "bearer", "env": "VARIABLE"}, or {"type": "command", "command": ["program", "argument"]}');
+      expect(existsSync(marker)).toBe(false);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 20000);
+
+  test("7. project .fx.json providers with command auth are ignored and helper never runs", async () => {
+    const f = fixture();
+    try {
+      const marker = join(f.workspace, "project-ran.marker");
+      const helper = installCommandHelper(f.home, "proj.sh", `touch "${marker}"\nprintf '{"token":"tok-proj"}\\n'`);
+      writeFileSync(join(f.workspace, ".fx.json"), JSON.stringify({
+        provider: "proj_cmd",
+        providers: {
+          proj_cmd: {
+            protocol: "openai-chat-completions",
+            base_url: connection(f).base_url,
+            auth: { type: "command", command: [helper] },
+          },
+        },
+      }));
+
+      const models = await runFx(["models", "--json"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      expect(models.code).toBe(0);
+      const ask = await runFx(["ask", "--provider", "proj_cmd", "--no-save", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      expect(ask.code).toBe(2);
+      expect(ask.stderr).toContain("unknown provider proj_cmd");
+      expect(existsSync(marker)).toBe(false);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("8. fx models --json with fetch_models and command auth sends helper token and lists served models", async () => {
+    const f = fixture(undefined, {
+      "/v1/models": () => Response.json({ object: "list", data: [{ id: "served-cmd-1" }, { id: "local-model" }] }),
+    });
+    try {
+      const helper = installCommandHelper(f.home, "models.sh", `printf '{"token":"tok-cmd-models"}\\n'`);
+      Object.assign(connection(f), { fetch_models: true, auth: { type: "command", command: [helper] } });
+      f.save();
+
+      const listed = await runFx(["models", "--json"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      if (listed.code !== 0) throw new Error(listed.stdout + listed.stderr);
+      const ids: string[] = JSON.parse(listed.stdout).ids;
+      expect(ids).toContain("served-cmd-1");
+      expect(ids).toContain("local-model");
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].method).toBe("GET");
+      expect(f.requests[0].path).toBe("/v1/models");
+      expect(f.requests[0].authorization).toBe("Bearer tok-cmd-models");
+    } finally { f.close(); }
+  }, 20000);
+
+  test("9. no secret token or helper header value is kept on disk or in trace or outputs", async () => {
+    const f = fixture(body => {
+      const req = f.requests.at(-1)!;
+      if (req.authorization !== "Bearer SEKRET-TOK-2-XYZ") {
+        return Response.json({ error: { message: "unauthorized SEKRET-TOK-1-XYZ SEKRET-HDR-VAL-999" } }, { status: 401 });
+      }
+      return completion(body.model, "saved reply");
+    });
+    const helperDir = mkdtempSync(join(tmpdir(), "fx-cmd-helper-"));
+    try {
+      const countFile = join(helperDir, "count");
+      const helper = installCommandHelper(
+        helperDir,
+        "secret.sh",
+        `n=$(cat "${countFile}" 2>/dev/null || echo 0)\nn=$((n+1))\necho "$n" > "${countFile}"\nprintf '{"token":"SEKRET-TOK-%s-XYZ","headers":{"X-Helper-Secret":"SEKRET-HDR-VAL-999"}}\\n' "$n"`,
+      );
+      connection(f).auth = { type: "command", command: [helper] };
+      f.save();
+
+      const traceLog = join(f.home, ".fx", "trace.log");
+      const result = await runFx(["ask", "--json", "remember secret check"], {
+        cwd: f.workspace,
+        env: { ...f.env, FX_TRACE: "1", FX_TRACE_LOG: traceLog },
+        timeoutMs: 20000,
+      });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(existsSync(traceLog)).toBe(true);
+      expect(readFileSync(traceLog, "utf8")).toContain("[command_auth]");
+
+      const secrets = ["SEKRET-TOK-1-XYZ", "SEKRET-TOK-2-XYZ", "SEKRET-HDR-VAL-999"];
+      const combinedOutput = result.stdout + result.stderr;
+      for (const secret of secrets) {
+        expect(combinedOutput).not.toContain(secret);
+      }
+      for (const filePath of [...collectFiles(f.home), ...collectFiles(f.workspace)]) {
+        const text = readFileSync(filePath, "utf8");
+        for (const secret of secrets) {
+          if (text.includes(secret)) {
+            throw new Error(`Found secret ${secret} in ${filePath}`);
+          }
+        }
+      }
+    } finally {
+      rmSync(helperDir, { recursive: true, force: true });
+      f.close();
+    }
+  }, 25000);
+
+  test("10. SIGINT while waiting for helper ends fx and helper exits within 3s", async () => {
+    const f = fixture();
+    let helperPid: number | null = null;
+    try {
+      const pidFile = join(f.home, "helper.pid");
+      const helper = installCommandHelper(f.home, "sleep.sh", `echo $$ > "${pidFile}"\nexec sleep 60`);
+      connection(f).auth = { type: "command", command: [helper] };
+      f.save();
+
+      const cleanEnv: Record<string, string> = {};
+      for (const [key, value] of Object.entries({ ...process.env, ...f.env })) {
+        if (value !== undefined) cleanEnv[key] = value;
+      }
+      const child = Bun.spawn([FX_BIN, "ask", "--no-save", "hello"], {
+        cwd: f.workspace,
+        env: cleanEnv,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const pidAppeared = await waitForCondition(() => {
+        if (!existsSync(pidFile)) return false;
+        const parsed = Number(readFileSync(pidFile, "utf8").trim());
+        if (Number.isInteger(parsed) && parsed > 0) {
+          helperPid = parsed;
+          return true;
+        }
+        return false;
+      }, 5000);
+      expect(pidAppeared).toBe(true);
+      expect(helperPid).not.toBeNull();
+
+      child.kill("SIGINT");
+      const exitPromise = child.exited;
+      const exitedInTime = await Promise.race([
+        exitPromise.then(() => true),
+        Bun.sleep(10000).then(() => false),
+      ]);
+      if (!exitedInTime) {
+        child.kill("SIGKILL");
+        throw new Error("SIGINT did not end fx ask while waiting for command auth helper");
+      }
+
+      const helperGone = await waitForCondition(() => {
+        try {
+          process.kill(helperPid!, 0);
+          return false;
+        } catch {
+          return true;
+        }
+      }, 3000);
+      expect(helperGone).toBe(true);
+    } finally {
+      if (helperPid !== null) {
+        try { process.kill(helperPid, "SIGKILL"); } catch {}
+      }
+      f.close();
+    }
+  }, 25000);
+
+  test("11. fx doctor reports executable command program and fails with fix for missing program", async () => {
+    const f = fixture();
+    try {
+      const helper = installCommandHelper(f.home, "doc-ok.sh", `exit 99`);
+      connection(f).auth = { type: "command", command: [helper] };
+      f.save();
+
+      const okDoctor = await runFx(["doctor"], { cwd: f.workspace, env: f.env, timeoutMs: 10000 });
+      expect(okDoctor.code).toBe(0);
+      expect(okDoctor.stdout).toContain(`uses auth type command (${helper}, executable)`);
+
+      const missing = join(f.home, "helpers", "does-not-exist.sh");
+      connection(f).auth = { type: "command", command: [missing] };
+      f.save();
+
+      const failDoctor = await runFx(["doctor"], { cwd: f.workspace, env: f.env, timeoutMs: 10000 });
+      expect(failDoctor.code).not.toBe(0);
+      expect(failDoctor.stdout).toContain(`uses auth type command (${missing}, not found or not executable)`);
+      expect(failDoctor.stdout).toContain("providers.local.auth.command");
+    } finally { f.close(); }
+  }, 25000);
+
+  test.skipIf(!tmuxAvailable())("12. TUI start defers fetch_models command helper until after the first frame", async () => {
+    const f = fixture(undefined, {
+      "/v1/models": () => Response.json({ object: "list", data: [{ id: "served-tui-1" }] }),
+    });
+    let session: TmuxSession | null = null;
+    try {
+      const marker = join(f.home, "tui-helper.started");
+      const helper = installCommandHelper(f.home, "tui-models.sh", `touch "${marker}"\nprintf '{"token":"tok-tui-models"}\\n'`);
+      Object.assign(connection(f), { fetch_models: true, auth: { type: "command", command: [helper] } });
+      f.save();
+
+      const traceLog = join(f.home, ".fx", "tui-trace.log");
+      session = await TmuxSession.create({
+        cwd: f.workspace,
+        env: { ...f.env, FX_TRACE: "1", FX_TRACE_LOG: traceLog },
+        isolated: true,
+      });
+      await session.waitForComposer(15000);
+
+      const modelsFetched = await waitForCondition(() => f.requests.some(r => r.path === "/v1/models"), 10000);
+      expect(modelsFetched).toBe(true);
+      expect(existsSync(marker)).toBe(true);
+
+      const lines = readFileSync(traceLog, "utf8").split("\n");
+      const deferredIdx = lines.findIndex(line => line.includes("model_cache_warmup_deferred reason=helper_waits_for_first_frame"));
+      const startedIdx = lines.findIndex(line => line.includes("[command_auth] event=run_started"));
+      expect(deferredIdx).toBeGreaterThanOrEqual(0);
+      expect(startedIdx).toBeGreaterThan(deferredIdx);
+    } finally {
+      if (session) await session.kill();
+      f.close();
+    }
   }, 30000);
 });

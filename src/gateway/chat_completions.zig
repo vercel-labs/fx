@@ -41,7 +41,13 @@ pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
 /// outlive the provider.
 pub fn model_catalog_provider(definition: *const definitions.Definition) catalog.Provider {
     const context: *anyopaque = @ptrCast(@constCast(definition));
-    return .{ .context = context, .fetch_fn = fetch_catalog, .lookup_capabilities_fn = lookup_capabilities, .provider_id = bound_identity(definition) };
+    return .{
+        .context = context,
+        .fetch_fn = fetch_catalog,
+        .lookup_capabilities_fn = lookup_capabilities,
+        .provider_id = bound_identity(definition),
+        .fetch_starts_helper = definition.auth == .command and definition.fetch_models,
+    };
 }
 
 fn definition_at(raw: ?*anyopaque) *const definitions.Definition {

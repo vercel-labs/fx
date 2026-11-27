@@ -410,6 +410,9 @@ pub fn resolveForProvider(
         return switch (definition.auth) {
             .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
             .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
+            // Startup never runs the helper (RULES.md R2.2); the transport asks
+            // `command_auth` at request time.
+            .command => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
         };
     }
     if (provider != .gateway) {

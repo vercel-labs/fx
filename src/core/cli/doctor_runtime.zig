@@ -14,6 +14,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_health = @import("../mcp/health.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const types = @import("../shared/types.zig");
+const configured_provider = @import("../config/configured_provider.zig");
 const model_provider = @import("../config/model_provider.zig");
 const safe_git = @import("../shell_command/safe_git.zig");
 const command_lex = @import("../shell_command/command_lex.zig");
@@ -123,7 +124,7 @@ pub fn collect(
         try appendConfigLoadFailureCheck(&checks, alloc, "config", "failed to load config", err);
         try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
         try appendMcpIssueChecks(&checks, alloc, mcp_issues);
-        try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
+        try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider, null);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
         snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
         try appendWorkspaceTrustCheck(&checks, alloc, snapshot.workspace_root);
@@ -148,7 +149,7 @@ pub fn collect(
     try appendEnvChecks(&checks, alloc, detailed.settings.permission_mode, detailed.settings.max_agent_steps, default_agent_step_limit);
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
     try appendMcpIssueChecks(&checks, alloc, mcp_issues);
-    try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
+    try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider, if (detailed.settings.providers) |*providers| providers else null);
     const selection = config_runtime.selectProviderModel(
         default_model,
         &detailed.settings,
@@ -325,7 +326,21 @@ pub fn loginCommand(provider: model_provider.ProviderId) []const u8 {
     };
 }
 
-fn appendAuthCheck(checks: *std.ArrayList(Check), alloc: Allocator, auth: auth_runtime.StatusSnapshot, provider: model_provider.ProviderId) !void {
+fn appendAuthCheck(
+    checks: *std.ArrayList(Check),
+    alloc: Allocator,
+    auth: auth_runtime.StatusSnapshot,
+    provider: model_provider.ProviderId,
+    providers: ?*const configured_provider.Registry,
+) !void {
+    if (provider == .configured) {
+        if (providers) |registry| {
+            if (registry.get(provider.label())) |definition| {
+                try appendConfiguredAuthCheck(checks, alloc, auth, provider, definition);
+                return;
+            }
+        }
+    }
     if (auth.missingHelp(.cli)) |help| {
         try checks.append(alloc, .{ .name = "auth", .status = .fail, .detail = help, .fix = loginCommand(provider) });
         return;
@@ -338,6 +353,76 @@ fn appendAuthCheck(checks: *std.ArrayList(Check), alloc: Allocator, auth: auth_r
         return;
     }
     try appendCheckOwned(checks, alloc, "auth", .ok, detail);
+}
+
+fn appendConfiguredAuthCheck(
+    checks: *std.ArrayList(Check),
+    alloc: Allocator,
+    auth: auth_runtime.StatusSnapshot,
+    provider: model_provider.ProviderId,
+    definition: *const configured_provider.Definition,
+) !void {
+    switch (definition.auth) {
+        .none => {
+            const detail = try alloc.print("connection {s} uses auth type none", .{definition.id});
+            try appendCheckOwned(checks, alloc, "auth", .ok, detail);
+        },
+        .bearer => |env| {
+            if (auth.missingHelp(.cli)) |help| {
+                try checks.append(alloc, .{ .name = "auth", .status = .fail, .detail = help, .fix = loginCommand(provider) });
+                return;
+            }
+            const detail = try alloc.print("connection {s} uses auth type bearer ({s})", .{ definition.id, env });
+            try appendCheckOwned(checks, alloc, "auth", .ok, detail);
+        },
+        .command => |argv| {
+            const max_program_display_bytes: usize = 128;
+            const max_resolved_display_bytes: usize = 256;
+            const program = argv[0];
+            const safe_program = text_utils.utf8PrefixByBytes(program, max_program_display_bytes);
+            if (try resolveCommandProgram(alloc, program)) |resolved| {
+                defer alloc.free(resolved);
+                const safe_resolved = text_utils.utf8PrefixByBytes(resolved, max_resolved_display_bytes);
+                const detail = if (std.Io.Dir.path.isAbsolute(program))
+                    try alloc.print("connection {s} uses auth type command ({f}, executable)", .{ definition.id, text_utils.terminalSafe(safe_program) })
+                else
+                    try alloc.print("connection {s} uses auth type command ({f}, resolved to {f})", .{ definition.id, text_utils.terminalSafe(safe_program), text_utils.terminalSafe(safe_resolved) });
+                try appendCheckOwned(checks, alloc, "auth", .ok, detail);
+            } else {
+                const detail = try alloc.print("connection {s} uses auth type command ({f}, not found or not executable)", .{ definition.id, text_utils.terminalSafe(safe_program) });
+                const fix = try alloc.print("check providers.{s}.auth.command in {s} or PATH", .{
+                    definition.id,
+                    profile_paths.displayText("~/.fx/settings.json"),
+                });
+                try appendCheckOwnedFix(checks, alloc, "auth", .fail, detail, fix);
+            }
+        },
+    }
+}
+
+fn resolveCommandProgram(alloc: Allocator, program: []const u8) !?[]u8 {
+    if (program.len == 0) return null;
+    if (std.Io.Dir.path.isAbsolute(program)) {
+        if (executableFile(program)) return try alloc.dupe(u8, program);
+        return null;
+    }
+    const path_env = io_mod.getenv("PATH") orelse return null;
+    var it = std.mem.splitScalar(u8, path_env, std.Io.Dir.path.delimiter);
+    while (it.next()) |dir| {
+        if (dir.len == 0 or !std.Io.Dir.path.isAbsolute(dir)) continue;
+        const candidate = try std.Io.Dir.path.join(alloc, &.{ dir, program });
+        if (executableFile(candidate)) return candidate;
+        alloc.free(candidate);
+    }
+    return null;
+}
+
+fn executableFile(path: []const u8) bool {
+    if (!std.Io.Dir.path.isAbsolute(path)) return false;
+    const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{}) catch return false;
+    if (stat.kind != .file) return false;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{ .execute = true }) catch return false;
+    return true;
 }
 
 fn appendResolvedStartupCheck(
@@ -1093,4 +1178,121 @@ test "each MCP config issue is a failure with a fix" {
         try std.testing.expectEqualStrings(issue.message, check.detail);
         try std.testing.expectEqualStrings("fix .mcp.json, then run fx doctor again", check.fix.?);
     }
+}
+
+test "doctor reports command auth program resolution without running it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "bin");
+    const bin_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "bin");
+    defer alloc.free(bin_dir);
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ bin_dir, "ran.marker" });
+    defer alloc.free(marker_path);
+
+    const script = try alloc.print("#!/bin/sh\ntouch \"{s}\"\n", .{marker_path});
+    defer alloc.free(script);
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "bin/glm-helper", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, script);
+        try file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(0o755));
+    }
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "bin/plain-file", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, script);
+        try file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(0o644));
+    }
+
+    const helper_abs = try std.Io.Dir.path.join(alloc, &.{ bin_dir, "glm-helper" });
+    defer alloc.free(helper_abs);
+    const plain_abs = try std.Io.Dir.path.join(alloc, &.{ bin_dir, "plain-file" });
+    defer alloc.free(plain_abs);
+    const missing_abs = try std.Io.Dir.path.join(alloc, &.{ bin_dir, "missing-helper" });
+    defer alloc.free(missing_abs);
+
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put("PATH", bin_dir);
+    io_mod.setEnvironMap(&env);
+    defer io_mod.resetEnvironForTest();
+
+    const json = try alloc.print(
+        "{{\"abs_ok\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{{\"type\":\"command\",\"command\":[\"{s}\",\"--secret\"]}}}},\"abs_plain\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{{\"type\":\"command\",\"command\":[\"{s}\"]}}}},\"abs_missing\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{{\"type\":\"command\",\"command\":[\"{s}\"]}}}},\"path_ok\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{{\"type\":\"command\",\"command\":[\"glm-helper\"]}}}},\"path_missing\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{{\"type\":\"command\",\"command\":[\"no-such-helper\"]}}}},\"esc_name\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{{\"type\":\"command\",\"command\":[\"bad\\u001b[31mprog\"]}}}}}}",
+        .{ helper_abs, plain_abs, missing_abs },
+    );
+    defer alloc.free(json);
+    var registry = try configured_provider.Registry.parse_json(alloc, json);
+    defer registry.deinit(alloc);
+
+    const runCase = struct {
+        fn check(a: Allocator, reg: *const configured_provider.Registry, id: []const u8) !Check {
+            var checks: std.ArrayList(Check) = .empty;
+            errdefer {
+                for (checks.items) |*entry| entry.deinit(a);
+                checks.deinit(a);
+            }
+            const provider = (try model_provider.parse(id).?.bind(reg.*));
+            try appendAuthCheck(&checks, a, .{ .active_source = .configured }, provider, reg);
+            try std.testing.expectEqual(@as(usize, 1), checks.items.len);
+            const result = checks.items[0];
+            checks.deinit(a);
+            return result;
+        }
+    }.check;
+
+    var c_abs_ok = try runCase(alloc, &registry, "abs_ok");
+    defer c_abs_ok.deinit(alloc);
+    try std.testing.expectEqual(CheckStatus.ok, c_abs_ok.status);
+    try std.testing.expect(std.mem.find(u8, c_abs_ok.detail, "auth type command") != null);
+    try std.testing.expect(std.mem.find(u8, c_abs_ok.detail, helper_abs) != null);
+    try std.testing.expect(std.mem.find(u8, c_abs_ok.detail, "executable") != null);
+    try std.testing.expect(std.mem.find(u8, c_abs_ok.detail, "--secret") == null);
+
+    var c_abs_plain = try runCase(alloc, &registry, "abs_plain");
+    defer c_abs_plain.deinit(alloc);
+    try std.testing.expectEqual(CheckStatus.fail, c_abs_plain.status);
+    try std.testing.expect(std.mem.find(u8, c_abs_plain.detail, "not found or not executable") != null);
+
+    var c_abs_missing = try runCase(alloc, &registry, "abs_missing");
+    defer c_abs_missing.deinit(alloc);
+    try std.testing.expectEqual(CheckStatus.fail, c_abs_missing.status);
+    try std.testing.expect(std.mem.find(u8, c_abs_missing.detail, "not found or not executable") != null);
+    try std.testing.expect(std.mem.find(u8, c_abs_missing.fix.?, "providers.abs_missing.auth.command") != null);
+
+    var c_path_ok = try runCase(alloc, &registry, "path_ok");
+    defer c_path_ok.deinit(alloc);
+    try std.testing.expectEqual(CheckStatus.ok, c_path_ok.status);
+    try std.testing.expect(std.mem.find(u8, c_path_ok.detail, "auth type command (glm-helper, resolved to ") != null);
+    try std.testing.expect(std.mem.find(u8, c_path_ok.detail, helper_abs) != null);
+
+    var c_path_missing = try runCase(alloc, &registry, "path_missing");
+    defer c_path_missing.deinit(alloc);
+    try std.testing.expectEqual(CheckStatus.fail, c_path_missing.status);
+    try std.testing.expect(std.mem.find(u8, c_path_missing.detail, "no-such-helper, not found or not executable") != null);
+
+    var c_esc = try runCase(alloc, &registry, "esc_name");
+    defer c_esc.deinit(alloc);
+    try std.testing.expectEqual(CheckStatus.fail, c_esc.status);
+    try std.testing.expect(std.mem.findScalar(u8, c_esc.detail, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, c_esc.detail, "bad\\x1b[31mprog") != null);
+
+    // Relative PATH entries must be ignored even when they contain an executable.
+    const cwd_path = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(cwd_path);
+    try std.testing.expect(std.mem.startsWith(u8, bin_dir, cwd_path));
+    try std.testing.expect(bin_dir.len > cwd_path.len + 1 and bin_dir[cwd_path.len] == std.Io.Dir.path.sep);
+    const rel_bin = bin_dir[cwd_path.len + 1 ..];
+    var rel_env = std.process.Environ.Map.init(alloc);
+    defer rel_env.deinit();
+    try rel_env.put("PATH", rel_bin);
+    io_mod.setEnvironMap(&rel_env);
+    var c_rel_path = try runCase(alloc, &registry, "path_ok");
+    defer c_rel_path.deinit(alloc);
+    try std.testing.expectEqual(CheckStatus.fail, c_rel_path.status);
+    try std.testing.expect(std.mem.find(u8, c_rel_path.detail, "not found or not executable") != null);
+
+    // Doctor never executed the helper script.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "bin/ran.marker", .{}));
 }

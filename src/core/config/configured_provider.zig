@@ -4,7 +4,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 
-const max_providers = 32;
+pub const max_providers = 32;
 const max_models = 256;
 pub const max_id_bytes = 64;
 pub const max_model_bytes = 1024;
@@ -15,7 +15,9 @@ const max_json_bytes = 1024 * 1024;
 pub const max_effort_levels = 16;
 const max_effort_name_bytes = 64;
 const max_headers = 16;
-const max_header_name_bytes = 64;
+pub const max_header_name_bytes = 64;
+const max_command_args = 16;
+const max_command_arg_bytes = 1024;
 /// One day: longer than any wait a person sits through, and it keeps every
 /// bound far from overflow.
 pub const max_timeout_ms = 24 * 60 * 60 * 1000;
@@ -88,6 +90,8 @@ pub const OutputLimitField = enum { max_tokens, max_completion_tokens };
 pub const Auth = union(enum) {
     none,
     bearer: []const u8,
+    /// The helper program and its arguments, run without a shell, that prints the connection's token; it holds the argv, never a token.
+    command: []const []const u8,
 };
 
 /// A request header whose value is read from the environment variable `env`
@@ -213,6 +217,12 @@ pub const Definition = struct {
         switch (self.auth) {
             .none => {},
             .bearer => |env| hash_part(&hash, env),
+            .command => |argv| {
+                var count: [4]u8 = undefined;
+                std.mem.writeInt(u32, &count, @intCast(argv.len), .little);
+                hash.update(&count);
+                for (argv) |arg| hash_part(&hash, arg);
+            },
         }
         return hash.finalResult();
     }
@@ -293,7 +303,7 @@ pub fn failure_advice(err: anyerror) ?[]const u8 {
         error.InvalidProtocol => "the protocol is openai-chat-completions, openai-responses, or anthropic-messages",
         error.InvalidBaseUrl => "base_url is an http or https URL with no user, query, or fragment",
         error.InsecureBaseUrl => "base_url uses https, or http only for localhost, 127.0.0.1, or [::1]",
-        error.InvalidAuth => "auth is {\"type\": \"none\"} or {\"type\": \"bearer\", \"env\": \"VARIABLE\"}",
+        error.InvalidAuth => "auth is {\"type\": \"none\"}, {\"type\": \"bearer\", \"env\": \"VARIABLE\"}, or {\"type\": \"command\", \"command\": [\"program\", \"argument\"]} where program is a bare name or an absolute path",
         error.InvalidEnvironmentName => "a variable's name uses letters, digits, and _, and does not start with a digit",
         error.InvalidProviderId => "a connection's name starts with a letter and uses letters, digits, _, and -",
         error.ReservedProviderId => "gateway, codex, and grok are fx's own providers; give the connection another name",
@@ -414,7 +424,7 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
     const normalized = try validate_url(url.string);
     leave(at);
     enter(at, "auth");
-    const auth = try parse_auth(try required(value, "auth"), at);
+    const auth = try parse_auth(owned, try required(value, "auth"), at);
     leave(at);
     var mode: ToolChoiceMode = .omit;
     if (value.object.get("tool_choice_mode")) |choice| {
@@ -446,10 +456,7 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
         .id = try owned.dupe(u8, id),
         .protocol = protocol,
         .base_url = try owned.dupe(u8, normalized),
-        .auth = switch (auth) {
-            .none => .none,
-            .bearer => |env| .{ .bearer = try owned.dupe(u8, env) },
-        },
+        .auth = auth,
         .tool_choice_mode = mode,
         .reviewer_model = reviewer_model,
         .title_model = title_model,
@@ -471,19 +478,52 @@ fn optional_model(owned: Allocator, parent: std.json.Value, key: []const u8, at:
     return try owned.dupe(u8, present.string);
 }
 
-fn parse_auth(value: std.json.Value, at: ?*FailurePath) ParseError!Auth {
-    try check_fields(value, &.{ "type", "env" }, at);
+/// `owned` is the registry's arena; the returned slices live there.
+fn parse_auth(owned: Allocator, value: std.json.Value, at: ?*FailurePath) ParseError!Auth {
+    try check_fields(value, &.{ "type", "env", "command" }, at);
     const kind = try required(value, "type");
     if (kind != .string) return error.InvalidAuth;
     if (std.mem.eql(u8, kind.string, "none")) {
-        if (value.object.contains("env")) return error.InvalidAuth;
+        if (value.object.contains("env") or value.object.contains("command")) return error.InvalidAuth;
         return .none;
     }
-    if (!std.mem.eql(u8, kind.string, "bearer")) return error.InvalidAuth;
-    enter(at, "env");
-    const env = try environment_name(try required(value, "env"));
-    leave(at);
-    return .{ .bearer = env };
+    if (std.mem.eql(u8, kind.string, "bearer")) {
+        if (value.object.contains("command")) return error.InvalidAuth;
+        enter(at, "env");
+        const env = try environment_name(try required(value, "env"));
+        leave(at);
+        return .{ .bearer = try owned.dupe(u8, env) };
+    }
+    if (std.mem.eql(u8, kind.string, "command")) {
+        if (value.object.contains("env")) return error.InvalidAuth;
+        enter(at, "command");
+        const argv = try command_argv(owned, try required(value, "command"));
+        leave(at);
+        return .{ .command = argv };
+    }
+    return error.InvalidAuth;
+}
+
+/// The helper's argv, copied into `owned`. The program must be a bare name or
+/// an absolute path so a repository cannot supply it, and 0 bytes are refused.
+fn command_argv(owned: Allocator, value: std.json.Value) ParseError![]const []const u8 {
+    if (value != .array) return error.InvalidAuth;
+    const items = value.array.items;
+    if (items.len == 0) return error.InvalidAuth;
+    if (items.len > max_command_args) return error.LimitExceeded;
+    const argv = try owned.alloc([]const u8, items.len);
+    for (items, 0..) |item, index| argv[index] = try command_arg(owned, item, index == 0);
+    return argv;
+}
+
+fn command_arg(owned: Allocator, value: std.json.Value, is_program: bool) ParseError![]const u8 {
+    if (value != .string) return error.InvalidAuth;
+    const arg = value.string;
+    if (arg.len == 0) return error.InvalidAuth;
+    if (arg.len > max_command_arg_bytes) return error.LimitExceeded;
+    if (std.mem.findScalar(u8, arg, 0) != null) return error.InvalidAuth;
+    if (is_program and arg[0] != '/' and std.mem.findScalar(u8, arg, '/') != null) return error.InvalidAuth;
+    return owned.dupe(u8, arg);
 }
 
 /// The name of an environment variable, borrowed from `value`.
@@ -502,6 +542,14 @@ fn environment_name(value: std.json.Value) ParseError![]const u8 {
 /// how a connection sets Authorization.
 const reserved_headers = [_][]const u8{ "authorization", "content-type", "content-length", "host", "accept", "accept-encoding", "user-agent", "connection", "transfer-encoding" };
 
+/// Whether `name` is one of `reserved_headers`, in any letter case.
+pub fn is_reserved_header(name: []const u8) bool {
+    for (reserved_headers) |reserved| {
+        if (std.ascii.eqlIgnoreCase(name, reserved)) return true;
+    }
+    return false;
+}
+
 fn parse_headers(owned: Allocator, value: std.json.Value, at: ?*FailurePath) ParseError![]const Header {
     enter(at, "headers");
     if (value != .object) return error.InvalidObject;
@@ -517,9 +565,7 @@ fn parse_headers(owned: Allocator, value: std.json.Value, at: ?*FailurePath) Par
         for (name) |byte| {
             if (!std.ascii.isAlphanumeric(byte) and std.mem.findScalar(u8, "!#$%&'*+-.^_`|~", byte) == null) return error.InvalidHeaderName;
         }
-        for (reserved_headers) |reserved| {
-            if (std.ascii.eqlIgnoreCase(name, reserved)) return error.ReservedHeader;
-        }
+        if (is_reserved_header(name)) return error.ReservedHeader;
         // Header names are case-insensitive, so two spellings are one header.
         for (headers[0..index]) |earlier| {
             if (std.ascii.eqlIgnoreCase(earlier.name, name)) return error.DuplicateField;
@@ -926,7 +972,7 @@ test "configured provider invalid schemas fail explicitly" {
     for (cases) |case| try std.testing.expectError(case.err, Registry.parse_json(std.testing.allocator, case.json));
 }
 
-test "configured provider auth admits only explicit none or a portable environment slot" {
+test "configured provider auth admits only explicit none, a portable environment variable, or a bounded command" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { json: []const u8, err: ParseError }{
         .{ .json = "null", .err = error.InvalidObject },
@@ -943,16 +989,92 @@ test "configured provider auth admits only explicit none or a portable environme
         .{ .json = "{\"type\":\"bearer\",\"env\":\"KEY=secret\"}", .err = error.InvalidEnvironmentName },
         .{ .json = "{\"type\":\"bearer\",\"env\":\"KEY\\n\"}", .err = error.InvalidEnvironmentName },
         .{ .json = "{\"type\":\"bearer\",\"env\":\"KEY\",\"token\":\"literal\"}", .err = error.UnknownField },
-        .{ .json = "{\"type\":\"bearer\",\"command\":\"get-key\"}", .err = error.UnknownField },
+        .{ .json = "{\"type\":\"bearer\",\"command\":\"get-key\"}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"command\",\"command\":[\"/bin/x\"],\"env\":\"KEY\"}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"none\",\"command\":[\"/bin/x\"]}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"bearer\",\"env\":\"KEY\",\"command\":[\"/bin/x\"]}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"command\"}", .err = error.MissingField },
+        .{ .json = "{\"type\":\"command\",\"command\":\"/bin/x\"}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"command\",\"command\":{}}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"command\",\"command\":[]}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"command\",\"command\":[1]}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"command\",\"command\":[\"/bin/x\",null]}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"command\",\"command\":[\"\"]}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"command\",\"command\":[\"/bin/x\\u0000\"]}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"command\",\"command\":[\"./x\"]}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"command\",\"command\":[\"bin/x\"]}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"command\",\"command\":[" ++ text_utils.repeat("\"a\",", max_command_args) ++ "\"a\"]}", .err = error.LimitExceeded },
+        .{ .json = "{\"type\":\"command\",\"command\":[\"" ++ text_utils.repeat("a", max_command_arg_bytes + 1) ++ "\"]}", .err = error.LimitExceeded },
     };
     for (cases) |case| {
         const json = try alloc.print("{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{s}}}}}", .{case.json});
         defer alloc.free(json);
         try std.testing.expectError(case.err, Registry.parse_json(alloc, json));
     }
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    for ([_][]const u8{ "{\"type\":\"command\",\"command\":[\"/usr/bin/x\"]}", "{\"type\":\"command\",\"command\":[\"x\"]}" }) |good| {
+        var parsed_cmd = try std.json.parseFromSlice(std.json.Value, alloc, good, .{});
+        defer parsed_cmd.deinit();
+        try std.testing.expectEqual(@as(usize, 1), (try parse_auth(arena.allocator(), parsed_cmd.value, null)).command.len);
+    }
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"bearer\",\"env\":\"_key_2\"}", .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("_key_2", (try parse_auth(parsed.value, null)).bearer);
+    try std.testing.expectEqualStrings("_key_2", (try parse_auth(arena.allocator(), parsed.value, null)).bearer);
+}
+
+test "configured provider command auth keeps its argv in order" {
+    const alloc = std.testing.allocator;
+    const json = "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{\"type\":\"command\",\"command\":[\"/usr/bin/printf\",\"{\\\"token\\\":\\\"t\\\"}\",\"--flag\"]}}}";
+    var registry = try Registry.parse_json(alloc, json);
+    defer registry.deinit(alloc);
+    const argv = registry.get("local").?.auth.command;
+    try std.testing.expectEqual(@as(usize, 3), argv.len);
+    try std.testing.expectEqualStrings("/usr/bin/printf", argv[0]);
+    try std.testing.expectEqualStrings("{\"token\":\"t\"}", argv[1]);
+    try std.testing.expectEqualStrings("--flag", argv[2]);
+}
+
+test "configured provider command auth takes sixteen arguments of the largest size" {
+    const alloc = std.testing.allocator;
+    const json = "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{\"type\":\"command\",\"command\":[" ++ text_utils.repeat("\"a\",", max_command_args - 1) ++ "\"" ++ text_utils.repeat("b", max_command_arg_bytes) ++ "\"]}}}";
+    var registry = try Registry.parse_json(alloc, json);
+    defer registry.deinit(alloc);
+    const argv = registry.get("local").?.auth.command;
+    try std.testing.expectEqual(@as(usize, max_command_args), argv.len);
+    try std.testing.expectEqual(@as(usize, max_command_arg_bytes), argv[max_command_args - 1].len);
+}
+
+test "configured provider refuses a bad command argument at the command path" {
+    const alloc = std.testing.allocator;
+    const json = "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{\"type\":\"command\",\"command\":[\"/bin/x\",\"\"]}}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    var at: FailurePath = .{};
+    try std.testing.expectError(error.InvalidAuth, Registry.parse_located(alloc, parsed.value, &at));
+    try std.testing.expectEqualStrings("local.auth.command", at.text());
+}
+
+fn command_identity(alloc: Allocator, argv_json: []const u8) ![32]u8 {
+    const json = try std.mem.concat(alloc, u8, &.{ "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{\"type\":\"command\",\"command\":", argv_json, "}}}" });
+    defer alloc.free(json);
+    var registry = try Registry.parse_json(alloc, json);
+    defer registry.deinit(alloc);
+    return registry.get("local").?.binding_identity();
+}
+
+test "configured provider command identity follows the argv exactly" {
+    const alloc = std.testing.allocator;
+    const first = try command_identity(alloc, "[\"/bin/a\",\"b\"]");
+    const again = try command_identity(alloc, "[\"/bin/a\",\"b\"]");
+    const other_argument = try command_identity(alloc, "[\"/bin/a\",\"c\"]");
+    const other_order = try command_identity(alloc, "[\"b\",\"/bin/a\"]");
+    const joined = try command_identity(alloc, "[\"a b\"]");
+    const split = try command_identity(alloc, "[\"a\",\"b\"]");
+    try std.testing.expectEqual(first, again);
+    try std.testing.expect(!std.mem.eql(u8, &first, &other_argument));
+    try std.testing.expect(!std.mem.eql(u8, &first, &other_order));
+    try std.testing.expect(!std.mem.eql(u8, &joined, &split));
 }
 
 test "configured provider scalar bounds and minimum input budget" {
@@ -1293,6 +1415,7 @@ test "configured provider settings parse or are refused on fuzzed bytes" {
             "{\"a\":{\"protocol\":\"anthropic-messages\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"none\"},\"headers\":{\"x-api-key\":{\"env\":\"KEY\"}},\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"high\":{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2048}}}}}}}",
             "{\"r\":{\"protocol\":\"openai-responses\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"none\"},\"model_metadata\":{\"m\":{\"request\":{\"input\":1}}}}}",
             "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:1/v1\",\"auth\":{\"type\":\"none\"},\"timeouts\":{\"stall_ms\":0}}}",
+            "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:11434/v1\",\"auth\":{\"type\":\"command\",\"command\":[\"/usr/bin/printf\",\"{\\\"token\\\":\\\"t\\\"}\"]}}}",
             "\xff\x00{",
         }) ++ @import("fuzz_corpus").configured_provider_definition.*),
     });

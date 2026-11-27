@@ -1,0 +1,52 @@
+%% ConfiguredAuth.tla, design "b": one custom connection whose token comes from
+%% a helper program (the planned `command` auth type). States are what a person
+%% would notice; arrows are events. The chart is checked by TLC through the
+%% model, not by itself: keep it in step with ConfiguredAuth.tla.
+stateDiagram-v2
+    [*] --> NoToken
+    NoToken: No token yet
+    Waiting: Waiting for the sign-in helper (one run for every waiting request)
+    Holding: Token in hand
+    Sending: Request sent with the token
+    Expired: Token past the expiry its helper printed
+    Replaying: Refused once (401); fx dropped the token and sends the request once more
+    Done: Request answered
+    FailedHelper: Request failed, and fx says the helper failed
+    FailedRefused: Request failed, and fx says the server refused the token
+    Cancelled: Request cancelled, helper stopped if nobody else waits
+
+    NoToken --> Waiting: a request needs a token
+    Expired --> Waiting: a request needs a token
+    Holding --> Sending: a request needs a token
+    Waiting --> Waiting: another request needs a token (it joins the run)
+    Waiting --> Sending: the helper prints a token
+    Waiting --> FailedHelper: the helper fails, or fx's deadline stops it
+    Waiting --> Cancelled: you cancel the last waiting request
+    Sending --> Done: the server answers
+    Sending --> Holding: the token stays in memory for the next request
+    Holding --> Expired: the token passes its expiry
+    Sending --> Replaying: the server refuses the token (first time)
+    Replaying --> Sending: another request already got a newer token
+    Replaying --> Waiting: no usable token, so the replay waits on a helper run
+    Replaying --> Cancelled: you cancel before the replay
+    Sending --> FailedRefused: the server refuses the new token too
+    Done --> [*]
+    FailedHelper --> [*]
+    FailedRefused --> [*]
+    Cancelled --> [*]
+
+    note right of Waiting
+        Rule breaks under planted defects, each shortest from the start:
+        no-single-flight: a second request starts a second helper (OneRunPerConnection)
+        orphan-helper: you cancel the last waiting request, the helper keeps running (NoOrphanRun)
+        no-deadline: the helper hangs and the request never ends (RequestSettles)
+        silent-failure: the helper fails and fx gives no reason (FailureSaysSo)
+    end note
+    note right of Replaying
+        refresh-loop: a second 401 replays again (RefreshCapped)
+        resend-same: the refused token is sent again (ResendHasNewToken)
+    end note
+    note left of Expired
+        send-expired: a request sends the expired token (NoExpiredTokenSent)
+        shared-cache: a request on c2 sends c1's token (TokenStaysWithItsConnection)
+    end note

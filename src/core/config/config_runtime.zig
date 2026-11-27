@@ -1,8 +1,11 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const agent_steps = @import("agent_steps.zig");
+const command_auth = if (build_options.libfx) struct {} else @import("../auth/command_auth.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const compactor = @import("../compactor/compactor.zig");
 const types = @import("../shared/types.zig");
@@ -425,6 +428,13 @@ pub fn configuredProviderMessage(alloc: Allocator, err: anyerror) Allocator.Erro
         return try alloc.print("{s}: providers.{s}: {s}", .{ profile_paths.displayText("~/.fx/settings.json"), at.text(), advice });
     }
     if (err == error.MissingConfiguredProviderHeader or err == error.InvalidConfiguredProviderHeader) return headerVariableMessage(alloc);
+    if (err == error.ConfiguredCommandAuthLimit) {
+        return try alloc.dupe(u8, "fx hit its custom-connection limit; restart fx to clear older connections");
+    }
+    if (err == error.ConfiguredCommandAuthFailed) {
+        if (comptime build_options.libfx) return null;
+        return commandAuthFailureMessage(alloc);
+    }
     return null;
 }
 
@@ -485,6 +495,51 @@ fn headerVariableMessage(alloc: Allocator) Allocator.Error!?[]u8 {
 }
 
 const max_listed_headers = 3;
+const max_command_program_display_bytes: usize = 128;
+const max_command_failure_display_bytes: usize = 300;
+
+/// Names each `.command` connection whose last helper run failed, with its
+/// program (`argv[0]` only, never later arguments) and terminal-safe message.
+fn commandAuthFailureMessage(alloc: Allocator) Allocator.Error!?[]u8 {
+    var registry = loadConfiguredProviders(alloc) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
+    defer registry.deinit(alloc);
+    var listed: std.ArrayList(u8) = .empty;
+    defer listed.deinit(alloc);
+    var only: ?[]u8 = null;
+    defer if (only) |message| alloc.free(message);
+    var count: usize = 0;
+    const settings_path = profile_paths.displayText("~/.fx/settings.json");
+    for (registry.definitions) |definition| {
+        const argv = switch (definition.auth) {
+            .command => |value| value,
+            else => continue,
+        };
+        const raw_reason = (try command_auth.lastFailure(alloc, definition.binding_identity())) orelse continue;
+        defer alloc.free(raw_reason);
+        const program = text_utils.utf8PrefixByBytes(argv[0], max_command_program_display_bytes);
+        const reason = text_utils.utf8PrefixByBytes(raw_reason, max_command_failure_display_bytes);
+        count += 1;
+        if (count == 1) {
+            only = try alloc.print(
+                "the sign-in command of connection {s} ({f}) failed: {s}; run it yourself to sign in, or fix providers.{s}.auth.command in {s}",
+                .{ definition.id, text_utils.terminalSafe(program), reason, definition.id, settings_path },
+            );
+        }
+        if (count > max_listed_headers) continue;
+        if (count > 1) try listed.appendSlice(alloc, "; ");
+        try listed.print(alloc, "{s} ({f}): {s}", .{ definition.id, text_utils.terminalSafe(program), reason });
+    }
+    if (count == 0) return null;
+    if (count == 1) {
+        defer only = null;
+        return only.?;
+    }
+    const unlisted = count -| max_listed_headers;
+    if (unlisted == 0) {
+        return try alloc.print("{d} sign-in commands failed: {s}. Run each yourself to sign in, or fix auth.command in {s}", .{ count, listed.items, settings_path });
+    }
+    return try alloc.print("{d} sign-in commands failed: {s} ({d} more). Run each yourself to sign in, or fix auth.command in {s}", .{ count, listed.items, unlisted, settings_path });
+}
 
 /// Why a header's variable can't be sent; with `fix`, also what to do.
 fn headerProblem(state: configured_provider.HeaderValue, fix: bool) []const u8 {
@@ -5014,6 +5069,65 @@ test "modelNotSelectedMessage names the provider and both ways to recover" {
     try std.testing.expect(std.mem.find(u8, modelNotSelectedMessage(error.GrokModelNotSelected).?, "`fx provider grok`") != null);
     try std.testing.expect(std.mem.find(u8, modelNotSelectedMessage(error.ConfiguredModelNotSelected).?, "\"models\" in ~/.fx/settings.json") != null);
     try std.testing.expect(modelNotSelectedMessage(error.OutOfMemory) == null);
+}
+
+test "configuredProviderMessage names failed sign-in command without arguments and explains limit" {
+    const alloc = std.testing.allocator;
+    const limit_msg = (try configuredProviderMessage(alloc, error.ConfiguredCommandAuthLimit)).?;
+    defer alloc.free(limit_msg);
+    try std.testing.expect(std.mem.find(u8, limit_msg, "restart fx") != null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home_root);
+    const settings_json =
+        \\{"providers":{"glm":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"command","command":["/bin/sh","-c","printf 'no session\\n' >&2; exit 3","--secret-arg"]}}}}
+    ;
+    try writeFixtureFile(tmp.dir, ".fx/settings.json", settings_json);
+
+    const home = try TestHome.install(alloc, home_root);
+    defer home.deinit();
+
+    var registry = try loadConfiguredProviders(alloc);
+    defer registry.deinit(alloc);
+    const glm = registry.get("glm").?;
+
+    command_auth.shutdown();
+    defer command_auth.shutdown();
+    const cancel = std.atomic.Value(bool).init(false);
+    try std.testing.expectError(error.HelperFailed, command_auth.token(alloc, .{
+        .identity = glm.binding_identity(),
+        .argv = glm.auth.command,
+    }, &cancel, null));
+
+    const msg = (try configuredProviderMessage(alloc, error.ConfiguredCommandAuthFailed)).?;
+    defer alloc.free(msg);
+    try std.testing.expect(std.mem.find(u8, msg, "connection glm (/bin/sh) failed:") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "no session") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "providers.glm.auth.command") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "~/.fx/settings.json") != null);
+    try std.testing.expect(std.mem.find(u8, msg, "--secret-arg") == null);
+
+    command_auth.shutdown();
+    const esc_json =
+        \\{"providers":{"esc":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"command","command":["/nonexistent/bad\u001b[31mprog","--secret-arg"]}}}}
+    ;
+    try writeFixtureFile(tmp.dir, ".fx/settings.json", esc_json);
+    var esc_registry = try loadConfiguredProviders(alloc);
+    defer esc_registry.deinit(alloc);
+    const esc = esc_registry.get("esc").?;
+    try std.testing.expectError(error.HelperFailed, command_auth.token(alloc, .{
+        .identity = esc.binding_identity(),
+        .argv = esc.auth.command,
+    }, &cancel, null));
+
+    const esc_msg = (try configuredProviderMessage(alloc, error.ConfiguredCommandAuthFailed)).?;
+    defer alloc.free(esc_msg);
+    try std.testing.expect(std.mem.findScalar(u8, esc_msg, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, esc_msg, "bad\\x1b[31mprog") != null);
+    try std.testing.expect(std.mem.find(u8, esc_msg, "--secret-arg") == null);
 }
 
 test "FX_ULTRAFAST overrides the profile and diagnoses malformed values" {

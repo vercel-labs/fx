@@ -505,6 +505,8 @@ pub const Runtime = struct {
     /// Counts credential changes, so a credits reply that started for an
     /// earlier credential does not speak for this one.
     token_pass_epoch: u32 = 0,
+    first_frame_painted: bool = false,
+    deferred_trigger: ?LoadTrigger = null,
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
         return .{
@@ -518,6 +520,15 @@ pub const Runtime = struct {
         self.discardStagedLocked();
         self.menu.deinit(self.alloc);
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+    }
+
+    pub fn noteFirstFramePainted(self: *Self) ?LoadTrigger {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.first_frame_painted = true;
+        const trigger = self.deferred_trigger;
+        self.deferred_trigger = null;
+        return trigger;
     }
 
     fn startWarmup(
@@ -540,6 +551,17 @@ pub const Runtime = struct {
         trigger: LoadTrigger,
         shared_sign_in: ?auth_runtime.SharedSignIn,
     ) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        const wait_for_first_frame = provider.fetch_starts_helper and !self.first_frame_painted;
+        if (wait_for_first_frame) {
+            self.deferred_trigger = trigger;
+        }
+        self.mutex.unlock(io_mod.getIo());
+        if (wait_for_first_frame) {
+            debug_trace.logf("catalog", "model_cache_warmup_deferred reason=helper_waits_for_first_frame", .{});
+            return;
+        }
+
         self.from_profile_settings = provider.provider_id == .configured;
         if (!self.beginLoad(access, provider.refresh_interval_ms, trigger)) return;
 
@@ -2694,4 +2716,38 @@ test "model cache request resolution records lookup misses for the trace report"
     try std.testing.expect(events[2].failed);
     try std.testing.expectEqualStrings("outcome=cache_failed model=zai/glm-5.2", events[1].detail());
     try std.testing.expectEqualStrings("outcome=cache_unavailable model=zai/glm-5.2", events[2].detail());
+}
+
+test "model cache defers helper-backed warmup until first frame and runs non-helper warmups immediately" {
+    const alloc = std.testing.allocator;
+    const access: credentials.CatalogAccess = .{ .public_only = .no_credential };
+
+    // A provider that starts a helper waits for noteFirstFramePainted, then runs once.
+    {
+        var runtime = Runtime.init(alloc, "/v1/models");
+        defer runtime.deinit();
+        var source = AuthChangeCatalog{ .model_id = "helper/m1" };
+        var provider = source.provider();
+        provider.fetch_starts_helper = true;
+
+        runtime.startWarmupWithSharedSignIn(provider, access, .activity, null);
+        try std.testing.expectEqual(@as(usize, 0), source.calls);
+        try std.testing.expectEqual(@as(?LoadTrigger, .activity), runtime.noteFirstFramePainted());
+        try std.testing.expectEqual(@as(?LoadTrigger, null), runtime.noteFirstFramePainted());
+
+        runtime.startWarmupWithSharedSignIn(provider, access, .activity, null);
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqual(@as(usize, 1), source.calls);
+    }
+
+    // A provider without fetch_starts_helper starts warming up before the first frame.
+    {
+        var runtime = Runtime.init(alloc, "/v1/models");
+        defer runtime.deinit();
+        var source = AuthChangeCatalog{ .model_id = "plain/m1" };
+        runtime.startWarmupWithSharedSignIn(source.provider(), access, .activity, null);
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqual(@as(usize, 1), source.calls);
+        try std.testing.expectEqual(@as(?LoadTrigger, null), runtime.noteFirstFramePainted());
+    }
 }

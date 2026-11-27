@@ -189,6 +189,7 @@ pub const FakeCompletion = struct {
     err_body: ?[]const u8 = null,
     failure_schema: ?[]const u8 = null,
     failure_request_shape: ?[]const u8 = null,
+    renews_credential_on_replay: bool = false,
     retry_after_seconds: ?u64 = null,
     pre_admission_error: ?anyerror = null,
     pre_send_error: ?anyerror = null,
@@ -361,6 +362,7 @@ pub const FakeGateway = struct {
                     .schema = failure_schema,
                     .request_shape = failure_request_shape,
                 },
+                .renews_credential_on_replay = completion.renews_credential_on_replay,
                 .ownership = .owned,
             } };
         }

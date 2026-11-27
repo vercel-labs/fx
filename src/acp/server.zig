@@ -25,6 +25,7 @@ const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const secret = @import("../core/auth/secret.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
+const command_auth = if (build_options.libfx) struct {} else @import("../core/auth/command_auth.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
@@ -451,6 +452,7 @@ pub const ServerState = struct {
         // A host `session/load` replaced may still be stopping its servers;
         // they end before this process does.
         if (comptime !host_target.is_wasm) mcp_host.waitRetired();
+        if (comptime !build_options.libfx) command_auth.shutdown();
         // Retention's maintenance, if one runs, ends with the server.
         if (comptime turn_capture.supported) turn_capture.finishMaintenance();
         if (self.sessions_v2) |*store| store.deinit(self.alloc);

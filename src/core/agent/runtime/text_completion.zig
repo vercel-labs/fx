@@ -72,7 +72,13 @@ pub const Outcome = union(enum) {
     /// trace; allocated with the caller's allocator. `unauthorized` when the
     /// provider rejected the credential with 401, `context_overflow` when it
     /// refused the request as longer than the model's context window.
-    failed: struct { reason: Reason, detail: []u8, unauthorized: bool = false, context_overflow: bool = false },
+    failed: struct {
+        reason: Reason,
+        detail: []u8,
+        unauthorized: bool = false,
+        renews_credential_on_replay: bool = false,
+        context_overflow: bool = false,
+    },
 };
 
 pub const Error = error{ Cancelled, OutOfMemory };
@@ -170,6 +176,7 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
             const safe_detail = debug_trace.preview(debug_trace.terminalPreview(&detail_buf, masked), 240);
             var outcome = try failed(alloc, .provider, "kind={s} detail={s}", .{ @tagName(failure.kind), safe_detail });
             outcome.failed.unauthorized = failure.kind == .unauthorized;
+            outcome.failed.renews_credential_on_replay = failure.renews_credential_on_replay;
             outcome.failed.context_overflow = agent_stream_provider.isContextOverflow(failure);
             return outcome;
         },
@@ -353,7 +360,7 @@ pub const CompactorCaller = struct {
         // Another fx process may have renewed the sign-in since the compaction
         // read it: one more send with the renewed credential, as `send` does.
         var attempt = try self.providerCompactionAttempt(alloc, call, conversation);
-        if (attempt == .unauthorized and try self.renewCredential(call.trace_ctx)) {
+        if (attempt == .unauthorized and try self.renewCredential(call.trace_ctx, attempt.unauthorized.renews_credential_on_replay)) {
             attempt = try self.providerCompactionAttempt(alloc, call, conversation);
         }
         return switch (attempt) {
@@ -364,7 +371,10 @@ pub const CompactorCaller = struct {
 
     /// One provider compaction request: the provider's reply, or a 401 the
     /// sign-in can be renewed for.
-    const ProviderAttempt = union(enum) { reply: compactor.ProviderReply, unauthorized };
+    const ProviderAttempt = union(enum) {
+        reply: compactor.ProviderReply,
+        unauthorized: struct { renews_credential_on_replay: bool = false },
+    };
 
     fn providerCompactionAttempt(self: *CompactorCaller, alloc: Allocator, call: compactor.ProviderCall, conversation: agent_stream_provider.RequestData) compactor.CallError!ProviderAttempt {
         var capture = StreamCapture{ .alloc = alloc, .max_bytes = types.ProviderReplay.max_bytes };
@@ -421,7 +431,7 @@ pub const CompactorCaller = struct {
         if (call.cancel_flag.load(.seq_cst)) return error.Cancelled;
         const completion = switch (streamed) {
             .failed => |failure| {
-                if (failure.kind == .unauthorized) return .unauthorized;
+                if (failure.kind == .unauthorized) return .{ .unauthorized = .{ .renews_credential_on_replay = failure.renews_credential_on_replay } };
                 return .{ .reply = try providerFailed(alloc, .provider, "kind={s}", .{@tagName(failure.kind)}) };
             },
             .completed => |completed| completed.completion,
@@ -486,7 +496,12 @@ pub const CompactorCaller = struct {
     /// After a 401: the stored credential, or a forced refresh while the store
     /// still holds the rejected one. Once per compaction. Returns whether the
     /// call can be sent again.
-    fn renewCredential(self: *CompactorCaller, trace_ctx: debug_trace.TraceContext) Error!bool {
+    fn renewCredential(self: *CompactorCaller, trace_ctx: debug_trace.TraceContext, renews_on_replay: bool) Error!bool {
+        if (renews_on_replay) {
+            if (self.renewal_tried) return false;
+            self.renewal_tried = true;
+            return true;
+        }
         const deps = self.renewal_deps orelse return false;
         if (self.renewal_tried) return false;
         self.renewal_tried = true;
@@ -533,7 +548,7 @@ pub const CompactorCaller = struct {
         var outcome = try self.completeCall(alloc, call, conversation, options, &usage);
         // Another fx process may have renewed the sign-in since the compaction
         // read it: one more send with the renewed credential.
-        if (outcome == .failed and outcome.failed.unauthorized and try self.renewCredential(call.trace_ctx)) {
+        if (outcome == .failed and outcome.failed.unauthorized and try self.renewCredential(call.trace_ctx, outcome.failed.renews_credential_on_replay)) {
             alloc.free(outcome.failed.detail);
             usage = .{};
             outcome = try self.completeCall(alloc, call, conversation, options, &usage);
@@ -923,5 +938,98 @@ test "a provider compaction request rejected with 401 is sent once more with the
                 try testing.expectEqualStrings("kind=unauthorized", failure.detail);
             },
         }
+    }
+}
+
+test "a marked 401 in the compactor replays once without loading a stored credential" {
+    const testing = std.testing;
+    const support = @import("tests/support.zig");
+    const Fake = struct {
+        sends: usize = 0,
+        reject_all: bool = false,
+
+        fn stream(raw: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !runtime_gateway_step.StreamResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            self.sends += 1;
+            if (self.reject_all or self.sends == 1) {
+                return .{ .failed = .{
+                    .kind = .unauthorized,
+                    .http_status = .unauthorized,
+                    .detail = try alloc.dupe(u8, "{\"error\":\"expired\"}"),
+                    .renews_credential_on_replay = true,
+                    .ownership = .owned,
+                } };
+            }
+            return .{ .completed = .{
+                .completion = .{ .content = try alloc.dupe(u8, "notes"), .finish_reason = .stop },
+                .ownership = .owned,
+            } };
+        }
+
+        fn capabilities(_: *anyopaque, _: []const u8) model_capabilities.Capabilities {
+            return .{};
+        }
+    };
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const call: compactor.Call = .{
+        .model = "m",
+        .reasoning = types.ReasoningEffort.literal("none"),
+        .system = "s",
+        .user = "u",
+        .max_bytes = 1024,
+        .cancel_flag = &cancel,
+        .trace_ctx = .{},
+    };
+
+    {
+        var fake: Fake = .{};
+        var hooks = support.FakeAgentRuntimeDeps.init(testing.allocator);
+        defer hooks.deinit();
+        const deps = hooks.deps();
+        var summary_model: CompactorCaller = .{
+            .stream_provider = .{ .context = &fake, .stream_fn = Fake.stream },
+            .provider = model_provider.parse("local").?,
+            .model = "m",
+            .api_key = "",
+            .credential_source = .configured,
+            .retry_count = 0,
+            .capabilities_context = &fake,
+            .capabilities_fn = Fake.capabilities,
+            .renewal_deps = &deps,
+        };
+        defer summary_model.deinit();
+        const caller = summary_model.caller();
+        const reply = try caller.vtable.send(caller.context, testing.allocator, call);
+        defer testing.allocator.free(reply.text);
+        try testing.expectEqualStrings("notes", reply.text);
+        try testing.expectEqual(@as(usize, 2), fake.sends);
+        try testing.expectEqual(@as(usize, 0), hooks.credential_refresh_modes.items.len);
+    }
+
+    {
+        var fake: Fake = .{ .reject_all = true };
+        var hooks = support.FakeAgentRuntimeDeps.init(testing.allocator);
+        defer hooks.deinit();
+        const deps = hooks.deps();
+        var summary_model: CompactorCaller = .{
+            .stream_provider = .{ .context = &fake, .stream_fn = Fake.stream },
+            .provider = model_provider.parse("local").?,
+            .model = "m",
+            .api_key = "",
+            .credential_source = .configured,
+            .retry_count = 0,
+            .capabilities_context = &fake,
+            .capabilities_fn = Fake.capabilities,
+            .renewal_deps = &deps,
+        };
+        defer summary_model.deinit();
+        const caller = summary_model.caller();
+        const first = try caller.vtable.send(caller.context, testing.allocator, call);
+        defer testing.allocator.free(first.failed.detail);
+        try testing.expectEqual(compactor.FailureReason.provider, first.failed.reason);
+        try testing.expectEqual(@as(usize, 2), fake.sends);
+        try testing.expectEqual(@as(usize, 0), hooks.credential_refresh_modes.items.len);
     }
 }

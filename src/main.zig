@@ -24,6 +24,7 @@ pub const debug = struct {
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
+const command_auth = if (build_options.libfx) struct {} else @import("core/auth/command_auth.zig");
 const api_key_validator = @import("core/auth/api_key_validator.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
 const js_host_auth = @import("core/auth/js_host_auth.zig");
@@ -1172,6 +1173,7 @@ const App = struct {
         shutdown_trace.mark("credentials_saved");
         self.mcp.deinitForProcessExit();
         shutdown_trace.mark("mcp_children_terminated");
+        if (comptime !build_options.libfx) command_auth.shutdown();
         shutdown_trace.mark("complete");
         if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
         return .{ .handoff = resume_handoff, .failure = shutdown_failure };
@@ -2566,6 +2568,12 @@ const App = struct {
         // The same credential's team may have Token Pass; ask once per team.
         if (comptime !host_profile.cooperative_agent) {
             if (!AuthAppRuntime.startupCredentialPending(self)) TokenPassCheckRuntime.start(self);
+        }
+    }
+
+    pub fn noteFirstFrameForModelCache(self: *App) void {
+        if (self.model_cache.noteFirstFramePainted()) |trigger| {
+            self.loadModelCatalog(trigger);
         }
     }
 
@@ -4358,8 +4366,14 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
                 .exit => |code| code,
             });
         },
-        .returned => exitFast(0),
-        .exit => |code| exitFast(code),
+        .returned => {
+            if (comptime !build_options.libfx) command_auth.shutdown();
+            exitFast(0);
+        },
+        .exit => |code| {
+            if (comptime !build_options.libfx) command_auth.shutdown();
+            exitFast(code);
+        },
     }
 }
 
@@ -5765,6 +5779,9 @@ test {
     _ = @import("core/app/app_auth_runtime.zig");
     _ = auth_runtime;
     _ = @import("core/auth/auth_transition.zig");
+    _ = @import("core/auth/command_token.zig");
+    _ = @import("core/auth/command_helper.zig");
+    _ = @import("core/auth/command_auth.zig");
     _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/subagent_turn_metrics.zig");
