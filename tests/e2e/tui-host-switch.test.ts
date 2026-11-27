@@ -2604,6 +2604,47 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "/trace says fx deleted the saved login after the issuer refused its refresh token",
+    async () => {
+      const issuer = startFakeIssuer({ refresh: () => Response.json({ error: "invalid_grant" }, { status: 400 }) });
+      const traceDir = mkdtempSync(join(tmpdir(), "fx-sign-in-trace-"));
+      try {
+        await withFx((body) => text("main", isMainRequest(body) ? "SWITCH_MAIN_DONE" : "SWITCH_OTHER"), async (session, { home }) => {
+          await session.sendText("SWITCH_USER first");
+          await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+          await session.waitForComposer(15_000);
+
+          writeFxLogin(home, issuer.issuerUrl, "seeded-token", { expiresAtMs: Date.now() - 120_000 });
+          const mark = traceText().length;
+          await session.sendText("SWITCH_USER after the refusal");
+          await until("the prompt waits", () => traceText().slice(mark).includes("pending_prompt_awaiting_auth"), 30_000);
+          await session.sendKeys("C-c");
+          await until("the prompt dropped", () => traceText().slice(mark).includes("reason=ctrl_c_pending_submission"), 15_000);
+
+          const before = new Set(traceReportNames(traceDir));
+          await session.sendText("/trace");
+          const report = await waitForNewTraceReport(traceDir, before);
+          const details = report.all("sign_in_event").map((record) => `${String(record.event)} ${String(record.detail ?? "")}`);
+          expect(details.some((d) => d.startsWith("issuer ") && d.includes("err=InvalidGrant") && d.includes("login_deleted=true"))).toBe(true);
+          expect(details.some((d) => d.startsWith("refresh ") && d.includes("outcome=failed") && d.includes("err=InvalidGrant"))).toBe(true);
+          expect(details.some((d) => d.startsWith("prompt ") && d.includes("reason=invalid_credential") && d.includes("retryable=false"))).toBe(true);
+          expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+          expect(report.text).not.toContain("seeded-refresh-token");
+        }, (home) => writeFxLogin(home, issuer.issuerUrl, "seeded-token"), false, {
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          AI_GATEWAY_API_KEY: undefined as unknown as string,
+          TMPDIR: traceDir,
+        });
+      } finally {
+        issuer.stop();
+        rmSync(traceDir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "/trace on a subagent's screen shows why its prompt waits for a sign-in: the failed refresh, the issuer step, and the notice it never showed",
     async () => {
       // The issuer cannot refresh the saved login. Main's screen shows the

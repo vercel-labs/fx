@@ -2310,12 +2310,6 @@ pub fn Runtime(comptime App: type) type {
             return recoverCredentialFailure(app, agent, source, err);
         }
 
-        /// Which screen `agent`'s prompt is on, for a `/trace` record.
-        fn screenLabel(agent: *const AppAgent) []const u8 {
-            if (comptime !@hasField(AppAgent, "role")) return "main";
-            return if (agent.role == .subagent) "subagent" else "main";
-        }
-
         fn recoverCredentialFailure(app: *App, agent: *AppAgent, source: credentials.Source, err: anyerror) !bool {
             debug_trace.logf("auth", "prompt credential refresh failed source={t} err={s}", .{ source, @errorName(err) });
             if (config_runtime.sessionConnectionNotice(err)) |notice| {
@@ -2340,7 +2334,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 notify;
             sign_in_trace.record(.prompt, true, "outcome=credential_failed screen={s} source={t} reason={t} retryable={} err={s} notice={s}", .{
-                screenLabel(agent),
+                sign_in_trace.screenName(agent),
                 failure.source,
                 failure.reason,
                 failure.retryable(),

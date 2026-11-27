@@ -974,10 +974,11 @@ fn refreshFxSessionSteps(
     };
     mutation.save(alloc, replacement) catch |err| {
         debug_trace.logf("auth", "retiring fx login session after refresh save failed err={s}", .{@errorName(err)});
-        retire_fx_session(alloc, mutation, session) catch |cleanup_err| {
+        if (retire_fx_session(alloc, mutation, session)) |_| {
+            progress.login_deleted = true;
+        } else |cleanup_err| {
             debug_trace.logf("auth", "fx login session retirement failed err={s}", .{@errorName(cleanup_err)});
-        };
-        progress.login_deleted = true;
+        }
         return error.OAuthSessionCleanupUncertain;
     };
 

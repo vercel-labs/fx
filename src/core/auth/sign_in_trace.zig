@@ -4,8 +4,8 @@
 //! for its credential. A shared trace then shows why a prompt waits for a
 //! sign-in even when FX_TRACE is off. Callers supply enum and error names,
 //! counts, and durations only, never a token, an account, or a prompt. A
-//! second ring keeps only the failed events, so a failure stays in the report
-//! however many events come after it.
+//! second ring keeps only the newest failed events, so a failure stays in the
+//! report however many successful events come after it.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -90,6 +90,14 @@ fn Ring(comptime capacity: usize) type {
             self.total = 0;
         }
     };
+}
+
+/// The screen an agent's prompt is on, for a `prompt` record: `subagent`
+/// for a subagent's own view, else `main`.
+pub fn screenName(agent: anytype) []const u8 {
+    const Agent = @TypeOf(agent.*);
+    if (comptime !@hasField(Agent, "role")) return "main";
+    return if (agent.role == .subagent) "subagent" else "main";
 }
 
 var mutex: std.Io.Mutex = .init;
@@ -187,6 +195,27 @@ test "sign-in events keep the newest window and every recent failure" {
     try std.testing.expectEqualStrings("outcome=failed err=Timeout", kept[0].detail());
     try std.testing.expectEqual(@as(u64, 1), kept[0].sequence);
     try std.testing.expectEqual(@as(u64, 1), failureCount());
+}
+
+test "sign-in failures past the kept ring replace the oldest, and all are counted" {
+    reset();
+    defer reset();
+    for (0..failure_ring_capacity + 2) |index| record(.issuer, true, "outcome=failed n={d}", .{index});
+
+    var kept: [failure_ring_capacity]Event = undefined;
+    try std.testing.expectEqual(@as(usize, failure_ring_capacity), snapshotFailures(&kept));
+    try std.testing.expectEqualStrings("outcome=failed n=2", kept[0].detail());
+    try std.testing.expectEqual(@as(u64, 3), kept[0].sequence);
+    try std.testing.expectEqual(@as(u64, failure_ring_capacity + 2), failureCount());
+}
+
+test "a screen name says which view the prompt is on" {
+    const Role = enum { instance, subagent };
+    const WithRole = struct { role: Role };
+    const WithoutRole = struct {};
+    try std.testing.expectEqualStrings("main", screenName(&WithRole{ .role = .instance }));
+    try std.testing.expectEqualStrings("subagent", screenName(&WithRole{ .role = .subagent }));
+    try std.testing.expectEqualStrings("main", screenName(&WithoutRole{}));
 }
 
 test "sign-in events cut a long detail on a character boundary" {

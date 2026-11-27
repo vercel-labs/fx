@@ -187,7 +187,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 .{trigger},
             );
             sign_in_trace.record(.prompt, false, "outcome=resumed screen={s} turn_id={d} trigger={s}", .{
-                screenLabel(agent),
+                sign_in_trace.screenName(agent),
                 pending.draft.turn_id,
                 trigger,
             });
@@ -198,15 +198,9 @@ pub fn SubmitRuntime(comptime App: type) type {
         /// change of source or team sends it on.
         fn recordPromptWaitsForSignIn(agent: *const AppAgent, turn_id: anytype) void {
             sign_in_trace.record(.prompt, true, "outcome=waits_for_sign_in screen={s} turn_id={d}", .{
-                screenLabel(agent),
+                sign_in_trace.screenName(agent),
                 turn_id,
             });
-        }
-
-        /// Which screen `agent`'s prompt is on, for a `/trace` record.
-        fn screenLabel(agent: *const AppAgent) []const u8 {
-            if (comptime !@hasField(AppAgent, "role")) return "main";
-            return if (agent.role == .subagent) "subagent" else "main";
         }
 
         pub fn resumePromptAfterAuth(app: *App, agent: *AppAgent, max_prompt_history: usize) !void {
@@ -2636,6 +2630,25 @@ test "Ctrl+C cancels pending ownership from every pre-worker phase" {
     try std.testing.expectEqual(@as(?u64, null), queued.agent().worker.queued_turn_id);
     try std.testing.expectEqual(@as(usize, 1), queued.agent().worker.delete_count);
     try std.testing.expectEqual(@as(usize, 1), queued.agent().worker.release_count);
+}
+
+test "a prompt that waited for a sign-in records that it went on" {
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+    sign_in_trace.reset();
+    defer sign_in_trace.reset();
+    var app = try pendingLifecycleFake(std.testing.allocator, 807);
+    defer app.deinit();
+    Runtime.noteCommittedFrame(&app, (&app).agent());
+    app.agent().submission.pending.?.phase = .awaiting_auth;
+
+    try std.testing.expect(Runtime.resumePendingPromptAfterAuth(&app, (&app).agent(), "auth_completion"));
+    try std.testing.expectEqual(PendingPhase.adopted, app.agent().submission.pending.?.phase);
+    var events: [1]sign_in_trace.Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), sign_in_trace.snapshot(&events));
+    try std.testing.expectEqualStrings("prompt", events[0].name());
+    try std.testing.expect(!events[0].failed);
+    try std.testing.expectEqualStrings("outcome=resumed screen=main turn_id=807 trigger=auth_completion", events[0].detail());
+    try std.testing.expect(Runtime.cancelPendingSubmission(&app, (&app).agent()));
 }
 
 test "Ctrl+C on a queued prompt gives back the stale shell handles note it carried (D93)" {

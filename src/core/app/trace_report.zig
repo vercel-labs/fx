@@ -178,14 +178,16 @@
 //!   the `model_catalog` problems come from these.
 //! - `sign_in`: `events`, the events the bounded ring holds, at most 32;
 //!   `session_events`, every event this session; `kept_failures`, the failed
-//!   events kept apart from the ring, at most 32, which later events never
-//!   push out; `session_failures`, every failed event this session. Then a
+//!   events kept apart from the ring, at most 32, which later successful
+//!   events never push out (a newer failure replaces the oldest);
+//!   `session_failures`, every failed event this session. Then a
 //!   `sign_in_event` per retained event, oldest first: `at`, `sequence`,
 //!   `event`, `failed`, `detail`, and `truncated`, whether the detail was cut
 //!   when recorded. Then a `failed_sign_in_event` per kept failure, oldest
 //!   first, with the same fields and `sequence`. `event` is `lock_wait`, a
 //!   wait for the fx login's `auth.lock` that every fx process sharing the
-//!   login takes (`outcome` `taken` or `given_up`, `waited_ms`, `limit_ms`);
+//!   login takes (`outcome` `taken`, `given_up`, or the name of another lock
+//!   error, `waited_ms`, and for a failure `limit_ms`);
 //!   `refresh`, one refresh of the saved fx login (`mode`, `outcome`
 //!   `rotated`, `saved_login_used`, `no_saved_login`, or `failed` with the
 //!   `step` and `err` where it stopped, `ms`); `issuer`, its request to the
