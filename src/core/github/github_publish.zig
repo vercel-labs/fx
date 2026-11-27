@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const safe_git = @import("../shell_command/safe_git.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -74,7 +75,22 @@ pub fn publish(alloc: Allocator, workflow: Workflow, draft: Draft) !PublishResul
     var argv = try buildPublishArgv(alloc, workflow, draft.title, draft.body);
     defer argv.deinit(alloc);
 
-    const result = runPublishCommand(alloc, argv.items) catch |err| {
+    // `gh pr create` runs `git status` in this repository, and the
+    // repository's own config can name programs for git to run (`safe_git`),
+    // so `gh` gets git's overrides for them, or does not run. `gh issue
+    // create` only lists the remotes, and `fx issue` needs no repository, so
+    // it runs in fx's own environment.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const environ: ?std.process.Environ.Map = switch (workflow) {
+        .pull_request => switch (try safeGhEnvironment(arena_state.allocator())) {
+            .environ => |map| map,
+            .refused => |reason| return .{ .ok = false, .text = try alloc.dupe(u8, reason) },
+        },
+        .issue => null,
+    };
+
+    const result = runPublishCommand(alloc, argv.items, if (environ) |*map| map else null) catch |err| {
         return publishResultFromRunError(alloc, err);
     };
     return publishResultFromProcess(alloc, result);
@@ -97,9 +113,33 @@ fn buildPublishArgv(alloc: Allocator, workflow: Workflow, title: []const u8, bod
     return argv;
 }
 
-fn runPublishCommand(alloc: Allocator, argv: []const []const u8) !CompletedProcess {
+const GhEnvironment = union(enum) {
+    environ: std.process.Environ.Map,
+    /// Why `gh` was not run. Static text.
+    refused: []const u8,
+};
+
+fn safeGhEnvironment(arena: Allocator) !GhEnvironment {
+    const cwd = io_mod.realpathAlloc(arena, ".") catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .refused = "gh was not run: the working directory could not be resolved" },
+    };
+    const ready = switch (try safe_git.prepare(arena, cwd)) {
+        .ready => |ready| ready,
+        .refused => return .{ .refused = "gh was not run: fx could not turn off the programs this repository's git config can start" },
+    };
+    var environ = io_mod.cloneEnvironMap(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .refused = "gh was not run: the environment could not be read" },
+    };
+    try safe_git.exportOverrides(arena, &environ, ready);
+    return .{ .environ = environ };
+}
+
+fn runPublishCommand(alloc: Allocator, argv: []const []const u8, environ: ?*const std.process.Environ.Map) !CompletedProcess {
     const result = try std.process.run(alloc, io_mod.getIo(), .{
         .argv = argv,
+        .environ_map = environ,
     });
     return .{
         .term = result.term,

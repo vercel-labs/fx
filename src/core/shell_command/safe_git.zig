@@ -215,6 +215,29 @@ fn appendPrelude(arena: Allocator, argv: *std.ArrayList([]const u8), ready: Read
     try appendHooksOff(arena, argv, ready.hook_names);
 }
 
+/// Exports the overrides `appendPrelude` passes as `-c` through
+/// `GIT_CONFIG_PARAMETERS`, which git reads in `env`'s children and their own
+/// git children alike, so a program that starts git itself, such as `gh`, gets
+/// the same protections. An existing value stays first and the overrides come
+/// after it, which makes them win. The legacy `'key=value'` spelling is read
+/// by every git version `prepare` accepts.
+pub fn exportOverrides(arena: Allocator, env: *std.process.Environ.Map, ready: Ready) Allocator.Error!void {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try appendPrelude(arena, &argv, ready);
+    var value: std.ArrayList(u8) = .empty;
+    if (env.get("GIT_CONFIG_PARAMETERS")) |existing| try value.appendSlice(arena, existing);
+    for (argv.items, 0..) |word, index| {
+        if (!std.mem.eql(u8, word, "-c")) continue;
+        if (value.items.len > 0) try value.append(arena, ' ');
+        try value.append(arena, '\'');
+        for (argv.items[index + 1]) |byte| {
+            if (byte == '\'') try value.appendSlice(arena, "'\\''") else try value.append(arena, byte);
+        }
+        try value.append(arena, '\'');
+    }
+    try env.put("GIT_CONFIG_PARAMETERS", value.items);
+}
+
 /// `appendPrelude` for fx's own capture reads, which never fetch: a
 /// repository whose config names a promisor remote cannot make them start a
 /// transport. git before 2.45 ignores `GIT_NO_LAZY_FETCH` (`blockLazyFetch`),
@@ -1525,6 +1548,21 @@ test "safe git argv turns off repository programs for every subcommand" {
     for (expected, argv.items) |want, have| try std.testing.expectEqualStrings(want, have);
 }
 
+test "safe git exports its overrides for a program that starts git itself" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var env = std.process.Environ.Map.init(arena);
+    try env.put("GIT_CONFIG_PARAMETERS", "'user.name=a'");
+    const ready: Ready = .{ .executable = "/usr/bin/git", .filter_names = &.{"l'fs"}, .hook_names = &.{"pre"} };
+    try exportOverrides(arena, &env, ready);
+    try std.testing.expectEqualStrings(
+        "'user.name=a' 'core.fsmonitor=false' 'core.hooksPath=/dev/null' 'log.showSignature=false'" ++
+            " 'filter.l'\\''fs.clean=' 'filter.l'\\''fs.smudge=' 'filter.l'\\''fs.process=' 'hook.pre.enabled=false'",
+        env.get("GIT_CONFIG_PARAMETERS").?,
+    );
+}
+
 test "safe git environment keeps only fixed values and user config locations" {
     var env = try environment(std.testing.allocator);
     defer env.deinit();
@@ -1754,6 +1792,42 @@ test "safe git blocks repository hooks" {
     try repo.plain(repo.repo, &.{ "config", "core.hooksPath", hooks });
     try repo.write("repo/a.txt", "one\n");
     try repo.expectBlocked(repo.repo, .status, &.{"--short"}, &.{ "status", "--short" });
+}
+
+test "plain git with the exported overrides runs none of the repository's programs" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
+    const hooks = try repo.path("hooks");
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, hooks);
+    try repo.writeExecutable(try repo.path("hooks/post-index-change"));
+    try repo.plain(repo.repo, &.{ "config", "core.hooksPath", hooks });
+    try repo.plain(repo.repo, &.{ "config", "core.fsmonitor", repo.sentinel });
+    try repo.plain(repo.repo, &.{ "config", "filter.evil.clean", repo.sentinel });
+    try repo.write("repo/.gitattributes", "*.txt filter=evil\n");
+    try repo.write("repo/a.txt", "one\n");
+    _ = try repo.runs();
+
+    // The command `gh pr create` starts, with no override of its own.
+    const status = try repo.plainArgv(&.{ "status", "--porcelain" });
+    var env = try repo.childEnvironment(.plain);
+    try exportOverrides(repo.arena, &env, try repo.ready(repo.repo));
+    _ = try std.process.run(repo.arena, std.testing.io, .{
+        .argv = status,
+        .cwd = .{ .path = repo.repo },
+        .environ_map = &env,
+        .stdout_limit = .limited(1 << 20),
+        .stderr_limit = .limited(1 << 20),
+    });
+    try std.testing.expectEqual(@as(usize, 0), try repo.runs());
+
+    // Control: the same command without the overrides runs them. The run
+    // above refreshed the index, so the file is touched again.
+    try repo.write("repo/a.txt", "one\n");
+    _ = try repo.run(repo.repo, status, .plain);
+    try std.testing.expect(try repo.runs() > 0);
 }
 
 test "safe git blocks a repository external diff and textconv" {
