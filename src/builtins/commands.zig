@@ -154,6 +154,11 @@ const tool_skill_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "open NAME [FILE]", .description = "Print a skill or one of its files" },
 };
 
+const tool_search_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--allow-domain <domain>", .description = "Only results from this domain; repeat for more" },
+    .{ .flag = "--block-domain <domain>", .description = "Skip results from this domain; repeat for more" },
+};
+
 const tool_agent_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "message NAME TEXT", .description = "Message or start a subagent; options take a value after a space or as --flag=value", .options = &tool_agent_message_options },
     .{ .usage = "wait", .description = "Wait for a subagent report or until none work" },
@@ -165,12 +170,12 @@ const tool_agent_subcommands = [_]command_specs.SubcommandDoc{
 /// The `tool` command's one-line summary. A build without the bash tool bridge
 /// still names the command, so its help never shows an empty summary.
 fn toolSummary(comptime bridge_supported: bool) []const u8 {
-    return if (bridge_supported) "Run bash-tool file, skill, and subagent commands" else "Bash tool commands (not available in this host)";
+    return if (bridge_supported) "Run bash-tool file, web, skill, and subagent commands" else "Bash tool commands (not available in this host)";
 }
 
 /// The `tool` command's usage, shared by its help entry and the top-level list.
 fn toolUsage(comptime bridge_supported: bool) []const u8 {
-    return if (bridge_supported) "tool <edit|write|skill|agent> ..." else "tool";
+    return if (bridge_supported) "tool <edit|write|skill|agent|web|search> ..." else "tool";
 }
 
 const tool_subcommands: []const command_specs.SubcommandDoc = if (tool_bridge.supported) &.{
@@ -178,6 +183,8 @@ const tool_subcommands: []const command_specs.SubcommandDoc = if (tool_bridge.su
     .{ .usage = "write PATH", .description = "Write a whole file from stdin" },
     .{ .usage = "skill <list|open>", .description = "List or read visible skills", .subcommands = &tool_skill_subcommands },
     .{ .usage = "agent <message|wait|status|stop|close>", .description = "Message, wait for, check, stop, or close subagents", .subcommands = &tool_agent_subcommands },
+    .{ .usage = "web URL", .description = "Fetch a web page as text" },
+    .{ .usage = "search QUERY [--allow-domain D]... [--block-domain D]...", .description = "Search the web and print the results; give one kind of domain filter, not both", .options = &tool_search_options },
 } else &.{};
 
 const mcp_subcommands = [_]command_specs.SubcommandDoc{
@@ -1029,7 +1036,7 @@ test "fx tool help matches tool_bridge.supported" {
         if (entry.kind == .tool) break entry;
     } else unreachable;
     if (tool_bridge.supported) {
-        try std.testing.expectEqual(@as(usize, 4), spec.subcommands.len);
+        try std.testing.expectEqual(@as(usize, 6), spec.subcommands.len);
         try std.testing.expect(spec.details.len > 0);
     } else {
         try std.testing.expectEqual(@as(usize, 0), spec.subcommands.len);
@@ -1037,6 +1044,24 @@ test "fx tool help matches tool_bridge.supported" {
     }
     try std.testing.expectEqualStrings(toolSummary(tool_bridge.supported), spec.summary);
     try std.testing.expect(toolSummary(false).len > 0);
+}
+
+test "fx tool help names web URL and search QUERY, and search lists its domain options" {
+    if (!tool_bridge.supported) return error.SkipZigTest;
+    const spec = for (top_level_specs) |entry| {
+        if (entry.kind == .tool) break entry;
+    } else unreachable;
+    var has_web = false;
+    var has_search = false;
+    for (spec.subcommands) |sub| {
+        if (std.mem.eql(u8, sub.usage, "web URL")) has_web = true;
+        if (std.mem.startsWith(u8, sub.usage, "search QUERY")) {
+            has_search = true;
+            try std.testing.expectEqual(@as(usize, 2), sub.options.len);
+        }
+    }
+    try std.testing.expect(has_web);
+    try std.testing.expect(has_search);
 }
 
 test "fx tool help group line shows the same usage as the tool spec" {

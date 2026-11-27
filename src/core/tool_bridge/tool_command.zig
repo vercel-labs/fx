@@ -29,6 +29,8 @@ pub const Command = union(enum) {
     agent_status: ?[]const u8,
     agent_stop: []const u8,
     agent_close: []const u8,
+    web_fetch: capability.WebFetchRequest,
+    web_search: SearchCommand,
 
     pub fn verb(self: Command) []const u8 {
         return switch (self) {
@@ -41,15 +43,41 @@ pub const Command = union(enum) {
             .agent_status => "agent status",
             .agent_stop => "agent stop",
             .agent_close => "agent close",
+            .web_fetch => "web",
+            .web_search => "search",
         };
     }
 
     fn readsStdin(self: Command) bool {
         return switch (self) {
             .edit, .write => true,
-            .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => false,
+            .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => false,
         };
     }
+};
+
+/// The most domain filters of one kind that `fx tool search` takes, so the parse
+/// needs no allocator. Each entry is a slice of the command's arguments.
+const DomainList = struct {
+    items: [capability.max_domain_filters][]const u8 = @splat(""),
+    len: usize = 0,
+
+    fn push(self: *DomainList, domain: []const u8) ParseError!void {
+        if (self.len == capability.max_domain_filters) return error.TooManyDomains;
+        self.items[self.len] = domain;
+        self.len += 1;
+    }
+
+    fn slice(self: *const DomainList) []const []const u8 {
+        return self.items[0..self.len];
+    }
+};
+
+/// `fx tool search QUERY` with its domain filters, before the bridge request copies them.
+const SearchCommand = struct {
+    query: []const u8,
+    allowed: DomainList = .{},
+    blocked: DomainList = .{},
 };
 
 pub const ParseError = error{
@@ -61,6 +89,10 @@ pub const ParseError = error{
     TooManyArguments,
     UnknownCommand,
     PathIsOption,
+    QueryTooShort,
+    InvalidQuery,
+    BothDomainKinds,
+    TooManyDomains,
 };
 
 /// Reads `args`, the words after `fx tool`.
@@ -127,7 +159,62 @@ pub fn parse(args: []const []const u8) ParseError!Command {
         }
         return error.UnknownCommand;
     }
+    if (std.mem.eql(u8, verb, "web")) return parseWeb(args);
+    if (std.mem.eql(u8, verb, "search")) return parseSearch(args);
     return error.UnknownCommand;
+}
+
+/// `fx tool web URL`: one URL. A `--` ends the options, so a URL may start with a dash.
+fn parseWeb(args: []const []const u8) ParseError!Command {
+    var url: ?[]const u8 = null;
+    var positional_only = false;
+    for (args[1..]) |arg| {
+        if (!positional_only and std.mem.eql(u8, arg, "--")) {
+            positional_only = true;
+            continue;
+        }
+        if (!positional_only and arg.len > 0 and arg[0] == '-') return error.UnknownOption;
+        if (url != null) return error.TooManyArguments;
+        url = arg;
+    }
+    const value = url orelse return error.MissingArgument;
+    if (value.len == 0) return error.MissingArgument;
+    return .{ .web_fetch = .{ .url = value } };
+}
+
+/// `fx tool search QUERY [--allow-domain D]... [--block-domain D]...`: one query of at
+/// least two characters, with at most one kind of domain filter.
+fn parseSearch(args: []const []const u8) ParseError!Command {
+    var query: ?[]const u8 = null;
+    var command: SearchCommand = .{ .query = "" };
+    var positional_only = false;
+    var index: usize = 1;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (!positional_only and std.mem.eql(u8, arg, "--")) {
+            positional_only = true;
+            continue;
+        }
+        if (!positional_only and arg.len > 0 and arg[0] == '-') {
+            if (try matchOptionValue(args, &index, "--allow-domain")) |domain| {
+                try command.allowed.push(domain);
+            } else if (try matchOptionValue(args, &index, "--block-domain")) |domain| {
+                try command.blocked.push(domain);
+            } else {
+                return error.UnknownOption;
+            }
+            continue;
+        }
+        if (query != null) return error.TooManyArguments;
+        query = arg;
+    }
+    const text = query orelse return error.MissingArgument;
+    if (text.len == 0) return error.QueryTooShort;
+    const characters = std.unicode.utf8CountCodepoints(text) catch return error.InvalidQuery;
+    if (characters < 2) return error.QueryTooShort;
+    if (command.allowed.len > 0 and command.blocked.len > 0) return error.BothDomainKinds;
+    command.query = text;
+    return .{ .web_search = command };
 }
 
 fn parseAgentMessage(args: []const []const u8) ParseError!Command {
@@ -206,6 +293,8 @@ fn matchOptionValue(args: []const []const u8, index: *usize, comptime flag: []co
 pub fn writeUsage(w: *Writer, err: ParseError, args: []const []const u8) Writer.Error!void {
     const verb = if (args.len > 0) args[0] else "";
     const sub = if (args.len > 1) args[1] else "";
+    if (std.mem.eql(u8, verb, "web")) return writeWebUsage(w, err);
+    if (std.mem.eql(u8, verb, "search")) return writeSearchUsage(w, err);
     if (std.mem.eql(u8, verb, "skill")) {
         const usage_line = if (std.mem.eql(u8, sub, "list"))
             "Usage: fx tool skill list\n"
@@ -241,6 +330,7 @@ pub fn writeUsage(w: *Writer, err: ParseError, args: []const []const u8) Writer.
             error.InvalidReport => try w.print("fx tool agent message: --report must be final, every_turn, or never.\n{s}", .{usage_line}),
             error.TooManyArguments => try w.print("fx tool agent {s}: too many arguments.\n{s}", .{ sub, usage_line }),
             error.UnknownCommand => try w.print("fx tool agent: unknown subcommand {f}.\n{s}", .{ text_utils.terminalSafe(sub), usage_line }),
+            error.QueryTooShort, error.InvalidQuery, error.BothDomainKinds, error.TooManyDomains => try w.print("fx tool agent {s}: invalid usage.\n{s}", .{ sub, usage_line }),
         }
         return;
     }
@@ -250,6 +340,32 @@ pub fn writeUsage(w: *Writer, err: ParseError, args: []const []const u8) Writer.
         error.PathIsOption, error.UnknownOption => try w.print("fx tool {s}: the file must be a path, not an option.\n", .{verb}),
         error.UnknownCommand => try w.print("fx tool: unknown command {f}. Use edit, write, skill, or agent.\n", .{text_utils.terminalSafe(verb)}),
         error.MissingOptionValue, error.InvalidReport => try w.print("fx tool {s}: invalid usage.\n", .{verb}),
+        error.QueryTooShort, error.InvalidQuery, error.BothDomainKinds, error.TooManyDomains => try w.print("fx tool {s}: invalid usage.\n", .{verb}),
+    }
+}
+
+fn writeWebUsage(w: *Writer, err: ParseError) Writer.Error!void {
+    const usage_line = "Usage: fx tool web URL\n";
+    switch (err) {
+        error.MissingArgument, error.MissingPath => try w.print("fx tool web: give the page to fetch, as in fx tool web URL.\n{s}", .{usage_line}),
+        error.TooManyArguments => try w.print("fx tool web: give one URL.\n{s}", .{usage_line}),
+        error.UnknownOption, error.PathIsOption => try w.print("fx tool web: unexpected option.\n{s}", .{usage_line}),
+        else => try w.print("fx tool web: invalid usage.\n{s}", .{usage_line}),
+    }
+}
+
+fn writeSearchUsage(w: *Writer, err: ParseError) Writer.Error!void {
+    const usage_line = "Usage: fx tool search QUERY [--allow-domain D]... [--block-domain D]...\n";
+    switch (err) {
+        error.MissingArgument, error.MissingPath => try w.print("fx tool search: give a query, as in fx tool search QUERY.\n{s}", .{usage_line}),
+        error.QueryTooShort => try w.print("fx tool search: the query needs at least 2 characters.\n{s}", .{usage_line}),
+        error.InvalidQuery => try w.print("fx tool search: the query must be valid UTF-8.\n{s}", .{usage_line}),
+        error.TooManyArguments => try w.print("fx tool search: give one query; quote a query with spaces.\n{s}", .{usage_line}),
+        error.BothDomainKinds => try w.print("fx tool search: give --allow-domain or --block-domain, not both.\n{s}", .{usage_line}),
+        error.TooManyDomains => try w.print("fx tool search: give at most {d} domain filters of each kind.\n{s}", .{ capability.max_domain_filters, usage_line }),
+        error.MissingOptionValue => try w.print("fx tool search: option requires a non-empty value.\n{s}", .{usage_line}),
+        error.UnknownOption, error.PathIsOption => try w.print("fx tool search: unexpected option.\n{s}", .{usage_line}),
+        else => try w.print("fx tool search: invalid usage.\n{s}", .{usage_line}),
     }
 }
 
@@ -306,7 +422,7 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
     const resolved_command: Command = switch (command) {
         .edit => |path| .{ .edit = try resolveCommandPath(arena, cwd, path) },
         .write => |path| .{ .write = try resolveCommandPath(arena, cwd, path) },
-        .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => command,
+        .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => command,
     };
     return send(arena, io, out, err, resolved_command, input, bridge, socket_caller);
 }
@@ -397,6 +513,12 @@ pub fn send(
         .agent_status => |agent| .{ .agent_status = agent },
         .agent_stop => |agent| .{ .agent_stop = agent },
         .agent_close => |agent| .{ .agent_close = agent },
+        .web_fetch => |req| .{ .web_fetch = req },
+        .web_search => |req| .{ .web_search = .{
+            .query = req.query,
+            .allowed_domains = try arena.dupe([]const u8, req.allowed.slice()),
+            .blocked_domains = try arena.dupe([]const u8, req.blocked.slice()),
+        } },
     };
     _ = client.encodeRequest(arena, bridge.token, operation) catch |encode_err| switch (encode_err) {
         error.RequestTooLarge => {
@@ -480,6 +602,8 @@ const FakeBridge = struct {
     calls: usize = 0,
     edit_blocks: usize = 0,
     written: []const u8 = "",
+    fetched: capability.WebFetchRequest = .{ .url = "" },
+    searched: capability.WebSearchRequest = .{ .query = "" },
 
     fn caller(self: *FakeBridge) Caller {
         return .{ .context = self, .call_fn = fakeCall };
@@ -492,11 +616,100 @@ const FakeBridge = struct {
         switch (operation) {
             .edit => |edit| self.edit_blocks = edit.blocks.len,
             .write => |write| self.written = write.content,
+            .web_fetch => |value| self.fetched = value,
+            .web_search => |value| self.searched = value,
             .call, .list, .search, .help, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => {},
         }
         return self.reply;
     }
 };
+
+test "parse reads web and search, with repeated domain filters in either form" {
+    try std.testing.expectEqualStrings("https://example.com/a", (try parse(&.{ "web", "https://example.com/a" })).web_fetch.url);
+    const found = (try parse(&.{ "search", "zig", "--allow-domain", "ziglang.org", "--allow-domain=example.com" })).web_search;
+    try std.testing.expectEqualStrings("zig", found.query);
+    try std.testing.expectEqual(@as(usize, 2), found.allowed.len);
+    try std.testing.expectEqualStrings("ziglang.org", found.allowed.items[0]);
+    try std.testing.expectEqualStrings("example.com", found.allowed.items[1]);
+    try std.testing.expectEqual(@as(usize, 0), found.blocked.len);
+    const blocked = (try parse(&.{ "search", "zig", "--block-domain=spam.example" })).web_search;
+    try std.testing.expectEqual(@as(usize, 1), blocked.blocked.len);
+    try std.testing.expectEqual(@as(usize, 0), blocked.allowed.len);
+    // A query after -- may start with a dash, and a query counts code points, not bytes.
+    try std.testing.expectEqualStrings("-x", (try parse(&.{ "search", "--", "-x" })).web_search.query);
+    try std.testing.expectEqualStrings("é!", (try parse(&.{ "search", "é!" })).web_search.query);
+}
+
+test "parse refuses an empty URL, a short query, both domain kinds, and an unknown option" {
+    try std.testing.expectError(error.MissingArgument, parse(&.{"web"}));
+    try std.testing.expectError(error.MissingArgument, parse(&.{ "web", "" }));
+    try std.testing.expectError(error.TooManyArguments, parse(&.{ "web", "https://a.example", "https://b.example" }));
+    try std.testing.expectError(error.UnknownOption, parse(&.{ "web", "--raw", "https://a.example" }));
+    try std.testing.expectError(error.MissingArgument, parse(&.{"search"}));
+    try std.testing.expectError(error.QueryTooShort, parse(&.{ "search", "a" }));
+    try std.testing.expectError(error.QueryTooShort, parse(&.{ "search", "" }));
+    try std.testing.expectError(error.QueryTooShort, parse(&.{ "search", "é" }));
+    try std.testing.expectError(error.BothDomainKinds, parse(&.{ "search", "zig", "--allow-domain", "a.example", "--block-domain", "b.example" }));
+    try std.testing.expectError(error.UnknownOption, parse(&.{ "search", "zig", "--json" }));
+    try std.testing.expectError(error.MissingOptionValue, parse(&.{ "search", "zig", "--allow-domain=" }));
+    try std.testing.expectError(error.TooManyArguments, parse(&.{ "search", "zig", "rust" }));
+}
+
+test "parse caps the domain filters of each kind" {
+    var args: [2 + 2 * (capability.max_domain_filters + 1)][]const u8 = undefined;
+    args[0] = "search";
+    args[1] = "zig";
+    for (0..capability.max_domain_filters + 1) |index| {
+        args[2 + 2 * index] = "--allow-domain";
+        args[3 + 2 * index] = "a.example";
+    }
+    try std.testing.expectError(error.TooManyDomains, parse(&args));
+}
+
+test "fx tool web and search each have their own usage text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var web_out: std.Io.Writer.Allocating = .init(arena);
+    try writeUsage(&web_out.writer, error.MissingArgument, &.{"web"});
+    try std.testing.expect(std.mem.find(u8, web_out.written(), "Usage: fx tool web URL\n") != null);
+    var search_out: std.Io.Writer.Allocating = .init(arena);
+    try writeUsage(&search_out.writer, error.QueryTooShort, &.{ "search", "a" });
+    try std.testing.expect(std.mem.find(u8, search_out.written(), "Usage: fx tool search QUERY [--allow-domain D]... [--block-domain D]...\n") != null);
+    try std.testing.expect(std.mem.find(u8, search_out.written(), "at least 2 characters") != null);
+}
+
+test "fx tool web sends a web_fetch request and prints the page on stdout" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .ok, .bytes = 10 }, .bytes = "PAGE TEXT\n" } };
+    const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .web_fetch = .{ .url = "https://example.com/a" } }, "", test_bridge, fake.caller());
+    try std.testing.expectEqual(client.exit.ok, code);
+    try std.testing.expectEqualStrings("https://example.com/a", fake.fetched.url);
+    try std.testing.expectEqualStrings("PAGE TEXT\n", out.written());
+    try std.testing.expectEqualStrings("", err.written());
+}
+
+test "fx tool search sends its query and one domain filter, and prints the results on stdout" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .ok, .bytes = 8 }, .bytes = "results\n" } };
+    var allowed: DomainList = .{};
+    try allowed.push("ziglang.org");
+    const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .web_search = .{ .query = "zig", .allowed = allowed } }, "", test_bridge, fake.caller());
+    try std.testing.expectEqual(client.exit.ok, code);
+    try std.testing.expectEqualStrings("zig", fake.searched.query);
+    try std.testing.expectEqual(@as(usize, 1), fake.searched.allowed_domains.len);
+    try std.testing.expectEqualStrings("ziglang.org", fake.searched.allowed_domains[0]);
+    try std.testing.expectEqual(@as(usize, 0), fake.searched.blocked_domains.len);
+    try std.testing.expectEqualStrings("results\n", out.written());
+}
 
 test "parse reads one verb and one path, and refuses the rest" {
     try std.testing.expectEqualStrings("app.py", (try parse(&.{ "edit", "app.py" })).edit);

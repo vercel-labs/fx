@@ -34,6 +34,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { completion, createConfiguredProviderFixture, toolCompletion } from "./fixtures/chat-completions";
 
 const TIMEOUT = 30_000;
 const TERMINAL_FIXTURE_SHELL = terminalFixtureShell();
@@ -3144,6 +3145,85 @@ describe("slice 6: fx tool skill and agent bridge", () => {
     } finally {
       releaseChild(fakeGatewayFinalText("Child cleanup.\n"));
       markChildSeen();
+    }
+  }, TIMEOUT);
+});
+
+describe("slice 7: fx tool web and search", () => {
+  const BASH_SETTING = ["--config", "experimental.bash_tool=true"];
+
+  test("fx tool web refuses a private address with the URL policy's text and exit 6", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("b_web", "bash", {
+        command: `${JSON.stringify(FX_BIN)} tool web https://10.0.0.1/x; echo "exit=$?"`,
+      }),
+      fakeGatewayFinalText("Refused.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Fetch a private address."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = (JSON.parse(toolResultText(gateway.requests[1]!.body, "b_web")) as { value: string }).value;
+    expect(out).toContain("web_fetch only fetches known public HTTP(S) URLs");
+    expect(out).toContain("exit=6");
+  }, TIMEOUT);
+
+  test("fx tool web under a deny rule for the host exits 5 before any fetch", async () => {
+    const root = createRoot();
+    mkdirSync(join(root.home, ".fx"), { recursive: true });
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ permission: { bash: "allow", web_fetch: { "domain:example.com": "deny" } } }),
+    );
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("b_deny", "bash", {
+        command: `${JSON.stringify(FX_BIN)} tool web https://example.com/page; echo "exit=$?"`,
+      }),
+      fakeGatewayFinalText("Denied.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--auto", ...BASH_SETTING, "Fetch example.com."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = (JSON.parse(toolResultText(gateway.requests[1]!.body, "b_deny")) as { value: string }).value;
+    expect(out).toContain("exit=5");
+  }, TIMEOUT);
+
+  test("fx tool search with no Gateway search backend exits 6 with the next step", async () => {
+    // The configured local provider is not the AI Gateway, so it has no search backend.
+    let calls = 0;
+    const f = createConfiguredProviderFixture(body => {
+      calls++;
+      if (calls === 1) {
+        return toolCompletion(body.model, "bash", { command: `${JSON.stringify(FX_BIN)} tool search "zig release notes"; echo "exit=$?"` }, "call-search");
+      }
+      return completion(body.model, "No search.");
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Search for zig release notes."], {
+        cwd: f.workspace,
+        env: f.env,
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code).toBe(0);
+      const toolMessage = f.requests[1]!.body.messages.find((message: { role: string }) => message.role === "tool");
+      const out = String(toolMessage.content);
+      expect(out).toContain("web search needs the AI Gateway provider; use web to fetch a page you know.");
+      expect(out).toContain("exit=6");
+    } finally {
+      f.close();
     }
   }, TIMEOUT);
 });

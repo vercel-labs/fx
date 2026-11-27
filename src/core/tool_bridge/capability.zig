@@ -95,6 +95,22 @@ pub const AgentMessageRequest = struct {
     report: ?AgentReport = null,
 };
 
+/// The most domain filters a web search takes of each kind.
+pub const max_domain_filters: usize = 32;
+
+/// `fx tool web URL`: fetch one page, as the `web_fetch` tool does.
+pub const WebFetchRequest = struct {
+    url: []const u8,
+};
+
+/// `fx tool search QUERY`: search the web, as the `web_search` tool does. At most
+/// one of the two domain lists is non-empty, since the tool takes one filter kind.
+pub const WebSearchRequest = struct {
+    query: []const u8,
+    allowed_domains: []const []const u8 = &.{},
+    blocked_domains: []const []const u8 = &.{},
+};
+
 pub const BashToolRequest = union(enum) {
     skill_list,
     skill_open: SkillOpenRequest,
@@ -103,6 +119,8 @@ pub const BashToolRequest = union(enum) {
     agent_status: ?[]const u8,
     agent_stop: []const u8,
     agent_close: []const u8,
+    web_fetch: WebFetchRequest,
+    web_search: WebSearchRequest,
 };
 
 pub const CallStatus = enum { ok, tool_error, failed };

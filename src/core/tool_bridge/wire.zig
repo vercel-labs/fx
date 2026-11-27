@@ -76,11 +76,15 @@ pub const Operation = union(enum) {
     agent_status: ?[]const u8,
     agent_stop: []const u8,
     agent_close: []const u8,
+    /// `fx tool web URL`: fetch one page.
+    web_fetch: capability_mod.WebFetchRequest,
+    /// `fx tool search QUERY`: search the web.
+    web_search: capability_mod.WebSearchRequest,
 
     /// The lookup this operation is, or null for a change or a call.
     pub fn lookup(self: Operation) ?capability_mod.Lookup {
         return switch (self) {
-            .call, .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => null,
+            .call, .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close, .web_fetch, .web_search => null,
             .list => |server| .{ .list = server },
             .search => |query| .{ .search = query },
             .help => |tool| .{ .help = tool },
@@ -100,6 +104,8 @@ pub const Operation = union(enum) {
             .agent_status => |agent| agent orelse "agent status",
             .agent_stop => |agent| agent,
             .agent_close => |agent| agent,
+            .web_fetch => |value| value.url,
+            .web_search => |value| value.query,
             .list, .search, .help => |text| text,
         };
     }
@@ -162,6 +168,8 @@ pub fn parseRequest(arena: Allocator, line: []const u8) RequestError!Request {
         .agent_status => .{ .agent_status = try optionalNonEmptyString(object, "agent") },
         .agent_stop => .{ .agent_stop = try nonEmptyString(object, "agent") },
         .agent_close => .{ .agent_close = try nonEmptyString(object, "agent") },
+        .web_fetch => .{ .web_fetch = .{ .url = try nonEmptyString(object, "url") } },
+        .web_search => .{ .web_search = try parseWebSearch(arena, object) },
     };
     return .{
         .version = @intCast(version.integer),
@@ -187,6 +195,35 @@ fn optionalNonEmptyString(object: std.json.ObjectMap, key: []const u8) RequestEr
     if (value == .null) return null;
     if (value != .string or value.string.len == 0) return error.MalformedRequest;
     return value.string;
+}
+
+/// A web search's query and its domain filters. Only one filter kind may be
+/// non-empty, as the web_search tool takes one.
+fn parseWebSearch(arena: Allocator, object: std.json.ObjectMap) RequestError!capability_mod.WebSearchRequest {
+    const allowed = try optionalDomainList(arena, object, "allowed_domains");
+    const blocked = try optionalDomainList(arena, object, "blocked_domains");
+    if (allowed.len > 0 and blocked.len > 0) return error.MalformedRequest;
+    return .{
+        .query = try nonEmptyString(object, "query"),
+        .allowed_domains = allowed,
+        .blocked_domains = blocked,
+    };
+}
+
+/// The domain filters an optional list field names: at most
+/// `capability_mod.max_domain_filters` non-empty strings. A missing or null field names none.
+fn optionalDomainList(arena: Allocator, object: std.json.ObjectMap, key: []const u8) RequestError![]const []const u8 {
+    const value = object.get(key) orelse return &.{};
+    if (value == .null) return &.{};
+    if (value != .array) return error.MalformedRequest;
+    const items = value.array.items;
+    if (items.len > capability_mod.max_domain_filters) return error.MalformedRequest;
+    const domains = try arena.alloc([]const u8, items.len);
+    for (items, domains) |item, *domain| {
+        if (item != .string or item.string.len == 0) return error.MalformedRequest;
+        domain.* = item.string;
+    }
+    return domains;
 }
 
 fn optionalReport(object: std.json.ObjectMap) RequestError!?capability_mod.AgentReport {
@@ -260,6 +297,12 @@ pub fn writeRequest(writer: *std.Io.Writer, token: mcp_call.Token, operation: Op
             if (maybe_agent) |agent| try writeField(writer, "agent", agent);
         },
         .agent_stop, .agent_close => |agent| try writeField(writer, "agent", agent),
+        .web_fetch => |value| try writeField(writer, "url", value.url),
+        .web_search => |value| {
+            try writeField(writer, "query", value.query);
+            if (value.allowed_domains.len > 0) try writeDomainList(writer, "allowed_domains", value.allowed_domains);
+            if (value.blocked_domains.len > 0) try writeDomainList(writer, "blocked_domains", value.blocked_domains);
+        },
     }
     try writer.writeAll("}\n");
 }
@@ -267,6 +310,15 @@ pub fn writeRequest(writer: *std.Io.Writer, token: mcp_call.Token, operation: Op
 fn writeField(writer: *std.Io.Writer, comptime key: []const u8, text: []const u8) std.Io.Writer.Error!void {
     try writer.writeAll(",\"" ++ key ++ "\":");
     try std.json.Stringify.value(text, .{}, writer);
+}
+
+fn writeDomainList(writer: *std.Io.Writer, comptime key: []const u8, domains: []const []const u8) std.Io.Writer.Error!void {
+    try writer.writeAll(",\"" ++ key ++ "\":[");
+    for (domains, 0..) |domain, index| {
+        if (index > 0) try writer.writeByte(',');
+        try std.json.Stringify.value(domain, .{}, writer);
+    }
+    try writer.writeByte(']');
 }
 
 pub const Status = enum { ok, tool_error, failed, denied, refused };
@@ -464,6 +516,46 @@ test "a notice is cut to the bound and encoded as one terminal-safe line" {
     try std.testing.expect(std.mem.findScalar(u8, bounded, 0x1b) == null);
     try std.testing.expect(std.mem.findScalar(u8, bounded, '\n') == null);
     try std.testing.expect(std.mem.endsWith(u8, bounded, "..."));
+}
+
+test "a web request round-trips with its url, its query, and its domain filters, if any" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const token: mcp_call.Token = @splat(0x03);
+    const allowed = [_][]const u8{ "ziglang.org", "example.com" };
+    const blocked = [_][]const u8{"spam.example"};
+    for ([_]Operation{
+        .{ .web_fetch = .{ .url = "https://example.com/a?b=\"c\"" } },
+        .{ .web_search = .{ .query = "zig allocators" } },
+        .{ .web_search = .{ .query = "zig", .allowed_domains = &allowed } },
+        .{ .web_search = .{ .query = "zig", .blocked_domains = &blocked } },
+    }) |operation| {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try writeRequest(&out.writer, token, operation);
+        const line = out.written();
+        try std.testing.expect(std.mem.endsWith(u8, line, "}\n"));
+        const parsed = try parseRequest(arena, line[0 .. line.len - 1]);
+        try std.testing.expectEqual(std.meta.activeTag(operation), std.meta.activeTag(parsed.operation));
+        try expectSameOperation(operation, parsed.operation);
+        try std.testing.expect(parsed.operation.lookup() == null);
+    }
+}
+
+test "a web request that is not one well-formed url or query is malformed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{
+        "{\"v\":1,\"token\":\"\",\"op\":\"web_fetch\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"web_fetch\",\"url\":\"\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"web_fetch\",\"url\":7}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"web_search\",\"query\":\"\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"web_search\",\"query\":\"zig\",\"allowed_domains\":\"a.com\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"web_search\",\"query\":\"zig\",\"allowed_domains\":[\"\"]}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"web_search\",\"query\":\"zig\",\"blocked_domains\":[7]}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"web_search\",\"query\":\"zig\",\"allowed_domains\":[\"a.com\"],\"blocked_domains\":[\"b.com\"]}",
+    }) |line| try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
 }
 
 test "an edit line keeps its path and its blocks in order, quotes and newlines included" {
@@ -678,7 +770,18 @@ fn expectSameOperation(want: Operation, got: Operation) !void {
         .agent_status => |w| try expectOptionalStrings(w, got.agent_status),
         .agent_stop => |w| try std.testing.expectEqualStrings(w, got.agent_stop),
         .agent_close => |w| try std.testing.expectEqualStrings(w, got.agent_close),
+        .web_fetch => |w| try std.testing.expectEqualStrings(w.url, got.web_fetch.url),
+        .web_search => |w| {
+            try std.testing.expectEqualStrings(w.query, got.web_search.query);
+            try expectStringLists(w.allowed_domains, got.web_search.allowed_domains);
+            try expectStringLists(w.blocked_domains, got.web_search.blocked_domains);
+        },
     }
+}
+
+fn expectStringLists(want: []const []const u8, got: []const []const u8) !void {
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try std.testing.expectEqualStrings(w, g);
 }
 
 fn expectOptionalStrings(want: ?[]const u8, got: ?[]const u8) !void {
