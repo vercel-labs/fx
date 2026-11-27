@@ -843,7 +843,8 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         while (!loaded() && Date.now() < deadline) await Bun.sleep(50);
         expect(loaded()).toBe(true);
         await session.sendKeys("Enter");
-        await session.waitForText("› Remove        /mcp remove remote", 5_000);
+        await session.waitForText("› Turn off", 5_000);
+        await session.waitForText("  Remove        /mcp remove remote", 5_000);
       } finally {
         holder.kill();
         if (session) {

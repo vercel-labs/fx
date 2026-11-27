@@ -2079,11 +2079,22 @@ describe("fx mcp add and remove refuse what fx would skip", () => {
     await tui.sendText("Turn 2 project check.");
     await tui.waitForPane((pane) => pane.includes("PROJECT_TURN2_OFF") && turnSettled(pane), 15_000);
 
-    // Reopen /mcp, turn fixture back on.
+    // Reopen /mcp, turn fixture back on: project server requires approval confirm.
     await tui.sendText("/mcp");
     await tui.waitForText(/fixture\s+rejected\s+project/, 10_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("Turn on", 5_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Approve fixture for this project? It runs:", 5_000);
+    await tui.waitForText("enter confirm     esc cancel", 5_000);
+    await tui.sendKeys("Escape");
+    await tui.waitForText("↑↓ navigate     enter run     esc back", 5_000);
+    const stillOff = JSON.parse(readFileSync(settingsPath, "utf8"));
+    expect(stillOff.workspaces[root.workspace].disabledMcpjsonServers).toEqual(["fixture"]);
+    expect(stillOff.workspaces[root.workspace].enabledMcpjsonServers).toBeUndefined();
+
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Approve fixture for this project? It runs:", 5_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("Turn off", 10_000);
     await tui.waitForText(/status\s+ready/, 15_000);

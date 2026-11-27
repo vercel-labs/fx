@@ -42,11 +42,19 @@ pub const Choice = enum {
         };
     }
 
-    /// Remove, approve, and reject ask first; login, logout, and toggles are quick to undo.
+    /// Remove, approve, reject, and turning on a project server ask first;
+    /// login, logout, turning off, and turning on a profile server are quick to undo.
     pub fn asks(c: Choice) bool {
         return switch (c) {
             .remove, .approve, .reject => true,
             .login, .logout, .turn_off, .turn_on => false,
+        };
+    }
+
+    pub fn asksFor(c: Choice, row: Row) bool {
+        return switch (c) {
+            .turn_on => row.status.source == .workspace,
+            else => c.asks(),
         };
     }
 
@@ -421,7 +429,7 @@ pub fn press(s: *State, view: View, key: Key) Effect {
                     const cs = choices(r, &buf);
                     if (s.cursor >= cs.len) return .none;
                     const c = cs[s.cursor];
-                    if (!c.asks()) {
+                    if (!c.asksFor(r)) {
                         s.clearError();
                         return .{ .run = .{ .choice = c, .server = r.status.name } };
                     }
@@ -941,4 +949,33 @@ test "a server that goes away takes its screen back to the list" {
     s = .{ .active = true, .screen = .server, .cursor = 3 };
     _ = settle(&s, .{ .rows = &.{}, .open = r, .layout = serverLayout(r, .loading, "", 9) });
     try testing.expectEqual(@as(usize, 1), s.cursor);
+}
+
+test "Turn on for a rejected project server asks for approval confirm before running" {
+    const proj = testRow("proj", .rejected, .{ .source = .workspace, .transport = .stdio });
+    const proj_view: View = .{ .rows = &.{}, .open = proj, .layout = serverLayout(proj, .disabled, "", 9) };
+    try testing.expect(Choice.turn_on.asksFor(proj));
+
+    var s: State = .{ .active = true, .screen = .server, .cursor = 0 };
+    try testing.expectEqual(Effect.none, press(&s, proj_view, .enter));
+    try testing.expectEqual(Screen.confirm, s.screen);
+    try testing.expectEqual(@as(?Choice, .turn_on), s.confirm);
+
+    // Esc cancels without running.
+    try testing.expectEqual(Effect.none, press(&s, proj_view, .escape));
+    try testing.expectEqual(Screen.server, s.screen);
+    try testing.expect(s.confirm == null);
+
+    // Enter confirms and runs turn_on.
+    try testing.expectEqual(Effect.none, press(&s, proj_view, .enter));
+    const confirmed = press(&s, proj_view, .enter);
+    try testing.expectEqual(Choice.turn_on, confirmed.run.choice);
+    try testing.expectEqualStrings("proj", confirmed.run.server);
+
+    // Profile Turn on still runs immediately without confirm.
+    const prof = testRow("prof", .disabled, .{ .source = .profile });
+    const prof_view: View = .{ .rows = &.{}, .open = prof, .layout = serverLayout(prof, .disabled, "", 9) };
+    try testing.expect(!Choice.turn_on.asksFor(prof));
+    var sp: State = .{ .active = true, .screen = .server, .cursor = 0 };
+    try testing.expectEqual(Choice.turn_on, press(&sp, prof_view, .enter).run.choice);
 }

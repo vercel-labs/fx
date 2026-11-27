@@ -143,6 +143,7 @@ pub const State = struct {
     /// `/mcp` commands and menu tool loads still running, and the flag that
     /// ends them on quit.
     host_verbs: std.atomic.Value(usize) = .init(0),
+    toggle_group: std.Io.Group = .init,
     host_closing: std.atomic.Value(bool) = .init(false),
     /// Set by process-exit teardown before it joins a pending reload, so the
     /// reload discards its candidate runtime without grace or session DELETEs.
@@ -393,6 +394,7 @@ pub const State = struct {
         }
         // `/mcp` commands still running end first, so none outlives the state.
         self.closeHostMenu();
+        self.toggle_group.cancel(io_mod.getIo());
         var waited: usize = 0;
         while (self.host_verbs.load(.acquire) > 0 and waited < 500) : (waited += 1) io_mod.sleep(10 * std.time.ns_per_ms);
         if (self.host_verbs.load(.acquire) > 0) debug_trace.logf("mcp", "MCP commands still running at exit count={d}", .{self.host_verbs.load(.acquire)});
@@ -976,8 +978,7 @@ pub const State = struct {
         job.name = try a.dupe(u8, name);
         _ = self.host_verbs.fetchAdd(1, .acq_rel);
         errdefer _ = self.host_verbs.fetchSub(1, .acq_rel);
-        const thread = try std.Thread.spawn(.{}, ToggleJob.run, .{job});
-        thread.detach();
+        try self.toggle_group.concurrent(io_mod.getIo(), ToggleJob.run, .{job});
     }
 
     const ToggleJob = struct {
@@ -994,7 +995,7 @@ pub const State = struct {
             a.free(job.name);
         }
 
-        fn run(job: *ToggleJob) void {
+        fn run(job: *ToggleJob) std.Io.Cancelable!void {
             const a = std.heap.c_allocator;
             const self = job.state;
             defer {
@@ -1002,6 +1003,7 @@ pub const State = struct {
                 a.destroy(job);
                 _ = self.host_verbs.fetchSub(1, .acq_rel);
             }
+            if (self.host_closing.load(.acquire)) return error.Canceled;
             self.applyToggle(job.home, job.workspace_root, job.name, job.enable);
         }
     };
@@ -1047,10 +1049,7 @@ pub const State = struct {
                     return;
                 };
                 switch (updated) {
-                    .updated => {
-                        self.host_reload_requested.store(true, .release);
-                        self.host_menu_at_ms = 0;
-                    },
+                    .updated => self.host_reload_requested.store(true, .release),
                     .missing => self.recordToggleError(aa, name, action_word, profile_paths.displayText("it isn't in ~/.fx/mcp.json")),
                     .refused => |refusal| {
                         const reason = mcp_verbs.refusalWords(aa, refusal) catch "the entry was refused";
@@ -1069,10 +1068,7 @@ pub const State = struct {
                 defer attempt.deinit(aa);
                 switch (attempt) {
                     .failure => |f| self.recordToggleError(aa, name, action_word, mcp_verbs.describe(f.err)),
-                    .outcome => {
-                        self.host_reload_requested.store(true, .release);
-                        self.host_menu_at_ms = 0;
-                    },
+                    .outcome => self.host_reload_requested.store(true, .release),
                 }
             },
             .acp => self.recordToggleError(aa, name, action_word, "session servers can't be toggled"),
@@ -1775,4 +1771,67 @@ test "applyToggle persists profile enabled and project disabledMcpjsonServers, r
     const untouched = (try readProfileConfig(alloc, home)).?;
     defer alloc.free(untouched);
     try std.testing.expectEqualStrings(bad_profile, untouched);
+}
+
+test "hostMenuKey requires approval confirmation before turning on a project server" {
+    const alloc = std.testing.allocator;
+    const project_config = @import("../mcp/project_config.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    try writeTestFile(&tmp, "workspace/.mcp.json",
+        \\{"mcpServers":{"proj_srv":{"command":"node","args":["proj.js"]}}}
+    );
+    const settings_json = try alloc.print("{{\"workspaces\":{{\"{s}\":{{\"" ++ project_config.disabled_servers_key ++ "\":[\"proj_srv\"]}}}}}}", .{root});
+    defer alloc.free(settings_json);
+    try writeTestFile(&tmp, "home/.fx/settings.json", settings_json);
+
+    ToggleTestLoader.home_path = home;
+    const registry: tool_dispatch.Registry = .{ .tools = &.{} };
+    var state: State = .{};
+    defer state.deinit();
+    try state.loadHost(ToggleTestLoader.load, alloc, home, root, registry, .{});
+
+    state.openHostMenu();
+    try state.hostMenuKey(.enter, "", home, root);
+    try std.testing.expectEqual(mcp_menu.Screen.server, state.host_menu.screen);
+
+    // First Enter on Turn on must enter confirm, not write enabledMcpjsonServers.
+    try state.hostMenuKey(.enter, "", home, root);
+    try std.testing.expectEqual(mcp_menu.Screen.confirm, state.host_menu.screen);
+    try std.testing.expectEqual(@as(?mcp_menu.Choice, .turn_on), state.host_menu.confirm);
+    {
+        var choices = try config_runtime.loadProjectMcpChoicesFromHome(alloc, home, root);
+        defer choices.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), choices.choices.approved.len);
+        try std.testing.expectEqual(@as(usize, 1), choices.choices.rejected.len);
+    }
+
+    // Escape cancels back to server with settings untouched.
+    try state.hostMenuKey(.escape, "", home, root);
+    try std.testing.expectEqual(mcp_menu.Screen.server, state.host_menu.screen);
+    {
+        var choices = try config_runtime.loadProjectMcpChoicesFromHome(alloc, home, root);
+        defer choices.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), choices.choices.approved.len);
+        try std.testing.expectEqual(@as(usize, 1), choices.choices.rejected.len);
+    }
+
+    // Enter then Enter confirms and enables proj_srv.
+    try state.hostMenuKey(.enter, "", home, root);
+    try std.testing.expectEqual(mcp_menu.Screen.confirm, state.host_menu.screen);
+    try state.hostMenuKey(.enter, "", home, root);
+    state.toggle_group.await(io_mod.getIo()) catch {};
+    var waited: usize = 0;
+    while (state.host_verbs.load(.acquire) > 0 and waited < 500) : (waited += 1) io_mod.sleep(10 * std.time.ns_per_ms);
+    var after = try config_runtime.loadProjectMcpChoicesFromHome(alloc, home, root);
+    defer after.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), after.choices.approved.len);
+    try std.testing.expectEqualStrings("proj_srv", after.choices.approved[0]);
 }

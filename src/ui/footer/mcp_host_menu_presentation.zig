@@ -482,9 +482,9 @@ fn confirmLines(p: Projection, r: menu.Row, width: u16, out: *Confirm) []const C
     const name = r.status.name;
     const q = switch (c) {
         .remove => std.mem.print(&out.question, "Remove {s} from {s}?", .{ name, p.fileOf(r) }),
-        .approve => std.mem.print(&out.question, "Approve {s} for this project? It {s}:", .{ name, if (r.status.transport == .stdio) "runs" else "connects to" }),
+        .approve, .turn_on => std.mem.print(&out.question, "Approve {s} for this project? It {s}:", .{ name, if (r.status.transport == .stdio) "runs" else "connects to" }),
         .reject => std.mem.print(&out.question, "Reject {s}? fx won't start it in this project.", .{name}),
-        .login, .logout, .turn_off, .turn_on => std.mem.print(&out.question, "{s} {s}?", .{ c.label(), name }),
+        .login, .logout, .turn_off => std.mem.print(&out.question, "{s} {s}?", .{ c.label(), name }),
     } catch "Are you sure?";
     out.lines[n] = .{ .text = q, .style = .question };
     n += 1;
@@ -493,7 +493,7 @@ fn confirmLines(p: Projection, r: menu.Row, width: u16, out: *Confirm) []const C
             out.lines[n] = .{ .text = "Its saved login is deleted too.", .style = .detail };
             n += 1;
         },
-        .approve => {
+        .approve, .turn_on => {
             var rest = r.target orelse "";
             const limit = @max(@as(usize, width) -| 4, 16);
             while (rest.len > 0 and n < out.lines.len) {
@@ -1240,4 +1240,27 @@ test "off servers and menu toggle errors render cleanly in the server view" {
         \\  Its tools show here once you turn it on.
         \\
     , text);
+}
+
+test "project Turn on renders the same approval confirmation screen as Approve" {
+    var docs = testStatus("docs", .rejected);
+    docs.source = .workspace;
+    docs.transport = .stdio;
+    const rows = [_]menu.Row{.{ .status = docs, .target = "node ./scripts/docs-server.js --port 4100" }};
+    var p: Projection = .{ .rows = &rows };
+    menu.open(&p.state);
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    _ = menu.press(&p.state, .{ .rows = &rows, .open = rows[0], .layout = p.layout(rows[0]) }, .enter);
+    try testing.expectEqual(menu.Screen.confirm, p.state.screen);
+    try testing.expectEqual(@as(?menu.Choice, .turn_on), p.state.confirm);
+    const text = try render(p, 52);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(
+        \\  docs  rejected
+        \\
+        \\  Approve docs for this project? It runs:
+        \\    node ./scripts/docs-server.js --port 4100
+        \\
+    , text);
+    try testing.expectEqualStrings("enter confirm     esc cancel", hintVariants(p)[0]);
 }
