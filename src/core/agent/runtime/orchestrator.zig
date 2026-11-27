@@ -8939,6 +8939,7 @@ fn processQueuedPromptLoop(
         request_recovery.continue_flag = config.recovery_continue_flag;
         request_recovery.sign_in_closed_flag = config.recovery_sign_in_closed_flag;
         request_recovery.retry_budget_ms = config.recovery_retry_budget_ms;
+        if (config.recovery_retry_budget_exhausted) |out| out.* = false;
         // `deinit` clears a status still shown on every exit; an error exit
         // reports `failed` first.
         defer request_recovery.deinit();
@@ -9898,6 +9899,9 @@ fn processQueuedPromptLoop(
                         );
                     }
                 }
+                if (request_recovery.budgetExhausted()) {
+                    if (config.recovery_retry_budget_exhausted) |out| out.* = true;
+                }
                 return err;
             };
             stream_result_set = true;
@@ -10649,7 +10653,10 @@ fn processQueuedPromptLoop(
                         reset_stream_for_next_attempt = true;
                         continue;
                     }
-                    if (request_recovery.budgetExhausted() and !config.cancel_flag.load(.seq_cst)) break :retry;
+                    if (request_recovery.budgetExhausted() and !config.cancel_flag.load(.seq_cst)) {
+                        if (config.recovery_retry_budget_exhausted) |out| out.* = true;
+                        break :retry;
+                    }
                     runtime_telemetry.traceCancelObserved(step_ctx, false);
                     try request_recovery.cancel();
                     try finishPendingCancelledCalls(
@@ -10825,6 +10832,9 @@ fn processQueuedPromptLoop(
             // Every exit below returns normally, so the request reports its
             // end here rather than through the step's errdefer.
             request_recovery.endWithError();
+            if (request_recovery.budgetExhausted()) {
+                if (config.recovery_retry_budget_exhausted) |out| out.* = true;
+            }
             if (!http_failure_notice_shown) {
                 const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
                 try deps.push_http_error(deps.ctx, failureStatus(failure), http_detail, job.credential_source);

@@ -731,6 +731,7 @@ const AskContext = struct {
     /// kind or attempt changes, not on every one-second refresh.
     last_recovery_notice_kind: ?types.RouteRecoveryStatus.Kind = null,
     last_recovery_notice_attempt: usize = 0,
+    retry_budget_exhausted: bool = false,
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -1963,6 +1964,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .auto_compact_percent = startup.auto_compact_percent,
         .cancel_flag = ctx.cancelFlag(),
         .recovery_retry_budget_ms = recovery_policy.retryBudgetFromValue(io_mod.getenv("FX_TEST_RECOVERY_RETRY_BUDGET_MS")),
+        .recovery_retry_budget_exhausted = &ctx.retry_budget_exhausted,
         .fast_mode = ctx.fast_mode,
         .ultrafast_mode = ctx.ultrafast_mode,
         .effort = ctx.effort,
@@ -1984,7 +1986,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     // When fx ask's own turn ended because its retry budget ran out, stop
     // waiting and let `ctx.deinit()` cancel and join any running subagents.
     while (ctx.subagent_host) |tree| {
-        if (askTurnStoppedByRetryBudget(&ctx)) {
+        if (ctx.retry_budget_exhausted) {
             tree.closeTree();
             break;
         }
@@ -2036,11 +2038,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     return takePromptRunResult(&ctx, alloc);
 }
 
-fn askTurnStoppedByRetryBudget(ctx: *const AskContext) bool {
-    const recovery = ctx.last_recovery_status orelse return false;
-    return ctx.failed and recovery.kind == .failed;
-}
-
 /// Starts background title generation for a fresh saved session. The task runs
 /// concurrently with the first turn and is applied by `completeAskTitleTask`
 /// on every exit path. The locally derived title remains when generation is
@@ -2064,6 +2061,7 @@ fn runAskTurn(
     // (`tests/tla/subagent/MainMail.tla` JoinsOpenTurn).
     const processing = marked or (ctx.subagent_host != null and ctx.worker.beginDirectProcessing(job.turn_id));
     defer if (processing) ctx.worker.finishProcessing();
+    ctx.retry_budget_exhausted = false;
     const processed = options.deps.process_queued_prompt(&ctx.session.agent, deps, semantic_presentation, ctx.lifecycleContext(), config, job);
     // The next turn starts the agent's usage over, so this one's is taken
     // now, whether the turn ended well or not.

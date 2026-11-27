@@ -14399,7 +14399,11 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
     const root = createFixtureRoot("ask-retry-budget-503-with-subagent");
     const tracePath = join(root.root, "trace.log");
     let sawParentStartCall = false;
+    let sawChildRequest = false;
     const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"') && body.includes("Keep working while the gateway fails.")) {
+        sawChildRequest = true;
+      }
       if (!sawParentStartCall && body.includes('"name":"subagent"') && !hasCurrentToolResult(body, "start_worker")) {
         sawParentStartCall = true;
         return fakeGatewayToolCall("start_worker", "subagent", {
@@ -14415,6 +14419,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
+    const started = Date.now();
     try {
       const result = await runFx(
         ["ask", "--json", "--yolo", "Start a subagent and stop if retries run out."],
@@ -14427,8 +14432,11 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
           timeoutMs: 60_000,
         },
       );
+      const elapsedMs = Date.now() - started;
 
       expect(result.timedOut).toBe(false);
+      expect(elapsedMs).toBeLessThan(15_000);
+      expect(sawChildRequest).toBe(true);
       expect(result.code).toBe(1);
       const json = parseAskJson(result.stdout);
       expect(json.exit_code).toBe(1);
@@ -14440,6 +14448,68 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 75_000);
+
+  test("fx ask --json still waits for its subagent when a retried turn fails for a non-budget reason", async () => {
+    const root = createFixtureRoot("ask-retry-then-non-budget-fail-waits-subagent");
+    const tracePath = join(root.root, "trace.log");
+    let sawParentStartCall = false;
+    let parentFailures = 0;
+    let sawParentReportTurn = false;
+    let releaseChild: () => void = () => {};
+    const childHeld = new Promise<void>((resolve) => { releaseChild = resolve; });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"') && body.includes("CHILD_AFTER_PARENT_ERROR")) {
+        await childHeld;
+        return fakeGatewayFinalText("CHILD_FINISHES_TASK");
+      }
+      if (body.includes("CHILD_FINISHES_TASK")) {
+        sawParentReportTurn = true;
+        return fakeGatewayFinalText("MAIN_AFTER_CHILD_REPORT");
+      }
+      if (!sawParentStartCall && body.includes('"name":"subagent"') && !hasCurrentToolResult(body, "start_worker")) {
+        sawParentStartCall = true;
+        return fakeGatewayToolCall("start_worker", "subagent", {
+          request: {
+            action: "message",
+            agent: "worker",
+            message: "CHILD_AFTER_PARENT_ERROR",
+          },
+        });
+      }
+      parentFailures += 1;
+      if (parentFailures === 1) return unavailableResponse("0");
+      return new Response(JSON.stringify({ error: { message: "bad request after retry" } }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const released = (async () => {
+      if (await waitUntil(() => mainTurnsEnded(tracePath) >= 1, 20_000)) releaseChild();
+    })();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "Start a subagent, retry once, then fail with 400."],
+        {
+          cwd: root.workspace,
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "worker" },
+          timeoutMs: 30_000,
+        },
+      );
+      await released;
+
+      expect(result.timedOut).toBe(false);
+      expect(sawParentReportTurn).toBe(true);
+      const json = parseAskJson(result.stdout);
+      expect(json.final_output).toBe("MAIN_AFTER_CHILD_REPORT");
+    } finally {
+      releaseChild();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
 
   test("a retried model request leaves its recovery timeline in the session log", async () => {
     const root = createFixtureRoot("recovery-timeline");

@@ -55,6 +55,9 @@ pub const Config = struct {
     /// Optional retry budget in milliseconds from a request's first failure.
     /// Only `fx ask` sets this; null retries transient failures without a cap.
     recovery_retry_budget_ms: ?u64 = null,
+    /// Call-scoped output flag set when the turn ended because
+    /// `recovery_retry_budget_ms` ran out. Only `fx ask` sets this.
+    recovery_retry_budget_exhausted: ?*bool = null,
     /// Set by the same host when the sign-in it opened for a request that
     /// waits for one closes without a new login, so the request tries the
     /// saved login once more.
