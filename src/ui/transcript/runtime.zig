@@ -6729,7 +6729,9 @@ pub const TranscriptRuntime = struct {
         finished: types.TurnFinished,
         preserve_normal_buffer_anchor: bool,
     ) !?types.ToolActivityKind {
-        self.clearAssistantTail(alloc);
+        if (finished.outcome == .interrupted or self.staged_assistant_tails.items.len == 0) {
+            self.clearAssistantTail(alloc);
+        }
         if (finished.turn_id == 0) return error.InvalidTurnId;
         if (!self.notebook.lifecycle_state.shouldApplyTurnFinished(finished.turn_id)) return null;
 
@@ -16579,6 +16581,26 @@ test "a non-assistant append and a finished turn each clear the assistant tail" 
     transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &events));
     // The tail is cleared before the turn's own checks, so their failure does not matter here.
     _ = runtime.applyTurnFinishedLifecycle(alloc, .{ .turn_id = 7, .outcome = .interrupted }, false) catch {};
+    try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
+}
+
+test "turn_finished keeps shown assistant tail while staged tails wait for the pacer" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    var events = [_]assistant_presentation.Event{.{ .text = @constCast("GATED_RESIZE_FINAL_CHUNK") }};
+
+    transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &events));
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+
+    // Pacer holds an upcoming tail slot while text is still revealing.
+    const empty_tail = try alloc.alloc(assistant_presentation.Event, 0);
+    _ = runtime.stageAssistantTail(alloc, empty_tail);
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{ .turn_id = 1, .outcome = .completed } });
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{ .turn_id = 2, .outcome = .interrupted } });
     try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
 }
 

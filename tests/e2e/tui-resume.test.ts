@@ -1317,7 +1317,11 @@ printf '${trailingMarker}   '
       expect(readFileSync(tracePath, "utf8")).toContain("route=approved_shell");
 
       await active.waitForPane(
-        (pane) => pane.includes(doneMarker) && turnSettled(pane),
+        (pane) =>
+          pane.includes(doneMarker) &&
+          pane.includes("Ran 1 command · ") &&
+          turnSettled(pane) &&
+          hasEmptyComposer(pane),
         TIMEOUT,
       );
       const compactGrid = await active.capturePaneGrid();
