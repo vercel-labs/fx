@@ -2,26 +2,32 @@
 //!
 //! One client connects lazily, at the first need or call for a shared server.
 //! If no owner answers, it starts one, detached, as `fx --fx-internal-mcp-owner
-//! <fx_home>`, and tries again: one attempt is "connect, else start an owner,
-//! then connect", repeated every 200 ms until the server's startup timeout,
-//! because an owner that is still exiting holds the lock and a new owner exits
-//! at once. A reader thread hands whole frames to the runtime, which decodes
-//! them on its owner thread and wakes the engine. When the owner cannot be
-//! reached at all, `SharingUnavailable` lets the runtime run that server in its
-//! own engine.
+//! <fx_home>` with stdout piped (`CLOEXEC`). The owner writes one ready byte to
+//! stdout once its socket is listening and 0600, or exits (giving EOF) if
+//! another owner holds the lock. The client polls that pipe until the ready
+//! byte, EOF, or the deadline, closes it, and connects at once; rounds without
+//! a fresh spawn wait with short growing pauses (5 ms doubling up to 100 ms)
+//! until the server's startup timeout. A reader thread hands whole frames to
+//! the runtime, which decodes them on its owner thread and wakes the engine.
+//! When the owner cannot be reached at all, `SharingUnavailable` lets the
+//! runtime run that server in its own engine.
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const owner = @import("owner.zig");
+const owner_test_controls = @import("owner_test_controls.zig");
 const wire = @import("owner_wire.zig");
 
 const Allocator = std.mem.Allocator;
 
 /// The longest socket path a Unix address takes on macOS.
 pub const max_socket_path = 103;
-/// One attempt is connect, else start an owner, then connect again.
-pub const retry_ms = 200;
+/// Initial pause between reconnect probes without a fresh owner ready pipe.
+pub const initial_retry_ms: u64 = 5;
+/// Maximum pause between reconnect probes without a fresh owner ready pipe.
+pub const max_retry_ms: u64 = 100;
 /// An owner is started at most this often while a session waits for one.
 pub const spawn_retry_ms = 1000;
 
@@ -98,8 +104,9 @@ pub const Client = struct {
         return std.Io.Clock.awake.now(c.io).toMilliseconds();
     }
 
-    /// Connected, or `SharingUnavailable`: one attempt is connect, else start
-    /// an owner, then connect again, every `retry_ms` until the timeout.
+    /// Connected, or `SharingUnavailable`: connects, else starts an owner and
+    /// waits on its ready pipe (or backs off from 5 ms to 100 ms when no fresh
+    /// spawn ran) until the startup timeout.
     pub fn ensureReady(c: *Client, startup_timeout_ms: u32) Error!void {
         // An owner started before this point may have exited: its process is
         // reaped here, so a session that outlives many owners leaves no
@@ -112,47 +119,132 @@ pub const Client = struct {
             c.close();
         }
         const deadline = c.now() + startup_timeout_ms;
+        var backoff_ms: u64 = initial_retry_ms;
         while (true) {
             // A refused or missing socket is expected here: the loop below
             // starts an owner when it may, and tries again until the deadline.
             c.connect(deadline) catch {};
             if (c.stream != null) return;
+            var ready_pipe: ?std.Io.File = null;
+            defer if (ready_pipe) |pipe| pipe.close(c.io);
             if (c.spawn_owner and c.now() - c.last_spawn_ms >= spawn_retry_ms) {
                 c.last_spawn_ms = c.now();
-                c.spawn();
+                ready_pipe = c.spawn();
             }
-            if (c.now() >= deadline) {
+            if (ready_pipe) |pipe| {
+                const outcome = c.waitReadyPipe(pipe, deadline);
+                pipe.close(c.io);
+                ready_pipe = null;
+                switch (outcome) {
+                    .ready => {
+                        backoff_ms = initial_retry_ms;
+                        continue;
+                    },
+                    .eof, .timeout => {},
+                }
+            }
+            const left = deadline - c.now();
+            if (left <= 0) {
                 debug_trace.logf("mcp-owner", "sharing unavailable reason=no owner within {d} ms", .{startup_timeout_ms});
                 return error.SharingUnavailable;
             }
-            // The owner is another process: its socket appears when that
-            // process is ready, and no signal crosses the boundary, so the
-            // client polls every `retry_ms` until the deadline above.
-            io_mod.sleep(retry_ms * std.time.ns_per_ms);
+            const pause_ms: u64 = @min(backoff_ms, @as(u64, @intCast(left)));
+            // Another owner may be starting or exiting under the lock without a
+            // ready pipe to this session, so back off briefly before probing again.
+            io_mod.sleep(pause_ms * std.time.ns_per_ms);
+            backoff_ms = nextRetryMs(backoff_ms);
         }
     }
 
-    /// Starts an owner, detached, with nothing on this session's terminal.
-    fn spawn(c: *Client) void {
+    const ReadyOutcome = enum { ready, eof, timeout };
+
+    fn nextRetryMs(current_ms: u64) u64 {
+        if (current_ms == 0) return initial_retry_ms;
+        return @min(current_ms *| 2, max_retry_ms);
+    }
+
+    fn waitReadyPipe(c: *Client, pipe: std.Io.File, deadline: i64) ReadyOutcome {
+        while (true) {
+            const left = deadline - c.now();
+            if (left <= 0) {
+                debug_trace.logf("mcp-owner", "event=owner_ready_dropped reason=timeout", .{});
+                return .timeout;
+            }
+            var fds = [_]std.posix.pollfd{.{
+                .fd = pipe.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&fds, @intCast(@min(left, std.math.maxInt(i32)))) catch |err| {
+                debug_trace.logf("mcp-owner", "event=owner_ready_dropped reason=poll err={s}", .{@errorName(err)});
+                return .eof;
+            };
+            if (ready == 0) {
+                debug_trace.logf("mcp-owner", "event=owner_ready_dropped reason=timeout", .{});
+                return .timeout;
+            }
+            if (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
+                var byte: [1]u8 = undefined;
+                const rc = std.c.read(pipe.handle, &byte, 1);
+                if (rc == 1) {
+                    debug_trace.logf("mcp-owner", "event=owner_ready byte={d}", .{byte[0]});
+                    return .ready;
+                }
+                if (rc < 0 and std.c.errno(rc) == .INTR) continue;
+                if (rc == 0) {
+                    debug_trace.logf("mcp-owner", "event=owner_ready_eof", .{});
+                    return .eof;
+                }
+                debug_trace.logf("mcp-owner", "event=owner_ready_dropped reason=read errno={d}", .{@backingInt(std.c.errno(rc))});
+                return .eof;
+            }
+        }
+    }
+
+    fn setCloexec(fd: std.posix.fd_t) void {
+        const flags = std.c.fcntl(fd, std.c.F.GETFD);
+        if (flags >= 0) {
+            _ = std.c.fcntl(fd, std.c.F.SETFD, flags | std.c.FD_CLOEXEC);
+        }
+    }
+
+    /// Starts an owner, detached, with its stdout piped for the ready signal
+    /// and nothing on this session's terminal. Returns the CLOEXEC read end.
+    fn spawn(c: *Client) ?std.Io.File {
+        if (comptime builtin.is_test) {
+            if (owner_test_controls.spawn_hook) |hook| {
+                var fds: [2]std.c.fd_t = undefined;
+                if (std.c.pipe(&fds) != 0) return null;
+                setCloexec(fds[0]);
+                setCloexec(fds[1]);
+                if (hook(c.io, c.fx_home, fds[1])) |pid| {
+                    c.spawned.append(c.gpa, pid) catch |err| {
+                        debug_trace.logf("mcp-owner", "owner pid not kept reason={s} pid={d}", .{ @errorName(err), pid });
+                    };
+                }
+                return .{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+            }
+        }
         const exe = self_exe.pathForPeerReexec(c.gpa) catch |err| {
             debug_trace.logf("mcp-owner", "owner not started reason=self path err={s}", .{@errorName(err)});
-            return;
+            return null;
         };
         defer c.gpa.free(exe);
         var argv = [_][]const u8{ exe, owner.mode, c.fx_home };
         const child = std.process.spawn(c.io, .{
             .argv = &argv,
             .stdin = .ignore,
-            .stdout = .ignore,
+            .stdout = .pipe,
             .stderr = .ignore,
             .pgid = 0,
         }) catch |err| {
             debug_trace.logf("mcp-owner", "owner not started err={s}", .{@errorName(err)});
-            return;
+            return null;
         };
         const pid = child.id orelse {
             debug_trace.logf("mcp-owner", "owner started without a pid", .{});
-            return;
+            if (child.stdout) |out| out.close(c.io);
+            return null;
         };
         // Kept until it exits, so a session that outlives its owner reaps it
         // rather than leaving a zombie in its process table.
@@ -160,6 +252,11 @@ pub const Client = struct {
             debug_trace.logf("mcp-owner", "owner pid not kept reason={s} pid={d}", .{ @errorName(err), pid });
         };
         debug_trace.logf("mcp-owner", "owner started pid={d}", .{pid});
+        if (child.stdout) |out| {
+            setCloexec(out.handle);
+            return out;
+        }
+        return null;
     }
 
     /// Reaps the owners this session started that have exited, so none stays a
@@ -650,7 +747,7 @@ test "an owner the session starts is reaped once it exits, so none stays a zombi
     const wake: Wake = .{ .context = &woken, .wake = wakeNothing };
     var client = try Client.init(testing.io, alloc, home, true, wake);
     defer client.deinit();
-    client.spawn();
+    if (client.spawn()) |pipe| pipe.close(testing.io);
     // The owner starts on the same fx home and exits on its own: it has no
     // client, so it goes after its grace period.
     if (client.spawned.items.len != 1) return error.OwnerNotStarted;
@@ -676,4 +773,252 @@ test "an fx home whose socket path is too long cannot share" {
     var woken: u8 = 0;
     const wake: Wake = .{ .context = &woken, .wake = wakeNothing };
     try testing.expectError(error.SharingUnavailable, Client.init(testing.io, alloc, long, false, wake));
+}
+
+test "a spawned owner connects well under 200 ms after signaling ready" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "ready");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    const run_dir = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name });
+    defer alloc.free(run_dir);
+    try std.Io.Dir.cwd().createDir(testing.io, run_dir, .fromMode(0o700));
+    const socket_path = try std.Io.Dir.path.join(alloc, &.{ run_dir, owner.socket_name });
+    defer alloc.free(socket_path);
+
+    const Harness = struct {
+        var mu: std.Io.Mutex = .init;
+        var active_io: std.Io = undefined;
+        var active_gpa: Allocator = undefined;
+        var active_home: []const u8 = "";
+        var active_socket: []const u8 = "";
+        var stop_owner = std.atomic.Value(bool).init(false);
+        var owner_thread: ?std.Thread = null;
+        var signal_thread: ?std.Thread = null;
+        var signaled_ms = std.atomic.Value(i64).init(0);
+
+        fn spawn(io: std.Io, _: []const u8, ready_write_fd: std.posix.fd_t) ?std.c.pid_t {
+            mu.lockUncancelable(io);
+            defer mu.unlock(io);
+            stop_owner.store(false, .release);
+            owner_thread = std.Thread.spawn(.{}, serveOnThread, .{ io, active_gpa, active_home, &stop_owner }) catch {
+                _ = std.c.close(ready_write_fd);
+                return null;
+            };
+            signal_thread = std.Thread.spawn(.{}, signalWhenListening, .{ io, ready_write_fd }) catch {
+                _ = std.c.close(ready_write_fd);
+                return null;
+            };
+            return null;
+        }
+
+        fn signalWhenListening(io: std.Io, write_fd: std.posix.fd_t) void {
+            defer _ = std.c.close(write_fd);
+            waitForSocket(active_socket) catch return;
+            signaled_ms.store(std.Io.Clock.awake.now(io).toMilliseconds(), .release);
+            const byte = [_]u8{1};
+            _ = std.c.write(write_fd, &byte, 1);
+        }
+
+        fn cleanup() void {
+            stop_owner.store(true, .release);
+            if (signal_thread) |t| t.join();
+            signal_thread = null;
+            if (owner_thread) |t| t.join();
+            owner_thread = null;
+        }
+    };
+
+    Harness.active_io = testing.io;
+    Harness.active_gpa = alloc;
+    Harness.active_home = home;
+    Harness.active_socket = socket_path;
+    Harness.signaled_ms.store(0, .release);
+    owner_test_controls.spawn_hook = Harness.spawn;
+    defer {
+        owner_test_controls.spawn_hook = null;
+        Harness.cleanup();
+    }
+
+    var woken: u8 = 0;
+    const wake: Wake = .{ .context = &woken, .wake = wakeNothing };
+    var client = try Client.init(testing.io, alloc, home, true, wake);
+    defer client.deinit();
+
+    const started_ms = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    try client.ensureReady(5_000);
+    const done_ms = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    // On main, spawn_hook is unused and ensureReady sleeps 200 ms before connecting.
+    const ref_ms = blk: {
+        const sig = Harness.signaled_ms.load(.acquire);
+        break :blk if (sig != 0) sig else started_ms;
+    };
+    try testing.expect(done_ms - ref_ms < 100);
+}
+
+test "an owner that exits with LockBusy gives EOF and does not hang on the pipe" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "lockeof");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    const run_dir = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name });
+    defer alloc.free(run_dir);
+    try std.Io.Dir.cwd().createDir(testing.io, run_dir, .fromMode(0o700));
+    const socket_path = try std.Io.Dir.path.join(alloc, &.{ run_dir, owner.socket_name });
+    defer alloc.free(socket_path);
+
+    var dir: io_mod.VerifiedDir = .{ .dir = try std.Io.Dir.openDirAbsolute(testing.io, run_dir, .{ .iterate = true }) };
+    var lock_released = false;
+    var held = try io_mod.acquireTimedAdvisoryLock(&dir, owner.lock_name, 0);
+    defer {
+        if (!lock_released) held.release();
+        dir.close();
+    }
+
+    const Harness = struct {
+        var active_gpa: Allocator = undefined;
+        var active_home: []const u8 = "";
+        var eof_sent = std.atomic.Value(bool).init(false);
+        var busy_err: ?anyerror = null;
+        var busy_thread: ?std.Thread = null;
+        var mutex: std.Io.Mutex = .init;
+        var cond: std.Io.Condition = .init;
+
+        fn spawn(io: std.Io, _: []const u8, ready_write_fd: std.posix.fd_t) ?std.c.pid_t {
+            busy_thread = std.Thread.spawn(.{}, runBusyOwner, .{ io, ready_write_fd }) catch {
+                _ = std.c.close(ready_write_fd);
+                eof_sent.store(true, .release);
+                cond.broadcast(io);
+                return null;
+            };
+            return null;
+        }
+
+        fn runBusyOwner(io: std.Io, write_fd: std.posix.fd_t) void {
+            defer {
+                _ = std.c.close(write_fd);
+                eof_sent.store(true, .release);
+                cond.broadcast(io);
+            }
+            var stop = std.atomic.Value(bool).init(false);
+            owner.serve(io, active_gpa, active_home, &stop, owner.test_client_version) catch |err| {
+                busy_err = err;
+                return;
+            };
+        }
+
+        fn cleanup() void {
+            if (busy_thread) |t| t.join();
+            busy_thread = null;
+        }
+    };
+
+    Harness.active_gpa = alloc;
+    Harness.active_home = home;
+    Harness.eof_sent.store(false, .release);
+    Harness.busy_err = null;
+    owner_test_controls.spawn_hook = Harness.spawn;
+    defer {
+        owner_test_controls.spawn_hook = null;
+        Harness.cleanup();
+    }
+
+    var stop_real = std.atomic.Value(bool).init(false);
+    var real_thread: ?std.Thread = null;
+    defer if (real_thread) |t| {
+        stop_real.store(true, .release);
+        t.join();
+    };
+
+    // On main, spawn_hook is unused so wait at most 40 ms on the condition before releasing the lock.
+    const ReleaserMain = struct {
+        fn run(
+            io: std.Io,
+            gpa: Allocator,
+            fx_home: []const u8,
+            sock: []const u8,
+            lock_ptr: *io_mod.TimedAdvisoryLock,
+            released_flag: *bool,
+            stop_flag: *std.atomic.Value(bool),
+            thread_slot: *?std.Thread,
+        ) void {
+            Harness.mutex.lockUncancelable(io);
+            if (!Harness.eof_sent.load(.acquire)) {
+                Harness.cond.waitTimeout(io, &Harness.mutex, .{ .duration = .{
+                    .raw = .fromMilliseconds(40),
+                    .clock = .awake,
+                } }) catch {}; // Timeout means main's spawn ran without spawn_hook; release the lock anyway.
+            }
+            Harness.mutex.unlock(io);
+            lock_ptr.release();
+            released_flag.* = true;
+            thread_slot.* = std.Thread.spawn(.{}, serveOnThread, .{ io, gpa, fx_home, stop_flag }) catch return;
+            waitForSocket(sock) catch {}; // ensureReady retries until the socket opens or times out.
+        }
+    };
+
+    const releaser = try std.Thread.spawn(
+        .{},
+        ReleaserMain.run,
+        .{ testing.io, alloc, home, socket_path, &held, &lock_released, &stop_real, &real_thread },
+    );
+    defer releaser.join();
+
+    var woken: u8 = 0;
+    const wake: Wake = .{ .context = &woken, .wake = wakeNothing };
+    var client = try Client.init(testing.io, alloc, home, true, wake);
+    defer client.deinit();
+
+    const started_ms = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    try client.ensureReady(5_000);
+    const elapsed_ms = std.Io.Clock.awake.now(testing.io).toMilliseconds() - started_ms;
+    // Must connect shortly after EOF + lock release, well before main's 200 ms sleep.
+    try testing.expect(elapsed_ms < 150);
+    if (Harness.eof_sent.load(.acquire)) {
+        try testing.expectEqual(@as(?anyerror, error.LockBusy), Harness.busy_err);
+    }
+}
+
+test "a round without a fresh spawn uses short growing pauses instead of 200 ms" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "backoff");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    const run_dir = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name });
+    defer alloc.free(run_dir);
+    try std.Io.Dir.cwd().createDir(testing.io, run_dir, .fromMode(0o700));
+
+    var woken: u8 = 0;
+    const wake: Wake = .{ .context = &woken, .wake = wakeNothing };
+    var client = try Client.init(testing.io, alloc, home, false, wake);
+    defer client.deinit();
+
+    const started_ms = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    try testing.expectError(error.SharingUnavailable, client.ensureReady(60));
+    const elapsed_ms = std.Io.Clock.awake.now(testing.io).toMilliseconds() - started_ms;
+    // On main, ensureReady sleeps a fixed 200 ms even when the deadline is 60 ms.
+    try testing.expect(elapsed_ms < 140);
+}
+
+test "backoff pause doubles from 5 ms and caps at 100 ms" {
+    var pause = Client.nextRetryMs(0);
+    try testing.expectEqual(@as(u64, 5), pause);
+    pause = Client.nextRetryMs(pause);
+    try testing.expectEqual(@as(u64, 10), pause);
+    pause = Client.nextRetryMs(pause);
+    try testing.expectEqual(@as(u64, 20), pause);
+    pause = Client.nextRetryMs(pause);
+    try testing.expectEqual(@as(u64, 40), pause);
+    pause = Client.nextRetryMs(pause);
+    try testing.expectEqual(@as(u64, 80), pause);
+    pause = Client.nextRetryMs(pause);
+    try testing.expectEqual(@as(u64, 100), pause);
+    pause = Client.nextRetryMs(pause);
+    try testing.expectEqual(@as(u64, 100), pause);
 }

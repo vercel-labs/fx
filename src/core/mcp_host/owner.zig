@@ -64,6 +64,12 @@ fn installSignals() void {
     };
     std.posix.sigaction(std.posix.SIG.TERM, &action, null);
     std.posix.sigaction(std.posix.SIG.INT, &action, null);
+    const ignore_pipe: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.PIPE, &ignore_pipe, null);
 }
 
 /// The process entry. It detaches from the session that started it, never
@@ -74,7 +80,7 @@ pub fn run(alloc: Allocator, fx_home: []const u8, client_version: []const u8) !v
     _ = std.c.chdir("/");
     installSignals();
     var stop = std.atomic.Value(bool).init(false);
-    serve(io_mod.getIo(), alloc, fx_home, &stop, client_version) catch |err| switch (err) {
+    serveInternal(io_mod.getIo(), alloc, fx_home, &stop, client_version, true) catch |err| switch (err) {
         // Another owner is alive, or still exiting and holding the lock.
         error.LockBusy => return,
         else => return err,
@@ -754,9 +760,61 @@ fn forgetConfig(owner: *Owner, key: core.Key) void {
     stored.deinit(owner.gpa);
 }
 
+const ready_byte = [_]u8{1};
+
+/// Writes one ready byte to `fd` only when `fd` is a FIFO, then points `fd`
+/// at `/dev/null` so the client's pipe closes cleanly.
+fn signalReadyOnFd(io: std.Io, fd: std.posix.fd_t) void {
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const stat = file.stat(io) catch |err| {
+        debug_trace.logf("mcp-owner", "event=owner_ready_skipped reason=stat err={s}", .{@errorName(err)});
+        return;
+    };
+    if (stat.kind != .named_pipe) return;
+    while (true) {
+        const rc = std.c.write(fd, &ready_byte, 1);
+        if (rc == 1) break;
+        if (rc < 0 and std.c.errno(rc) == .INTR) continue;
+        debug_trace.logf(
+            "mcp-owner",
+            "event=owner_ready_signal_failed reason=write errno={d}",
+            .{if (rc < 0) @backingInt(std.c.errno(rc)) else 0},
+        );
+        break;
+    }
+    const dev_null = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY });
+    if (dev_null < 0) {
+        debug_trace.logf("mcp-owner", "event=owner_stdout_redirect_failed reason=open errno={d}", .{@backingInt(std.c.errno(dev_null))});
+        return;
+    }
+    defer if (dev_null != fd) {
+        _ = std.c.close(dev_null);
+    };
+    if (dev_null != fd) {
+        while (true) {
+            const rc = std.c.dup2(dev_null, fd);
+            if (rc >= 0) break;
+            if (std.c.errno(rc) == .INTR) continue;
+            debug_trace.logf("mcp-owner", "event=owner_stdout_redirect_failed reason=dup2 errno={d}", .{@backingInt(std.c.errno(rc))});
+            return;
+        }
+    }
+}
+
 /// Serves until the last client has been gone for `exit_grace_ms` or `stop`
 /// is set. `error.LockBusy` means another owner holds the lock.
 pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.Value(bool), client_version: []const u8) !void {
+    return serveInternal(io, gpa, fx_home, stop, client_version, false);
+}
+
+fn serveInternal(
+    io: std.Io,
+    gpa: Allocator,
+    fx_home: []const u8,
+    stop: *std.atomic.Value(bool),
+    client_version: []const u8,
+    signal_stdout: bool,
+) !void {
     const run_dir = try std.Io.Dir.path.join(gpa, &.{ fx_home, run_dir_name });
     defer gpa.free(run_dir);
     std.Io.Dir.cwd().createDir(io, run_dir, .fromMode(0o700)) catch |err| switch (err) {
@@ -785,6 +843,7 @@ pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.
     std.Io.Dir.cwd().setFilePermissions(io, socket_path, .fromMode(0o600), .{ .follow_symlinks = false }) catch |err| {
         debug_trace.logf("mcp-owner", "owner socket not private reason=set mode err={s}", .{@errorName(err)});
     };
+    if (signal_stdout) signalReadyOnFd(io, std.posix.STDOUT_FILENO);
 
     var owner: Owner = .{ .io = io, .gpa = gpa, .stop = stop, .client_version = client_version };
     owner.last_open_ms = owner.now();
@@ -2420,4 +2479,65 @@ test "a failing server's status reaches a client before the phase frame that end
         }
     }
     return error.NoFailedPhaseFrame;
+}
+
+test "a spawned owner writes the ready byte when stdout is a FIFO, then points stdout at /dev/null" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    const exe = try @import("../shared/self_exe.zig").pathForPeerReexec(alloc);
+    defer alloc.free(exe);
+
+    var argv = [_][]const u8{ exe, mode, home };
+    const child = try std.process.spawn(testing.io, .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    defer {
+        if (child.id) |pid| {
+            _ = std.c.kill(@intCast(pid), std.posix.SIG.TERM);
+            _ = std.c.waitpid(@intCast(pid), null, 0);
+        }
+    }
+    const out = child.stdout orelse return error.MissingStdoutPipe;
+    defer out.close(testing.io);
+
+    // The owner writes 1 ready byte while still serving, then redirects stdout
+    // to /dev/null so the pipe sees EOF immediately after that byte.
+    var fds = [_]std.posix.pollfd{.{ .fd = out.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = try std.posix.poll(&fds, 1_500);
+    try testing.expect(ready > 0);
+    var byte: [1]u8 = undefined;
+    try testing.expectEqual(@as(isize, 1), std.c.read(out.handle, &byte, 1));
+    var eof_fds = [_]std.posix.pollfd{.{ .fd = out.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    try testing.expect((try std.posix.poll(&eof_fds, 500)) > 0);
+    try testing.expectEqual(@as(isize, 0), std.c.read(out.handle, &byte, 1));
+}
+
+test "signalReadyOnFd skips a regular file and redirects a FIFO to /dev/null" {
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const regular = try tmp.dir.createFile(testing.io, "regular.txt", .{ .read = true });
+    defer regular.close(testing.io);
+    signalReadyOnFd(testing.io, regular.handle);
+    const written = try tmp.dir.readFileAlloc(testing.io, "regular.txt", alloc, .limited(64));
+    defer alloc.free(written);
+    try testing.expectEqual(@as(usize, 0), written.len);
+
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    signalReadyOnFd(testing.io, fds[1]);
+
+    var byte: [1]u8 = undefined;
+    try testing.expectEqual(@as(isize, 1), std.c.read(fds[0], &byte, 1));
+    try testing.expectEqual(@as(isize, 0), std.c.read(fds[0], &byte, 1));
+    const redirected: std.Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    const stat = try redirected.stat(testing.io);
+    try testing.expect(stat.kind != .named_pipe);
 }

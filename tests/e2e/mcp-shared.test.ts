@@ -377,4 +377,28 @@ describe("shared MCP servers", () => {
 
     await expectExited([serverPid!, secondPid, ...ownerPids(root.fxHome)]);
   }, 120_000);
+
+  test("the session connects as soon as the owner signals ready on its pipe", async () => {
+    const root = createRoot("ready-trace");
+    const tracePath = join(root.root, "owner-trace.log");
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the shared MCP tool."], {
+      cwd: root.workspace,
+      env: {
+        ...envFor(root, gatewayFor("READY_TRACE_DONE")),
+        FX_TRACE_LOG: tracePath,
+        FX_TRACE_SCOPES: "mcp-owner",
+      },
+      timeoutMs: CALL_TIMEOUT_MS,
+    });
+    expect(result.code, result.stderr || result.stdout).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("READY_TRACE_DONE");
+
+    const lines = readFileSync(tracePath, "utf8").split("\n").filter(Boolean);
+    const readyIdx = lines.findIndex((line) => line.includes("event=owner_ready"));
+    const connectedIdx = lines.findIndex((line) => line.includes("owner connected socket="));
+    expect(readyIdx, lines.join("\n")).toBeGreaterThanOrEqual(0);
+    expect(connectedIdx, lines.join("\n")).toBeGreaterThan(readyIdx);
+
+    await expectExited([...serverPids(root.wire), ...ownerPids(root.fxHome)]);
+  }, 120_000);
 });
