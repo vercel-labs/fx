@@ -3056,5 +3056,87 @@ describe("slice 6: fx tool skill and agent bridge", () => {
     expect(out).toContain('"ok":true');
     expect(out).toContain("No subagents yet.");
   }, TIMEOUT);
+
+  test("killing fx tool agent wait inside bash ends the wait through the bridge while a subagent still works", async () => {
+    const root = createRoot();
+    let releaseChild!: (response: Response) => void;
+    const childReply = new Promise<Response>((resolve) => {
+      releaseChild = resolve;
+    });
+    let markChildSeen!: () => void;
+    const childSeen = new Promise<void>((resolve) => {
+      markChildSeen = resolve;
+    });
+
+    let parentStep = 0;
+    let bashStartedAt = 0;
+    let bashElapsedMs = -1;
+    let bashResultBody = "";
+
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        markChildSeen();
+        return await childReply;
+      }
+      parentStep += 1;
+      if (parentStep === 1) {
+        return fakeGatewayToolCall("spawn_child", "subagent", {
+          action: "message",
+          agent: "helper",
+          message: "HOLD_CHILD_WORK",
+        });
+      }
+      if (parentStep === 2) {
+        await childSeen;
+        bashStartedAt = Date.now();
+        return fakeGatewayToolCall("bash_wait", "bash", {
+          command: `${JSON.stringify(FX_BIN)} tool agent wait & w=$!; sleep 1; kill $w; wait $w; echo "wait-exit=$?"`,
+        });
+      }
+      if (parentStep === 3) {
+        bashElapsedMs = Date.now() - bashStartedAt;
+        bashResultBody = body;
+        releaseChild(fakeGatewayFinalText("Child work finished.\n"));
+        return fakeGatewayFinalText("Wait killed cleanly.\n");
+      }
+      return fakeGatewayFinalText("Subagent report received.\n");
+    });
+    gateways.push(gateway);
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", ...BASH_SETTING, "Start a helper subagent, then run bash to wait and kill it."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root.home, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parentStep).toBeGreaterThanOrEqual(3);
+      expect(bashElapsedMs).toBeGreaterThanOrEqual(0);
+      expect(bashElapsedMs).toBeLessThan(20_000);
+
+      const out = (JSON.parse(toolResultText(bashResultBody, "bash_wait")) as { value: string }).value;
+      const match = /wait-exit=(\d+)/.exec(out);
+      expect(match).not.toBeNull();
+      expect(Number(match![1])).toBeGreaterThan(0);
+
+      const output = JSON.parse(result.stdout) as {
+        output: string;
+        error_code?: string;
+        tool_calls: Array<{ name: string; status: string }>;
+      };
+      expect(output.error_code).toBeUndefined();
+      expect(output.tool_calls.map(({ name, status }) => ({ name, status }))).toEqual([
+        { name: "subagent", status: "success" },
+        { name: "bash", status: "success" },
+      ]);
+    } finally {
+      releaseChild(fakeGatewayFinalText("Child cleanup.\n"));
+      markChildSeen();
+    }
+  }, TIMEOUT);
 });
 

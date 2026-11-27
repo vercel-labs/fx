@@ -3213,6 +3213,8 @@ test "an automatic review of a bridged edit holds a caution and applies a clear,
 const BridgeSubagentTestFixture = struct {
     mutex: std.Io.Mutex = .init,
     runs: std.atomic.Value(usize) = .init(0),
+    hold: bool = false,
+    release: std.Io.Event = .unset,
     last_message: ?[]u8 = null,
     last_model: ?[]u8 = null,
     last_effort: ?types.ReasoningEffort = null,
@@ -3244,6 +3246,7 @@ const BridgeSubagentTestFixture = struct {
         self.last_cancel_ptr = cancel;
         self.mutex.unlock(io_mod.getIo());
         _ = self.runs.fetchAdd(1, .seq_cst);
+        if (self.hold) self.release.waitUncancelable(io_mod.getIo());
         const reply = std.testing.allocator.dupe(u8, "DONE") catch return error.ProviderFailed;
         defer std.testing.allocator.free(reply);
         turn.commit(turn.active_work_id.?, .{ .assistant = .{
@@ -3341,6 +3344,91 @@ test "bridged agent message reaches the host with the right request, and a child
     try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, child_outcome.status);
     try std.testing.expect(std.mem.find(u8, child_outcome.bytes, "caller_unavailable") != null);
     try std.testing.expect(std.mem.find(u8, child_outcome.bytes, "Only the agent that started the subagents") != null);
+}
+
+test "bridged agent wait ends when the bridge request cancel flag is set while a child still works" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var parent: test_subagent_child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture: BridgeSubagentTestFixture = .{ .hold = true };
+    defer fixture.deinit();
+    var runtime_cancel: std.atomic.Value(bool) = .init(false);
+    var bridge_cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{
+        .workspace_root = parent.children.workspace,
+        .permission_mode = .yolo,
+        .subagent_caller_id = parent.parent.id(),
+        .cancel_flag = &runtime_cancel,
+    };
+    defer rt.deinit(alloc);
+    const host = try subagent_tool_host.Runtime.create(
+        alloc,
+        &parent.children,
+        .{ .resolve_fn = BridgeSubagentTestFixture.resolve },
+        .{ .context = &fixture, .run_fn = BridgeSubagentTestFixture.run },
+    );
+    defer host.deinit();
+    host.report_sink = .{ .context = &fixture, .post_fn = BridgeSubagentTestFixture.post };
+    defer fixture.release.set(io_mod.getIo());
+    rt.subagent_host = host;
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+
+    const msg_allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-47", .{ .agent_message = .{
+        .agent = "helper",
+        .message = "work",
+        .model = "custom-model",
+    } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    var msg_cancel: std.atomic.Value(bool) = .init(false);
+    const msg_outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-47", "helper", "", msg_allowed, &msg_cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, msg_outcome.status);
+    try std.testing.expect(std.mem.find(u8, msg_outcome.bytes, "\"ok\":true") != null);
+    for (0..5000) |_| {
+        if (fixture.runs.load(.seq_cst) >= 1) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), rt.worker.queuedPromptCount());
+
+    const Canceler = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            io_mod.sleep(20 * std.time.ns_per_ms);
+            flag.store(true, .seq_cst);
+        }
+    };
+    // Without the flag, the wait blocks until a nudge. The watchdog nudges after
+    // 5 s, so a regression fails the elapsed check below instead of hanging.
+    const Watchdog = struct {
+        fn run(target: *worker_runtime.WorkerRuntime, done: *std.Io.Event) void {
+            done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } }) catch {
+                target.nudgeWaiter();
+            };
+        }
+    };
+    var done: std.Io.Event = .unset;
+    const canceler = try std.Thread.spawn(.{}, Canceler.run, .{&bridge_cancel});
+    defer canceler.join();
+    const watchdog = try std.Thread.spawn(.{}, Watchdog.run, .{ &rt.worker, &done });
+    defer watchdog.join();
+    defer done.set(io_mod.getIo());
+
+    const wait_allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-48", .agent_wait)) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const started_ms = io_mod.milliTimestamp();
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-48", "agent wait", "", wait_allowed, &bridge_cancel);
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, outcome.status);
+    try std.testing.expectEqualStrings("Cancelled.", outcome.bytes);
+    try std.testing.expectEqual(@as(usize, 0), rt.worker.queuedPromptCount());
 }
 
 test "bridged skill list formats one NAME<TAB>DESCRIPTION line per skill within the 32 KiB cap" {
