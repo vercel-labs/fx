@@ -55,6 +55,9 @@ pub const Request = struct {
     /// it. The page's byte budget still holds: the last rows give up their
     /// arguments before any row is left out.
     schemas_in_result: bool = false,
+    /// Whether a page that says a server needs a login carries `toolbox {open}`'s own sentence for it as its
+    /// message, for a command to print as it is, and not the guidance toolbox search gives the model.
+    login_sentence: bool = false,
 
     pub fn validate(self: Request) ValidationError!void {
         if (self.limit == 0 or self.limit > max_limit) return error.InvalidLimit;

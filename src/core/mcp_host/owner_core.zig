@@ -1037,6 +1037,35 @@ test "a 33rd key is refused for that key alone, and the keys before it stay" {
     try testing.expect(!hasEffect(output.effects(), .refuse));
 }
 
+test "a 25th call is refused for that call alone, and the client keeps its calls and keys" {
+    var s: State = .{};
+    var output: Output = .{};
+    hello(&s, 1);
+    register(&s, 1, key_a, true, true, &output);
+    register(&s, 1, key_b, true, true, &output);
+    // The client fills its 24: each call starts on its first key.
+    for (0..max_calls_per_client) |i| {
+        _ = startCall(&s, 1, @intCast(i + 1), key_a, &output);
+        try testing.expectEqual(@as(usize, 1), output.len);
+        try testing.expect(output.effects()[0] == .call);
+    }
+    // The 25th is refused, and the one effect names that call alone.
+    output = .{};
+    step(&s, .{ .call = .{ .client = @fromBackingInt(1), .id = 25, .key = key_a } }, &output);
+    try testing.expectEqual(@as(usize, 1), output.len);
+    const refused = output.effects()[0].refuse;
+    try testing.expectEqual(Refuse.too_many_calls, refused.reason);
+    try testing.expectEqual(@as(u32, 25), refused.call.?);
+    try testing.expectEqual(key_a, refused.key.?);
+    // It keeps the 24 calls it holds, and its other key still goes out.
+    try testing.expectEqual(@as(usize, max_calls_per_client), heldBy(&s, @fromBackingInt(1)));
+    output = .{};
+    step(&s, .{ .need = .{ .client = @fromBackingInt(1), .key = key_b } }, &output);
+    try testing.expectEqual(@as(usize, 1), output.len);
+    try testing.expect(!hasEffect(output.effects(), .refuse));
+    try testing.expectEqualSlices(u8, &key_b, &output.effects()[0].need.key);
+}
+
 test "a second registration for the same key adds no second slot, and an unregistered need is refused" {
     var s: State = .{};
     var output: Output = .{};

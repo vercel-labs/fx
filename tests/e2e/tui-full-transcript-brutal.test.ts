@@ -25,6 +25,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { stdoutFrames } from "./render-lab/tape";
 import { logLines, savedSessionIds, storeRoot } from "./saved-sessions";
@@ -975,6 +976,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
       HISTORY_DONE,
       config.historyTimeoutMs ?? TIMEOUT * 4,
     );
+    await session.waitForPane(turnSettled, TIMEOUT);
     // Held transcript rows settle into native scrollback on the frames
     // right after the answer completes; wait for the settled markers
     // instead of asserting one racy snapshot.
@@ -1137,6 +1139,8 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     writeMetrics();
     const finalScrollback = await waitForScrollback(session, LIVE_DONE, TIMEOUT * 2);
     expect(finalScrollback).toContain(LIVE_DONE);
+    // The reply's words show before its turn is saved.
+    await session.waitForPane(() => committedAssistantOccurrences(paths.home, LIVE_DONE) > 0, TIMEOUT * 2);
     // Terminal reset may duplicate a visible line in tmux; durable state must not.
     expect(committedAssistantOccurrences(paths.home, LIVE_DONE)).toBe(1);
     if ((config.settledCycles ?? 0) > 0) {
@@ -1321,7 +1325,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Read saved.txt completely.");
-      await active.waitForText("Saved read complete.", TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("Saved read complete.") && turnSettled(pane), TIMEOUT);
       for (const width of [100, 80]) {
         await active.resizeWindow(width, 32);
         await active.sendHexBytes(CTRL_O);
@@ -1387,7 +1391,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Build a tall transcript.");
-      await active.waitForText(tallTail, TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(tallTail) && turnSettled(pane), TIMEOUT);
       await active.sendHexBytes(CTRL_O);
       const full = await active.waitForText(FULL_FOOTER, TIMEOUT);
       const rows = full.split("\n");

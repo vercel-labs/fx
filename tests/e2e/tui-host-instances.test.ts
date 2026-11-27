@@ -11,6 +11,8 @@ import {
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
+  hasEmptyComposer,
 } from "./tmux-helpers";
 
 // One fx process hosting several identical fx instances: each has its own
@@ -294,7 +296,7 @@ async function saveGroup(home: string, workspace: string): Promise<string[]> {
         await session.waitForComposer(15_000);
       }
       await session.sendText(`HOST_${letter} first run`);
-      await session.waitForText(`HOST_ANSWER_${letter}`, 30_000);
+      await session.waitForPane((pane) => pane.includes(`HOST_ANSWER_${letter}`) && turnSettled(pane), 30_000);
     }
     await quitWith(session, "/exit");
   });
@@ -736,7 +738,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         expect(shownAnswers(launched)).toEqual([]);
         await session.waitForComposer(15_000);
         await session.sendText("HOST_D launched");
-        await session.waitForText("HOST_ANSWER_D", 30_000);
+        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_D") && turnSettled(pane), 30_000);
 
         // Closing it leaves the others running; the row above it, fx 2,
         // comes on screen, not the first.
@@ -852,7 +854,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       await withHost(answerByLetter, { instances: 2 }, async ({ session }) => {
         await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
         await session.sendText("HOST_A first");
-        await session.waitForText("HOST_ANSWER_A", 30_000);
+        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && turnSettled(pane), 30_000);
 
         // Down shows fx 2, which has no conversation yet.
         await session.sendKeys("C-x");
@@ -887,7 +889,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       await withHost(answerByLetter, { instances: 2 }, async ({ session }) => {
         await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
         await session.sendText("HOST_A first");
-        await session.waitForText("HOST_ANSWER_A", 30_000);
+        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && turnSettled(pane), 30_000);
 
         // The list opens on the first instance, the one on screen.
         await session.sendKeys("C-x");
@@ -921,7 +923,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("HOST_B before new");
-        await session.waitForText("HOST_ANSWER_B", 30_000);
+        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_B") && turnSettled(pane), 30_000);
 
         // A session command runs on any instance, as on the first.
         await session.sendText("/new");
@@ -1057,7 +1059,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // So does main, which is in ask mode itself.
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_3 RUN[${command}]`);
-        await session.waitForText("GRANT_DONE_3", 30_000);
+        await session.waitForPane((pane) => pane.includes("GRANT_DONE_3") && turnSettled(pane), 30_000);
         expect(countLines(log)).toBe(5);
 
         // The grant shows in the session's permissions.
@@ -1088,7 +1090,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
 
         await session.waitForComposer(15_000);
         await session.sendText("GRANT_3 FILE[grant-main]");
-        await session.waitForText("GRANT_DONE_3", 30_000);
+        await session.waitForPane((pane) => pane.includes("GRANT_DONE_3") && turnSettled(pane), 30_000);
         expect(existsSync(join(workspace, "grant-main.txt"))).toBe(true);
 
         await session.sendText("/permissions");
@@ -1151,7 +1153,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // So does main, which is in ask mode itself.
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_3 RUN[${command}]`);
-        await session.waitForText("GRANT_DONE_3", 30_000);
+        await session.waitForPane((pane) => pane.includes("GRANT_DONE_3") && turnSettled(pane), 30_000);
         expect(countLines(log)).toBe(5);
 
         await session.sendText("/permissions");
@@ -1216,7 +1218,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendText(`GRANT_2 RUN[${command}]`);
         await waitShows(session, "main's command prompt", (pane) => asking(pane, "") && !pane.includes("Subagent"));
         await session.sendKeys("1");
-        await session.waitForText("GRANT_DONE_2", 30_000);
+        await session.waitForPane((pane) => pane.includes("GRANT_DONE_2") && turnSettled(pane), 30_000);
 
         await session.sendText("/permissions");
         await waitShows(session, "no session grants", (pane) => /^ {2}Session grants {2,}none/m.test(pane), 15_000);
@@ -1559,12 +1561,12 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       await withHost(answerByLetter, { instances: 3 }, async ({ home, session }) => {
         await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
         await session.sendText("HOST_A first");
-        await session.waitForText("HOST_ANSWER_A", 30_000);
+        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && turnSettled(pane), 30_000);
         await switchAgent(session, "next");
         await session.waitForPane((pane) => pane.includes("fx 2/3"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("HOST_B second");
-        await session.waitForText("HOST_ANSWER_B", 30_000);
+        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_B") && turnSettled(pane), 30_000);
 
         // Close the first: the second takes over as fx 1, as it was.
         await switchAgent(session, 1);
@@ -1732,7 +1734,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       try {
         await withHost(answerByLetter, { remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
           await session.sendText("HOST_A alone");
-          await session.waitForText("HOST_ANSWER_A", 30_000);
+          await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && turnSettled(pane), 30_000);
           expect(hostRecords(home)).toEqual([]);
           await session.sendText("/launch");
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
@@ -1912,7 +1914,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
           await session.waitForComposer(15_000);
           await session.sendText("CLOSE_USER start a slow helper");
-          await session.waitForText("CLOSE_MAIN_FINAL", 45_000);
+          await session.waitForPane((pane) => pane.includes("CLOSE_MAIN_FINAL") && turnSettled(pane), 45_000);
           await session.waitForPane(() => releases.length > 0 && hostRecords(home).some((ids) => ids.length === 2), 15_000);
           closedId = hostRecords(home).find((ids) => ids.length === 2)![1]!;
           // Closed while slowpoke still works.
@@ -1982,7 +1984,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
           await session.waitForComposer(15_000);
           await session.sendText("SWITCH_USER start a slow helper");
-          await session.waitForText("SWITCH_MAIN_FINAL", 45_000);
+          await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_FINAL") && turnSettled(pane), 45_000);
           await session.waitForPane(() => releases.length > 0 && hostRecords(home).some((ids) => ids.length === 2), 15_000);
           oldId = hostRecords(home).find((ids) => ids.length === 2)![1]!;
           // A new session in fx 2 while slowpoke still works.
@@ -1990,7 +1992,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           await session.waitForText("stopped 1 running subagent task", 15_000);
           await session.waitForComposer(15_000);
           await session.sendText("AFTER_NEW go on");
-          await session.waitForText("AFTER_NEW_ANSWER", 30_000);
+          await session.waitForPane((pane) => pane.includes("AFTER_NEW_ANSWER") && turnSettled(pane), 30_000);
           // fx 2 moved to its new session, and fx 1 kept its own.
           await session.waitForPane(() => hostRecords(home).some((ids) => ids.length === 2 && ids[1] !== oldId), 15_000);
           await session.sendText("/exit");
@@ -2037,7 +2039,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
           await session.waitForComposer(15_000);
           await session.sendText("KEEP_USER start a keeper");
-          await session.waitForText("KEEP_MAIN_REPORTED", 45_000);
+          await session.waitForPane((pane) => pane.includes("KEEP_MAIN_REPORTED") && turnSettled(pane), 45_000);
           await session.sendText("/exit");
           await session.waitForSessionEnd(15_000);
         });
@@ -2092,7 +2094,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("TREE_USER_PLAIN start a plain helper");
-        await session.waitForText("TREE_PLAIN_FINAL", 45_000);
+        await session.waitForPane((pane) => pane.includes("TREE_PLAIN_FINAL") && turnSettled(pane), 45_000);
         await session.waitForComposer(15_000);
         await session.sendText("TREE_USER_BUILDER start a builder");
         await session.waitForText("TREE_BUILDER_FINAL", 45_000);
@@ -2771,7 +2773,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // fx 1 runs in main, and fx 2 is launched in `limited`.
         await withHost(answerByLetter, { remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
           await session.sendText("HOST_A first run");
-          await session.waitForText("HOST_ANSWER_A", 30_000);
+          await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && turnSettled(pane), 30_000);
           await session.waitForComposer(15_000);
           await session.sendText("/launch limited");
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
@@ -2920,12 +2922,12 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       const bodies = await withHost(answerByLetter, { instances: 3 }, async ({ session }) => {
         await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
         await session.sendText("HOST_A first");
-        await session.waitForText("HOST_ANSWER_A", 30_000);
+        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && turnSettled(pane), 30_000);
         await switchAgent(session, 2);
         await session.waitForPane((pane) => pane.includes("fx 2/3"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("HOST_B second");
-        await session.waitForText("HOST_ANSWER_B", 30_000);
+        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_B") && turnSettled(pane), 30_000);
         await switchAgent(session, 1);
         await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
         await session.waitForComposer(15_000);
@@ -2980,8 +2982,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       await withHost(answerByLetter, { instances: 3 }, async ({ session }) => {
         await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
         await session.sendText("HOST_A first");
-        await session.waitForText("HOST_ANSWER_A", 30_000);
-        await session.waitForComposer(15_000);
+        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && hasEmptyComposer(pane) && turnSettled(pane), 30_000);
 
         // Down opens the list on fx 1, its first row. Nothing is above it, so
         // Up closes the list, and fx 1 stays on screen.
@@ -3028,8 +3029,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       await withHost(answerByLetter, { instances: 3 }, async ({ session }) => {
         await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
         await session.sendText("HOST_A first");
-        await session.waitForText("HOST_ANSWER_A", 30_000);
-        await session.waitForComposer(15_000);
+        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && hasEmptyComposer(pane) && turnSettled(pane), 30_000);
 
         // "f 3" matches no row, so fx 1 stays shown.
         await session.sendKeys("C-x");
@@ -3065,7 +3065,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           }
           await session.waitForComposer(15_000);
           await session.sendText(`HOST_${letter} hello`);
-          await session.waitForText(`HOST_ANSWER_${letter}`, 30_000);
+          await session.waitForPane((pane) => pane.includes(`HOST_ANSWER_${letter}`) && turnSettled(pane), 30_000);
         }
         await switchAgent(session, 4);
         await session.waitForPane((pane) => pane.includes("fx 4/4"), 15_000);
@@ -3147,7 +3147,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("LIST_USER start a helper");
-        await session.waitForText("LIST_MAIN_FINAL", 30_000);
+        await session.waitForPane((pane) => pane.includes("LIST_MAIN_FINAL") && turnSettled(pane), 30_000);
         await session.waitForComposer(15_000);
         // fx 1's subagent comes right after it when switching.
         await switchAgent(session, "next");

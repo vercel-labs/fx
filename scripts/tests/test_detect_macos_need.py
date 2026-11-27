@@ -214,5 +214,23 @@ class DetectMacosNeedTests(unittest.TestCase):
         self.assertIn("not a JSON array", text)
 
 
+class MacosWorkflowConcurrencyTests(unittest.TestCase):
+    def test_only_a_label_run_waits_for_the_run_in_progress(self) -> None:
+        lines = (REPO_ROOT / ".github" / "workflows" / "macos.yml").read_text(encoding="utf-8").splitlines()
+        code = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+        start = code.index("concurrency:")
+
+        self.assertEqual(
+            [
+                "concurrency:",
+                "  group: macos-${{ github.event.pull_request.number || github.ref }}",
+                "  cancel-in-progress: ${{ github.event.action != 'labeled' }}",
+            ],
+            code[start : start + 3],
+        )
+        self.assertFalse(code[start + 3].startswith(" "))
+        self.assertIn("    types: [opened, synchronize, reopened, labeled]", code[:start])
+
+
 if __name__ == "__main__":
     unittest.main()

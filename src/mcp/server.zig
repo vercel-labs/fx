@@ -154,7 +154,7 @@ pub const Event = union(enum) {
     failed: Failure,
     /// A listing ended (or a need was served from the cache). Read the list
     /// with `toolList`.
-    tools: struct { ok: bool, fresh: bool, dropped: tools.Added = .{}, needs_auth: bool = false },
+    tools: struct { ok: bool, fresh: bool, needs_auth: bool = false },
     /// The tool list may have changed: `list_changed`, a call answer that
     /// suggests so, a new process, or a fresh list's TTL ran out. A host
     /// that keeps its own copy lists again before its next call (CAT-05).
@@ -256,6 +256,9 @@ const Logical = struct {
     /// refuses it (`httpListRefusal`). Null when the ending is no answer, or another flow reads it.
     list_why: ?tools.Refusal = null,
     list_status: u16 = 0,
+    /// A line fx could not read, that names no request, came while this request could be the only one it
+    /// was about: on its own stream, or when it was the one request in flight (`markOwnLine`).
+    own_line: bool = false,
     instance: []const u8 = "",
     /// 2025: the stream's last event id, sent back to resume it.
     last_event_id: ?[]const u8 = null,
@@ -357,8 +360,10 @@ pub const Server = struct {
     stray_len: u8 = 0,
     /// The message of the last progress event, until the next `next`.
     note: [note_max + 3]u8 = undefined,
-    /// What the last page added, for the warning about dropped tools.
-    last_added: tools.Added = .{},
+    /// What the pages of the listing in progress left out, by reason. A listing that ends without publishing drops it.
+    gathering_dropped: tools.Dropped = .{},
+    /// What the published list left out, by reason (`droppedTools`).
+    dropped: tools.Dropped = .{},
     /// The words of why the last page fx refused was refused, written when it was refused (`refuse`). They mean
     /// something only while `catalog.refused` holds.
     list_refusal_buf: [tools.text_max]u8 = undefined,
@@ -463,6 +468,12 @@ pub const Server = struct {
 
     pub fn toolList(r: *const Server) *const tools.List {
         return &r.store.current;
+    }
+
+    /// How many tools of the list `toolList` returns fx left out, by reason; empty for a list that kept every tool and
+    /// for a server that listed none. A refused newer list leaves it as it was, like the list it describes.
+    pub fn droppedTools(r: *const Server) tools.Dropped {
+        return r.dropped;
     }
 
     /// Why fx refused the last list the server answered, in the words of `tools.Refusal` (with the HTTP status
@@ -884,6 +895,21 @@ pub const Server = struct {
         }
     }
 
+    /// A line that names no request is about every normal request in flight (`request.Table.refusedLine`), so it is
+    /// a list's own answer only when no other such request could have written it: it came on the list's own
+    /// stream, or the list is the one normal request in flight. A listen is not one of them: it is waited on for no
+    /// reply, and a modern server always has one open. Otherwise the list's answer is only late, and when the grace
+    /// runs out the list ends with no reason, as a lost page does (`tests/tla/mcp/Catalog.tla` `PageSharedGrace`).
+    fn markOwnLine(r: *Server, stream: ?u64) void {
+        const own = if (stream) |key| r.logicalFor(key) else if (r.table.normalInFlightCount() == 1) r.soleList() else null;
+        if (own) |l| l.own_line = true;
+    }
+
+    fn soleList(r: *Server) ?*Logical {
+        for (&r.logicals) |*l| if (l.used and l.what == .list and l.id != null) return l;
+        return null;
+    }
+
     /// A line `decode` refused that names a request in flight is that
     /// request's answer, an invalid one: the request fails with what was
     /// wrong and the start of the line. It names a request by the id read
@@ -900,6 +926,7 @@ pub const Server = struct {
         const id = wire.responseId(line) orelse {
             r.keepStray(line);
             r.refused_bytes = @intCast(@min(line.len, std.math.maxInt(u32)));
+            r.markOwnLine(stream);
             return r.stepRequest(.{ .refused_line = stream });
         };
         if (r.logicalFor(id) == null) return r.keepStray(line);
@@ -1006,7 +1033,7 @@ pub const Server = struct {
             // Answers were read on arrival; the probe timer covers silence.
             .discover => {},
             .initialize => if (outcome == .timed_out) try r.stepEra(.initialize_timed_out),
-            .list => if (!answered) try r.stepCatalog(.page_failed),
+            .list => if (!answered) try r.listFailed(l),
             // The server's notifications/cancelled. A lost one waits
             // for the process, and a listen never times out.
             .listen => if (outcome == .ended) try r.stepSubs(.{ .final = .{ .id = id, .end = .server_cancelled } }),
@@ -1081,6 +1108,7 @@ pub const Server = struct {
         r.detector.step(.operation_sent, &out) catch return error.NotReady;
         if (r.tracer()) |t| try era.writeTrace(t, r.era_instance, &out);
         l.id = try r.newRequest(.normal);
+        l.own_line = false;
         try r.stepLegacy(.{ .send = l.id.? });
     }
 
@@ -1178,6 +1206,7 @@ pub const Server = struct {
             else => .normal,
         });
         l.id = id;
+        l.own_line = false;
         if (l.what == .listen) {
             l.listen_id = id;
             try r.stepSubs(if (l.resend) .{ .resent = .{ .sub = l.sub, .id = id } } else .{ .opened = .{ .sub = l.sub, .id = id, .filter = l.filter } });
@@ -1465,7 +1494,7 @@ pub const Server = struct {
                         return .page_refused;
                     },
                 };
-                r.last_added = added;
+                r.gatherDropped(added);
                 return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms, .now_ms = r.now() } };
             },
         }
@@ -2203,6 +2232,10 @@ pub const Server = struct {
             .malformed => if (r.logicalFor(effect.deliver.id)) |l| {
                 l.malformed = true;
                 l.refused_bytes = r.refused_bytes;
+                // The server wrote a line fx could not read and no id could tell whose it was. For a list, that is an
+                // answer fx could not use (`tests/tla/mcp/Catalog.tla` `PageUnreadable`) only when the line could be
+                // nobody else's (`markOwnLine`); a call's bad reply that gave the list a grace says nothing about it.
+                if (l.what == .list and l.own_line) l.list_why = .unreadable;
             },
             else => {},
         };
@@ -2300,6 +2333,25 @@ pub const Server = struct {
         };
     }
 
+    /// A page was read: what it left out joins the count of the listing in progress.
+    fn gatherDropped(r: *Server, added: tools.Added) void {
+        r.gathering_dropped.merge(added.dropped());
+    }
+
+    /// The listing ended with a list: the gathered tools and what the pages left out become the published ones.
+    fn publishStore(r: *Server) void {
+        r.store.publish();
+        r.dropped = r.gathering_dropped;
+        r.gathering_dropped = .{};
+    }
+
+    /// The listing ended with no list, or restarts: the pages gathered so far, and their count, go. The published list
+    /// and its count stay.
+    fn discardStore(r: *Server) void {
+        r.store.discard();
+        r.gathering_dropped = .{};
+    }
+
     fn stepCatalog(r: *Server, event: catalog.Event) Error!void {
         var out: catalog.Output = .{};
         const generation = r.catalog.generation;
@@ -2315,14 +2367,14 @@ pub const Server = struct {
                 const l = try r.newLogical(.list, .idempotent);
                 try r.start(l);
             },
-            .discard_pages => r.store.discard(),
+            .discard_pages => r.discardStore(),
             .publish => |fresh| {
-                r.store.publish();
-                r.emit(.{ .tools = .{ .ok = true, .fresh = fresh, .dropped = r.last_added } });
+                r.publishStore();
+                r.emit(.{ .tools = .{ .ok = true, .fresh = fresh } });
                 try r.relisted(true);
             },
             .fail => {
-                r.store.discard();
+                r.discardStore();
                 r.emit(.{ .tools = .{ .ok = false, .fresh = false, .needs_auth = r.page_needs_auth } });
                 r.page_needs_auth = false;
                 try r.relisted(false);
@@ -2330,7 +2382,7 @@ pub const Server = struct {
             // The last list goes out unless the page needs a sign-in, which
             // every call from that list would need too.
             .serve_last => {
-                r.store.discard();
+                r.discardStore();
                 r.emit(.{ .tools = .{ .ok = !r.page_needs_auth, .fresh = false, .needs_auth = r.page_needs_auth } });
                 r.page_needs_auth = false;
                 try r.relisted(false);
@@ -2597,6 +2649,133 @@ test "two ids on a refused line name no request, and give every request in fligh
     try std.testing.expect(r.logicalFor(id) != null);
 }
 
+/// Ends the grace of the one refused line the server holds, as the server's own loop does when its timer is due.
+fn fireRefusedTimer(r: *Server) !void {
+    for (r.timers.items, 0..) |t, at| if (t.kind == .request and t.kind.request.kind == .refused) {
+        _ = r.timers.swapRemove(at);
+        return r.stepRequest(.{ .timer_fired = t.kind.request });
+    };
+    return error.TestExpectedRefusedTimer;
+}
+
+/// An HTTP server with room for requests, so a list can be in flight on a stream.
+fn streamTestServer(r: *Server) !void {
+    try r.init(std.testing.io, std.testing.allocator, .{
+        .link = .{ .http = .{ .url = "http://127.0.0.1:1/mcp", .max_in_flight = 4 } },
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    });
+}
+
+test "a list whose line has its id after the part fx cannot read is refused when the grace runs out, with the words of an unreadable list" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const id = try listInFlight(&r);
+    var line: [96]u8 = undefined;
+    // The id comes after the bad part, so the line names no request: the list waits out the grace, and says nothing meanwhile.
+    const unnamed = try std.mem.print(&line, "{{\"jsonrpc\":\"2.0\",\"result\":nope,\"id\":{d}}}", .{id});
+    try r.onRefusedLine(error.InvalidJson, unnamed, null);
+    try std.testing.expect(holdsGrace(&r, id));
+    try std.testing.expect(r.logicalFor(id) != null);
+    try std.testing.expect(r.listRefusal() == null);
+
+    try fireRefusedTimer(&r);
+    try std.testing.expect(r.logicalFor(id) == null);
+    try std.testing.expect(r.catalog.refused);
+    try std.testing.expectEqualStrings("the answer is not a readable tool list", r.listRefusal() orelse return error.TestExpectedRefusal);
+}
+
+test "a list that ends with no line fx could read is not refused: a lost process says nothing about the list" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const id = try listInFlight(&r);
+    try r.stepRequest(.{ .transport_lost = id });
+    try std.testing.expect(r.logicalFor(id) == null);
+    try std.testing.expect(!r.catalog.refused);
+    try std.testing.expect(r.listRefusal() == null);
+}
+
+test "a list whose SSE event names no request is refused when its grace runs out, as a stdio line is" {
+    var r: Server = undefined;
+    try streamTestServer(&r);
+    defer r.deinit();
+    const id = try listInFlight(&r);
+    // The list's POST is out, as it is while its stream is read; nothing here sends it.
+    r.logicalFor(id).?.exchange.phase = .posted;
+    // An event on the list's own stream that is no JSON-RPC message: the stream says which request it is about.
+    try r.onRefusedLine(error.InvalidJson, "not json", id);
+    try std.testing.expect(holdsGrace(&r, id));
+    try std.testing.expect(r.listRefusal() == null);
+
+    try fireRefusedTimer(&r);
+    try std.testing.expect(r.catalog.refused);
+    try std.testing.expectEqualStrings("the answer is not a readable tool list", r.listRefusal() orelse return error.TestExpectedRefusal);
+}
+
+/// Ends every grace the server holds, as its loop does when each timer is due.
+fn fireAllRefusedTimers(r: *Server) !void {
+    while (refusedTimers(r) > 0) try fireRefusedTimer(r);
+}
+
+/// A call in flight beside the list, as a second request on the one stdio connection.
+fn callInFlight(r: *Server) !request.Id {
+    const l = try r.newLogical(.call, .call);
+    l.id = try r.newRequest(.normal);
+    return l.id.?;
+}
+
+test "a bad line that a call in flight could have written does not refuse the list that waits with it: its answer is only late" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const list = try listInFlight(&r);
+    const call = try callInFlight(&r);
+    // The call's reply is a line with no readable id: stdio gives each request in flight a grace, and the line
+    // can be the list's as little as it can be the call's.
+    try r.onRefusedLine(error.InvalidJson, "not json", null);
+    try std.testing.expect(holdsGrace(&r, list));
+    try std.testing.expect(holdsGrace(&r, call));
+
+    try fireAllRefusedTimers(&r);
+    try std.testing.expect(r.logicalFor(list) == null);
+    try std.testing.expect(r.logicalFor(call) == null);
+    try std.testing.expect(!r.catalog.refused);
+    try std.testing.expect(r.listRefusal() == null);
+}
+
+test "a later bad line, when the list is the one request left, is the list's own, though it began its grace with a call's line" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const list = try listInFlight(&r);
+    const call = try callInFlight(&r);
+    try r.onRefusedLine(error.InvalidJson, "not json", null);
+    // The call is answered; the list is the one request left, and the server writes another line fx cannot read.
+    try r.stepRequest(.{ .response_received = .{ .id = call, .response = .result } });
+    try r.onRefusedLine(error.InvalidJson, "still not json", null);
+
+    try fireAllRefusedTimers(&r);
+    try std.testing.expect(r.logicalFor(list) == null);
+    try std.testing.expect(r.catalog.refused);
+    try std.testing.expectEqualStrings("the answer is not a readable tool list", r.listRefusal() orelse return error.TestExpectedRefusal);
+}
+
+test "a list is still the one request a bad line can be about while a listen is open, because the listen gets no grace" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const list = try listInFlight(&r);
+    try r.stepRequest(.{ .send = .listen });
+    try r.onRefusedLine(error.InvalidJson, "not json", null);
+    try std.testing.expect(holdsGrace(&r, list));
+
+    try fireAllRefusedTimers(&r);
+    try std.testing.expect(r.logicalFor(list) == null);
+    try std.testing.expect(r.catalog.refused);
+    try std.testing.expectEqualStrings("the answer is not a readable tool list", r.listRefusal() orelse return error.TestExpectedRefusal);
+}
+
 fn pageTestServer(r: *Server) !void {
     // No request goes out: it waits for a place, and there is none.
     try r.init(std.testing.io, std.testing.allocator, .{
@@ -2754,4 +2933,56 @@ test "a tool list that ends with an HTTP answer is refused with the status in it
         try std.testing.expect(!r.catalog.refused);
         try std.testing.expect(r.listRefusal() == null);
     }
+}
+
+test "what a listing leaves out is counted over every page, and a listing that is discarded leaves the published count" {
+    var r: Server = undefined;
+    try pageTestServer(&r);
+    defer r.deinit();
+    const gpa = std.testing.allocator;
+    const first = "{\"tools\":[{\"name\":\"a\",\"inputSchema\":{}},{\"name\":\"a\",\"inputSchema\":{}},{\"inputSchema\":{}}],\"nextCursor\":\"c\"}";
+    const last = "{\"tools\":[{\"name\":\"b\",\"inputSchema\":{}},{\"name\":\"b\",\"inputSchema\":{}}]}";
+
+    r.gatherDropped(try r.store.addPage(gpa, try tools.parsePage(first)));
+    // Nothing is published until the listing ends, so the first page's count is not the list's yet.
+    try std.testing.expectEqual(@as(u32, 0), r.droppedTools().total());
+    r.gatherDropped(try r.store.addPage(gpa, try tools.parsePage(last)));
+    r.publishStore();
+    // Two pages, each leaving tools out: the count is of the whole list, not of the last page.
+    try std.testing.expectEqual(@as(usize, 2), r.toolList().len());
+    const got = r.droppedTools();
+    try std.testing.expectEqual(@as(u32, 3), got.total());
+    try std.testing.expectEqual(@as(u32, 2), got.counts[@backingInt(tools.Drop.repeated_name)]);
+    try std.testing.expectEqual(@as(u32, 1), got.counts[@backingInt(tools.Drop.unnamed)]);
+
+    // A later listing that ends with no list leaves the older list served, and the count that describes it.
+    r.gatherDropped(try r.store.addPage(gpa, try tools.parsePage(first)));
+    r.discardStore();
+    try std.testing.expectEqual(@as(usize, 2), r.toolList().len());
+    try std.testing.expectEqual(@as(u32, 3), r.droppedTools().total());
+
+    // What the discarded listing counted is gone: the next list that keeps every tool says nothing is left out.
+    _ = try r.store.addPage(gpa, try tools.parsePage("{\"tools\":[{\"name\":\"c\",\"inputSchema\":{}}]}"));
+    r.publishStore();
+    try std.testing.expectEqual(@as(usize, 1), r.toolList().len());
+    try std.testing.expectEqual(@as(u32, 0), r.droppedTools().total());
+}
+
+test "a listing that fails drops what its pages left out, and the published count stays" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const gpa = std.testing.allocator;
+    // A list is published with two tools left out.
+    r.gatherDropped(try r.store.addPage(gpa, try tools.parsePage("{\"tools\":[{\"name\":\"a\",\"inputSchema\":{}},{\"name\":\"a\",\"inputSchema\":{}},{\"inputSchema\":{}}]}")));
+    r.publishStore();
+    try std.testing.expectEqual(@as(u32, 2), r.droppedTools().total());
+
+    // The next listing counts five more on its first page, and then its process is lost: no list comes of it.
+    const id = try listInFlight(&r);
+    r.gatherDropped(.{ .duplicate = 5 });
+    try r.stepRequest(.{ .transport_lost = id });
+    try std.testing.expectEqual(@as(u32, 0), r.gathering_dropped.total());
+    try std.testing.expectEqual(@as(u32, 2), r.droppedTools().total());
+    try std.testing.expectEqual(@as(usize, 1), r.toolList().len());
 }

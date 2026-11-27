@@ -6,13 +6,16 @@ usage: check_deprecated.py [--review] [--strict] [PATH ...]   (default PATH: .)
 Each finding prints `path:line: [kind] old -> replacement`.
   deprecated  still compiles on 0.17, scheduled for removal
   removed     does not compile on 0.17
-  review      compiles, but 0.17 changed its meaning; read the call site.
+  review      read the call site: 0.17 changed its meaning, or the name is
+              deprecated or removed only on a std type, and a scan of text
+              cannot see the receiver's type (such as `.getLast()` or `.Debug`).
               Counted always, listed only with --review (use it when migrating).
 Exit status is 1 when any deprecated or removed finding exists, or any
 finding at all with --strict, and 2 when a given path could not be read.
 Directories are searched for .zig files; symbolic links and files that are
 not regular files are skipped there. Comments and string literals are ignored.
-File-level aliases such as `const mem = std.mem;` are resolved.
+Top-level aliases such as `const mem = std.mem;` are resolved, unless the file
+declares the same name again.
 Reads files only; no network access and no code execution.
 """
 import os
@@ -85,18 +88,21 @@ SYNTAX_RULES = [
     (r"\berrdefer\s*\|", "errdefer capture", "split into an inner function and handle the error in the caller", "removed"),
     # zig fmt writes the removed value syntax as `void{}` and a void function body as `void {}`.
     (r"(?<![\w.!])void\{\s*\}", "void{}", "{}", "removed"),
+    # From here on, review: the match names no std declaration, so code that
+    # declares its own i0, enum tag, or method of that name also matches.
     # Only in type positions, so a variable named i0 is not reported.
-    (r"(?:(?<=[:\]*?!])\s*|@as\(\s*)i0\b", "i0", "u0", "removed"),
-    (r"\.Release(?:Safe|Fast|Small)\b", "Debug/ReleaseSafe/ReleaseFast/ReleaseSmall tag", ".debug / .safe / .fast / .small", "deprecated"),
-    (r"\.getLast(?:OrNull)?\s*\(\s*\)", "ArrayList.getLast/getLastOrNull", "last() (optional) or last().?", "deprecated"),
-    (r"\.readAlloc\s*\(", "Io.Reader.readAlloc", "readAllocAll", "deprecated"),
-    (r"\.sendMany\s*\(", "Io.net sendMany", "sendManyTimeout(..., .none)", "deprecated"),
-    (r"\.(?:initEmpty|initFull)\s*\(\s*\)", "bit set / EnumSet initEmpty()/initFull()", ".empty / .full", "removed"),
+    (r"(?:(?<=[:\]*?!])\s*|@as\(\s*)i0\b", "i0", "u0", "review"),
+    (r"\.Release(?:Safe|Fast|Small)\b", "Debug/ReleaseSafe/ReleaseFast/ReleaseSmall tag", ".debug / .safe / .fast / .small", "review"),
+    (r"\.getLast(?:OrNull)?\s*\(\s*\)", "ArrayList.getLast/getLastOrNull", "last() (optional) or last().?", "review"),
+    (r"\.readAlloc\s*\(", "Io.Reader.readAlloc", "readAllocAll", "review"),
+    (r"\.sendMany\s*\(", "Io.net sendMany", "sendManyTimeout(..., .none)", "review"),
+    (r"\.(?:initEmpty|initFull)\s*\(\s*\)", "bit set / EnumSet initEmpty()/initFull()", ".empty / .full", "review"),
 ]
-# Reported only when the second pattern follows on the same line.
+# Reported only when the second pattern follows in code on the same line.
+# Review: the tag may belong to the code's own enum.
 SAME_LINE_RULES = [
-    (r"\.(?:internal|link_once)\b", r"linkage", "internal/link_once linkage", "do not @export, or use .weak", "removed"),
-    (r"\.Debug\b", r"optimize|mode|Optimize", "Debug/ReleaseSafe/ReleaseFast/ReleaseSmall tag", ".debug / .safe / .fast / .small", "deprecated"),
+    (r"\.(?:internal|link_once)\b", r"linkage", "internal/link_once linkage", "do not @export, or use .weak", "review"),
+    (r"\.Debug\b", r"optimize|mode|Optimize", "Debug/ReleaseSafe/ReleaseFast/ReleaseSmall tag", ".debug / .safe / .fast / .small", "review"),
 ]
 REVIEW_RULES = [
     (r"containsAtLeastScalar\s*\(", "containsAtLeastScalar", "0.17 order is (T, list, element, minimum); 0.16 was (T, list, minimum, element)"),
@@ -110,6 +116,12 @@ def findings(text):
     mask = code_mask(text)
     lines = Lines(text)
     seen = set()
+    module_aliases = {}
+
+    def aliases_of(module):
+        if module not in module_aliases:
+            module_aliases[module] = aliases(text, module)
+        return module_aliases[module]
 
     def emit(m, old, new, kind, start=None):
         s = m.start() if start is None else start
@@ -120,9 +132,9 @@ def findings(text):
 
     out = []
     for module, member, new, kind in MODULE_RULES:
-        prefixes = [re.escape(module)] + [re.escape(a) for a in aliases(text, module)]
+        prefixes = [re.escape(module)] + [re.escape(a) for a in aliases_of(module)]
         if module == "std.fs":
-            prefixes += [re.escape(a) + r"(?=\.(?:resolve|relative)\s*\()" for a in aliases(text, "std.fs.path")]
+            prefixes += [re.escape(a) + r"(?=\.(?:resolve|relative)\s*\()" for a in aliases_of("std.fs.path")]
         for p in prefixes:
             pat = START + p + (r"\." + member if "(?=" not in p else r"\.(?:resolve|relative)") + r"\b"
             for m in re.finditer(pat, text):
@@ -157,7 +169,8 @@ def findings(text):
         # The last start of `after` on each line, found in one pass.
         last_after = {}
         for m in re.finditer(after, text):
-            last_after[lines.number(m.start())] = m.start()
+            if mask[m.start()]:
+                last_after[lines.number(m.start())] = m.start()
         for m in re.finditer(pat, text):
             if last_after.get(lines.number(m.start()), -1) >= m.end():
                 f = emit(m, old, new, kind)

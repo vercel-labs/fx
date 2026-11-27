@@ -384,19 +384,6 @@ pub const Owner = struct {
         return false;
     }
 
-    /// The current tool call of `child_id`'s running turn, for status and
-    /// its row in the agent list.
-    pub fn currentCall(self: *Owner, child_id: []const u8) ?live_metrics.Call {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        for (self.slots.items) |slot| {
-            if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
-            if (slot.completion != .running) return null;
-            return slot.metrics.currentCall();
-        }
-        return null;
-    }
-
     /// Each running turn's current tool call, by child id, allocated in
     /// `alloc`. Status reads them before it takes the registry's lock, since
     /// `wait` takes that lock under this owner's mutex.

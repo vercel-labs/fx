@@ -85,10 +85,17 @@ pub fn buildRequest(
     const writer = &out.writer;
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
-    try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
+    try writer.writeAll(",\"store\":false,\"stream\":true,\"input\":[");
+    // The stable prompt leads `input`, so later requests share its bytes as a cached prefix.
+    try writer.writeAll("{\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
-    try writer.writeAll(",\"input\":[");
+    try writer.writeAll("}]}");
+    const developer_end = out.written().len;
+    try writer.writeByte(',');
+    const items_start = out.written().len;
     try writeResponsesInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, budget);
+    // No message wrote an item, so drop the separator: JSON has no trailing comma.
+    if (out.written().len == items_start) out.shrinkRetainingCapacity(developer_end);
     try writer.writeByte(']');
 
     _ = try responses_protocol.writeTools(writer, alloc, request.tools);
@@ -480,13 +487,128 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "\"model\":\"gpt-5.4\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"instructions\":\"Be concise.\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"input\":[{\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":\"Be concise.\"}]},") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"type\":\"function_call_output\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"encrypted_content\":\"opaque\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"parameters\":{\"type\":\"object\",\"properties\":{}}") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":{\"effort\":\"high\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\":\"priority\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\"") == null);
+}
+
+test "OpenAI Codex sends the instructions as one developer item first in input" {
+    const instructions = [_]types.ChatMessage{
+        .{ .role = .system, .content = "Be concise." },
+        .{ .role = .system, .content = "Use tools." },
+    };
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
+    const body = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .instructions = &instructions,
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const input = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), input.len);
+    try std.testing.expectEqualStrings("developer", input[0].object.get("role").?.string);
+    const part = input[0].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("input_text", part.get("type").?.string);
+    try std.testing.expectEqualStrings("Be concise.\n\nUse tools.", part.get("text").?.string);
+    try std.testing.expectEqualStrings("user", input[1].object.get("role").?.string);
+    try std.testing.expect(parsed.value.object.get("instructions") == null);
+}
+
+test "OpenAI Codex sends the default developer item when no instruction text is set" {
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
+    const body = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const input = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), input.len);
+    try std.testing.expectEqualStrings("developer", input[0].object.get("role").?.string);
+    const part = input[0].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("You are a helpful assistant.", part.get("text").?.string);
+    try std.testing.expect(parsed.value.object.get("instructions") == null);
+}
+
+test "OpenAI Codex sends only the developer item when a request has no messages" {
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Be concise." }};
+    const body = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .instructions = &instructions,
+        .messages = &.{},
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const input = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), input.len);
+    try std.testing.expectEqualStrings("developer", input[0].object.get("role").?.string);
+    const part = input[0].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("Be concise.", part.get("text").?.string);
+    try std.testing.expect(parsed.value.object.get("instructions") == null);
+}
+
+test "OpenAI Codex keeps the body valid when no message writes an input item" {
+    const messages = [_]types.ChatMessage{.{ .role = .assistant }};
+    const body = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const input = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), input.len);
+    try std.testing.expectEqualStrings("developer", input[0].object.get("role").?.string);
+}
+
+test "OpenAI Codex keeps the developer item byte-identical across turns of a session" {
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Be concise." }};
+    const first_turn = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
+    const later_turn = [_]types.ChatMessage{
+        .{ .role = .user, .content = "Hello." },
+        .{ .role = .assistant, .content = "Hi." },
+        .{ .role = .user, .content = "More." },
+    };
+    const first = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .instructions = &instructions,
+        .messages = &first_turn,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(first);
+    const later = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .instructions = &instructions,
+        .messages = &later_turn,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(later);
+
+    const developer_first = "\"input\":[{\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":\"Be concise.\"}]},";
+    try std.testing.expect(std.mem.find(u8, first, developer_first) != null);
+    try std.testing.expect(std.mem.find(u8, later, developer_first) != null);
 }
 
 fn makeSizedProviderState(alloc: Allocator, size: usize) ![]u8 {
@@ -972,4 +1094,35 @@ test "a Codex event that is not JSON resends, and a duplicate key still ends the
     try std.testing.expect(gateway_client.networkFailureEvidence(error.MalformedOpenAICodexSseEvent, .possibly_sent) != null);
     try expectOpenAICodexSseError(error.InvalidOpenAICodexSseEvent, partial ++ "data: {\"type\":\"a\",\"type\":\"b\"}\n\n", .{});
     try std.testing.expect(gateway_client.networkFailureEvidence(error.InvalidOpenAICodexSseEvent, .possibly_sent) == null);
+}
+
+test "eb03: ChatMessage.input_id leaves Codex request body byte-identical" {
+    const alloc = std.testing.allocator;
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Be concise." }};
+    const without_id = [_]types.ChatMessage{
+        .{ .role = .user, .content = "initial prompt" },
+        .{ .role = .assistant, .content = "working" },
+        .{ .role = .user, .content = "follow up steer", .restored_steering = true },
+    };
+    var with_id = without_id;
+    with_id[0].input_id = 42;
+    with_id[2].input_id = 43;
+
+    const body_without = try buildRequest(alloc, .{
+        .model = "gpt-5",
+        .instructions = &instructions,
+        .messages = &without_id,
+        .tool_choice = .auto,
+        .provider_options = .{},
+    });
+    defer alloc.free(body_without);
+    const body_with = try buildRequest(alloc, .{
+        .model = "gpt-5",
+        .instructions = &instructions,
+        .messages = &with_id,
+        .tool_choice = .auto,
+        .provider_options = .{},
+    });
+    defer alloc.free(body_with);
+    try std.testing.expectEqualStrings(body_without, body_with);
 }

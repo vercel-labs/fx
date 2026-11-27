@@ -30,6 +30,7 @@ import { join, resolve } from "node:path";
 import { startManyMcpHttpServers } from "../e2e/fixtures/mcp-many";
 import { TmuxSession } from "../e2e/tmux-helpers";
 import { requireAbsoluteExecutableBinary } from "./agent-quality-ab";
+import { fxChildEnv } from "./eval-helpers";
 import { DEFAULT_UPSTREAM, startRecordingProxy, type RecordedRequest } from "./prompt-cache-ab";
 
 const MCP_FIXTURE = resolve(import.meta.dirname, "../e2e/fixtures/mcp-modern-stdio.mjs");
@@ -243,8 +244,7 @@ export async function runTask(
   const root = mkdtempSync(join(tmpdir(), `fx-toolbox-ab-${task.name}-`));
   const { home, workspace } = writeTaskFixture(root, { mcp: task.name !== "added", manyUrl: task.name === "many" ? opts.manyUrl : undefined });
   const proxy = startRecordingProxy(opts.upstream ?? DEFAULT_UPSTREAM);
-  const env: Record<string, string | undefined> = {
-    ...process.env,
+  const env: Record<string, string | undefined> = fxChildEnv({
     HOME: home,
     NO_COLOR: "1",
     FX_SOUND: "0",
@@ -253,7 +253,7 @@ export async function runTask(
     FX_MODEL: opts.model,
     FX_GATEWAY_BASE_URL: proxy.url,
     FX_GATEWAY_CHAT_URL: `${proxy.url}/v4/ai/language-model`,
-  };
+  }, { keepCredentials: true });
   let answer = "";
   let exitedCleanly = true;
   try {
