@@ -64,7 +64,7 @@ while IFS= read -r line; do
   case "$resolved" in
     "$folder"/*)
       # Fuzz roots name the file that declares the test (`test_fuzz_nightly.py`).
-      if [[ "$resolved" != "$front_door" ]] && ! [[ "$file" == "src/fuzz_targets.zig" && "$resolved" == "$folder/edit_blocks.zig" ]]; then
+      if [[ "$resolved" != "$front_door" ]] && ! [[ "$file" == "src/fuzz_targets.zig" && ( "$resolved" == "$folder/edit_blocks.zig" || "$resolved" == "$folder/wire.zig" ) ]]; then
         reaching_in+="$line"$'\n'
       fi
       ;;

@@ -67,6 +67,7 @@ test {
     _ = @import("core/terminal/engine.zig");
     _ = @import("core/terminal/shell_snapshot.zig");
     _ = @import("core/tool_bridge/edit_blocks.zig");
+    _ = @import("core/tool_bridge/wire.zig");
     _ = @import("core/tooling/command_output_content.zig");
     _ = @import("core/tooling/file_mutation.zig");
     _ = @import("core/workspace/capture_retention.zig");

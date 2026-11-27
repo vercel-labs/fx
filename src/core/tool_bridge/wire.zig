@@ -34,6 +34,11 @@ pub const token_env = "FX_MCP_CALL_TOKEN";
 pub const max_request_bytes: usize = 1024 * 1024;
 /// The longest reply header line the client reads.
 pub const max_header_bytes: usize = 4 * 1024;
+/// Deepest `arguments` value `parseRequest` accepts (matches `json_depth.max_depth`
+/// in `src/core/shared/json_depth.zig`, which the tool-bridge boundary does not
+/// import, and stays under `std.json.Stringify`'s 256-level fixed stack, which
+/// panics at level 257 in Debug and ReleaseSafe builds).
+const max_arguments_depth: usize = 64;
 
 pub const token_hex_len = 2 * @sizeOf(mcp_call.Token);
 
@@ -107,6 +112,7 @@ pub const RequestError = error{ MalformedRequest, OutOfMemory };
 
 /// Parses one request line. The result borrows from `arena`.
 pub fn parseRequest(arena: Allocator, line: []const u8) RequestError!Request {
+    if (line.len > max_request_bytes) return error.MalformedRequest;
     const value = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedRequest,
@@ -124,6 +130,7 @@ pub fn parseRequest(arena: Allocator, line: []const u8) RequestError!Request {
         .call => blk: {
             const arguments = object.get("arguments") orelse return error.MalformedRequest;
             if (arguments != .object) return error.MalformedRequest;
+            if (!withinDepth(arguments, max_arguments_depth)) return error.MalformedRequest;
             var out: std.Io.Writer.Allocating = .init(arena);
             std.json.Stringify.value(arguments, .{}, &out.writer) catch return error.OutOfMemory;
             break :blk .{ .call = .{ .tool = try nonEmptyString(object, "tool"), .arguments_json = out.written() } };
@@ -181,6 +188,48 @@ fn optionalNonEmptyString(object: std.json.ObjectMap, key: []const u8) RequestEr
 fn optionalReport(object: std.json.ObjectMap) RequestError!?capability_mod.AgentReport {
     const raw = (try optionalNonEmptyString(object, "report")) orelse return null;
     return capability_mod.AgentReport.parse(raw) orelse error.MalformedRequest;
+}
+
+const DepthFrame = union(enum) {
+    array: struct { items: []const std.json.Value, next: usize },
+    object: std.json.ObjectMap.Iterator,
+};
+
+fn withinDepth(value: std.json.Value, max: usize) bool {
+    std.debug.assert(max <= max_arguments_depth);
+    var stack: [max_arguments_depth]DepthFrame = undefined;
+    var len: usize = 0;
+    var pending: ?std.json.Value = value;
+    while (true) {
+        if (pending) |entered| {
+            pending = null;
+            switch (entered) {
+                .array => |array| {
+                    if (len == max) return false;
+                    stack[len] = .{ .array = .{ .items = array.items, .next = 0 } };
+                    len += 1;
+                },
+                .object => |object| {
+                    if (len == max) return false;
+                    stack[len] = .{ .object = object.iterator() };
+                    len += 1;
+                },
+                else => {},
+            }
+        }
+        if (len == 0) return true;
+        switch (stack[len - 1]) {
+            .array => |*frame| {
+                if (frame.next < frame.items.len) {
+                    pending = frame.items[frame.next];
+                    frame.next += 1;
+                } else len -= 1;
+            },
+            .object => |*iterator| {
+                if (iterator.next()) |entry| pending = entry.value_ptr.* else len -= 1;
+            },
+        }
+    }
 }
 
 /// The blocks of an edit line: one to `edit_blocks.max_blocks`, each with a
@@ -540,4 +589,140 @@ test "malformed skill and agent lines are rejected" {
         "{\"v\":1,\"token\":\"\",\"op\":\"agent_close\"}",
         "{\"v\":1,\"token\":\"\",\"op\":\"agent_close\",\"agent\":\"\"}",
     }) |line| try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
+}
+
+const max_fuzz_request_bytes = max_request_bytes + 64;
+
+fn fuzzWire(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [max_fuzz_request_bytes]u8 = undefined;
+    const line = buffer[0..smith.slice(&buffer)];
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const parsed = parseRequest(arena, line) catch |err| switch (err) {
+        error.MalformedRequest, error.OutOfMemory => return,
+    };
+    if (line.len > max_request_bytes) return error.TestOversizedRequestAccepted;
+
+    const token = parsed.token orelse @as(mcp_call.Token, @splat(0));
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try writeRequest(&out.writer, token, parsed.operation);
+    const rewritten = out.written();
+    try std.testing.expect(std.mem.endsWith(u8, rewritten, "}\n"));
+    const reparsed = try parseRequest(arena, rewritten[0 .. rewritten.len - 1]);
+    if (parsed.version == mcp_call.protocol_version) {
+        try std.testing.expectEqual(parsed.version, reparsed.version);
+    } else {
+        try std.testing.expectEqual(mcp_call.protocol_version, reparsed.version);
+    }
+    try std.testing.expect(reparsed.token != null);
+    try std.testing.expectEqualSlices(u8, &token, &reparsed.token.?);
+    try expectSameOperation(parsed.operation, reparsed.operation);
+}
+
+fn expectSameOperation(want: Operation, got: Operation) !void {
+    try std.testing.expectEqual(std.meta.activeTag(want), std.meta.activeTag(got));
+    switch (want) {
+        .call => |w| {
+            try std.testing.expectEqualStrings(w.tool, got.call.tool);
+            try std.testing.expectEqualStrings(w.arguments_json, got.call.arguments_json);
+        },
+        .list => |w| try std.testing.expectEqualStrings(w, got.list),
+        .search => |w| try std.testing.expectEqualStrings(w, got.search),
+        .help => |w| try std.testing.expectEqualStrings(w, got.help),
+        .edit => |w| {
+            try std.testing.expectEqualStrings(w.path, got.edit.path);
+            try std.testing.expectEqual(w.blocks.len, got.edit.blocks.len);
+            for (w.blocks, got.edit.blocks) |wb, gb| {
+                try std.testing.expectEqualStrings(wb.search, gb.search);
+                try std.testing.expectEqualStrings(wb.replace, gb.replace);
+            }
+        },
+        .write => |w| {
+            try std.testing.expectEqualStrings(w.path, got.write.path);
+            try std.testing.expectEqualStrings(w.content, got.write.content);
+        },
+        .skill_list, .agent_wait => {},
+        .skill_open => |w| {
+            try std.testing.expectEqualStrings(w.name, got.skill_open.name);
+            try expectOptionalStrings(w.resource, got.skill_open.resource);
+        },
+        .agent_message => |w| {
+            try std.testing.expectEqualStrings(w.agent, got.agent_message.agent);
+            try std.testing.expectEqualStrings(w.message, got.agent_message.message);
+            try expectOptionalStrings(w.instructions, got.agent_message.instructions);
+            try expectOptionalStrings(w.model, got.agent_message.model);
+            try expectOptionalStrings(w.effort, got.agent_message.effort);
+            try expectOptionalStrings(w.profile, got.agent_message.profile);
+            try std.testing.expectEqual(w.report, got.agent_message.report);
+        },
+        .agent_status => |w| try expectOptionalStrings(w, got.agent_status),
+        .agent_stop => |w| try std.testing.expectEqualStrings(w, got.agent_stop),
+        .agent_close => |w| try std.testing.expectEqualStrings(w, got.agent_close),
+    }
+}
+
+fn expectOptionalStrings(want: ?[]const u8, got: ?[]const u8) !void {
+    if (want) |w| {
+        const g = got orelse return error.TestExpectedOptionalValue;
+        try std.testing.expectEqualStrings(w, g);
+    } else {
+        try std.testing.expect(got == null);
+    }
+}
+
+test "tool bridge wire requests parse or are refused, and parsed requests round-trip, on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzWire, .{
+        .corpus = &(@import("fuzz_corpus").tool_bridge_wire.*),
+    });
+}
+
+test "a call request whose arguments nest deeper than the limit is refused, not a crash" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_]usize{ 300, max_arguments_depth }) |array_levels| {
+        const line = try nestedCallLine(arena, array_levels);
+        try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
+    }
+}
+
+test "a request line longer than max_request_bytes is refused" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pad = try arena.alloc(u8, max_request_bytes);
+    @memset(pad, 'a');
+    const line = try arena.print("{{\"v\":1,\"token\":\"\",\"op\":\"list\",\"server\":\"{s}\"}}", .{pad});
+    try std.testing.expectEqual(@as(usize, 1_048_618), line.len);
+    try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
+}
+
+test "a call request whose arguments nest at the limit parses and round-trips" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `arguments` itself is level 1, plus `max_arguments_depth - 1` array levels.
+    const line = try nestedCallLine(arena, max_arguments_depth - 1);
+    const parsed = try parseRequest(arena, line);
+    const token = parsed.token orelse return error.TestExpectedToken;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try writeRequest(&out.writer, token, parsed.operation);
+    const rewritten = out.written();
+    const reparsed = try parseRequest(arena, rewritten[0 .. rewritten.len - 1]);
+    try expectSameOperation(parsed.operation, reparsed.operation);
+}
+
+fn nestedCallLine(arena: Allocator, array_levels: usize) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const hex = tokenHex(@splat(0xab));
+    try out.writer.print("{{\"v\":1,\"token\":\"{s}\",\"op\":\"call\",\"tool\":\"t\",\"arguments\":{{\"x\":", .{&hex});
+    try out.writer.splatByteAll('[', array_levels);
+    try out.writer.splatByteAll(']', array_levels);
+    try out.writer.writeAll("}}");
+    return out.written();
 }
