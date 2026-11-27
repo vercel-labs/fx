@@ -329,9 +329,9 @@ describe("fx mcp", () => {
     const twice = '{"name":"twice","name":"again","inputSchema":{"type":"object"}}';
     const sameName = '{"name":"good","description":"the second","inputSchema":{"type":"object"}}';
     const tooDeep = JSON.stringify({ name: "deep", inputSchema: deepSchema });
-    // The engine keeps a tool it can index, a plain name. The host's reading refuses the next ones, and a tool it refuses is
-    // in the count of what was left out and in no list: `odd` has a `description` that is no text, `flat` an `inputSchema` of
-    // `{}`, which does not say `"type":"object"`, and `noSchema` and `listSchema` an `inputSchema` that is missing or no object.
+    // The engine skips a tool whose `inputSchema` is missing or no object (`noSchema`, `listSchema`). The host's reading
+    // refuses the tools the engine keeps and fx can't use: `odd` has a `description` that is no text, `flat` an `inputSchema`
+    // of `{}`, which does not say `"type":"object"`. A tool either leaves out is in the count and in no list.
     const odd = '{"name":"odd","description":7,"inputSchema":{"type":"object"}}';
     const flat = '{"name":"flat","inputSchema":{}}';
     const noSchema = '{"name":"noSchema"}';
@@ -363,6 +363,48 @@ describe("fx mcp", () => {
       expect(JSON.parse((await mcp(root, "list", "--json")).stdout).servers[0]).toHaveProperty("tools_left_out");
     }
   }, 120_000);
+
+  // A tool the engine skips because its `inputSchema` is missing or no object takes no name, so a later good tool of the
+  // same name is the one that is listed, counted, and given to the model.
+  const skippedFirstTools = [
+    { form: "no inputSchema", first: '{"name":"a"}' },
+    { form: "a null inputSchema", first: '{"name":"a","inputSchema":null}' },
+    { form: "an inputSchema that is a list", first: '{"name":"a","inputSchema":[]}' },
+  ];
+  for (const { form, first } of skippedFirstTools) {
+    test(`a tool named a with ${form} does not hide a good tool named a: show lists it, and the model gets it`, async () => {
+      const goodA = '{"name":"a","description":"the good one","inputSchema":{"type":"object"}}';
+      const reply = `"result":{"resultType":"complete","tools":[${first},${goodA}]}`;
+      const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: reply } }) } });
+      const text = await mcp(root, "show", "fixture");
+      expect(text.stderr).toBe("");
+      expect(text.code).toBe(0);
+      expect(text.stdout).toContain("  status     ready, 1 tool\n");
+      expect(text.stdout).toContain("  left out   1 tool: a name or schema is missing\n");
+      const shown = JSON.parse((await mcp(root, "show", "fixture", "--json")).stdout);
+      expect(shown).toMatchObject({ status: "ready", tools_left_out: { count: 1, reason: "a name or schema is missing" } });
+      expect(shown.tools).toEqual([{ name: "a", description: "the good one" }]);
+
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("list_fixture", "shell", { action: "run", command: `"${FX_BIN}" mcp call list fixture` }),
+        fakeGatewayToolCall("run_a", "toolbox", { run: "mcp_fixture_a", arguments: {} }),
+        fakeGatewayFinalText("TOOL_A_GIVEN"),
+      ], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+      gateway = activeGateway;
+      const asked = await runFx(["ask", "--json", "--full-access", "--no-save", "Use tool a."], {
+        cwd: root.workspace,
+        env: { ...root.env, FX_GATEWAY_BASE_URL: activeGateway.baseUrl, FX_GATEWAY_CHAT_URL: activeGateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+        timeoutMs: 60_000,
+      });
+      expect(asked.code).toBe(0);
+      const told = activeGateway.requests[2]?.body ?? "";
+      // Only the good tool has a description, so the list the command printed holds the good one.
+      expect(told).toContain("mcp_fixture_a");
+      expect(told).toContain("the good one");
+      expect(told).toContain("MODERN_MCP_TOOL_RESULT");
+      expect(told).not.toContain("No tool named mcp_fixture_a");
+    }, 90_000);
+  }
 
   test("show says when fx refused the tool list of an HTTP server too", async () => {
     const upstream = startModernMcpHttpFixture("list_refused");

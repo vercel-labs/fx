@@ -1905,6 +1905,32 @@ test "what the catalog leaves out of a server's tools is what the count says was
     try testing.expectEqual(@as(u32, 2), counted.dropped.total());
 }
 
+test "a tool the engine skips for its inputSchema takes no name: the model gets a later good tool of the name" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const skipped = [_][]const u8{ "{\"name\":\"a\"}", "{\"name\":\"a\",\"inputSchema\":null}", "{\"name\":\"a\",\"inputSchema\":[]}" };
+    for (skipped) |bad| {
+        var list = try dropped_tools.listOf(gpa, &.{
+            bad,
+            "{\"name\":\"a\",\"description\":\"the good one\",\"inputSchema\":{\"type\":\"object\"}}",
+        });
+        defer list.deinit(gpa);
+        var listed: [1]runtime_mod.Tool = undefined;
+        try testing.expectEqual(listed.len, list.len());
+        listed[0] = .{ .name = list.get(0).name, .raw = list.get(0).raw };
+        var c: Catalog = undefined;
+        c.names = .init(gpa);
+        defer c.names.deinit();
+        c.builtins = .{};
+        const built = try c.build(a, "srv", &listed);
+        try testing.expectEqual(@as(usize, 1), built.len);
+        try testing.expectEqualStrings("a", built[0].original_name);
+        try testing.expectEqualStrings("the good one", built[0].description);
+    }
+}
+
 test "a call the server answers with a 401 tells the model it refused the login, in the server's quoted words" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

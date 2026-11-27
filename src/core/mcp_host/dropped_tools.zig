@@ -1,8 +1,9 @@
-//! The tools of a server's list that fx leaves out of what the model gets, counted by reason. The engine keeps a tool it
-//! can index, a plain name, and counts what `Store.addPage` skips for that (`Server.droppedTools`). This owns the host's
-//! reading of a tool: `read` decides whether a listed tool is kept or left out and why, and `Catalog.build` (what the
-//! model gets), `reading` (how many tools `fx mcp show` and the `/mcp` screen count, and how many they say are left out)
-//! and `Runtime.copyTools` (which tools they list) all go through it, so none of them can differ.
+//! The tools of a server's list that fx leaves out of what the model gets, counted by reason. The engine checks the
+//! structure of a listed tool, a plain name and an `inputSchema` that is an object, and counts what `Store.addPage`
+//! skips (`Server.droppedTools`). This owns the host's reading of what a tool means: `read` decides whether a listed
+//! tool is kept or left out and why, and `Catalog.build` (what the model gets), `reading` (how many tools `fx mcp show`
+//! and the `/mcp` screen count, and how many they say are left out) and `Runtime.copyTools` (which tools they list) all
+//! go through it, so none of them can differ.
 //!
 //! One skip is not counted. `Catalog.build` also leaves out a tool whose name no longer fits the session's full alias
 //! registry (`McpToolNameLimitExceeded`, 65,536 names): that needs the session's name registry, which the runtime that
@@ -59,7 +60,6 @@ pub fn reading(gpa: Allocator, list: *const tools.List) Allocator.Error!Reading 
 /// The reason for an error `parseToolJson` gave, from a closed set: nothing the server wrote is in it.
 fn reasonOf(err: tools_feature.Error) tools.Drop {
     return switch (err) {
-        error.UnnamedTool => .unnamed,
         error.SchemaLimitExceeded, error.NestingTooDeep, error.MetadataLimitExceeded => .over_limit,
         else => .unusable,
     };
@@ -136,19 +136,37 @@ test "a list whose tools all read cleanly counts nothing, and an empty one too" 
     try std.testing.expectEqual(@as(u32, 0), empty.dropped.total());
 }
 
-test "the engine keeps a tool whose inputSchema is missing or no object, and the host's reading leaves it out as unnamed" {
+test "a tool the engine skips for its inputSchema takes no name: the reading keeps a later good tool of the name" {
     const gpa = std.testing.allocator;
     var list = try listOf(gpa, &.{
-        "{\"name\":\"good\",\"inputSchema\":{\"type\":\"object\"}}",
-        "{\"name\":\"none\"}",
-        "{\"name\":\"list\",\"inputSchema\":[]}",
+        "{\"name\":\"a\"}",
+        "{\"name\":\"a\",\"description\":\"the good one\",\"inputSchema\":{\"type\":\"object\"}}",
         "{\"name\":\"flat\",\"inputSchema\":{}}",
     });
     defer list.deinit(gpa);
-    // The engine indexes all four: it judges a plain name, and the rest is the host's to read.
-    try std.testing.expectEqual(@as(usize, 4), list.len());
+    // The engine skipped the first `a` and kept the second and `flat`; `flat` is the host's to refuse.
+    try std.testing.expectEqual(@as(usize, 2), list.len());
+    try std.testing.expect(std.mem.find(u8, list.find("a").?.raw, "the good one") != null);
     const got = try reading(gpa, &list);
     try std.testing.expectEqual(@as(u32, 1), got.kept);
-    try std.testing.expectEqual(@as(u32, 2), got.dropped.counts[@backingInt(tools.Drop.unnamed)]);
     try std.testing.expectEqual(@as(u32, 1), got.dropped.counts[@backingInt(tools.Drop.unusable)]);
+    try std.testing.expectEqual(@as(u32, 1), got.dropped.total());
+}
+
+test "the host has no reason of its own for an inputSchema that is missing or no object: the engine owns that rule" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const never_listed = [_][]const u8{
+        "{\"name\":\"x\"}",
+        "{\"name\":\"x\",\"inputSchema\":null}",
+        "{\"name\":\"x\",\"inputSchema\":[]}",
+        "{\"name\":\"x\",\"inputSchema\":\"x\"}",
+    };
+    for (never_listed) |raw| {
+        const got = try read(arena.allocator(), raw);
+        switch (got) {
+            .left_out => |left_out| try std.testing.expectEqual(tools.Drop.unusable, left_out.why),
+            .tool => return error.TestUnexpectedResult,
+        }
+    }
 }
