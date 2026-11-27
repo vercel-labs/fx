@@ -17400,3 +17400,65 @@ test("a repeated subagent message with the same model and effort is delivered an
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 60_000);
+
+test("symlink retarget mid-step explains why read_file did not run and lets the model reissue", async () => {
+  const root = createFixtureRoot("symlink-retarget-explain");
+  const tracePath = join(root.root, "trace.log");
+  mkdirSync(join(root.workspace, "old"), { recursive: true });
+  mkdirSync(join(root.workspace, "new"), { recursive: true });
+  writeFileSync(join(root.workspace, "old", "target.txt"), "OLD_SYMLINK_TARGET_PAYLOAD\n");
+  writeFileSync(join(root.workspace, "new", "target.txt"), "NEW_SYMLINK_TARGET_PAYLOAD\n");
+  symlinkSync("old", join(root.workspace, "link"), "dir");
+  const expectedReason =
+    "Not executed: an earlier call in this step changed the target of this call. " +
+    "Reissue the call to run it on the current target.";
+  const responses = [
+    fakeGatewaySse([
+      {
+        type: "tool-call",
+        toolCallId: "retarget_shell",
+        toolName: "shell",
+        input: { request: { action: "run", command: "ln -sfn new link", profile: "clean" } },
+      },
+      {
+        type: "tool-call",
+        toolCallId: "retarget_read",
+        toolName: "read_file",
+        input: { path: "link/target.txt" },
+      },
+      {
+        type: "finish",
+        finishReason: { unified: "tool-calls", raw: "tool-calls" },
+      },
+    ]),
+    fakeGatewayToolCall("retarget_read_reissue", "read_file", { path: "link/target.txt" }),
+    fakeGatewayFinalText("retargeted read complete"),
+  ];
+  const gateway = startGateway(() =>
+    responses.shift() ?? new Response("unexpected request", { status: 500 })
+  );
+
+  try {
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Switch the link and read the target."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 15_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(gateway.requests).toHaveLength(3);
+    expect(toolResultOutput(gateway.requests[1]!.body, "retarget_read")).toBe(expectedReason);
+    expect(gateway.requests[1]!.body).not.toContain("OLD_SYMLINK_TARGET_PAYLOAD");
+    expect(gateway.requests[1]!.body).not.toContain("NEW_SYMLINK_TARGET_PAYLOAD");
+    expect(toolResultOutput(gateway.requests[2]!.body, "retarget_read_reissue")).toContain(
+      "NEW_SYMLINK_TARGET_PAYLOAD",
+    );
+    expect(parseAskJson(result.stdout).output).toContain("retargeted read complete");
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 20_000);

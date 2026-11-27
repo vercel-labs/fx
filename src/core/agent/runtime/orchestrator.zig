@@ -3275,6 +3275,38 @@ fn preparedFileMutationTargetMatches(
     };
 }
 
+const PreparedCallFreshness = enum {
+    fresh,
+    target_changed,
+    target_unavailable,
+    file_mutation_target_changed,
+};
+
+fn preparedCallApplicableTargetsFreshness(
+    arena: Allocator,
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    call: ToolCall,
+    maybe_preparation: ?*tool_preparation.Result,
+) Allocator.Error!PreparedCallFreshness {
+    const preparation = maybe_preparation orelse return .fresh;
+    return switch (preparation.*) {
+        .terminal => .fresh,
+        .candidate => |*candidate| switch (try tool_preparation.ordinaryApplicableTargetFreshnessInScope(
+            arena,
+            call,
+            deps.tool_registry,
+            config.workspace_root,
+            config.access_scope,
+            candidate,
+        )) {
+            .fresh => .fresh,
+            .target_changed => .target_changed,
+            .target_unavailable => .target_unavailable,
+        },
+    };
+}
+
 fn preparedCallApplicableTargetsFresh(
     arena: Allocator,
     deps: *const AgentRuntimeDeps,
@@ -3282,24 +3314,21 @@ fn preparedCallApplicableTargetsFresh(
     call: ToolCall,
     maybe_preparation: ?*tool_preparation.Result,
 ) Allocator.Error!bool {
-    const preparation = maybe_preparation orelse return true;
-    return switch (preparation.*) {
-        .terminal => true,
-        .candidate => |*candidate| tool_preparation.ordinaryApplicableTargetsFreshInScope(
-            arena,
-            call,
-            deps.tool_registry,
-            config.workspace_root,
-            config.access_scope,
-            candidate,
-        ),
-    };
+    return (try preparedCallApplicableTargetsFreshness(
+        arena,
+        deps,
+        config,
+        call,
+        maybe_preparation,
+    )) == .fresh;
 }
 
 const LateTargetResolution = enum {
     may_run,
     scoped_instructions_pending,
-    stale,
+    target_changed,
+    target_unavailable,
+    file_mutation_target_changed,
 };
 
 const NotExecutedReason = struct {
@@ -3314,10 +3343,27 @@ fn lateTargetNotExecutedReason(resolution: LateTargetResolution) ?NotExecutedRea
             .result_kind = "scoped_instructions_pending",
             .model_output = types.scoped_instructions_pending_tool_result_output,
         },
-        .stale => .{
+        .target_changed => .{
             .result_kind = "applicable_targets_changed",
-            .model_output = types.deferred_tool_result_output,
+            .model_output = types.target_changed_tool_result_output,
         },
+        .target_unavailable => .{
+            .result_kind = "applicable_targets_unavailable",
+            .model_output = types.target_unavailable_tool_result_output,
+        },
+        .file_mutation_target_changed => .{
+            .result_kind = "file_mutation_target_changed",
+            .model_output = types.file_mutation_target_changed_tool_result_output,
+        },
+    };
+}
+
+fn staleLateTargetResolution(freshness: PreparedCallFreshness) LateTargetResolution {
+    return switch (freshness) {
+        .fresh => unreachable,
+        .target_changed => .target_changed,
+        .target_unavailable => .target_unavailable,
+        .file_mutation_target_changed => .file_mutation_target_changed,
     };
 }
 
@@ -3339,11 +3385,13 @@ fn lateTargetResolution(
     step_ctx: TraceContext,
     tool_call: ToolCall,
     maybe_preparation: ?tool_preparation.Result,
+    stale_freshness: PreparedCallFreshness,
 ) !LateTargetResolution {
-    const context_registry = deps.context_registry orelse return .stale;
-    const preparation = maybe_preparation orelse return .stale;
+    const stale = staleLateTargetResolution(stale_freshness);
+    const context_registry = deps.context_registry orelse return stale;
+    const preparation = maybe_preparation orelse return stale;
     const stale_candidate = switch (preparation) {
-        .terminal => return .stale,
+        .terminal => return stale,
         .candidate => |*candidate| candidate,
     };
     const late_targets = (try tool_preparation.lateResolvedApplicableTargets(
@@ -3353,7 +3401,7 @@ fn lateTargetResolution(
         config.workspace_root,
         config.access_scope,
         stale_candidate,
-    )) orelse return .stale;
+    )) orelse return stale;
     // The probe is only a question to the registry.
     var resolved_candidate: tool_preparation.Candidate = .{
         .kind = .registered,
@@ -12865,7 +12913,7 @@ fn processQueuedPromptLoop(
             var prepared_file_mutation: ?tooling_tool_admission.PreparedFileMutationCall = null;
             defer if (prepared_file_mutation) |*prepared| prepared.deinit(arena);
 
-            const applicable_targets_fresh = if (is_file_mutation and
+            const call_freshness: PreparedCallFreshness = if (is_file_mutation and
                 preparation_batch.preparations[tool_call_index] != null)
             fresh: {
                 const admission = tooling_tool_admission.prepareFileMutationCall(
@@ -12888,23 +12936,26 @@ fn processQueuedPromptLoop(
                     );
                 };
                 switch (admission) {
-                    .tool_failure => break :fresh false,
+                    .tool_failure => break :fresh .file_mutation_target_changed,
                     // A host tool reuses a reserved mutation name; it has no
                     // builtin mutation targets to keep fresh.
-                    .not_file_mutation => break :fresh false,
+                    .not_file_mutation => break :fresh .file_mutation_target_changed,
                     .prepared => |prepared| {
                         prepared_file_mutation = prepared;
-                        break :fresh preparedFileMutationTargetMatches(
+                        break :fresh if (preparedFileMutationTargetMatches(
                             if (preparation_batch.preparations[tool_call_index]) |*preparation|
                                 preparation
                             else
                                 null,
                             prepared,
-                        );
+                        ))
+                            .fresh
+                        else
+                            .file_mutation_target_changed;
                     },
                 }
             } else if (preparation_batch.preparations[tool_call_index]) |*preparation|
-                preparedCallApplicableTargetsFresh(
+                preparedCallApplicableTargetsFreshness(
                     arena,
                     deps,
                     config,
@@ -12922,8 +12973,8 @@ fn processQueuedPromptLoop(
                     );
                 }
             else
-                true;
-            const late_resolution: LateTargetResolution = if (applicable_targets_fresh)
+                .fresh;
+            const late_resolution: LateTargetResolution = if (call_freshness == .fresh)
                 .may_run
             else
                 lateTargetResolution(
@@ -12934,6 +12985,7 @@ fn processQueuedPromptLoop(
                     step_ctx,
                     tool_call,
                     preparation_batch.preparations[tool_call_index],
+                    call_freshness,
                 ) catch |err| {
                     return settleFailedContextGate(
                         deps,

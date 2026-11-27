@@ -4080,7 +4080,10 @@ test "same-batch retarget defers stale scoped call before permission and reloads
     try std.testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
     try std.testing.expectEqual(@as(usize, 3), execution.tool_steps[0].tool_results.len);
     try std.testing.expectEqualStrings("retargeted", execution.tool_steps[0].tool_results[0].output);
-    try std.testing.expectEqualStrings("Not executed", execution.tool_steps[0].tool_results[1].output);
+    try std.testing.expectEqualStrings(
+        types.target_changed_tool_result_output,
+        execution.tool_steps[0].tool_results[1].output,
+    );
     try std.testing.expectEqual(types.PersistedToolStatus.failure, execution.tool_steps[0].tool_results[1].status);
     try std.testing.expectEqualStrings("stable info", execution.tool_steps[0].tool_results[2].output);
     try std.testing.expectEqualStrings("new scope access", execution.tool_steps[1].tool_results[0].output);
@@ -4153,10 +4156,94 @@ test "same-batch file mutation retarget stops before permission and execution" {
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
     try std.testing.expectEqual(@as(usize, 2), execution.tool_steps[0].tool_results.len);
     try std.testing.expectEqualStrings("retargeted", execution.tool_steps[0].tool_results[0].output);
-    try std.testing.expectEqualStrings("Not executed", execution.tool_steps[0].tool_results[1].output);
+    try std.testing.expectEqualStrings(
+        types.file_mutation_target_changed_tool_result_output,
+        execution.tool_steps[0].tool_results[1].output,
+    );
     try std.testing.expectEqual(
         types.PersistedToolStatus.failure,
         execution.tool_steps[0].tool_results[1].status,
+    );
+}
+
+test "same-batch target deletion or kind change explains why read_file did not run" {
+    const alloc = std.testing.allocator;
+    defer EmptyApplicableContext.reset();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/old");
+    {
+        var deleted_file = try tmp.dir.createFile(std.testing.io, "workspace/deleted.txt", .{});
+        defer deleted_file.close(std.testing.io);
+        try deleted_file.writeStreamingAll(std.testing.io, "gone");
+        var kind_file = try tmp.dir.createFile(std.testing.io, "workspace/old/item.txt", .{});
+        defer kind_file.close(std.testing.io);
+        try kind_file.writeStreamingAll(std.testing.io, "old");
+    }
+    try tmp.dir.symLink(std.testing.io, "old", "workspace/link", .{ .is_directory = true });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const deleted_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "deleted.txt" });
+    defer alloc.free(deleted_path);
+    const link_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "link" });
+    defer alloc.free(link_path);
+
+    const MutateOnExecute = struct {
+        deleted_path: []const u8,
+        link_path: []const u8,
+        fn run(raw: *anyopaque, request: runtime_tool_contracts.ToolExecutionRequest) !runtime_tool_contracts.ToolExecutionResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, request.call.name, "terminal")) {
+                var cwd = std.Io.Dir.cwd();
+                try cwd.deleteFile(io_mod.getIo(), self.deleted_path);
+                try cwd.deleteFile(io_mod.getIo(), self.link_path);
+                var file = try cwd.createFile(io_mod.getIo(), self.link_path, .{});
+                file.close(io_mod.getIo());
+                return .{ .model_output = "mutated" };
+            }
+            return .{ .model_output = "unexpected" };
+        }
+    };
+    var mutate_override = MutateOnExecute{
+        .deleted_path = deleted_path,
+        .link_path = link_path,
+    };
+
+    const calls = [_]ToolCall{
+        toolCall("mutate", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
+        toolCall("deleted_read", "read_file", "{\"path\":\"deleted.txt\"}"),
+        toolCall("kind_changed_read", "read_file", "{\"path\":\"link/item.txt\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls, .streamed_tool_starts = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.context_enabled = true;
+    hooks.context_registry = EmptyApplicableContext.registry;
+    hooks.tool_execution_override = .{ .context = &mutate_override, .execute_fn = MutateOnExecute.run };
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.index);
+    try expectBodyContains(&gateway, 1, types.target_unavailable_tool_result_output);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 3), execution.tool_steps[0].tool_results.len);
+    try std.testing.expectEqualStrings("mutated", execution.tool_steps[0].tool_results[0].output);
+    try std.testing.expectEqualStrings(
+        types.target_unavailable_tool_result_output,
+        execution.tool_steps[0].tool_results[1].output,
+    );
+    try std.testing.expectEqualStrings(
+        types.target_unavailable_tool_result_output,
+        execution.tool_steps[0].tool_results[2].output,
     );
 }
 

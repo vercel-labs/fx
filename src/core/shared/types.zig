@@ -1411,6 +1411,9 @@ pub const deferred_tool_result_output = "Not executed";
 pub const context_deferred_tool_result_output = "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.";
 pub const context_deferred_tool_status_label = "Reading project instructions before continuing:";
 pub const scoped_instructions_pending_tool_result_output = "Not executed: new scoped project instructions apply to this path. Reissue this tool call so fx can load them before execution.";
+pub const target_changed_tool_result_output = "Not executed: an earlier call in this step changed the target of this call. Reissue the call to run it on the current target.";
+pub const target_unavailable_tool_result_output = "Not executed: the target of this call was deleted or can no longer be resolved after an earlier call in this step. Reissue the call if you still want to run it.";
+pub const file_mutation_target_changed_tool_result_output = "Not executed: an earlier call in this step changed the file target of this mutation. Reissue the call to prepare and run it on the current target.";
 
 pub fn isContextDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
@@ -1421,7 +1424,10 @@ pub fn isDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
         (std.mem.eql(u8, result.output, deferred_tool_result_output) or
             std.mem.eql(u8, result.output, context_deferred_tool_result_output) or
-            std.mem.eql(u8, result.output, scoped_instructions_pending_tool_result_output));
+            std.mem.eql(u8, result.output, scoped_instructions_pending_tool_result_output) or
+            std.mem.eql(u8, result.output, target_changed_tool_result_output) or
+            std.mem.eql(u8, result.output, target_unavailable_tool_result_output) or
+            std.mem.eql(u8, result.output, file_mutation_target_changed_tool_result_output));
 }
 
 test "persisted deferred tool result classifier is exact" {
@@ -1464,6 +1470,21 @@ test "persisted deferred tool result classifier is exact" {
 
     result.status = .success;
     result.output = @constCast(scoped_instructions_pending_tool_result_output);
+    try std.testing.expect(!isDeferredToolResult(result));
+
+    result.status = .failure;
+    for ([_][]const u8{
+        target_changed_tool_result_output,
+        target_unavailable_tool_result_output,
+        file_mutation_target_changed_tool_result_output,
+    }) |output| {
+        result.output = @constCast(output);
+        try std.testing.expect(isDeferredToolResult(result));
+        try std.testing.expect(!isContextDeferredToolResult(result));
+    }
+
+    result.status = .success;
+    result.output = @constCast(target_changed_tool_result_output);
     try std.testing.expect(!isDeferredToolResult(result));
 }
 

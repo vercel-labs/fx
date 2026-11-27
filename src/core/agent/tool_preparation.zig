@@ -402,20 +402,26 @@ pub fn ordinaryApplicableTargetsFresh(
     );
 }
 
-pub fn ordinaryApplicableTargetsFreshInScope(
+pub const OrdinaryTargetFreshness = enum {
+    fresh,
+    target_changed,
+    target_unavailable,
+};
+
+pub fn ordinaryApplicableTargetFreshnessInScope(
     alloc: Allocator,
     call: ToolCall,
     tool_registry: tool_dispatch.Registry,
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope,
     candidate: *const Candidate,
-) Allocator.Error!bool {
+) Allocator.Error!OrdinaryTargetFreshness {
     switch (candidate.kind) {
-        .advertised_dynamic, .deferred_dynamic => return true,
-        .registered => if (candidate.applicable_targets.len == 0) return true,
+        .advertised_dynamic, .deferred_dynamic => return .fresh,
+        .registered => if (candidate.applicable_targets.len == 0) return .fresh,
         .legacy_target_resolution => {},
     }
-    const tool = tool_registry.lookup(call.name) orelse return false;
+    const tool = tool_registry.lookup(call.name) orelse return .target_unavailable;
 
     const current_preparation = try prepareRegisteredApplicableTargets(
         alloc,
@@ -425,12 +431,38 @@ pub fn ordinaryApplicableTargetsFreshInScope(
         tool.*,
     );
     const current = switch (current_preparation) {
-        .legacy_candidate => return candidate.kind == .legacy_target_resolution,
+        .legacy_candidate => return if (candidate.kind == .legacy_target_resolution)
+            .fresh
+        else
+            .target_unavailable,
         .prepared => |targets| targets,
     };
     defer freeApplicableTargets(alloc, current);
-    if (candidate.kind == .legacy_target_resolution) return current.len == 0;
-    return applicableTargetsEqual(candidate.applicable_targets, current);
+    if (candidate.kind == .legacy_target_resolution) {
+        return if (current.len == 0) .fresh else .target_changed;
+    }
+    return if (applicableTargetsEqual(candidate.applicable_targets, current))
+        .fresh
+    else
+        .target_changed;
+}
+
+pub fn ordinaryApplicableTargetsFreshInScope(
+    alloc: Allocator,
+    call: ToolCall,
+    tool_registry: tool_dispatch.Registry,
+    workspace_root: []const u8,
+    access_scope: ?workspace_access.AccessScope,
+    candidate: *const Candidate,
+) Allocator.Error!bool {
+    return (try ordinaryApplicableTargetFreshnessInScope(
+        alloc,
+        call,
+        tool_registry,
+        workspace_root,
+        access_scope,
+        candidate,
+    )) == .fresh;
 }
 
 /// Re-prepares the targets of a call whose preparation could not resolve them
@@ -877,6 +909,17 @@ test "ordinary applicable target freshness detects retarget and resolution failu
     ));
     try tmp.dir.deleteFile(std.testing.io, "workspace/link");
     try tmp.dir.symLink(std.testing.io, "new", "workspace/link", .{ .is_directory = true });
+    try std.testing.expectEqual(
+        OrdinaryTargetFreshness.target_changed,
+        try ordinaryApplicableTargetFreshnessInScope(
+            alloc,
+            .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"link/input.txt\"}" },
+            config.tool_registry,
+            config.workspace_root,
+            null,
+            &read.candidate,
+        ),
+    );
     try std.testing.expect(!try ordinaryApplicableTargetsFresh(
         alloc,
         .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"link/input.txt\"}" },
@@ -898,6 +941,17 @@ test "ordinary applicable target freshness detects retarget and resolution failu
     }, config);
     defer missing.deinit(alloc);
     try tmp.dir.deleteFile(std.testing.io, "workspace/new/input.txt");
+    try std.testing.expectEqual(
+        OrdinaryTargetFreshness.target_unavailable,
+        try ordinaryApplicableTargetFreshnessInScope(
+            alloc,
+            .{ .id = "missing", .name = "read_file", .arguments_json = "{\"path\":\"new/input.txt\"}" },
+            config.tool_registry,
+            config.workspace_root,
+            null,
+            &missing.candidate,
+        ),
+    );
     try std.testing.expect(!try ordinaryApplicableTargetsFresh(
         alloc,
         .{ .id = "missing", .name = "read_file", .arguments_json = "{\"path\":\"new/input.txt\"}" },
@@ -905,6 +959,20 @@ test "ordinary applicable target freshness detects retarget and resolution failu
         config.workspace_root,
         &missing.candidate,
     ));
+    try tmp.dir.deleteFile(std.testing.io, "workspace/link");
+    var replaced_link = try tmp.dir.createFile(std.testing.io, "workspace/link", .{});
+    replaced_link.close(std.testing.io);
+    try std.testing.expectEqual(
+        OrdinaryTargetFreshness.target_unavailable,
+        try ordinaryApplicableTargetFreshnessInScope(
+            alloc,
+            .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"link/input.txt\"}" },
+            config.tool_registry,
+            config.workspace_root,
+            null,
+            &read.candidate,
+        ),
+    );
 }
 
 test "legacy ordinary applicable target freshness detects newly resolvable scope" {
