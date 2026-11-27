@@ -1,5 +1,6 @@
 const std = @import("std");
 const command_specs = @import("../core/slash_commands/command_specs.zig");
+const tool_bridge = @import("../core/tool_bridge/tool_bridge.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -161,12 +162,12 @@ const tool_agent_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "close NAME", .description = "Close a subagent for good" },
 };
 
-const tool_subcommands = [_]command_specs.SubcommandDoc{
+const tool_subcommands: []const command_specs.SubcommandDoc = if (tool_bridge.supported) &.{
     .{ .usage = "edit PATH", .description = "Change a file with SEARCH/REPLACE blocks on stdin" },
     .{ .usage = "write PATH", .description = "Write a whole file from stdin" },
     .{ .usage = "skill <list|open>", .description = "List or read visible skills", .subcommands = &tool_skill_subcommands },
     .{ .usage = "agent <message|wait|status|stop|close>", .description = "Message, wait for, check, stop, or close subagents", .subcommands = &tool_agent_subcommands },
-};
+} else &.{};
 
 const mcp_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "list", .description = "List configured servers; never connects", .options = &mcp_list_options },
@@ -370,14 +371,14 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .tool,
         .token = "tool",
-        .usage = "tool <edit|write|skill|agent> ...",
-        .summary = "Run bash-tool file, skill, and subagent commands",
-        .subcommands = &tool_subcommands,
-        .details = &.{
+        .usage = if (tool_bridge.supported) "tool <edit|write|skill|agent> ..." else "tool",
+        .summary = if (tool_bridge.supported) "Run bash-tool file, skill, and subagent commands" else "",
+        .subcommands = tool_subcommands,
+        .details = if (tool_bridge.supported) &.{
             "Each command runs through fx's permission rules and review, as the agent's own call does. Only edit and write read stdin.",
             "Experimental: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, before that bash call returns.",
             "Exit codes: 0 ok; 1 failed; 2 bad input or usage; 3 unavailable (no running bash call to reach); 4 busy; 5 denied; 6 tool error.",
-        },
+        } else &.{},
     },
     .{
         .kind = .models,
@@ -1010,4 +1011,17 @@ test "the launch usage line pairs each --no- spelling with its flag" {
     try std.testing.expect(std.mem.startsWith(u8, launch_usage, "usage: fx [--context-limit <spec>] [--add-dir <path>] [--no-additional-dirs] "));
     try std.testing.expect(std.mem.find(u8, launch_usage, " [--fast|--no-fast] ") != null);
     try std.testing.expect(std.mem.endsWith(u8, launch_usage, " <command>\n"));
+}
+
+test "fx tool help matches tool_bridge.supported" {
+    const spec = for (top_level_specs) |entry| {
+        if (entry.kind == .tool) break entry;
+    } else unreachable;
+    if (tool_bridge.supported) {
+        try std.testing.expectEqual(@as(usize, 4), spec.subcommands.len);
+        try std.testing.expect(spec.details.len > 0);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), spec.subcommands.len);
+        try std.testing.expectEqual(@as(usize, 0), spec.details.len);
+    }
 }
