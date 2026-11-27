@@ -123,7 +123,10 @@ for revision in "$base" "$head"; do
   fi
 done
 
-if ! changed_files="$(git diff --name-only --no-renames "$base" "$head")"; then
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+if ! git -c core.quotePath=false diff --name-only --no-renames -z "$base" "$head" > "$tmp"; then
   printf 'error: git diff %s %s failed; CI cannot decide which checks to run\n' "$base" "$head" >&2
   exit 1
 fi
@@ -132,7 +135,7 @@ if [ -n "${CI_NEED_REQUESTED:-}" ]; then
   require_all "$CI_NEED_REQUESTED"
 fi
 
-while IFS= read -r path; do
+while IFS= read -r -d '' path; do
   [ -n "$path" ] || continue
   case "$path" in
     .github/workflows/ci.yml | scripts/detect-ci-need.sh)
@@ -199,7 +202,7 @@ while IFS= read -r path; do
     tests/e2e/fixtures/mcp-* | tests/e2e/render-lab/tape.ts)
       require_mcp "$path: a file the MCP drivers load changed" ;;
   esac
-done <<<"$changed_files"
+done < "$tmp"
 
 # Prints whether one check runs, and why. The reasons follow the name and
 # whether it is needed.

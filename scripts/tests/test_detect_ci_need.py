@@ -297,6 +297,40 @@ class DetectCiNeedTests(unittest.TestCase):
         self.assertEqual({}, outputs)
         self.assertIn("cannot read revision", text)
 
+    def test_non_ascii_path_triggers_its_check(self) -> None:
+        self.write("src/mcp/café.zig", "pub fn cafe() void {}\n")
+        self.commit("non-ascii path")
+
+        text = self.assert_needs(libfx=False, mcp=True)
+        self.assertIn("src/mcp/café.zig", text)
+
+    def test_quoted_path_triggers_its_check(self) -> None:
+        self.write('src/core/subagent/a "quoted" name.zig', "pub fn run() void {}\n")
+        self.commit("quoted path")
+
+        text = self.assert_needs(libfx=False, mcp=False, subagent=True)
+        self.assertIn('src/core/subagent/a "quoted" name.zig', text)
+
+    def test_newline_in_path_triggers_its_check_without_crashing(self) -> None:
+        self.write("src/ui/transcript/transcript_window_x\ny.zig", "pub fn draw() void {}\n")
+        self.commit("newline path")
+
+        text = self.assert_needs(libfx=False, mcp=False, transcript_window=True)
+        self.assertIn("src/ui/transcript/transcript_window_x\ny.zig", text)
+
+    def test_git_diff_failure_exits_nonzero(self) -> None:
+        tree_sha = self.git("rev-parse", "HEAD^{tree}")
+        obj_path = self.root / ".git" / "objects" / tree_sha[:2] / tree_sha[2:]
+        obj_path.chmod(0o644)
+        obj_path.unlink()
+
+        code, outputs, text = self.detect()
+
+        self.assertNotEqual(0, code, text)
+        self.assertEqual({}, outputs)
+        self.assertIn("git diff", text)
+        self.assertIn("failed", text)
+
 
 if __name__ == "__main__":
     unittest.main()
