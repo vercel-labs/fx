@@ -109,7 +109,7 @@ jobs:
         run: python3 -m scripts.check_cli_shape
 
       - name: Test CI and release scripts
-        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape scripts.tests.test_check_provider_versions
+        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_dev_channel_forward scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape scripts.tests.test_check_provider_versions
 
       - name: Test the zig skill's scripts and examples
         run: python3 -m unittest discover -s .fx/skills/zig/scripts
@@ -1188,6 +1188,7 @@ jobs:
             scripts/check-recovery-boundary.sh
             scripts/detect-ci-need.sh
             scripts/detect-macos-need.sh
+            scripts/dev-channel-forward.sh
             scripts/smoke-binary.sh
             tests/e2e/ci-run-files.sh
           )
