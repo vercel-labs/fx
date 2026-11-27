@@ -101,34 +101,82 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
-  test("a tool call cut off by the provider's own limit is resent once with fx's limit", async () => {
+  test("a tool call cut off by the provider's own limit is asked for again in smaller steps with fx's limit", async () => {
     let calls = 0;
-    const f = fixture(body => ++calls === 1 ? cutToolCall(body.model, "printf ran > cut.txt") : completion(body.model, "finished after the resend"));
+    const f = fixture(body => ++calls === 1 ? cutToolCall(body.model, "printf ran > cut.txt") : completion(body.model, "finished after the note"));
     try {
       // No limit in the metadata, so the first request names none.
       (f.settings.providers.local.model_metadata as any)["local-model"] = { context_window: 262144, supports_tool_use: true };
       f.save();
       const result = await runFx(["ask", "--json", "--no-save", "Run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
-      expect(JSON.parse(result.stdout).final_output).toBe("finished after the resend");
+      expect(JSON.parse(result.stdout).final_output).toBe("finished after the note");
       expect(f.requests).toHaveLength(2);
       expect(f.requests[0].body.max_tokens).toBeUndefined();
       expect(f.requests[1].body.max_tokens).toBe(32768);
-      expect(JSON.stringify(f.requests[1].body.messages)).not.toContain("call-cut");
-      expect(result.stderr).toContain("Retrying with a higher limit.");
+      const resent = JSON.stringify(f.requests[1].body.messages);
+      expect(resent).not.toContain("call-cut");
+      expect(resent).toContain("Your last reply reached its output limit before its tool call to shell was complete, so fx did not run it.");
+      expect(result.stderr).toContain("Asking the model to do it in smaller steps. The next requests allow 32768 output tokens.");
       expect(existsSync(join(f.workspace, "cut.txt"))).toBe(false);
     } finally { f.close(); }
   }, 25000);
 
-  test("a tool call cut off at the model's own limit is not resent when that would repeat the request", async () => {
+  test("the text a cut reply streamed before its cut call reaches the next request intact", async () => {
+    // The stream's buffer is freed before the next request; a borrowed copy
+    // sent freed bytes, and a real provider answered HTTP 400.
+    const said = "I will write the whole file in one call now.";
     let calls = 0;
-    const f = fixture(body => ++calls === 1 ? cutToolCall(body.model, "printf ran > cut.txt") : completion(body.model, "a resend must not be sent"));
+    const f = fixture(async body => ++calls === 1
+      ? withReasoning(cutToolCall(body.model, "printf ran > cut.txt"), { content: said })
+      : completion(body.model, "finished after the note"));
     try {
       const result = await runFx(["ask", "--json", "--no-save", "Run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
-      expect(result.code).toBe(1);
-      expect(f.requests).toHaveLength(1);
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(f.requests).toHaveLength(2);
+      const messages = f.requests[1].body.messages as any[];
+      expect(messages.at(-2).role).toBe("assistant");
+      expect(messages.at(-2).content).toBe(said);
+      expect(messages.at(-1).role).toBe("user");
+      expect(JSON.stringify(messages.at(-1))).toContain("before its tool call to shell was complete, so fx did not run it.");
+      expect(existsSync(join(f.workspace, "cut.txt"))).toBe(false);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("a cut reply with only reasoning and a cut call sends its note alone", async () => {
+    // The reasoning led to the cut, so it is not sent again.
+    const detail = { type: "reasoning.text", text: "Plan the long write.", signature: "cut-signature", format: "anthropic-claude-v1", index: 0 };
+    let calls = 0;
+    const f = fixture(async body => ++calls === 1
+      ? withReasoning(cutToolCall(body.model, "printf ran > cut.txt"), { reasoning_details: [detail] })
+      : completion(body.model, "finished after the note"));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "Run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(f.requests).toHaveLength(2);
+      const messages = f.requests[1].body.messages as any[];
+      expect(messages.at(-1).role).toBe("user");
+      expect(JSON.stringify(messages.at(-1))).toContain("before its tool call to shell was complete, so fx did not run it.");
+      expect(messages.some((message) => message.role === "assistant")).toBe(false);
+      expect(JSON.stringify(messages)).not.toContain("cut-signature");
+      expect(existsSync(join(f.workspace, "cut.txt"))).toBe(false);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("a tool call cut off at the model's own limit is asked for again in smaller steps at that limit", async () => {
+    let calls = 0;
+    const f = fixture(body => ++calls === 1 ? cutToolCall(body.model, "printf ran > cut.txt") : completion(body.model, "finished after the note"));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "Run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).final_output).toBe("finished after the note");
+      expect(f.requests).toHaveLength(2);
+      // The model's own limit is not fx's to raise.
       expect(f.requests[0].body.max_tokens).toBe(8192);
-      expect(result.stderr).toContain("so I did not run them");
+      expect(f.requests[1].body.max_tokens).toBe(8192);
+      expect(JSON.stringify(f.requests[1].body.messages)).toContain("reached the output limit of 8192 tokens before its tool call to shell was complete");
+      expect(result.stderr).toContain("Asking the model to do it in smaller steps.");
+      expect(result.stderr).not.toContain("The next requests allow");
       expect(existsSync(join(f.workspace, "cut.txt"))).toBe(false);
     } finally { f.close(); }
   }, 25000);

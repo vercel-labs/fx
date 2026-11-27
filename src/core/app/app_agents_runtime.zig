@@ -3623,6 +3623,10 @@ pub fn Runtime(comptime App: type) type {
             noteLastEnd(app, agent, finished);
             const run = runInFlight(app, agent) orelse userWorkRun(app, agent) orelse return;
             run.ended_as = finished.outcome;
+            // The parent hears why, such as a reply cut off at the output
+            // limit, in place of `agent_turn_failed`. A provider's own error
+            // the worker kept stays first.
+            if (run.failure == null) run.failure = types.turnFailureFor(finished);
             if (finished.outcome == .interrupted and agent.worker.handedOff(finished.turn_id)) {
                 run.handed_off = true;
                 debug_trace.eventf("host", "child_turn_handed_off", .{}, "agent={s} work_id={s} turn_id={d}", .{ run.child_id, run.work_id, finished.turn_id });

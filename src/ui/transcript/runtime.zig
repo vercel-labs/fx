@@ -12551,6 +12551,22 @@ pub const TranscriptRuntime = struct {
         }
     }
 
+    /// Writes an OSC 7577 report between frames, like the notification bell.
+    pub fn writeProgramResume(
+        self: *TranscriptRuntime,
+        metrics: *Metrics,
+        report: []const u8,
+    ) void {
+        switch (transcript_io.writeFrameBytes(self, metrics, report)) {
+            .complete => {},
+            .partial => |partial| debug_trace.logf(
+                "program_resume",
+                "report write failed accepted_bytes={d} err={s}",
+                .{ partial.accepted_bytes, @errorName(partial.err) },
+            ),
+        }
+    }
+
     fn writeFrameSink(ctx: *anyopaque, metrics: *Metrics, bytes: []const u8) render_engine.terminal_diff.FrameSinkWriteResult {
         const self: *TranscriptRuntime = @ptrCast(@alignCast(ctx));
         return transcript_io.writeFrameBytes(self, metrics, bytes);
