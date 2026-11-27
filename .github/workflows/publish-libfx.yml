@@ -464,7 +464,7 @@ jobs:
             missing=()
             for name in "${names[@]}"; do
               status=0
-              output=$(npm view "${name}@${LIBFX_VERSION}" version --json --prefer-online --registry=https://registry.npmjs.org/ 2>/tmp/npm-view.err) || status=$?
+              output=$(npm view "${name}@${LIBFX_VERSION}" version --json --prefer-online --fetch-timeout=30000 --fetch-retries=0 --registry=https://registry.npmjs.org/ 2>/tmp/npm-view.err) || status=$?
               if [ "$status" -eq 0 ] && [ "$(jq -r . <<<"$output" 2>/dev/null)" = "$LIBFX_VERSION" ]; then
                 continue
               fi
@@ -482,7 +482,7 @@ jobs:
               break
             fi
             if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::npm still does not show ${missing[*]} after ${deadline_seconds} seconds"
+              echo "::error::npm still does not show ${missing[*]} after ${deadline_seconds} seconds; rerun this job once npm shows them"
               exit 1
             fi
             echo "npm does not show ${missing[*]} yet; checking again in ${poll_interval_seconds} seconds"
