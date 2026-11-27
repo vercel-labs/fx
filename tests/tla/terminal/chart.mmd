@@ -1,0 +1,40 @@
+stateDiagram-v2
+    [*] --> TerminalRunning: A tool starts a terminal
+
+    TerminalRunning --> ExitStarted: You quit fx
+    ExitStarted --> TreeNoted: fx writes down the terminal's processes
+    TreeNoted --> ShellHungUp: fx hangs up the shell, which ends
+    ShellHungUp --> ShellHungUp: The shell had started a child in its own group
+    ShellHungUp --> SessionEmpty: fx ends the terminal and every process of its session
+    SessionEmpty --> FxGone: fx exits after a bounded wait
+
+    ShellHungUp --> ChildHoldsPty: Planted record_once, only the noted processes die
+    ChildHoldsPty --> FxGoneHeld: fx exits after the wait
+    ShellHungUp --> LauncherWaits: Planted launcher_wait, the launcher waits for a release that cannot come
+    LauncherWaits --> FxGoneHeld: fx exits after the wait
+
+    TerminalRunning --> Orphaned: fx crashes
+    Orphaned --> TerminalGone: The kernel hangs up the PTY
+    Orphaned --> DaemonLives: A program that ignores the hangup stays
+
+    FxGone --> [*]
+    FxGoneHeld --> [*]
+    TerminalGone --> [*]
+    DaemonLives --> [*]
+
+    note right of FxGoneHeld
+        Breaks NoHolderAfterCleanExit: after a normal exit something still
+        holds the PTY, which keeps its backend from draining.
+        Shortest path, 7 steps for either planted defect:
+        Start, OpenBegin, BeginExit, ExitRecord, ExitHangup, ExitKill, FinishExit.
+    end note
+
+    note right of SessionEmpty
+        Left out: a program that moved to its own session with setsid, which
+        survives the exit by design and, when it keeps the PTY open, is why the
+        wait is bounded; a host daemon that keeps terminals past a clean exit
+        (daemon_survives, which breaks OrphansOnlyAfterCrash); a start that
+        has not returned (list_in_flight, end_at_return); reconcile and resume
+        (profile_wide_recover, reattach); a terminal that ends by itself; and a
+        second fx process.
+    end note

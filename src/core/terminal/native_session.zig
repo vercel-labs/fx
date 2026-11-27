@@ -237,7 +237,13 @@ const LauncherControl = struct {
                     @intCast(self.child_pid),
                 );
                 while (!self.watchdog.command_released.load(.acquire)) {
-                    if (self.watchdog.host_closed.load(.acquire)) {
+                    // `done` is set when the shell has ended: no release is
+                    // coming, and the launcher joins this thread before it
+                    // closes the PTY slave (`tests/tla/terminal/TerminalLifecycle.tla`
+                    // NoHolderAfterCleanExit).
+                    if (self.watchdog.host_closed.load(.acquire) or
+                        self.done.load(.acquire))
+                    {
                         return error.LauncherHostClosed;
                     }
                     io_mod.sleep(wait_poll_ns);
@@ -694,8 +700,9 @@ const SupportedRegistry = struct {
 
     /// Ends every terminal this process owns, without a prompt. Each live
     /// process group is hung up and given at most `exit_grace_ms` in total,
-    /// then killed, and its record is marked lost so a resumed session shows
-    /// it as ended. Backend threads are joined within `exit_join_ms`.
+    /// then killed along with what is left in the terminal's session, and its
+    /// record is marked lost so a resumed session shows it as ended. Backend
+    /// threads are joined within `exit_join_ms`.
     ///
     /// Returns whether every backend finished, which `deinit` requires.
     /// Otherwise the registry must stay allocated until process exit.
@@ -1553,6 +1560,10 @@ const Session = struct {
     /// up, so processes outside the shell's process group can be killed
     /// after the shell itself exits. Used only by the exit path.
     exit_tree: ?process_tree.Tracker = null,
+    /// The launcher, as it was when it started. It leads the terminal's
+    /// session, and the exit path ends what is left in that session only
+    /// while this identity still matches the process at its pid.
+    launcher_target: ?SignalTarget = null,
     engine: terminal_engine.Grid,
     screen_available: bool = true,
     durable: terminal_store.DurableSession,
@@ -1766,6 +1777,7 @@ const Session = struct {
         });
         var child_owned = true;
         errdefer if (child_owned) child.kill(io_mod.getIo());
+        self.recordLauncher(child.id);
         closeFd(pty.slave);
         slave_open = false;
 
@@ -1835,6 +1847,29 @@ const Session = struct {
         input_open = false;
         try input.writeStreamingAll(io_mod.getIo(), &.{1});
         self.child_released = true;
+    }
+
+    /// Keeps the launcher's identity while it still waits for its
+    /// configuration. Without it, the exit path ends nothing in its session.
+    fn recordLauncher(self: *Session, launcher_pid: ?std.posix.pid_t) void {
+        const pid = launcher_pid orelse return;
+        var pid_buffer: [32]u8 = undefined;
+        const pid_text = std.mem.print(&pid_buffer, "{d}", .{pid}) catch return;
+        const token = self.durable.profile.process_provider.captureToken(
+            self.alloc,
+            pid_text,
+        ) catch |err| {
+            debug_trace.logf(
+                "terminal_host",
+                "terminal launcher identity unavailable id={s} err={s}",
+                .{ self.id, @errorName(err) },
+            );
+            return;
+        };
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        self.launcher_target = .{ .pid = pid, .token = token };
+        self.mutex.unlock(zio);
     }
 
     fn deinit(self: *Session) void {
@@ -1932,6 +1967,9 @@ const Session = struct {
         self.mutex.unlock(zio);
         if (!live) return false;
         self.exit_tree = self.recordProcessTreeForExit();
+        if (builtin.is_test) if (test_after_exit_record) |hook| {
+            hook(self.id, if (self.launcherTarget()) |launcher| launcher.pid else null);
+        };
         _ = self.signalProcess(.hangup);
         if (self.exit_tree) |*tree| {
             if (tree.root) |root| {
@@ -1975,6 +2013,52 @@ const Session = struct {
             _ = tree.signalAll(signalValue(.kill));
             tree.deinit();
             self.exit_tree = null;
+        }
+        self.endLauncherSession();
+    }
+
+    fn launcherTarget(self: *Session) ?SignalTarget {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        return self.launcher_target;
+    }
+
+    /// Kills what is left in the launcher's session: a process the shell
+    /// started after `recordProcessTreeForExit` read the tree, or one that
+    /// outlived the shell, which holds the PTY open and keeps the backend from
+    /// draining. A program that moved to its own session with `setsid` is not
+    /// in it. The launcher must still be the process it was: its pid names a
+    /// session only while the launcher exists, and a launcher that is gone
+    /// leaves nothing to check it by, so nothing is signalled then
+    /// (`tests/tla/terminal/TerminalLifecycle.tla` NoHolderAfterCleanExit; the
+    /// test `closing owned terminals for exit ends a child the shell started
+    /// after the process tree was recorded` in `src/core/terminal/client.zig`).
+    /// A launcher that has exited but is not collected yet still counts: the
+    /// host collects it only after the PTY drains, and that is the launcher
+    /// this runs for when a process that outlived the shell holds the PTY.
+    fn endLauncherSession(self: *Session) void {
+        const target = self.launcherTarget() orelse return;
+        const launcher_is_ours = switch (self.signalTargetMatch(target)) {
+            .matched => true,
+            .missing => process_tree.exitedUncollectedSince(target.pid, target.token.view()),
+            .mismatched, .unavailable => false,
+        };
+        if (!launcher_is_ours) return;
+        const summary = process_tree.endSession(self.alloc, target.pid) catch |err| {
+            debug_trace.logf(
+                "terminal",
+                "terminal session not ended at exit id={s} err={s}",
+                .{ self.id, @errorName(err) },
+            );
+            return;
+        };
+        if (summary.delivered != 0 or summary.incomplete) {
+            debug_trace.logf(
+                "terminal",
+                "ended {d} process(es) left in the terminal session id={s} incomplete={any}",
+                .{ summary.delivered, self.id, summary.incomplete },
+            );
         }
     }
 
@@ -2154,17 +2238,21 @@ const Session = struct {
     }
 
     fn matchesSignalTarget(self: *Session, target: SignalTarget) bool {
+        return self.signalTargetMatch(target) == .matched;
+    }
+
+    fn signalTargetMatch(self: *Session, target: SignalTarget) process_identity.TokenMatch {
         var pid_buffer: [32]u8 = undefined;
         const pid_text = std.mem.print(
             &pid_buffer,
             "{d}",
             .{target.pid},
-        ) catch return false;
+        ) catch return .unavailable;
         return self.durable.profile.process_provider.matchToken(
             self.alloc,
             pid_text,
             target.token,
-        ) == .matched;
+        );
     }
 
     fn signalTerminalProcesses(
@@ -2722,6 +2810,7 @@ const Session = struct {
     }
 
     fn releaseCommandEvaluation(self: *Session) bool {
+        if (builtin.is_test and test_hold_release) return true;
         const zio = io_mod.getIo();
         self.write_mutex.lockUncancelable(zio);
         defer self.write_mutex.unlock(zio);
@@ -3866,6 +3955,20 @@ pub var test_gap: if (builtin.is_test) ?*const fn (point: GapPoint, session_id: 
 fn reachedGap(point: GapPoint, session_id: []const u8) void {
     if (builtin.is_test) if (test_gap) |hook| hook(point, session_id);
 }
+
+/// Test builds only: a test sets it to run code once the exit close has
+/// recorded a terminal's process tree and before it hangs the terminal up, so
+/// a process can start in that gap. It gets the terminal's id and its
+/// launcher's pid.
+pub var test_after_exit_record: if (builtin.is_test) ?*const fn (
+    session_id: []const u8,
+    launcher_pid: ?std.posix.pid_t,
+) void else void = if (builtin.is_test) null else {};
+
+/// Test builds only: when set, the host never writes the release byte that
+/// lets the launcher run the terminal's command, so the launcher keeps waiting
+/// for it.
+pub var test_hold_release: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
 
 fn maybeDelayForTest(name: []const u8) void {
     const value = io_mod.getenv(name) orelse return;
@@ -5238,4 +5341,90 @@ test "start in flight: a start that cannot reserve a slot leaves nothing in flig
     try std.testing.expect(InFlightProbe.saved_in_flight);
     try std.testing.expect(InFlightProbe.registered_in_flight);
     try std.testing.expect(!fixture.profile.is_starting(InFlightProbe.id()));
+}
+
+/// What the identity check of the launcher answers in a test.
+const LauncherIdentity = struct {
+    var answer: process_identity.TokenMatch = .mismatched;
+
+    fn match(_: []const u8, _: process_identity.ProcessInstanceToken) process_identity.TokenMatch {
+        return answer;
+    }
+};
+
+test "the exit close ends a launcher's session only while the launcher is the process it was" {
+    if (!isSupported()) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-launcher-identity");
+    var session = try Session.init(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    // A session leader with one member. The member is the last holder of the
+    // pipe that the test reads, so the pipe's end says when it is gone. It
+    // leaves by itself once the leader is gone, which closes the only write
+    // end of its life pipe, so the test leaves nothing.
+    const script =
+        \\import os, signal, sys
+        \\os.setsid()
+        \\life_r, life_w = os.pipe()
+        \\member = os.fork()
+        \\if member == 0:
+        \\    os.close(life_w)
+        \\    signal.alarm(30)
+        \\    os.read(life_r, 1)
+        \\    os._exit(0)
+        \\sys.stdout.write("%d\n" % member); sys.stdout.flush()
+        \\os.close(1)
+        \\signal.alarm(30); signal.pause()
+    ;
+    var leader = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "-c", script },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer leader.kill(io);
+    const reports = leader.stdout.?.handle;
+    var fds = [_]std.posix.pollfd{.{ .fd = reports, .events = std.posix.POLL.IN, .revents = 0 }};
+    try std.testing.expect(try std.posix.poll(&fds, 15_000) != 0);
+    var line: [32]u8 = undefined;
+    _ = try std.posix.read(reports, &line);
+
+    session.launcher_target = .{
+        .pid = leader.id.?,
+        .token = try process_identity.ProcessInstanceToken.parse(
+            "linux:00112233445566778899aabbccddeeff:1",
+        ),
+    };
+    process_identity.process_token_match_for_test = &LauncherIdentity.match;
+    defer process_identity.process_token_match_for_test = null;
+
+    // The launcher's pid may name another process by now: nothing is signalled.
+    for ([_]process_identity.TokenMatch{ .missing, .mismatched, .unavailable }) |answer| {
+        LauncherIdentity.answer = answer;
+        session.endLauncherSession();
+        fds[0].revents = 0;
+        try std.testing.expectEqual(@as(usize, 0), try std.posix.poll(&fds, 200));
+    }
+
+    LauncherIdentity.answer = .matched;
+    session.endLauncherSession();
+    fds[0].revents = 0;
+    try std.testing.expect(try std.posix.poll(&fds, 15_000) != 0);
+    try std.testing.expectEqual(@as(usize, 0), try std.posix.read(reports, &line));
 }

@@ -21,6 +21,8 @@ const json_decode = @import("../shared/json_decode.zig");
 const process_provider_mod = @import(
     "../execution/process_provider.zig",
 );
+const process_identity = @import("../execution/process_identity.zig");
+const process_tree = @import("../execution/process_tree.zig");
 const ui_projection = @import("ui_projection.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1623,9 +1625,9 @@ test "cancelling a start after its terminal launched closes that terminal" {
 const idle_signalling_command = "printf x > ./" ++ LaunchSignal.name ++ "; exec sleep 30";
 
 /// A start request for a terminal that stays idle until the fixture ends it.
-/// A test that ends with the fixture waits for the launch signal first: an
-/// exit close that comes while the shell is still starting can leave the
-/// launcher alive (see "What this does not fix" in the PR).
+/// A test that ends with the fixture waits for the launch signal first, so
+/// the exit close never comes while the shell is still starting, where it
+/// waits out its whole grace.
 fn idleStart(fixture: *LiveTerminalFixture, retain_in_flight: bool) contracts.ActionRequest {
     return .{ .start = .{
         .cwd = fixture.home,
@@ -1790,4 +1792,320 @@ test "closing owned terminals for exit leaves no orphan and records them ended" 
     } });
     defer refused.deinit(alloc);
     try std.testing.expect(refused.view() == .failure);
+}
+
+/// A named pipe the exit close writes one byte to, so a terminal's command can
+/// wait for it with `read -r _ < ./go`. The test holds both ends open, as
+/// `LaunchSignal` does, so the command's open never blocks.
+const GoSignal = struct {
+    const name = "go";
+
+    read_fd: std.posix.fd_t,
+    write_fd: std.posix.fd_t,
+
+    fn init(signal: *GoSignal, dir: []const u8) !void {
+        var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+        const fifo = try std.mem.printSentinel(&path_buf, "{s}/" ++ name, .{dir}, 0);
+        if (LaunchSignal.fifo_c.mkfifo(fifo, 0o600) != 0) return error.TestGoSignalFailed;
+        signal.read_fd = std.c.open(fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+        if (signal.read_fd < 0) return error.TestGoSignalFailed;
+        errdefer _ = std.c.close(signal.read_fd);
+        signal.write_fd = std.c.open(fifo, .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+        if (signal.write_fd < 0) return error.TestGoSignalFailed;
+    }
+
+    fn deinit(signal: *GoSignal) void {
+        _ = std.c.close(signal.write_fd);
+        _ = std.c.close(signal.read_fd);
+    }
+
+    fn send(signal: *GoSignal) !void {
+        if (std.c.write(signal.write_fd, "x\n", 2) != 2) return error.TestGoSignalFailed;
+    }
+};
+
+const real_process_provider = @import("../../tools/shell/process_provider.zig").provider;
+
+/// A named pipe that a process holds open for writing. The test reads the end
+/// of the pipe to learn that the process is gone: its files close when it
+/// dies, so no wait on a clock or a process state is needed. A terminal's late
+/// child holds it as its standard output and writes one byte when it starts.
+const LifeSignal = struct {
+    const late_child = "alive";
+    const daemon = "daemon-alive";
+
+    read_fd: std.posix.fd_t,
+
+    fn init(signal: *LifeSignal, dir: []const u8, name: []const u8) !void {
+        var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+        const fifo = try std.mem.printSentinel(&path_buf, "{s}/{s}", .{ dir, name }, 0);
+        if (LaunchSignal.fifo_c.mkfifo(fifo, 0o600) != 0) return error.TestLifeSignalFailed;
+        signal.read_fd = std.c.open(fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+        if (signal.read_fd < 0) return error.TestLifeSignalFailed;
+    }
+
+    fn deinit(signal: *LifeSignal) void {
+        _ = std.c.close(signal.read_fd);
+    }
+
+    /// Blocks until the child's byte arrives, for at most `timeout_ms`.
+    fn waitStarted(signal: *LifeSignal, timeout_ms: i32) !void {
+        var fds = [_]std.posix.pollfd{.{ .fd = signal.read_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        if ((try std.posix.poll(&fds, timeout_ms)) == 0) return error.TestLifeSignalTimedOut;
+        var byte: [1]u8 = undefined;
+        if ((try std.posix.read(signal.read_fd, &byte)) != 1) return error.TestLifeSignalFailed;
+    }
+
+    /// Blocks until the process is gone, for at most `timeout_ms`.
+    fn waitGone(signal: *LifeSignal, timeout_ms: i32) !void {
+        var fds = [_]std.posix.pollfd{.{ .fd = signal.read_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        if ((try std.posix.poll(&fds, timeout_ms)) == 0) return error.TestProcessStillRuns;
+        var byte: [1]u8 = undefined;
+        if ((try std.posix.read(signal.read_fd, &byte)) != 0) return error.TestLifeSignalFailed;
+    }
+};
+
+/// A process a test started, with the identity it had, so the test ends it by
+/// pid only while it is still that process.
+const TestProcess = struct {
+    pid: std.posix.pid_t,
+    token: ?process_identity.ProcessInstanceToken,
+
+    fn init(pid: std.posix.pid_t) TestProcess {
+        var buffer: [32]u8 = undefined;
+        const text = std.mem.print(&buffer, "{d}", .{pid}) catch return .{ .pid = pid, .token = null };
+        return .{
+            .pid = pid,
+            .token = real_process_provider.captureToken(
+                std.testing.allocator,
+                text,
+            ) catch null,
+        };
+    }
+
+    fn isSame(process: TestProcess) bool {
+        var buffer: [32]u8 = undefined;
+        const text = std.mem.print(&buffer, "{d}", .{process.pid}) catch return false;
+        const token = process.token orelse return false;
+        return real_process_provider.matchToken(
+            std.testing.allocator,
+            text,
+            token,
+        ) == .matched;
+    }
+
+    /// Whether it still runs. A zombie, which only waits to be reaped, does not.
+    fn isRunning(process: TestProcess) bool {
+        if (!process.isSame()) return false;
+        return process_tree.processIsAlive(std.testing.allocator, process.pid) catch true;
+    }
+
+    fn end(process: TestProcess) void {
+        if (!process.isRunning()) return;
+        // Cleanup: it may have ended between the check and the signal.
+        std.posix.kill(process.pid, std.posix.SIG.KILL) catch {};
+    }
+};
+
+/// What a late-fork test holds while the exit close runs: the pipe that lets
+/// the terminal's command go on once the close has recorded its process tree,
+/// the pipes that command answers on once it has started its late child, and
+/// the launcher that the close reported.
+const ExitGate = struct {
+    var go: ?*GoSignal = null;
+    var forked: ?*LaunchSignal = null;
+    var alive: ?*LifeSignal = null;
+    var session_id: [128]u8 = undefined;
+    var session_id_len: usize = 0;
+    var failed = false;
+    var launcher: ?TestProcess = null;
+
+    fn arm(
+        go_signal: ?*GoSignal,
+        forked_signal: ?*LaunchSignal,
+        alive_signal: ?*LifeSignal,
+        id: []const u8,
+    ) void {
+        go = go_signal;
+        forked = forked_signal;
+        alive = alive_signal;
+        session_id_len = @min(id.len, session_id.len);
+        @memcpy(session_id[0..session_id_len], id[0..session_id_len]);
+        failed = false;
+        launcher = null;
+        native_session.test_after_exit_record = &afterRecord;
+    }
+
+    fn disarm() void {
+        native_session.test_after_exit_record = null;
+        go = null;
+        forked = null;
+        alive = null;
+    }
+
+    fn afterRecord(id: []const u8, launcher_pid: ?std.posix.pid_t) void {
+        if (!std.mem.eql(u8, id, session_id[0..session_id_len])) return;
+        if (launcher_pid) |pid| launcher = TestProcess.init(pid);
+        const go_signal = go orelse return;
+        go_signal.send() catch {
+            failed = true;
+            return;
+        };
+        const forked_signal = forked orelse return;
+        forked_signal.wait(15_000) catch {
+            failed = true;
+            return;
+        };
+        const alive_signal = alive orelse return;
+        alive_signal.waitStarted(15_000) catch {
+            failed = true;
+        };
+    }
+
+    fn endLauncher() void {
+        if (launcher) |process| process.end();
+    }
+};
+
+/// The late child starts after the exit close recorded the process tree, so
+/// the record misses it: the command waits for `go`, starts the child in its
+/// own process group with the `alive` pipe as its output, detaches it from the
+/// shell's job table, and tells the close that it did. The child still holds
+/// the terminal as its input and error output.
+const late_fork_command = "read -r _ < ./" ++ GoSignal.name ++
+    "; ( printf x; exec sleep 30 ) > ./" ++ LifeSignal.late_child ++
+    " & echo $! > ./late.pid; disown; printf x > ./" ++ LaunchSignal.name ++
+    "; exec sleep 60";
+const launched_byte = "printf x > ./" ++ LaunchSignal.name ++ "; ";
+
+fn readPid(fixture: *LiveTerminalFixture, name: []const u8) !std.posix.pid_t {
+    const bytes = try fixture.tmp.dir.readFileAlloc(
+        std.testing.io,
+        name,
+        std.testing.allocator,
+        .limited(64),
+    );
+    defer std.testing.allocator.free(bytes);
+    return std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, bytes, " \n"), 10);
+}
+
+test "closing owned terminals for exit ends a child the shell started after the process tree was recorded" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    var go: GoSignal = undefined;
+    try go.init(fixture.home);
+    defer go.deinit();
+    var forked: LaunchSignal = undefined;
+    try forked.init(fixture.home);
+    defer forked.deinit();
+    var alive: LifeSignal = undefined;
+    try alive.init(fixture.home, LifeSignal.late_child);
+    defer alive.deinit();
+
+    const session_id = try fixture.start(late_fork_command);
+    defer alloc.free(session_id);
+    ExitGate.arm(&go, &forked, &alive, session_id);
+    defer ExitGate.disarm();
+
+    fixture.runtime.closeOwnedTerminals();
+    // The hook ran after the shell's tree was recorded and waited for the child.
+    try std.testing.expect(!ExitGate.failed);
+    const late = TestProcess.init(try readPid(&fixture, "late.pid"));
+    // Past the failed assertions, so the test never leaves its child behind.
+    defer late.end();
+    try std.testing.expect(fixture.runtime.backend_drained);
+    try alive.waitGone(2_000);
+}
+
+test "closing owned terminals for exit ends a launcher that still waits to release its command" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    // The shell has told the launcher that its command starts, and the host
+    // never releases it. The hangup ends the shell, and the launcher waits
+    // for a release that cannot come until it closes the PTY, which the
+    // backend waits for.
+    native_session.test_hold_release = true;
+    defer native_session.test_hold_release = false;
+    const session_id = try fixture.start("sleep 30");
+    defer alloc.free(session_id);
+    ExitGate.arm(null, null, null, session_id);
+    defer ExitGate.disarm();
+    defer ExitGate.endLauncher();
+
+    fixture.runtime.closeOwnedTerminals();
+    try std.testing.expect(ExitGate.launcher != null);
+    try std.testing.expect(fixture.runtime.backend_drained);
+}
+
+test "closing owned terminals for exit leaves a setsid program and another runtime's terminal running" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    // A terminal of another runtime, as a second fx process owns its own.
+    var sibling: LiveTerminalFixture = undefined;
+    try sibling.init();
+    defer sibling.deinit();
+    const sibling_id = try sibling.start("printf 'UP%s\\n' NOW; exec sleep 30");
+    defer alloc.free(sibling_id);
+    try sibling.waitForMatch(sibling_id, "UPNOW");
+    const sibling_shell = TestProcess.init(try sibling.shellPid(sibling_id));
+    defer sibling_shell.end();
+
+    // The daemon leaves the terminal's session before the late child starts,
+    // and closes its terminal files, so only the late child holds the PTY.
+    try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "daemon.py", .data =
+        \\import os, signal, sys
+        \\ready_r, ready_w = os.pipe()
+        \\if os.fork() == 0:
+        \\    os.setsid()
+        \\    null = os.open(os.devnull, os.O_RDWR)
+        \\    for fd in (0, 1, 2):
+        \\        os.dup2(null, fd)
+        \\    life = os.open(sys.argv[1], os.O_WRONLY)
+        \\    open("daemon.pid", "w").write(str(os.getpid()))
+        \\    os.write(ready_w, b"x")
+        \\    signal.alarm(30); signal.pause()
+        \\    os._exit(0)
+        \\os.read(ready_r, 1)
+    });
+    var go: GoSignal = undefined;
+    try go.init(fixture.home);
+    defer go.deinit();
+    var forked: LaunchSignal = undefined;
+    try forked.init(fixture.home);
+    defer forked.deinit();
+    var alive: LifeSignal = undefined;
+    try alive.init(fixture.home, LifeSignal.late_child);
+    defer alive.deinit();
+    var daemon_life: LifeSignal = undefined;
+    try daemon_life.init(fixture.home, LifeSignal.daemon);
+    defer daemon_life.deinit();
+    const session_id = try fixture.start("python3 ./daemon.py " ++ LifeSignal.daemon ++ "; " ++ launched_byte ++ late_fork_command);
+    defer alloc.free(session_id);
+    // The first byte says the daemon has left, and the second the late child has started.
+    try forked.wait(15_000);
+    const daemon = TestProcess.init(try readPid(&fixture, "daemon.pid"));
+    defer daemon.end();
+    ExitGate.arm(&go, &forked, &alive, session_id);
+    defer ExitGate.disarm();
+
+    fixture.runtime.closeOwnedTerminals();
+    try std.testing.expect(!ExitGate.failed);
+    const late = TestProcess.init(try readPid(&fixture, "late.pid"));
+    defer late.end();
+    try std.testing.expect(fixture.runtime.backend_drained);
+    try alive.waitGone(2_000);
+    try std.testing.expect(daemon.isRunning());
+    try std.testing.expect(sibling_shell.isRunning());
+    // The test leaves nothing running: the daemon is gone when it returns.
+    daemon.end();
+    try daemon_life.waitGone(5_000);
 }

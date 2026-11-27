@@ -156,6 +156,14 @@ const SystemSignalEffects = struct {
     fn send(pid: std.posix.pid_t, signal: std.posix.SIG) std.posix.KillError!void {
         return std.posix.kill(pid, signal);
     }
+
+    fn ownPid() std.posix.pid_t {
+        return std.c.getpid();
+    }
+
+    fn list(alloc: Allocator, out: *std.ArrayList(std.posix.pid_t)) !void {
+        return listProcessIds(alloc, out);
+    }
 };
 
 /// Tracks a command root and descendants across new sessions or process
@@ -715,6 +723,46 @@ pub const Tracker = struct {
         });
     }
 
+    /// Tracks each live process of `session` that this tracker does not track
+    /// yet, except the session's leader and this process. Returns how many it
+    /// added.
+    fn trackSessionWith(
+        self: *Tracker,
+        session: std.posix.pid_t,
+        comptime Effects: type,
+    ) !usize {
+        var pids: std.ArrayList(std.posix.pid_t) = .empty;
+        defer pids.deinit(self.alloc);
+        try Effects.list(self.alloc, &pids);
+        const own = Effects.ownPid();
+        var added: usize = 0;
+        next: for (pids.items) |pid| {
+            if (pid <= 1 or pid == own or pid == session) continue;
+            if (!inSessionWith(pid, session, Effects)) continue;
+            const snapshot = Effects.capture(self.alloc, pid) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                continue;
+            };
+            // Read after the identity: a process that is alive from this read
+            // until its signal is the one this read described, never a later
+            // owner of the pid.
+            if (!inSessionWith(pid, session, Effects)) continue;
+            for (self.processes.items) |*process| {
+                if (process.pid != pid) continue;
+                if (process.identity.eql(snapshot.identity)) continue :next;
+                process.identity = snapshot.identity;
+                added += 1;
+                continue :next;
+            }
+            try self.processes.append(self.alloc, .{
+                .pid = pid,
+                .identity = snapshot.identity,
+            });
+            added += 1;
+        }
+        return added;
+    }
+
     fn trackLineageProcess(self: *Tracker, pid: std.posix.pid_t) !bool {
         const snapshot = captureSnapshot(self.alloc, pid) catch return false;
         if (!couldBelongByStart(
@@ -761,6 +809,62 @@ pub const Tracker = struct {
         return false;
     }
 };
+
+/// How many times `endSession` looks for members after a kill: a member can
+/// start another process while the kill runs.
+const session_end_passes: usize = 16;
+
+/// Kills every live process whose session is `session`, except the session's
+/// leader (the process with that pid, which the caller ends or keeps) and
+/// this process. A process that left the session with `setsid` is not in it
+/// and is not touched. Members are stopped before any is killed, as
+/// `Tracker.signalAll` does, and the session is read again after each kill.
+///
+/// The caller must own `session`: this process leads it, or holds its
+/// leader's identity, since the session id only names the session while a
+/// member lives, and a leader that is gone leaves nothing to check it by.
+/// A session this process belongs to without leading is refused.
+pub fn endSession(alloc: Allocator, session: std.posix.pid_t) !DeliverySummary {
+    return endSessionWith(alloc, session, SystemSignalEffects);
+}
+
+fn endSessionWith(
+    alloc: Allocator,
+    session: std.posix.pid_t,
+    comptime Effects: type,
+) !DeliverySummary {
+    var summary: DeliverySummary = .{};
+    if (session <= 1) return summary;
+    const own = Effects.ownPid();
+    if (session != own) switch (Effects.session(own)) {
+        .found => |own_session| if (own_session == session) return summary,
+        .vanished, .unavailable => {
+            summary.incomplete = true;
+            return summary;
+        },
+    };
+    var tracker = try Tracker.init(alloc);
+    defer tracker.deinit();
+    var pass: usize = 0;
+    while (pass < session_end_passes) : (pass += 1) {
+        if (try tracker.trackSessionWith(session, Effects) == 0) break;
+        const pass_summary = tracker.signalProcessesWith(std.posix.SIG.KILL, null, Effects);
+        summary.delivered += pass_summary.delivered;
+        summary.incomplete = summary.incomplete or pass_summary.incomplete;
+    }
+    return summary;
+}
+
+fn inSessionWith(
+    pid: std.posix.pid_t,
+    session: std.posix.pid_t,
+    comptime Effects: type,
+) bool {
+    return switch (Effects.session(pid)) {
+        .found => |value| value == session,
+        .vanished, .unavailable => false,
+    };
+}
 
 fn identityHasMacOSUniqueId(identity: Identity, unique_id: u64) bool {
     return switch (identity) {
@@ -916,6 +1020,85 @@ fn openLinuxProcFile(path: []const u8) !?std.Io.File {
         .handle = fd,
         .flags = .{ .nonblocking = false },
     };
+}
+
+/// Appends the pid of every process the OS lists, in no particular order.
+/// A process can start or end while the list is read.
+fn listProcessIds(alloc: Allocator, out: *std.ArrayList(std.posix.pid_t)) !void {
+    switch (builtin.target.os.tag) {
+        .linux => try listLinuxProcessIds(alloc, out),
+        .macos => try listMacOSProcessIds(alloc, out),
+        else => return error.ProcessTreeUnsupported,
+    }
+}
+
+fn listLinuxProcessIds(alloc: Allocator, out: *std.ArrayList(std.posix.pid_t)) !void {
+    if (comptime builtin.target.os.tag != .linux) return error.ProcessTreeUnsupported;
+    var proc_dir = (try openLinuxProcDir("/proc")) orelse
+        return error.ProcessTreeInspectionFailed;
+    defer proc_dir.close(io_mod.getIo());
+    var entries = proc_dir.iterateAssumeFirstIteration();
+    while (try entries.next(io_mod.getIo())) |entry| {
+        const pid = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
+        if (pid > 0) try out.append(alloc, pid);
+    }
+}
+
+fn listMacOSProcessIds(alloc: Allocator, out: *std.ArrayList(std.posix.pid_t)) !void {
+    if (comptime builtin.target.os.tag != .macos) return error.ProcessTreeUnsupported;
+    const reported = Darwin.proc_listallpids(null, 0);
+    if (reported <= 0) return error.ProcessTreeInspectionFailed;
+    const buffer = try alloc.alloc(std.posix.pid_t, @as(usize, @intCast(reported)) + 256);
+    defer alloc.free(buffer);
+    const count = Darwin.proc_listallpids(
+        buffer.ptr,
+        @intCast(buffer.len * @sizeOf(std.posix.pid_t)),
+    );
+    if (count <= 0) return error.ProcessTreeInspectionFailed;
+    for (buffer[0..@min(@as(usize, @intCast(count)), buffer.len)]) |pid| {
+        if (pid > 0) try out.append(alloc, pid);
+    }
+}
+
+/// True when `pid` has exited, its parent has not collected it yet, and it
+/// started at the time the macOS identity token `token` names. The lookup that
+/// makes those tokens does not see an exited process that is still waiting to
+/// be collected, so its owner would take it for gone; this one does. It is
+/// false everywhere else, where the identity check sees such a process.
+pub fn exitedUncollectedSince(pid: std.posix.pid_t, token: []const u8) bool {
+    if (comptime builtin.target.os.tag != .macos) return false;
+    const start = macOSTokenStart(token) orelse return false;
+    var info: Darwin.ProcBsdInfo = undefined;
+    // The last argument asks for exited processes as well.
+    const read_len = Darwin.proc_pidinfo(pid, 3, 1, &info, @sizeOf(Darwin.ProcBsdInfo));
+    if (read_len != @sizeOf(Darwin.ProcBsdInfo)) return false;
+    return info.pbi_status == Darwin.process_status_zombie and
+        info.pbi_start_tvsec == start.seconds and
+        info.pbi_start_tvusec == start.microseconds;
+}
+
+const MacOSTokenStart = struct { seconds: u64, microseconds: u64 };
+
+/// The start time inside a `macos:<boot>:<seconds>:<microseconds>` token.
+fn macOSTokenStart(token: []const u8) ?MacOSTokenStart {
+    var parts = std.mem.splitScalar(u8, token, ':');
+    if (!std.mem.eql(u8, parts.next() orelse return null, "macos")) return null;
+    _ = parts.next() orelse return null;
+    const seconds = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null;
+    const microseconds = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null;
+    if (parts.next() != null) return null;
+    return .{ .seconds = seconds, .microseconds = microseconds };
+}
+
+test "the start time is read from a macOS token and from nothing else" {
+    const start = macOSTokenStart("macos:0123456789abcdef0123456789abcdef:1795769402:695677").?;
+    try std.testing.expectEqual(@as(u64, 1795769402), start.seconds);
+    try std.testing.expectEqual(@as(u64, 695677), start.microseconds);
+    try std.testing.expect(macOSTokenStart("linux:0123456789abcdef0123456789abcdef:42") == null);
+    try std.testing.expect(macOSTokenStart("macos:0123456789abcdef0123456789abcdef:1:2:3") == null);
+    try std.testing.expect(macOSTokenStart("macos:0123456789abcdef0123456789abcdef:1") == null);
+    try std.testing.expect(macOSTokenStart("macos:0123456789abcdef0123456789abcdef:x:2") == null);
+    try std.testing.expect(macOSTokenStart("") == null);
 }
 
 test "Linux proc helpers treat missing process data as vanished" {
@@ -1428,6 +1611,314 @@ test "session inspection separates the caller's session from a new one" {
         CompletionStanding.detached,
         completionStanding(own_session, inspectSession(pid)),
     );
+}
+
+/// A fake process table for `endSessionWith`. A kill removes the process.
+const FakeSessionTable = struct {
+    const Entry = struct {
+        pid: std.posix.pid_t,
+        session: std.posix.pid_t,
+        zombie: bool = false,
+    };
+
+    var entries: [64]Entry = undefined;
+    var count: usize = 0;
+    var own_pid: std.posix.pid_t = 100;
+    var own_session: SessionState = .{ .found = 90 };
+    var killed: [64]std.posix.pid_t = undefined;
+    var killed_count: usize = 0;
+    var stopped_count: usize = 0;
+    var list_calls: usize = 0;
+    /// The next `forks_left` kills each start a process in `fork_into`, as a
+    /// member that forks while it dies.
+    var fork_into: std.posix.pid_t = 0;
+    var forks_left: usize = 0;
+    var next_pid: std.posix.pid_t = 400;
+    /// The pid is taken over by a process of another session after its identity is read once.
+    var reused_pid: ?std.posix.pid_t = null;
+    var reused_reads: usize = 0;
+    /// The pid is taken over right after its session is read once, so the identity read next is already the new process's.
+    var swapped_pid: ?std.posix.pid_t = null;
+    var swapped_reads: usize = 0;
+
+    fn reset() void {
+        count = 0;
+        own_pid = 100;
+        own_session = .{ .found = 90 };
+        killed_count = 0;
+        stopped_count = 0;
+        list_calls = 0;
+        forks_left = 0;
+        next_pid = 400;
+        reused_pid = null;
+        reused_reads = 0;
+        swapped_pid = null;
+        swapped_reads = 0;
+    }
+
+    fn add(pid: std.posix.pid_t, session_id: std.posix.pid_t, zombie: bool) void {
+        entries[count] = .{ .pid = pid, .session = session_id, .zombie = zombie };
+        count += 1;
+    }
+
+    fn find(pid: std.posix.pid_t) ?usize {
+        for (entries[0..count], 0..) |entry, index| {
+            if (entry.pid == pid) return index;
+        }
+        return null;
+    }
+
+    fn expectKilled(expected: []const std.posix.pid_t) !void {
+        var sorted: [64]std.posix.pid_t = undefined;
+        @memcpy(sorted[0..killed_count], killed[0..killed_count]);
+        std.mem.sort(std.posix.pid_t, sorted[0..killed_count], {}, std.sort.asc(std.posix.pid_t));
+        try std.testing.expectEqualSlices(std.posix.pid_t, expected, sorted[0..killed_count]);
+    }
+
+    fn ownPid() std.posix.pid_t {
+        return own_pid;
+    }
+
+    fn list(alloc: Allocator, out: *std.ArrayList(std.posix.pid_t)) !void {
+        list_calls += 1;
+        for (entries[0..count]) |entry| try out.append(alloc, entry.pid);
+    }
+
+    fn session(pid: std.posix.pid_t) SessionState {
+        if (pid == own_pid) return own_session;
+        const index = find(pid) orelse return .vanished;
+        if (reused_pid == pid and reused_reads > 1) return .{ .found = 999 };
+        if (swapped_pid == pid) {
+            swapped_reads += 1;
+            if (swapped_reads > 1) return .{ .found = 999 };
+        }
+        return .{ .found = entries[index].session };
+    }
+
+    fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+        const index = find(pid) orelse return error.ProcessNotFound;
+        var ticks: u64 = @intCast(pid);
+        if (reused_pid == pid) {
+            reused_reads += 1;
+            if (reused_reads > 1) ticks += 1000;
+        }
+        if (swapped_pid == pid and swapped_reads > 0) ticks += 1000;
+        return .{
+            .identity = .{ .linux_start_ticks = ticks },
+            .parent_pid = 1,
+            .zombie = entries[index].zombie,
+        };
+    }
+
+    fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+        return .{ .found = pid };
+    }
+
+    fn send(pid: std.posix.pid_t, signal: std.posix.SIG) std.posix.KillError!void {
+        const index = find(pid) orelse return error.ProcessNotFound;
+        if (signal == std.posix.SIG.STOP) stopped_count += 1;
+        if (signal != std.posix.SIG.KILL) return;
+        killed[killed_count] = pid;
+        killed_count += 1;
+        entries[index] = entries[count - 1];
+        count -= 1;
+        if (forks_left > 0) {
+            forks_left -= 1;
+            add(next_pid, fork_into, false);
+            next_pid += 1;
+        }
+    }
+};
+
+test "ending a session kills its members and nothing else" {
+    const table = FakeSessionTable;
+    table.reset();
+    // The leader 200 and its members 201 and 202 share a session. Another
+    // session, a member that is already a zombie, init, and this process
+    // (100, in the session of pid 90) do not count.
+    table.add(1, 200, false);
+    table.add(100, 200, false);
+    table.add(200, 200, false);
+    table.add(201, 200, false);
+    table.add(202, 200, false);
+    table.add(203, 200, true);
+    table.add(300, 300, false);
+    table.add(301, 90, false);
+
+    const summary = try endSessionWith(std.testing.allocator, 200, table);
+    try table.expectKilled(&.{ 201, 202 });
+    try std.testing.expectEqual(@as(usize, 2), summary.delivered);
+    try std.testing.expect(!summary.incomplete);
+    // Both were stopped before either was killed.
+    try std.testing.expectEqual(@as(usize, 2), table.stopped_count);
+}
+
+test "ending a session looks again for a member that starts while the kill runs" {
+    const table = FakeSessionTable;
+    table.reset();
+    table.add(200, 200, false);
+    table.add(201, 200, false);
+    table.add(300, 300, false);
+    // The kill of 201 starts 400, which the next pass finds.
+    table.fork_into = 200;
+    table.forks_left = 1;
+
+    const summary = try endSessionWith(std.testing.allocator, 200, table);
+    try std.testing.expectEqualSlices(std.posix.pid_t, &.{ 201, 400 }, table.killed[0..table.killed_count]);
+    try std.testing.expectEqual(@as(usize, 2), summary.delivered);
+    // Two passes that killed, and a third that found the session empty.
+    try std.testing.expectEqual(@as(usize, 3), table.list_calls);
+}
+
+test "ending a session stops looking after a bounded number of passes" {
+    const table = FakeSessionTable;
+    table.reset();
+    table.add(200, 200, false);
+    table.add(201, 200, false);
+    table.fork_into = 200;
+    table.forks_left = 1000;
+
+    _ = try endSessionWith(std.testing.allocator, 200, table);
+    // Every kill started another member, and the loop still ended.
+    try std.testing.expectEqual(session_end_passes, table.list_calls);
+    try std.testing.expectEqual(session_end_passes, table.killed_count);
+}
+
+test "ending a session refuses the session this process belongs to unless it leads it" {
+    const table = FakeSessionTable;
+    table.reset();
+    table.own_session = .{ .found = 200 };
+    table.add(200, 200, false);
+    table.add(201, 200, false);
+    table.add(202, 200, false);
+
+    const refused = try endSessionWith(std.testing.allocator, 200, table);
+    try std.testing.expectEqual(@as(usize, 0), table.killed_count);
+    try std.testing.expectEqual(@as(usize, 0), refused.delivered);
+
+    // An unreadable own session refuses as well, and says it is incomplete.
+    table.own_session = .unavailable;
+    const unknown = try endSessionWith(std.testing.allocator, 200, table);
+    try std.testing.expectEqual(@as(usize, 0), table.killed_count);
+    try std.testing.expect(unknown.incomplete);
+
+    // A process that leads the session may end it: the launcher ends its own.
+    table.own_pid = 200;
+    table.own_session = .{ .found = 200 };
+    _ = try endSessionWith(std.testing.allocator, 200, table);
+    try table.expectKilled(&.{ 201, 202 });
+
+    // Init's session and a negative id are never a session to end.
+    table.reset();
+    table.add(2, 1, false);
+    _ = try endSessionWith(std.testing.allocator, 1, table);
+    _ = try endSessionWith(std.testing.allocator, 0, table);
+    _ = try endSessionWith(std.testing.allocator, -1, table);
+    try std.testing.expectEqual(@as(usize, 0), table.killed_count);
+}
+
+test "ending a session never signals a pid that another process took over after it was read" {
+    const table = FakeSessionTable;
+    table.reset();
+    table.add(200, 200, false);
+    table.add(201, 200, false);
+    table.add(202, 200, false);
+    table.add(203, 200, false);
+    // 201 changes owner after its identity was read, and 203 before it: the
+    // second read of the session and the identity at the signal catch each.
+    table.reused_pid = 201;
+    table.swapped_pid = 203;
+
+    const summary = try endSessionWith(std.testing.allocator, 200, table);
+    try table.expectKilled(&.{202});
+    try std.testing.expectEqual(@as(usize, 1), summary.delivered);
+}
+
+test "the process list holds this process and a child it starts" {
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sleep", "30" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+
+    var pids: std.ArrayList(std.posix.pid_t) = .empty;
+    defer pids.deinit(alloc);
+    try listProcessIds(alloc, &pids);
+    try std.testing.expect(std.mem.findScalar(std.posix.pid_t, pids.items, std.c.getpid()) != null);
+    try std.testing.expect(std.mem.findScalar(std.posix.pid_t, pids.items, child.id.?) != null);
+}
+
+test "ending a real session leaves the leader and a setsid daemon alone" {
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    // The leader starts a session and two children. `member` stays in it and
+    // is the only holder of the pipe the test reads, so the pipe's end says
+    // when it is gone. `daemon` leaves with setsid and tells the leader when
+    // it has, before the leader reports.
+    const script =
+        \\import os, signal, sys
+        \\os.setsid()
+        \\ready_r, ready_w = os.pipe()
+        \\member = os.fork()
+        \\if member == 0:
+        \\    os.close(ready_r); os.close(ready_w)
+        \\    signal.alarm(30); signal.pause()
+        \\    os._exit(0)
+        \\daemon = os.fork()
+        \\if daemon == 0:
+        \\    os.setsid()
+        \\    os.dup2(os.open(os.devnull, os.O_RDWR), 1)
+        \\    os.write(ready_w, b"x")
+        \\    signal.alarm(30); signal.pause()
+        \\    os._exit(0)
+        \\os.read(ready_r, 1)
+        \\sys.stdout.write("%d %d\n" % (member, daemon)); sys.stdout.flush()
+        \\os.close(1)
+        \\signal.alarm(30); signal.pause()
+    ;
+    var leader = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "-c", script },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer leader.kill(io);
+    const leader_pid = leader.id.?;
+    const reports = leader.stdout.?.handle;
+
+    var line: [64]u8 = undefined;
+    try waitReadable(reports, 15_000);
+    const line_len = try std.posix.read(reports, &line);
+    var pids = std.mem.tokenizeScalar(u8, std.mem.trim(u8, line[0..line_len], "\n"), ' ');
+    const member_pid = try std.fmt.parseInt(std.posix.pid_t, pids.next().?, 10);
+    const daemon_pid = try std.fmt.parseInt(std.posix.pid_t, pids.next().?, 10);
+    const daemon_identity = (try captureSnapshot(alloc, daemon_pid)).identity;
+    defer if (captureSnapshot(alloc, daemon_pid)) |now| {
+        // Cleanup: the daemon may have ended already.
+        if (now.identity.eql(daemon_identity)) std.posix.kill(daemon_pid, std.posix.SIG.KILL) catch {};
+    } else |_| {};
+    try std.testing.expectEqual(SessionState{ .found = leader_pid }, inspectSession(member_pid));
+    try std.testing.expectEqual(SessionState{ .found = daemon_pid }, inspectSession(daemon_pid));
+
+    const summary = try endSession(alloc, leader_pid);
+    try std.testing.expectEqual(@as(usize, 1), summary.delivered);
+    // The member held the last copy of the pipe: its end arrives with its death.
+    try waitReadable(reports, 15_000);
+    try std.testing.expectEqual(@as(usize, 0), try std.posix.read(reports, &line));
+    try std.testing.expect(try processIsAlive(alloc, leader_pid));
+    try std.testing.expect(try processIsAlive(alloc, daemon_pid));
+}
+
+fn waitReadable(fd: std.posix.fd_t, timeout_ms: i32) !void {
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    if ((try std.posix.poll(&fds, timeout_ms)) == 0) return error.TestTimedOut;
 }
 
 fn captureSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
