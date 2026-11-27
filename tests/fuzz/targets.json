@@ -1,5 +1,6 @@
 {
   "targets": [
+    {"name": "acp_preview_idempotency_key", "module": "fx", "test": "ACP Preview accepts only bounded Unicode idempotency keys on fuzzed bytes", "iterations": 150000},
     {"name": "kept_sign_outs", "module": "fx", "test": "a kept sign-out record parses or is refused on fuzzed bytes, and what parses writes back the same", "iterations": 400000},
     {"name": "acp_mcp_servers", "module": "fx", "test": "ACP MCP parser handles fuzzed request bytes", "iterations": 1500000},
     {"name": "vision_json", "module": "fx", "test": "Vision JSON parsers tolerate arbitrary bounded bytes", "iterations": 1200000},

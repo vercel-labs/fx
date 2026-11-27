@@ -83,6 +83,21 @@ pub const RpcError = struct {
     } = null,
 };
 
+pub fn writeErrorObject(w: *std.Io.Writer, err: RpcError) !void {
+    try w.print("{{\"code\":{d},\"message\":", .{err.code});
+    try writeJsonStr(err.message, w);
+    if (err.data) |data| {
+        try w.writeAll(",\"data\":{\"code\":");
+        try writeJsonStr(data.code, w);
+        try w.writeAll(",\"model\":");
+        try writeJsonStr(data.model, w);
+        try w.writeAll(",\"capability\":");
+        try writeJsonStr(data.capability, w);
+        try w.writeByte('}');
+    }
+    try w.writeByte('}');
+}
+
 pub fn parseMessage(alloc: Allocator, line: []const u8) !Message {
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch
         return error.ParseError;
@@ -191,20 +206,9 @@ pub const Writer = struct {
                 .error_response => |response| {
                     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
                     try writeId(w, response.id);
-                    try w.writeAll(",\"error\":{\"code\":");
-                    try w.print("{d}", .{response.err.code});
-                    try w.writeAll(",\"message\":");
-                    try writeJsonStr(response.err.message, w);
-                    if (response.err.data) |data| {
-                        try w.writeAll(",\"data\":{\"code\":");
-                        try writeJsonStr(data.code, w);
-                        try w.writeAll(",\"model\":");
-                        try writeJsonStr(data.model, w);
-                        try w.writeAll(",\"capability\":");
-                        try writeJsonStr(data.capability, w);
-                        try w.writeByte('}');
-                    }
-                    try w.writeAll("}}\n");
+                    try w.writeAll(",\"error\":");
+                    try writeErrorObject(w, response.err);
+                    try w.writeAll("}\n");
                 },
                 .notification => |notification| {
                     try w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":");
