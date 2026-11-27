@@ -15,6 +15,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const net_connect = @import("../shared/net_connect.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const owner = @import("owner.zig");
 const owner_test_controls = @import("owner_test_controls.zig");
@@ -226,13 +227,6 @@ pub const Client = struct {
         }
     }
 
-    fn setCloexec(fd: std.posix.fd_t) void {
-        const flags = std.c.fcntl(fd, std.c.F.GETFD);
-        if (flags >= 0) {
-            _ = std.c.fcntl(fd, std.c.F.SETFD, flags | std.c.FD_CLOEXEC);
-        }
-    }
-
     /// Starts an owner, detached, with its stdout piped for the ready signal
     /// and nothing on this session's terminal. Returns the CLOEXEC read end.
     fn spawn(c: *Client) ?std.Io.File {
@@ -240,8 +234,10 @@ pub const Client = struct {
             if (owner_test_controls.spawn_hook) |hook| {
                 var fds: [2]std.c.fd_t = undefined;
                 if (std.c.pipe(&fds) != 0) return null;
-                setCloexec(fds[0]);
-                setCloexec(fds[1]);
+                // Best effort: the ready pipe is closed right after `waitReadyPipe` returns.
+                net_connect.setCloexec(fds[0]) catch {};
+                // Best effort: the test owner closes its write end once done.
+                net_connect.setCloexec(fds[1]) catch {};
                 if (hook(c.io, c.fx_home, fds[1])) |pid| {
                     c.spawned.append(c.gpa, pid) catch |err| {
                         debug_trace.logf("mcp-owner", "owner pid not kept reason={s} pid={d}", .{ @errorName(err), pid });
@@ -278,7 +274,8 @@ pub const Client = struct {
         };
         debug_trace.logf("mcp-owner", "owner started pid={d}", .{pid});
         if (child.stdout) |out| {
-            setCloexec(out.handle);
+            // Best effort: the ready pipe is closed right after `waitReadyPipe` returns.
+            net_connect.setCloexec(out.handle) catch {};
             return out;
         }
         return null;
