@@ -3111,7 +3111,10 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
     } else "";
 
     const id_value = entry.object.get("id") orelse return null;
-    if (id_value != .string) return null;
+    if (id_value != .string or id_value.string.len == 0) return null;
+    for (id_value.string) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return null;
+    }
 
     const released = if (entry.object.get("released")) |value|
         switch (value) {
@@ -3504,6 +3507,22 @@ test "gateway catalog accepts an explicit empty data array" {
     defer freeModelCatalog(std.testing.allocator, &catalog);
 
     try std.testing.expectEqual(@as(usize, 0), catalog.items.len);
+}
+
+test "gateway catalog rejects empty model ids and ids with ASCII control bytes" {
+    const json_text =
+        \\{"object":"list","data":[
+        \\  {"id":"","type":"language"},
+        \\  {"id":"openai/gpt\u001b[2J","type":"language"},
+        \\  {"id":"openai/gpt\u007f","type":"language"},
+        \\  {"id":"openai/gpt-5.4","type":"language"}
+        \\]}
+    ;
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, json_text);
+    defer freeModelCatalog(std.testing.allocator, &catalog);
+
+    try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", catalog.items[0].id);
 }
 
 test "gateway catalog retains broad capability metadata" {
