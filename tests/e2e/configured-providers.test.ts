@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import { completion, neverAnswers, stallsAfterFirstChunk, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
 import * as messagesFake from "./fixtures/anthropic-messages";
 import * as responsesFake from "./fixtures/responses";
@@ -623,7 +623,7 @@ describe("configured providers", () => {
 
   test.each(["headers", "stream"])("cancellation stops stalled custom %s without replaying the POST", async phase => {
     const f = fixture(() => phase === "headers" ? new Promise<Response>(() => {}) : new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n')); } }), { headers: { "content-type": "text/event-stream" } }));
-    const env: Record<string, string | undefined> = { ...process.env };
+    const env: Record<string, string | undefined> = fxChildEnv();
     for (const [key, value] of Object.entries(f.env)) {
       if (value === undefined) delete env[key]; else env[key] = value;
     }
@@ -1321,7 +1321,7 @@ describe("custom connection limits", () => {
       const first = await runFx(["ask", "--json", "start the long task"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
       if (first.code !== 0) throw new Error(first.stdout + first.stderr);
       const session = JSON.parse(first.stdout).session_id;
-      const env = Object.fromEntries(Object.entries({ ...process.env, ...f.env }).filter(([, value]) => value !== undefined)) as Record<string, string>;
+      const env = Object.fromEntries(Object.entries(fxChildEnv(f.env)).filter(([, value]) => value !== undefined)) as Record<string, string>;
       const child = Bun.spawn([FX_BIN, "ask", "--json", "--resume", session, "second step"], { cwd: f.workspace, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
       const deadline = Date.now() + 15_000;
       while (f.requests.length < 2 && Date.now() < deadline) await Bun.sleep(20);
