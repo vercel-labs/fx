@@ -677,6 +677,12 @@ pub noinline fn nanoTimestamp() i128 {
     return @intCast(ts.nanoseconds);
 }
 
+/// The deadline `duration_ms` after `now_ms`, held at the largest time
+/// instead of overflowing.
+pub fn addMillis(now_ms: i64, duration_ms: i64) i64 {
+    return std.math.add(i64, now_ms, duration_ms) catch std.math.maxInt(i64);
+}
+
 /// Milliseconds on the awake clock, which every process on the machine shares
 /// and which stops while the machine sleeps (mach uptime on macOS). For
 /// timeouts one process sets and another reads.

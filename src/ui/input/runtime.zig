@@ -9,6 +9,7 @@ const image_attachments = @import("../../core/images/image_attachments.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
+const clipboard_protocol = @import("../terminal/clipboard_protocol.zig");
 const cursor_probe = @import("../terminal/cursor_probe.zig");
 const mode_rearm = @import("../terminal/mode_rearm.zig");
 const theme_monitor = @import("../terminal/theme_monitor.zig");
@@ -587,6 +588,9 @@ pub const Runtime = struct {
     /// it, the terminal sends a paste as typed keys, and each line break in
     /// the paste presses Enter.
     bracketed_paste_rearm: mode_rearm.Schedule = .{},
+    /// Reads a clipboard image from the terminal when fx cannot read the
+    /// clipboard itself, such as over SSH.
+    terminal_clipboard_reader: clipboard_protocol.Reader = .{},
     deferred_terminal_input_source: ?DeferredTerminalInputSource = null,
     deferred_session_input: std.ArrayList(DeferredSessionInput) = .empty,
     deferred_session_input_index: usize = 0,
@@ -599,6 +603,7 @@ pub const Runtime = struct {
         if (dropped > 0) debug_trace.logf("input", "deferred session input dropped bytes={d} reason=shutdown", .{dropped});
         self.deferred_session_input.deinit(alloc);
         self.native_clear_probe.deinit(alloc);
+        self.terminal_clipboard_reader.deinit(alloc);
     }
 
     pub fn hasDeferredSessionInput(self: *const Runtime) bool {

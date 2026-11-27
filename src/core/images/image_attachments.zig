@@ -11,6 +11,7 @@ const image_data = @import("image_data.zig");
 const image_route = @import("image_route.zig");
 const io_mod = @import("../shared/io.zig");
 const png_downscale = @import("png_downscale.zig");
+const terminal_env = @import("../shared/terminal_env.zig");
 const types = @import("../shared/types.zig");
 const pathing = @import("../workspace/pathing.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -2067,6 +2068,39 @@ pub const ClipboardImageAttachment = struct {
         self.* = undefined;
     }
 };
+
+/// Whether fx can read the clipboard image itself, which only a local macOS
+/// session can. Over SSH, `osascript` would read the clipboard of the machine
+/// fx runs on, not the user's; the terminal must send the image instead.
+pub fn nativeClipboardImageReadable() bool {
+    return builtin.target.os.tag == .macos and !terminal_env.sshSession();
+}
+
+/// Stores clipboard image bytes, such as the PNG a terminal sent, the same way
+/// `loadClipboardImageAttachment` stores what it reads: as a temporary source
+/// that insertion snapshots and then removes. The caller owns the result.
+pub fn clipboardImageAttachmentFromBytes(alloc: std.mem.Allocator, bytes: []const u8) !ClipboardImageAttachment {
+    if (bytes.len > max_image_bytes) return error.ImageTooLarge;
+    const source_dir = try createTempSnapshotDir(alloc);
+    errdefer {
+        cleanupSnapshotDir(source_dir);
+        alloc.free(source_dir);
+    }
+    const temp_path = try std.Io.Dir.path.join(alloc, &.{ source_dir, "clipboard.png" });
+    defer alloc.free(temp_path);
+    {
+        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), temp_path, .{
+            .exclusive = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        });
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), bytes);
+    }
+    return .{
+        .attachment = try loadImageAttachment(alloc, temp_path),
+        .source_dir = source_dir,
+    };
+}
 
 pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
     if (builtin.target.os.tag != .macos) return error.Unsupported;
@@ -4880,4 +4914,32 @@ test "eb03: verifySnapshotFile rejects a FIFO without blocking" {
     try std.testing.expectEqual(@as(c_int, 0), mkfifo(fifo_path.ptr, 0o600));
     const fake_sha: [snapshot_digest_hex_len]u8 = @splat('0');
     try std.testing.expect(!verifySnapshotFile(fifo_path, &fake_sha, "image/png"));
+}
+
+test "clipboard image bytes become a temporary attachment that deinit removes" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\n" ++ "terminal clipboard";
+    var loaded = try clipboardImageAttachmentFromBytes(alloc, png);
+    const source_dir = try alloc.dupe(u8, loaded.source_dir);
+    defer alloc.free(source_dir);
+    {
+        const attachment = loaded.attachment.?;
+        try std.testing.expectEqualStrings("image/png", attachment.media_type);
+        try std.testing.expect(std.mem.startsWith(u8, attachment.path, source_dir));
+        var file = try std.Io.Dir.openFileAbsolute(std.testing.io, attachment.path, .{});
+        defer file.close(std.testing.io);
+        const stored = try io_mod.readFileToEnd(alloc, &file, 1024);
+        defer alloc.free(stored);
+        try std.testing.expectEqualStrings(png, stored);
+    }
+    loaded.deinit(alloc);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(std.testing.io, source_dir, .{}));
+}
+
+test "clipboard image bytes reject oversized and unknown data" {
+    const alloc = std.testing.allocator;
+    const oversized = try alloc.alloc(u8, max_image_bytes + 1);
+    defer alloc.free(oversized);
+    try std.testing.expectError(error.ImageTooLarge, clipboardImageAttachmentFromBytes(alloc, oversized));
+    try std.testing.expectError(error.UnsupportedImageType, clipboardImageAttachmentFromBytes(alloc, "not an image"));
 }

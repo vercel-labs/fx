@@ -1,6 +1,7 @@
 const std = @import("std");
 const activity_runtime = @import("../core/output/activity_runtime.zig");
 const builtin = @import("builtin");
+const clipboard_protocol = @import("terminal/clipboard_protocol.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const terminal_env = @import("../core/shared/terminal_env.zig");
@@ -245,6 +246,12 @@ pub const TerminalState = struct {
     pub fn requestThemeBackground(_: TerminalState) !void {
         var stdout_file = std.Io.File.stdout();
         try stdout_file.writeStreamingAll(io_mod.getIo(), ui_terminal.theme_background_query_with_fence);
+    }
+
+    /// Asks the terminal for the clipboard image (`clipboard_protocol`).
+    pub fn requestClipboardImage(_: TerminalState) !void {
+        var stdout_file = std.Io.File.stdout();
+        try stdout_file.writeStreamingAll(io_mod.getIo(), clipboard_protocol.image_read_request);
     }
 
     pub fn read(self: TerminalState, out: []u8) !usize {

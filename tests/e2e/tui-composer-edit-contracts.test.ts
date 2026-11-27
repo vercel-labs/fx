@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv } from "../evals/eval-helpers";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
@@ -40,10 +40,14 @@ let root: string | null = null;
 let stderrPath: string | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
 let fixtureImagePath: string | null = null;
+let ptyFx: ReturnType<typeof Bun.spawn> | null = null;
 
 afterEach(async () => {
   await session?.kill();
   session = null;
+  ptyFx?.kill();
+  await ptyFx?.exited;
+  ptyFx = null;
   gateway?.stop();
   gateway = null;
   if (root) rmSync(root, { recursive: true, force: true });
@@ -1262,6 +1266,160 @@ tmuxTest(
     await waitForGatewayRequest(4);
     expect(finalUserText(3)).toBe("DELETE_OK");
     expectCleanRuntime(active);
+  },
+  TIMEOUT,
+);
+
+const ONE_PIXEL_PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const CLIPBOARD_IMAGE_REQUEST = "\x1b[?5522$p\x1b]5522;type=read;aW1hZ2UvcG5n\x1b\\";
+
+let ptyOutput = "";
+// Called by the pty's data handler when fx writes more output.
+let onPtyOutput: (() => void) | null = null;
+
+function visibleText(output: string): string {
+  return output
+    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-9;?<>=]*[ -\/]*[@-~]/g, "");
+}
+
+// Waits on fx's output, not on a clock: each check runs when fx writes more.
+// The test's own timeout bounds the wait.
+async function waitForOutput(check: () => boolean, label: string): Promise<void> {
+  const exited = ptyFx!.exited.then(() => `fx exited while waiting for ${label}`);
+  while (!check()) {
+    const reason = await Promise.race([
+      new Promise<null>((resolve) => {
+        onPtyOutput = () => resolve(null);
+      }),
+      exited,
+    ]);
+    if (reason) throw new Error(reason);
+  }
+}
+
+function writeToFx(bytes: string): void {
+  ptyFx!.terminal!.write(bytes);
+}
+
+// tmux keeps the kitty clipboard protocol (OSC 5522) from the pane, so these
+// tests are the terminal themselves: they run fx on its own pty and answer the
+// way Ghostty 1.4 and kitty answer over SSH.
+async function startFxOnPty(): Promise<void> {
+  root = realpathSync(mkdtempSync(join(tmpdir(), "fx-terminal-clipboard-")));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace);
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
+  gateway = startFakeGateway([fakeGatewayFinalText("clipboard image received")], {
+    models: [{
+      id: FAKE_GATEWAY_MODEL,
+      type: "language",
+      tags: ["vision", "file-input", "tool-use"],
+      context_window: 200_000,
+      max_tokens: 8_000,
+    }],
+  });
+
+  ptyOutput = "";
+  ptyFx = Bun.spawn([FX_BIN], {
+    cwd: workspace,
+    env: fxChildEnv({
+      HOME: home,
+      TERM: "xterm-256color",
+      NO_COLOR: "1",
+      // fx is on the far side of SSH, so the terminal must send the image.
+      SSH_CONNECTION: "203.0.113.7 52144 198.51.100.9 22",
+      TMUX: undefined,
+      AI_GATEWAY_API_KEY: "fake-terminal-clipboard-key",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_MODEL: FAKE_GATEWAY_MODEL,
+      FX_AUTO_UPGRADE: "0",
+      FX_SOUND: "0",
+      FX_TEST_SKIP_WORKSPACE_TRUST: "1",
+    }),
+    terminal: {
+      cols: 112,
+      rows: 32,
+      data(terminal, chunk) {
+        const text = Buffer.from(chunk).toString("latin1");
+        ptyOutput += text;
+        // Answer the queries every terminal answers.
+        if (text.includes("\x1b[6n")) terminal.write("\x1b[32;1R");
+        if (text.includes("\x1b[c")) terminal.write("\x1b[?62;22;52c");
+        const wake = onPtyOutput;
+        onPtyOutput = null;
+        wake?.();
+      },
+    },
+  });
+  await waitForOutput(() => visibleText(ptyOutput).includes("Run /help for commands"), "the composer");
+}
+
+// Presses Ctrl+V and waits for fx to ask the terminal for the image.
+async function requestClipboardImage(): Promise<void> {
+  const beforeRequest = ptyOutput.length;
+  writeToFx("\x16");
+  await waitForOutput(
+    () => ptyOutput.slice(beforeRequest).includes(CLIPBOARD_IMAGE_REQUEST),
+    "the clipboard request",
+  );
+}
+
+test(
+  "Ctrl+V over SSH attaches the image the terminal sends with OSC 5522",
+  async () => {
+    await startFxOnPty();
+    await requestClipboardImage();
+    writeToFx("\x1b[?5522;2$y");
+    writeToFx("\x1b]5522;type=read:status=OK\x1b\\");
+    writeToFx(`\x1b]5522;type=read:status=DATA:mime=aW1hZ2UvcG5n;${ONE_PIXEL_PNG_BASE64}\x1b\\`);
+    writeToFx("\x1b]5522;type=read:status=DONE\x1b\\");
+    await waitForOutput(() => visibleText(ptyOutput).includes("[Image 1]"), "the image badge");
+
+    writeToFx(" describe");
+    writeToFx("\r");
+    await waitForGatewayRequest();
+
+    expect(finalUserText()).toBe("[Image #1] describe");
+    expect(userParts().filter((part) => part.type === "file")).toHaveLength(1);
+    // No byte of the reply reached the composer or the screen.
+    expect(visibleText(ptyOutput)).not.toContain("status=");
+    expect(visibleText(ptyOutput)).not.toContain(ONE_PIXEL_PNG_BASE64.slice(0, 16));
+    expect(ptyFx!.exitCode).toBeNull();
+  },
+  TIMEOUT,
+);
+
+test(
+  "a clipboard reply that stalls inside its prefix never reaches the composer",
+  async () => {
+    await startFxOnPty();
+    await requestClipboardImage();
+    writeToFx("\x1b[?5522;2$y");
+
+    // The network stalls after the first bytes of the next packet. With a
+    // request open, fx holds them, gives up after a second, and says so.
+    const beforeStall = ptyOutput.length;
+    writeToFx("\x1b]5");
+    await waitForOutput(
+      () => visibleText(ptyOutput.slice(beforeStall)).includes("didn't send the clipboard image"),
+      "the timeout notice",
+    );
+
+    // The rest of the packet arrives late, then the person types.
+    writeToFx("522;type=read:status=OK\x1b\\");
+    writeToFx("zq9");
+    await waitForOutput(() => visibleText(ptyOutput.slice(beforeStall)).includes("zq9"), "the typed text");
+
+    const screen = visibleText(ptyOutput.slice(beforeStall));
+    expect(screen).not.toContain("type=read");
+    expect(screen).not.toContain("5522");
+    expect(ptyFx!.exitCode).toBeNull();
   },
   TIMEOUT,
 );

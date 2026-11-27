@@ -48,6 +48,7 @@ const allowlist: AllowRule[] = [
   rule("src/ui/shell_runtime.zig", "ensureInteractive", /fixed_descriptor/, "terminal_probe", "TTY capability probe"),
   rule("src/ui/shell_runtime.zig", "(?:query|requestResize)CursorPosition", /stdio_(?:acquisition|write)/, "terminal_probe", "cursor-position query"),
   rule("src/ui/shell_runtime.zig", "(?:requestThemeColorScheme|requestThemeResponseFence|requestThemeBackground)", /stdio_(?:acquisition|write)/, "terminal_probe", "terminal theme query"),
+  rule("src/ui/shell_runtime.zig", "requestClipboardImage", /stdio_(?:acquisition|write)/, "terminal_probe", "terminal clipboard image request"),
   rule("src/ui/terminal/theme_detection.zig", "queryTerminalBackground", /stdio_(?:acquisition|write)/, "terminal_probe", "terminal background query"),
   rule("src/ui/ask_presentation.zig", "init", /fixed_descriptor/, "terminal_probe", "ask stdout geometry probe"),
   rule("src/ui/ask_presentation.zig", "init", /stdio_acquisition/, "interactive_terminal_owner", "stored ask presenter stdout handle"),
