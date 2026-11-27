@@ -739,9 +739,16 @@ pub const WorkerRuntime = struct {
     accepted_input_hooks: ?AcceptedInputHooks = null,
     /// Set on the main loop when an upgrade's restart waits for this agent
     /// (Ctrl+G). The running turn reads it at each step boundary and stops
-    /// there (`Config.yield_flag`), and no other work starts while it is set,
-    /// since fx exits once every turn has stopped.
+    /// there (`Config.yield_flag`), and no other work starts while it is set:
+    /// fx exits once every turn has stopped, unless a second Ctrl+G cancels
+    /// the restart and clears it (`cancelYield`).
     yield_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// The main loop let a turn held for the restart return. Guarded by `worker_mutex`.
+    yield_released: bool = false,
+    /// The running turn holds at its step boundary for the restart. Guarded by `worker_mutex`.
+    yield_held: bool = false,
+    /// `requestYield` set `mail_nudged` and no wait took it yet. Guarded by `worker_mutex`.
+    yield_nudged: bool = false,
     next_permission_request_id: u64 = 1,
     pending_permission_response: ?permission_request.OwnedPermissionResponse = null,
     pending_permission_request_shared: ?permission_request.OwnedPermissionRequest = null,
@@ -1510,6 +1517,8 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         self.mail_nudged = true;
+        // A real nudge: a cancelled restart keeps it.
+        self.yield_nudged = false;
         self.worker_cond.broadcast(io_mod.getIo());
     }
 
@@ -1523,11 +1532,13 @@ pub const WorkerRuntime = struct {
             if (self.worker_stop_requested or self.worker_cancel_requested.load(.seq_cst)) return .stopped;
             if (self.mail_nudged) {
                 self.mail_nudged = false;
+                self.yield_nudged = false;
                 return .nudged;
             }
             self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch return .stopped;
         }
         self.mail_nudged = false;
+        self.yield_nudged = false;
         return .posted;
     }
 
@@ -1541,6 +1552,7 @@ pub const WorkerRuntime = struct {
             if (self.worker_stop_requested or self.worker_cancel_requested.load(.seq_cst)) return .stopped;
             if (self.mail_nudged) {
                 self.mail_nudged = false;
+                self.yield_nudged = false;
                 return .nudged;
             }
             self.worker_cond.waitTimeout(io_mod.getIo(), &self.worker_mutex, timeout) catch |err| return switch (err) {
@@ -1549,6 +1561,7 @@ pub const WorkerRuntime = struct {
             };
         }
         self.mail_nudged = false;
+        self.yield_nudged = false;
         return .posted;
     }
 
@@ -2313,18 +2326,94 @@ pub const WorkerRuntime = struct {
         return true;
     }
 
+    /// How a turn held for an upgrade's restart ends (`holdForRestart`).
+    pub const RestartHoldEnd = enum {
+        /// The restart was cancelled: the turn sends its request.
+        go_on,
+        /// The restart goes ahead, or the worker stops: the turn returns
+        /// `error.TurnYielded`.
+        stop,
+        /// The turn was cancelled, as Esc twice or `/quit` do: it ends cancelled.
+        cancelled,
+    };
+
+    /// What a worker's turn does now, for the restart's wait.
+    const TurnActivity = enum { idle, running, held_for_restart };
+
     /// Asks the running turn to stop at its next step boundary and holds
-    /// every queued work, for an upgrade's restart. There is no release: the
-    /// process exits once every turn has stopped.
+    /// every queued work, for an upgrade's restart. The turn then holds there
+    /// (`holdForRestart`) until the main loop lets it return (`releaseYield`)
+    /// or the restart is cancelled (`cancelYield`).
     pub fn requestYield(self: *WorkerRuntime) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         self.yield_requested.store(true, .seq_cst);
+        self.yield_released = false;
         // A turn blocked in the subagent `wait` tool returns, so it reaches
         // its step boundary without waiting for the subagent's report.
-        self.mail_nudged = true;
+        if (!self.mail_nudged) {
+            self.mail_nudged = true;
+            self.yield_nudged = true;
+        }
         self.worker_cond.broadcast(io_mod.getIo());
         debug_trace.logf("worker", "event=yield_requested processing={} queued={d}", .{ self.worker_processing, self.queuedWorkCountLocked() });
+    }
+
+    /// Lets a turn held for the restart return, so fx can exit for it.
+    pub fn releaseYield(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.yield_requested.load(.seq_cst)) return;
+        self.yield_released = true;
+        self.worker_cond.broadcast(io_mod.getIo());
+        debug_trace.logf("worker", "event=yield_released held={}", .{self.yield_held});
+    }
+
+    /// Takes back `requestYield` when the restart is cancelled: a held turn
+    /// goes on, queued work flows again, and a nudge the request made that no
+    /// wait took is dropped, so it cannot end a later `wait`.
+    pub fn cancelYield(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.yield_requested.load(.seq_cst)) return;
+        self.yield_requested.store(false, .seq_cst);
+        self.yield_released = false;
+        if (self.yield_nudged) {
+            self.mail_nudged = false;
+            self.yield_nudged = false;
+        }
+        self.worker_cond.broadcast(io_mod.getIo());
+        debug_trace.logf("worker", "event=yield_cancelled held={} processing={} queued={d}", .{ self.yield_held, self.worker_processing, self.queuedWorkCountLocked() });
+    }
+
+    /// Called on the turn's own thread once it stopped at its step boundary
+    /// for the restart, with its record saved clean and the turn marked
+    /// yielded. Waits until the restart is cancelled, the main loop lets it
+    /// return, the worker stops, or the turn is cancelled. A turn cancel
+    /// wins, so Esc twice ends the turn even after the release
+    /// (`tests/tla/recovery/RestartWait.tla` HeldOnlyWhileRestartWaits).
+    pub fn holdForRestart(self: *WorkerRuntime) RestartHoldEnd {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.yield_held = true;
+        // Wakes a thread that waits to see the hold start.
+        self.worker_cond.broadcast(io_mod.getIo());
+        defer self.yield_held = false;
+        debug_trace.logf("worker", "event=turn_held_for_restart turn_id={d}", .{self.active_turn_id});
+        while (true) {
+            if (self.worker_cancel_requested.load(.seq_cst)) return .cancelled;
+            if (!self.yield_requested.load(.seq_cst)) return .go_on;
+            if (self.yield_released or self.worker_stop_requested) return .stop;
+            self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch return .stop;
+        }
+    }
+
+    /// What this worker's turn does now, read under one lock.
+    pub fn turnActivity(self: *WorkerRuntime) TurnActivity {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.worker_processing) return .idle;
+        return if (self.yield_held) .held_for_restart else .running;
     }
 
     /// Whether the queued prompt for `turn_id` carries the stale shell
@@ -10175,6 +10264,90 @@ test "a yield request ends a wait for subagent mail" {
     defer runtime.deinit(std.testing.allocator);
     runtime.requestYield();
     try std.testing.expectEqual(WorkerRuntime.PostWake.nudged, runtime.waitForPostOrNudge());
+}
+
+test "a cancelled restart lets the work it held go" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "held", "test/model"));
+    runtime.requestYield();
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    runtime.cancelYield();
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    defer freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("held", work.prompt.prompt);
+}
+
+test "a turn held for the restart goes on once the restart is cancelled" {
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(std.testing.allocator);
+    runtime.requestYield();
+    runtime.cancelYield();
+    try std.testing.expectEqual(WorkerRuntime.RestartHoldEnd.go_on, runtime.holdForRestart());
+}
+
+test "a turn held for the restart stops once it is released" {
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(std.testing.allocator);
+    runtime.requestYield();
+    runtime.releaseYield();
+    try std.testing.expectEqual(WorkerRuntime.RestartHoldEnd.stop, runtime.holdForRestart());
+}
+
+test "a held turn that is cancelled ends cancelled even after the release" {
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(std.testing.allocator);
+    runtime.requestYield();
+    runtime.releaseYield();
+    runtime.requestInteractiveCancel();
+    try std.testing.expectEqual(WorkerRuntime.RestartHoldEnd.cancelled, runtime.holdForRestart());
+}
+
+test "a held turn wakes when the restart is cancelled" {
+    const Holder = struct {
+        fn run(held: *WorkerRuntime, result: *WorkerRuntime.RestartHoldEnd) void {
+            result.* = held.holdForRestart();
+        }
+    };
+    const io = io_mod.getIo();
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(std.testing.allocator);
+    var result: WorkerRuntime.RestartHoldEnd = .stop;
+    runtime.requestYield();
+    runtime.worker_processing = true;
+    const thread = try std.Thread.spawn(.{}, Holder.run, .{ &runtime, &result });
+
+    // Wait for the hold to start, then cancel the restart while it holds.
+    runtime.worker_mutex.lockUncancelable(io);
+    while (!runtime.yield_held) try runtime.worker_cond.wait(io, &runtime.worker_mutex);
+    runtime.worker_mutex.unlock(io);
+    const held_while_waiting = runtime.turnActivity();
+    runtime.cancelYield();
+    thread.join();
+    const activity_after = runtime.turnActivity();
+    runtime.worker_processing = false;
+
+    try std.testing.expectEqual(WorkerRuntime.TurnActivity.held_for_restart, held_while_waiting);
+    try std.testing.expectEqual(WorkerRuntime.RestartHoldEnd.go_on, result);
+    try std.testing.expectEqual(WorkerRuntime.TurnActivity.running, activity_after);
+}
+
+test "a cancelled restart takes back the nudge it made" {
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(std.testing.allocator);
+    runtime.requestYield();
+    runtime.cancelYield();
+    try std.testing.expectEqual(@as(?WorkerRuntime.PostWake, null), runtime.waitForPostOrNudgeTimeout(joinedMailBound(1)));
+}
+
+test "a cancelled restart keeps a nudge a subagent made" {
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(std.testing.allocator);
+    runtime.nudgeWaiter();
+    runtime.requestYield();
+    runtime.cancelYield();
+    try std.testing.expectEqual(@as(?WorkerRuntime.PostWake, .nudged), runtime.waitForPostOrNudgeTimeout(joinedMailBound(1)));
 }
 
 test "a time-bounded put-back hands its segment scan to the next take only" {
