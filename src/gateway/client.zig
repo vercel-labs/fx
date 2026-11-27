@@ -20,7 +20,7 @@ const tool_call_ids = @import("tool_call_ids.zig");
 const request_deadlines = @import("request_deadlines.zig");
 const json_depth = @import("../core/shared/json_depth.zig");
 const host_stream_provider = @import("host_stream_provider.zig");
-const open_job = @import("open_job.zig");
+const open_job = @import("../core/shared/open_job.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
@@ -1381,7 +1381,7 @@ const RequestOpenOperation = struct {
 };
 
 /// A request's connection open, on a thread of its own so the request can
-/// walk away from a DNS lookup or connect that hangs (`open_job.zig`).
+/// walk away from a DNS lookup or connect that hangs (`src/core/shared/open_job.zig`).
 ///
 /// A pooled open runs on the pool's client, which the pool keeps until its
 /// jobs are gone (`HttpPool.deinit`). Any other open runs on a client the job

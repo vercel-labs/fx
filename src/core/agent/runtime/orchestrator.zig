@@ -4329,6 +4329,7 @@ fn persistPromptBeforeCapture(
         append(deps.ctx, .{
             .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
             .execution = projected,
+            .saved_execution = finalization.savedExecution(execution),
         }) catch |err| break :saved err;
         return;
     };
@@ -4359,6 +4360,7 @@ fn appendRunningToolCalls(
     try append(deps.ctx, .{
         .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
         .execution = try finalization.persistedExecution(arena, execution),
+        .saved_execution = finalization.savedExecution(execution),
         .running_calls = running,
         .running_assistant = issuing.content,
     });
@@ -4516,7 +4518,7 @@ fn persistRecoveryCheckpointWithAction(
     const projected = try finalization.persistedExecution(arena, execution);
     const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id };
     // Every completed piece reaches the session before the next request.
-    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected, .recovery_record = record });
+    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected, .saved_execution = finalization.savedExecution(execution), .recovery_record = record });
     const effect = deps.recovery_checkpoint orelse return;
     try effect.set(deps.ctx, .{
         .turn_id = job.turn_id,
@@ -10700,6 +10702,7 @@ fn processQueuedPromptLoop(
                 .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
                 .assistant = @constCast(assistant_text),
                 .execution = try finalization.persistedExecution(arena, finish_execution),
+                .saved_execution = finalization.savedExecution(finish_execution),
             } };
             types.setHistoryTurnSummary(&turn, completed_summary);
             try deps.propagate_history_turn(deps.ctx, turn);
@@ -11308,10 +11311,7 @@ fn processQueuedPromptLoop(
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
         empty_reply_nudged = false;
         if (step_has_content) {
-            // The model's own call, so a toolbox question keeps the break that ends the prose in `fx ask`.
-            const first_tool_is_ask = effective_tool_calls.len > 0 and
-                tool_dispatch.toolActivityKindForCall(arena, deps.tool_registry, effective_tool_calls[0]) == .ask;
-            if (!first_tool_is_ask) try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+            try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
             silent_tool_steps = 0;
         } else {
             silent_tool_steps += 1;
@@ -13780,6 +13780,7 @@ fn finishFailedTurnWithNotice(
         .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
         .assistant = @constCast(notice),
         .execution = try finalization.persistedExecution(arena, execution_memory),
+        .saved_execution = finalization.savedExecution(execution_memory),
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     try deps.propagate_history_turn(deps.ctx, turn);
