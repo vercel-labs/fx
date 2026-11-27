@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
 import { LineQueue } from "./line-queue";
 import { savedText } from "./saved-sessions";
 import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
@@ -252,7 +252,7 @@ class AcpClient {
 
   static create(cwd: string, env: Record<string, string | undefined>) {
     const definedEnv = Object.fromEntries(
-      Object.entries({ ...process.env, NO_COLOR: "1", ...env }).filter(
+      Object.entries(fxChildEnv({ NO_COLOR: "1", ...env })).filter(
         (entry): entry is [string, string] => entry[1] !== undefined,
       ),
     );
@@ -678,15 +678,12 @@ describe("web_fetch Gateway fixture", () => {
         outerText("unexpected completion after SIGINT"),
       ]);
       const env = Object.fromEntries(
-        Object.entries({
-          ...process.env,
-          ...fakeGatewayEnv(root, gateway, {
-            FX_SOUND: "0",
-            FX_AUTO_UPGRADE: "0",
-            FX_DISABLE_KEYCHAIN: "1",
-            ...boundary.env,
-          }),
-        }).filter((entry): entry is [string, string] => entry[1] !== undefined),
+        Object.entries(fxChildEnv(fakeGatewayEnv(root, gateway, {
+          FX_SOUND: "0",
+          FX_AUTO_UPGRADE: "0",
+          FX_DISABLE_KEYCHAIN: "1",
+          ...boundary.env,
+        }))).filter((entry): entry is [string, string] => entry[1] !== undefined),
       );
       const proc = Bun.spawn([FX_BIN, "ask", "--auto", "--json", "--no-save", "Fetch docs."], {
         cwd: root.workspace,
