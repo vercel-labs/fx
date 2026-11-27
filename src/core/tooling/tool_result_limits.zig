@@ -186,6 +186,9 @@ test "prepareModelOutput caps chatty output with explicit marker" {
 
     try std.testing.expect(output.len <= 128);
     try std.testing.expect(std.mem.find(u8, output, "... [tool result truncated for grep_files: original 256 bytes; cap is 128 bytes]") != null);
+    // The text ends with the marker, written from the words `tool_result_cut_marker` shares with the reader.
+    const marker = tool_result_cut_marker.cut_marker_start ++ "grep_files: original 256 bytes; cap is 128" ++ tool_result_cut_marker.cut_marker_end;
+    try std.testing.expect(std.mem.endsWith(u8, output, marker));
 }
 
 test "prepareModelOutput keeps complete codepoints at the cap" {

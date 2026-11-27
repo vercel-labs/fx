@@ -3795,6 +3795,58 @@ describe("cli: sessions", () => {
   );
 
   test(
+    "session lists return every session for small and large stores",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-sizes-"));
+      try {
+        // 40 sessions is past sessions_before_helper_threads in
+        // src/core/session/session_catalog_cache.zig, so it takes the helper threads.
+        for (const sessions of [8, 40]) {
+          const home = join(root, `home-${sessions}`);
+          const workspace = join(root, `workspace-${sessions}`);
+          mkdirSync(home);
+          mkdirSync(workspace);
+          const workspaceRoot = realpathSync(workspace);
+          const fixture = spawnSync(
+            "python3",
+            [
+              join(REPO_ROOT, "benchmarks", "session_list_fixture.py"),
+              "--home",
+              home,
+              "--workspace",
+              workspaceRoot,
+              "--sessions",
+              String(sessions),
+              "--log-size",
+              "4096",
+            ],
+            { encoding: "utf8" },
+          );
+          expect(fixture.status).toBe(0);
+
+          const listed = await runFx(["sessions", "--json"], {
+            cwd: workspaceRoot,
+            env: { HOME: home },
+            timeoutMs: TIMEOUT,
+          });
+          expect(listed.code).toBe(0);
+          const page = JSON.parse(listed.stdout);
+          expect(page.count).toBe(sessions);
+          expect(page.sessions.map((session: { id: string }) => session.id)).toEqual(
+            Array.from(
+              { length: sessions },
+              (_, index) => `benchmark-session-${String(sessions - 1 - index).padStart(2, "0")}`,
+            ),
+          );
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "workspace-scoped session discovery filters list and last by cwd",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-workspace-sessions-"));
