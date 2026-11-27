@@ -628,7 +628,12 @@ pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provide
             state.cfg.gateway_provider.oauth_transport,
             state.cfg.secret_store,
             provider,
-            if (provider == .gateway) state.gateway_source_preference else state.credential_source,
+            if (provider == .gateway)
+                state.gateway_source_preference
+            else if (model_provider.authorizesCredential(provider, state.credential_source))
+                state.credential_source
+            else
+                null,
         )) orelse return error.ProviderCredentialUnavailable;
     };
 }
@@ -3188,13 +3193,26 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         } else if (startup_credential_is_final)
             &startup_credential.?
         else routed: {
-            routed_credential = try auth_runtime.prepareCredential(
+            routed_credential = auth_runtime.prepareCredential(
                 alloc,
                 state.cfg.gateway_provider.oauth_transport,
                 state.cfg.secret_store,
                 state.provider,
-                if (state.provider == .gateway) startup.credential_source_preference else null,
-            );
+                if (model_provider.authorizesCredential(state.provider, startup.credential_source_preference))
+                    startup.credential_source_preference
+                else
+                    null,
+            ) catch |err| switch (err) {
+                error.GoogleSignInRequired => return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = credentials.google_sign_in_required_message,
+                }),
+                error.GoogleSessionDamaged => return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = credentials.google_session_damaged_message,
+                }),
+                else => return err,
+            };
             if (routed_credential == null) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
@@ -3843,7 +3861,18 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                         });
                     }
                 }
-                if (!try selectCredentialForProvider(state, session.provider)) {
+                const selected = selectCredentialForProvider(state, session.provider) catch |err| switch (err) {
+                    error.GoogleSignInRequired => return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.invalid_request,
+                        .message = credentials.google_sign_in_required_message,
+                    }),
+                    error.GoogleSessionDamaged => return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.invalid_request,
+                        .message = credentials.google_session_damaged_message,
+                    }),
+                    else => return err,
+                };
+                if (!selected) {
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
                         .message = if (session.provider == .codex)
@@ -3923,13 +3952,24 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .source = .ai_gateway_api_key,
                 }
             else credential: {
-                break :credential (try auth_runtime.prepareCredential(
+                const prepared = auth_runtime.prepareCredential(
                     alloc,
                     state.cfg.gateway_provider.oauth_transport,
                     state.cfg.secret_store,
                     target,
                     if (target == .gateway) state.gateway_source_preference else null,
-                )) orelse
+                ) catch |err| switch (err) {
+                    error.GoogleSignInRequired => return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.invalid_request,
+                        .message = credentials.google_sign_in_required_message,
+                    }),
+                    error.GoogleSessionDamaged => return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.invalid_request,
+                        .message = credentials.google_session_damaged_message,
+                    }),
+                    else => return err,
+                };
+                break :credential prepared orelse
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
                         .message = if (target == .codex)

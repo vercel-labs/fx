@@ -750,7 +750,7 @@ fn countText(alloc: Allocator, count: usize) ![]const u8 {
 
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
-    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription and source != .configured);
+    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription and source != .gemini_api_key and source != .configured);
 }
 
 fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
@@ -759,6 +759,10 @@ fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
 
 fn grokProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     return auth.grok_connected or auth.active_source == .grok_subscription;
+}
+
+fn googleProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
+    return auth.google_connected or auth.active_source == .google_subscription or auth.active_source == .gemini_api_key;
 }
 
 fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.StatusSnapshot) !void {
@@ -775,6 +779,11 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
     if (grokProviderConnected(auth)) {
         if (wrote_provider) try writer.writeAll(", Grok");
         if (!wrote_provider) try writer.writeAll("Grok");
+        wrote_provider = true;
+    }
+    if (googleProviderConnected(auth)) {
+        if (wrote_provider) try writer.writeAll(", Google");
+        if (!wrote_provider) try writer.writeAll("Google");
         wrote_provider = true;
     }
     if (!wrote_provider) try writer.writeAll("none");
@@ -1122,6 +1131,11 @@ pub const StatusSnapshot = struct {
             if (grokProviderConnected(self.auth)) {
                 if (wrote_provider) try writer.writeByte(',');
                 try std.json.Stringify.value("grok", .{}, writer);
+                wrote_provider = true;
+            }
+            if (googleProviderConnected(self.auth)) {
+                if (wrote_provider) try writer.writeByte(',');
+                try std.json.Stringify.value("google", .{}, writer);
             }
             try writer.writeByte(']');
         }
@@ -1424,6 +1438,7 @@ pub const ModelListSnapshot = struct {
             .gateway => "gateway",
             .codex => provider_catalog.label(.codex),
             .grok => provider_catalog.label(.grok),
+            .google => provider_catalog.label(.google),
             .configured => "configured provider",
         };
     }

@@ -11,6 +11,7 @@ const settings_store = @import("settings_store.zig");
 const settings_keys = @import("settings_keys.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
+const google_gemini_models = @import("../../gateway/google_gemini_models.zig");
 const model_preferences = @import("model_preferences.zig");
 const configured_provider = @import("configured_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -227,6 +228,7 @@ pub const ConfigDiagnosticCause = enum {
     invalid_additional_directories,
     invalid_skill_symlink_authorities,
     invalid_ultrafast_mode_override,
+    reserved_provider_id,
 };
 
 pub const ConfigDiagnostic = struct {
@@ -256,6 +258,10 @@ pub const ConfigDiagnostic = struct {
 };
 
 pub fn writeDiagnosticMetadata(writer: *std.Io.Writer, diagnostic: ConfigDiagnostic) !void {
+    if (diagnostic.cause == .reserved_provider_id) {
+        if (diagnostic.setting_key) |warning| try writer.print("; {s}", .{warning});
+        return;
+    }
     if (diagnostic.setting_key) |key| try writer.print("; key={s}", .{key});
     if (diagnostic.recovery_path) |path| try writer.print("; recovery={s}", .{path});
     if (diagnostic.cause == .retired_skill_match_fuzzy) {
@@ -340,9 +346,10 @@ pub const ModelSelectionError = error{
 };
 
 /// Chooses the provider and the model it persists as its preference. A saved
-/// model wins; Gateway falls back to `default_model`; providers without a
-/// built-in default accept `run_model` (--model or FX_MODEL) for this run.
-/// The result borrows from its arguments.
+/// model wins. Gateway falls back to `default_model`, and Google to its fixed
+/// default; `run_model` (--model or FX_MODEL) wins over the Google default for
+/// this run. Codex, Grok, and custom connections have no default and accept
+/// `run_model` only. The result borrows from its arguments.
 pub fn selectProviderModel(
     default_model: []const u8,
     settings: *const Settings,
@@ -354,6 +361,7 @@ pub fn selectProviderModel(
         .gateway => default_model,
         .codex => run_model orelse return error.CodexModelNotSelected,
         .grok => run_model orelse return error.GrokModelNotSelected,
+        .google => run_model orelse google_gemini_models.default_model,
         .configured => run_model orelse return error.ConfiguredModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
@@ -1069,19 +1077,42 @@ fn mergeDetailedSettingsLayer(
                 },
             }
         }
+        if (incoming.providers) |providers| {
+            try appendProviderWarnings(alloc, state.diagnostics, diagnostic_layer, providers);
+        }
         try mergeSettings(state.settings, &incoming, alloc);
     } else |err| {
         if (err == error.OutOfMemory) return err;
         if (diagnostic_layer == .user and value == .object) {
-            _ = salvageProviderRouting(alloc, state.settings, state.sources, value, if (source == .user_workspace) .profile_workspace else settings_layer, source) catch |salvage_err| switch (salvage_err) {
+            const salvaged = salvageProviderRouting(alloc, state.settings, state.sources, value, if (source == .user_workspace) .profile_workspace else settings_layer, source) catch |salvage_err| switch (salvage_err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidProviderRouting => return err,
+            };
+            if (salvaged) if (state.settings.providers) |providers| {
+                try appendProviderWarnings(alloc, state.diagnostics, diagnostic_layer, providers);
             };
         }
         if (diagnostic_layer == .user and err == error.InvalidModelValue) state.prompt_history_store_allowed.* = false;
         try state.diagnostics.append(alloc, .{
             .layer = diagnostic_layer,
             .cause = diagnosticCauseForParseError(err),
+        });
+    }
+}
+
+fn appendProviderWarnings(
+    alloc: Allocator,
+    diagnostics: *std.ArrayList(ConfigDiagnostic),
+    layer: ConfigLayer,
+    providers: configured_provider.Registry,
+) Allocator.Error!void {
+    for (providers.warnings) |warning| {
+        const owned = try alloc.dupe(u8, warning);
+        errdefer alloc.free(owned);
+        try diagnostics.append(alloc, .{
+            .layer = layer,
+            .cause = .reserved_provider_id,
+            .setting_key = owned,
         });
     }
 }
@@ -3016,6 +3047,48 @@ test "invalid skill_symlink_authorities reports a specific diagnostic" {
     try std.testing.expect(found);
 }
 
+test "late reserved custom connection keeps loading sibling connections with a warning" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        \\{"effort":"high","providers":{"google":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"none"}},"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1","auth":{"type":"none"}}}}
+        ,
+    );
+
+    var detailed = try loadMergedSettingsDetailedFromHome(alloc, home_root, workspace_root);
+    defer detailed.deinit(alloc);
+    try std.testing.expectEqualStrings("high", detailed.settings.effort.?.label());
+    const registry = detailed.settings.providers.?;
+    try std.testing.expectEqual(@as(usize, 1), registry.definitions.len);
+    try std.testing.expect(registry.get("local") != null);
+    try std.testing.expect(registry.get("google") == null);
+
+    var found = false;
+    for (detailed.diagnostics) |diagnostic| {
+        if (diagnostic.layer != .user or diagnostic.cause != .reserved_provider_id) continue;
+        found = true;
+        var buffer: [512]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try writeDiagnosticMetadata(&writer, diagnostic);
+        try std.testing.expect(std.mem.find(
+            u8,
+            writer.buffered(),
+            "providers.google: google is now fx's own provider; rename this connection to keep using it",
+        ) != null);
+    }
+    try std.testing.expect(found);
+}
+
 test "collapse tool calls parses merges and rejects invalid types" {
     var absent = try parseSettingsJson(std.testing.allocator, "{}");
     defer absent.deinit(std.testing.allocator);
@@ -4921,6 +4994,13 @@ test "selectProviderModel accepts the run model when the provider has none saved
     // Gateway keeps its compiled default as the persisted preference.
     const gateway = try selectProviderModel("default/model", &gateway_only, null, "gpt-env");
     try std.testing.expectEqualStrings("default/model", gateway.model);
+}
+
+test "selectProviderModel picks the Google default model when none is saved" {
+    const missing_google = Settings{ .provider = .google };
+    const selection = try selectProviderModel("default/model", &missing_google, null, null);
+    try std.testing.expectEqual(model_provider.ProviderId.google, selection.provider);
+    try std.testing.expectEqualStrings("gemini-4-hydrogen", selection.model);
 }
 
 test "modelNotSelectedMessage names the provider and both ways to recover" {

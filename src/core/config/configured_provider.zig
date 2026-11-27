@@ -323,8 +323,9 @@ pub fn header_value(value: ?[]const u8) HeaderValue {
 
 pub const Registry = struct {
     definitions: []const Definition = &.{},
-    /// Holds every slice the definitions point at. Null for an empty registry
-    /// and for a view built from another registry's `definitions`.
+    warnings: []const []const u8 = &.{},
+    /// Holds every slice the definitions and warnings point at. Null for an
+    /// empty registry and for a view built from another registry's `definitions`.
     arena: ?*std.heap.ArenaAllocator = null,
 
     /// Parse the providers object itself, not the surrounding settings object.
@@ -348,15 +349,29 @@ pub const Registry = struct {
             alloc.destroy(arena);
         }
         const owned = arena.allocator();
-        const definitions = try owned.alloc(Definition, providers.object.count());
+        const definitions_buf = try owned.alloc(Definition, providers.object.count());
+        var warnings_list: std.ArrayList([]const u8) = .empty;
         var iterator = providers.object.iterator();
         var index: usize = 0;
-        while (iterator.next()) |entry| : (index += 1) {
+        while (iterator.next()) |entry| {
+            if (late_reserved_name(entry.key_ptr.*)) |reserved| {
+                const warning = try owned.print(
+                    "providers.{s}: {s} is now fx's own provider; rename this connection to keep using it",
+                    .{ entry.key_ptr.*, reserved },
+                );
+                try warnings_list.append(owned, warning);
+                continue;
+            }
             enter(at, entry.key_ptr.*);
-            definitions[index] = try parse_definition(owned, entry.key_ptr.*, entry.value_ptr.*, at);
+            definitions_buf[index] = try parse_definition(owned, entry.key_ptr.*, entry.value_ptr.*, at);
             leave(at);
+            index += 1;
         }
-        return .{ .definitions = definitions, .arena = arena };
+        return .{
+            .definitions = definitions_buf[0..index],
+            .warnings = warnings_list.items,
+            .arena = arena,
+        };
     }
 
     /// Bounded, duplicate-rejecting convenience parser for a raw providers object.
@@ -690,6 +705,21 @@ fn required(value: std.json.Value, name: []const u8) ParseError!std.json.Value {
     return value.object.get(name) orelse error.MissingField;
 }
 
+/// Built-in provider names added after custom connections shipped; skipped
+/// with a non-fatal warning in saved `providers` so existing files stay usable.
+pub const late_reserved_ids = [_][]const u8{"google"};
+
+pub fn late_reserved_name(id: []const u8) ?[]const u8 {
+    for (late_reserved_ids) |reserved| {
+        if (std.ascii.eqlIgnoreCase(id, reserved)) return reserved;
+    }
+    return null;
+}
+
+pub fn is_late_reserved_id(id: []const u8) bool {
+    return late_reserved_name(id) != null;
+}
+
 // Named connection IDs are ASCII [A-Za-z][A-Za-z0-9_-]*. Built-in names are
 // reserved case-insensitively, matching the existing provider selector.
 pub fn validate_id(id: []const u8) error{ LimitExceeded, InvalidProviderId, ReservedProviderId }!void {
@@ -922,6 +952,26 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_search\":true}}}}", .err = error.UnknownField },
     };
     for (cases) |case| try std.testing.expectError(case.err, Registry.parse_json(std.testing.allocator, case.json));
+    try std.testing.expectError(error.ReservedProviderId, validate_id("Grok"));
+}
+
+test "late reserved provider name is skipped with warning while sibling connections load" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"google":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"none"}},
+        \\"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1","auth":{"type":"none"}}}
+    ;
+    var registry = try Registry.parse_json(alloc, json);
+    defer registry.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), registry.definitions.len);
+    try std.testing.expect(registry.get("local") != null);
+    try std.testing.expect(registry.get("google") == null);
+    try std.testing.expectEqual(@as(usize, 1), registry.warnings.len);
+    try std.testing.expectEqualStrings(
+        "providers.google: google is now fx's own provider; rename this connection to keep using it",
+        registry.warnings[0],
+    );
 }
 
 test "configured provider auth admits only explicit none or a portable environment slot" {

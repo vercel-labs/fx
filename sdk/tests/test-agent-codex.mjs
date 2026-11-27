@@ -198,7 +198,7 @@ const assertNoSecrets = (value, secrets) => {
 
 // 4. Options are checked before anything starts.
 await assert.rejects(createFxEngine({ ...backendOptions, provider: "codex", model: "gpt-6.1-sol" }), /needs a credentials\(\) function/);
-await assert.rejects(createFxEngine({ ...backendOptions, provider: "custom", apiKey: "key" }), /provider must be "gateway", "codex", "grok" or a custom provider/);
+await assert.rejects(createFxEngine({ ...backendOptions, provider: "custom", apiKey: "key" }), /provider must be "gateway", "codex", "grok", "google" or a custom provider/);
 await assert.rejects(createFxEngine({ ...backendOptions, apiKey: "key", credentials: () => ({}) }), /credentials needs provider "codex"/);
 await assert.rejects(createFxEngine({ ...backendOptions, apiKey: "key", onCredentials: () => {} }), /onCredentials needs provider "codex"/);
 await assert.rejects(createFxEngine({ ...backendOptions }), /apiKey is required/);

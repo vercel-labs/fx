@@ -4,6 +4,8 @@ const api_key_validator = @import("api_key_validator.zig");
 const auth_transition = @import("auth_transition.zig");
 const credentials = @import("credentials.zig");
 const chatgpt_oauth = @import("chatgpt_oauth.zig");
+const gemini_api_key = @import("gemini_api_key.zig");
+const google_oauth = @import("google_oauth.zig");
 const grok_oauth = @import("grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
@@ -52,7 +54,13 @@ const credential_source_order = [_]credentials.Source{
     .stored_key,
     .chatgpt_subscription,
     .grok_subscription,
+    .google_subscription,
+    .gemini_api_key,
 };
+
+fn isGatewayCredentialSource(source: credentials.Source) bool {
+    return model_provider.authorizesCredential(.gateway, source);
+}
 
 const SourceProbeFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!bool;
 const CredentialLoaderFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!?credentials.Credential;
@@ -75,9 +83,17 @@ pub const CredentialFailureReason = enum {
     authority_changed,
 };
 
+pub fn isGoogleSessionDamagedError(err: anyerror) bool {
+    return err == error.GoogleSessionDamaged or
+        err == error.InvalidGoogleSession or
+        err == error.GoogleSessionTooLarge or
+        err == error.GoogleSessionTooManyAccounts;
+}
+
 pub const CredentialFailure = struct {
     source: credentials.Source,
     reason: CredentialFailureReason,
+    damaged_google_session: bool = false,
 
     pub fn retryable(self: CredentialFailure) bool {
         return self.reason == .temporary_unavailable;
@@ -94,6 +110,7 @@ pub fn classifyCredentialFailure(
 ) CredentialFailure {
     return .{
         .source = source,
+        .damaged_google_session = source == .google_subscription and isGoogleSessionDamagedError(err),
         .reason = switch (err) {
             error.InvalidGrant,
             error.AccessDenied,
@@ -102,6 +119,7 @@ pub fn classifyCredentialFailure(
             error.NoRefreshToken,
             error.CredentialRefreshRejected,
             error.CredentialRefreshUnavailable,
+            error.GoogleSignInRequired,
             => .invalid_credential,
             error.InvalidAuthSession,
             error.InvalidOAuthKeychainSession,
@@ -114,6 +132,12 @@ pub fn classifyCredentialFailure(
             error.StoredKeyInsecure,
             error.InvalidChatGptAuthSession,
             error.InvalidGrokAuthSession,
+            error.InvalidGoogleSession,
+            error.GoogleSessionTooLarge,
+            error.GoogleSessionTooManyAccounts,
+            error.GoogleSessionDamaged,
+            error.GoogleOAuthUnavailable,
+            error.GoogleClientNotConfigured,
             error.KeychainReadFailed,
             error.PrivateStatePermissionsUnsupported,
             error.HomeNotSet,
@@ -131,6 +155,7 @@ pub fn classifyCredentialFailure(
             error.SessionChanged,
             error.ChatGptAccountChanged,
             error.GrokAccountChanged,
+            error.GoogleAccountChanged,
             => .authority_changed,
             else => .temporary_unavailable,
         },
@@ -249,6 +274,23 @@ pub fn refreshCredentialForAccount(
 ) !?credentials.Credential {
     if (!credentials.sourceRefreshable(source)) return null;
 
+    if (mode != .stored and source == .google_subscription) {
+        if (expected_account_id) |expected| {
+            if (try credentials.loadStoredSource(alloc, source)) |stored_val| {
+                var stored = stored_val;
+                defer stored.deinit(alloc);
+                const actual = stored.accountId() orelse {
+                    debug_trace.logf("auth", "credential refresh rejected stage=account_missing source={t}", .{source});
+                    return error.GoogleAccountChanged;
+                };
+                if (!std.mem.eql(u8, expected, actual)) {
+                    debug_trace.logf("auth", "credential refresh rejected stage=account_changed source={t}", .{source});
+                    return error.GoogleAccountChanged;
+                }
+            }
+        }
+    }
+
     var credential = (loadCredentialForRefresh(alloc, transport, source, mode, rejected_token) catch |err| {
         debug_trace.logf(
             "auth",
@@ -265,11 +307,11 @@ pub fn refreshCredentialForAccount(
     if (expected_account_id) |expected| {
         const actual = credential.accountId() orelse {
             debug_trace.logf("auth", "credential refresh rejected stage=account_missing source={t}", .{source});
-            return error.ChatGptAccountChanged;
+            return if (source == .google_subscription) error.GoogleAccountChanged else error.ChatGptAccountChanged;
         };
         if (!std.mem.eql(u8, expected, actual)) {
             debug_trace.logf("auth", "credential refresh rejected stage=account_changed source={t}", .{source});
-            return error.ChatGptAccountChanged;
+            return if (source == .google_subscription) error.GoogleAccountChanged else error.ChatGptAccountChanged;
         }
     }
     // A stored read proves nothing about the login; only a send does.
@@ -372,6 +414,11 @@ fn loadCredentialForRefresh(
             .force => credentials.refreshGrokCredential(alloc, transport, rejected_token),
             .stored => credentials.loadStoredSource(alloc, source),
         },
+        .google_subscription => switch (mode) {
+            .if_needed, .reload => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
+            .force => credentials.refreshGoogleCredential(alloc, transport, rejected_token),
+            .stored => credentials.loadStoredSource(alloc, source),
+        },
         else => null,
     };
 }
@@ -381,6 +428,8 @@ pub const CredentialPreparationError = Allocator.Error || error{
     CredentialTemporarilyUnavailable,
     CredentialRefreshPersistenceUncertain,
     CredentialAuthorityChanged,
+    GoogleSignInRequired,
+    GoogleSessionDamaged,
     /// A saved session's custom connection no longer has the protocol,
     /// base_url, or auth it was saved with (`model_provider.ProviderId.bind`).
     /// Its history may go only to that connection, so nothing is sent
@@ -445,6 +494,10 @@ fn prepareResolvedCredential(
 ) CredentialPreparationError!?credentials.Credential {
     var credential = resolution.credential orelse {
         if (resolution.failure) |failure| {
+            if (failure.err == error.GoogleSignInRequired) return error.GoogleSignInRequired;
+            if (failure.source == .google_subscription and isGoogleSessionDamagedError(failure.err)) {
+                return error.GoogleSessionDamaged;
+            }
             if (preparationError(classifyCredentialFailure(failure.source, failure.err))) |err| return err;
             return null;
         }
@@ -461,7 +514,7 @@ fn prepareResolvedCredential(
         (credential.source == .fx_login and
             (credential.gatewayTeam() == null or
                 !types.validGatewayTeam(credential.gatewayTeam().?))) or
-        ((provider == .codex or provider == .grok) and
+        ((provider == .codex or provider == .grok or credential.source == .google_subscription) and
             (credential.accountId() == null or
                 !types.validCredentialAccountId(credential.accountId().?)));
 
@@ -479,6 +532,12 @@ pub fn requestedSource(
     provider: model_provider.ProviderId,
     preferred: ?credentials.Source,
 ) ?credentials.Source {
+    if (provider == .google) {
+        if (model_provider.authorizesCredential(.google, preferred) and preferred != .host_managed) {
+            return preferred;
+        }
+        return provider_catalog.find(provider).login_source;
+    }
     if (provider != .gateway) return provider_catalog.find(provider).login_source;
     return if (model_provider.authorizesCredential(provider, preferred)) preferred else null;
 }
@@ -520,6 +579,12 @@ pub fn preparationFailureNotice(err: anyerror) ?[]const u8 {
         error.CredentialTemporarilyUnavailable => "Credential refresh is temporarily unavailable. Retry shortly.",
         error.CredentialRefreshPersistenceUncertain => "Credential could not be saved. Check authentication storage before signing in again.",
         error.CredentialAuthorityChanged => "The credential account or team changed. Review authentication before retrying.",
+        error.GoogleSignInRequired => credentials.google_sign_in_required_message,
+        error.GoogleSessionDamaged,
+        error.InvalidGoogleSession,
+        error.GoogleSessionTooLarge,
+        error.GoogleSessionTooManyAccounts,
+        => credentials.google_session_damaged_message,
         error.ConfiguredProviderChanged, error.ConfiguredProviderRemoved => config_runtime.sessionConnectionNotice(err),
         else => null,
     };
@@ -527,6 +592,8 @@ pub fn preparationFailureNotice(err: anyerror) ?[]const u8 {
 
 /// Returns an owned, secret-free explanation shared by activation surfaces.
 pub fn preparationFailureText(alloc: Allocator, provider: model_provider.ProviderId, err: anyerror) ![]u8 {
+    if (err == error.GoogleSignInRequired) return alloc.dupe(u8, credentials.google_sign_in_required_message);
+    if (isGoogleSessionDamagedError(err)) return alloc.dupe(u8, credentials.google_session_damaged_message);
     const label = provider_catalog.label(provider);
     if (err == error.ConfiguredProviderChanged or err == error.ConfiguredProviderRemoved) return alloc.print("{s}: {s}", .{ label, preparationFailureNotice(err).? });
     const failure = classifyCredentialFailure(provider_catalog.find(provider).login_source, err);
@@ -616,13 +683,43 @@ test "credential preparation preserves failure categories across providers" {
         var rejected: credentials.Resolution = .{ .failure = .{ .source = provider.login_source, .err = error.CredentialRefreshRejected } };
         try std.testing.expect((try prepareResolvedCredential(alloc, provider.id, 100, &rejected)) == null);
     }
+    var google_sign_in: credentials.Resolution = .{ .failure = .{ .source = .google_subscription, .err = error.GoogleSignInRequired } };
+    try std.testing.expectError(error.GoogleSignInRequired, prepareResolvedCredential(alloc, .google, 100, &google_sign_in));
+    try std.testing.expectEqualStrings(
+        "Sign in with Google again: run fx login google.",
+        preparationFailureNotice(error.GoogleSignInRequired).?,
+    );
+    const failure_text = try preparationFailureText(alloc, .google, error.GoogleSignInRequired);
+    defer alloc.free(failure_text);
+    try std.testing.expectEqualStrings("Sign in with Google again: run fx login google.", failure_text);
+
+    for ([_]anyerror{ error.InvalidGoogleSession, error.GoogleSessionTooLarge, error.GoogleSessionTooManyAccounts }) |err| {
+        var damaged_google: credentials.Resolution = .{ .failure = .{ .source = .google_subscription, .err = err } };
+        try std.testing.expectError(error.GoogleSessionDamaged, prepareResolvedCredential(alloc, .google, 100, &damaged_google));
+        const damaged_text = try preparationFailureText(alloc, .google, err);
+        defer alloc.free(damaged_text);
+        try std.testing.expectEqualStrings(credentials.google_session_damaged_message, damaged_text);
+        const damaged_snapshot = StatusSnapshot{ .failure = classifyCredentialFailure(.google_subscription, err) };
+        try std.testing.expectEqualStrings(credentials.google_session_damaged_message, damaged_snapshot.missingHelp(.cli).?);
+    }
+    try std.testing.expectEqualStrings(
+        credentials.google_session_damaged_message,
+        preparationFailureNotice(error.GoogleSessionDamaged).?,
+    );
 }
+
+pub const ApiKeyTarget = enum {
+    gateway,
+    google,
+};
 
 pub const AcquisitionAction = enum {
     connections,
     login,
     chatgpt_login,
     grok_login,
+    google_login,
+    gemini_api_key,
     setup,
     change_team,
     switch_credential,
@@ -658,6 +755,9 @@ pub const ApiKeySaveResult = union(enum) {
     gateway_unavailable,
     store_failed,
     reload_failed,
+    gemini_saved: bool,
+    gemini_store_failed,
+    gemini_reload_failed,
 };
 
 /// The save does a gateway round trip and a key-store write, either of which can
@@ -670,10 +770,13 @@ pub const ApiKeySaveOutcome = union(enum) {
     store_failed,
     reload_failed,
     loaded: credentials.Credential,
+    gemini_store_failed,
+    gemini_reload_failed,
+    gemini_loaded: credentials.Credential,
 
     pub fn deinit(self: *ApiKeySaveOutcome, alloc: Allocator) void {
         switch (self.*) {
-            .loaded => |*credential| credential.deinit(alloc),
+            .loaded, .gemini_loaded => |*credential| credential.deinit(alloc),
             else => {},
         }
         self.* = .reload_failed;
@@ -682,34 +785,57 @@ pub const ApiKeySaveOutcome = union(enum) {
 
 const ApiKeySaveDeps = struct {
     ctx: ?*anyopaque = null,
+    target: ApiKeyTarget = .gateway,
     validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     store: StoredKeyStoreFn = storeUnavailableSecret,
+    store_gemini: StoredKeyStoreFn = storeGeminiSecret,
     loader: CredentialLoaderFn = loadCredentialSource,
 };
 
 /// The whole save sequence with no runtime state, so outcome behaviour can be
 /// tested synchronously while the worker owns only threading.
 fn performApiKeySave(alloc: Allocator, key: []const u8, deps: ApiKeySaveDeps) ApiKeySaveOutcome {
-    switch (deps.validator.validate(alloc, key)) {
-        .accepted => {},
-        .refused => return .gateway_refused,
-        .unavailable => return .gateway_unavailable,
+    switch (deps.target) {
+        .gateway => {
+            switch (deps.validator.validate(alloc, key)) {
+                .accepted => {},
+                .refused => return .gateway_refused,
+                .unavailable => return .gateway_unavailable,
+            }
+            deps.store(deps.ctx, alloc, key) catch |err| {
+                debug_trace.logf("auth", "api key save failed step=store err={s}", .{@errorName(err)});
+                return .store_failed;
+            };
+            const loaded = deps.loader(deps.ctx, alloc, .stored_key) catch |err| {
+                debug_trace.logf("auth", "api key save failed step=reload err={s}", .{@errorName(err)});
+                return .reload_failed;
+            };
+            const credential = loaded orelse return .reload_failed;
+            if (credential.source != .stored_key) {
+                var wrong = credential;
+                wrong.deinit(alloc);
+                return .reload_failed;
+            }
+            return .{ .loaded = credential };
+        },
+        .google => {
+            deps.store_gemini(deps.ctx, alloc, key) catch |err| {
+                debug_trace.logf("auth", "gemini api key save failed step=store err={s}", .{@errorName(err)});
+                return .gemini_store_failed;
+            };
+            const loaded = deps.loader(deps.ctx, alloc, .gemini_api_key) catch |err| {
+                debug_trace.logf("auth", "gemini api key save failed step=reload err={s}", .{@errorName(err)});
+                return .gemini_reload_failed;
+            };
+            const credential = loaded orelse return .gemini_reload_failed;
+            if (credential.source != .gemini_api_key) {
+                var wrong = credential;
+                wrong.deinit(alloc);
+                return .gemini_reload_failed;
+            }
+            return .{ .gemini_loaded = credential };
+        },
     }
-    deps.store(deps.ctx, alloc, key) catch |err| {
-        debug_trace.logf("auth", "api key save failed step=store err={s}", .{@errorName(err)});
-        return .store_failed;
-    };
-    const loaded = deps.loader(deps.ctx, alloc, .stored_key) catch |err| {
-        debug_trace.logf("auth", "api key save failed step=reload err={s}", .{@errorName(err)});
-        return .reload_failed;
-    };
-    const credential = loaded orelse return .reload_failed;
-    if (credential.source != .stored_key) {
-        var wrong = credential;
-        wrong.deinit(alloc);
-        return .reload_failed;
-    }
-    return .{ .loaded = credential };
 }
 
 const ApiKeySaveRuntime = struct {
@@ -831,6 +957,8 @@ const InventoryRefreshDeps = struct {
 const SourceInventory = struct {
     available: SourceSet = .empty,
     unavailable: SourceSet = .empty,
+    google_email_buf: [256]u8 = undefined,
+    google_email_len: usize = 0,
 
     fn detect(alloc: Allocator, ctx: ?*anyopaque, probe: SourceProbeFn) !SourceInventory {
         var inventory: SourceInventory = .{};
@@ -845,7 +973,16 @@ const SourceInventory = struct {
             };
             if (present) inventory.available.insert(source);
         }
+        if (probe == probeCredentialSource and inventory.available.contains(.google_subscription)) {
+            if (google_oauth.activeEmailInto(alloc, &inventory.google_email_buf)) |email| {
+                inventory.google_email_len = email.len;
+            }
+        }
         return inventory;
+    }
+
+    fn googleEmail(self: *const SourceInventory) []const u8 {
+        return self.google_email_buf[0..self.google_email_len];
     }
 };
 
@@ -982,12 +1119,15 @@ pub const RemoteRevocation = union(enum) {
     grok: []u8,
     /// The Codex refresh token. Owned; allocated with `std.heap.c_allocator`.
     codex: []u8,
+    /// The Google refresh token. Owned; allocated with `std.heap.c_allocator`.
+    google: []u8,
 
     pub fn source(self: RemoteRevocation) credentials.Source {
         return switch (self) {
             .fx_login => .fx_login,
             .grok => .grok_subscription,
             .codex => .chatgpt_subscription,
+            .google => .google_subscription,
         };
     }
 
@@ -996,6 +1136,7 @@ pub const RemoteRevocation = union(enum) {
             .fx_login => .fx_login,
             .grok => .grok,
             .codex => .codex,
+            .google => .google,
         };
     }
 
@@ -1003,7 +1144,7 @@ pub const RemoteRevocation = union(enum) {
     fn refreshToken(self: RemoteRevocation) []const u8 {
         return switch (self) {
             .fx_login => |session| session.refresh_token,
-            .grok, .codex => |token| token,
+            .grok, .codex, .google => |token| token,
         };
     }
 
@@ -1011,7 +1152,7 @@ pub const RemoteRevocation = union(enum) {
         const alloc = std.heap.c_allocator;
         switch (self.*) {
             .fx_login => |*session| session.deinit(alloc),
-            .grok, .codex => |token| secret.zeroAndFree(alloc, token),
+            .grok, .codex, .google => |token| secret.zeroAndFree(alloc, token),
         }
         self.* = undefined;
     }
@@ -1057,6 +1198,7 @@ const RemoteRevocationTask = struct {
             .fx_login => |session| login_flow.revokeLoggedOutSession(alloc, transport.provider(), session),
             .grok => |token| grok_oauth.revokeToken(alloc, transport.provider(), token),
             .codex => |token| chatgpt_oauth.revokeToken(alloc, transport.provider(), token),
+            .google => |token| google_oauth.revokeToken(alloc, transport.provider(), token),
         };
         revoked catch |err| {
             debug_trace.logf("auth", "remote revocation failed source={t} err={s} kept={}", .{ self.target.source(), @errorName(err), self.kept });
@@ -1107,13 +1249,15 @@ const KeptSignOutRetryTask = struct {
         var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel };
         const codex = chatgpt_oauth.retryKeptSignOuts(alloc, transport.provider(), null);
         const grok = grok_oauth.retryKeptSignOuts(alloc, transport.provider(), null);
+        const google = google_oauth.retryKeptSignOuts(alloc, transport.provider(), null);
         const fx_login = login_flow.retryKeptSignOuts(alloc, transport.provider(), null);
         const mcp: pending_revocation.RetryOutcome = if (io_mod.homeDir()) |home| mcp_kept_sign_outs.retry(alloc, home, transport.provider(), null) else .{};
-        const failed = codex.failed or grok.failed or fx_login.failed or mcp.failed;
-        if (codex.revoked + grok.revoked + fx_login.revoked + mcp.revoked == 0 and !failed) return;
-        debug_trace.logf("auth", "kept sign-outs retried at start codex={d} grok={d} fx_login={d} mcp={d} failed={}", .{
+        const failed = codex.failed or grok.failed or google.failed or fx_login.failed or mcp.failed;
+        if (codex.revoked + grok.revoked + google.revoked + fx_login.revoked + mcp.revoked == 0 and !failed) return;
+        debug_trace.logf("auth", "kept sign-outs retried at start codex={d} grok={d} google={d} fx_login={d} mcp={d} failed={}", .{
             codex.revoked,
             grok.revoked,
+            google.revoked,
             fx_login.revoked,
             mcp.revoked,
             failed,
@@ -1805,6 +1949,12 @@ pub const Choice = union(enum) {
 /// background.
 pub const team_list_loading_label = "loading teams...";
 
+pub const google_plan_linked_details = [_][]const u8{
+    "Sign out on this device: /logout google",
+    "Disconnect Google Account: /logout google --disconnect",
+    "Manage access: https://myaccount.google.com/connections",
+};
+
 pub const PickerView = struct {
     active: bool,
     available_sources: SourceSet,
@@ -1826,9 +1976,52 @@ pub const PickerView = struct {
     sign_in_code_mask_count: usize = 0,
     api_key_mask_count: usize = 0,
     api_key_inline: bool = false,
+    api_key_target: ApiKeyTarget = .gateway,
+    api_key_backend_label: []const u8 = credentials.stored_key_backend_label,
+    google_plan_label: []const u8 = "",
+    google_plan_current_label: []const u8 = "",
 
     pub fn activeSourceLabel(self: PickerView) []const u8 {
         return sourceLabelOrMissing(self.active_source);
+    }
+
+    pub fn googlePlanLabel(self: PickerView) []const u8 {
+        if (!self.available_sources.contains(.google_subscription)) {
+            return "Sign in with Google (AI Pro or Ultra)";
+        }
+        return if (self.google_plan_label.len > 0) self.google_plan_label else "Google AI Pro or Ultra plan";
+    }
+
+    pub fn googlePlanCurrentLabel(self: PickerView) []const u8 {
+        if (!self.available_sources.contains(.google_subscription)) {
+            return "Sign in with Google (AI Pro or Ultra)";
+        }
+        return if (self.google_plan_current_label.len > 0) self.google_plan_current_label else "Google AI Pro or Ultra plan · current";
+    }
+
+    pub fn selectedDetailLines(self: PickerView) []const []const u8 {
+        if (self.stage == .connections and
+            self.available_sources.contains(.google_subscription) and
+            self.selected_choice != null and
+            self.selected_choice.?.eql(.{ .action = .google_login }))
+        {
+            return &google_plan_linked_details;
+        }
+        return &.{};
+    }
+
+    pub fn methodDetailLines(
+        self: PickerView,
+        provider: model_provider.ProviderId,
+        method_slug: []const u8,
+    ) []const []const u8 {
+        if (provider == .google and
+            std.ascii.eqlIgnoreCase(method_slug, "plan") and
+            self.available_sources.contains(.google_subscription))
+        {
+            return &google_plan_linked_details;
+        }
+        return &.{};
     }
 
     pub fn choiceCount(self: PickerView) usize {
@@ -1840,7 +2033,7 @@ pub const PickerView = struct {
             else
                 4,
             .connections => connectionChoiceCount(),
-            .provider => if (comptime host_target.is_wasm) 2 else 3,
+            .provider => if (comptime host_target.is_wasm) 2 else 4,
             .sign_in, .api_key => 0,
             .change_team => teamFilter(self.teams, self.team_query).count(),
             .switch_credential => gatewaySourceCount(self.available_sources) + 1,
@@ -1868,6 +2061,7 @@ pub const PickerView = struct {
                 0 => .{ .provider = .gateway },
                 1 => .{ .provider = .codex },
                 2 => if (comptime host_target.is_wasm) null else .{ .provider = .grok },
+                3 => if (comptime host_target.is_wasm) null else .{ .provider = .google },
                 else => null,
             },
             .sign_in, .api_key => null,
@@ -1904,6 +2098,8 @@ pub const PickerView = struct {
                 .login => "Sign in with Vercel",
                 .chatgpt_login => "Sign in with Codex",
                 .grok_login => "Sign in with Grok",
+                .google_login => self.googlePlanLabel(),
+                .gemini_api_key => "Gemini API key",
                 .setup => if (self.include_skip) "Add an API key" else "API key",
                 .change_team => "Change team",
                 .switch_credential => "Switch credential",
@@ -1923,6 +2119,8 @@ pub const PickerView = struct {
                 .login => if (self.fx_login_session_available) "connected" else "",
                 .chatgpt_login => if (self.available_sources.contains(.chatgpt_subscription)) "connected" else "",
                 .grok_login => if (self.available_sources.contains(.grok_subscription)) "connected" else "",
+                .google_login => if (self.available_sources.contains(.google_subscription)) "connected" else "",
+                .gemini_api_key => if (self.available_sources.contains(.gemini_api_key)) "connected" else "",
                 .setup, .switch_credential, .switch_provider => "",
                 .automatic => "use the first available source",
                 .change_team => if (self.team_list_loading)
@@ -1940,7 +2138,9 @@ pub const PickerView = struct {
         return switch (choice) {
             .action => |action| (action != .change_team or self.fx_login_session_available) and
                 (action != .chatgpt_login or !host_target.is_wasm) and
-                (action != .grok_login or !host_target.is_wasm),
+                (action != .grok_login or !host_target.is_wasm) and
+                (action != .google_login or !host_target.is_wasm) and
+                (action != .gemini_api_key or !host_target.is_wasm),
             .provider, .source, .team => true,
         };
     }
@@ -1954,7 +2154,7 @@ pub const PickerView = struct {
 };
 
 fn connectionChoiceCount() usize {
-    return if (comptime host_target.is_wasm) 2 else 4;
+    return if (comptime host_target.is_wasm) 2 else 6;
 }
 
 fn connectionChoiceAt(index: usize) ?Choice {
@@ -1969,7 +2169,9 @@ fn connectionChoiceAt(index: usize) ?Choice {
         0 => .{ .action = .login },
         1 => .{ .action = .chatgpt_login },
         2 => .{ .action = .grok_login },
-        3 => .{ .action = .setup },
+        3 => .{ .action = .google_login },
+        4 => .{ .action = .gemini_api_key },
+        5 => .{ .action = .setup },
         else => null,
     };
 }
@@ -2020,6 +2222,7 @@ pub const StatusSnapshot = struct {
     gateway_connected: bool = false,
     chatgpt_connected: bool = false,
     grok_connected: bool = false,
+    google_connected: bool = false,
     /// The active credential is past its refresh deadline. Distinct from `refreshable`,
     /// which answers whether this source type can refresh at all.
     expired: bool = false,
@@ -2048,6 +2251,12 @@ pub const StatusSnapshot = struct {
             return credentials.unreadable_store_message;
         }
         if (self.failure) |failure| {
+            if (failure.source == .google_subscription and failure.reason == .invalid_credential) {
+                return credentials.google_sign_in_required_message;
+            }
+            if (failure.source == .google_subscription and failure.damaged_google_session) {
+                return credentials.google_session_damaged_message;
+            }
             if (preparationError(failure)) |err| return preparationFailureNotice(err);
         }
         const automatic_help: []const u8 = switch (surface) {
@@ -2080,6 +2289,8 @@ pub const StatusSnapshot = struct {
                 .cli => credentials.missing_grok_credential_message,
                 .interactive => credentials.missing_grok_interactive_credential_message,
             },
+            .gemini_api_key => "Gemini API key is unavailable. Set GEMINI_API_KEY; no other credential was selected.",
+            .google_subscription => "Google AI Pro or Ultra plan is not signed in; no other credential was selected.",
             .host_managed => automatic_help,
             .configured => "The configured provider credential is unavailable. Check its auth environment variable in settings.json; no other provider was selected.",
         };
@@ -2130,6 +2341,23 @@ pub fn loadStatusSnapshotForProvider(
         error.OutOfMemory => return err,
         else => false,
     };
+    const google_plan_connected = credentials.sourceExists(
+        alloc,
+        secret_store,
+        .google_subscription,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => false,
+    };
+    const google_key_connected = credentials.sourceExists(
+        alloc,
+        secret_store,
+        .gemini_api_key,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => false,
+    };
+    const google_connected = google_plan_connected or google_key_connected;
     // Resolves in `.stored` mode: a diagnostic must not refresh, because refreshing
     // rewrites the session file and performs network I/O. It reports the expired state
     // instead of repairing it.
@@ -2158,9 +2386,14 @@ pub fn loadStatusSnapshotForProvider(
         },
     };
     const resolved_source = if (resolution.credential) |credential| credential.source else null;
-    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription and resolved_source != .configured;
-    const gateway_probe_required = (provider != null and (provider.? == .codex or provider.? == .grok)) or
-        resolved_source == .chatgpt_subscription or resolved_source == .grok_subscription;
+    var gateway_connected = resolved_source != null and
+        resolved_source != .chatgpt_subscription and
+        resolved_source != .grok_subscription and
+        resolved_source != .gemini_api_key and
+        resolved_source != .google_subscription and
+        resolved_source != .configured;
+    const gateway_probe_required = (provider != null and (provider.? == .codex or provider.? == .grok or provider.? == .google)) or
+        resolved_source == .chatgpt_subscription or resolved_source == .grok_subscription or resolved_source == .gemini_api_key or resolved_source == .google_subscription;
     if (gateway_probe_required) {
         for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key }) |source| {
             if (credentials.sourceExists(alloc, secret_store, source) catch |err| switch (err) {
@@ -2186,6 +2419,7 @@ pub fn loadStatusSnapshotForProvider(
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
+            .google_connected = google_connected,
             .expired = expired,
         };
     }
@@ -2197,6 +2431,7 @@ pub fn loadStatusSnapshotForProvider(
         .gateway_connected = gateway_connected,
         .chatgpt_connected = chatgpt_connected,
         .grok_connected = grok_connected,
+        .google_connected = google_connected,
     };
 }
 
@@ -2271,6 +2506,7 @@ pub const Runtime = struct {
     /// panel, so the composer keeps showing which path the user walked.
     api_key_inline: bool = false,
     api_key_returns_to_root: bool = false,
+    api_key_target: ApiKeyTarget = .gateway,
     api_key_save: ApiKeySaveRuntime = .{},
     inventory_refresh_task: ?*InventoryRefreshTask = null,
     prompt_credential_refresh_task: ?*PromptCredentialRefreshTask = null,
@@ -2293,6 +2529,10 @@ pub const Runtime = struct {
     startup_credential_task: ?*StartupCredentialTask = null,
     /// The launch source inventory waits for the first frame.
     startup_inventory_deferred: bool = false,
+    google_plan_label_buf: [288]u8 = undefined,
+    google_plan_label_len: usize = 0,
+    google_plan_current_label_buf: [304]u8 = undefined,
+    google_plan_current_label_len: usize = 0,
 
     pub fn init(
         validator: api_key_validator.Provider,
@@ -2335,7 +2575,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (@typeInfo(Self).@"struct".field_names.len != 38) {
+            if (@typeInfo(Self).@"struct".field_names.len != 43) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -2367,6 +2607,7 @@ pub const Runtime = struct {
         storage.api_key_input = .empty;
         storage.api_key_inline = false;
         storage.api_key_returns_to_root = false;
+        storage.api_key_target = .gateway;
         storage.api_key_save = .{};
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
@@ -2378,6 +2619,10 @@ pub const Runtime = struct {
         storage.provider_preparation = null;
         storage.startup_credential_task = null;
         storage.startup_inventory_deferred = false;
+        storage.google_plan_label_buf = undefined;
+        storage.google_plan_label_len = 0;
+        storage.google_plan_current_label_buf = undefined;
+        storage.google_plan_current_label_len = 0;
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
@@ -2569,6 +2814,7 @@ pub const Runtime = struct {
             .gateway_connected = true,
             .chatgpt_connected = true,
             .grok_connected = true,
+            .google_connected = true,
         };
         const gateway_connected = self.source_inventory.contains(.vercel_oidc_token) or
             self.source_inventory.contains(.ai_gateway_api_key) or
@@ -2576,6 +2822,8 @@ pub const Runtime = struct {
             self.source_inventory.contains(.stored_key);
         const chatgpt_connected = self.source_inventory.contains(.chatgpt_subscription);
         const grok_connected = self.source_inventory.contains(.grok_subscription);
+        const google_connected = self.source_inventory.contains(.google_subscription) or
+            self.source_inventory.contains(.gemini_api_key);
         const credential = self.selected_credential orelse return .{
             .required_source = requestedSource(provider, preferred),
             .failure = if (self.credential_failure) |episode|
@@ -2587,6 +2835,7 @@ pub const Runtime = struct {
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
+            .google_connected = google_connected,
         };
         return .{
             .active_source = credential.source,
@@ -2594,6 +2843,7 @@ pub const Runtime = struct {
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
+            .google_connected = google_connected,
             .expired = credential.needsRefreshAt(now_ms),
         };
     }
@@ -2844,10 +3094,34 @@ pub const Runtime = struct {
         self.applySourceInventory(try SourceInventory.detect(alloc, ctx, probe));
     }
 
+    fn setGooglePlanEmail(self: *Self, email: []const u8) void {
+        if (email.len == 0) {
+            self.google_plan_label_len = 0;
+            self.google_plan_current_label_len = 0;
+            return;
+        }
+        const prefix = "Google AI Pro or Ultra plan · ";
+        const suffix = " · current";
+        const max_email = @min(email.len, self.google_plan_label_buf.len - prefix.len);
+        const safe_email = text_utils.prefixTerminalSafeByWidth(email[0..max_email], max_email);
+        const label = std.mem.print(&self.google_plan_label_buf, "{s}{s}", .{ prefix, safe_email }) catch {
+            self.google_plan_label_len = 0;
+            self.google_plan_current_label_len = 0;
+            return;
+        };
+        self.google_plan_label_len = label.len;
+        const current_label = std.mem.print(&self.google_plan_current_label_buf, "{s}{s}", .{ label, suffix }) catch {
+            self.google_plan_current_label_len = 0;
+            return;
+        };
+        self.google_plan_current_label_len = current_label.len;
+    }
+
     fn applySourceInventory(self: *Self, inventory: SourceInventory) void {
         self.source_inventory = inventory.available;
         self.unavailable_sources = inventory.unavailable;
         self.fx_login_session_available = inventory.available.contains(.fx_login);
+        self.setGooglePlanEmail(inventory.googleEmail());
         if (!inventory.available.contains(.stored_key) and !inventory.unavailable.contains(.stored_key)) {
             self.stored_key_status = .not_found;
         }
@@ -2918,6 +3192,13 @@ pub const Runtime = struct {
             .sign_in_code_mask_count = @min(self.sign_in_code_input.items.len, max_manual_code_mask_glyphs),
             .api_key_mask_count = self.apiKeyMaskCount(),
             .api_key_inline = self.api_key_inline,
+            .api_key_target = self.api_key_target,
+            .api_key_backend_label = if (self.api_key_target == .google)
+                gemini_api_key.backendLabel()
+            else
+                credentials.stored_key_backend_label,
+            .google_plan_label = self.google_plan_label_buf[0..self.google_plan_label_len],
+            .google_plan_current_label = self.google_plan_current_label_buf[0..self.google_plan_current_label_len],
         };
     }
 
@@ -3024,7 +3305,7 @@ pub const Runtime = struct {
         self.picker_stage = .switch_credential;
         const active_source = self.credentialSource();
         self.picker_selection = if (active_source) |source|
-            if (source != .chatgpt_subscription and source != .grok_subscription and self.source_inventory.contains(source))
+            if (isGatewayCredentialSource(source) and self.source_inventory.contains(source))
                 .{ .source = source }
             else
                 self.pickerView().choiceAt(0)
@@ -3033,14 +3314,39 @@ pub const Runtime = struct {
     }
 
     pub fn openApiKeyPicker(self: *Self, alloc: Allocator) void {
-        self.openApiKeyPickerWithParent(alloc, false);
+        self.openApiKeyPickerWithOptions(alloc, false, false, .gateway);
     }
 
     pub fn openApiKeyPickerFromRoot(self: *Self, alloc: Allocator) void {
-        self.openApiKeyPickerWithParent(alloc, true);
+        self.openApiKeyPickerWithOptions(alloc, true, false, .gateway);
     }
 
-    fn openApiKeyPickerWithParent(self: *Self, alloc: Allocator, returns_to_root: bool) void {
+    pub fn openGoogleApiKeyPicker(self: *Self, alloc: Allocator) void {
+        self.openApiKeyPickerWithOptions(alloc, false, false, .google);
+    }
+
+    pub fn openGoogleApiKeyPickerFromRoot(self: *Self, alloc: Allocator) void {
+        self.openApiKeyPickerWithOptions(alloc, true, false, .google);
+    }
+
+    /// Opens the key field for the inline `/provider` picker. The stage is the
+    /// same one the staged panel uses, so entry, saving, and cancelling all
+    /// keep working; only the rendering differs.
+    pub fn openApiKeyPickerInline(self: *Self, alloc: Allocator) void {
+        self.openApiKeyPickerWithOptions(alloc, false, true, .gateway);
+    }
+
+    pub fn openGoogleApiKeyPickerInline(self: *Self, alloc: Allocator) void {
+        self.openApiKeyPickerWithOptions(alloc, false, true, .google);
+    }
+
+    fn openApiKeyPickerWithOptions(
+        self: *Self,
+        alloc: Allocator,
+        returns_to_root: bool,
+        is_inline: bool,
+        target: ApiKeyTarget,
+    ) void {
         self.exitSignInStage(alloc);
         self.exitApiKeyStage(alloc, .screen_replacement);
         self.clearTeamSelection(alloc);
@@ -3048,14 +3354,8 @@ pub const Runtime = struct {
         self.picker_stage = .api_key;
         self.picker_selection = null;
         self.api_key_returns_to_root = returns_to_root;
-    }
-
-    /// Opens the key field for the inline `/provider` picker. The stage is the
-    /// same one the staged panel uses, so entry, saving, and cancelling all
-    /// keep working; only the rendering differs.
-    pub fn openApiKeyPickerInline(self: *Self, alloc: Allocator) void {
-        self.openApiKeyPickerWithParent(alloc, false);
-        self.api_key_inline = true;
+        self.api_key_inline = is_inline;
+        self.api_key_target = target;
     }
 
     pub fn apiKeyInlineActive(self: *const Self) bool {
@@ -3102,6 +3402,16 @@ pub const Runtime = struct {
         return self.openSignInPickerWithParent(alloc, false, .grok_subscription);
     }
 
+    pub fn openGoogleSignInPickerFromRoot(self: *Self, alloc: Allocator) !bool {
+        if (comptime host_target.is_wasm) return error.GoogleOAuthUnavailable;
+        return self.openSignInPickerWithParent(alloc, true, .google_subscription);
+    }
+
+    pub fn openGoogleSignInPickerForProviderSwitch(self: *Self, alloc: Allocator) !bool {
+        if (comptime host_target.is_wasm) return error.GoogleOAuthUnavailable;
+        return self.openSignInPickerWithParent(alloc, false, .google_subscription);
+    }
+
     fn openSignInPickerWithParent(
         self: *Self,
         alloc: Allocator,
@@ -3113,6 +3423,7 @@ pub const Runtime = struct {
             .fx_login => try self.sign_in_flow.start(alloc, self.oauth_transport),
             .chatgpt_subscription => try chatgpt_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
             .grok_subscription => try grok_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
+            .google_subscription => try google_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
             else => return error.InvalidSignInSource,
         };
         if (!started) return false;
@@ -3235,8 +3546,10 @@ pub const Runtime = struct {
     pub fn beginApiKeySave(self: *Self, alloc: Allocator) ApiKeySaveStart {
         return self.beginApiKeySaveWithDeps(alloc, .{
             .ctx = self,
+            .target = self.api_key_target,
             .validator = self.api_key_validator,
             .store = storeRuntimeSecret,
+            .store_gemini = storeGeminiSecret,
             .loader = loadRuntimeCredentialSource,
         });
     }
@@ -3249,14 +3562,16 @@ pub const Runtime = struct {
         self.api_key_input = .empty;
 
         const returns_to_root = self.api_key_returns_to_root;
+        const target = deps.target;
+        const action: AcquisitionAction = if (target == .google) .gemini_api_key else .setup;
         self.exitApiKeyStage(alloc, .saved);
         self.picker_active = returns_to_root;
         if (!returns_to_root or self.picker_include_skip) {
             self.picker_stage = .root;
-            self.picker_selection = if (returns_to_root) .{ .action = .setup } else null;
+            self.picker_selection = if (returns_to_root) .{ .action = action } else null;
         } else {
             self.picker_stage = .connections;
-            self.picker_selection = .{ .action = .setup };
+            self.picker_selection = .{ .action = action };
         }
 
         return if (self.api_key_save.start(alloc, key, deps)) .started else .busy;
@@ -3275,11 +3590,19 @@ pub const Runtime = struct {
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
             .reload_failed => .reload_failed,
+            .gemini_store_failed => .gemini_store_failed,
+            .gemini_reload_failed => .gemini_reload_failed,
             .loaded => |*credential| blk: {
                 var owned = credential.*;
                 outcome = .reload_failed;
                 defer owned.deinit(alloc);
                 break :blk .{ .saved = self.adoptCredential(alloc, &owned) };
+            },
+            .gemini_loaded => |*credential| blk: {
+                var owned = credential.*;
+                outcome = .gemini_reload_failed;
+                defer owned.deinit(alloc);
+                break :blk .{ .gemini_saved = self.adoptCredential(alloc, &owned) };
             },
         };
     }
@@ -3319,6 +3642,7 @@ pub const Runtime = struct {
                 self.picker_selection = .{ .action = switch (self.sign_in_source) {
                     .chatgpt_subscription => .chatgpt_login,
                     .grok_subscription => .grok_login,
+                    .google_subscription => .google_login,
                     else => .login,
                 } };
                 return true;
@@ -3327,6 +3651,8 @@ pub const Runtime = struct {
 
         if (stage == .api_key) {
             const returns_to_root = self.api_key_returns_to_root;
+            const target = self.api_key_target;
+            const action: AcquisitionAction = if (target == .google) .gemini_api_key else .setup;
             self.exitApiKeyStage(alloc, .cancel);
             if (!returns_to_root) {
                 self.picker_active = false;
@@ -3337,9 +3663,13 @@ pub const Runtime = struct {
             if (!self.picker_include_skip) {
                 self.clearTeamSelection(alloc);
                 self.picker_stage = .connections;
-                self.picker_selection = .{ .action = .setup };
+                self.picker_selection = .{ .action = action };
                 return true;
             }
+            self.clearTeamSelection(alloc);
+            self.picker_stage = .root;
+            self.picker_selection = .{ .action = action };
+            return true;
         }
 
         self.clearTeamSelection(alloc);
@@ -3352,9 +3682,11 @@ pub const Runtime = struct {
                 .chatgpt_login
             else if (self.sign_in_source == .grok_subscription)
                 .grok_login
+            else if (self.sign_in_source == .google_subscription)
+                .google_login
             else
                 .login,
-            .api_key => .setup,
+            .api_key => unreachable,
             .change_team => .change_team,
             .switch_credential => .switch_credential,
         } };
@@ -3380,8 +3712,8 @@ pub const Runtime = struct {
             .sign_in, .api_key => unreachable,
             .connections => switch (selected) {
                 .action => |action| switch (action) {
-                    .login, .chatgpt_login, .grok_login => self.closePicker(alloc),
-                    .setup => {},
+                    .login, .chatgpt_login, .grok_login, .google_login => self.closePicker(alloc),
+                    .gemini_api_key, .setup => {},
                     .connections,
                     .change_team,
                     .switch_credential,
@@ -3409,10 +3741,10 @@ pub const Runtime = struct {
                         self.openSwitchCredentialPicker(alloc);
                         return null;
                     },
-                    .setup => {},
+                    .gemini_api_key, .setup => {},
                     // Only reachable from the switch screen, never the root.
                     .automatic => unreachable,
-                    .login, .chatgpt_login, .grok_login => self.closePicker(alloc),
+                    .login, .chatgpt_login, .grok_login, .google_login => self.closePicker(alloc),
                 },
                 .team => unreachable,
             },
@@ -3741,7 +4073,7 @@ pub const Runtime = struct {
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
         for (credential_source_order) |source| {
-            if (source == .chatgpt_subscription or source == .grok_subscription) continue;
+            if (!isGatewayCredentialSource(source)) continue;
             if (!self.source_inventory.contains(source)) continue;
             if (try self.selectSourceWithLoader(alloc, source, ctx, loader) != null) {
                 return self.credentialSource() != previous;
@@ -3767,6 +4099,20 @@ pub const Runtime = struct {
     pub fn reconcileAfterGrokLogout(self: *Self, alloc: Allocator) !bool {
         const was_available = self.source_inventory.contains(.grok_subscription);
         const was_active = self.credentialSource() == .grok_subscription;
+        if (was_active) {
+            if (self.selected_credential) |*credential| credential.deinit(alloc);
+            self.selected_credential = null;
+            self.credential_failure = null;
+        }
+        try self.refreshSourceInventory(alloc);
+        return was_active or was_available;
+    }
+
+    pub fn reconcileAfterGoogleLogout(self: *Self, alloc: Allocator) !bool {
+        const was_available = self.source_inventory.contains(.gemini_api_key) or
+            self.source_inventory.contains(.google_subscription);
+        const was_active = self.credentialSource() == .gemini_api_key or
+            self.credentialSource() == .google_subscription;
         if (was_active) {
             if (self.selected_credential) |*credential| credential.deinit(alloc);
             self.selected_credential = null;
@@ -3803,7 +4149,7 @@ pub const Runtime = struct {
         if (!login_was_active) return false;
 
         for (credential_source_order) |source| {
-            if (source == .chatgpt_subscription or source == .grok_subscription) continue;
+            if (!isGatewayCredentialSource(source)) continue;
             if (!self.source_inventory.contains(source)) continue;
             if (try self.selectSourceWithLoader(alloc, source, ctx, loader) != null) return true;
             self.source_inventory.remove(source);
@@ -3846,6 +4192,7 @@ pub const Runtime = struct {
             self.api_key_input = .empty;
         }
         self.api_key_returns_to_root = false;
+        self.api_key_target = .gateway;
         if (byte_count > 0) {
             debug_trace.logf(
                 "auth",
@@ -3946,6 +4293,10 @@ fn storeRuntimeSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !vo
     return self.secret_store.store(alloc, value);
 }
 
+fn storeGeminiSecret(_: ?*anyopaque, alloc: Allocator, value: []const u8) !void {
+    return gemini_api_key.save(alloc, value);
+}
+
 fn storeUnavailableSecret(_: ?*anyopaque, _: Allocator, _: []const u8) !void {
     return error.StoredKeyWriteFailed;
 }
@@ -4014,7 +4365,7 @@ test "the status view names a login's team only by a valid team name" {
 fn gatewaySourceCount(sources: SourceSet) usize {
     var count: usize = 0;
     for (credential_source_order) |source| {
-        if (source == .chatgpt_subscription or source == .grok_subscription or !sources.contains(source)) continue;
+        if (!isGatewayCredentialSource(source) or !sources.contains(source)) continue;
         count += 1;
     }
     return count;
@@ -4023,7 +4374,7 @@ fn gatewaySourceCount(sources: SourceSet) usize {
 fn gatewaySourceAtIndex(sources: SourceSet, wanted_index: usize) ?credentials.Source {
     var index: usize = 0;
     for (credential_source_order) |source| {
-        if (source == .chatgpt_subscription or source == .grok_subscription or !sources.contains(source)) continue;
+        if (!isGatewayCredentialSource(source) or !sources.contains(source)) continue;
         if (index == wanted_index) return source;
         index += 1;
     }
@@ -4035,6 +4386,7 @@ fn credentialAuthorityFacts(credential: credentials.Credential) auth_transition.
         .provider = switch (credential.source) {
             .chatgpt_subscription => .codex,
             .grok_subscription => .grok,
+            .gemini_api_key, .google_subscription => .google,
             else => .gateway,
         },
         .source = credential.source,
@@ -4266,6 +4618,65 @@ test "auth runtime complete credential refresher ignores non-refreshable sources
             null,
         )) == null);
     }
+}
+
+test "auth runtime refuses google_subscription refresh when active Google account changed" {
+    const alloc = std.testing.allocator;
+    const dpop = @import("dpop.zig");
+    const google_session = @import("google_session.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+    defer alloc.free(home);
+
+    var env_map = std.process.Environ.Map.init(alloc);
+    defer env_map.deinit();
+    try env_map.put("HOME", home);
+    try env_map.put("FX_DISABLE_KEYCHAIN", "1");
+    io_mod.setEnvironMap(&env_map);
+    defer io_mod.resetEnvironForTest();
+
+    const now_s = @divFloor(io_mod.milliTimestamp(), std.time.ms_per_s);
+    const seed: [dpop.seed_bytes]u8 = @splat(0x51);
+    const kp = try dpop.keyPairFromSeed(seed);
+    const dpop_key = try dpop.encodeSecretKeyAlloc(alloc, kp);
+    defer secret.zeroAndFree(alloc, dpop_key);
+
+    {
+        var mutation = try google_session.beginMutation(alloc);
+        defer mutation.deinit(alloc);
+        var record = google_session.Record{};
+        defer record.deinit(alloc);
+        try record.upsertAccount(alloc, .{
+            .subject = "sub-other",
+            .email = "other@example.com",
+            .client_id = "test-client-id",
+            .refresh_token = "1//refresh-other",
+            .refresh_token_expires_at_s = now_s + 7 * std.time.s_per_day,
+            .access_token = "ya29.other",
+            .access_token_expires_at_s = now_s - 10,
+            .dpop_private_key = dpop_key,
+            .granted_scopes = &.{google_oauth.required_scope},
+        }, true);
+        try mutation.save(alloc, record);
+    }
+
+    const TrapTransport = struct {
+        calls: usize = 0,
+        fn execute(raw: ?*anyopaque, _: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return error.TestUnexpectedSend;
+        }
+    };
+    var trap = TrapTransport{};
+    const transport: oauth_transport.Provider = .{ .context = &trap, .execute_fn = TrapTransport.execute };
+    try std.testing.expectError(
+        error.GoogleAccountChanged,
+        refreshCredentialForAccount(transport, alloc, .google_subscription, .force, "sub-expected", "ya29.rejected"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), trap.calls);
 }
 
 test "auth failure snapshot names every selected source without exposing styling" {
@@ -5475,13 +5886,45 @@ test "auth onboarding picker exposes the setup paths" {
 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.include_skip);
-    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 6), picker.choiceCount());
     try std.testing.expect((Choice{ .action = .login }).eql(picker.choiceAt(0).?));
     try std.testing.expect((Choice{ .action = .chatgpt_login }).eql(picker.choiceAt(1).?));
     try std.testing.expect((Choice{ .action = .grok_login }).eql(picker.choiceAt(2).?));
-    try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(3).?));
-    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(3).?));
-    try std.testing.expect(picker.choiceAt(4) == null);
+    try std.testing.expect((Choice{ .action = .google_login }).eql(picker.choiceAt(3).?));
+    try std.testing.expectEqualStrings("Sign in with Google (AI Pro or Ultra)", picker.choiceLabel(picker.choiceAt(3).?));
+    try std.testing.expect((Choice{ .action = .gemini_api_key }).eql(picker.choiceAt(4).?));
+    try std.testing.expectEqualStrings("Gemini API key", picker.choiceLabel(picker.choiceAt(4).?));
+    try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(5).?));
+    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(5).?));
+    try std.testing.expect(picker.choiceAt(6) == null);
+}
+
+test "setup provider and connections pickers expose Google on native builds" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.source_inventory = SourceSet.initOne(.gemini_api_key);
+    runtime.openPicker(alloc);
+
+    try std.testing.expect(runtime.takePickerChoice(alloc) == null);
+    const connections = runtime.pickerView();
+    try std.testing.expectEqual(PickerStage.connections, connections.stage);
+    try std.testing.expectEqualStrings("Sign in with Google (AI Pro or Ultra)", connections.choiceLabel(.{ .action = .google_login }));
+    try std.testing.expectEqualStrings("", connections.choiceDescription(.{ .action = .google_login }));
+    try std.testing.expectEqualStrings("connected", connections.choiceDescription(.{ .action = .gemini_api_key }));
+
+    runtime.source_inventory.insert(.google_subscription);
+    runtime.setGooglePlanEmail("ultra@example.com");
+    const linked = runtime.pickerView();
+    try std.testing.expectEqualStrings("Google AI Pro or Ultra plan · ultra@example.com", linked.choiceLabel(.{ .action = .google_login }));
+    try std.testing.expectEqualStrings("connected", linked.choiceDescription(.{ .action = .google_login }));
+
+    runtime.openProviderPicker(alloc, .google);
+    const providers = runtime.pickerView();
+    try std.testing.expectEqual(PickerStage.provider, providers.stage);
+    try std.testing.expectEqual(@as(usize, 4), providers.choiceCount());
+    try std.testing.expect((Choice{ .provider = .google }).eql(providers.choiceAt(3).?));
+    try std.testing.expectEqualStrings("current", providers.choiceDescription(.{ .provider = .google }));
 }
 
 test "clearing a remembered choice re-resolves even when no login was active" {
@@ -5708,7 +6151,7 @@ test "api key save from setup returns to the selected Connections row" {
     runtime.openPicker(alloc);
     try std.testing.expect(runtime.takePickerChoice(alloc) == null);
     try std.testing.expectEqual(PickerStage.connections, runtime.pickerView().stage);
-    for (0..3) |_| try std.testing.expect(runtime.movePicker(1));
+    for (0..5) |_| try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .setup }).eql(runtime.takePickerChoice(alloc).?));
 
     runtime.openApiKeyPickerFromRoot(alloc);
@@ -5723,7 +6166,8 @@ test "api key save from setup returns to the selected Connections row" {
     const picker = runtime.pickerView();
     try std.testing.expectEqual(PickerStage.connections, picker.stage);
     try std.testing.expect((Choice{ .action = .setup }).eql(picker.selected_choice.?));
-    try std.testing.expect(picker.choiceIsSelected(picker.choiceAt(3).?));
+    try std.testing.expect((Choice{ .action = .gemini_api_key }).eql(picker.choiceAt(4).?));
+    try std.testing.expect(picker.choiceIsSelected(picker.choiceAt(5).?));
 }
 
 test "auth runtime saves and reloads through its injected secret store" {
@@ -5868,6 +6312,9 @@ test "api key stage zeroes its allocation on every exit path" {
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
             .reload_failed => .reload_failed,
+            .gemini_loaded => .{ .gemini_saved = true },
+            .gemini_store_failed => .gemini_store_failed,
+            .gemini_reload_failed => .gemini_reload_failed,
         };
         try std.testing.expect(result == .gateway_unavailable);
         try std.testing.expectEqual(@as(usize, 0), fixture.store_calls);
@@ -5897,6 +6344,9 @@ test "api key stage zeroes its allocation on every exit path" {
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
             .reload_failed => .reload_failed,
+            .gemini_loaded => .{ .gemini_saved = true },
+            .gemini_store_failed => .gemini_store_failed,
+            .gemini_reload_failed => .gemini_reload_failed,
         };
         try std.testing.expect(result == .saved);
         try std.testing.expectEqual(@as(usize, 1), fixture.store_calls);
@@ -5926,6 +6376,9 @@ test "api key stage zeroes its allocation on every exit path" {
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
             .reload_failed => .reload_failed,
+            .gemini_loaded => .{ .gemini_saved = true },
+            .gemini_store_failed => .gemini_store_failed,
+            .gemini_reload_failed => .gemini_reload_failed,
         };
         try std.testing.expect(result == .gateway_refused);
         try std.testing.expectEqual(@as(usize, 0), fixture.store_calls);
@@ -5955,6 +6408,9 @@ test "api key stage zeroes its allocation on every exit path" {
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
             .reload_failed => .reload_failed,
+            .gemini_loaded => .{ .gemini_saved = true },
+            .gemini_store_failed => .gemini_store_failed,
+            .gemini_reload_failed => .gemini_reload_failed,
         };
         try std.testing.expect(result == .store_failed);
         try std.testing.expectEqual(@as(usize, 1), fixture.store_calls);
@@ -5984,6 +6440,9 @@ test "api key stage zeroes its allocation on every exit path" {
             .gateway_unavailable => .gateway_unavailable,
             .store_failed => .store_failed,
             .reload_failed => .reload_failed,
+            .gemini_loaded => .{ .gemini_saved = true },
+            .gemini_store_failed => .gemini_store_failed,
+            .gemini_reload_failed => .gemini_reload_failed,
         };
         try std.testing.expect(result == .reload_failed);
         try expectApiKeyAllocationCleared(&runtime, &backing, sentinel);
@@ -6373,4 +6832,89 @@ test "team preparation cancels a slow credits lookup at its wait budget" {
         // Yielding is best-effort while waiting for the worker thread to finish.
         std.Thread.yield() catch {};
     }
+}
+
+test "google api key save stores off the event loop without gateway validation" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var fixture: ApiKeySaveFixture = .{ .validation = .refused };
+
+    runtime.openGoogleApiKeyPickerInline(alloc);
+    try std.testing.expectEqual(ApiKeyTarget.google, runtime.pickerView().api_key_target);
+    for ("AIza-google-worker-test") |byte| _ = try runtime.appendApiKeyByte(alloc, byte);
+
+    try std.testing.expectEqual(ApiKeySaveStart.started, runtime.beginApiKeySaveWithDeps(alloc, .{
+        .ctx = @ptrCast(&fixture),
+        .target = .google,
+        .validator = fixture.validator(),
+        .store_gemini = ApiKeySaveFixture.store,
+        .loader = ApiKeySaveFixture.load,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.capacity);
+    try std.testing.expect(!runtime.apiKeyEntryActive());
+
+    const result = while (true) {
+        if (runtime.takeApiKeySaveResult(alloc)) |value| break value;
+    };
+    try std.testing.expectEqual(ApiKeySaveResult{ .gemini_saved = true }, result);
+    try std.testing.expectEqual(@as(usize, 0), fixture.validate_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.store_calls);
+    try std.testing.expectEqual(credentials.Source.gemini_api_key, runtime.credentialSource().?);
+}
+
+test "google api key save failure keeps any earlier active credential" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var existing = try makeTestCredential(alloc, "AIza-earlier-key", .gemini_api_key, null, null);
+    defer existing.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &existing);
+
+    var fixture: ApiKeySaveFixture = .{ .fail_store = true };
+    runtime.openGoogleApiKeyPickerFromRoot(alloc);
+    for ("AIza-replacement-fail") |byte| _ = try runtime.appendApiKeyByte(alloc, byte);
+    try std.testing.expectEqual(ApiKeySaveStart.started, runtime.beginApiKeySaveWithDeps(alloc, .{
+        .ctx = @ptrCast(&fixture),
+        .target = .google,
+        .store_gemini = ApiKeySaveFixture.store,
+        .loader = ApiKeySaveFixture.load,
+    }));
+
+    const result = while (true) {
+        if (runtime.takeApiKeySaveResult(alloc)) |value| break value;
+    };
+    try std.testing.expectEqual(ApiKeySaveResult.gemini_store_failed, result);
+    try std.testing.expectEqual(credentials.Source.gemini_api_key, runtime.credentialSource().?);
+    try std.testing.expectEqualStrings("AIza-earlier-key", runtime.apiKey().?);
+}
+
+test "google api key cancel pops back to Connections when opened from setup" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.openPicker(alloc);
+    runtime.openGoogleApiKeyPickerFromRoot(alloc);
+    for ("AIza-cancel") |byte| _ = try runtime.appendApiKeyByte(alloc, byte);
+
+    try std.testing.expect(runtime.popPickerStage(alloc));
+    const view = runtime.pickerView();
+    try std.testing.expect(view.active);
+    try std.testing.expectEqual(PickerStage.connections, view.stage);
+    try std.testing.expect((Choice{ .action = .gemini_api_key }).eql(view.selected_choice.?));
+    try std.testing.expectEqual(@as(usize, 0), view.api_key_mask_count);
+}
+
+test "reconcileAfterGoogleLogout clears active gemini_api_key credential" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var cred = try makeTestCredential(alloc, "AIza-active", .gemini_api_key, null, null);
+    defer cred.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &cred);
+    try std.testing.expectEqual(credentials.Source.gemini_api_key, runtime.credentialSource().?);
+
+    const changed = try runtime.reconcileAfterGoogleLogout(alloc);
+    try std.testing.expect(changed);
+    try std.testing.expect(runtime.credentialSource() == null);
 }

@@ -16,6 +16,8 @@
   { "file": "poisoned-repository.test.ts", "weight": 5 },
   { "file": "file-tool-permissions.test.ts", "weight": 2 },
   { "file": "gateway-stream-lifecycle.test.ts", "weight": 98 },
+  { "file": "google-provider.test.ts", "weight": 3 },
+  { "file": "google-sign-in.test.ts", "weight": 4 },
   { "file": "host-managed-auth.test.ts", "weight": 2 },
   { "file": "mcp-auth.test.ts", "weight": 173 },
   { "file": "mcp-http.test.ts", "weight": 8 },

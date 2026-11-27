@@ -6,7 +6,9 @@ pub const root_dir_name = ".fx";
 pub const auth_file_name = "auth.json";
 pub const chatgpt_auth_file_name = "chatgpt-auth.json";
 pub const grok_auth_file_name = "grok-auth.json";
+pub const google_auth_file_name = "google-auth.json";
 pub const api_key_file_name = "api-key";
+pub const gemini_api_key_file_name = "gemini-api-key";
 pub const sessions_dir_name = "sessions";
 const hosts_dir_name = "hosts";
 /// Side folders older v2 sessions kept (D27): v1's per-session layout, one
@@ -176,8 +178,16 @@ pub fn chatgptAuthPath(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{chatgpt_auth_file_name});
 }
 
+pub fn googleAuthPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return rootPath(alloc, home, &.{google_auth_file_name});
+}
+
 pub fn apiKeyPath(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{api_key_file_name});
+}
+
+pub fn geminiApiKeyPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return rootPath(alloc, home, &.{gemini_api_key_file_name});
 }
 
 pub fn sessionsDir(alloc: Allocator, home: []const u8) ![]u8 {
@@ -263,9 +273,17 @@ test "profile path helpers preserve current default locations" {
     defer alloc.free(chatgpt_auth);
     try std.testing.expectEqualStrings("/tmp/fake-home/.fx/chatgpt-auth.json", chatgpt_auth);
 
+    const google_auth = try googleAuthPath(alloc, "/tmp/fake-home");
+    defer alloc.free(google_auth);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/google-auth.json", google_auth);
+
     const api_key = try apiKeyPath(alloc, "/tmp/fake-home");
     defer alloc.free(api_key);
     try std.testing.expectEqualStrings("/tmp/fake-home/.fx/api-key", api_key);
+
+    const gemini_api_key = try geminiApiKeyPath(alloc, "/tmp/fake-home");
+    defer alloc.free(gemini_api_key);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/gemini-api-key", gemini_api_key);
 
     const sessions = try sessionsDir(alloc, "/tmp/fake-home");
     defer alloc.free(sessions);

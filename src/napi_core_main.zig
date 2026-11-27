@@ -17,6 +17,8 @@ const host_stream_provider = @import("gateway/host_stream_provider.zig");
 const host_openai_codex = @import("gateway/host_openai_codex.zig");
 const openai_codex = @import("gateway/openai_codex.zig");
 const host_xai_grok = @import("gateway/host_xai_grok.zig");
+const host_google_gemini = @import("gateway/host_google_gemini.zig");
+const google_gemini = @import("gateway/google_gemini.zig");
 const host_chat_completions = @import("gateway/host_chat_completions.zig");
 const configured_provider = @import("core/config/configured_provider.zig");
 const provider_catalog = @import("core/auth/provider_catalog.zig");
@@ -676,6 +678,7 @@ const Runtime = struct {
     stream_context: host_stream_provider.ProviderContext = undefined,
     codex_context: host_openai_codex.Context = undefined,
     grok_context: host_xai_grok.Context = undefined,
+    google_context: host_google_gemini.Context = undefined,
     /// The app's configured provider, when `provider` names one.
     custom_context: ?host_chat_completions.Context = null,
     input: InputQueue = .{},
@@ -721,7 +724,7 @@ const Runtime = struct {
             .chat_url = builtin_gateway.provider.chat_url,
         };
         var providers = provider_set.gateway_only(.{
-            .capabilities = .{ .gateway_prompt_caching = true },
+            .capabilities = .{ .gateway_prompt_caching = true, .declares_effort_levels = true },
             .presentation = builtin_gateway.provider_bundle.presentation,
             .auth_strategy = .vercel,
             .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
@@ -740,6 +743,12 @@ const Runtime = struct {
             .auth_strategy = .grok,
             .agent_stream = bridgeBound(host_xai_grok.provider(&self.grok_context)),
             .model_catalog = host_xai_grok.modelCatalogProvider(&self.grok_context),
+        };
+        providers.google = .{
+            .capabilities = google_gemini.bundle_capabilities,
+            .presentation = provider_catalog.find(.google),
+            .agent_stream = bridgeBound(host_google_gemini.provider(&self.google_context)),
+            .model_catalog = host_google_gemini.model_catalog_provider,
         };
         if (self.custom_context) |*context| {
             providers.configured_fn = configuredBridgeBundle;
@@ -990,7 +999,7 @@ const CreateError = error{
 const max_provider_bytes = configured_provider.max_id_bytes;
 const max_configured_providers_bytes = 1024 * 1024;
 
-/// Reads the optional `provider` option: "gateway", "codex", "grok", or the name
+/// Reads the optional `provider` option: "gateway", "codex", "grok", "google", or the name
 /// of the provider that the `configuredProviders` option defines.
 fn getProvider(env: c.napi_env, options: c.napi_value) CreateError!?model_provider.ProviderId {
     const alloc = std.heap.c_allocator;
@@ -1003,6 +1012,7 @@ fn getProvider(env: c.napi_env, options: c.napi_value) CreateError!?model_provid
     if (std.mem.eql(u8, raw, "gateway")) return .gateway;
     if (std.mem.eql(u8, raw, "codex")) return .codex;
     if (std.mem.eql(u8, raw, "grok")) return .grok;
+    if (std.mem.eql(u8, raw, "google")) return .google;
     const configured = model_provider.parse(raw) orelse return error.InvalidProvider;
     if (configured != .configured) return error.InvalidProvider;
     return configured;
@@ -1106,6 +1116,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     });
     runtime.codex_context = .{ .transport = runtime.stream_context.transport };
     runtime.grok_context = .{ .transport = runtime.stream_context.transport };
+    runtime.google_context = .{ .transport = runtime.stream_context.transport };
     if (configured_providers) |json| {
         var context = host_chat_completions.Context.init(alloc, runtime.stream_context.transport, json) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1126,7 +1137,7 @@ fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
         error.JavaScriptException => null,
         error.TooManyRuntimes => throw(env, "LIBFX_NATIVE_LIMIT", "too many active native runtimes"),
         error.InvalidApiKey => throw(env, "LIBFX_INVALID_ARGUMENT", "apiKey is required and must be a bounded string"),
-        error.InvalidProvider => throw(env, "LIBFX_INVALID_ARGUMENT", "provider must be \"gateway\", \"codex\", \"grok\" or a configured provider's name"),
+        error.InvalidProvider => throw(env, "LIBFX_INVALID_ARGUMENT", "provider must be \"gateway\", \"codex\", \"grok\", \"google\" or a configured provider's name"),
         error.InvalidConfiguredProvider => throw(env, "LIBFX_INVALID_ARGUMENT", "configuredProviders must validly define the selected provider, without credentials"),
         error.InvalidModel => throw(env, "LIBFX_INVALID_ARGUMENT", "model must be a bounded string"),
         error.InvalidEffort => throw(env, "LIBFX_INVALID_ARGUMENT", "effort must be a bounded string"),
@@ -1553,6 +1564,9 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callco
     var supports_grok: c.napi_value = undefined;
     if (!statusOk(env, c.napi_get_boolean(env, true, &supports_grok), "could not create Grok capability")) return null;
     if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsGrok", supports_grok), "could not export Grok capability")) return null;
+    var supports_google: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_get_boolean(env, true, &supports_google), "could not create Google capability")) return null;
+    if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsGoogle", supports_google), "could not export Google capability")) return null;
     var supports_configured: c.napi_value = undefined;
     if (!statusOk(env, c.napi_get_boolean(env, true, &supports_configured), "could not create configured provider capability")) return null;
     if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsConfiguredProvider", supports_configured), "could not export configured provider capability")) return null;

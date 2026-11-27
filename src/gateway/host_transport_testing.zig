@@ -6,7 +6,7 @@ const host_stream = @import("host_stream_provider.zig");
 
 /// Serves canned responses in order and records each request.
 pub const FakeTransport = struct {
-    pub const Response = struct { status: u16, body: []const u8 };
+    pub const Response = struct { status: u16, body: []const u8, retry_after: i32 = -1 };
     pub const max_calls = 4;
 
     responses: []const Response,
@@ -34,7 +34,7 @@ pub const FakeTransport = struct {
     }
 
     pub fn transport(self: *FakeTransport) host_stream.Transport {
-        return .{ .context = self, .open_fn = open, .status_fn = status, .next_fn = next, .close_fn = close, .consumed_fn = markConsumed };
+        return .{ .context = self, .open_fn = open, .status_fn = status, .next_fn = next, .close_fn = close, .consumed_fn = markConsumed, .retry_after_fn = retryAfter };
     }
 
     pub fn request(self: *FakeTransport, credential: stream_provider.CredentialLease) stream_provider.ModelRequest {
@@ -95,6 +95,11 @@ pub const FakeTransport = struct {
     fn markConsumed(raw: ?*anyopaque, _: i32) void {
         const self: *FakeTransport = @ptrCast(@alignCast(raw.?));
         self.consumed += 1;
+    }
+
+    fn retryAfter(raw: ?*anyopaque, handle: i32) i32 {
+        const self: *FakeTransport = @ptrCast(@alignCast(raw.?));
+        return self.responses[@intCast(handle - 1)].retry_after;
     }
 
     fn emit(_: *anyopaque, _: stream_provider.Event) void {}

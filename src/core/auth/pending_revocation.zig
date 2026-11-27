@@ -46,6 +46,7 @@ const Allocator = std.mem.Allocator;
 pub const Source = enum {
     codex,
     grok,
+    google,
     fx_login,
     mcp,
 
@@ -53,6 +54,7 @@ pub const Source = enum {
         return switch (self) {
             .codex => .{ .record = "chatgpt-revocations.json", .lock = "chatgpt-revocations.lock", .label = "Codex kept sign-outs" },
             .grok => .{ .record = "grok-revocations.json", .lock = "grok-revocations.lock", .label = "Grok kept sign-outs" },
+            .google => .{ .record = "google-revocations.json", .lock = "google-revocations.lock", .label = "Google kept sign-outs" },
             .fx_login => .{ .record = "auth-revocations.json", .lock = "auth-revocations.lock", .label = "fx login kept sign-outs", .keychain_marker = "auth-revocations.keychain" },
             .mcp => .{ .record = "mcp-revocations.json", .lock = "mcp-revocations.lock", .label = "MCP kept sign-outs", .keychain_marker = "mcp-revocations.keychain" },
         };

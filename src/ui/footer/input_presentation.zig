@@ -443,7 +443,17 @@ fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const
     if (!view.active or view.include_skip) return null;
 
     if (view.stage == .api_key and view.api_key_inline) {
-        const key_variants = [_][]const u8{
+        const key_variants = if (view.api_key_target == .google) blk: {
+            const full_hint = if (std.mem.eql(u8, view.api_key_backend_label, "macOS Keychain"))
+                "enter saves     esc cancels     macOS Keychain"
+            else
+                "enter saves     esc cancels     profile file";
+            break :blk [_][]const u8{
+                full_hint,
+                "enter saves  esc cancels",
+                "enter  esc",
+            };
+        } else [_][]const u8{
             "enter saves     esc cancels     " ++ credentials.stored_key_backend_label,
             "enter saves  esc cancels",
             "enter  esc",
@@ -496,6 +506,18 @@ fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const
         "enter  tab  esc",
         "enter tab esc",
     };
+    const google_browser_variants = [_][]const u8{
+        "enter reopens browser · tab pastes URL · esc cancels",
+        "enter browser  tab paste url  esc cancels",
+        "enter  tab  esc",
+        "enter tab esc",
+    };
+    const google_manual_variants = [_][]const u8{
+        "enter submits URL · tab returns to browser · esc cancels",
+        "enter submits  tab browser  esc cancels",
+        "enter  tab  esc",
+        "enter tab esc",
+    };
     const variants = switch (view.stage) {
         .root => root_variants,
         .connections => connections_variants,
@@ -507,6 +529,10 @@ fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const
                 grok_manual_variants
             else
                 grok_browser_variants,
+            .google_subscription => if (view.sign_in_code_visible)
+                google_manual_variants
+            else
+                google_browser_variants,
             else => return null,
         },
         .api_key => return null,
@@ -1788,6 +1814,16 @@ test "compose hint row replaces model status with subscription sign-in controls"
             .source = .grok_subscription,
             .manual_code_visible = true,
             .expected = "enter submits code · tab returns to browser · esc cancels",
+        },
+        .{
+            .source = .google_subscription,
+            .manual_code_visible = false,
+            .expected = "enter reopens browser · tab pastes URL · esc cancels",
+        },
+        .{
+            .source = .google_subscription,
+            .manual_code_visible = true,
+            .expected = "enter submits URL · tab returns to browser · esc cancels",
         },
     };
 

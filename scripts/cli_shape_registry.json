@@ -197,6 +197,30 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_GEMINI_BASE_URL": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_GOOGLE_AUTH_URL": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_GOOGLE_CLIENT_ID": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_GOOGLE_CLIENT_SECRET": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_GOOGLE_REVOKE_URL": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_GOOGLE_TOKEN_URL": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_GREP_RELEASE": {
       "job": "test",
       "stability": "internal"
@@ -428,6 +452,8 @@
   },
   "not_env": {
     "FX_AI_GATEWAY_API_KEY": "Keychain service name for the AI Gateway API key, not an env var",
+    "FX_GEMINI_API_KEY": "Keychain service name for the Gemini API key, not an env var",
+    "FX_GOOGLE_SESSION_V1": "Keychain service name for Google AI Pro or Ultra plan sessions, not an env var",
     "FX_MCP_OAUTH_CREDENTIALS_V3": "Keychain service name for MCP OAuth credentials, not an env var",
     "FX_MCP_PENDING_REVOCATIONS_V1": "Keychain service name for MCP logins' kept sign-outs, not an env var",
     "FX_OAUTH_PENDING_REVOCATIONS_V1": "Keychain service name for the fx login's kept sign-outs, not an env var",

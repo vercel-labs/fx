@@ -15,6 +15,7 @@ const diagnostics = @import("../workspace/diagnostics.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const fuzzy_match = @import("../shared/fuzzy_match.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const test_builtin_gateway = if (@import("builtin").is_test)
     @import("../../builtins/gateway.zig")
@@ -251,13 +252,19 @@ pub const model_provider_filter_count = @typeInfo(ModelProviderFilter).@"enum".f
 
 pub const ModelMenuItem = struct {
     id: []u8,
+    name: ?[]u8 = null,
     provider: []const u8,
     capabilities: model_capabilities.Capabilities,
     /// Whether the catalog marks this model as paid by the team's Token Pass.
     token_pass: bool = false,
 
+    pub fn displayName(self: ModelMenuItem, shows_display_names: bool) []const u8 {
+        return if (shows_display_names) self.name orelse self.id else self.id;
+    }
+
     fn deinit(self: ModelMenuItem, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.name) |name| alloc.free(name);
     }
 };
 
@@ -266,6 +273,7 @@ pub const ModelMenu = struct {
     load_state: ModelMenuLoadState = .loading,
     catalog_state: ModelMenuCatalogState = .{},
     items: std.ArrayList(ModelMenuItem) = .empty,
+    shows_display_names: bool = false,
     provider_index: usize = 0,
     selected_index: usize = 0,
     window_start: usize = 0,
@@ -294,11 +302,11 @@ pub const ModelMenu = struct {
     }
 
     pub fn filteredItemCount(self: *const ModelMenu) usize {
-        return modelMenuFilteredItemCount(self.items.items, self.providerFilter(), self.query());
+        return modelMenuFilteredItemCount(self.items.items, self.providerFilter(), self.query(), self.shows_display_names);
     }
 
     pub fn itemAt(self: *const ModelMenu, display_index: usize) ?*const ModelMenuItem {
-        return modelMenuItemAt(self.items.items, self.providerFilter(), self.query(), display_index);
+        return modelMenuItemAt(self.items.items, self.providerFilter(), self.query(), self.shows_display_names, display_index);
     }
 
     pub fn moveVisibleItems(self: *ModelMenu, delta: i32, visible_items: u16) bool {
@@ -352,6 +360,7 @@ pub const ModelMenu = struct {
         for (self.items.items) |item| item.deinit(alloc);
         self.items.deinit(alloc);
         self.items = .empty;
+        self.shows_display_names = false;
         self.provider_index = 0;
         self.selected_index = 0;
         self.window_start = 0;
@@ -362,8 +371,9 @@ pub fn modelMenuFilteredItemCount(
     items: []const ModelMenuItem,
     provider_filter: ModelProviderFilter,
     query: []const u8,
+    shows_display_names: bool,
 ) usize {
-    return modelMenuRanking(items, provider_filter, query).count();
+    return modelMenuRanking(items, provider_filter, query, shows_display_names).count();
 }
 
 /// Returns the row at `display_index`. Better matches list first, and rows
@@ -372,9 +382,10 @@ pub fn modelMenuItemAt(
     items: []const ModelMenuItem,
     provider_filter: ModelProviderFilter,
     query: []const u8,
+    shows_display_names: bool,
     display_index: usize,
 ) ?*const ModelMenuItem {
-    const position = modelMenuRanking(items, provider_filter, query).at(display_index) orelse return null;
+    const position = modelMenuRanking(items, provider_filter, query, shows_display_names).at(display_index) orelse return null;
     return &items[position];
 }
 
@@ -383,12 +394,13 @@ fn modelMenuDisplayIndex(
     items: []const ModelMenuItem,
     provider_filter: ModelProviderFilter,
     query: []const u8,
+    shows_display_names: bool,
     id: []const u8,
 ) ?usize {
     const position = for (items, 0..) |item, position| {
         if (std.mem.eql(u8, item.id, id)) break position;
     } else return null;
-    return modelMenuRanking(items, provider_filter, query).rankOf(position);
+    return modelMenuRanking(items, provider_filter, query, shows_display_names).rankOf(position);
 }
 
 /// Matches a model on its full id, provider prefix included, so one query
@@ -406,10 +418,24 @@ const ModelMenuMatches = struct {
     items: []const ModelMenuItem,
     provider_filter: ModelProviderFilter,
     query: []const u8,
+    shows_display_names: bool = false,
 
     pub fn matchAt(self: ModelMenuMatches, position: usize) ?fuzzy_match.Match {
         const item = self.items[position];
         if (!providerMatchesFilter(item.provider, self.provider_filter)) return null;
+        if (self.shows_display_names) if (item.name) |name| {
+            if (std.mem.findScalarLast(u8, item.id, '/')) |slash| {
+                return fuzzy_match.match(self.query, &.{
+                    .{ .text = name },
+                    .{ .text = item.id },
+                    .{ .text = item.id[slash + 1 ..] },
+                });
+            }
+            return fuzzy_match.match(self.query, &.{
+                .{ .text = name },
+                .{ .text = item.id },
+            });
+        };
         return modelIdMatch(self.query, item.id);
     }
 };
@@ -418,9 +444,15 @@ fn modelMenuRanking(
     items: []const ModelMenuItem,
     provider_filter: ModelProviderFilter,
     query: []const u8,
+    shows_display_names: bool,
 ) fuzzy_match.Ranking(ModelMenuMatches) {
     return .{
-        .context = .{ .items = items, .provider_filter = provider_filter, .query = query },
+        .context = .{
+            .items = items,
+            .provider_filter = provider_filter,
+            .query = query,
+            .shows_display_names = shows_display_names,
+        },
         .len = items.len,
     };
 }
@@ -494,6 +526,7 @@ pub const Runtime = struct {
     requested_access: ?model_catalog.AccessMetadata = null,
     outcome: CatalogOutcome = .{},
     from_profile_settings: bool = false,
+    shows_display_names: bool = false,
     menu: ModelMenu = .{},
     /// Whether this credential's team has Token Pass: the answer fx saved
     /// for the team, then the credits check, the provider that served its
@@ -541,6 +574,7 @@ pub const Runtime = struct {
         shared_sign_in: ?auth_runtime.SharedSignIn,
     ) void {
         self.from_profile_settings = provider.provider_id == .configured;
+        self.shows_display_names = provider.shows_display_names;
         if (!self.beginLoad(access, provider.refresh_interval_ms, trigger)) return;
 
         const failed_to_copy: model_catalog.FetchResult = .{ .failed = .{
@@ -585,6 +619,7 @@ pub const Runtime = struct {
         access: credentials.CatalogAccess,
     ) void {
         self.from_profile_settings = provider.provider_id == .configured;
+        self.shows_display_names = provider.shows_display_names;
         if (!self.beginLoad(access, provider.refresh_interval_ms, .activity)) return;
 
         self.completeFetch(model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
@@ -742,6 +777,7 @@ pub const Runtime = struct {
         self.catalog = .empty;
         self.outcome = .{};
         self.from_profile_settings = false;
+        self.shows_display_names = false;
     }
 
     /// Installs a catalog that was completely fetched and validated before the
@@ -750,6 +786,7 @@ pub const Runtime = struct {
         self: *Self,
         access: credentials.CatalogAccess,
         owned_catalog: *std.ArrayList(model_catalog.ModelCatalogEntry),
+        shows_display_names: bool,
     ) void {
         self.cancelAndJoin();
 
@@ -765,6 +802,7 @@ pub const Runtime = struct {
             .access = model_catalog.AccessMetadata.init(access),
         } };
         self.from_profile_settings = false;
+        self.shows_display_names = shows_display_names;
         self.state = .ready;
         self.completion_pending = true;
         self.last_attempt_ms = model_catalog.clockMs();
@@ -1143,7 +1181,7 @@ pub const Runtime = struct {
                 // A retry runs behind the failed state; the picker shows it.
                 menu.load_state = if (self.fetch_in_flight) .loading else .failed;
             },
-            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items, self.token_pass.hasPass()),
+            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items, self.token_pass.hasPass(), self.shows_display_names),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
     }
@@ -1184,8 +1222,17 @@ fn modelMenuCatalogState(outcome: CatalogOutcome, from_profile_settings: bool) M
 
 fn appendMenuItem(alloc: Allocator, items: *std.ArrayList(ModelMenuItem), entry: model_catalog.ModelCatalogEntry) !void {
     const id = try alloc.dupe(u8, entry.id);
+    errdefer alloc.free(id);
+    const name = if (entry.name) |raw_name| blk: {
+        var encoded = try text_utils.encodeTerminalSafeInline(alloc, raw_name, 512);
+        defer encoded.deinit(alloc);
+        if (encoded.bytes.len == 0) break :blk null;
+        break :blk try alloc.dupe(u8, encoded.bytes);
+    } else null;
+    errdefer if (name) |value| alloc.free(value);
     const item: ModelMenuItem = .{
         .id = id,
+        .name = name,
         .provider = modelProvider(id),
         .capabilities = model_capabilities.resolveCapabilities(
             id,
@@ -1193,10 +1240,7 @@ fn appendMenuItem(alloc: Allocator, items: *std.ArrayList(ModelMenuItem), entry:
         ),
         .token_pass = entry.token_pass,
     };
-    items.append(alloc, item) catch |err| {
-        item.deinit(alloc);
-        return err;
-    };
+    try items.append(alloc, item);
 }
 
 /// Fills `menu` from `catalog`, in catalog order. With `token_pass_first`,
@@ -1208,6 +1252,7 @@ fn hydrateMenuSnapshot(
     menu: *ModelMenu,
     catalog: []const model_catalog.ModelCatalogEntry,
     token_pass_first: bool,
+    shows_display_names: bool,
 ) !void {
     var items: std.ArrayList(ModelMenuItem) = .empty;
     errdefer {
@@ -1237,8 +1282,8 @@ fn hydrateMenuSnapshot(
         .all;
     const selected_index = if (!previous_ready) 0 else selected: {
         const previous = menu.itemAt(menu.selected_index) orelse break :selected 0;
-        if (modelMenuDisplayIndex(items.items, filter, menu.query(), previous.id)) |index| break :selected index;
-        const match_count = modelMenuFilteredItemCount(items.items, filter, menu.query());
+        if (modelMenuDisplayIndex(items.items, filter, menu.query(), shows_display_names, previous.id)) |index| break :selected index;
+        const match_count = modelMenuFilteredItemCount(items.items, filter, menu.query(), shows_display_names);
         break :selected @min(menu.selected_index, match_count -| 1);
     };
     // Shift the window with the selection so its row stays put on screen.
@@ -1249,6 +1294,7 @@ fn hydrateMenuSnapshot(
 
     menu.clearSnapshot(alloc);
     menu.items = items;
+    menu.shows_display_names = shows_display_names;
     menu.load_state = .ready;
     menu.provider_index = @backingInt(filter);
     menu.selected_index = selected_index;
@@ -2221,7 +2267,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, false);
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, false, false);
     runtime.menu.active = true;
 
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
@@ -2281,7 +2327,7 @@ test "model menu leaves out a fast variant that Fast mode on a listed model runs
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, false);
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, false, false);
     runtime.menu.active = true;
 
     // `provider/plain` has no Fast mode, so its variant is the only way to run fast.
@@ -2297,7 +2343,7 @@ test "model menu leaves out a fast variant that Fast mode on a listed model runs
     // stays out too, while its base keeps the Fast mode row.
     var marked = entries;
     marked[1].token_pass = true;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &marked, true);
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &marked, true, false);
     try std.testing.expectEqual(@as(usize, 3), runtime.menu.filteredItemCount());
     for (runtime.menu.items.items) |item| {
         try std.testing.expect(!std.mem.eql(u8, item.id, "anthropic/claude-opus-5-fast"));
@@ -2316,7 +2362,7 @@ test "model menu leads with the models the catalog marks as Token Pass, for a te
     defer menu.deinit(alloc);
 
     // The marks, not a list in fx, pick the models, in catalog order.
-    try hydrateMenuSnapshot(alloc, &menu, &entries, true);
+    try hydrateMenuSnapshot(alloc, &menu, &entries, true, false);
     const led = [_][]const u8{ "acme/new-pass-model", "zai/glm-5.3", "openai/gpt-6-sol", "deepseek/deepseek-v4.1-flash" };
     for (led, menu.items.items) |id, item| {
         try std.testing.expectEqualStrings(id, item.id);
@@ -2324,7 +2370,7 @@ test "model menu leads with the models the catalog marks as Token Pass, for a te
     }
 
     // Without Token Pass the catalog order stands.
-    try hydrateMenuSnapshot(alloc, &menu, &entries, false);
+    try hydrateMenuSnapshot(alloc, &menu, &entries, false, false);
     for (entries, menu.items.items) |entry, item| try std.testing.expectEqualStrings(entry.id, item.id);
 }
 
@@ -2338,7 +2384,7 @@ test "model menu ranks fuzzy matches below verbatim ones and keeps the selection
     };
     var menu: ModelMenu = .{};
     defer menu.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &menu, &entries, false);
+    try hydrateMenuSnapshot(alloc, &menu, &entries, false, false);
     menu.active = true;
 
     menu.setQuery("gpt5");
@@ -2362,7 +2408,7 @@ test "model menu ranks fuzzy matches below verbatim ones and keeps the selection
     const revalidated = [_]model_catalog.ModelCatalogEntry{
         .{ .id = @constCast("acme/gpt5-pro"), .model_type = @constCast("language") },
     } ++ entries;
-    try hydrateMenuSnapshot(alloc, &menu, &revalidated, false);
+    try hydrateMenuSnapshot(alloc, &menu, &revalidated, false, false);
     try std.testing.expectEqual(@as(usize, 2), menu.selected_index);
     try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(menu.selected_index).?.id);
 }
@@ -2377,7 +2423,7 @@ test "a model's own name ranks it above longer ids that contain it" {
     };
     var menu: ModelMenu = .{};
     defer menu.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &menu, &entries, false);
+    try hydrateMenuSnapshot(alloc, &menu, &entries, false, false);
     menu.active = true;
 
     menu.setQuery("GPT-4o");
@@ -2434,7 +2480,7 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var mixed: ModelMenu = .{};
     defer mixed.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries, false);
+    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries, false, false);
     mixed.active = true;
 
     try std.testing.expect(mixed.moveProvider(1));
@@ -2450,7 +2496,7 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var codex: ModelMenu = .{};
     defer codex.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &codex, &codex_entries, false);
+    try hydrateMenuSnapshot(alloc, &codex, &codex_entries, false, false);
     codex.active = true;
 
     try std.testing.expect(!codex.moveProvider(1));
@@ -2466,14 +2512,14 @@ test "model menu snapshot construction cleans every allocation failure" {
 
     var probe = std.testing.FailingAllocator.init(backing, .{});
     var menu: ModelMenu = .{};
-    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, false);
+    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, false, false);
     menu.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         var failed_menu: ModelMenu = .{};
-        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, false)) {
+        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, false, false)) {
             failed_menu.deinit(failing.allocator());
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(failing.has_induced_failure);
@@ -2694,4 +2740,61 @@ test "model cache request resolution records lookup misses for the trace report"
     try std.testing.expect(events[2].failed);
     try std.testing.expectEqualStrings("outcome=cache_failed model=zai/glm-5.2", events[1].detail());
     try std.testing.expectEqualStrings("outcome=cache_unavailable model=zai/glm-5.2", events[2].detail());
+}
+
+test "model menu keeps sanitized display name while selecting raw model id" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    errdefer model_catalog.freeModelCatalog(alloc, &entries);
+    try entries.append(alloc, .{
+        .id = try alloc.dupe(u8, "gemini-4-hydrogen"),
+        .name = try alloc.dupe(u8, "Gemini 4 Hydrogen"),
+        .model_type = try alloc.dupe(u8, "language"),
+    });
+    try entries.append(alloc, .{
+        .id = try alloc.dupe(u8, "gemini-3.5-flash-lite"),
+        .name = try alloc.dupe(u8, "Gemini\x1b[31m 3.5 Flash-Lite"),
+        .model_type = try alloc.dupe(u8, "language"),
+    });
+
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    runtime.adoptOwnedCatalog(credentials.catalogAccessForCredential(.gemini_api_key, "AIza-key", null), &entries, true);
+    try runtime.openMenu();
+
+    try std.testing.expect(runtime.menu.shows_display_names);
+    try std.testing.expectEqual(@as(usize, 2), runtime.menu.filteredItemCount());
+    try std.testing.expectEqualStrings("Gemini 4 Hydrogen", runtime.menu.itemAt(0).?.displayName(true));
+    try std.testing.expect(std.mem.findScalar(u8, runtime.menu.itemAt(1).?.displayName(true), '\x1b') == null);
+
+    runtime.menu.setQuery("Hydrogen");
+    try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
+    const selected = (try runtime.menu.selectedModelAlloc(alloc)).?;
+    defer alloc.free(selected);
+    try std.testing.expectEqualStrings("gemini-4-hydrogen", selected);
+}
+
+test "model menu hides catalog display names and searches only ids when shows_display_names is false" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    errdefer model_catalog.freeModelCatalog(alloc, &entries);
+    try entries.append(alloc, .{
+        .id = try alloc.dupe(u8, "openai/gpt-6"),
+        .name = try alloc.dupe(u8, "Astra Flagship"),
+        .model_type = try alloc.dupe(u8, "language"),
+    });
+
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    runtime.adoptOwnedCatalog(credentials.catalogAccessForCredential(.ai_gateway_api_key, "gw-key", null), &entries, false);
+    try runtime.openMenu();
+
+    try std.testing.expect(!runtime.menu.shows_display_names);
+    try std.testing.expectEqualStrings("openai/gpt-6", runtime.menu.itemAt(0).?.displayName(false));
+
+    runtime.menu.setQuery("Flagship");
+    try std.testing.expectEqual(@as(usize, 0), runtime.menu.filteredItemCount());
+
+    runtime.menu.setQuery("gpt-6");
+    try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
 }

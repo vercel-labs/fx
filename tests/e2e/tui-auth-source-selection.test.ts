@@ -1560,7 +1560,7 @@ for (const gatewayState of ["absent", "rejected"] as const) {
       await session.sendText("/logout");
       await session.waitForText("Signed out of Codex.", TIMEOUT);
       await openProviderPicker(session);
-      expect(await session.capturePane()).toContain("grok · current");
+      expect(await session.capturePane()).toContain("grok   · current");
       await session.sendKeys("Escape");
       await session.sendKeys("C-u");
       await session.sendText("Use the remaining subscription.");
@@ -1674,9 +1674,9 @@ tmuxTest("provider recovery stays signed out when no replacement is connected", 
   await session.waitForText("Signed out of Codex.", TIMEOUT);
   await openProviderPicker(session);
   const pane = await session.capturePane();
-  expect(pane).not.toContain("codex · current");
+  expect(pane).not.toContain("codex  · current");
   expect(pane).not.toContain("vercel · current");
-  expect(pane).not.toContain("grok · current");
+  expect(pane).not.toContain("grok   · current");
   expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
   expect(gateway.requests).toHaveLength(0);
   expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -4887,7 +4887,7 @@ profileStoredKeyTmuxTest(
       (pane) => pane.includes("saved · saved by fx · current"),
       TIMEOUT,
     );
-    expect(keyColumn).toContain("env · AI_GATEWAY_API_KEY");
+    expect(keyColumn).toContain("env   · AI_GATEWAY_API_KEY");
     await session.sendKeys("Escape");
     await session.sendKeys("C-u");
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "stored API key (profile file)");
@@ -11074,6 +11074,105 @@ tmuxTest(
     } finally {
       releaseCredits();
     }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Google Gemini API key setup in /provider switches provider, keeps 0600 key out of screen, and /logout google removes it",
+  async () => {
+    const TEST_GEMINI_KEY = "AIza-e2e-gemini-secret-key-1234";
+    home = mkdtempSync(join(tmpdir(), "fx-tui-google-api-key-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+
+    session = await startFx(home, stderrPath, gateway);
+    await session.waitForComposer(TIMEOUT);
+
+    await session.sendText("/provider");
+    const providerList = await session.waitForPane(
+      (pane) =>
+        pane.includes("vercel") &&
+        pane.includes("codex") &&
+        pane.includes("grok") &&
+        pane.includes("google · Google (AI Pro or Ultra plan, or Gemini API key)"),
+      TIMEOUT,
+    );
+    expect(providerList).toContain("Google (AI Pro or Ultra plan, or Gemini API key)");
+
+    await session.sendKeys("Down");
+    await session.sendKeys("Down");
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    const methodList = await session.waitForPane(
+      (pane) =>
+        pane.includes("plan    · Sign in with Google (AI Pro or Ultra)") &&
+        pane.includes("api-key · Gemini API key"),
+      TIMEOUT,
+    );
+    expect(methodList.indexOf("plan    · Sign in with Google (AI Pro or Ultra)")).toBeLessThan(
+      methodList.indexOf("api-key · Gemini API key"),
+    );
+
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    const pasteStage = await session.waitForPane(
+      (pane) => pane.includes("Paste or type a key") && pane.includes("enter saves"),
+      TIMEOUT,
+    );
+    expect(pasteStage).toContain("enter saves");
+
+    await session.sendLiteralText(TEST_GEMINI_KEY);
+    const maskedStage = await session.waitForPane(
+      (pane) => pane.includes("•".repeat(Math.min(TEST_GEMINI_KEY.length, 32))),
+      TIMEOUT,
+    );
+    expect(maskedStage).not.toContain(TEST_GEMINI_KEY);
+
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) =>
+        pane.includes("Gemini API key saved.") &&
+        pane.includes("Switched to Google with gemini-4-hydrogen."),
+      TIMEOUT,
+    );
+
+    const keyPath = join(home, ".fx", "gemini-api-key");
+    expect(existsSync(keyPath)).toBe(true);
+    expect(readFileSync(keyPath, "utf8")).toBe(TEST_GEMINI_KEY);
+    expect(statSync(keyPath).mode & 0o777).toBe(0o600);
+
+    await session.sendText("/provider");
+    const connectedList = await session.waitForPane(
+      (pane) => pane.includes("google · Gemini API key · current"),
+      TIMEOUT,
+    );
+    expect(connectedList).toContain("google · Gemini API key · current");
+    await session.sendKeys("Escape");
+    await session.sendKeys("C-u");
+    await session.waitForPane((pane) => !pane.includes("google · Gemini API key"), TIMEOUT);
+
+    await session.sendText("/model");
+    const modelPicker = await session.waitForPane(
+      (pane) =>
+        pane.includes("Gemini 4 Hydrogen") &&
+        pane.includes("Gemini 4 Neon") &&
+        pane.includes("Gemini 4 Carbon") &&
+        pane.includes("Gemini 3.5 Flash-Lite"),
+      TIMEOUT,
+    );
+    expect(modelPicker).toContain("Google catalog: authenticated with Gemini API key.");
+    await session.sendKeys("Escape");
+    await session.waitForPane((pane) => !pane.includes("esc close"), TIMEOUT);
+
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).not.toContain(TEST_GEMINI_KEY);
+
+    await session.sendText("/logout google");
+    await session.waitForText("Signed out of Google.", TIMEOUT);
+    expect(existsSync(keyPath)).toBe(false);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
 );

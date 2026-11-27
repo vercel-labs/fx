@@ -42,6 +42,15 @@ pub const entries = [_]Entry{
         .subscription = true,
         .login_source = .grok_subscription,
     },
+    .{
+        .id = .google,
+        .slug = "google",
+        .name = "Google",
+        .route_name = "Google",
+        .description = "Google AI Pro or Ultra plan, or Gemini API key",
+        .subscription = false,
+        .login_source = .gemini_api_key,
+    },
 };
 
 pub fn parse(value: []const u8) ?model_provider.ProviderId {
@@ -77,9 +86,18 @@ test "auth provider catalog uses the model provider identity and explicit aliase
     try std.testing.expectEqual(model_provider.ProviderId.gateway, parse("gateway").?);
     try std.testing.expectEqual(model_provider.ProviderId.codex, parse("codex").?);
     try std.testing.expectEqual(model_provider.ProviderId.grok, parse("grok").?);
+    try std.testing.expectEqual(model_provider.ProviderId.google, parse("google").?);
+    try std.testing.expectEqual(model_provider.ProviderId.google, parse("GOOGLE").?);
     try std.testing.expect(parse("openai-codex") == null);
     try std.testing.expect(parse("chatgpt") == null);
     try std.testing.expect(parse("unknown") == null);
     try std.testing.expect(find(.codex).subscription);
     try std.testing.expect(find(.grok).subscription);
+    const google = find(.google);
+    try std.testing.expectEqualStrings("google", google.slug);
+    try std.testing.expectEqualStrings("Google", google.name);
+    try std.testing.expectEqualStrings("Google", google.route_name);
+    try std.testing.expectEqualStrings("Google AI Pro or Ultra plan, or Gemini API key", google.description);
+    try std.testing.expect(!google.subscription);
+    try std.testing.expectEqual(types.CredentialSource.gemini_api_key, google.login_source);
 }

@@ -226,6 +226,7 @@ pub inline fn composeModelMenuRow(
         return composeTitleRow(
             alloc,
             item.*,
+            projection.itemLabel(item.*),
             display_index == layout.selected,
             FactColumns.build(projection, width, if (layout.token_pass_rows != null) .shown else .hidden),
             width,
@@ -400,7 +401,7 @@ const FactColumns = struct {
         var tab_has_token_pass = false;
         for (projection.items) |item| {
             if (!model_cache_runtime.modelProviderFilterKeeps(item, filter)) continue;
-            longest_id = @max(longest_id, display_width.visibleWidth(item.id));
+            longest_id = @max(longest_id, display_width.visibleWidth(projection.itemLabel(item)));
             if (projection.token_pass and item.token_pass) tab_has_token_pass = true;
             var buf: [32]u8 = undefined;
             if (item.capabilities.context_window) |tokens| {
@@ -555,6 +556,7 @@ fn formatTokenCount(buf: []u8, tokens: u32) ![]const u8 {
 fn composeTitleRow(
     alloc: Allocator,
     item: model_cache_runtime.ModelMenuItem,
+    label: []const u8,
     selected: bool,
     columns: ?FactColumns,
     width: u16,
@@ -570,7 +572,7 @@ fn composeTitleRow(
     if (columns) |c| try c.appendCells(alloc, &cells, item);
 
     const id_budget = if (columns) |c| c.start - indent_width - fact_gap else @as(usize, width) -| indent_width;
-    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, item.id, id_budget);
+    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, label, id_budget);
     if (selected) try row.appendSlice(alloc, ui_render.reset_style);
 
     if (cells.items.len > 0) {
@@ -624,6 +626,8 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .stored_key => "Gateway catalog: authenticated with the stored API key.",
             .chatgpt_subscription => "Codex catalog: authenticated with a subscription.",
             .grok_subscription => "Grok catalog: authenticated with a subscription.",
+            .gemini_api_key => "Google catalog: authenticated with Gemini API key.",
+            .google_subscription => "Using your Google AI Pro or Ultra plan",
             .host_managed => "Provider catalog: authentication is managed by the host.",
             .configured => "Provider catalog: models from profile settings.",
         };
@@ -772,13 +776,13 @@ test "model menu keeps shared-prefix model ids distinguishable when narrow" {
         .capabilities = .{},
     };
 
-    var alpha_row = try composeTitleRow(alloc, alpha, true, null, 40);
+    var alpha_row = try composeTitleRow(alloc, alpha, alpha.id, true, null, 40);
     defer alpha_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, alpha_row.items, "provider/very-lo") != null);
     try std.testing.expect(std.mem.find(u8, alpha_row.items, "reasoning-alpha") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(alpha_row.items) <= 40);
 
-    var beta_row = try composeTitleRow(alloc, beta, false, null, 40);
+    var beta_row = try composeTitleRow(alloc, beta, beta.id, false, null, 40);
     defer beta_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, beta_row.items, "provider/very-lo") != null);
     try std.testing.expect(std.mem.find(u8, beta_row.items, "reasoning-beta") != null);
@@ -1443,4 +1447,89 @@ test "model menu for a team without Token Pass shows no Token Pass heading or ta
     try std.testing.expect(std.mem.find(u8, text.items, "kimi-k3") != null);
     try std.testing.expect(std.mem.find(u8, text.items, "Token Pass") == null);
     try std.testing.expect(std.mem.find(u8, text.items, "1M context   128K output   Fast mode") != null);
+}
+
+test "model menu shows catalog display names when provided and shows_display_names is true" {
+    const alloc = std.testing.allocator;
+    const items = [_]model_cache_runtime.ModelMenuItem{
+        .{ .id = @constCast("gemini-4-hydrogen"), .name = @constCast("Gemini 4 Hydrogen"), .provider = "", .capabilities = .{ .context_window = 1_048_576, .max_output_tokens = 65_536 } },
+        .{ .id = @constCast("gemini-4-neon"), .name = @constCast("Gemini 4 Neon"), .provider = "", .capabilities = .{ .context_window = 1_048_576, .max_output_tokens = 65_536 } },
+        .{ .id = @constCast("gemini-4-carbon"), .name = @constCast("Gemini 4 Carbon"), .provider = "", .capabilities = .{ .context_window = 1_048_576, .max_output_tokens = 65_536 } },
+        .{ .id = @constCast("gemini-3.5-flash-lite"), .name = @constCast("Gemini 3.5 Flash-Lite"), .provider = "", .capabilities = .{ .context_window = 1_048_576, .max_output_tokens = 65_536 } },
+    };
+    const projection: ModelMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .catalog_state = .{ .access_level = .authenticated, .source = .gemini_api_key },
+        .items = &items,
+        .shows_display_names = true,
+    };
+
+    const rows = menuRowCount(projection, 100, 20);
+    var grid = try renderMenuGrid(alloc, projection, 100, 20);
+    defer grid.deinit();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for ([_][]const u8{
+        "Gemini 4 Hydrogen",
+        "Gemini 4 Neon",
+        "Gemini 4 Carbon",
+        "Gemini 3.5 Flash-Lite",
+    }, 0..) |expected_name, idx| {
+        text.clearRetainingCapacity();
+        try grid.rowTextTrimmed(@intCast(3 + idx), &text);
+        try std.testing.expect(std.mem.find(u8, text.items, expected_name) != null);
+        try std.testing.expect(std.mem.find(u8, text.items, items[idx].id) == null);
+    }
+    text.clearRetainingCapacity();
+    try grid.rowTextTrimmed(rows, &text);
+    try std.testing.expect(std.mem.find(u8, text.items, "Google catalog: authenticated with Gemini API key.") != null);
+}
+
+test "model menu status shows Google AI Pro or Ultra plan active indicator" {
+    const alloc = std.testing.allocator;
+    const items = [_]model_cache_runtime.ModelMenuItem{
+        .{ .id = @constCast("gemini-4-hydrogen"), .name = @constCast("Gemini 4 Hydrogen"), .provider = "google", .capabilities = .{ .context_window = 1_000_000 } },
+    };
+    const projection: ModelMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .items = &items,
+        .shows_display_names = true,
+        .catalog_state = .{
+            .access_level = .authenticated,
+            .source = .google_subscription,
+        },
+    };
+    const rows = menuRowCount(projection, 100, 20);
+    var grid = try renderMenuGrid(alloc, projection, 100, 20);
+    defer grid.deinit();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    try grid.rowTextTrimmed(rows, &text);
+    try std.testing.expect(std.mem.find(u8, text.items, "Using your Google AI Pro or Ultra plan") != null);
+}
+
+test "model menu keeps ids for gateway-style projections when entries have names and shows_display_names is false" {
+    const alloc = std.testing.allocator;
+    const items = [_]model_cache_runtime.ModelMenuItem{
+        .{ .id = @constCast("openai/gpt-6-astra"), .name = @constCast("GPT-6 Astra"), .provider = "openai", .capabilities = .{ .context_window = 400_000 } },
+    };
+    const projection: ModelMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .items = &items,
+        .shows_display_names = false,
+    };
+
+    var grid = try renderMenuGrid(alloc, projection, 100, 20);
+    defer grid.deinit();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    try grid.rowTextTrimmed(3, &text);
+    try std.testing.expect(std.mem.find(u8, text.items, "openai/gpt-6-astra") != null);
+    try std.testing.expect(std.mem.find(u8, text.items, "GPT-6 Astra") == null);
 }

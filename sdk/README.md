@@ -25,7 +25,7 @@ for await (const event of turn) {
 await agent.close();
 ```
 
-Set `AI_GATEWAY_API_KEY` and run it with Node.js 20.19, 22.12, or newer. Model calls go through [AI Gateway](https://vercel.com/docs/ai-gateway), so any model it lists works, and on Vercel libfx uses the deployment's OIDC token instead of a key. libfx can also run on a user's own ChatGPT or Grok plan, or on another server through the OpenAI Chat Completions API. See [Providers](#providers).
+Set `AI_GATEWAY_API_KEY` and run it with Node.js 20.19, 22.12, or newer. Model calls go through [AI Gateway](https://vercel.com/docs/ai-gateway), so any model it lists works, and on Vercel libfx uses the deployment's OIDC token instead of a key. libfx can also run on Google's Gemini API, on a user's own ChatGPT or Grok plan, or on another server through the OpenAI Chat Completions API. See [Providers](#providers).
 
 Importing libfx and calling `createFxAgent()` touch no network, files or processes. The engine loads when a session runs its first turn.
 
@@ -369,6 +369,20 @@ const credentials = await completeDeviceSignIn(device);
 
 `startSignIn()` and `finishSignIn()` work as for ChatGPT, except that xAI opens a page at `127.0.0.1`. The sign-in uses the same xAI client as the fx CLI, and the user's Grok plan and xAI's terms apply to the turns.
 
+### Google Gemini
+
+`provider: "google"` runs on Google's Gemini API with a Gemini API key:
+
+```js
+const agent = createFxAgent({
+  provider: "google",
+  model: "gemini-4-hydrogen",
+  credentials: async ({ provider, sessionId }) => ({ apiKey: await keys.load(provider, sessionId) }),
+});
+```
+
+Name a Gemini model such as `gemini-4-hydrogen`, `gemini-4-neon`, `gemini-4-carbon`, or `gemini-3.5-flash-lite`, here or in `agent.session(id, { model })`. Requests go to `/v1beta/interactions` with `x-goog-api-key`. Keys aren't refreshed, so `onCredentials` and `refreshLock` don't apply. In libfx, only the Gemini API key route is supported; the Google AI Pro or Ultra plan sign-in is available in the fx CLI and TUI.
+
 ### Several servers, one account
 
 The sessions in one process share each refresh. Across servers, two can notice the same expiring credentials at once, and the provider accepts only the first refresh. Pass `refreshLock` so they take turns:
@@ -403,7 +417,7 @@ Saved sessions follow the agent's provider: point an agent at another base URL a
 
 ### Where credentials go
 
-libfx adds ChatGPT, Grok and custom-provider credentials to each request in JavaScript, just before it's sent, and sends them only to that provider. They never reach the engine. No credential is written to a saved session or passed to `onEvent`, and if a server quotes a key or token back in an error, libfx masks it before the error reaches the turn.
+libfx adds ChatGPT, Grok, Google and custom-provider credentials to each request in JavaScript, just before it's sent, and sends them only to that provider. They never reach the engine. No credential is written to a saved session or passed to `onEvent`, and if a server quotes a key or token back in an error, libfx masks it before the error reaches the turn.
 
 ## Images
 

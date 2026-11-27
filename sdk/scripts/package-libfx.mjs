@@ -58,6 +58,7 @@ const files = [
   ["sdk/chatgpt-sign-in.js", "chatgpt-sign-in.js"],
   ["sdk/grok.js", "grok.js"],
   ["sdk/grok-sign-in.js", "grok-sign-in.js"],
+  ["sdk/google.js", "google.js"],
   ["sdk/custom-provider.js", "custom-provider.js"],
   ["sdk/fetch-cleanup.js", "fetch-cleanup.js"],
   ["sdk/mcp.js", "mcp.js"],

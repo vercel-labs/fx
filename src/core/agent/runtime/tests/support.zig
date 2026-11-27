@@ -186,6 +186,7 @@ fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthori
 
 pub const FakeCompletion = struct {
     status: std.http.Status = .ok,
+    daily_limit: bool = false,
     err_body: ?[]const u8 = null,
     failure_schema: ?[]const u8 = null,
     failure_request_shape: ?[]const u8 = null,
@@ -354,6 +355,7 @@ pub const FakeGateway = struct {
             const failure_request_shape = if (completion.failure_request_shape) |value| try alloc.dupe(u8, value) else null;
             return .{ .failed = .{
                 .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(completion.status), err_body),
+                .daily_limit = completion.daily_limit,
                 .http_status = completion.status,
                 .detail = err_body,
                 .retry_after_seconds = completion.retry_after_seconds,
@@ -642,6 +644,11 @@ pub const FakeAgentRuntimeDeps = struct {
     out_of_credits_choices: []const runtime_deps.OutOfCreditsChoice = &.{},
     out_of_credits_index: usize = 0,
     out_of_credits_count: usize = 0,
+    /// Answers to the daily-limit picker, in order; past the end it cancels.
+    daily_limit_choices: []const runtime_deps.DailyLimitChoice = &.{},
+    daily_limit_index: usize = 0,
+    daily_limit_count: usize = 0,
+    daily_limit_last_offer_api_key: ?bool = null,
     default_model_capabilities: model_capabilities.Capabilities = .{
         .image_input_support = .non_native,
         .context_window = 1_000_000,
@@ -859,6 +866,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_http_error = httpError,
             .refresh_gateway_credential = refreshGatewayCredential,
             .ask_out_of_credits = askOutOfCredits,
+            .ask_daily_limit = askDailyLimit,
             .save_recovery_record = if (self.enable_recovery_record) saveRecoveryRecord else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
@@ -1087,6 +1095,18 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.out_of_credits_index < self.out_of_credits_choices.len) {
             const choice = self.out_of_credits_choices[self.out_of_credits_index];
             self.out_of_credits_index += 1;
+            return choice;
+        }
+        return .cancel;
+    }
+
+    fn askDailyLimit(raw: *anyopaque, _: []const u8, offer_api_key: bool) !runtime_deps.DailyLimitChoice {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.daily_limit_count += 1;
+        self.daily_limit_last_offer_api_key = offer_api_key;
+        if (self.daily_limit_index < self.daily_limit_choices.len) {
+            const choice = self.daily_limit_choices[self.daily_limit_index];
+            self.daily_limit_index += 1;
             return choice;
         }
         return .cancel;
@@ -1813,6 +1833,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 try self.record("model_call:{s}:{s}", .{ @tagName(call.outcome), call.model });
             },
             .open_model_picker => try self.record("event:open_model_picker", .{}),
+            .open_google_api_key_picker => try self.record("event:open_google_api_key_picker", .{}),
             .clear_route_recovery_status => {
                 self.route_recovery_clear_count += 1;
                 try self.record("event:clear_route_recovery_status", .{});

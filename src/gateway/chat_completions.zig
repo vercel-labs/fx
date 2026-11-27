@@ -27,7 +27,7 @@ pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
     return .{
         // The image fallback asks the connection's own vision model, so it
         // is on only when the settings name one.
-        .capabilities = .{ .vision_fallback = definition.vision_model != null, .vision_model = definition.vision_model },
+        .capabilities = .{ .vision_fallback = definition.vision_model != null, .vision_model = definition.vision_model, .declares_effort_levels = true },
         .title_model = definition.title_model,
         .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build, .project_replay_fn = replay_projection(definition.protocol) },
         .model_catalog = model_catalog_provider(definition),

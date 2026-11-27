@@ -5039,6 +5039,7 @@ fn needsUserFailureKind(
     failure: agent_stream_provider.Failure,
     credential_source: ?types.CredentialSource,
 ) ?runtime_request_recovery.Failure.Kind {
+    if (failure.daily_limit) return .daily_limit;
     if (failure.kind == .quota_exhausted or
         gateway_error_format.namesOutOfCredits(alloc, failure.detail orelse ""))
     {
@@ -5071,9 +5072,24 @@ fn gatewayLogin(credential_source: ?types.CredentialSource) bool {
 fn signInRepairs(credential_source: ?types.CredentialSource) bool {
     const source = credential_source orelse return false;
     return switch (source) {
-        .fx_login, .chatgpt_subscription, .grok_subscription => true,
-        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => false,
+        .fx_login, .chatgpt_subscription, .grok_subscription, .google_subscription => true,
+        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .gemini_api_key, .host_managed, .configured => false,
     };
+}
+
+test "signInRepairs enables sign-in repair for Google AI Pro or Ultra plan and disables it for Gemini API key" {
+    try std.testing.expect(signInRepairs(.google_subscription));
+    try std.testing.expect(!signInRepairs(.gemini_api_key));
+    try std.testing.expect(!signInRepairs(null));
+    const unauthorized = agent_stream_provider.Failure{ .kind = .unauthorized };
+    try std.testing.expectEqual(
+        @as(?runtime_request_recovery.Failure.Kind, .sign_in),
+        needsUserFailureKind(std.testing.allocator, unauthorized, .google_subscription),
+    );
+    try std.testing.expectEqual(
+        @as(?runtime_request_recovery.Failure.Kind, null),
+        needsUserFailureKind(std.testing.allocator, unauthorized, .gemini_api_key),
+    );
 }
 
 /// The provider's HTTP error detail, clipped, as fx shows it.
@@ -5082,8 +5098,10 @@ fn httpFailureDetail(
     failure: agent_stream_provider.Failure,
     job: QueuedPrompt,
     request_capabilities: model_capabilities.Capabilities,
+    prefer_interactive: bool,
 ) ![]const u8 {
-    const detail = if (failure.detail) |body| std.mem.trim(u8, body, " \r\n\t") else "";
+    const raw = if (prefer_interactive) (failure.interactive_detail orelse failure.detail) else failure.detail;
+    const detail = if (raw) |body| std.mem.trim(u8, body, " \r\n\t") else "";
     const clipped = detail[0..@min(detail.len, http_error_detail_max_bytes)];
     return runtime_gateway_step.gatewayHttpErrorDetail(
         arena,
@@ -5103,7 +5121,7 @@ fn pushWaitingHttpFailureReason(
     job: QueuedPrompt,
     request_capabilities: model_capabilities.Capabilities,
 ) !void {
-    const detail = try httpFailureDetail(arena, failure, job, request_capabilities);
+    const detail = try httpFailureDetail(arena, failure, job, request_capabilities, true);
     const message = try gateway_error_format.formatHttpErrorMessage(arena, failureStatus(failure), detail);
     if (deps.push_interactive_notice) |push| {
         try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
@@ -5134,15 +5152,20 @@ fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: Que
     }
 }
 
-const UserAnswer = enum { resend, cancelled, switch_model };
+const UserAnswer = enum { resend, cancelled, switch_model, use_gemini_api_key };
 
 /// Reports a failure that needs the user and waits for their answer.
 fn waitForUser(
     request_recovery: *runtime_request_recovery.RequestRecovery,
     deps: *const AgentRuntimeDeps,
     kind: runtime_request_recovery.Failure.Kind,
+    failure: agent_stream_provider.Failure,
+    job: QueuedPrompt,
 ) !UserAnswer {
-    var send = try request_recovery.failed(.{ .kind = kind });
+    var send = try request_recovery.failed(.{
+        .kind = kind,
+        .retry_after_ms = if (kind == .daily_limit) retryAfterMs(failure.retry_after_seconds) else null,
+    });
     // fx compacts a request that is too long before it reports one, so the
     // module's compacted send would repeat the same request. That send fails
     // the same way without going out, and the module asks the user.
@@ -5156,6 +5179,15 @@ fn waitForUser(
         return switch (choice) {
             .retry => if (try request_recovery.userContinue() != null) .resend else .cancelled,
             .switch_model => .switch_model,
+            .cancel => .cancelled,
+        };
+    };
+    if (kind == .daily_limit) if (deps.ask_daily_limit) |ask| {
+        const choice = try ask(deps.ctx, job.model, job.credential_source == .google_subscription);
+        debug_trace.logf("recovery", "daily limit choice={s}", .{@tagName(choice)});
+        return switch (choice) {
+            .switch_model => .switch_model,
+            .use_api_key => .use_gemini_api_key,
             .cancel => .cancelled,
         };
     };
@@ -5858,6 +5890,7 @@ fn renewRejectedCredentialForJob(
     job_arena: Allocator,
     active_api_key: *[]const u8,
     owned_api_key: *?[]u8,
+    google_sign_in_required: *bool,
     trace_ctx: TraceContext,
 ) !bool {
     // A host can free the active key while it loads the stored one, such as
@@ -5866,6 +5899,7 @@ fn renewRejectedCredentialForJob(
     const rejected = try alloc.dupe(u8, active_api_key.*);
     defer secret.zeroAndFree(alloc, rejected);
     const renewal = try credential_renewal.renewRejected(deps, alloc, jobSignIn(job.*), rejected, trace_ctx);
+    google_sign_in_required.* = renewal.google_sign_in_required;
     // Adopt the stored one even when it is the rejected token: the job then
     // owns the bytes it holds if the forced refresh gives nothing.
     if (renewal.stored) |stored| adoptJobCredential(alloc, job, job_arena, .reload, stored, active_api_key, owned_api_key, trace_ctx) catch |err| {
@@ -8399,6 +8433,7 @@ fn processQueuedPromptLoop(
         // The next send reads the stored credential again, after a sign-in.
         var credential_reload_pending = false;
         var auth_retry_used = false;
+        var google_sign_in_required = false;
         // The gateway's reason for refusing this request's login is on
         // screen; its resends do not repeat it.
         var auth_reason_shown = false;
@@ -8695,15 +8730,15 @@ fn processQueuedPromptLoop(
             provider_opts.provider_strict = config.provider_strict;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, attempt_fast_mode, step_effort, provider_opts);
             // A custom connection sends an effort level only when the model's
-            // settings declare it, and the Gateway only when its catalog lists
-            // it. One the person set and the model does not declare is left
-            // out, and the session says so once
-            // (`tests/tla/configured_provider/ConfiguredRequest.tla`
-            // IgnoredEffortNoticed, NoticeOncePerSession). A Gateway catalog
-            // that failed cannot say what it lists, so its drop stays quiet
+            // settings declare it, and providers whose catalog declares effort
+            // levels only when that catalog lists it. One the person set and
+            // the model does not declare is left out, and the session says so
+            // once (`tests/tla/configured_provider/ConfiguredRequest.tla`
+            // IgnoredEffortNoticed, NoticeOncePerSession). A catalog that
+            // failed cannot say what it lists, so its drop stays quiet
             // (`deps.zig` model_catalog_failure).
             const effort_catalog_known = job.provider == .configured or
-                (job.provider == .gateway and deps.model_catalog_failure != null and request_catalog_failure == null);
+                (config.provider_capabilities.declares_effort_levels and deps.model_catalog_failure != null and request_catalog_failure == null);
             if (effort_catalog_known and !step_effort.isDefault() and provider_opts.reasoning == null and !ignored_effort_notified) {
                 ignored_effort_notified = true;
                 if (deps.push_session_notice) |push| {
@@ -9351,6 +9386,7 @@ fn processQueuedPromptLoop(
                     arena,
                     &active_api_key,
                     &owned_refreshed_api_key,
+                    &google_sign_in_required,
                     step_ctx,
                 )) {
                     auth_retry_used = true;
@@ -9619,7 +9655,7 @@ fn processQueuedPromptLoop(
                 continue;
             }
 
-            if (response_failure) |failure| if (isRetryableModelFailure(failure.kind)) {
+            if (response_failure) |failure| if (isRetryableModelFailure(failure.kind) and !failure.daily_limit) {
                 // 429 and 5xx wait and resend through the recovery module,
                 // which honors the server's Retry-After. Esc during the wait
                 // falls through to the cancel path below.
@@ -9711,7 +9747,7 @@ fn processQueuedPromptLoop(
                         request_recovery.sign_in_renewed = .{ .ctx = &stored_sign_in, .check = StoredSignInWatch.renewed };
                     }
                     defer request_recovery.sign_in_renewed = null;
-                    switch (try waitForUser(&request_recovery, deps, kind)) {
+                    switch (try waitForUser(&request_recovery, deps, kind, failure, job)) {
                         .resend => {
                             stream_result.deinit(arena);
                             stream_result_set = false;
@@ -9729,6 +9765,10 @@ fn processQueuedPromptLoop(
                             // model.
                             restorePromptAfterTerminalFailure(deps, job, config);
                             try deps.push_event(deps.ctx, .open_model_picker);
+                        },
+                        .use_gemini_api_key => {
+                            restorePromptAfterTerminalFailure(deps, job, config);
+                            try deps.push_event(deps.ctx, .open_google_api_key_picker);
                         },
                         .cancelled => {},
                     }
@@ -10234,7 +10274,10 @@ fn processQueuedPromptLoop(
             // end here rather than through the step's errdefer.
             request_recovery.endWithError();
             if (!http_failure_notice_shown) {
-                const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
+                const http_detail = if (google_sign_in_required)
+                    credentials.google_sign_in_required_message
+                else
+                    try httpFailureDetail(arena, failure, job, request_capabilities, request_recovery.canAskUser());
                 try deps.push_http_error(deps.ctx, failureStatus(failure), http_detail, job.credential_source);
             }
             if (stop_state.retained_candidate != null) {

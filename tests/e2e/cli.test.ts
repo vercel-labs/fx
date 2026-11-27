@@ -367,7 +367,8 @@ describe("cli: help", () => {
       expect(stdout).toContain("Choose the active model provider");
       // `fx login --api-key` replaced the removed `fx setup`.
       expect(stdout).not.toContain("Configure a Vercel AI Gateway API key");
-      expect(stdout).toContain("login [vercel|codex|grok] [--api-key]");
+      expect(stdout).toContain("login [provider] [--api-key]");
+      expect(stdout).toContain("logout [provider] [--disconnect]");
       expect(stdout).toContain("Choose a Vercel AI Gateway team");
       expect(stdout).toContain("Show Vercel AI Gateway credits");
       expect(stdout).not.toContain("Sign in to Vercel or a selected provider");
@@ -420,7 +421,7 @@ Options:
   --auto                      Automatically review unresolved permission requests
   --full-access               Disable fx permission checks
   --yolo                      Alias for --full-access
-  --provider <name>           Override the model provider for this request (gateway, codex, grok, or a configured name)
+  --provider <name>           Override the model provider for this request (gateway, codex, grok, google, or a configured name)
   --model <id>                Override the model for this request
   --effort <level>            Override the reasoning effort for this request
   --fast                      Enable Fast mode for this request when the model supports it
@@ -3019,7 +3020,7 @@ describe("cli: setup", () => {
   );
 
   test(
-    "fx login --api-key pastes a key and is only for vercel",
+    "fx login --api-key pastes a key and is only for vercel and google",
     async () => {
       for (const args of [["login", "--api-key"], ["login", "vercel", "--api-key"]]) {
         const disabled = await runFx(args, { env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" } });
@@ -3032,9 +3033,9 @@ describe("cli: setup", () => {
       expect(noTerminal.code).toBe(1);
       expect(noTerminal.stderr).toBe("fx login: an interactive terminal is required to paste an API key\n");
 
-      const usage = "usage: fx login [vercel|codex|grok] [--api-key]\n";
+      const usage = "usage: fx login [vercel|codex|grok|google] [--api-key]\n";
       const cases: [string[], string][] = [
-        [["login", "codex", "--api-key"], "fx login: --api-key works only with vercel\n"],
+        [["login", "codex", "--api-key"], "fx login: --api-key works only with vercel or google\n"],
         [["login", "--bogus"], "fx login: unknown flag --bogus\n" + usage],
         [["login", "vercel", "codex"], usage],
       ];
@@ -7169,7 +7170,7 @@ describe("cli: completion", () => {
     [["fx", "sessions", ""], "ls convert"],
     [["fx", "mcp", "add", "--g"], "--global"],
     [["fx", "usage", "--period", ""], "today 7d month"],
-    [["fx", "login", ""], "vercel codex grok"],
+    [["fx", "login", ""], "vercel codex grok google"],
     [["fx", "completion", ""], "bash zsh fish"],
     [["fx", "-r", ""], "last"],
   ];

@@ -165,6 +165,18 @@ pub const OutOfCreditsChoice = enum {
     cancel,
 };
 
+/// The user's answer when a provider's daily limit is reached.
+pub const DailyLimitChoice = enum {
+    /// "Switch to another model": end the turn with the prompt back in the
+    /// composer and the model picker open.
+    switch_model,
+    /// "Use a Gemini API key": end the turn with the prompt back in the
+    /// composer and `/provider google api-key` open.
+    use_api_key,
+    /// "Cancel this turn", or Esc.
+    cancel,
+};
+
 pub const CredentialRefreshMode = auth_runtime.CredentialRefreshMode;
 
 /// Ordered text emitted by the agent runtime. Payloads are borrowed for the
@@ -378,6 +390,9 @@ pub const AgentRuntimeDeps = struct {
     /// Asks the user what to do when the account is out of credits, and
     /// blocks until they answer. Only the TUI sets it.
     ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,
+    /// Asks the user what to do when a provider's daily limit is reached, and
+    /// blocks until they answer. Only the TUI sets it.
+    ask_daily_limit: ?*const fn (ctx: *anyopaque, model: []const u8, offer_api_key: bool) anyerror!DailyLimitChoice = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
     /// The failure that keeps the model catalog down, so capability drops are

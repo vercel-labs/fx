@@ -145,6 +145,8 @@
     {"name": "verify-yolo-permission-mode", "argv": ["bun", "test", "--max-concurrency", "1", "./yolo-permission-mode.test.ts"], "test_file": "yolo-permission-mode.test.ts"},
     {"name": "verify-doctor", "argv": ["bun", "test", "--max-concurrency", "1", "./doctor.test.ts"], "test_file": "doctor.test.ts"},
     {"name": "verify-tui-custom-connection-errors", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-custom-connection-errors.test.ts"], "test_file": "tui-custom-connection-errors.test.ts"},
-    {"name": "verify-mcp-shared", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-shared.test.ts"], "test_file": "mcp-shared.test.ts", "requires_tmux": false}
+    {"name": "verify-mcp-shared", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-shared.test.ts"], "test_file": "mcp-shared.test.ts", "requires_tmux": false},
+    {"name": "verify-google-provider", "argv": ["bun", "test", "--max-concurrency", "1", "./google-provider.test.ts"], "test_file": "google-provider.test.ts", "requires_tmux": false},
+    {"name": "verify-google-sign-in", "argv": ["bun", "test", "--max-concurrency", "1", "./google-sign-in.test.ts"], "test_file": "google-sign-in.test.ts"}
   ]
 }

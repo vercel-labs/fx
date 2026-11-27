@@ -2265,7 +2265,7 @@ const App = struct {
     }
 
     pub fn providerSet(self: *const App) provider_set.Set {
-        if (self.provider_selection.model_requests_blocked) return .{ .gateway = .{}, .codex = .{}, .grok = .{} };
+        if (self.provider_selection.model_requests_blocked) return .{ .gateway = .{}, .codex = .{}, .grok = .{}, .google = .{} };
         if (comptime host_target.is_wasm) {
             return provider_set.gateway_only(.{
                 .capabilities = .{
@@ -2298,6 +2298,7 @@ const App = struct {
             providers.gateway.permission_reviewer = null;
             providers.codex.permission_reviewer = null;
             providers.grok.permission_reviewer = null;
+            providers.google.permission_reviewer = null;
         }
         return providers;
     }
@@ -5568,8 +5569,17 @@ test {
     _ = @import("gateway/provider_versions.zig");
     _ = @import("gateway/xai_grok.zig");
     _ = @import("gateway/xai_grok_permission_reviewer.zig");
+    _ = @import("gateway/gemini_errors.zig");
+    _ = @import("gateway/gemini_interactions_protocol.zig");
+    _ = @import("gateway/google_gemini.zig");
+    _ = @import("gateway/google_gemini_models.zig");
+    _ = @import("gateway/google_gemini_permission_reviewer.zig");
     _ = credentials;
     _ = @import("core/auth/oauth.zig");
+    _ = @import("core/auth/dpop.zig");
+    _ = @import("core/auth/google_oauth.zig");
+    _ = @import("core/auth/google_refresh.zig");
+    _ = @import("core/auth/google_session.zig");
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/mcp_host/kept_sign_outs.zig");
@@ -5738,6 +5748,7 @@ test {
     _ = @import("gateway/host_model_catalog.zig");
     _ = @import("gateway/host_openai_codex.zig");
     _ = @import("gateway/host_xai_grok.zig");
+    _ = @import("gateway/host_google_gemini.zig");
     _ = @import("gateway/host_chat_completions.zig");
 }
 

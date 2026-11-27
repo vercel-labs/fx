@@ -1630,6 +1630,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         options.resume_target == null and startup.credential == null)
     {
         if (startup.credential_load_failure) |failure| {
+            if (failure.err == error.GoogleSignInRequired) return error.GoogleSignInRequired;
+            if (failure.source == .google_subscription and auth_runtime.isGoogleSessionDamagedError(failure.err)) {
+                return error.GoogleSessionDamaged;
+            }
             if (auth_runtime.preparationError(auth_runtime.classifyCredentialFailure(failure.source, failure.err))) |err| return err;
         }
         return missingCredentialResult(alloc, options, startup.provider, startup.credential_source_preference);
@@ -1761,7 +1765,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         const credential: *const credentials.Credential = if (startup_credential_is_final)
             &startup.credential.?
         else routed: {
-            const preferred_source = if (ctx.provider == .gateway) startup.credential_source_preference else null;
+            const preferred_source = if (model_provider.authorizesCredential(ctx.provider, startup.credential_source_preference))
+                startup.credential_source_preference
+            else
+                null;
             routed_credential = try auth_runtime.prepareCredential(
                 alloc,
                 cfg.gateway_provider.oauth_transport,

@@ -11,8 +11,13 @@ const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const pending_revocation = @import("../auth/pending_revocation.zig");
+const builtin_commands = @import("../../builtins/commands.zig");
+const cli_flags = @import("../cli/cli_flags.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
+const gemini_api_key = @import("../auth/gemini_api_key.zig");
+const google_oauth = @import("../auth/google_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -151,10 +156,13 @@ pub fn Runtime(comptime App: type) type {
         fn selectProviderCredential(app: *App, provider: model_provider.ProviderId) !auth_runtime.ProviderCredentialSelection {
             if (hostManagesAuth(app) or (provider != .configured and model_provider.authorizesCredential(provider, app.auth.credentialSource()))) return .unchanged;
             var preferred: ?credentials.Source = null;
-            if (provider == .gateway and !host_target.is_wasm) {
+            if ((provider == .gateway or provider == .google) and !host_target.is_wasm) {
                 var settings = try config_runtime.loadMergedSettings(app.alloc, app.workspace_root);
                 defer settings.deinit(app.alloc);
-                preferred = settings.credential_source;
+                preferred = if (model_provider.authorizesCredential(provider, settings.credential_source))
+                    settings.credential_source
+                else
+                    null;
             }
             return app.auth.selectForProvider(app.alloc, provider, preferred);
         }
@@ -190,19 +198,25 @@ pub fn Runtime(comptime App: type) type {
                         .gateway => credentials.missing_interactive_credential_message,
                         .codex => credentials.missing_chatgpt_interactive_credential_message,
                         .grok => credentials.missing_grok_interactive_credential_message,
+                        .google => "Google authentication is unavailable.",
                         .configured => "Configured provider authentication is unavailable. Check settings.json and its environment variable.",
                     },
                 }, true),
                 .failed => |failure| {
                     const classified = auth_runtime.classifyCredentialFailure(failure.source, failure.err);
-                    const message = if (auth_runtime.preparationError(classified)) |err|
-                        auth_runtime.preparationFailureNotice(err).?
-                    else
-                        "Authentication is unavailable. Run /provider to repair this source.";
-                    debug_trace.logf("auth", "resumed credential unavailable source={t} err={s}", .{ failure.source, @errorName(failure.err) });
-                    const body = try app.alloc.print("{s}: {s}", .{ credentials.sourceLabel(failure.source), message });
-                    defer app.alloc.free(body);
-                    try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = body }, true);
+                    if (classified.source == .google_subscription and classified.damaged_google_session) {
+                        debug_trace.logf("auth", "resumed credential unavailable source={t} err={s}", .{ failure.source, @errorName(failure.err) });
+                        try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = credentials.google_session_damaged_message }, true);
+                    } else {
+                        const message = if (auth_runtime.preparationError(classified)) |err|
+                            auth_runtime.preparationFailureNotice(err).?
+                        else
+                            "Authentication is unavailable. Run /provider to repair this source.";
+                        debug_trace.logf("auth", "resumed credential unavailable source={t} err={s}", .{ failure.source, @errorName(failure.err) });
+                        const body = try app.alloc.print("{s}: {s}", .{ credentials.sourceLabel(failure.source), message });
+                        defer app.alloc.free(body);
+                        try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = body }, true);
+                    }
                 },
             }
             app.shell.render_requests.request(.footer);
@@ -216,6 +230,8 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .warning,
                     .body = if (provider == .configured)
                         "Configured provider authentication is unavailable. Check settings.json and its environment variable."
+                    else if (provider == .google)
+                        "Google authentication is unavailable."
                     else if (provider == .grok)
                         credentials.missing_grok_interactive_credential_message
                     else
@@ -276,17 +292,18 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            const requested_provider = if (std.mem.trim(u8, target, " \t\r\n").len == 0)
-                null
-            else
-                provider_catalog.parse(std.mem.trim(u8, target, " \t\r\n")) orelse {
-                    try writeAuthNotice(app, .{
-                        .topic = "",
-                        .tone = .warning,
-                        .body = "usage: /logout [vercel|codex|grok]",
-                    });
-                    return;
-                };
+            const logout_args = parseLogoutCommandArgs(app.alloc, target) catch |err| {
+                try writeAuthNotice(app, .{
+                    .topic = "",
+                    .tone = .warning,
+                    .body = switch (err) {
+                        error.DisconnectNeedsGoogle => "/logout: --disconnect works only with google",
+                        else => "usage: /logout [vercel|codex|grok|google] [--disconnect]",
+                    },
+                });
+                return;
+            };
+            const requested_provider = logout_args.provider;
             try app.flushBeforeBlockingExternalWork();
             const selected_provider: model_provider.ProviderId = if (comptime provider_runtime.supported(App))
                 provider_runtime.providerOf(app, agent)
@@ -302,6 +319,14 @@ pub fn Runtime(comptime App: type) type {
                 .active_source = app.auth.credentialSource(),
                 .available_sources = provider_inventory,
             });
+            if (logout_args.disconnect and logout_provider != .google) {
+                try writeAuthNotice(app, .{
+                    .topic = "",
+                    .tone = .warning,
+                    .body = "/logout: --disconnect works only with google",
+                });
+                return;
+            }
             const hold_turn_start = logout_provider.eql(selected_provider) and logout_provider != .gateway;
             if (hold_turn_start and (agent.stream.active or !agent.worker.tryHoldTurnStart())) {
                 try writeAuthNotice(app, .{
@@ -312,9 +337,105 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             defer if (hold_turn_start) agent.worker.releaseTurnStartHold();
+            if (logout_provider == .google) return logoutGoogleWithOptions(app, agent, logout_args.disconnect);
             if (logout_provider == .grok) return logoutGrok(app, agent);
             if (logout_provider == .codex) return logoutCodex(app, agent);
             return logoutFxLogin(app);
+        }
+
+        fn logoutGoogle(app: *App, agent: *AppAgent) !void {
+            return logoutGoogleWithOptions(app, agent, false);
+        }
+
+        fn logoutGoogleWithOptions(app: *App, agent: *AppAgent, disconnect: bool) !void {
+            if (disconnect) {
+                const local = google_oauth.disconnectLocally(std.heap.c_allocator, null) catch {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not durably remove saved Google session. The current source is unchanged.",
+                    });
+                    return;
+                };
+                var revocation: ?auth_runtime.RemoteRevocation = if (local.refresh_token) |token| .{ .google = token } else null;
+                defer if (revocation) |pending| releaseRemoteRevocation(pending);
+                const key_deleted = gemini_api_key.delete(app.alloc) catch {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not durably remove saved Gemini API key. The current source is unchanged.",
+                    });
+                    return;
+                };
+                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterGoogleLogout"))
+                    try app.auth.reconcileAfterGoogleLogout(app.alloc)
+                else
+                    false;
+                applyCredentialChange(app, changed);
+                if (key_deleted) {
+                    try writeAuthNotice(app, .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Google." });
+                }
+                if (local.local_deleted) {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .neutral,
+                        .body = "Signed out on this device. Disconnecting your Google Account...",
+                    });
+                } else if (!key_deleted) {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .neutral,
+                        .body = "No Google Account session found.",
+                    });
+                }
+                try reconcileSubscriptionLogout(app, agent, .google);
+                try startRemoteRevocation(app, &revocation, local.kept);
+                return;
+            }
+
+            const plan_deleted = google_oauth.signOutOnDevice(app.alloc, null) catch {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "Could not durably remove saved Google session. The current source is unchanged.",
+                });
+                return;
+            };
+            const key_deleted = gemini_api_key.delete(app.alloc) catch {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "Could not durably remove saved Gemini API key. The current source is unchanged.",
+                });
+                return;
+            };
+            const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterGoogleLogout"))
+                try app.auth.reconcileAfterGoogleLogout(app.alloc)
+            else
+                false;
+            applyCredentialChange(app, changed);
+            if (plan_deleted) {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .neutral,
+                    .body = "Signed out of Google AI Pro or Ultra plan on this device.",
+                });
+            }
+            if (key_deleted) {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .neutral,
+                    .body = "Signed out of Google.",
+                });
+            }
+            if (!plan_deleted and !key_deleted) {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .neutral,
+                    .body = "No Google API key found.",
+                });
+            }
+            try reconcileSubscriptionLogout(app, agent, .google);
         }
 
         /// Signs out of Codex locally, then revokes its refresh token at
@@ -404,8 +525,12 @@ pub fn Runtime(comptime App: type) type {
         /// Takes `pending`, leaving null so the caller's release skips it.
         /// `kept` says whether its tokens are kept to revoke later.
         fn startRemoteRevocation(app: *App, pending: *?auth_runtime.RemoteRevocation, kept: bool) !void {
-            const revocation = pending.* orelse return;
+            var revocation = pending.* orelse return;
             pending.* = null;
+            if (comptime !@hasDecl(@TypeOf(app.auth), "beginRemoteRevocation")) {
+                revocation.deinit();
+                return;
+            }
             const source = revocation.source();
             if (!app.auth.beginRemoteRevocation(revocation, kept)) {
                 try writeRemoteRevocationWarning(app, source, kept);
@@ -420,10 +545,19 @@ pub fn Runtime(comptime App: type) type {
             owned.deinit();
         }
 
-        /// Reports a remote revocation that finished with a failure.
+        /// Reports a remote revocation that finished with a failure, or confirms
+        /// Google Account disconnection.
         pub fn collectRemoteRevocationFacts(app: *App) !void {
             while (app.auth.takeRemoteRevocation()) |outcome| {
-                if (outcome.failed) try writeRemoteRevocationWarning(app, outcome.source, outcome.retry_kept);
+                if (outcome.failed) {
+                    try writeRemoteRevocationWarning(app, outcome.source, outcome.retry_kept);
+                } else if (outcome.source == .google_subscription) {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .neutral,
+                        .body = "Disconnected your Google Account.",
+                    });
+                }
             }
         }
 
@@ -432,6 +566,8 @@ pub fn Runtime(comptime App: type) type {
         fn writeRemoteRevocationWarning(app: *App, source: credentials.Source, retry_kept: bool) !void {
             const grok = "The local Grok session was removed, but remote revocation could not be confirmed.";
             const codex = "The local Codex session was removed, but remote revocation could not be confirmed.";
+            const google_base = "The local Google session was removed, but remote revocation could not be confirmed.";
+            const google_connections = " You can also remove fx at " ++ google_oauth.connections_url ++ ".";
             const retry_later = " " ++ pending_revocation.retry_later ++ ".";
             try writeAuthNotice(app, .{
                 .topic = "auth",
@@ -439,6 +575,10 @@ pub fn Runtime(comptime App: type) type {
                 .body = switch (source) {
                     .grok_subscription => if (retry_kept) grok ++ retry_later else grok,
                     .chatgpt_subscription => if (retry_kept) codex ++ retry_later else codex,
+                    .google_subscription => if (retry_kept)
+                        google_base ++ retry_later ++ google_connections
+                    else
+                        google_base ++ google_connections,
                     else => if (retry_kept) login_flow.remote_revocation_retry_warning else login_flow.remote_revocation_warning,
                 },
             });
@@ -747,6 +887,19 @@ pub fn Runtime(comptime App: type) type {
                     .login => try beginSignIn(app, agent, true),
                     .chatgpt_login => try beginChatGptSignIn(app, agent),
                     .grok_login => try beginGrokSignIn(app, agent),
+                    .google_login => try beginGoogleSignIn(app, agent),
+                    .gemini_api_key => {
+                        if (comptime !runtime_profile.allows(App, .native_auth)) {
+                            try app.writeDomainNotice(.{
+                                .topic = "auth",
+                                .tone = .warning,
+                                .body = "API key setup is unavailable in this WASM session.",
+                            }, true);
+                            return;
+                        }
+                        prepareApiKeyInputBoundary(app);
+                        app.auth.openGoogleApiKeyPickerFromRoot(app.alloc);
+                    },
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
                             try app.writeDomainNotice(.{
@@ -775,7 +928,29 @@ pub fn Runtime(comptime App: type) type {
                 } else if (app.auth.signInCodeEntryActive()) {
                     switch (byte) {
                         3, 4 => cancelAndPopPickerStage(app, agent),
-                        '\r', '\n' => _ = try app.auth.submitSignInCode(app.alloc),
+                        '\r', '\n' => {
+                            _ = app.auth.submitSignInCode(app.alloc) catch |err| switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                error.InvalidGoogleCallbackUrl => {
+                                    try writeAuthNotice(app, .{
+                                        .topic = "auth",
+                                        .tone = .warning,
+                                        .body = "Paste the full callback URL from your browser (http://127.0.0.1:.../oauth2callback?...).",
+                                    });
+                                    app.shell.render_requests.request(.footer);
+                                    return true;
+                                },
+                                else => {
+                                    try writeAuthNotice(app, .{
+                                        .topic = "auth",
+                                        .tone = .warning,
+                                        .body = "That sign-in code could not be used. Try pasting it again.",
+                                    });
+                                    app.shell.render_requests.request(.footer);
+                                    return true;
+                                },
+                            };
+                        },
                         8, 127 => _ = app.auth.deleteSignInCodeByte(),
                         else => _ = try app.auth.appendSignInCodeByte(app.alloc, byte),
                     }
@@ -842,6 +1017,16 @@ pub fn Runtime(comptime App: type) type {
                 .none => {},
                 .cancelled => {
                     cancelPromptRetryAfterAuth(app, agent);
+                    if (app.auth.signInEntryActive()) {
+                        _ = app.auth.popPickerStage(app.alloc);
+                        if (sign_in_source == .google_subscription) {
+                            try writeAuthNotice(app, .{
+                                .topic = "auth",
+                                .tone = .neutral,
+                                .body = "Sign-in was canceled.",
+                            });
+                        }
+                    }
                     app.shell.render_requests.request(.footer);
                 },
                 .failed => |err| {
@@ -892,8 +1077,74 @@ pub fn Runtime(comptime App: type) type {
                             try finishSubscriptionSignIn(app, agent, .grok);
                             return;
                         },
+                        .google => |account| {
+                            var safe_email = try text_utils.encodeTerminalSafe(app.alloc, account.email, 256);
+                            defer safe_email.deinit(app.alloc);
+                            try finishGoogleSignIn(app, agent, safe_email.bytes);
+                            return;
+                        },
                     }
                 },
+            }
+        }
+
+        fn finishGoogleSignIn(
+            app: *App,
+            agent: *AppAgent,
+            safe_email: []const u8,
+        ) !void {
+            try app.auth.refreshSourceInventory(app.alloc);
+            const connected_body = if (safe_email.len > 0)
+                try app.alloc.print("Google AI Pro or Ultra plan connected ({s}).", .{safe_email})
+            else
+                try app.alloc.dupe(u8, "Google AI Pro or Ultra plan connected.");
+            defer app.alloc.free(connected_body);
+
+            switch (auth_transition.signInCompletion(
+                .google,
+                (comptime provider_runtime.supported(App)) and !renewsWaitingRequest(app, agent, .google),
+            )) {
+                .vercel => unreachable,
+                .switch_provider => |target| {
+                    app.auth.closePicker(app.alloc);
+                    clearStickyGeminiApiKeyPreference(app);
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .neutral,
+                        .body = connected_body,
+                        .detail = "Requests follow the Gemini API Unpaid Services Terms: https://ai.google.dev/gemini-api/terms#unpaid-services",
+                    });
+                    try switchProvider(app, agent, target, false, .post_oauth);
+                },
+                .activate_source => |source| {
+                    if (!try selectCredentialSource(app, source)) {
+                        cancelPromptRetryAfterAuth(app, agent);
+                        _ = app.auth.popPickerStage(app.alloc);
+                        try writeAuthNotice(app, .{
+                            .topic = "auth",
+                            .tone = .@"error",
+                            .body = "Signed in, but the Google AI Pro or Ultra plan credential could not be loaded.",
+                        });
+                        return;
+                    }
+                    clearStickyGeminiApiKeyPreference(app);
+                    app.auth.closePicker(app.alloc);
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .neutral,
+                        .body = connected_body,
+                    });
+                    try resumePromptAfterAuth(app, agent);
+                },
+            }
+        }
+
+        fn clearStickyGeminiApiKeyPreference(app: *App) void {
+            if (comptime !@hasField(App, "workspace_root")) return;
+            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch return;
+            defer settings.deinit(app.alloc);
+            if (settings.credential_source == .gemini_api_key or settings.credential_source == .google_subscription) {
+                forgetCredentialSource(app);
             }
         }
 
@@ -1033,6 +1284,46 @@ pub fn Runtime(comptime App: type) type {
                         .body = body,
                     }, true);
                 },
+                .gemini_saved => |changed| {
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .neutral,
+                        .body = "Gemini API key saved.",
+                    }, true);
+                    if (comptime provider_runtime.supported(App)) {
+                        if (provider_runtime.providerOf(app, agent) != .google) {
+                            try switchProvider(app, agent, .google, false, .manual);
+                        } else {
+                            applyCredentialChange(app, changed);
+                        }
+                    } else {
+                        applyCredentialChange(app, changed);
+                    }
+                },
+                .gemini_store_failed => {
+                    const body = try app.alloc.print(
+                        "Could not save the Gemini API key to {s}. Nothing was stored.",
+                        .{gemini_api_key.backendLabel()},
+                    );
+                    defer app.alloc.free(body);
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = body,
+                    }, true);
+                },
+                .gemini_reload_failed => {
+                    const body = try app.alloc.print(
+                        "Saved the Gemini API key to {s}, but could not make it active.",
+                        .{gemini_api_key.backendLabel()},
+                    );
+                    defer app.alloc.free(body);
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = body,
+                    }, true);
+                },
             }
         }
 
@@ -1087,6 +1378,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             rememberCredentialSource(app, source);
+            if (source == .google_subscription) clearStickyGeminiApiKeyPreference(app);
             try app.writeDomainNotice(.{
                 .topic = "auth",
                 .tone = .neutral,
@@ -1100,9 +1392,9 @@ pub fn Runtime(comptime App: type) type {
         /// leaves the source active for this run rather than refusing a working
         /// credential the user already selected.
         fn rememberCredentialSource(app: *App, source: credentials.Source) void {
-            // ChatGPT is selected by model route, not as a global Gateway
-            // credential preference. Its saved session coexists independently.
-            if (source == .chatgpt_subscription or source == .grok_subscription) return;
+            // Subscriptions are selected by model route, not as a global Gateway
+            // credential preference. Their saved sessions coexist independently.
+            if (source == .chatgpt_subscription or source == .grok_subscription or source == .google_subscription) return;
             if (comptime @hasDecl(App, "persistCredentialSourcePreference")) {
                 app.persistCredentialSourcePreference(source);
                 return;
@@ -1217,6 +1509,74 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        fn beginGoogleSignIn(app: *App, agent: *AppAgent) !void {
+            if (comptime provider_runtime.supported(App)) {
+                if (!renewsWaitingRequest(app, agent, .google)) {
+                    const decision = decideProviderSwitch(.{
+                        .current = provider_runtime.providerOf(app, agent),
+                        .target = .google,
+                        .target_credential_ready = false,
+                        .intent = .post_oauth,
+                        .stream_active = agent.stream.active,
+                        .queued_prompts = agent.worker.queuedPromptCount(),
+                    });
+                    if (decision == .busy) {
+                        try app.writeDomainNotice(.{
+                            .topic = "auth",
+                            .tone = .warning,
+                            .body = "Google sign-in is unavailable until active and queued work finishes.",
+                        }, true);
+                        return;
+                    }
+                }
+            }
+            try app.flushBeforeBlockingExternalWork();
+            const started = app.auth.openGoogleSignInPickerFromRoot(app.alloc);
+            if (started catch |err| {
+                cancelPromptRetryAfterAuth(app, agent);
+                debug_trace.logf("auth", "Google login failed err={s}", .{@errorName(err)});
+                try writeLoginError(app, .google_subscription, err);
+                return;
+            }) {
+                app.shell.render_requests.request(.footer);
+                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+            }
+        }
+
+        pub fn beginGoogleSignInForProviderPicker(app: *App, agent: *AppAgent) !void {
+            if (comptime provider_runtime.supported(App)) {
+                if (!renewsWaitingRequest(app, agent, .google)) {
+                    const decision = decideProviderSwitch(.{
+                        .current = provider_runtime.providerOf(app, agent),
+                        .target = .google,
+                        .target_credential_ready = false,
+                        .intent = .post_oauth,
+                        .stream_active = agent.stream.active,
+                        .queued_prompts = agent.worker.queuedPromptCount(),
+                    });
+                    if (decision == .busy) {
+                        try app.writeDomainNotice(.{
+                            .topic = "auth",
+                            .tone = .warning,
+                            .body = "Google sign-in is unavailable until active and queued work finishes.",
+                        }, true);
+                        return;
+                    }
+                }
+            }
+            try app.flushBeforeBlockingExternalWork();
+            const started = app.auth.openGoogleSignInPickerForProviderSwitch(app.alloc);
+            if (started catch |err| {
+                cancelPromptRetryAfterAuth(app, agent);
+                debug_trace.logf("auth", "Google login failed err={s}", .{@errorName(err)});
+                try writeLoginError(app, .google_subscription, err);
+                return;
+            }) {
+                app.shell.render_requests.request(.footer);
+                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+            }
+        }
+
         fn switchProvider(
             app: *App,
             agent: *AppAgent,
@@ -1297,7 +1657,12 @@ pub fn Runtime(comptime App: type) type {
                 .intent = .{ .provider = .{ .target = target, .allow_login = allow_login, .origin = intent, .fallback = fallback } },
                 .catalog_provider = catalog_provider,
                 .models_path = app.model_cache.models_path,
-                .preferred_source = if (target == .gateway) settings.credential_source else null,
+                .preferred_source = if (target == .google and intent == .post_oauth)
+                    .google_subscription
+                else if ((target == .gateway or target == .google) and model_provider.authorizesCredential(target, settings.credential_source))
+                    settings.credential_source
+                else
+                    null,
                 .primary_model = if (intent == .post_oauth and provider_runtime.providerOf(app, agent).eql(target)) provider_runtime.modelOf(app, agent) else null,
                 .preferred_model = if (intent == .post_oauth) settings.models.get(target) else io_mod.getenv("FX_MODEL") orelse settings.models.get(target),
             });
@@ -1429,6 +1794,10 @@ pub fn Runtime(comptime App: type) type {
                     switch (target) {
                         .codex => try beginCodexSignInForProviderSwitch(app),
                         .grok => try beginGrokSignInForProviderSwitch(app),
+                        .google => {
+                            prepareApiKeyInputBoundary(app);
+                            app.auth.openGoogleApiKeyPicker(app.alloc);
+                        },
                         .gateway, .configured => {},
                     }
                 }
@@ -1436,7 +1805,16 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .warning,
-                        .body = if (intent == .post_oauth) "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged." else if (target == .codex) "Run fx login codex, then try switching again." else if (target == .grok) "Run fx login grok, then try switching again." else credentials.missing_interactive_credential_message,
+                        .body = if (intent == .post_oauth)
+                            "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged."
+                        else if (target == .codex)
+                            "Run fx login codex, then try switching again."
+                        else if (target == .grok)
+                            "Run fx login grok, then try switching again."
+                        else if (target == .google)
+                            "Google authentication is unavailable."
+                        else
+                            credentials.missing_interactive_credential_message,
                     }, true);
                 }
                 return false;
@@ -1495,7 +1873,7 @@ pub fn Runtime(comptime App: type) type {
                 return false;
             }
 
-            app.model_cache.adoptOwnedCatalog(access, &catalog);
+            app.model_cache.adoptOwnedCatalog(access, &catalog, task.input.catalog_provider.shows_display_names);
             app.provider_selection.adoptOwned(target, &owned_model);
             if (credential) |*value| _ = app.auth.adoptCredential(app.alloc, value);
 
@@ -2196,9 +2574,11 @@ pub fn Runtime(comptime App: type) type {
                 .fx_login => try beginSignIn(app, agent, false),
                 .chatgpt_subscription => try beginChatGptSignIn(app, agent),
                 .grok_subscription => try beginGrokSignIn(app, agent),
+                .google_subscription => try beginGoogleSignIn(app, agent),
                 .vercel_oidc_token,
                 .ai_gateway_api_key,
                 .stored_key,
+                .gemini_api_key,
                 .host_managed,
                 .configured,
                 => {},
@@ -2256,7 +2636,8 @@ pub fn Runtime(comptime App: type) type {
                 .fx_login => try beginSignIn(app, agent, false),
                 .chatgpt_subscription => try beginChatGptSignIn(app, agent),
                 .grok_subscription => try beginGrokSignIn(app, agent),
-                .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => {},
+                .google_subscription => try beginGoogleSignIn(app, agent),
+                .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .gemini_api_key, .host_managed, .configured => {},
             }
         }
 
@@ -2327,6 +2708,9 @@ pub fn Runtime(comptime App: type) type {
             alloc: std.mem.Allocator,
             failure: auth_runtime.CredentialFailure,
         ) ![]u8 {
+            if (failure.source == .google_subscription and failure.damaged_google_session) {
+                return alloc.dupe(u8, credentials.google_session_damaged_message);
+            }
             const source_label = credentials.sourceLabel(failure.source);
             return switch (failure.reason) {
                 .invalid_credential => alloc.print(
@@ -2375,6 +2759,10 @@ pub fn Runtime(comptime App: type) type {
                     error.GrokLoginTimedOut, error.LoginTimedOut => "Grok sign-in expired. Your current login is unchanged, and fx keeps trying it every few minutes. Press Enter to retry with your current login, or run /login to sign in again.",
                     else => null,
                 },
+                .google_subscription => switch (err) {
+                    error.LoginTimedOut => "Google sign-in timed out. Your current login is unchanged. Press Enter to retry with your current login, or run /login to sign in again.",
+                    else => null,
+                },
                 else => switch (err) {
                     error.ExpiredToken, error.LoginTimedOut => "The Vercel sign-in code expired. Your current login is unchanged, and fx keeps trying it every few minutes. Press Enter to retry with your current login, or run /login to sign in again.",
                     else => null,
@@ -2385,6 +2773,22 @@ pub fn Runtime(comptime App: type) type {
         fn writeLoginError(app: *App, source: credentials.Source, err: anyerror) !void {
             const failure = auth_runtime.classifyCredentialFailure(source, err);
             if (failure.reason == .invalid_storage or failure.reason == .persistence_uncertain) {
+                if (source == .google_subscription and err == error.GoogleClientNotConfigured) {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "This build has no Google sign-in client yet. Use Gemini API key.",
+                    });
+                    return;
+                }
+                if (failure.source == .google_subscription and failure.damaged_google_session) {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = credentials.google_session_damaged_message,
+                    });
+                    return;
+                }
                 const notice = auth_runtime.preparationFailureNotice(auth_runtime.preparationError(failure).?).?;
                 const body = try app.alloc.print("{s}: {s}", .{ credentials.sourceLabel(source), notice });
                 defer app.alloc.free(body);
@@ -2402,6 +2806,15 @@ pub fn Runtime(comptime App: type) type {
                     error.GrokAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in was denied. The current credential is unchanged." },
                     error.GrokLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "Grok sign-in expired. The current credential is unchanged; run /login to try again." },
                     else => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in failed. The current credential is unchanged." },
+                }
+            else if (source == .google_subscription)
+                switch (err) {
+                    error.GoogleClientNotConfigured => .{ .topic = "auth", .tone = .@"error", .body = "This build has no Google sign-in client yet. Use Gemini API key." },
+                    error.GoogleScopeMissing => .{ .topic = "auth", .tone = .@"error", .body = "Google did not grant permission to run Gemini models on your Google AI Pro or Ultra plan." },
+                    error.GoogleOAuthStateMismatch => .{ .topic = "auth", .tone = .@"error", .body = "Google sign-in could not be verified. The current credential is unchanged." },
+                    error.GoogleAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "Google sign-in was denied. The current credential is unchanged." },
+                    error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "Google sign-in timed out. The current credential is unchanged; run /login to try again." },
+                    else => .{ .topic = "auth", .tone = .@"error", .body = "Google sign-in failed. The current credential is unchanged." },
                 }
             else switch (err) {
                 error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. The current credential is unchanged." },
@@ -2568,6 +2981,11 @@ const BusySignInAuth = struct {
         return true;
     }
 
+    fn openGoogleSignInPickerFromRoot(self: *BusySignInAuth, _: std.mem.Allocator) !bool {
+        self.start_count += 1;
+        return true;
+    }
+
     fn signInBrowserUrlAlloc(_: *BusySignInAuth, _: std.mem.Allocator) !?[]u8 {
         return null;
     }
@@ -2625,7 +3043,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
     };
 
     for (cases) |case| {
-        inline for ([_]model_provider.ProviderId{ .codex, .grok }) |provider| {
+        inline for ([_]model_provider.ProviderId{ .codex, .grok, .google }) |provider| {
             var app: BusySignInApp = .{};
             defer app.deinit();
             app.agent().stream.active = case.stream_active;
@@ -2634,6 +3052,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app, (&app).agent()),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app, (&app).agent()),
+                .google => try Runtime(BusySignInApp).beginGoogleSignIn(&app, (&app).agent()),
                 .gateway, .configured => unreachable,
             }
 
@@ -2799,6 +3218,14 @@ const TestAuth = struct {
     }
 
     fn openGrokSignInPickerFromRoot(self: *TestAuth, alloc: std.mem.Allocator) !bool {
+        return self.openSignInPicker(alloc);
+    }
+
+    fn openGoogleSignInPickerFromRoot(self: *TestAuth, alloc: std.mem.Allocator) !bool {
+        return self.openSignInPicker(alloc);
+    }
+
+    fn openGoogleSignInPickerForProviderSwitch(self: *TestAuth, alloc: std.mem.Allocator) !bool {
         return self.openSignInPicker(alloc);
     }
 
@@ -2992,6 +3419,46 @@ const TestRenderRequests = struct {
     }
 };
 
+const LogoutCommandArgs = struct {
+    provider: ?model_provider.ProviderId = null,
+    disconnect: bool = false,
+};
+
+const LogoutCommandFlag = enum { disconnect };
+const logout_command_flag_ids = cli_flags.idTable(LogoutCommandFlag, &builtin_commands.google_logout_options);
+
+fn parseLogoutCommandArgs(alloc: std.mem.Allocator, raw: []const u8) !LogoutCommandArgs {
+    var tokens: std.ArrayList([:0]const u8) = .empty;
+    defer {
+        for (tokens.items) |tok| alloc.free(tok);
+        tokens.deinit(alloc);
+    }
+    var it = std.mem.tokenizeAny(u8, raw, " \t\r\n");
+    while (it.next()) |word| {
+        if (tokens.items.len >= 4) return error.InvalidLogoutArgs;
+        try tokens.append(alloc, try alloc.dupeSentinel(u8, word, 0));
+    }
+    var parsed: LogoutCommandArgs = .{};
+    var provider_arg: ?[]const u8 = null;
+    var parser: cli_flags.Parser = .init(&builtin_commands.google_logout_options, tokens.items);
+    while (parser.next() catch return error.InvalidLogoutArgs) |item| switch (item) {
+        .positional => |arg| {
+            if (provider_arg != null) return error.InvalidLogoutArgs;
+            provider_arg = arg;
+        },
+        .option => |match| switch (logout_command_flag_ids[match.index].?) {
+            .disconnect => parsed.disconnect = true,
+        },
+    };
+    if (provider_arg) |name| {
+        parsed.provider = provider_catalog.parse(name) orelse return error.InvalidLogoutArgs;
+    }
+    if (parsed.disconnect and parsed.provider != null and parsed.provider.? != .google) {
+        return error.DisconnectNeedsGoogle;
+    }
+    return parsed;
+}
+
 const TestUrlOpener = struct {
     calls: usize = 0,
     succeeds: bool = true,
@@ -3036,6 +3503,12 @@ const TestApp = struct {
             fn queuedPromptCount(self: @This()) usize {
                 return self.queued_prompts;
             }
+
+            fn tryHoldTurnStart(_: @This()) bool {
+                return true;
+            }
+
+            fn releaseTurnStartHold(_: @This()) void {}
         } = .{},
     } = .{},
     selected_provider: model_provider.ProviderId = .gateway,
@@ -3577,6 +4050,45 @@ test "cancelled login and rejected API key do not persist a source" {
 
     try std.testing.expectEqual(@as(usize, 0), app.preference_write_count);
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, app.auth.active_source.?);
+}
+
+test "gemini API key save writes notice without Gateway preference and reports store failure" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .gemini_api_key;
+
+    try Runtime(TestApp).applyApiKeySaveResult(&app, (&app).agent(), .{ .gemini_saved = true });
+    try std.testing.expectEqual(@as(usize, 0), app.preference_write_count);
+    try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Gemini API key saved.") != null);
+
+    try Runtime(TestApp).applyApiKeySaveResult(&app, (&app).agent(), .gemini_store_failed);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Could not save the Gemini API key") != null);
+}
+
+test "logout google removes the stored Gemini key and prints a one-line notice" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var env = try StartupCredentialTestEnv.install(alloc, &.{
+        .{ "HOME", home },
+        .{ "FX_DISABLE_KEYCHAIN", "1" },
+    });
+    defer env.deinit(alloc);
+
+    try gemini_api_key.save(alloc, "AIza-logout-test-key");
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .gemini_api_key;
+
+    try Runtime(TestApp).logoutGoogle(&app, (&app).agent());
+    try std.testing.expect((try gemini_api_key.load(alloc)) == null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Signed out of Google.") != null);
+
+    try Runtime(TestApp).logoutGoogle(&app, (&app).agent());
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "No Google API key found.") != null);
 }
 
 test "team source load failure preserves the environment source and preference" {
@@ -4171,4 +4683,22 @@ test "quitting during the launch lookup waits for its worker" {
     try std.testing.expect(auth.beginStartupCredentialLoad(.{ .provider = .gateway, .preferred = .ai_gateway_api_key }));
     auth.deinit(alloc);
     try std.testing.expect(!auth.startupCredentialPending());
+}
+
+test "parseLogoutCommandArgs parses google --disconnect and rejects invalid flags" {
+    const alloc = std.testing.allocator;
+    const g_disconnect = try parseLogoutCommandArgs(alloc, "google --disconnect");
+    try std.testing.expectEqual(@as(?model_provider.ProviderId, .google), g_disconnect.provider);
+    try std.testing.expect(g_disconnect.disconnect);
+
+    const g_plain = try parseLogoutCommandArgs(alloc, "google");
+    try std.testing.expectEqual(@as(?model_provider.ProviderId, .google), g_plain.provider);
+    try std.testing.expect(!g_plain.disconnect);
+
+    const empty = try parseLogoutCommandArgs(alloc, "   ");
+    try std.testing.expect(empty.provider == null);
+    try std.testing.expect(!empty.disconnect);
+
+    try std.testing.expectError(error.DisconnectNeedsGoogle, parseLogoutCommandArgs(alloc, "codex --disconnect"));
+    try std.testing.expectError(error.InvalidLogoutArgs, parseLogoutCommandArgs(alloc, "google --bogus"));
 }

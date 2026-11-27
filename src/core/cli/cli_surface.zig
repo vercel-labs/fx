@@ -5,6 +5,7 @@ const terminal_env = @import("../shared/terminal_env.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
+const google_oauth = @import("../auth/google_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
@@ -48,6 +49,8 @@ const pending_revocation = @import("../auth/pending_revocation.zig");
 const oauth = @import("../auth/oauth.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
+const gemini_api_key = @import("../auth/gemini_api_key.zig");
+const google_gemini_models = @import("../../gateway/google_gemini_models.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
@@ -303,15 +306,15 @@ fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
 
 const LoginArgs = struct {
     provider: ?model_provider.ProviderId = null,
-    /// Paste an AI Gateway API key instead of signing in through the browser.
+    /// Paste an AI Gateway or Gemini API key instead of signing in through the browser.
     api_key: bool = false,
 };
 
 const LoginFlag = enum { api_key };
 const login_flag_ids = cli_flags.idTable(LoginFlag, &builtin_commands.login_options);
 
-/// `fx login [vercel|codex|grok] [--api-key]`, in either order.
-fn parseLoginArgs(rest: []const [:0]const u8) error{ InvalidLoginProviderArgs, ApiKeyNeedsVercel }!LoginArgs {
+/// `fx login [vercel|codex|grok|google] [--api-key]`, in either order.
+fn parseLoginArgs(rest: []const [:0]const u8) error{ InvalidLoginProviderArgs, ApiKeyNeedsVercelOrGoogle }!LoginArgs {
     var parsed: LoginArgs = .{};
     var provider_arg: ?[]const u8 = null;
     var parser: cli_flags.Parser = .init(&builtin_commands.login_options, rest);
@@ -327,7 +330,38 @@ fn parseLoginArgs(rest: []const [:0]const u8) error{ InvalidLoginProviderArgs, A
     if (provider_arg) |name| {
         parsed.provider = provider_catalog.parse(name) orelse return error.InvalidLoginProviderArgs;
     }
-    if (parsed.api_key and (parsed.provider orelse .gateway) != .gateway) return error.ApiKeyNeedsVercel;
+    const provider = parsed.provider orelse .gateway;
+    if (parsed.api_key and provider != .gateway and provider != .google) return error.ApiKeyNeedsVercelOrGoogle;
+    return parsed;
+}
+
+const LogoutArgs = struct {
+    provider: ?model_provider.ProviderId = null,
+    disconnect: bool = false,
+};
+
+const LogoutFlag = enum { disconnect };
+const logout_flag_ids = cli_flags.idTable(LogoutFlag, &builtin_commands.google_logout_options);
+
+/// `fx logout [vercel|codex|grok|google] [--disconnect]`, in either order.
+fn parseLogoutArgs(rest: []const [:0]const u8) error{ InvalidLogoutArgs, DisconnectNeedsGoogle }!LogoutArgs {
+    var parsed: LogoutArgs = .{};
+    var provider_arg: ?[]const u8 = null;
+    var parser: cli_flags.Parser = .init(&builtin_commands.google_logout_options, rest);
+    while (parser.next() catch return error.InvalidLogoutArgs) |item| switch (item) {
+        .positional => |arg| {
+            if (provider_arg != null) return error.InvalidLogoutArgs;
+            provider_arg = arg;
+        },
+        .option => |match| switch (logout_flag_ids[match.index].?) {
+            .disconnect => parsed.disconnect = true,
+        },
+    };
+    if (provider_arg) |name| {
+        parsed.provider = provider_catalog.parse(name) orelse return error.InvalidLogoutArgs;
+    }
+    const provider = parsed.provider orelse .gateway;
+    if (parsed.disconnect and provider != .google) return error.DisconnectNeedsGoogle;
     return parsed;
 }
 
@@ -473,6 +507,7 @@ const LoadStartupStatusWithAuthModeFn = *const fn (Allocator, host.SecretStore, 
 const EnvironMapFn = *const fn (?*anyopaque) ?*const std.process.Environ.Map;
 const ReadMaskedKeyFn = *const fn (?*anyopaque, Allocator, WriteFn, ?*anyopaque) anyerror![]u8;
 const SetupTerminalAvailableFn = *const fn (?*anyopaque) bool;
+const StoreGeminiInteractiveFn = *const fn (?*anyopaque) host.SecretStoreWriteError!bool;
 const RunDeps = struct {
     stdout_ctx: ?*anyopaque = null,
     stderr_ctx: ?*anyopaque = null,
@@ -488,6 +523,7 @@ const RunDeps = struct {
     environ_map: EnvironMapFn = environMapDefault,
     read_masked_key: ReadMaskedKeyFn = readMaskedKeyDefault,
     setup_terminal_available: SetupTerminalAvailableFn = setupTerminalAvailableDefault,
+    store_gemini_interactive: StoreGeminiInteractiveFn = storeGeminiInteractiveDefault,
     stdout_is_tty: ?bool = null,
 };
 
@@ -1297,6 +1333,8 @@ fn activateProviderSelection(
             error.CredentialTemporarilyUnavailable,
             error.CredentialRefreshPersistenceUncertain,
             error.CredentialAuthorityChanged,
+            error.GoogleSignInRequired,
+            error.GoogleSessionDamaged,
             => {},
             else => return err,
         }
@@ -1322,6 +1360,7 @@ fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.Prov
         .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
         .grok => try grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
+        .google => return error.GoogleLoginUsesDedicatedRunner,
         .configured => return error.ConfiguredProviderUsesEnvironmentAuth,
     }
 }
@@ -1417,6 +1456,7 @@ fn activateProviderSelectionFallible(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .google => "Google is already selected.\n",
             .configured => "Configured provider is already selected.\n",
         });
         return true;
@@ -1450,6 +1490,7 @@ fn activateProviderSelectionFallible(
             switch (target) {
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
+                .google => "configure a Google credential first: run fx login google --api-key, or set GEMINI_API_KEY",
                 .gateway => "configure a Gateway credential first",
                 .configured => "configure the provider auth environment variable first",
             },
@@ -1460,6 +1501,7 @@ fn activateProviderSelectionFallible(
         try writeProviderActivationError(alloc, deps, caller, switch (target) {
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
+            .google => "Google model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
             .configured => "Configured model catalog is unavailable",
         });
@@ -1541,7 +1583,9 @@ fn activateProviderSelectionFallible(
     var attempt = config_runtime.attemptUserPreferences(alloc, .{
         .provider = target,
         .model_preference = .{ .provider = target, .model = selected_model },
-        .credential_source = exact_source,
+        .credential_source = if (exact_source == .google_subscription) null else exact_source,
+        .clear_credential_source = exact_source == .google_subscription and
+            (settings.credential_source == .gemini_api_key or settings.credential_source == .google_subscription),
     });
     defer attempt.deinit(alloc);
     switch (attempt) {
@@ -1594,13 +1638,14 @@ fn activateProviderSelectionFallible(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway, .configured => unreachable,
+        .gateway, .google, .configured => {},
     };
     if (caller == .provider_command) {
         try writeStdout(deps, switch (target) {
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .google => "Provider set to Google.\n",
             .configured => "Provider set to configured connection.\n",
         });
     }
@@ -1789,10 +1834,10 @@ fn runNonInteractiveWithDeps(
         .login => |rest| {
             const login_args = parseLoginArgs(rest) catch |err| {
                 switch (err) {
-                    error.ApiKeyNeedsVercel => try writeStderr(deps, "fx login: --api-key works only with vercel\n"),
+                    error.ApiKeyNeedsVercelOrGoogle => try writeStderr(deps, "fx login: --api-key works only with vercel or google\n"),
                     error.InvalidLoginProviderArgs => {
                         try writeFlagFailure(alloc, deps, .login, rest);
-                        try writeStderr(deps, "usage: fx login [vercel|codex|grok] [--api-key]\n");
+                        try writeStderr(deps, "usage: fx login [vercel|codex|grok|google] [--api-key]\n");
                     },
                 }
                 return usage_failure;
@@ -1801,11 +1846,18 @@ fn runNonInteractiveWithDeps(
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
+            const login_provider = login_args.provider orelse .gateway;
             if (login_args.api_key) {
-                return if (try runPasteSetup(alloc, cfg.secret_store, deps, "fx login")) .handled_success else .handled_failure;
+                const saved = if (login_provider == .google)
+                    try runGeminiPasteSetup(alloc, deps, "fx login google")
+                else
+                    try runPasteSetup(alloc, cfg.secret_store, deps, "fx login");
+                return if (saved) .handled_success else .handled_failure;
+            }
+            if (login_provider == .google) {
+                return runGooglePlanLogin(alloc, cfg, deps);
             }
             // Preserve the original `fx login` behavior for scripts and users.
-            const login_provider = login_args.provider orelse .gateway;
             runProviderLogin(alloc, cfg, login_provider) catch |err| {
                 try writeProviderLoginFailure(alloc, deps, login_provider, .provider_login, err);
                 return .handled_failure;
@@ -1835,13 +1887,20 @@ fn runNonInteractiveWithDeps(
                 },
                 .codex => try writeStdout(deps, "Signed in with Codex.\n"),
                 .grok => try writeStdout(deps, "Signed in with Grok.\n"),
+                .google => unreachable,
                 .configured => try writeStdout(deps, "Configured providers use settings.json authentication.\n"),
             }
             return .handled_success;
         },
         .logout => |rest| {
-            const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+            const logout_args = parseLogoutArgs(rest) catch |err| {
+                switch (err) {
+                    error.DisconnectNeedsGoogle => try writeStderr(deps, "fx logout: --disconnect works only with google\n"),
+                    error.InvalidLogoutArgs => {
+                        try writeFlagFailure(alloc, deps, .logout, rest);
+                        try writeStderr(deps, "usage: fx logout [vercel|codex|grok|google] [--disconnect]\n");
+                    },
+                }
                 return usage_failure;
             };
             if (cfg.auth_mode == .host_managed) {
@@ -1850,7 +1909,7 @@ fn runNonInteractiveWithDeps(
             }
             configureAuthCommandTrace(alloc);
             // Preserve the original `fx logout` behavior for scripts and users.
-            const login_provider = maybe_login_provider orelse .gateway;
+            const login_provider = logout_args.provider orelse .gateway;
             if (login_provider == .codex) {
                 const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.codex };
                 const outcome = chatgpt_oauth.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch {
@@ -1909,6 +1968,7 @@ fn runNonInteractiveWithDeps(
                     },
                 };
             }
+            if (login_provider == .google) return runGoogleLogout(alloc, cfg, deps, logout_args.disconnect);
             const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.fx_login };
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport, wait_line.notice()) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
@@ -2005,7 +2065,7 @@ fn runNonInteractiveWithDeps(
                 return usage_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or a configured name\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, google, or a configured name\n");
                 return usage_failure;
             };
             const activated = activateProviderSelection(alloc, cfg, deps, target, .provider_command, null, null) catch |err| switch (err) {
@@ -2145,6 +2205,7 @@ fn runNonInteractiveWithDeps(
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
+                    .google => "fx models: Google model catalog is unavailable\n",
                     .configured => "fx models: Configured model catalog is unavailable\n",
                 });
                 return .handled_failure;
@@ -2731,6 +2792,199 @@ fn writePasteFailure(alloc: Allocator, deps: RunDeps, command: []const u8, probl
     try writeStderr(deps, message);
 }
 
+fn runGooglePlanLogin(alloc: Allocator, cfg: Config, deps: RunDeps) !RunResult {
+    configureAuthCommandTrace(alloc);
+    const email = runGoogleLoginAttempt(alloc, cfg, deps, false) catch |err| switch (err) {
+        error.GoogleScopeMissing => blk: {
+            try writeStderr(deps, "Google did not grant permission to run Gemini models on your Google AI Pro or Ultra plan.\n");
+            if (!deps.setup_terminal_available(deps.setup_ctx) or !promptYesNoConsentRetry()) {
+                if (!deps.setup_terminal_available(deps.setup_ctx)) {
+                    try writeStderr(deps, "Run fx login google to try again.\n");
+                }
+                return .handled_failure;
+            }
+            break :blk runGoogleLoginAttempt(alloc, cfg, deps, true) catch |retry_err| {
+                return try handleGoogleLoginError(alloc, deps, retry_err);
+            };
+        },
+        else => return try handleGoogleLoginError(alloc, deps, err),
+    };
+    defer alloc.free(email);
+
+    if (!try activateProviderSelection(
+        alloc,
+        cfg,
+        deps,
+        .google,
+        .provider_login,
+        .google_subscription,
+        null,
+    )) return .handled_failure;
+    retryKeptSignOuts(alloc, cfg, deps, .google);
+
+    const line = try alloc.print("Google AI Pro or Ultra plan connected ({f}).\n", .{text_utils.terminalSafe(email)});
+    defer alloc.free(line);
+    try writeStdout(deps, line);
+    try writeStdout(
+        deps,
+        "Requests follow the Gemini API Unpaid Services Terms: https://ai.google.dev/gemini-api/terms#unpaid-services\n",
+    );
+    return .handled_success;
+}
+
+fn runGoogleLoginAttempt(alloc: Allocator, cfg: Config, _: RunDeps, force_consent: bool) ![]u8 {
+    return google_oauth.runLoginWithOptions(
+        alloc,
+        cfg.gateway_provider.oauth_transport,
+        cfg.url_opener,
+        .{ .force_consent = force_consent },
+    );
+}
+
+fn handleGoogleLoginError(alloc: Allocator, deps: RunDeps, err: anyerror) !RunResult {
+    switch (err) {
+        error.Interrupted => return .{ .handled_exit = 130 },
+        error.GoogleAccessDenied => {
+            try writeStderr(deps, "Sign-in was canceled.\n");
+            return .handled_failure;
+        },
+        error.GoogleClientNotConfigured => {
+            try writeStderr(
+                deps,
+                "fx login google: this build has no Google sign-in client yet. Use fx login google --api-key.\n",
+            );
+            return .handled_failure;
+        },
+        error.GoogleScopeMissing => {
+            try writeStderr(
+                deps,
+                "Google did not grant permission to run Gemini models on your Google AI Pro or Ultra plan. Run fx login google to try again.\n",
+            );
+            return .handled_failure;
+        },
+        error.InvalidGoogleCallbackUrl => {
+            try writeStderr(
+                deps,
+                "fx login google: paste the full callback URL from your browser (http://127.0.0.1:.../oauth2callback?...)\n",
+            );
+            return .handled_failure;
+        },
+        error.GoogleOAuthStateMismatch => {
+            try writeStderr(deps, "fx login google: sign-in state could not be verified\n");
+            return .handled_failure;
+        },
+        error.LoginTimedOut => {
+            try writeStderr(deps, "fx login google: sign-in timed out; run fx login google to try again\n");
+            return .handled_failure;
+        },
+        else => {
+            try writeProviderLoginFailure(alloc, deps, .google, .provider_login, err);
+            return .handled_failure;
+        },
+    }
+}
+
+fn promptYesNoConsentRetry() bool {
+    std.Io.File.stderr().writeStreamingAll(
+        io_mod.getIo(),
+        "Retry sign-in and ask for permission again? [y/N] ",
+    ) catch return false;
+    var buf: [64]u8 = undefined;
+    const read_len = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return false;
+    if (read_len == 0) return false;
+    const line_end = std.mem.findScalar(u8, buf[0..read_len], '\n') orelse read_len;
+    const trimmed = std.mem.trim(u8, buf[0..line_end], " \t\r\n");
+    return std.ascii.eqlIgnoreCase(trimmed, "y") or std.ascii.eqlIgnoreCase(trimmed, "yes");
+}
+
+fn storeGeminiInteractiveDefault(_: ?*anyopaque) host.SecretStoreWriteError!bool {
+    return gemini_api_key.storeInteractive();
+}
+
+/// Reads a Gemini API key with the same choice as the AI Gateway paste: the
+/// Keychain prompt when it stores the key, otherwise the hidden input here.
+fn runGeminiPasteSetup(alloc: Allocator, deps: RunDeps, command: []const u8) !bool {
+    if (!deps.setup_terminal_available(deps.setup_ctx)) {
+        try writePasteFailure(alloc, deps, command, "an interactive terminal is required to paste an API key");
+        return false;
+    }
+
+    try writeStderr(deps, "Paste Gemini API key (input hidden): ");
+    const stored_interactively = deps.store_gemini_interactive(deps.setup_ctx) catch {
+        try writeStderr(deps, "\n");
+        try writePasteFailure(alloc, deps, command, "API key was not saved");
+        return false;
+    };
+    if (!stored_interactively) {
+        const key = deps.read_masked_key(
+            deps.setup_ctx,
+            alloc,
+            deps.write_stderr,
+            deps.stderr_ctx,
+        ) catch {
+            try writeStderr(deps, "\n");
+            try writePasteFailure(alloc, deps, command, "API key was not saved");
+            return false;
+        };
+        defer secret.zeroAndFree(alloc, key);
+        try writeStderr(deps, "\n");
+        gemini_api_key.save(alloc, key) catch {
+            try writePasteFailure(alloc, deps, command, "API key was not saved");
+            return false;
+        };
+    }
+
+    const label = if (stored_interactively) gemini_api_key.keychain_label else gemini_api_key.backendLabel();
+    const message = try alloc.print("Saved Gemini API key to {s}.\n", .{label});
+    defer alloc.free(message);
+    try writeStdout(deps, message);
+    return true;
+}
+
+fn runGoogleLogout(alloc: Allocator, cfg: Config, deps: RunDeps, disconnect: bool) !RunResult {
+    if (disconnect) {
+        const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.google };
+        _ = wait_line;
+        const disconnect_res = google_oauth.disconnectAccount(alloc, cfg.gateway_provider.oauth_transport, null) catch {
+            try writeStderr(deps, "fx logout: failed to durably remove saved Google session\n");
+            return .handled_failure;
+        };
+        const key_deleted = gemini_api_key.delete(alloc) catch {
+            try writeStderr(deps, "fx logout: failed to durably remove saved Gemini API key\n");
+            return .handled_failure;
+        };
+        if (key_deleted) try writeStdout(deps, "Signed out of Google.\n");
+        if (disconnect_res.local_deleted) {
+            if (disconnect_res.remote_revoked) {
+                retryKeptSignOuts(alloc, cfg, deps, .google);
+                try writeStdout(deps, "Disconnected your Google Account.\n");
+            } else {
+                try writeStderr(deps, if (disconnect_res.retry_kept)
+                    "fx logout: local Google session removed, but remote revocation could not be confirmed; " ++ pending_revocation.retry_later ++ ".\n"
+                else
+                    "fx logout: local Google session removed, but remote revocation could not be confirmed.\n");
+                try writeStderr(deps, "You can also remove fx at " ++ google_oauth.connections_url ++ ".\n");
+            }
+            return .handled_success;
+        }
+        if (!key_deleted) try writeStdout(deps, "No Google Account session found.\n");
+        return .handled_success;
+    }
+
+    const plan_deleted = google_oauth.signOutOnDevice(alloc, null) catch {
+        try writeStderr(deps, "fx logout: failed to durably remove saved Google session\n");
+        return .handled_failure;
+    };
+    const key_deleted = gemini_api_key.delete(alloc) catch {
+        try writeStderr(deps, "fx logout: failed to durably remove saved Gemini API key\n");
+        return .handled_failure;
+    };
+    if (plan_deleted) try writeStdout(deps, "Signed out of Google AI Pro or Ultra plan on this device.\n");
+    if (key_deleted) try writeStdout(deps, "Signed out of Google.\n");
+    if (!plan_deleted and !key_deleted) try writeStdout(deps, "No Google API key found.\n");
+    return .handled_success;
+}
+
 fn setupTerminalAvailableDefault(_: ?*anyopaque) bool {
     return std.c.isatty(std.posix.STDIN_FILENO) != 0 and
         std.c.isatty(std.posix.STDERR_FILENO) != 0;
@@ -3206,6 +3460,7 @@ fn parsedOptions(kind: TopLevelKind) ?[]const command_specs.OptionDoc {
         .slack => &command_specs.slack_options,
         .sessions => &builtin_commands.sessions_options,
         .login => &builtin_commands.login_options,
+        .logout => &builtin_commands.google_logout_options,
         .usage => &builtin_commands.usage_options,
         .upgrade => &builtin_commands.upgrade_options,
         .workspace => &builtin_commands.workspace_options,
@@ -4751,6 +5006,7 @@ const LogoutWaitLine = struct {
     const request_s = oauth_transport.default_request_timeout_ms / std.time.ms_per_s;
     const codex = std.fmt.comptimePrint("revoking the Codex login at OpenAI (up to {d} s)...\n", .{request_s});
     const grok = std.fmt.comptimePrint("revoking the Grok login at xAI (up to {d} s)...\n", .{request_s});
+    const google = std.fmt.comptimePrint("disconnecting your Google Account (up to {d} s)...\n", .{request_s});
     /// The fx login asks for its issuer's endpoints, then revokes two tokens
     /// (`login_flow.revokeLoggedOutSession`), each request with its own limit.
     const fx_login = std.fmt.comptimePrint("revoking the fx login at Vercel (up to {d} s)...\n", .{3 * request_s});
@@ -4759,6 +5015,7 @@ const LogoutWaitLine = struct {
     /// (`pending_revocation.retry`), which sends one sign-out after another.
     const codex_kept = std.fmt.comptimePrint("revoking earlier Codex sign-outs at OpenAI (up to {d} s each)...\n", .{request_s});
     const grok_kept = std.fmt.comptimePrint("revoking earlier Grok sign-outs at xAI (up to {d} s each)...\n", .{request_s});
+    const google_kept = std.fmt.comptimePrint("revoking earlier Google sign-outs (up to {d} s each)...\n", .{request_s});
     const fx_login_kept = std.fmt.comptimePrint("revoking earlier fx sign-outs at Vercel (up to {d} s each)...\n", .{3 * request_s});
     const mcp_kept = std.fmt.comptimePrint("revoking earlier MCP sign-outs at their servers (up to {d} s each)...\n", .{request_s});
 
@@ -4788,6 +5045,10 @@ fn retryKeptSignOuts(alloc: Allocator, cfg: Config, deps: RunDeps, provider: mod
         .grok => {
             const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.grok_kept };
             _ = grok_oauth.retryKeptSignOuts(alloc, transport, wait_line.notice());
+        },
+        .google => {
+            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.google_kept };
+            _ = google_oauth.retryKeptSignOuts(alloc, transport, wait_line.notice());
         },
         .gateway => {
             const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.fx_login_kept };
@@ -6759,13 +7020,250 @@ test "login --api-key stores a pasted key without a warning" {
     try std.testing.expectEqualStrings("fx login: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n", capture.stderr.written());
 }
 
-test "login arguments take one provider and --api-key only for vercel" {
+test "login arguments take one provider and --api-key only for vercel and google" {
     try std.testing.expectEqual(LoginArgs{}, try parseLoginArgs(&.{}));
     try std.testing.expectEqual(LoginArgs{ .provider = .codex }, try parseLoginArgs(&.{"codex"}));
+    try std.testing.expectEqual(LoginArgs{ .provider = .google }, try parseLoginArgs(&.{"google"}));
     try std.testing.expectEqual(LoginArgs{ .provider = .gateway, .api_key = true }, try parseLoginArgs(&.{ "--api-key", "vercel" }));
-    try std.testing.expectError(error.ApiKeyNeedsVercel, parseLoginArgs(&.{ "codex", "--api-key" }));
+    try std.testing.expectEqual(LoginArgs{ .provider = .google, .api_key = true }, try parseLoginArgs(&.{ "google", "--api-key" }));
+    try std.testing.expectEqual(LoginArgs{ .provider = .google, .api_key = true }, try parseLoginArgs(&.{ "--api-key", "google" }));
+    try std.testing.expectError(error.ApiKeyNeedsVercelOrGoogle, parseLoginArgs(&.{ "codex", "--api-key" }));
     try std.testing.expectError(error.InvalidLoginProviderArgs, parseLoginArgs(&.{ "vercel", "codex" }));
     try std.testing.expectError(error.InvalidLoginProviderArgs, parseLoginArgs(&.{"--bogus"}));
+}
+
+fn putGeminiTestHome(environ: *std.process.Environ.Map, home: []const u8) !void {
+    try environ.put("HOME", home);
+    try environ.put("PATH", "");
+    try environ.put("FX_DISABLE_KEYCHAIN", "1");
+    io_mod.setEnvironMap(environ);
+}
+
+test "login google --api-key saves a pasted Gemini key with hidden input" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try putGeminiTestHome(&environ, home);
+    defer io_mod.resetEnvironForTest();
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+    var cfg = testConfig();
+    cfg.secret_store = capture.secretStore();
+
+    const result = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("login"), @constCast("google"), @constCast("--api-key") },
+        cfg,
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    try std.testing.expectEqual(@as(usize, 1), capture.gemini_interactive_calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.setup_read_calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "Paste Gemini API key (input hidden): ") != null);
+    try std.testing.expectEqualStrings("Saved Gemini API key to profile file.\n", capture.stdout.written());
+    const saved = (try gemini_api_key.load(alloc)) orelse return error.TestUnexpectedMissingGeminiKey;
+    defer secret.zeroAndFree(alloc, saved);
+    try std.testing.expectEqualStrings("paste-only-test-key", saved);
+}
+
+test "login google --api-key delegates secure input to the Keychain" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try putGeminiTestHome(&environ, home);
+    defer io_mod.resetEnvironForTest();
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+    capture.gemini_interactive = true;
+    var cfg = testConfig();
+    cfg.secret_store = capture.secretStore();
+
+    const result = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("login"), @constCast("google"), @constCast("--api-key") },
+        cfg,
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    try std.testing.expectEqual(@as(usize, 1), capture.gemini_interactive_calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
+    try std.testing.expectEqualStrings("Saved Gemini API key to macOS Keychain.\n", capture.stdout.written());
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "Paste Gemini API key (input hidden): ") != null);
+    try std.testing.expect((try gemini_api_key.load(alloc)) == null);
+}
+
+test "login google --api-key refuses without a terminal and saves nothing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try putGeminiTestHome(&environ, home);
+    defer io_mod.resetEnvironForTest();
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+    capture.setup_terminal = false;
+    var cfg = testConfig();
+    cfg.secret_store = capture.secretStore();
+
+    const result = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("login"), @constCast("google"), @constCast("--api-key") },
+        cfg,
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqualStrings("fx login google: an interactive terminal is required to paste an API key\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+    try std.testing.expectEqual(@as(usize, 0), capture.gemini_interactive_calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
+    try std.testing.expect((try gemini_api_key.load(alloc)) == null);
+}
+
+test "login google without --api-key exits 1 when no Google sign-in client is configured" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try putGeminiTestHome(&environ, home);
+    defer io_mod.resetEnvironForTest();
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+
+    const result = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("login"), @constCast("google") },
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqualStrings(
+        "fx login google: this build has no Google sign-in client yet. Use fx login google --api-key.\n",
+        capture.stderr.written(),
+    );
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+}
+
+test "logout --disconnect rejects non-google providers with usage failure" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("logout"), @constCast("codex"), @constCast("--disconnect") },
+        testConfig(),
+        capture.deps(),
+    );
+    try std.testing.expectEqual(usage_failure, result);
+    try std.testing.expectEqualStrings("fx logout: --disconnect works only with google\n", capture.stderr.written());
+}
+
+test "logout google deletes the saved Gemini key and reports when none is left" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try putGeminiTestHome(&environ, home);
+    defer io_mod.resetEnvironForTest();
+    try gemini_api_key.save(alloc, "paste-only-test-key");
+
+    {
+        var capture = CaptureOutput.init(alloc);
+        defer capture.deinit();
+        const result = try runIfRequestedWithDeps(alloc, &.{ @constCast("logout"), @constCast("google") }, testConfig(), capture.deps());
+        try std.testing.expectEqual(RunResult.handled_success, result);
+        try std.testing.expectEqualStrings("Signed out of Google.\n", capture.stdout.written());
+        try std.testing.expectEqualStrings("", capture.stderr.written());
+    }
+    try std.testing.expect((try gemini_api_key.load(alloc)) == null);
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+    const again = try runIfRequestedWithDeps(alloc, &.{ @constCast("logout"), @constCast("google") }, testConfig(), capture.deps());
+    try std.testing.expectEqual(RunResult.handled_success, again);
+    try std.testing.expectEqualStrings("No Google API key found.\n", capture.stdout.written());
+}
+
+test "provider google without a key names fx login google --api-key and fails" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try putGeminiTestHome(&environ, home);
+    defer io_mod.resetEnvironForTest();
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+    const result = try runIfRequestedWithDeps(alloc, &.{ @constCast("provider"), @constCast("google") }, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqualStrings(
+        "fx provider: configure a Google credential first: run fx login google --api-key, or set GEMINI_API_KEY\n",
+        capture.stderr.written(),
+    );
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+}
+
+test "provider google with a saved key selects Google with its default model" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try putGeminiTestHome(&environ, home);
+    defer io_mod.resetEnvironForTest();
+    try gemini_api_key.save(alloc, "paste-only-test-key");
+
+    var cfg = testConfig();
+    var providers = provider_set.gateway_only(test_builtin_gateway.provider_bundle);
+    providers.google = .{ .model_catalog = google_gemini_models.model_catalog_provider };
+    cfg.provider_set = providers;
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+    const result = try runIfRequestedWithDeps(alloc, &.{ @constCast("provider"), @constCast("google") }, cfg, capture.deps());
+
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    try std.testing.expectEqualStrings("Provider set to Google.\n", capture.stdout.written());
+    try std.testing.expectEqualStrings("", capture.stderr.written());
+
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    var settings = try config_runtime.loadMergedSettings(alloc, workspace_root);
+    defer settings.deinit(alloc);
+    try std.testing.expectEqual(model_provider.ProviderId.google, settings.provider.?);
+    try std.testing.expectEqualStrings(google_gemini_models.default_model, settings.models.get(.google).?);
 }
 
 test "workspace indeterminate errors report the reconciled durable state" {
@@ -7674,6 +8172,9 @@ const CaptureOutput = struct {
     setup_value_matched: bool = false,
     setup_interactive_store: bool = false,
     setup_store_disabled: bool = false,
+    setup_terminal: bool = true,
+    gemini_interactive: bool = false,
+    gemini_interactive_calls: usize = 0,
 
     fn init(alloc: Allocator) CaptureOutput {
         return .{
@@ -7696,6 +8197,7 @@ const CaptureOutput = struct {
             .write_stderr = captureStderr,
             .read_masked_key = captureReadMaskedKey,
             .setup_terminal_available = captureSetupTerminalAvailable,
+            .store_gemini_interactive = captureStoreGeminiInteractive,
         };
     }
 
@@ -7721,8 +8223,15 @@ fn captureStderr(ctx: ?*anyopaque, text: []const u8) !void {
     try capture.stderr.writer.writeAll(text);
 }
 
-fn captureSetupTerminalAvailable(_: ?*anyopaque) bool {
-    return true;
+fn captureSetupTerminalAvailable(ctx: ?*anyopaque) bool {
+    const capture: *CaptureOutput = @ptrCast(@alignCast(ctx.?));
+    return capture.setup_terminal;
+}
+
+fn captureStoreGeminiInteractive(ctx: ?*anyopaque) host.SecretStoreWriteError!bool {
+    const capture: *CaptureOutput = @ptrCast(@alignCast(ctx.?));
+    capture.gemini_interactive_calls += 1;
+    return capture.gemini_interactive;
 }
 
 fn captureReadMaskedKey(

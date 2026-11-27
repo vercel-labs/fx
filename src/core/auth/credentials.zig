@@ -2,6 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const chatgpt_oauth = @import("chatgpt_oauth.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
+const gemini_api_key = @import("gemini_api_key.zig");
+const google_oauth = @import("google_oauth.zig");
+const google_session = @import("google_session.zig");
 const grok_oauth = @import("grok_oauth.zig");
 const grok_session = @import("grok_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -64,6 +67,8 @@ pub const CatalogAuthenticatedSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    gemini_api_key,
+    google_subscription,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
@@ -73,6 +78,8 @@ pub const CatalogAuthenticatedSource = enum {
             .stored_key => .stored_key,
             .chatgpt_subscription => .chatgpt_subscription,
             .grok_subscription => .grok_subscription,
+            .gemini_api_key => .gemini_api_key,
+            .google_subscription => .google_subscription,
         };
     }
 };
@@ -121,7 +128,9 @@ pub const CatalogAccess = union(enum) {
             .public_only => null,
             .authenticated => |access| if (access.authority == .explicit or
                 access.source == .chatgpt_subscription or
-                access.source == .grok_subscription)
+                access.source == .grok_subscription or
+                access.source == .gemini_api_key or
+                access.source == .google_subscription)
                 null
             else
                 .{
@@ -233,6 +242,8 @@ pub fn catalogAccessForCredentialAndAccount(
         .stored_key => .stored_key,
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
+        .gemini_api_key => .gemini_api_key,
+        .google_subscription => .google_subscription,
         .host_managed => unreachable,
         .configured => return .{ .public_only = .no_credential },
         .fx_login => blk: {
@@ -247,8 +258,15 @@ pub fn catalogAccessForCredentialAndAccount(
         .authenticated = .{
             .source = authenticated_source,
             .credential = credential,
-            .team_context = if (authenticated_source == .chatgpt_subscription or authenticated_source == .grok_subscription) null else team_context,
-            .account_id = if (authenticated_source == .grok_subscription) account_id else null,
+            .team_context = if (authenticated_source == .chatgpt_subscription or
+                authenticated_source == .grok_subscription or
+                authenticated_source == .gemini_api_key or
+                authenticated_source == .google_subscription)
+                null
+            else
+                team_context,
+            .account_id = if (authenticated_source == .grok_subscription or
+                authenticated_source == .google_subscription) account_id else null,
         },
     };
 }
@@ -278,6 +296,8 @@ pub const missing_chatgpt_credential_message = "fx needs a Codex subscription lo
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login, open Connections, then choose Codex subscription.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
+pub const google_sign_in_required_message = "Sign in with Google again: run fx login google.";
+pub const google_session_damaged_message = "Your saved Google sign-in is damaged. Run fx login google to sign in again.";
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 pub const host_managed_auth_message = "Authentication is managed by the host.";
 
@@ -412,6 +432,33 @@ pub fn resolveForProvider(
             .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
         };
     }
+    if (provider == .google) {
+        if (preferred) |explicit| {
+            if (model_provider.authorizesCredential(.google, explicit) and explicit != .host_managed) {
+                const chosen = loadPreferredSource(alloc, transport, secret_store, mode, explicit) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    debug_trace.logf("auth", "provider source load failed source={t} err={s}", .{ explicit, @errorName(err) });
+                    return .{ .failure = .{ .source = explicit, .err = err } };
+                };
+                return .{ .credential = chosen };
+            }
+        }
+        // Prefer the Google AI Pro or Ultra plan login over a Gemini API key when both exist,
+        // and never fall back between sources once the plan login fails (SEC-31).
+        const plan = loadPreferredSource(alloc, transport, secret_store, mode, .google_subscription) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf("auth", "provider source load failed source=google_subscription err={s}", .{@errorName(err)});
+            return .{ .failure = .{ .source = .google_subscription, .err = err } };
+        };
+        if (plan) |credential| return .{ .credential = credential };
+
+        const api_key = loadPreferredSource(alloc, transport, secret_store, mode, .gemini_api_key) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf("auth", "provider source load failed source=gemini_api_key err={s}", .{@errorName(err)});
+            return .{ .failure = .{ .source = .gemini_api_key, .err = err } };
+        };
+        return .{ .credential = api_key };
+    }
     if (provider != .gateway) {
         const source = provider_catalog.find(provider).login_source;
         const credential = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| {
@@ -426,7 +473,7 @@ pub fn resolveForProvider(
         transport,
         secret_store,
         mode,
-        if (preferred == .chatgpt_subscription or preferred == .grok_subscription) null else preferred,
+        if (preferred == .chatgpt_subscription or preferred == .grok_subscription or preferred == .gemini_api_key or preferred == .google_subscription) null else preferred,
     );
 }
 
@@ -493,7 +540,15 @@ fn missingExplicitResolution(source: Source) Resolution {
     return switch (source) {
         .fx_login => .{ .fx_login_status = .absent },
         .stored_key => .{ .stored_key_status = .not_found },
-        else => .{},
+        .vercel_oidc_token,
+        .ai_gateway_api_key,
+        .chatgpt_subscription,
+        .grok_subscription,
+        .gemini_api_key,
+        .google_subscription,
+        .host_managed,
+        .configured,
+        => .{},
     };
 }
 
@@ -501,7 +556,15 @@ fn unavailableExplicitResolution(source: Source, err: anyerror) Resolution {
     var resolution: Resolution = switch (source) {
         .fx_login => .{ .fx_login_status = .unavailable },
         .stored_key => .{ .stored_key_status = .unavailable },
-        else => .{},
+        .vercel_oidc_token,
+        .ai_gateway_api_key,
+        .chatgpt_subscription,
+        .grok_subscription,
+        .gemini_api_key,
+        .google_subscription,
+        .host_managed,
+        .configured,
+        => .{},
     };
     resolution.failure = .{ .source = source, .err = err };
     return resolution;
@@ -541,7 +604,17 @@ fn loadPreferredSource(
             .stored => loadStoredGrokCredential(alloc),
             .refresh_if_needed => loadGrokCredential(alloc, transport, .if_needed),
         },
-        else => loadSource(alloc, transport, secret_store, source),
+        .google_subscription => switch (mode) {
+            .stored => loadStoredGoogleCredential(alloc),
+            .refresh_if_needed => loadGoogleCredential(alloc, transport, .if_needed),
+        },
+        .vercel_oidc_token,
+        .ai_gateway_api_key,
+        .stored_key,
+        .gemini_api_key,
+        .host_managed,
+        .configured,
+        => loadSource(alloc, transport, secret_store, source),
     };
 }
 
@@ -558,6 +631,8 @@ pub fn loadSource(
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
+        .gemini_api_key => loadGeminiApiKeyCredential(alloc),
+        .google_subscription => loadGoogleCredential(alloc, transport, .if_needed),
         .host_managed, .configured => null,
     };
 }
@@ -612,6 +687,28 @@ pub fn sourceExists(
                 },
             };
         },
+        .gemini_api_key => blk: {
+            if (nonEmptyEnvValue("GEMINI_API_KEY") != null) break :blk true;
+            break :blk switch (gemini_api_key.presence()) {
+                .present => true,
+                .missing => false,
+                .unavailable => {
+                    debug_trace.logf(
+                        "auth",
+                        "source probe failed source=gemini_api_key err=StoredKeyUnreadable",
+                        .{},
+                    );
+                    return error.StoredKeyUnreadable;
+                },
+            };
+        },
+        .google_subscription => google_oauth.sourceExists(alloc) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => blk: {
+                debug_trace.logf("auth", "source probe failed source=google err={s}", .{@errorName(err)});
+                break :blk false;
+            },
+        },
         .host_managed, .configured => false,
     };
 }
@@ -636,6 +733,11 @@ pub fn sourcePresence(
             secret_store.presence(),
         .chatgpt_subscription => chatgpt_session.presence(),
         .grok_subscription => grok_session.presence(),
+        .gemini_api_key => if (nonEmptyEnvValue("GEMINI_API_KEY") != null)
+            .present
+        else
+            gemini_api_key.presence(),
+        .google_subscription => google_session.presence(),
         .host_managed, .configured => .missing,
     };
 }
@@ -654,7 +756,14 @@ pub fn requireSignInStorage(source: Source) error{CredentialStorageUnavailable}!
         .fx_login => try oauth_session.requireSignInStorage(),
         .chatgpt_subscription => try chatgpt_session.requireSignInStorage(),
         .grok_subscription => try grok_session.requireSignInStorage(),
-        else => {},
+        .google_subscription => try google_session.requireSignInStorage(),
+        .vercel_oidc_token,
+        .ai_gateway_api_key,
+        .stored_key,
+        .gemini_api_key,
+        .host_managed,
+        .configured,
+        => {},
     }
 }
 
@@ -677,6 +786,14 @@ fn loadStoredKeyCredential(
     if (secret_store.isDisabled()) return null;
     const value = (try secret_store.load(alloc)) orelse return null;
     return .{ .token = value, .source = .stored_key };
+}
+
+fn loadGeminiApiKeyCredential(alloc: std.mem.Allocator) !?Credential {
+    if (try loadEnvCredential(alloc, "GEMINI_API_KEY", .gemini_api_key)) |env_credential| {
+        return env_credential;
+    }
+    const value = (try gemini_api_key.load(alloc)) orelse return null;
+    return .{ .token = value, .source = .gemini_api_key };
 }
 
 fn loadChatGptCredential(
@@ -727,6 +844,30 @@ fn loadStoredGrokCredential(alloc: std.mem.Allocator) !?Credential {
     return loadGrokCredential(alloc, oauth_transport.unavailable_provider, .stored);
 }
 
+fn loadGoogleCredential(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: google_oauth.RefreshMode,
+) !?Credential {
+    try requireSourceStorage(.google_subscription);
+    var access = (try google_oauth.loadAccess(alloc, transport, mode)) orelse return null;
+    defer access.deinit(alloc);
+    const token = access.access_token;
+    access.access_token = &.{};
+    const account_id = access.account_id;
+    access.account_id = &.{};
+    return .{
+        .token = token,
+        .source = .google_subscription,
+        .account_id = account_id,
+        .refresh_after_ms = access.refresh_after_ms,
+    };
+}
+
+fn loadStoredGoogleCredential(alloc: std.mem.Allocator) !?Credential {
+    return loadGoogleCredential(alloc, oauth_transport.unavailable_provider, .stored);
+}
+
 fn nonEmptyEnvValue(name: []const u8) ?[]const u8 {
     return nonEmptyValue(io_mod.getenv(name));
 }
@@ -767,7 +908,8 @@ pub fn loadStoredSource(alloc: std.mem.Allocator, source: Source) !?Credential {
         .fx_login => loadStoredFxLoginCredential(alloc),
         .chatgpt_subscription => loadStoredChatGptCredential(alloc),
         .grok_subscription => loadStoredGrokCredential(alloc),
-        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => null,
+        .google_subscription => loadStoredGoogleCredential(alloc),
+        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .gemini_api_key, .host_managed, .configured => null,
     };
 }
 
@@ -806,6 +948,17 @@ pub fn refreshGrokCredential(
 ) !?Credential {
     const mode: grok_oauth.RefreshMode = if (rejected_token) |token| .{ .replace_rejected = token } else .force;
     return loadGrokCredential(alloc, transport, mode);
+}
+
+/// Refreshes the saved Google plan login after Gemini rejected `rejected_token`.
+/// Null forces a refresh of the active account regardless of its current token.
+pub fn refreshGoogleCredential(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    rejected_token: ?[]const u8,
+) !?Credential {
+    const mode: google_oauth.RefreshMode = if (rejected_token) |token| .{ .replace_rejected = token } else .force;
+    return loadGoogleCredential(alloc, transport, mode);
 }
 
 fn refreshFxLoginCredentialLocked(
@@ -1004,13 +1157,24 @@ pub fn sourceLabel(source: Source) []const u8 {
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
         .grok_subscription => "Grok subscription",
+        .gemini_api_key => "Gemini API key",
+        .google_subscription => "Google AI Pro or Ultra plan",
         .host_managed => "host managed",
         .configured => "configured provider",
     };
 }
 
 pub fn sourceRefreshable(source: Source) bool {
-    return source == .fx_login or source == .chatgpt_subscription or source == .grok_subscription;
+    return switch (source) {
+        .fx_login, .chatgpt_subscription, .grok_subscription, .google_subscription => true,
+        .vercel_oidc_token,
+        .ai_gateway_api_key,
+        .stored_key,
+        .gemini_api_key,
+        .host_managed,
+        .configured,
+        => false,
+    };
 }
 
 test "stored key label discloses the backend that answered" {
@@ -1612,7 +1776,7 @@ test "the stored fx login is read as saved, without a refresh" {
     defer persisted.deinit(alloc);
     try std.testing.expectEqualStrings("rejected-refresh", persisted.refresh_token);
 
-    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured }) |source| {
+    for ([_]Source{ .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .gemini_api_key, .host_managed, .configured }) |source| {
         try std.testing.expect((try loadStoredSource(alloc, source)) == null);
     }
 }
@@ -2064,4 +2228,178 @@ test "a cancel while an fx login refresh is on the wire never cuts it off, and t
     var persisted = (try oauth_session.load(alloc)).?;
     defer persisted.deinit(alloc);
     try std.testing.expectEqualStrings("renewed-refresh", persisted.refresh_token);
+}
+
+test "gemini api key prefers GEMINI_API_KEY env over stored key and stays isolated from gateway" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+    defer alloc.free(home);
+
+    {
+        const env = try CredentialTestEnv.install(alloc, &.{.{ "HOME", home }});
+        defer env.deinit();
+
+        try std.testing.expectEqualStrings("Gemini API key", sourceLabel(.gemini_api_key));
+        try std.testing.expect(!sourceRefreshable(.gemini_api_key));
+        try std.testing.expect(!(try sourceExists(alloc, host.unavailable_secret_store, .gemini_api_key)));
+        try std.testing.expectEqual(host.SecretStorePresence.missing, sourcePresence(host.unavailable_secret_store, .gemini_api_key));
+
+        try gemini_api_key.save(alloc, "stored-gemini-key");
+        try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .gemini_api_key));
+        try std.testing.expectEqual(host.SecretStorePresence.present, sourcePresence(host.unavailable_secret_store, .gemini_api_key));
+
+        var resolved_stored = try resolveForProvider(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed, .google, null);
+        defer if (resolved_stored.credential) |*credential| credential.deinit(alloc);
+        try std.testing.expectEqual(Source.gemini_api_key, resolved_stored.credential.?.source);
+        try std.testing.expectEqualStrings("stored-gemini-key", resolved_stored.credential.?.token);
+
+        var gateway_res = try resolveForProvider(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed, .gateway, .gemini_api_key);
+        defer if (gateway_res.credential) |*credential| credential.deinit(alloc);
+        try std.testing.expect(gateway_res.credential == null);
+    }
+
+    {
+        const env = try CredentialTestEnv.install(alloc, &.{
+            .{ "HOME", home },
+            .{ "GEMINI_API_KEY", "env-gemini-key" },
+        });
+        defer env.deinit();
+
+        var resolved_env = try resolveForProvider(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed, .google, null);
+        defer if (resolved_env.credential) |*credential| credential.deinit(alloc);
+        try std.testing.expectEqual(Source.gemini_api_key, resolved_env.credential.?.source);
+        try std.testing.expectEqualStrings("env-gemini-key", resolved_env.credential.?.token);
+
+        const access = catalogAccessForCredential(.gemini_api_key, "env-gemini-key", "team_123");
+        try std.testing.expectEqual(Source.gemini_api_key, access.credentialSource().?);
+        try std.testing.expectEqualStrings("env-gemini-key", access.authorizationCredential().?);
+        try std.testing.expect(access.teamContext() == null);
+        try std.testing.expect(access.accountId() == null);
+        try std.testing.expect(access.publicFallbackAfterRejection() == null);
+    }
+}
+
+test "google provider prefers plan login over GEMINI_API_KEY and never falls back on failure (SEC-31)" {
+    const dpop = @import("dpop.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+    defer alloc.free(home);
+
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "HOME", home },
+        .{ "GEMINI_API_KEY", "env-gemini-key" },
+        .{ "FX_TEST_GOOGLE_TOKEN_URL", "http://127.0.0.1:1/token" },
+        .{ "FX_TEST_GOOGLE_CLIENT_ID", "test-client-id" },
+        .{ "FX_TEST_GOOGLE_CLIENT_SECRET", "test-client-secret" },
+    });
+    defer env.deinit();
+
+    const now_s = @divFloor(io_mod.milliTimestamp(), std.time.ms_per_s);
+    const seed: [dpop.seed_bytes]u8 = @splat(0x42);
+    const kp = try dpop.keyPairFromSeed(seed);
+    const dpop_key = try dpop.encodeSecretKeyAlloc(alloc, kp);
+    defer secret.zeroAndFree(alloc, dpop_key);
+
+    // Seed an active plan login alongside GEMINI_API_KEY.
+    {
+        var mutation = try google_session.beginMutation(alloc);
+        defer mutation.deinit(alloc);
+        var record = google_session.Record{};
+        defer record.deinit(alloc);
+        try record.upsertAccount(alloc, .{
+            .subject = "10769150350006150715113082367",
+            .email = "user@example.com",
+            .client_id = "test-client-id",
+            .refresh_token = "1//refresh-token",
+            .refresh_token_expires_at_s = now_s + 7 * std.time.s_per_day,
+            .access_token = "ya29.live-plan-token",
+            .access_token_expires_at_s = now_s + 3600,
+            .dpop_private_key = dpop_key,
+            .dpop_nonce = "nonce-1",
+            .granted_scopes = &.{google_oauth.required_scope},
+        }, true);
+        try mutation.save(alloc, record);
+    }
+
+    // 1. Automatic precedence prefers the plan login with sub as account_id.
+    {
+        var res = try resolveForProvider(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed, .google, null);
+        defer if (res.credential) |*c| c.deinit(alloc);
+        try std.testing.expectEqual(Source.google_subscription, res.credential.?.source);
+        try std.testing.expectEqualStrings("ya29.live-plan-token", res.credential.?.token);
+        try std.testing.expectEqualStrings("10769150350006150715113082367", res.credential.?.accountId().?);
+    }
+
+    // 2. Explicit preference for gemini_api_key selects it without falling back.
+    {
+        var res = try resolveForProvider(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed, .google, .gemini_api_key);
+        defer if (res.credential) |*c| c.deinit(alloc);
+        try std.testing.expectEqual(Source.gemini_api_key, res.credential.?.source);
+        try std.testing.expectEqualStrings("env-gemini-key", res.credential.?.token);
+    }
+
+    // 3. replace_rejected refresh loads via google_oauth.loadAccess and keeps sub as account_id.
+    const RefreshProbe = struct {
+        calls: usize = 0,
+        fn execute(raw: ?*anyopaque, a: std.mem.Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (request.dpop == null) return error.TestExpectedDpop;
+            return .{
+                .disposition = .accepted,
+                .status = 200,
+                .body = try a.dupe(u8, "{\"access_token\":\"ya29.rotated-plan-token\",\"expires_in\":3599}"),
+                .dpop_nonce = try a.dupe(u8, "nonce-2"),
+            };
+        }
+    };
+    var probe = RefreshProbe{};
+    {
+        var refreshed = (try refreshGoogleCredential(alloc, .{ .context = &probe, .execute_fn = RefreshProbe.execute }, "ya29.live-plan-token")).?;
+        defer refreshed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        try std.testing.expectEqual(Source.google_subscription, refreshed.source);
+        try std.testing.expectEqualStrings("ya29.rotated-plan-token", refreshed.token);
+        try std.testing.expectEqualStrings("10769150350006150715113082367", refreshed.accountId().?);
+    }
+
+    // 4. When the plan login fails with GoogleSignInRequired (7-day expiry), never fall back to GEMINI_API_KEY.
+    {
+        var mutation = try google_session.beginMutation(alloc);
+        defer mutation.deinit(alloc);
+        var record = google_session.Record{};
+        defer record.deinit(alloc);
+        try record.upsertAccount(alloc, .{
+            .subject = "10769150350006150715113082367",
+            .email = "user@example.com",
+            .client_id = "test-client-id",
+            .refresh_token = "1//expired-refresh",
+            .refresh_token_expires_at_s = now_s - 10,
+            .access_token = "ya29.old",
+            .access_token_expires_at_s = now_s - 10,
+            .dpop_private_key = dpop_key,
+            .granted_scopes = &.{google_oauth.required_scope},
+        }, true);
+        try mutation.save(alloc, record);
+    }
+    {
+        var res = try resolveForProvider(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed, .google, null);
+        defer if (res.credential) |*c| c.deinit(alloc);
+        try std.testing.expect(res.credential == null);
+        try std.testing.expectEqual(Source.google_subscription, res.failure.?.source);
+        try std.testing.expectEqual(error.GoogleSignInRequired, res.failure.?.err);
+    }
+
+    // 5. Explicit preference for google_subscription when no plan login exists never falls back to GEMINI_API_KEY.
+    _ = try google_session.signOutOnDevice(alloc, "10769150350006150715113082367");
+    {
+        var res = try resolveForProvider(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, .refresh_if_needed, .google, .google_subscription);
+        defer if (res.credential) |*c| c.deinit(alloc);
+        try std.testing.expect(res.credential == null);
+        try std.testing.expect(res.failure == null);
+    }
 }

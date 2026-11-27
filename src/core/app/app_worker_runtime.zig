@@ -65,6 +65,7 @@ fn discardCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayloa
 }
 
 fn discardThematicRule(_: *anyopaque) !void {}
+fn discardPicker(_: *anyopaque) !void {}
 fn discardAssistantTail(_: *anyopaque, events: []assistant_presentation.Event) !void {
     assistant_presentation.freeEventSlice(std.heap.c_allocator, events);
 }
@@ -95,6 +96,7 @@ pub const WorkerEventHandlers = struct {
     /// false when nothing is pending and the line is written now.
     hold_model_call: *const fn (*anyopaque, types.ModelCallRecord) anyerror!bool = holdNoModelCall,
     open_model_picker: *const fn (*anyopaque) anyerror!void,
+    open_google_api_key_picker: *const fn (*anyopaque) anyerror!void = discardPicker,
     semantic_notice: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
     credential_refreshed: *const fn (*anyopaque, credentials.Credential) anyerror!void = discardCredentialRefresh,
     command_output: *const fn (*anyopaque, ?types.ToolLifecycleId, command_output_content.Stream, []const u8) anyerror!void,
@@ -423,6 +425,7 @@ pub fn Runtime(comptime App: type) type {
             return switch (event) {
                 .assistant_presentation,
                 .open_model_picker,
+                .open_google_api_key_picker,
                 .semantic_notice,
                 .command_output,
                 .turn_token_update,
@@ -1437,6 +1440,15 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         try handlers.open_model_picker(handlers.ctx);
+                        app.shell.render_requests.request(.modal);
+                    },
+                    .open_google_api_key_picker => {
+                        if (!try requireAssistantTextDrain(handlers)) {
+                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
+                            drain_owns_current = false;
+                            break :events;
+                        }
+                        try handlers.open_google_api_key_picker(handlers.ctx);
                         app.shell.render_requests.request(.modal);
                     },
                     .semantic_notice => |notice| {

@@ -335,3 +335,22 @@ export async function grokEngine(): Promise<FxEngine> {
   await createFxEngine({ provider: "grok", credentials: ({ provider, sessionId }) => planTokens.load(provider, sessionId) });
   return engine;
 }
+
+// A Google Gemini engine on the host's Gemini API key.
+declare const keyStore: { load(provider: "google", sessionId?: string): Promise<{ apiKey: string }> };
+export async function googleEngine(): Promise<FxEngine> {
+  const engine = await createFxEngine({
+    provider: "google",
+    model: "gemini-4-hydrogen",
+    credentials: ({ provider, sessionId }) => keyStore.load(provider, sessionId),
+  });
+  // @ts-expect-error a Google request expects a Gemini API key, not plan tokens
+  await createFxEngine({ provider: "google", model, credentials: ({ provider, sessionId }) => planTokens.load(provider, sessionId) });
+  // @ts-expect-error a Google API key is never refreshed
+  await createFxEngine({ provider: "google", model, credentials: ({ provider }) => keyStore.load(provider), onCredentials: () => {} });
+  // @ts-expect-error a Google API key is never refreshed, so it takes no lock
+  await createFxEngine({ provider: "google", model, credentials: ({ provider }) => keyStore.load(provider), refreshLock: async (_info, refresh) => refresh() });
+  // @ts-expect-error a Google engine needs a model: fx's default is an AI Gateway id
+  await createFxEngine({ provider: "google", credentials: ({ provider, sessionId }) => keyStore.load(provider, sessionId) });
+  return engine;
+}

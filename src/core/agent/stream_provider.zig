@@ -535,7 +535,9 @@ pub const Completed = struct {
 
 pub const Failure = struct {
     kind: FailureKind,
+    daily_limit: bool = false,
     detail: ?[]u8 = null,
+    interactive_detail: ?[]u8 = null,
     diagnostics: FailureDiagnostics = .{},
     retry_after_seconds: ?u64 = null,
     /// The response's own status, so messages name the code it sent.
@@ -600,9 +602,11 @@ pub const Result = union(enum) {
                 var copy = Result{ .failed = failure };
                 copy.failed.ownership = .owned;
                 copy.failed.detail = null;
+                copy.failed.interactive_detail = null;
                 copy.failed.diagnostics = .{};
                 errdefer copy.deinit(alloc);
                 if (failure.detail) |value| copy.failed.detail = try alloc.dupe(u8, value);
+                if (failure.interactive_detail) |value| copy.failed.interactive_detail = try alloc.dupe(u8, value);
                 if (failure.diagnostics.schema) |value| copy.failed.diagnostics.schema = try alloc.dupe(u8, value);
                 if (failure.diagnostics.request_shape) |value| copy.failed.diagnostics.request_shape = try alloc.dupe(u8, value);
                 return copy;
@@ -639,6 +643,7 @@ pub const Result = union(enum) {
             },
             .failed => |failure| if (failure.ownership == .owned) {
                 if (failure.detail) |detail| alloc.free(detail);
+                if (failure.interactive_detail) |detail| alloc.free(detail);
                 if (failure.diagnostics.schema) |schema| alloc.free(schema);
                 if (failure.diagnostics.request_shape) |shape| alloc.free(shape);
             },

@@ -664,6 +664,15 @@ export type FxCodexProvider = FxSubscriptionProvider<"codex">;
 /** Runs on a Grok plan instead of AI Gateway. */
 export type FxGrokProvider = FxSubscriptionProvider<"grok">;
 
+/** Runs on Google's Gemini API with a Gemini API key instead of AI Gateway. */
+export interface FxGoogleProvider {
+  provider: "google";
+  /** The Gemini API key for the provider's requests, asked for in whichever process runs the turn. */
+  credentials: (request: { provider: "google"; sessionId?: string }) => FxApiKeyCredentials | Promise<FxApiKeyCredentials>;
+  onCredentials?: undefined;
+  refreshLock?: undefined;
+}
+
 /** What libfx knows about a model a custom provider serves. Unset fields are unknown. */
 export interface FxCustomProviderModel {
   contextWindow?: number;
@@ -681,7 +690,7 @@ export interface FxCustomProviderModel {
 
 /** A server that speaks OpenAI Chat Completions, such as a local model server or a router. */
 export interface FxCustomProviderDefinition {
-  /** Names the provider to `credentials()`: a letter, then letters, digits, `_` or `-`, at most 64 characters. Not `gateway`, `codex` or `grok`. */
+  /** Names the provider to `credentials()`: a letter, then letters, digits, `_` or `-`, at most 64 characters. Not `gateway`, `codex`, `grok` or `google`. */
   name: string;
   /** The API prefix: requests go to `{baseUrl}/chat/completions`. HTTPS, or HTTP on localhost. */
   baseUrl: string;
@@ -715,7 +724,7 @@ export type FxEngineOptions = FxSharedOptions<FxEngineEvent> & FxModelChoice & F
     /** The AI Gateway credential. Required. */
     apiKey: string;
   })
-  | ((FxCodexProvider | FxGrokProvider | FxCustomProvider) & {
+  | ((FxCodexProvider | FxGrokProvider | FxGoogleProvider | FxCustomProvider) & {
     /** The AI Gateway credential, unused by this provider's turns. */
     apiKey?: string | undefined;
     /** The provider's own model. Required: fx's built-in model is an AI Gateway id. */
@@ -751,7 +760,7 @@ export declare function memory(options?: MemoryOptions): Durability;
 // Durable agents
 
 /** Options for `createFxAgent()`. */
-export type FxAgentOptions = Omit<FxSharedOptions<FxAgentEvent>, "tools"> & FxModelChoice & (FxGatewayProvider | FxCodexProvider | FxGrokProvider | FxCustomProvider) & {
+export type FxAgentOptions = Omit<FxSharedOptions<FxAgentEvent>, "tools"> & FxModelChoice & (FxGatewayProvider | FxCodexProvider | FxGrokProvider | FxGoogleProvider | FxCustomProvider) & {
   /** Every host tool sets `idempotent`. */
   tools?: FxAgentTools;
   /** The AI Gateway credential. Without it, libfx uses `AI_GATEWAY_API_KEY`, then on Vercel the deployment's OIDC token. */

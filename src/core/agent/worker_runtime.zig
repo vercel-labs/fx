@@ -545,6 +545,7 @@ pub const WorkerEvent = union(enum) {
     notification: notification_contract.Notification,
     question_requested,
     open_model_picker,
+    open_google_api_key_picker,
     semantic_notice: types.SemanticNotice,
     /// One settled model call, which Ctrl+O shows where it happened. Its
     /// strings are owned like the rest of the event.
@@ -5158,6 +5159,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .notification => |notification| .{ .notification = notification },
         .question_requested => .question_requested,
         .open_model_picker => .open_model_picker,
+        .open_google_api_key_picker => .open_google_api_key_picker,
         .semantic_notice => |notice| .{ .semantic_notice = try types.dupeSemanticNotice(alloc, notice) },
         .model_call => |record| .{ .model_call = try types.dupeModelCallRecord(alloc, record) },
         .route_recovery_status => |status| .{ .route_recovery_status = status },
@@ -5252,7 +5254,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             owned.deinit(alloc);
         },
         .notification => {},
-        .open_model_picker => {},
+        .open_model_picker, .open_google_api_key_picker => {},
         .semantic_notice => |notice| types.freeSemanticNotice(alloc, notice),
         .model_call => |record| types.freeModelCallRecordStrings(alloc, record),
         .route_recovery_status => {},

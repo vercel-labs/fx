@@ -153,7 +153,7 @@ pub const agent_stream_provider = agent_stream_provider_contract.Provider{
 };
 
 pub const provider_bundle = provider_set.Bundle{
-    .capabilities = .{ .gateway_prompt_caching = true, .fx_search = true, .vision_fallback = true },
+    .capabilities = .{ .gateway_prompt_caching = true, .fx_search = true, .vision_fallback = true, .declares_effort_levels = true },
     .presentation = provider_catalog.find(.gateway),
     .auth_strategy = .vercel,
     .title_model = title_model,
@@ -1053,7 +1053,13 @@ const OAuthHttpOperation = struct {
         defer secret.zeroAndFree(self.alloc, response_buffer);
         var response_writer = std.Io.Writer.fixed(response_buffer);
 
-        const result = gateway_client.fetchOnOpenJob(.{
+        var extra_headers_buf: [1]std.http.Header = undefined;
+        const extra_headers: []const std.http.Header = if (self.request.dpop) |proof| blk: {
+            extra_headers_buf[0] = .{ .name = "DPoP", .value = proof };
+            break :blk extra_headers_buf[0..1];
+        } else &.{};
+
+        var result = gateway_client.fetchOnOpenJobWithResponseHeaders(self.alloc, .{
             .location = .{ .url = self.request.url },
             .method = switch (self.request.method) {
                 .get => .GET,
@@ -1073,19 +1079,29 @@ const OAuthHttpOperation = struct {
                 else
                     .default,
             },
+            .extra_headers = extra_headers,
             .redirect_behavior = .unhandled,
             .response_writer = &response_writer,
         }) catch |err| switch (err) {
             error.WriteFailed => return error.OAuthResponseTooLarge,
             else => return err,
         };
+        errdefer result.deinit(self.alloc);
         const body = response_writer.buffered();
         if (body.len > max_bytes) return error.OAuthResponseTooLarge;
 
+        const body_copy = try self.alloc.dupe(u8, body);
+        const dpop_nonce = result.dpop_nonce;
+        result.dpop_nonce = null;
+        const date_header = result.date_header;
+        result.date_header = null;
+
         return .{
             .disposition = if (result.status == .ok) .accepted else .rejected,
-            .body = try self.alloc.dupe(u8, body),
+            .body = body_copy,
             .status = @backingInt(result.status),
+            .dpop_nonce = dpop_nonce,
+            .date_header = date_header,
         };
     }
 };
@@ -3540,6 +3556,158 @@ test "an OAuth request stops at once when cancelled during a lookup that hangs" 
         .cancel_flag = &cancel,
     }));
     try std.testing.expect(stuck_lookup_testing.elapsedMsSince(started) < 1_000);
+}
+
+test "OAuthHttpOperation sends DPoP header and reads DPoP-Nonce and Date headers only when present" {
+    const alloc = std.testing.allocator;
+    const testing_listener = @import("../core/shared/testing_listener.zig");
+
+    const Probe = struct {
+        io_backend: std.Io.Threaded = .init_single_threaded,
+        server: std.Io.net.Server,
+        send_response_headers: bool,
+        captured_headers: ?[]u8 = null,
+        failure: ?anyerror = null,
+        stopping: std.atomic.Value(bool) = .init(false),
+        thread: ?std.Thread = null,
+
+        fn init(send_response_headers: bool) !@This() {
+            var self: @This() = .{
+                .server = undefined,
+                .send_response_headers = send_response_headers,
+            };
+            var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+            self.server = try address.listen(self.io(), .{ .reuse_address = true });
+            return self;
+        }
+
+        fn io(self: *@This()) std.Io {
+            return self.io_backend.io();
+        }
+
+        fn start(self: *@This()) !void {
+            self.thread = try std.Thread.spawn(.{}, run, .{self});
+        }
+
+        fn deinit(self: *@This(), a: Allocator) void {
+            self.stopping.store(true, .seq_cst);
+            if (self.thread) |thread| {
+                thread.join();
+                self.thread = null;
+            }
+            self.server.deinit(self.io());
+            if (self.captured_headers) |h| a.free(h);
+        }
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn runFallible(self: *@This()) !void {
+            const zio = self.io();
+            var stream = (try testing_listener.acceptUnlessStopping(&self.server, zio, &self.stopping)) orelse return;
+            defer stream.close(zio);
+
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(zio, &read_buf);
+            var head_buf: [8192]u8 = undefined;
+            var head_len: usize = 0;
+            while (head_len < head_buf.len) {
+                head_buf[head_len] = try reader.interface.takeByte();
+                head_len += 1;
+                if (std.mem.endsWith(u8, head_buf[0..head_len], "\r\n\r\n")) break;
+            }
+            const raw_head = head_buf[0..head_len];
+            var content_length: usize = 0;
+            var lines = std.mem.splitSequence(u8, raw_head, "\r\n");
+            while (lines.next()) |line| {
+                const prefix = "content-length:";
+                if (line.len >= prefix.len and std.ascii.eqlIgnoreCase(line[0..prefix.len], prefix)) {
+                    content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, line[prefix.len..], " \t"), 10);
+                }
+            }
+            if (content_length > 0) {
+                const discard = try std.heap.c_allocator.alloc(u8, content_length);
+                defer std.heap.c_allocator.free(discard);
+                try reader.interface.readSliceAll(discard);
+            }
+            self.captured_headers = try std.heap.c_allocator.dupe(u8, raw_head);
+
+            var write_buf: [4096]u8 = undefined;
+            var writer = stream.writer(zio, &write_buf);
+            if (self.send_response_headers) {
+                const body = "{\"error\":\"use_dpop_nonce\"}";
+                try writer.interface.print(
+                    "HTTP/1.1 400 Bad Request\r\n" ++
+                        "Content-Type: application/json\r\n" ++
+                        "DPoP-Nonce: server-nonce-1\r\n" ++
+                        "Date: Tue, 29 Feb 2000 12:34:56 GMT\r\n" ++
+                        "Content-Length: {d}\r\n" ++
+                        "Connection: close\r\n\r\n{s}",
+                    .{ body.len, body },
+                );
+            } else {
+                const body = "{\"access_token\":\"ok\"}";
+                try writer.interface.print(
+                    "HTTP/1.1 200 OK\r\n" ++
+                        "Content-Type: application/json\r\n" ++
+                        "Content-Length: {d}\r\n" ++
+                        "Connection: close\r\n\r\n{s}",
+                    .{ body.len, body },
+                );
+            }
+            try writer.interface.flush();
+        }
+    };
+
+    {
+        var probe = try Probe.init(true);
+        defer probe.deinit(std.heap.c_allocator);
+        try probe.start();
+
+        const url = try alloc.print("http://127.0.0.1:{d}/token", .{probe.server.socket.address.getPort()});
+        defer alloc.free(url);
+
+        var response = try executeOAuthRequest(null, alloc, .{
+            .method = .post_form,
+            .url = url,
+            .payload = "grant_type=refresh_token",
+            .dpop = "dpop-proof-jwt",
+        });
+        defer response.deinit(alloc);
+        if (probe.failure) |err| return err;
+
+        try std.testing.expectEqual(oauth_transport.Disposition.rejected, response.disposition);
+        try std.testing.expectEqual(@as(u16, 400), response.status);
+        try std.testing.expectEqualStrings("server-nonce-1", response.dpop_nonce.?);
+        try std.testing.expectEqualStrings("Tue, 29 Feb 2000 12:34:56 GMT", response.date_header.?);
+        try std.testing.expect(std.mem.find(u8, probe.captured_headers.?, "DPoP: dpop-proof-jwt\r\n") != null);
+    }
+
+    {
+        var probe = try Probe.init(false);
+        defer probe.deinit(std.heap.c_allocator);
+        try probe.start();
+
+        const url = try alloc.print("http://127.0.0.1:{d}/token", .{probe.server.socket.address.getPort()});
+        defer alloc.free(url);
+
+        var response = try executeOAuthRequest(null, alloc, .{
+            .method = .post_form,
+            .url = url,
+            .payload = "grant_type=refresh_token",
+        });
+        defer response.deinit(alloc);
+        if (probe.failure) |err| return err;
+
+        try std.testing.expectEqual(oauth_transport.Disposition.accepted, response.disposition);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        try std.testing.expect(response.dpop_nonce == null);
+        try std.testing.expect(response.date_header == null);
+        try std.testing.expect(std.mem.find(u8, probe.captured_headers.?, "DPoP:") == null);
+    }
 }
 
 test "gateway catalog reads the Token Pass marks and nothing else as one" {

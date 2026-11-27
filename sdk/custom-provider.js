@@ -7,7 +7,7 @@
 import { tokenString } from "./subscription.js";
 
 const encoder = new TextEncoder();
-const reservedNames = new Set(["gateway", "codex", "grok"]);
+const reservedNames = new Set(["gateway", "codex", "grok", "google"]);
 const namePattern = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const providerFields = new Set(["name", "baseUrl", "models", "modelDefaults", "titleModel", "visionModel"]);
@@ -117,7 +117,7 @@ export function customProviderDefinition(provider) {
   }
   const { name, baseUrl, models, modelDefaults, titleModel, visionModel } = provider;
   if (typeof name !== "string" || !namePattern.test(name) || reservedNames.has(name.toLowerCase())) {
-    throw new TypeError("provider.name must be a letter followed by letters, digits, _ or -, at most 64 characters, and not gateway, codex or grok");
+    throw new TypeError("provider.name must be a letter followed by letters, digits, _ or -, at most 64 characters, and not gateway, codex, grok or google");
   }
   const chatUrl = chatUrlOf(baseUrl);
   const definition = {

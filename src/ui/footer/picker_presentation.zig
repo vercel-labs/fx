@@ -59,13 +59,16 @@ pub fn authPickerRowCount(view: auth_runtime.PickerView) u16 {
     if (view.stage == .sign_in) {
         return switch (view.sign_in_source) {
             .chatgpt_subscription => 4,
-            .grok_subscription => if (view.sign_in_code_visible) 7 else 5,
+            .grok_subscription, .google_subscription => if (view.sign_in_code_visible) 7 else 5,
             else => 7,
         };
     }
     if (view.stage == .api_key) return 4;
-    if (view.stage == .root and view.include_skip) return 18;
-    if (isSetupListStage(view.stage)) return @intCast(2 + @max(view.choiceCount(), 1));
+    if (view.stage == .root and view.include_skip) return 20;
+    if (isSetupListStage(view.stage)) {
+        const detail_count = view.selectedDetailLines().len;
+        return @intCast(2 + @max(view.choiceCount(), 1) + if (detail_count > 0) 1 + detail_count else 0);
+    }
     return @intCast(1 + @max(view.choiceCount(), 1));
 }
 
@@ -84,7 +87,7 @@ fn setupChoiceLabel(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                 .switch_provider => "Model provider",
                 .change_team => "Vercel team",
                 .switch_credential => "Credential source",
-                .login, .chatgpt_login, .grok_login, .setup, .automatic => "",
+                .login, .chatgpt_login, .grok_login, .google_login, .gemini_api_key, .setup, .automatic => "",
             },
             .provider, .source, .team => "",
         },
@@ -93,12 +96,21 @@ fn setupChoiceLabel(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                 .login => "Vercel account",
                 .chatgpt_login => "Codex subscription",
                 .grok_login => "Grok subscription",
+                .google_login => view.googlePlanLabel(),
+                .gemini_api_key => "Gemini API key",
                 .setup => "AI Gateway API key",
                 .connections, .change_team, .switch_credential, .switch_provider, .automatic => "",
             },
             .provider, .source, .team => "",
         },
-        .provider, .change_team, .switch_credential => view.choiceLabel(choice),
+        .provider => switch (choice) {
+            .provider => |provider| if (provider == .google)
+                "Google (AI Pro or Ultra plan, or Gemini API key)"
+            else
+                view.choiceLabel(choice),
+            else => view.choiceLabel(choice),
+        },
+        .change_team, .switch_credential => view.choiceLabel(choice),
         .sign_in, .api_key => "",
     };
 }
@@ -114,7 +126,7 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                     view.activeSourceLabel()
                 else
                     "not connected",
-                .login, .chatgpt_login, .grok_login, .setup, .automatic => "",
+                .login, .chatgpt_login, .grok_login, .google_login, .gemini_api_key, .setup, .automatic => "",
             },
             .provider, .source, .team => "",
         },
@@ -123,6 +135,8 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                 .login => if (view.fx_login_session_available) "connected" else "not connected",
                 .chatgpt_login => if (view.available_sources.contains(.chatgpt_subscription)) "connected" else "not connected",
                 .grok_login => if (view.available_sources.contains(.grok_subscription)) "connected" else "not connected",
+                .google_login => if (view.available_sources.contains(.google_subscription)) "connected" else "not connected",
+                .gemini_api_key => if (view.available_sources.contains(.gemini_api_key)) "connected" else "not connected",
                 .setup => if (view.available_sources.contains(.stored_key))
                     "stored"
                 else if (view.available_sources.contains(.ai_gateway_api_key))
@@ -257,15 +271,41 @@ fn composeSetupPickerRow(
     if (row_index < choice_start) return .empty;
     if (view.choiceCount() == 0) return composeSetupEmptyRow(alloc, view, width);
 
+    const detail_lines = view.selectedDetailLines();
+    const detail_reserved: u16 = if (detail_lines.len > 0 and row_count >= choice_start + 2 + detail_lines.len)
+        @intCast(1 + detail_lines.len)
+    else
+        0;
+    if (detail_reserved > 0 and row_index >= row_count - detail_reserved) {
+        const detail_offset = row_index - (row_count - detail_reserved);
+        if (detail_offset == 0) return .empty;
+        return composeSetupDetailRow(alloc, detail_lines[detail_offset - 1], width);
+    }
+
     const window = pickerWindow(
         view.choiceCount(),
         view.selectedIndex(),
-        row_count - choice_start,
+        row_count - choice_start - detail_reserved,
     );
     const choice_index = window.start + row_index - choice_start;
     if (choice_index >= window.end) return .empty;
     const choice = view.choiceAt(choice_index) orelse return .empty;
     return composeSetupChoiceRow(alloc, view, choice, width);
+}
+
+fn composeSetupDetailRow(
+    alloc: Allocator,
+    detail: []const u8,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    if (width <= 2) return row;
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row.appendSlice(alloc, "  ");
+    try row_text.appendTerminalSafeSingleLine(alloc, &row, detail, @as(usize, width) - 2);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
 }
 
 pub noinline fn composeAuthPickerRow(
@@ -294,7 +334,7 @@ pub noinline fn composeAuthPickerRow(
         );
     }
     if (view.stage == .api_key) {
-        return composeApiKeyPickerRow(alloc, view.api_key_mask_count, row_index, width);
+        return composeApiKeyPickerRow(alloc, view, row_index, width);
     }
     if (view.stage == .root and view.include_skip) {
         return composeOnboardingPickerRow(alloc, view, row_index, row_count, width);
@@ -316,9 +356,9 @@ fn signInProjectedRowIndex(
     if (source == .chatgpt_subscription) {
         return prioritizedRowIndex(4, &codex_priority, row_index, row_count);
     }
-    const grok_browser_priority = [_]u16{ 2, 3, 0, 4, 1 };
-    if (source == .grok_subscription and !manual_code_visible) {
-        return prioritizedRowIndex(5, &grok_browser_priority, row_index, row_count);
+    const browser_priority = [_]u16{ 2, 3, 0, 4, 1 };
+    if ((source == .grok_subscription or source == .google_subscription) and !manual_code_visible) {
+        return prioritizedRowIndex(5, &browser_priority, row_index, row_count);
     }
 
     const manual_code_priority = [_]u16{ 5, 4, 2, 0, 6, 3, 1 };
@@ -353,13 +393,13 @@ const onboarding_note = "   ⚠︎ Note: fx is experimental and defaults to auto
 const onboarding_note_link = onboarding_note ++ " \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\";
 
 fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, row_count: u16) u16 {
-    if (row_count >= 18) return row_index;
+    if (row_count >= 20) return row_index;
 
     const selected_row: u16 = 8 + @as(u16, @intCast(view.selectedIndex()));
-    const priority = [_]u16{ selected_row, 11, 9, 10, 8, 15, 7, 12, 5, 0, 2, 3, 6, 13, 14, 1, 4, 16, 17 };
+    const priority = [_]u16{ selected_row, 13, 9, 10, 11, 12, 8, 17, 7, 14, 5, 0, 2, 3, 6, 15, 16, 1, 4, 18, 19 };
 
     var projected_index: u16 = 0;
-    for (0..18) |source_row| {
+    for (0..20) |source_row| {
         for (priority[0..@min(row_count, priority.len)]) |included_row| {
             if (source_row != included_row) continue;
             if (projected_index == row_index) return @intCast(source_row);
@@ -367,7 +407,7 @@ fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, ro
             break;
         }
     }
-    return 17;
+    return 19;
 }
 
 fn composeOnboardingPickerRow(
@@ -387,6 +427,8 @@ fn composeOnboardingPickerRow(
         9 => 1,
         10 => 2,
         11 => 3,
+        12 => 4,
+        13 => 5,
         else => null,
     };
     if (maybe_choice_index) |choice_index| {
@@ -414,10 +456,10 @@ fn composeOnboardingPickerRow(
         5 => "   You can change this anytime with /provider.",
         6 => "",
         7 => "   Get started",
-        12 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
-        13, 14 => "",
-        15 => "   esc to set up later · explore all commands with /help",
-        16, 17 => "",
+        14 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
+        15, 16 => "",
+        17 => "   esc to set up later · explore all commands with /help",
+        18, 19 => "",
         else => "",
     };
     try row_text.appendClipped(alloc, &row, label, width);
@@ -451,7 +493,9 @@ fn composeSignInPickerRow(
     if (width == 0) return row;
     const accepts_manual_code = snapshot.accepts_manual_code;
 
-    const subscription_source = source == .chatgpt_subscription or source == .grok_subscription;
+    const subscription_source = source == .chatgpt_subscription or
+        source == .grok_subscription or
+        source == .google_subscription;
     if (subscription_source and row_index == 0) {
         try row.appendSlice(alloc, ui_render.dim_style);
         const value_col = detailValueColumn(width);
@@ -469,7 +513,12 @@ fn composeSignInPickerRow(
         try row_text.appendSingleLineEllipsized(
             alloc,
             &row,
-            if (source == .chatgpt_subscription) "Sign in with Codex" else "Sign in with Grok",
+            switch (source) {
+                .chatgpt_subscription => "Sign in with Codex",
+                .grok_subscription => "Sign in with Grok",
+                .google_subscription => "Sign in with Google (AI Pro or Ultra)",
+                else => unreachable,
+            },
             value_col,
         );
         if (status_col < width) {
@@ -494,17 +543,24 @@ fn composeSignInPickerRow(
         if (remaining > 0) {
             try row.appendSlice(
                 alloc,
-                if (source == .chatgpt_subscription)
-                    "\x1b]8;id=fx-codex-auth;"
-                else
-                    "\x1b]8;id=fx-grok-auth;",
+                switch (source) {
+                    .chatgpt_subscription => "\x1b]8;id=fx-codex-auth;",
+                    .grok_subscription => "\x1b]8;id=fx-grok-auth;",
+                    .google_subscription => "\x1b]8;id=fx-google-auth;",
+                    else => unreachable,
+                },
             );
             try row.appendSlice(alloc, snapshot.verification_uri);
             try row.appendSlice(alloc, "\x1b\\\x1b[4m");
             try row_text.appendClipped(
                 alloc,
                 &row,
-                if (source == .chatgpt_subscription) "Authorize with Codex" else "Authorize with Grok",
+                switch (source) {
+                    .chatgpt_subscription => "Authorize with Codex",
+                    .grok_subscription => "Authorize with Grok",
+                    .google_subscription => "Authorize with Google",
+                    else => unreachable,
+                },
                 remaining,
             );
             try row.appendSlice(alloc, "\x1b[24m\x1b]8;;\x1b\\");
@@ -513,13 +569,16 @@ fn composeSignInPickerRow(
         return row;
     }
 
-    if (source == .grok_subscription and !manual_code_visible) {
+    if ((source == .grok_subscription or source == .google_subscription) and !manual_code_visible) {
         try row.appendSlice(alloc, ui_render.dim_style);
         if (row_index == 3) {
             try row_text.appendClipped(
                 alloc,
                 &row,
-                "  Browser didn't return? press tab to enter a code",
+                if (source == .google_subscription)
+                    "  Browser didn't return? press tab to paste the callback URL"
+                else
+                    "  Browser didn't return? press tab to enter a code",
                 width,
             );
         }
@@ -535,18 +594,29 @@ fn composeSignInPickerRow(
         else
             ui_render.dim_style,
     );
-    if (source == .grok_subscription and manual_code_visible and row_index == 4) {
-        try row_text.appendClipped(alloc, &row, "  Paste the code shown by xAI", width);
+    if ((source == .grok_subscription or source == .google_subscription) and manual_code_visible and row_index == 4) {
+        try row_text.appendClipped(
+            alloc,
+            &row,
+            if (source == .google_subscription)
+                "  Paste the full callback URL from your browser"
+            else
+                "  Paste the code shown by xAI",
+            width,
+        );
         try row.appendSlice(alloc, ui_render.reset_style);
         return row;
     }
-    if (source == .grok_subscription and manual_code_visible and row_index == 5) {
+    if ((source == .grok_subscription or source == .google_subscription) and manual_code_visible and row_index == 5) {
         const prefix = "  ┃ ";
         try row_text.appendClipped(alloc, &row, prefix, width);
         const used: u16 = @intCast(@min(display_width.visibleWidth(prefix), width));
         if (manual_code_mask_count == 0) {
             try row.appendSlice(alloc, ui_render.dim_style);
-            const placeholder = "Paste or type the code";
+            const placeholder = if (source == .google_subscription)
+                "Paste the full callback URL (http://127.0.0.1:...)"
+            else
+                "Paste or type the code";
             try row_text.appendClipped(alloc, &row, placeholder, width -| used);
         } else {
             const visible_mask_count = @min(manual_code_mask_count, width -| used);
@@ -555,7 +625,7 @@ fn composeSignInPickerRow(
         try row.appendSlice(alloc, ui_render.reset_style);
         return row;
     }
-    if (source == .grok_subscription and manual_code_visible and row_index == 6) {
+    if ((source == .grok_subscription or source == .google_subscription) and manual_code_visible and row_index == 6) {
         try row.appendSlice(alloc, ui_render.reset_style);
         return row;
     }
@@ -565,6 +635,8 @@ fn composeSignInPickerRow(
             "   Sign in with Codex"
         else if (source == .grok_subscription)
             "   Sign in with Grok"
+        else if (source == .google_subscription)
+            "   Sign in with Google (AI Pro or Ultra)"
         else
             "   Sign in with Vercel",
         1, 4 => "",
@@ -576,6 +648,8 @@ fn composeSignInPickerRow(
             "   Open the Codex authorization page"
         else if (source == .grok_subscription)
             "   Open the Grok authorization page"
+        else if (source == .google_subscription)
+            "   Open the Google authorization page"
         else
             "   Open the Vercel device authorization page",
         3 => if (snapshot.user_code.len == 0)
@@ -606,7 +680,7 @@ fn composeSignInPickerRow(
 
 fn composeApiKeyPickerRow(
     alloc: Allocator,
-    mask_count: usize,
+    view: auth_runtime.PickerView,
     row_index: u16,
     width: u16,
 ) !std.ArrayList(u8) {
@@ -619,14 +693,22 @@ fn composeApiKeyPickerRow(
     else
         ui_render.dim_style);
     switch (row_index) {
-        0 => try row_text.appendClipped(alloc, &row, "   Paste your AI Gateway API key", width),
+        0 => try row_text.appendClipped(
+            alloc,
+            &row,
+            if (view.api_key_target == .google)
+                "   Paste your Gemini API key"
+            else
+                "   Paste your AI Gateway API key",
+            width,
+        ),
         1 => {
             try row_text.appendClipped(alloc, &row, "   ┃ ", width);
-            if (mask_count == 0) {
+            if (view.api_key_mask_count == 0) {
                 try row.appendSlice(alloc, ui_render.dim_style);
                 try row_text.appendClipped(alloc, &row, "Paste or type a key", width -| 5);
             } else {
-                for (0..@min(mask_count, width -| 5)) |_| try row.appendSlice(alloc, "•");
+                for (0..@min(view.api_key_mask_count, width -| 5)) |_| try row.appendSlice(alloc, "•");
             }
         },
         2 => try row_text.appendClipped(alloc, &row, "   enter saves · esc cancels", width),
@@ -635,7 +717,7 @@ fn composeApiKeyPickerRow(
             const label = std.mem.print(
                 &label_buf,
                 "   Saves to {s}",
-                .{credentials.stored_key_backend_label},
+                .{view.api_key_backend_label},
             ) catch "   Saves to configured credential store";
             try row_text.appendClipped(alloc, &row, label, width);
         },
@@ -677,7 +759,14 @@ pub fn authPickerReservedRows(view: auth_runtime.PickerView, terminal_rows: u16,
         const available_rows = terminal_rows -| (5 +| input_extra +| banner_rows);
         return @min(authPickerRowCount(view), @max(available_rows, 1));
     }
-    return @min(authPickerRowCount(view), activeListPickerReservedRows(terminal_rows, input_extra, banner_rows));
+    const list_budget = activeListPickerReservedRows(terminal_rows, input_extra, banner_rows);
+    const detail_len = view.selectedDetailLines().len;
+    if (detail_len > 0) {
+        const available_rows = terminal_rows -| (5 +| input_extra +| banner_rows);
+        const desired_budget = list_budget +| @as(u16, @intCast(1 + detail_len));
+        return @min(authPickerRowCount(view), @max(@min(desired_budget, available_rows), 1));
+    }
+    return @min(authPickerRowCount(view), list_budget);
 }
 
 pub const PickerWindow = list_window.Window;
@@ -811,17 +900,31 @@ pub noinline fn composePickerOptionRow(
     selected: bool,
     width: u16,
 ) !std.ArrayList(u8) {
-    return composePickerOptionRowAnnotated(alloc, kind, start_col, item, "", selected, width);
+    return composePickerOptionRowAnnotated(alloc, kind, start_col, item, "", 0, selected, width);
 }
 
 const picker_annotation_separator = " · ";
 
+/// The widest visible label among the rows that have an annotation. The caller
+/// passes it to every annotated row, so their separators share one column.
+pub fn annotatedLabelColumnWidth(items: []const []const u8, annotations: []const []const u8) usize {
+    var widest: usize = 0;
+    for (items, 0..) |item, i| {
+        if (i >= annotations.len or annotations[i].len == 0) continue;
+        widest = @max(widest, display_width.visibleWidth(item));
+    }
+    return widest;
+}
+
+/// `label_column_width` pads the label before the separator. When the padded
+/// label and annotation do not fit, the annotation is dropped and the label clips.
 pub noinline fn composePickerOptionRowAnnotated(
     alloc: Allocator,
     kind: input_presentation.PickerKind,
     start_col: u16,
     item: []const u8,
     annotation: []const u8,
+    label_column_width: usize,
     selected: bool,
     width: u16,
 ) !std.ArrayList(u8) {
@@ -838,22 +941,43 @@ pub noinline fn composePickerOptionRowAnnotated(
     };
     const base_style = if (selected) selected_style else ui_render.dim_style;
     const available = width_usize - @as(usize, start_col - 1);
+    const item_width = display_width.visibleWidth(item);
     const annotation_width = if (annotation.len == 0)
         0
     else
         display_width.visibleWidth(picker_annotation_separator) + display_width.visibleWidth(annotation);
+    const padded_label_width = @max(item_width, label_column_width);
     const show_annotation = annotation_width > 0 and
-        available >= display_width.visibleWidth(item) + annotation_width;
-    const label_width = if (show_annotation) available - annotation_width else available;
+        available >= padded_label_width + annotation_width;
+    const label_clip_width = if (show_annotation) item_width else available;
 
     try row.appendSlice(alloc, base_style);
-    try row_text.appendClipped(alloc, &row, item, @intCast(label_width));
+    try row_text.appendClipped(alloc, &row, item, @intCast(label_clip_width));
     if (show_annotation) {
+        try row.appendNTimes(alloc, ' ', padded_label_width - item_width);
         try row.appendSlice(alloc, ui_render.reset_style);
         try row.appendSlice(alloc, ui_render.dim_style);
         try row.appendSlice(alloc, picker_annotation_separator);
         try row.appendSlice(alloc, annotation);
     }
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
+pub noinline fn composePickerDetailRow(
+    alloc: Allocator,
+    start_col: u16,
+    detail: []const u8,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    const width_usize: usize = width;
+    if (width_usize == 0 or start_col == 0 or start_col > width) return row;
+
+    if (start_col > 1) try row_text.appendAbsoluteColumn(alloc, &row, start_col);
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row_text.appendTerminalSafeSingleLine(alloc, &row, detail, width_usize - @as(usize, start_col - 1));
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
@@ -2160,6 +2284,99 @@ test "typed file picker tiny directory row retains kind identity" {
     try std.testing.expect(std.mem.find(u8, row.items, "/") != null);
 }
 
+fn stripEscapesForTest(alloc: Allocator, text: []const u8) !std.ArrayList(u8) {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == 0x1b) {
+            i = display_width.ansiSequenceEnd(text, i);
+            continue;
+        }
+        try out.append(alloc, text[i]);
+        i += 1;
+    }
+    return out;
+}
+
+fn separatorColumnForTest(text: []const u8) ?usize {
+    const index = std.mem.find(u8, text, picker_annotation_separator) orelse return null;
+    return display_width.visibleWidth(text[0..index]);
+}
+
+test "annotated picker rows align their separators to the widest labeled row" {
+    const alloc = std.testing.allocator;
+    const items = [_][]const u8{ "plan", "api-key" };
+    const annotations = [_][]const u8{ "Sign in with Google (AI Pro or Ultra)", "Gemini API key" };
+    const label_column = annotatedLabelColumnWidth(&items, &annotations);
+    try std.testing.expectEqual(@as(usize, 7), label_column);
+
+    var plan_row = try composePickerOptionRowAnnotated(alloc, .provider_stage, 1, items[0], annotations[0], label_column, false, 80);
+    defer plan_row.deinit(alloc);
+    var api_key_row = try composePickerOptionRowAnnotated(alloc, .provider_stage, 1, items[1], annotations[1], label_column, false, 80);
+    defer api_key_row.deinit(alloc);
+
+    var plan_text = try stripEscapesForTest(alloc, plan_row.items);
+    defer plan_text.deinit(alloc);
+    var api_key_text = try stripEscapesForTest(alloc, api_key_row.items);
+    defer api_key_text.deinit(alloc);
+
+    try std.testing.expectEqualStrings("plan    · Sign in with Google (AI Pro or Ultra)", plan_text.items);
+    try std.testing.expectEqualStrings("api-key · Gemini API key", api_key_text.items);
+    try std.testing.expectEqual(@as(?usize, 7), separatorColumnForTest(plan_text.items));
+    try std.testing.expectEqual(separatorColumnForTest(plan_text.items), separatorColumnForTest(api_key_text.items));
+}
+
+test "annotated picker separators align by visible width for wide labels" {
+    const alloc = std.testing.allocator;
+    const items = [_][]const u8{ "設定", "api-key" };
+    const annotations = [_][]const u8{ "Sign in", "Gemini API key" };
+    const label_column = annotatedLabelColumnWidth(&items, &annotations);
+    try std.testing.expectEqual(@as(usize, 7), label_column);
+
+    var wide_row = try composePickerOptionRowAnnotated(alloc, .provider_stage, 1, items[0], annotations[0], label_column, false, 80);
+    defer wide_row.deinit(alloc);
+    var ascii_row = try composePickerOptionRowAnnotated(alloc, .provider_stage, 1, items[1], annotations[1], label_column, false, 80);
+    defer ascii_row.deinit(alloc);
+
+    var wide_text = try stripEscapesForTest(alloc, wide_row.items);
+    defer wide_text.deinit(alloc);
+    var ascii_text = try stripEscapesForTest(alloc, ascii_row.items);
+    defer ascii_text.deinit(alloc);
+
+    try std.testing.expectEqualStrings("設定    · Sign in", wide_text.items);
+    try std.testing.expectEqualStrings("api-key · Gemini API key", ascii_text.items);
+    try std.testing.expectEqual(@as(?usize, 7), separatorColumnForTest(wide_text.items));
+    try std.testing.expectEqual(separatorColumnForTest(wide_text.items), separatorColumnForTest(ascii_text.items));
+}
+
+test "annotated picker row clips its label and drops the annotation when narrow" {
+    const alloc = std.testing.allocator;
+    const items = [_][]const u8{ "plan", "api-key" };
+    const annotations = [_][]const u8{ "Sign in with Google (AI Pro or Ultra)", "Gemini API key" };
+    const label_column = annotatedLabelColumnWidth(&items, &annotations);
+
+    var plan_row = try composePickerOptionRowAnnotated(alloc, .provider_stage, 1, items[0], annotations[0], label_column, false, 5);
+    defer plan_row.deinit(alloc);
+    var api_key_row = try composePickerOptionRowAnnotated(alloc, .provider_stage, 1, items[1], annotations[1], label_column, false, 5);
+    defer api_key_row.deinit(alloc);
+
+    var plan_text = try stripEscapesForTest(alloc, plan_row.items);
+    defer plan_text.deinit(alloc);
+    var api_key_text = try stripEscapesForTest(alloc, api_key_row.items);
+    defer api_key_text.deinit(alloc);
+
+    try std.testing.expectEqualStrings("plan", plan_text.items);
+    try std.testing.expectEqualStrings("api-k", api_key_text.items);
+    try std.testing.expectEqual(@as(?usize, null), separatorColumnForTest(api_key_text.items));
+}
+
+test "annotated picker label column ignores rows without an annotation" {
+    const items = [_][]const u8{ "a-very-long-unannotated-label", "plan", "api-key" };
+    const annotations = [_][]const u8{ "", "Sign in with Google (AI Pro or Ultra)", "" };
+    try std.testing.expectEqual(@as(usize, 4), annotatedLabelColumnWidth(&items, &annotations));
+}
+
 test "compose model picker rows render raw catalog model ids" {
     var codex = try composePickerOptionRow(std.testing.allocator, .model_stage, 1, "gpt-5.4", true, 80);
     defer codex.deinit(std.testing.allocator);
@@ -2188,7 +2405,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
         .include_skip = true,
     };
 
-    try std.testing.expectEqual(@as(u16, 18), authPickerRowCount(view));
+    try std.testing.expectEqual(@as(u16, 20), authPickerRowCount(view));
     var screen: std.ArrayList(u8) = .empty;
     defer screen.deinit(alloc);
     for (0..authPickerRowCount(view)) |row_index| {
@@ -2204,6 +2421,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
     try std.testing.expect(std.mem.find(u8, screen.items, "⚠︎ Note: fx is experimental and defaults to auto mode. \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Learn more: https://") == null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Gemini API key") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Add an API key") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "esc to set up later · explore all commands with /help") != null);
 
@@ -2227,11 +2445,19 @@ test "auth onboarding composes the welcome copy and setup choices" {
     defer grok_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, grok_row.items, "Sign in with Grok") != null);
 
-    var unselected_row = try composeAuthPickerRow(alloc, view, 11, authPickerRowCount(view), 100);
+    var google_plan_row = try composeAuthPickerRow(alloc, view, 11, authPickerRowCount(view), 100);
+    defer google_plan_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, google_plan_row.items, "Sign in with Google (AI Pro or Ultra)") != null);
+
+    var gemini_row = try composeAuthPickerRow(alloc, view, 12, authPickerRowCount(view), 100);
+    defer gemini_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, gemini_row.items, "Gemini API key") != null);
+
+    var unselected_row = try composeAuthPickerRow(alloc, view, 13, authPickerRowCount(view), 100);
     defer unselected_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, unselected_row.items, "Add an API key") != null);
 
-    var narrow_note = try composeAuthPickerRow(alloc, view, 12, authPickerRowCount(view), 58);
+    var narrow_note = try composeAuthPickerRow(alloc, view, 14, authPickerRowCount(view), 58);
     defer narrow_note.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow_note.items, "https://fx.sh/docs/stability") == null);
 
@@ -2349,6 +2575,38 @@ test "compact auth picker keeps the selected hub action visible" {
     try std.testing.expect(std.mem.find(u8, row.items, "Credential source") != null);
 }
 
+test "setup connections shows linked Google plan email, sign-out actions, and manage access link" {
+    const alloc = std.testing.allocator;
+    const view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = auth_runtime.SourceSet.initOne(.google_subscription),
+        .selected_choice = .{ .action = .google_login },
+        .active_source = .google_subscription,
+        .active_provider = .google,
+        .include_skip = false,
+        .stage = .connections,
+        .google_plan_label = "Google AI Pro or Ultra plan · dev@example.com",
+    };
+
+    const row_count = authPickerReservedRows(view, 30, 0, 0);
+    try std.testing.expectEqual(@as(u16, 10), row_count);
+
+    var screen: std.ArrayList(u8) = .empty;
+    defer screen.deinit(alloc);
+    for (0..row_count) |row_index| {
+        var row = try composeAuthPickerRow(alloc, view, @intCast(row_index), row_count, 100);
+        defer row.deinit(alloc);
+        try screen.appendSlice(alloc, row.items);
+        try screen.append(alloc, '\n');
+    }
+
+    try std.testing.expect(std.mem.find(u8, screen.items, "Google AI Pro or Ultra plan · dev@example.com") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "connected") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Sign out on this device: /logout google") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Disconnect Google Account: /logout google --disconnect") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Manage access: https://myaccount.google.com/connections") != null);
+}
+
 test "auth picker renders the staged switch and disabled team screens" {
     const alloc = std.testing.allocator;
 
@@ -2362,7 +2620,11 @@ test "auth picker renders the staged switch and disabled team screens" {
         .stage = .provider,
     };
     const provider_rows = authPickerRowCount(provider_view);
-    try std.testing.expectEqual(@as(u16, 5), provider_rows);
+    try std.testing.expectEqual(@as(u16, 6), provider_rows);
+    var google_row = try composeAuthPickerRow(alloc, provider_view, 5, provider_rows, 80);
+    defer google_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, google_row.items, "Google (AI Pro or Ultra plan, or Gemini API key)") != null);
+    try std.testing.expect(std.mem.find(u8, google_row.items, "available") != null);
     var provider_header = try composeAuthPickerRow(alloc, provider_view, 0, provider_rows, 80);
     defer provider_header.deinit(alloc);
     try std.testing.expect(std.mem.startsWith(u8, provider_header.items, ui_render.dim_style));
@@ -2470,6 +2732,24 @@ test "api key stage renders only a bounded mask and the configured backend label
     defer backend.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, backend.items, "Saves to") != null);
     try std.testing.expect(std.mem.find(u8, backend.items, credentials.stored_key_backend_label) != null);
+
+    const google_view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = null,
+        .active_source = null,
+        .include_skip = false,
+        .stage = .api_key,
+        .api_key_mask_count = 4,
+        .api_key_target = .google,
+        .api_key_backend_label = "profile file",
+    };
+    var google_title = try composeAuthPickerRow(alloc, google_view, 0, 4, 80);
+    defer google_title.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, google_title.items, "Paste your Gemini API key") != null);
+    var google_backend = try composeAuthPickerRow(alloc, google_view, 3, 4, 80);
+    defer google_backend.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, google_backend.items, "Saves to profile file") != null);
 }
 
 test "api key field reads as a text field rather than a selectable row" {
@@ -2756,6 +3036,7 @@ test "compact subscription browser sign-in prioritizes the authorization action"
     }{
         .{ .source = .chatgpt_subscription, .label = "Authorize with Codex" },
         .{ .source = .grok_subscription, .label = "Authorize with Grok" },
+        .{ .source = .google_subscription, .label = "Authorize with Google" },
     };
 
     for (cases) |case| {
@@ -2770,7 +3051,7 @@ test "compact subscription browser sign-in prioritizes the authorization action"
             .sign_in = .{
                 .state = .polling,
                 .verification_uri = "https://issuer.test/authorize",
-                .accepts_manual_code = case.source == .grok_subscription,
+                .accepts_manual_code = case.source == .grok_subscription or case.source == .google_subscription,
             },
         };
 
@@ -2836,4 +3117,64 @@ test "partially visible auth picker shows a source window without duplicates" {
     var scrolled_selected = try composeAuthPickerRow(alloc, scrolled_view, 3, 4, 80);
     defer scrolled_selected.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, scrolled_selected.items, credentials.sourceLabel(.stored_key)) != null);
+}
+
+test "Google sign-in renders browser and manual callback URL entry modes" {
+    const alloc = std.testing.allocator;
+    const url = "https://accounts.google.com/o/oauth2/v2/auth?state=s1";
+    const browser_view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = null,
+        .active_source = null,
+        .include_skip = false,
+        .stage = .sign_in,
+        .sign_in_source = .google_subscription,
+        .sign_in = .{
+            .state = .polling,
+            .verification_uri = url,
+            .accepts_manual_code = true,
+        },
+        .sign_in_code_visible = false,
+    };
+
+    try std.testing.expectEqual(@as(u16, 5), authPickerRowCount(browser_view));
+    var browser_grid = try composeAuthPickerTestGrid(alloc, browser_view, 80);
+    defer browser_grid.deinit();
+
+    var row: std.ArrayList(u8) = .empty;
+    defer row.deinit(alloc);
+    const expected_browser = [_][]const u8{
+        "Sign in with Google (AI Pro or Ultra)                 Waiting for authorization…",
+        "",
+        "  Open   Authorize with Google",
+        "  Browser didn't return? press tab to paste the callback URL",
+        "",
+    };
+    for (expected_browser, 1..) |expected, row_index| {
+        row.clearRetainingCapacity();
+        try browser_grid.rowTextTrimmed(@intCast(row_index), &row);
+        try std.testing.expectEqualStrings(expected, row.items);
+    }
+
+    var manual_view = browser_view;
+    manual_view.sign_in_code_visible = true;
+    try std.testing.expectEqual(@as(u16, 7), authPickerRowCount(manual_view));
+    var manual_grid = try composeAuthPickerTestGrid(alloc, manual_view, 80);
+    defer manual_grid.deinit();
+
+    const expected_manual = [_][]const u8{
+        "Sign in with Google (AI Pro or Ultra)                 Waiting for authorization…",
+        "",
+        "  Open   Authorize with Google",
+        "",
+        "  Paste the full callback URL from your browser",
+        "  ┃ Paste the full callback URL (http://127.0.0.1:...)",
+        "",
+    };
+    for (expected_manual, 1..) |expected, row_index| {
+        row.clearRetainingCapacity();
+        try manual_grid.rowTextTrimmed(@intCast(row_index), &row);
+        try std.testing.expectEqualStrings(expected, row.items);
+    }
 }

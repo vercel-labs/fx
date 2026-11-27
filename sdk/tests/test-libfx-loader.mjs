@@ -94,6 +94,21 @@ await assert.rejects(
     !String(error.cause).includes("old addon must not receive ultrafast"),
 );
 
+await assert.rejects(
+  createFxEngine({
+    backend: "native",
+    nativeAddon: {
+      libfxApiVersion: 4,
+      createCore() { throw new Error("old addon must not receive google"); },
+    },
+    provider: "google",
+    model: "gemini-4-hydrogen",
+    credentials: () => ({ apiKey: "gm-k" }),
+  }),
+  (error) => error?.code === "LIBFX_NATIVE_CAPABILITY_UNAVAILABLE" &&
+    !String(error.cause).includes("old addon must not receive google"),
+);
+
 for (const gatewayChatUrl of [
   "http://attacker.example/chat",
   "https://[redacted]@example.com/chat",

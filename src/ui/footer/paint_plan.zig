@@ -95,6 +95,7 @@ pub const FooterPlannerInput = struct {
     picker_kind: input_presentation.PickerKind = .model_stage,
     picker_items: []const []const u8 = &.{},
     picker_annotations: []const []const u8 = &.{},
+    picker_detail_lines: []const []const u8 = &.{},
     file_picker_items: []const file_index.SearchResult = &.{},
     picker_selection_index: usize = 0,
     picker_window_start: usize = 0,
@@ -958,11 +959,22 @@ pub fn composeFooterFrame(
             const window_start = picker_presentation.updateEdgeScrollPickerWindowStart(input.picker_window_start, input.picker_items.len, selected, input.picker_rows);
             const window = picker_presentation.edgeScrollPickerWindowFromStart(input.picker_items.len, window_start, input.picker_rows);
             var row = rows.picker_start;
+            const label_column_width = picker_presentation.annotatedLabelColumnWidth(input.picker_items, input.picker_annotations);
             for (input.picker_items[window.start..window.end], window.start..) |item, i| {
                 const annotation = if (i < input.picker_annotations.len) input.picker_annotations[i] else "";
-                var picker_row = try picker_presentation.composePickerOptionRowAnnotated(alloc, input.picker_kind, input.picker_start_col, item, annotation, i == selected, shell.layout.cols);
+                var picker_row = try picker_presentation.composePickerOptionRowAnnotated(alloc, input.picker_kind, input.picker_start_col, item, annotation, label_column_width, i == selected, shell.layout.cols);
                 try pushFooterBandRow(alloc, &frame, plan, row, &picker_row);
                 row += 1;
+            }
+            const picker_end = rows.picker_start + input.picker_rows;
+            if (input.picker_detail_lines.len > 0 and row < picker_end) {
+                if (picker_end - row > input.picker_detail_lines.len) row += 1;
+                for (input.picker_detail_lines) |detail| {
+                    if (row >= picker_end) break;
+                    var detail_row = try picker_presentation.composePickerDetailRow(alloc, input.picker_start_col, detail, shell.layout.cols);
+                    try pushFooterBandRow(alloc, &frame, plan, row, &detail_row);
+                    row += 1;
+                }
             }
         } else {
             var status_row = if (input.picker_kind == .file and ctx.file_completion_status != null)

@@ -349,7 +349,7 @@ function createNativeCoreRuntime(addon, options) {
     error.code = "LIBFX_NATIVE_CAPABILITY_UNAVAILABLE";
     throw error;
   }
-  const capability = customProvider ? "supportsConfiguredProvider" : { codex: "supportsCodex", grok: "supportsGrok" }[provider];
+  const capability = customProvider ? "supportsConfiguredProvider" : { codex: "supportsCodex", grok: "supportsGrok", google: "supportsGoogle" }[provider];
   if (capability && addon[capability] !== true) {
     const error = new Error(`native addon does not support the ${provider} provider`);
     error.code = "LIBFX_NATIVE_CAPABILITY_UNAVAILABLE";

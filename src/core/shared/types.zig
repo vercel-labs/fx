@@ -119,6 +119,8 @@ pub const CredentialSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    gemini_api_key,
+    google_subscription,
     host_managed,
     configured,
 };

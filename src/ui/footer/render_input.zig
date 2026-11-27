@@ -83,6 +83,7 @@ pub const ModelMenuProjection = struct {
     load_state: model_cache_runtime.ModelMenuLoadState = .loading,
     catalog_state: model_cache_runtime.ModelMenuCatalogState = .{},
     items: []const model_cache_runtime.ModelMenuItem = &.{},
+    shows_display_names: bool = false,
     provider_index: usize = 0,
     selected_index: usize = 0,
     window_start: usize = 0,
@@ -96,11 +97,15 @@ pub const ModelMenuProjection = struct {
     }
 
     pub fn filteredItemCount(self: ModelMenuProjection) usize {
-        return model_cache_runtime.modelMenuFilteredItemCount(self.items, self.providerFilter(), self.query);
+        return model_cache_runtime.modelMenuFilteredItemCount(self.items, self.providerFilter(), self.query, self.shows_display_names);
     }
 
     pub fn itemAt(self: ModelMenuProjection, display_index: usize) ?*const model_cache_runtime.ModelMenuItem {
-        return model_cache_runtime.modelMenuItemAt(self.items, self.providerFilter(), self.query, display_index);
+        return model_cache_runtime.modelMenuItemAt(self.items, self.providerFilter(), self.query, self.shows_display_names, display_index);
+    }
+
+    pub fn itemLabel(self: ModelMenuProjection, item: model_cache_runtime.ModelMenuItem) []const u8 {
+        return item.displayName(self.shows_display_names);
     }
 };
 
@@ -407,6 +412,7 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
         .load_state = cache.menu.load_state,
         .catalog_state = cache.menu.catalog_state,
         .items = cache.menu.items.items,
+        .shows_display_names = cache.menu.shows_display_names,
         .provider_index = cache.menu.provider_index,
         .selected_index = cache.menu.selected_index,
         .window_start = cache.menu.window_start,
@@ -451,6 +457,7 @@ pub const RenderContext = struct {
     provider_picker_completions: []const []const u8 = &.{},
     /// Parallel to `provider_picker_completions`; an empty entry renders no annotation.
     provider_picker_annotations: []const []const u8 = &.{},
+    provider_picker_detail_lines: []const []const u8 = &.{},
     provider_picker_completion_index: usize = 0,
     provider_picker_completion_window_start: usize = 0,
     provider_picker_completion_anchor: usize = 0,

@@ -16,6 +16,7 @@ const model_catalog = @import("../gateway/model_catalog.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const composer_stash = @import("../input/composer_stash.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
+const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
@@ -390,6 +391,10 @@ pub fn Bindings(comptime App: type) type {
                     agentAskOutOfCredits
                 else
                     null,
+                .ask_daily_limit = if (comptime @hasDecl(@TypeOf(agent.worker), "requestRouteRecoveryAnswerBlocking"))
+                    agentAskDailyLimit
+                else
+                    null,
                 .available_model_capabilities = agentAvailableModelCapabilities,
                 .resolve_model_capabilities = agentResolveModelCapabilities,
                 .model_catalog_failure = agentModelCatalogFailure,
@@ -528,6 +533,7 @@ pub fn Bindings(comptime App: type) type {
                 .drain_assistant_text = workerBridgeDrainAssistantText,
                 .hold_model_call = workerBridgeHoldModelCall,
                 .open_model_picker = workerBridgeOpenModelPicker,
+                .open_google_api_key_picker = workerBridgeOpenGoogleApiKeyPicker,
                 .semantic_notice = workerBridgeSemanticNotice,
                 .credential_refreshed = workerBridgeCredentialRefreshed,
                 .command_output = workerBridgeCommandOutput,
@@ -1527,7 +1533,8 @@ pub fn Bindings(comptime App: type) type {
                             .fx_login => "Run /login to repair this source.",
                             .chatgpt_subscription => "Reconnect Codex through /login to repair this source.",
                             .grok_subscription => "Reconnect Grok through /login to repair this source.",
-                            .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /provider to repair this source.",
+                            .google_subscription => "Reconnect Google through /login to repair this source.",
+                            .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .gemini_api_key => "Run /provider to repair this source.",
                             .host_managed => credentials.host_managed_auth_message,
                             .configured => "Check the configured provider auth environment variable.",
                         },
@@ -1560,6 +1567,56 @@ pub fn Bindings(comptime App: type) type {
             const label = if (answers) |owned| (if (owned.len > 0) owned[0] else "") else "";
             if (std.mem.eql(u8, label, options[0].label)) return .retry;
             if (std.mem.eql(u8, label, options[1].label)) return .switch_model;
+            return .cancel;
+        }
+
+        /// Asks what to do when a provider's daily limit is reached. Esc on
+        /// the picker cancels.
+        fn agentAskDailyLimit(
+            ctx: *anyopaque,
+            model: []const u8,
+            offer_api_key: bool,
+        ) !agent_runtime.DailyLimitChoice {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const switch_label = "Switch to another model";
+            const api_key_label = "Use a Gemini API key";
+            const cancel_label = "Cancel this turn";
+            var options_buf: [3]types.QuestionOption = undefined;
+            var option_count: usize = 0;
+            options_buf[option_count] = .{
+                .label = switch_label,
+                .description = "Open the model picker with your message back in the composer.",
+            };
+            option_count += 1;
+            if (offer_api_key) {
+                options_buf[option_count] = .{
+                    .label = api_key_label,
+                    .description = "Enter a Gemini API key in /provider google api-key with your message kept in the composer.",
+                };
+                option_count += 1;
+            }
+            options_buf[option_count] = .{
+                .label = cancel_label,
+                .description = "Stop this request.",
+            };
+            option_count += 1;
+            const question = if (model.len > 0)
+                try std.heap.c_allocator.print("Daily limit reached for {s}. What should fx do?", .{model})
+            else
+                try std.heap.c_allocator.dupe(u8, "Daily limit reached. What should fx do?");
+            defer std.heap.c_allocator.free(question);
+            const entry = types.QuestionBatchEntry{
+                .question = question,
+                .options = options_buf[0..option_count],
+            };
+            const answers = try agent.worker.requestRouteRecoveryAnswerBlocking(std.heap.c_allocator, &.{entry});
+            defer if (answers) |owned| {
+                for (owned) |label| std.heap.c_allocator.free(label);
+                std.heap.c_allocator.free(owned);
+            };
+            const label = if (answers) |owned| (if (owned.len > 0) owned[0] else "") else "";
+            if (std.mem.eql(u8, label, switch_label)) return .switch_model;
+            if (offer_api_key and std.mem.eql(u8, label, api_key_label)) return .use_api_key;
             return .cancel;
         }
 
@@ -1697,6 +1754,21 @@ pub fn Bindings(comptime App: type) type {
             }
         }
 
+        fn workerBridgeOpenGoogleApiKeyPicker(ctx: *anyopaque) !void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            if (comptime @hasField(App, "input_runtime") and
+                @hasField(App, "auth") and
+                provider_picker_runtime.supported(App))
+            {
+                const InputRuntime = @TypeOf(app.input_runtime);
+                if (comptime @hasField(InputRuntime, "model_picker_draft")) {
+                    if (app.input_runtime.model_picker_draft != null) return;
+                }
+                try provider_picker_runtime.Runtime(App).openGoogleApiKeyPrompt(app);
+            }
+        }
+
         fn workerBridgeSemanticNotice(ctx: *anyopaque, notice: types.SemanticNotice) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
@@ -1803,10 +1875,33 @@ const FakeWorker = struct {
     fail_diff_push: bool = false,
     fail_semantic_push: bool = false,
     fail_command_output_push: bool = false,
+    recovery_question: std.ArrayList(u8) = .empty,
+    recovery_options: std.ArrayList([]u8) = .empty,
+    recovery_reply: []const u8 = "",
 
     fn deinit(self: *FakeWorker) void {
         for (self.events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
         self.events.deinit(std.heap.c_allocator);
+        self.recovery_question.deinit(std.heap.c_allocator);
+        for (self.recovery_options.items) |label| std.heap.c_allocator.free(label);
+        self.recovery_options.deinit(std.heap.c_allocator);
+    }
+
+    pub fn requestRouteRecoveryAnswerBlocking(
+        self: *FakeWorker,
+        a: std.mem.Allocator,
+        entries: []const types.QuestionBatchEntry,
+    ) !?[][]u8 {
+        self.recovery_question.clearRetainingCapacity();
+        try self.recovery_question.appendSlice(std.heap.c_allocator, entries[0].question);
+        for (self.recovery_options.items) |label| std.heap.c_allocator.free(label);
+        self.recovery_options.clearRetainingCapacity();
+        for (entries[0].options) |option| {
+            try self.recovery_options.append(std.heap.c_allocator, try std.heap.c_allocator.dupe(u8, option.label));
+        }
+        const out = try a.alloc([]u8, 1);
+        out[0] = try a.dupe(u8, self.recovery_reply);
+        return out;
     }
 
     pub fn pushEvent(self: *FakeWorker, alloc: std.mem.Allocator, event: WorkerEvent) !void {
@@ -3173,4 +3268,33 @@ test "worker bridge history append fallback updates runtime history" {
         "saved",
         app.agent().session.agent.history.items[0].assistant.assistant,
     );
+}
+
+test "agentAskDailyLimit formats question and options per route with no retry" {
+    const alloc = std.testing.allocator;
+    var app = FakeApp.init(alloc);
+    defer app.deinit();
+    const deps = Bindings(FakeApp).agentRuntimeDeps(&app, (&app).agent());
+    const ask = deps.ask_daily_limit.?;
+
+    // Plan route: Switch to another model, Use a Gemini API key, Cancel this turn.
+    app.agent().worker.recovery_reply = "Use a Gemini API key";
+    const plan_choice = try ask(deps.ctx, "gemini-4-hydrogen", true);
+    try std.testing.expectEqual(agent_runtime.DailyLimitChoice.use_api_key, plan_choice);
+    try std.testing.expectEqualStrings(
+        "Daily limit reached for gemini-4-hydrogen. What should fx do?",
+        app.agent().worker.recovery_question.items,
+    );
+    try std.testing.expectEqual(@as(usize, 3), app.agent().worker.recovery_options.items.len);
+    try std.testing.expectEqualStrings("Switch to another model", app.agent().worker.recovery_options.items[0]);
+    try std.testing.expectEqualStrings("Use a Gemini API key", app.agent().worker.recovery_options.items[1]);
+    try std.testing.expectEqualStrings("Cancel this turn", app.agent().worker.recovery_options.items[2]);
+
+    // API key route: omits Use a Gemini API key.
+    app.agent().worker.recovery_reply = "Switch to another model";
+    const key_choice = try ask(deps.ctx, "gemini-4-hydrogen", false);
+    try std.testing.expectEqual(agent_runtime.DailyLimitChoice.switch_model, key_choice);
+    try std.testing.expectEqual(@as(usize, 2), app.agent().worker.recovery_options.items.len);
+    try std.testing.expectEqualStrings("Switch to another model", app.agent().worker.recovery_options.items[0]);
+    try std.testing.expectEqualStrings("Cancel this turn", app.agent().worker.recovery_options.items[1]);
 }

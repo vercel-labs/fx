@@ -202,6 +202,7 @@ fn configWarningFix(alloc: Allocator, diagnostic: config_runtime.ConfigDiagnosti
             break :blk alloc.print("to go back to the last good settings, copy {s} to {s}", .{ quoted, file });
         } else alloc.print("fix or remove {s}, then run fx doctor again", .{file}),
         .private_state_permissions_tightened => alloc.print("check {s} if you did not write it yourself", .{file}),
+        .reserved_provider_id => alloc.print("rename or remove the reserved connection in {s}", .{file}),
         else => alloc.print("fix or remove {s}, then run fx doctor again", .{file}),
     };
 }
@@ -306,6 +307,7 @@ fn causeRejectsLayer(cause: @FieldType(config_runtime.ConfigDiagnostic, "cause")
             .legacy_workspace_preferences,
             .manual_backup_available,
             .private_state_permissions_tightened,
+            .reserved_provider_id,
             => return false,
         }
     }
@@ -317,6 +319,7 @@ pub fn loginCommand(provider: model_provider.ProviderId) []const u8 {
         .gateway => "fx login",
         .codex => "fx login codex",
         .grok => "fx login grok",
+        .google => "set GEMINI_API_KEY",
         .configured => profile_paths.displayText("check the connection's auth in ~/.fx/settings.json"),
     };
 }

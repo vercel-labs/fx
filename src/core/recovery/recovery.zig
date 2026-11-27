@@ -93,6 +93,7 @@ pub const Failure = struct {
         /// Auth refresh failed, or there are no credentials.
         sign_in,
         quota,
+        daily_limit,
         content_filter,
         /// The server answered with a stream fx could not read. Waits and
         /// resends as `dropped` does, under its own name.
@@ -148,6 +149,7 @@ pub const Status = struct {
         crash_loop,
         /// The request resumes from a record more than a day old.
         stale,
+        daily_limit,
     };
 };
 
@@ -349,6 +351,7 @@ fn onFailed(state: *State, failure: Failure, now_ms: u64) Plan {
         else
             askSignIn(state, now_ms),
         .quota => askUser(state, .quota, now_ms),
+        .daily_limit => askDailyLimit(state, failure.retry_after_ms, now_ms),
         .content_filter => resendAfterContentFilter(state, now_ms),
     };
 }
@@ -386,7 +389,7 @@ fn onTick(state: *State, now_ms: u64) Plan {
 /// an answer that would not, since that drops what the user did.
 pub fn usesAnswer(state: *const State, event: Event) bool {
     return switch (event) {
-        .user_continue => state.phase == .need_user or (state.phase == .sending and state.polling),
+        .user_continue => (state.phase == .need_user and state.need != .daily_limit) or (state.phase == .sending and state.polling),
         .sign_in_closed => state.phase == .need_user and state.need == .sign_in,
         else => true,
     };
@@ -404,7 +407,7 @@ fn onUserContinue(state: *State, now_ms: u64) Plan {
         state.continue_pending = true;
         return .{};
     }
-    if (state.phase != .need_user) return .{};
+    if (state.phase != .need_user or state.need == .daily_limit) return .{};
     // The user's answer starts the content filter's count over, so the
     // blocks after it get `content_filter_resends` resends again
     // (`tests/tla/recovery/Recovery.tla` AnswerGivesResends).
@@ -413,6 +416,7 @@ fn onUserContinue(state: *State, now_ms: u64) Plan {
         .crash_loop, .stale => .resuming,
         .sign_in => .after_sign_in,
         .quota, .content_filter, .rejected, .too_long => .after_user,
+        .daily_limit => unreachable,
     } else .after_user;
     if (state.need == .crash_loop) state.abrupt_deaths = 0;
     state.need = null;
@@ -466,7 +470,7 @@ fn waitAfter(state: *State, failure: Failure, now_ms: u64) Plan {
     const delay_ms = switch (failure.kind) {
         .offline => offlineDelay(state),
         .dropped, .unreadable, .server, .rate_limited, .refused => transientDelay(state, failure),
-        .too_long, .rejected, .sign_in, .quota, .content_filter => unreachable, // routed by onFailed
+        .too_long, .rejected, .sign_in, .quota, .daily_limit, .content_filter => unreachable, // routed by onFailed
     };
     state.wait_until_ms = now_ms +| delay_ms;
     return .{
@@ -502,6 +506,16 @@ fn compactAndSend(state: *State, now_ms: u64) Plan {
     state.cause = .too_long;
     state.retry_label = .compacting;
     return sendNow(state, now_ms, .{ .compact_first = true });
+}
+
+fn askDailyLimit(state: *State, reset_after_ms: ?u32, now_ms: u64) Plan {
+    state.phase = .need_user;
+    state.need = .daily_limit;
+    state.flowing = false;
+    return .{
+        .save = encode(state, now_ms),
+        .status = show(state, dailyLimitStatus(reset_after_ms)),
+    };
 }
 
 fn askUser(state: *State, need: Status.Need, now_ms: u64) Plan {
@@ -595,7 +609,7 @@ fn escalate(state: *State, kind: Failure.Kind) void {
         .server => if (state.fast) {
             state.flags.no_fast = true;
         },
-        .offline, .dropped, .unreadable, .rate_limited, .too_long, .rejected, .sign_in, .quota, .content_filter, .refused => {},
+        .offline, .dropped, .unreadable, .rate_limited, .too_long, .rejected, .sign_in, .quota, .daily_limit, .content_filter, .refused => {},
     }
 }
 
@@ -633,7 +647,7 @@ fn reasonText(state: *const State) []const u8 {
         .refused => "Gateway refused the login",
         .rate_limited => "Rate limited",
         .too_long => "Conversation too long",
-        .rejected, .sign_in, .quota, .content_filter => "Retrying",
+        .rejected, .sign_in, .quota, .daily_limit, .content_filter => "Retrying",
     };
 }
 
@@ -684,11 +698,32 @@ fn signInStatus(state: *const State, now_ms: u64) Status {
     };
 }
 
+fn dailyLimitStatus(reset_after_ms: ?u32) Status {
+    const ms = reset_after_ms orelse return needStatus(.daily_limit);
+    if (ms == 0) return needStatus(.daily_limit);
+    const secs: u64 = @max(1, (@as(u64, ms) +| 999) / 1000);
+    const text = if (secs < 60)
+        constText("Daily limit reached · resets in under a minute")
+    else blk: {
+        const hours = secs / 3_600;
+        const minutes = (secs % 3_600) / 60;
+        break :blk if (hours > 0 and minutes > 0)
+            textOf("Daily limit reached · resets in {d} h {d} min", .{ hours, minutes })
+        else if (hours > 0)
+            textOf("Daily limit reached · resets in {d} h", .{hours})
+        else
+            textOf("Daily limit reached · resets in {d} min", .{minutes});
+    };
+    const short: Text = if (text.len > 46) constText("Daily limit reached") else .{};
+    return .{ .kind = .need_user, .need = .daily_limit, .text = text, .short = short };
+}
+
 fn needStatus(need: Status.Need) Status {
     return switch (need) {
         // askUser routes a sign-in to signInStatus, which counts the wait.
         .sign_in => needOf(need, "Sign-in expired", ""),
         .quota => needOf(need, "Out of credits", ""),
+        .daily_limit => needOf(need, "Daily limit reached", ""),
         .content_filter => needOf(
             need,
             "Blocked by the content filter · press Esc and rephrase",
@@ -1126,6 +1161,26 @@ test "out of credits waits for the user and continues after Enter" {
     try testing.expectEqualStrings("Retrying · attempt 2", resumed.status.?.text.slice());
 }
 
+test "daily limit formats reset time and refuses retry" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    const ask = step(&state, .{ .failed = .{ .kind = .daily_limit, .retry_after_ms = 19_104 * 1000 } }, 1_000);
+    try testing.expect(ask.send == null);
+    try testing.expectEqual(Status.Kind.need_user, ask.status.?.kind);
+    try testing.expectEqual(Status.Need.daily_limit, ask.status.?.need.?);
+    try testing.expectEqualStrings("Daily limit reached · resets in 5 h 18 min", ask.status.?.text.slice());
+    try testing.expect(!usesAnswer(&state, .user_continue));
+    try testing.expectEqual(Plan{}, step(&state, .user_continue, 2_000));
+    try testing.expectEqual(Plan{}, step(&state, .tick, 60_000));
+    const cancelled = step(&state, .user_cancel, 3_000);
+    try testing.expectEqual(Finish.cancelled, cancelled.finish.?);
+
+    var no_reset: State = .{};
+    _ = startNew(&no_reset, 0, false);
+    const ask_plain = fail(&no_reset, .daily_limit, 1_000);
+    try testing.expectEqualStrings("Daily limit reached", ask_plain.status.?.text.slice());
+}
+
 test "sign-in waits, then names the retry" {
     var state: State = .{};
     _ = startNew(&state, 0, false);
@@ -1270,7 +1325,7 @@ test "the sign-in fx opened closing resends once and keeps the sign-in status" {
     try testing.expectEqual(Status.Need.sign_in, closed.status.?.need.?);
     // Only a wait for a sign-in resends.
     try testing.expect(step(&state, .sign_in_closed, 601_500).send == null);
-    for ([_]Failure.Kind{ .quota, .rejected, .content_filter }) |kind| {
+    for ([_]Failure.Kind{ .quota, .daily_limit, .rejected, .content_filter }) |kind| {
         var asked: State = .{};
         _ = startNew(&asked, 0, false);
         // A block asks only after its resends.
@@ -1774,7 +1829,7 @@ const SimHost = struct {
                         try testing.expectEqual(Status.Need.content_filter, plan.status.?.need.?);
                     }
                 },
-                .too_long, .rejected, .sign_in, .quota => {},
+                .too_long, .rejected, .sign_in, .quota, .daily_limit => {},
             }
         }
         if (plan.send != null and event == .tick) {
@@ -1838,6 +1893,10 @@ const SimHost = struct {
     }
 
     fn userContinue(host: *SimHost) !void {
+        if (host.status == .need_user and host.need == .daily_limit) {
+            try host.deliver(.user_cancel);
+            return;
+        }
         if (host.status == .need_user and host.need == .crash_loop) host.inflight_deaths = 0;
         try host.deliver(.user_continue);
     }
@@ -1867,9 +1926,9 @@ const SimHost = struct {
 
 fn randomFailure(random: std.Random) Failure {
     const kinds = [_]Failure.Kind{
-        .dropped,      .dropped,  .server,   .server,  .offline, .offline,        .unreadable,
-        .rate_limited, .too_long, .rejected, .sign_in, .quota,   .content_filter, .refused,
-        .sign_in,
+        .dropped,      .dropped,  .server,   .server,  .offline, .offline,     .unreadable,
+        .rate_limited, .too_long, .rejected, .sign_in, .quota,   .daily_limit, .content_filter,
+        .refused,      .sign_in,
     };
     const kind = kinds[random.uintLessThan(usize, kinds.len)];
     const hint: ?u32 = if (kind == .rate_limited and random.boolean())

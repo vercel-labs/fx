@@ -27,10 +27,26 @@ const login_providers = [_]command_specs.SubcommandDoc{
     .{ .usage = "vercel", .description = "Vercel AI Gateway (the default)", .options = &login_options },
     .{ .usage = "codex", .description = "ChatGPT subscription" },
     .{ .usage = "grok", .description = "Grok subscription" },
+    .{ .usage = "google", .description = "Sign in with Google (AI Pro or Ultra), or paste a Gemini API key with --api-key", .options = &google_login_options },
 };
 
 pub const login_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--api-key", .description = "Paste a Vercel AI Gateway API key instead of signing in through the browser" },
+    .{ .flag = "--api-key", .description = "Paste an AI Gateway or Gemini API key instead of signing in through the browser" },
+};
+
+const google_login_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--api-key", .description = "Paste a Gemini API key" },
+};
+
+pub const google_logout_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--disconnect", .description = "Also disconnect your Google Account from fx" },
+};
+
+const logout_providers = [_]command_specs.SubcommandDoc{
+    .{ .usage = "vercel", .description = "Vercel AI Gateway (the default)" },
+    .{ .usage = "codex", .description = "ChatGPT subscription" },
+    .{ .usage = "grok", .description = "Grok subscription" },
+    .{ .usage = "google", .description = "Google AI Pro or Ultra plan, or Gemini API key", .options = &google_logout_options },
 };
 
 pub const sessions_options = [_]command_specs.OptionDoc{
@@ -196,7 +212,7 @@ pub const mcp_approve_options = [_]command_specs.OptionDoc{
 
 const permission_modes = [_][]const u8{ "ask", "auto", "full-access" };
 /// The built-in providers. A configured connection's name is also accepted.
-const builtin_providers = [_][]const u8{ "gateway", "codex", "grok" };
+const builtin_providers = [_][]const u8{ "gateway", "codex", "grok", "google" };
 
 /// Whether a command takes the gateway provider-order flags.
 const ProviderOrder = enum { with_provider_order, without_provider_order };
@@ -213,7 +229,7 @@ fn agentRunOptions(comptime scope: []const u8, comptime provider_order: Provider
         .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
         .{ .flag = "--full-access", .description = "Disable fx permission checks" },
         .{ .flag = "--yolo", .description = "Alias for --full-access" },
-        .{ .flag = "--provider <name>", .description = "Override the model provider for " ++ scope ++ " (gateway, codex, grok, or a configured name)", .values = &builtin_providers },
+        .{ .flag = "--provider <name>", .description = "Override the model provider for " ++ scope ++ " (gateway, codex, grok, google, or a configured name)", .values = &builtin_providers },
         .{ .flag = "--model <id>", .description = "Override the model for " ++ scope },
         .{ .flag = "--effort <level>", .description = "Override the reasoning effort for " ++ scope },
         .{ .flag = "--fast", .description = "Enable Fast mode for " ++ scope ++ " when the model supports it" },
@@ -297,7 +313,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .login,
         .token = "login",
-        .usage = "login [vercel|codex|grok] [--api-key]",
+        .usage = "login [vercel|codex|grok|google] [--api-key]",
         .summary = "Sign in to Vercel or a selected provider",
         .subcommands = &login_providers,
         .options = &login_options,
@@ -305,9 +321,14 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .logout,
         .token = "logout",
-        .usage = "logout [vercel|codex|grok]",
+        .usage = "logout [vercel|codex|grok|google] [--disconnect]",
         .summary = "Sign out of Vercel or a selected provider session",
-        .subcommands = &login_providers,
+        .subcommands = &logout_providers,
+        .options = &google_logout_options,
+        .details = &.{
+            "With google, fx logout google signs out on this device only; pass --disconnect to also disconnect your Google Account from fx.",
+            "Disconnecting a Google Account and deleting local fx data are separate.",
+        },
     },
     .{
         .kind = .status,
@@ -505,8 +526,8 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login [vercel|codex|grok] [--api-key]", .summary = "Sign in to a model provider" },
-        .{ .kind = .logout, .usage = "logout [vercel|codex|grok]", .summary = "Sign out of a model provider" },
+        .{ .kind = .login, .usage = "login [provider] [--api-key]", .summary = "Sign in to a model provider" },
+        .{ .kind = .logout, .usage = "logout [provider] [--disconnect]", .summary = "Sign out of a model provider" },
         .{ .kind = .provider, .usage = "provider <name>", .summary = "Choose the active model provider" },
         .{ .kind = .models, .usage = "models" },
     } },
@@ -604,7 +625,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "--provider <name>",
-        .description = "Override the model provider for an interactive session (gateway, codex, grok, or a configured name)",
+        .description = "Override the model provider for an interactive session (gateway, codex, grok, google, or a configured name)",
     },
     .{
         .usage = "--provider-order <a,b,...>",
@@ -730,7 +751,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .requires_args = true, .accepts_payload = true },
     .{ .kind = .fork_session, .command = "/fork", .help_entry = "/fork", .completion_description = "fork the session before a prompt", .presentation_category = .session },
     .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
-    .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [vercel|codex|grok]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
+    .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [vercel|codex|grok|google] [--disconnect]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
     .{ .kind = .provider, .command = "/provider", .help_entry = "/provider", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show terminal rendering counters", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{}, .help_entry = "/usage", .completion_description = "show your provider's usage and spend", .presentation_category = .account },

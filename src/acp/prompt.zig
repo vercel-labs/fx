@@ -1162,7 +1162,18 @@ pub fn handlePrompt(
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
     };
-    if (!try server.selectCredentialForProvider(state, session.provider)) {
+    const selected = server.selectCredentialForProvider(state, session.provider) catch |err| switch (err) {
+        error.GoogleSignInRequired => return .{ .rpc_error = .{
+            .code = ErrorCode.invalid_request,
+            .message = credentials.google_sign_in_required_message,
+        } },
+        error.GoogleSessionDamaged => return .{ .rpc_error = .{
+            .code = ErrorCode.invalid_request,
+            .message = credentials.google_session_damaged_message,
+        } },
+        else => return err,
+    };
+    if (!selected) {
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
             .message = if (session.provider == .codex)

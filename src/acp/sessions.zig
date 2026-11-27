@@ -887,6 +887,18 @@ fn handleRestoreSession(
     else
         durable.preferences.model;
     var staged_credential = server.prepareCredentialForProvider(state, effective_provider) catch |err| {
+        if (err == error.GoogleSignInRequired) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = credentials.google_sign_in_required_message,
+            });
+        }
+        if (err == error.GoogleSessionDamaged) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = credentials.google_session_damaged_message,
+            });
+        }
         if (err != error.ProviderCredentialUnavailable) return err;
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,

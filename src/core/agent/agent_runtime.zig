@@ -28,6 +28,7 @@ pub const RefreshedGatewayCredential = runtime_deps.RefreshedGatewayCredential;
 pub const TurnProgress = runtime_deps.TurnProgress;
 pub const TextEmission = runtime_deps.TextEmission;
 pub const OutOfCreditsChoice = runtime_deps.OutOfCreditsChoice;
+pub const DailyLimitChoice = runtime_deps.DailyLimitChoice;
 pub const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 pub const SemanticPresentationSink = runtime_assistant_stream.SemanticPresentationSink;
 pub const LifecycleContext = runtime_lifecycle.LifecycleContext;

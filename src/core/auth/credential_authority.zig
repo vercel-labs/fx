@@ -25,11 +25,13 @@ pub fn derive(
         .ai_gateway_api_key,
         .fx_login,
         .stored_key,
+        .gemini_api_key,
         .host_managed,
         .configured,
         => hash.update("\x00slot\x00"),
         .chatgpt_subscription,
         .grok_subscription,
+        .google_subscription,
         => {
             const account = account_id orelse return null;
             if (account.len == 0) return null;
@@ -50,6 +52,11 @@ test "credential authority uses account identity for provider subscriptions" {
     try std.testing.expect(!first.eql(other));
     try std.testing.expect(derive(.chatgpt_subscription, null) == null);
     try std.testing.expect(derive(.grok_subscription, "") == null);
+    const google_sub_1 = derive(.google_subscription, "1076915035").?;
+    const google_sub_2 = derive(.google_subscription, "1076915036").?;
+    try std.testing.expect(!google_sub_1.eql(google_sub_2));
+    try std.testing.expect(derive(.google_subscription, null) == null);
+    try std.testing.expect(derive(.google_subscription, "") == null);
     try std.testing.expect(@sizeOf(Identity) == 32);
     _ = types.CredentialSource;
 }
@@ -58,8 +65,13 @@ test "credential authority uses non-secret Gateway credential slots" {
     const api_key = derive(.ai_gateway_api_key, null).?;
     const same_slot = derive(.ai_gateway_api_key, "ignored-account").?;
     const stored_key = derive(.stored_key, null).?;
+    const gemini_key = derive(.gemini_api_key, null).?;
+    const gemini_same_slot = derive(.gemini_api_key, "ignored-account").?;
     try std.testing.expect(api_key.eql(same_slot));
     try std.testing.expect(!api_key.eql(stored_key));
+    try std.testing.expect(gemini_key.eql(gemini_same_slot));
+    try std.testing.expect(!gemini_key.eql(api_key));
+    try std.testing.expect(!gemini_key.eql(stored_key));
     try std.testing.expect(derive(.vercel_oidc_token, null) != null);
     try std.testing.expect(derive(.fx_login, null) != null);
     try std.testing.expect(derive(.host_managed, null) != null);

@@ -4846,6 +4846,51 @@ test "processQueuedPrompt keeps an effort drop quiet when the Gateway catalog fa
     try std.testing.expectEqual(@as(usize, 0), hooks.session_notices.items.len);
 }
 
+test "processQueuedPrompt emits the effort notice for Google and keeps Codex and Grok quiet" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+    var fixture = PromptFixture{};
+
+    {
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var config = fixture.config();
+        config.effort = types.ReasoningEffort.literal("minimal");
+        config.provider_capabilities = .{ .sends_output_limit = false, .declares_effort_levels = true };
+        var job = fixture.job();
+        job.provider = .google;
+        job.model = @constCast("gemini-4-hydrogen");
+
+        try runFakePrompt(&gateway, &hooks, config, job);
+
+        try expectBodyNotContains(&gateway, 0, "\"reasoning\"");
+        try std.testing.expectEqual(@as(usize, 1), hooks.session_notices.items.len);
+        try std.testing.expectEqualStrings(
+            "Effort minimal is not available for gemini-4-hydrogen, so it is not sent.",
+            hooks.session_notices.items[0],
+        );
+    }
+
+    for ([_]model_provider.ProviderId{ .codex, .grok }) |provider| {
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var config = fixture.config();
+        config.effort = types.ReasoningEffort.literal("minimal");
+        config.provider_capabilities = .{};
+        var job = fixture.job();
+        job.provider = provider;
+        job.model = @constCast("test-model");
+
+        try runFakePrompt(&gateway, &hooks, config, job);
+
+        try std.testing.expectEqual(@as(usize, 0), hooks.session_notices.items.len);
+    }
+}
+
 test "processQueuedPrompt notifies once when fast mode drops on a failed catalog" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "Done" }};
@@ -9993,6 +10038,76 @@ test "processQueuedPrompt hands the prompt back and opens the model picker when 
     try expectWaitingReason(&hooks, "quota used up");
 }
 
+test "processQueuedPrompt handles Google daily limit on plan and api-key routes without retry" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{
+            .status = .too_many_requests,
+            .daily_limit = true,
+            .err_body = "Daily limit reached for gemini-4-hydrogen; resets in 5 h 18 min. Switch models or try again after reset.",
+            .retry_after_seconds = 19_104,
+        },
+        .{ .content = "MUST_NOT_RUN" },
+    };
+
+    // Plan route offers Use a Gemini API key, restores prompt, and opens /provider google api-key.
+    {
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        const choices = [_]runtime_deps.DailyLimitChoice{.use_api_key};
+        hooks.daily_limit_choices = &choices;
+        hooks.record_restored_prompt = true;
+        var fixture = PromptFixture{};
+        var continue_flag: std.atomic.Value(bool) = .init(false);
+        var config = fixture.config();
+        config.recovery_continue_flag = &continue_flag;
+        var job = fixture.job();
+        job.provider = .google;
+        job.credential_source = .google_subscription;
+        job.model = @constCast("gemini-4-hydrogen");
+
+        try runFakePrompt(&gateway, &hooks, config, job);
+
+        try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+        try std.testing.expectEqual(@as(usize, 1), hooks.daily_limit_count);
+        try std.testing.expectEqual(@as(?bool, true), hooks.daily_limit_last_offer_api_key);
+        try std.testing.expectEqualStrings("Daily limit reached · resets in 5 h 18 min", needUserText(&hooks).?);
+        var restored_buf: [256]u8 = undefined;
+        const restored = try std.mem.print(&restored_buf, "restore_failed_prompt:{s}", .{std.mem.trim(u8, job.prompt, " \t\r\n")});
+        const restore_index = logIndex(&hooks, restored).?;
+        const picker_index = logIndex(&hooks, "event:open_google_api_key_picker").?;
+        try std.testing.expect(restore_index < picker_index);
+    }
+
+    // API key route does not offer Use a Gemini API key.
+    {
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        const choices = [_]runtime_deps.DailyLimitChoice{.switch_model};
+        hooks.daily_limit_choices = &choices;
+        hooks.record_restored_prompt = true;
+        var fixture = PromptFixture{};
+        var continue_flag: std.atomic.Value(bool) = .init(false);
+        var config = fixture.config();
+        config.recovery_continue_flag = &continue_flag;
+        var job = fixture.job();
+        job.provider = .google;
+        job.credential_source = .gemini_api_key;
+        job.model = @constCast("gemini-4-hydrogen");
+
+        try runFakePrompt(&gateway, &hooks, config, job);
+
+        try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+        try std.testing.expectEqual(@as(usize, 1), hooks.daily_limit_count);
+        try std.testing.expectEqual(@as(?bool, false), hooks.daily_limit_last_offer_api_key);
+        try std.testing.expect(logIndex(&hooks, "event:open_model_picker") != null);
+    }
+}
+
 test "processQueuedPrompt waits for the user when a request is still too long after compacting" {
     const alloc = std.testing.allocator;
     const model = "provider/still-too-long";
@@ -11621,6 +11736,103 @@ test "400 and 422 still end after one request" {
 
         try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
         try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+        try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    }
+}
+
+test "google_subscription 401 refreshes once with account id and replays; a second 401 is terminal" {
+    const alloc = std.testing.allocator;
+
+    // 1. First 401 refreshes once with expected_account_id and replays to completion.
+    {
+        const completions = [_]FakeCompletion{
+            .{ .status = .unauthorized, .err_body = "{\"error\":{\"message\":\"Invalid token\"}}" },
+            .{ .content = "replayed google answer" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.credential_refresh_tokens = &.{ "ya29.initial", "ya29.initial", "ya29.refreshed" };
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.provider = .google;
+        job.model = @constCast("gemini-4-hydrogen");
+        job.api_key = @constCast("ya29.initial");
+        job.credential_source = .google_subscription;
+        job.account_id = @constCast("sub-google-1");
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+        try std.testing.expectEqualStrings("ya29.initial", gateway.request_api_keys.items[0]);
+        try std.testing.expectEqualStrings("ya29.refreshed", gateway.request_api_keys.items[1]);
+        try std.testing.expectEqualSlices(
+            runtime_deps.CredentialRefreshMode,
+            &.{ .if_needed, .reload, .force },
+            hooks.credential_refresh_modes.items,
+        );
+        try std.testing.expectEqualStrings("sub-google-1", hooks.last_credential_refresh_expected_account.?);
+        try std.testing.expectEqualStrings("replayed google answer", hooks.finish_assistant_text.?);
+        try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    }
+
+    // 2. Second 401 after replay is terminal with no second forced refresh.
+    {
+        const completions = [_]FakeCompletion{
+            .{ .status = .unauthorized, .err_body = "{\"error\":{\"message\":\"Invalid token\"}}" },
+            .{ .status = .unauthorized, .err_body = "{\"error\":{\"message\":\"Still invalid\"}}" },
+            .{ .content = "MUST_NOT_RUN" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.credential_refresh_tokens = &.{ "ya29.initial", "ya29.initial", "ya29.refreshed", "ya29.must-not-use" };
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.provider = .google;
+        job.model = @constCast("gemini-4-hydrogen");
+        job.api_key = @constCast("ya29.initial");
+        job.credential_source = .google_subscription;
+        job.account_id = @constCast("sub-google-1");
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(
+            runtime_deps.CredentialRefreshMode,
+            hooks.credential_refresh_modes.items,
+            &.{.force},
+        ));
+        try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
+        try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    }
+
+    // 3. GoogleSignInRequired during 401 refresh stops without replay and surfaces sign-in failure.
+    {
+        const completions = [_]FakeCompletion{
+            .{ .status = .unauthorized, .err_body = "{\"error\":{\"message\":\"Invalid token\"}}" },
+            .{ .content = "MUST_NOT_RUN" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.credential_refresh_error = error.GoogleSignInRequired;
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.provider = .google;
+        job.model = @constCast("gemini-4-hydrogen");
+        job.api_key = @constCast("ya29.initial");
+        job.credential_source = .google_subscription;
+        job.account_id = @constCast("sub-google-1");
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+        try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
+        try std.testing.expectEqualStrings("Sign in with Google again: run fx login google.", hooks.http_detail.?);
         try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     }
 }

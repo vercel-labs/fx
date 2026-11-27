@@ -172,6 +172,7 @@ fn postCommitResolutionError(
             .legacy_workspace_preferences,
             .manual_backup_available,
             .private_state_permissions_tightened,
+            .reserved_provider_id,
             => {},
         }
     }

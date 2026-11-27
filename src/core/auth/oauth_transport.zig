@@ -19,6 +19,8 @@ pub const Request = struct {
     payload: ?[]const u8 = null,
     /// Optional preformatted Authorization value, borrowed for this request.
     authorization: ?[]const u8 = null,
+    /// Optional DPoP proof header value, borrowed for this request.
+    dpop: ?[]const u8 = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     deadline: ?std.Io.Clock.Timestamp = null,
     /// Overrides the transport's response size limit for a request whose
@@ -45,9 +47,15 @@ pub const Response = struct {
     /// The HTTP status, or 0 when the transport doesn't say. A caller that
     /// takes any 2xx, as an RFC 7009 revocation does, reads it.
     status: u16 = 0,
+    /// Optional `DPoP-Nonce` response header, owned by `Response`.
+    dpop_nonce: ?[]u8 = null,
+    /// Optional `Date` response header, owned by `Response`.
+    date_header: ?[]u8 = null,
 
     pub fn deinit(self: *Response, alloc: Allocator) void {
         secret.zeroAndFree(alloc, self.body);
+        if (self.dpop_nonce) |nonce| secret.zeroAndFree(alloc, nonce);
+        if (self.date_header) |date| alloc.free(date);
         self.* = .{
             .disposition = .rejected,
             .body = &.{},
@@ -149,11 +157,15 @@ test "response transfers owned bytes exactly once" {
     var response = Response{
         .disposition = .accepted,
         .body = try std.testing.allocator.dupe(u8, "secret"),
+        .dpop_nonce = try std.testing.allocator.dupe(u8, "nonce-secret"),
+        .date_header = try std.testing.allocator.dupe(u8, "Thu, 01 Jan 1970 00:00:00 GMT"),
     };
     const body = response.takeBody();
     defer secret.zeroAndFree(std.testing.allocator, body);
 
     response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), response.body.len);
+    try std.testing.expect(response.dpop_nonce == null);
+    try std.testing.expect(response.date_header == null);
     try std.testing.expectEqualStrings("secret", body);
 }

@@ -406,14 +406,14 @@ fn turnInFlight(agent: *agents.Agent) bool {
 fn parentMayResend(need: @FieldType(types.RouteRecoveryStatus, "need")) bool {
     return switch (need orelse return false) {
         .rejected, .stale => true,
-        .sign_in, .quota, .content_filter, .too_long, .crash_loop => false,
+        .sign_in, .quota, .daily_limit, .content_filter, .too_long, .crash_loop => false,
     };
 }
 
 test "a subagent's parent may send again only a refused or a day-old request" {
     try std.testing.expect(parentMayResend(.rejected));
     try std.testing.expect(parentMayResend(.stale));
-    for ([_]@FieldType(types.RouteRecoveryStatus, "need"){ null, .sign_in, .quota, .content_filter, .too_long, .crash_loop }) |need| {
+    for ([_]@FieldType(types.RouteRecoveryStatus, "need"){ null, .sign_in, .quota, .daily_limit, .content_filter, .too_long, .crash_loop }) |need| {
         try std.testing.expect(!parentMayResend(need));
     }
 }

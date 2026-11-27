@@ -40,6 +40,7 @@ pub const Config = struct {
         .gateway_prompt_caching = true,
         .fx_search = true,
         .vision_fallback = true,
+        .declares_effort_levels = true,
     },
     custom_tool_guidance: []const u8 = "",
     agent_step_limit: usize,
