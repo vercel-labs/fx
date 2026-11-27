@@ -1,0 +1,59 @@
+%% Chart of tests/tla/tool_bridge/AgentWait.tla, the design that agent-design.cfg checks (it passes).
+%% Labels use bash call, the words the person sees, and never write a model variable as a variable.
+stateDiagram-v2
+    state "No program is running" as NoProgram
+    state "The program runs inside its first bash call" as FirstRun
+    state "The program is waiting for a subagent, and the bash call is held" as Waiting
+    state "A report waits for your turn while fx is inside the bash call" as ReportHeld
+    state "The bash call returned still running" as Yielded
+    state "fx waits again for the program (wait_more); the bridge is gone, so a wait is refused at once" as LaterRun
+    state "The program has ended; the bash call returns once its bridge calls end" as GoneHeld
+    state "The program ended while its wait was still open" as GoneWaiting
+
+    [*] --> NoProgram
+    NoProgram --> FirstRun : the model starts a program
+    FirstRun --> Waiting : the program sends fx tool agent wait while a subagent works
+    FirstRun --> ReportHeld : a subagent posts a report
+    FirstRun --> Yielded : the bash call yields after its yield time
+    FirstRun --> GoneHeld : the program exits or is killed
+    Waiting --> ReportHeld : a subagent posts a report; the wait ends and leaves the report for your turn
+    Waiting --> GoneWaiting : the program exits or is killed
+    GoneWaiting --> GoneHeld : fx cancels the wait of the exited program
+    ReportHeld --> Yielded : the bash call yields after its yield time
+    ReportHeld --> GoneHeld : the program exits or is killed
+    Yielded --> LaterRun : the model asks for more time on the bash call
+    Yielded --> Yielded : a report joins your turn
+    Yielded --> Yielded : the program sends fx tool agent wait, and it is refused at once
+    LaterRun --> Yielded : the bash call yields again
+    LaterRun --> GoneHeld : the program exits or is killed
+    GoneHeld --> NoProgram : the bash call returns
+
+    note right of Waiting
+        Rule NoYieldWhileHeld breaks here, and only in agent-mutant-yield-while-held, a planted bug.
+        The bash call yields while the wait holds it.
+        Shortest path, the same as the TLC trace: the program starts, sends the wait, then the bash call yields.
+        Actions: Run, StartWait, Yield.
+    end note
+
+    note right of GoneWaiting
+        Rule NoMailLost breaks on the step "the wait ends" out of this state, and only in agent-mutant-takes-mail, the rejected design.
+        The wait takes the report, the program is gone, and the report is dropped.
+        TLC trace actions: Run, StartWait, Gone, Post, Wake.
+        Rule WaitEndsWhenGone breaks here, and only in agent-current-cancel, today's code.
+        The cancel is ignored, so the wait never ends. It is the only failing config that checks this rule.
+        TLC trace actions: Post, Run, Yield, Post, Join, Join, StartWait, Gone, Run, StartWait, Gone, then a stutter.
+        Shorter path to this state: Run, StartWait, Gone.
+        Rule CallReturnsWhenGone breaks here, and only in agent-current-hang, today's code.
+        The bash call never returns, because the wait never ends.
+        TLC trace actions: Run, Yield, Gone, Post, Join, Run, StartWait, Gone, then a stutter.
+        Shorter path to this state: Run, StartWait, Gone.
+    end note
+
+%% Left out of this chart:
+%% - A subagent finishes its work. The chart keeps a subagent that can still post.
+%% - A wait that returns at once, because a report is already ready or no subagent works. Only a wait that holds is drawn.
+%% - The answer a wait gives the program: a report, quiet, canceled, or refused. Only the resulting states are drawn.
+%% - The program exits after its bash call yielded, and a new program starts from there.
+%% - A report that joins your turn after the bash call has returned and no program runs.
+%% - Caps on how many reports, runs, and wait requests there can be.
+%% - Fairness: fx steps happen eventually, while the program, the subagent, and the model may stop at any time.
