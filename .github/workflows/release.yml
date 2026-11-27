@@ -13,8 +13,12 @@ on:
 permissions:
   contents: read
 
+# A push whose commits do not touch src/main.zig cannot change the version,
+# so check-version skips it. Such a run gets its own group, so it can never
+# replace a release run that waits in stable-release. Other pushes and
+# manual runs share stable-release: one release at a time.
 concurrency:
-  group: stable-release
+  group: ${{ github.event_name == 'push' && !contains(toJSON(github.event.commits), '"src/main.zig"') && format('stable-release-skip-{0}', github.run_id) || 'stable-release' }}
   cancel-in-progress: false
 
 jobs:
