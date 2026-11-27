@@ -12,6 +12,7 @@ const io_mod = @import("../shared/io.zig");
 const message = @import("../shared/message.zig");
 const language_script = @import("../shared/language_script.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
+const toolbox = @import("../tooling/toolbox.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const compactor = @import("../compactor/compactor.zig");
@@ -1846,8 +1847,10 @@ pub const SessionRuntime = struct {
     pub fn commitPreparedHistoryEntry(
         self: *SessionRuntime,
         alloc: Allocator,
-        turn: HistoryTurn,
+        prepared: HistoryTurn,
     ) void {
+        var turn = prepared;
+        core_types.dropSavedExecution(alloc, &turn);
         if (isCurrentCompactionCheckpoint(turn)) {
             self.disarmCacheWarming("history_compacted");
             // The conversation goes on after compacting: it keeps its toolbox
@@ -2510,11 +2513,25 @@ fn appendExecutionMemoryMessages(
     }
 }
 
+/// The tool a saved result's call ran: the one a toolbox run carries, else
+/// the call's own name, or the result's name when the step has no call with
+/// its id. Borrows `calls`, `result`, or `arena`.
+fn savedRanToolName(arena: Allocator, calls: []const core_types.ToolCall, result: core_types.PersistedToolResult) Allocator.Error![]const u8 {
+    for (calls) |call| {
+        if (!std.mem.eql(u8, call.id, result.tool_call_id)) continue;
+        const carried = (try toolbox.carriedCall(arena, call.name, call.arguments_json)) orelse return call.name;
+        return carried.name;
+    }
+    return result.tool_name;
+}
+
 pub fn appendExecutionMemoryChatMessages(
     alloc: Allocator,
     messages: *std.ArrayList(core_types.ChatMessage),
     execution: core_types.ExecutionMemory,
 ) !void {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
     var steering_index: usize = 0;
     var note_index: usize = 0;
     for (execution.tool_steps, 0..) |step, step_index| {
@@ -2549,6 +2566,12 @@ pub fn appendExecutionMemoryChatMessages(
                 .tool_result_memory = toolResultMemory(result),
                 // A turn resumed from its checkpoint keeps each result's time.
                 .tool_result_created_at_ms = if (result.created_at_ms > 0) result.created_at_ms else null,
+                .user_answer = try core_types.isUserAnswer(
+                    scratch_state.allocator(),
+                    try savedRanToolName(scratch_state.allocator(), step.tool_calls, result),
+                    result.status,
+                    result.output,
+                ),
             });
         }
         for (step.tool_results) |result| {
@@ -2573,6 +2596,64 @@ pub fn appendExecutionMemoryChatMessages(
             }
         }
         try messages.append(alloc, restoredSteeringChatMessage(steering.text));
+    }
+}
+
+test "a rebuilt turn marks the user's answers by the call that ran, as the live turn did" {
+    const alloc = std.testing.allocator;
+    const answers = "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"}]";
+    // fx's own notes, which the question tool saves as a success.
+    const cancelled = "(user cancelled the question)";
+    const not_available = "(ask_user_question is only available in the interactive shell; ask the user freeform instead)";
+    const invalid = "(ask_user_question: invalid arguments; provide {questions})";
+    const direct_args = "{\"questions\":[]}";
+    const toolbox_args = "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}";
+    const saved = struct {
+        fn result(id: []const u8, name: []const u8, status: core_types.PersistedToolStatus, output: []const u8) core_types.PersistedToolResult {
+            return .{ .tool_call_id = @constCast(id), .tool_name = @constCast(name), .status = status, .output = @constCast(output), .output_bytes = output.len, .stored_output_bytes = output.len };
+        }
+    }.result;
+    var calls = [_]core_types.ToolCall{
+        .{ .id = "direct", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "toolbox", .name = "toolbox", .arguments_json = toolbox_args },
+        .{ .id = "failed", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "search", .name = "toolbox", .arguments_json = "{\"search\":\"ask_user_question\"}" },
+        .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" },
+        .{ .id = "direct-cancelled", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "toolbox-cancelled", .name = "toolbox", .arguments_json = toolbox_args },
+        .{ .id = "direct-not-available", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "toolbox-not-available", .name = "toolbox", .arguments_json = toolbox_args },
+        .{ .id = "direct-invalid", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "toolbox-invalid", .name = "toolbox", .arguments_json = toolbox_args },
+    };
+    var results = [_]core_types.PersistedToolResult{
+        saved("direct", "ask_user_question", .success, answers),
+        saved("toolbox", "toolbox", .success, answers),
+        saved("failed", "ask_user_question", .failure, answers),
+        saved("search", "toolbox", .success, answers),
+        saved("read", "read_file", .success, answers),
+        // A result whose call the step lacks keeps its own name's reading.
+        saved("unpaired", "ask_user_question", .success, answers),
+        // A note is never the user's answer, though the tool saves it as a success.
+        saved("direct-cancelled", "ask_user_question", .success, cancelled),
+        saved("toolbox-cancelled", "toolbox", .success, cancelled),
+        saved("direct-not-available", "ask_user_question", .success, not_available),
+        saved("toolbox-not-available", "toolbox", .success, not_available),
+        saved("direct-invalid", "ask_user_question", .success, invalid),
+        saved("toolbox-invalid", "toolbox", .success, invalid),
+        saved("unpaired-cancelled", "ask_user_question", .success, cancelled),
+    };
+    var steps = [_]core_types.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+
+    try appendExecutionMemoryChatMessages(alloc, &messages, .{ .tool_steps = steps[0..] });
+
+    const user_answers = [_]bool{ true, true, false, false, false, true, false, false, false, false, false, false, false };
+    try std.testing.expectEqual(@as(usize, 1 + user_answers.len), messages.items.len);
+    for (messages.items[1..], results, user_answers) |rebuilt, result, user_answer| {
+        try std.testing.expectEqualStrings(result.tool_name, rebuilt.tool_name.?);
+        try std.testing.expectEqual(user_answer, rebuilt.user_answer);
     }
 }
 
@@ -3970,6 +4051,23 @@ test "SessionRuntime.restore may retain earlier restored turns after later appen
     try std.testing.expectEqual(ConversationLanguage.literal("fr"), runtime.languageSnapshot());
     try std.testing.expectEqual(@as(usize, 1), runtime.historyLen());
     try std.testing.expectEqualStrings("first", runtime.agent.history.items[0].assistant.user.text);
+}
+
+test "SessionRuntime history keeps a cut turn as the model sees it, without the whole turn only the log saves (D87)" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 0 };
+    defer runtime.deinit(alloc);
+    var kept = [_]core_types.ToolExecutionStep{.{ .assistant = @constCast("kept step") }};
+    var whole = [_]core_types.ToolExecutionStep{ .{ .assistant = @constCast("folded step") }, .{ .assistant = @constCast("kept step") } };
+    try runtime.appendHistoryEntry(alloc, .{ .assistant = .{
+        .user = .{ .text = @constCast("two steps") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = &kept },
+        .saved_execution = .{ .tool_steps = &whole },
+    } });
+    const entry = runtime.agent.history.items[0].assistant;
+    try std.testing.expectEqual(@as(usize, 1), entry.execution.tool_steps.len);
+    try std.testing.expect(entry.saved_execution == null);
 }
 
 test "SessionRuntime.reset clears history and restores default language" {

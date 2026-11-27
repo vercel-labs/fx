@@ -5,6 +5,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fxChildEnv } from "../../../../evals/eval-helpers";
 
 // ------------------------------------------------------------ observation --
 
@@ -234,8 +235,7 @@ export class Fixture {
 
   env(): Record<string, string> {
     const env: Record<string, string> = {};
-    for (const [key, value] of Object.entries({
-      ...process.env,
+    for (const [key, value] of Object.entries(fxChildEnv({
       NO_COLOR: "1",
       HOME: this.home,
       AI_GATEWAY_API_KEY: "acp-modes-fake-key",
@@ -248,7 +248,7 @@ export class Fixture {
       FX_TEST_GATEWAY_MODELS_URL: `${this.gateway.baseUrl}/coding-agent/v1/models`,
       FX_TEST_GATEWAY_CHAT_URL: this.gateway.chatUrl,
       ...(this.traceLog ? { FX_TRACE_LOG: this.traceLog, FX_TRACE_SCOPES: "acp,permission,host_config" } : {}),
-    })) {
+    }))) {
       if (value === undefined || STRIPPED_ENV.includes(key)) continue;
       env[key] = value;
     }

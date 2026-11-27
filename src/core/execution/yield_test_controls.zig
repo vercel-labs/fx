@@ -4,14 +4,14 @@
 //! exists, for at most a minute, before it returns its command running. A
 //! test then knows the command's row cannot change until it lets the yield go
 //! (`tests/e2e/tui-gateway-stream-lifecycle.test.ts`, "multiline steering
-//! survives retained history recovery after tool completion"). Only that test
-//! sets the controls, so the libfx artifacts leave them out.
+//! survives retained history recovery after tool completion"). Only tests set
+//! the controls, so the libfx artifacts leave them out.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
+const hold_marker = @import("../shared/hold_marker.zig");
 
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 const max_hold_ms = 60_000;
 
 /// Test builds only: an inline test sets it to hold a run's timed yield, in
@@ -34,23 +34,13 @@ pub fn holdTimedYield() void {
     const release = io_mod.getenvAbsolutePath("FX_TEST_SHELL_YIELD_RELEASE") orelse return;
     // A marker that cannot be written skips the hold; the test that set the
     // controls then fails on the missing marker.
-    writeMarker(held) catch return;
+    hold_marker.write(held, "timed_yield held") catch return;
     // The release file is the only signal a test can send this process, so
     // the hold polls for it, as the other test holds do.
     const deadline = io_mod.milliTimestamp() + max_hold_ms;
     while (!pathExists(release) and io_mod.milliTimestamp() < deadline) {
         io_mod.sleep(std.time.ns_per_ms);
     }
-}
-
-fn writeMarker(path: []const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{
-        .truncate = true,
-        .permissions = private_file_permissions,
-    });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), "timed_yield held");
-    try file.sync(io_mod.getIo());
 }
 
 fn pathExists(path: []const u8) bool {

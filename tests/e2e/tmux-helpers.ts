@@ -11,7 +11,17 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { FX_BIN, REPO_ROOT, providerVersionTestEnv } from "../evals/eval-helpers";
+import {
+  CREDENTIAL_ENV_KEYS,
+  DEFAULT_UNSET_ENV_KEYS,
+  FX_BIN,
+  REPO_ROOT,
+} from "../evals/eval-helpers";
+
+// A pane inherits the tmux server's environment, which a developer's shell
+// may have filled, so a test's tmux launch drops the same names as every
+// other launcher of fx.
+export { DEFAULT_UNSET_ENV_KEYS, fxChildEnv } from "../evals/eval-helpers";
 
 let sessionCounter = 0;
 
@@ -19,53 +29,6 @@ export const FAKE_GATEWAY_MODEL = "openai/gpt-5";
 const TMUX_CAPTURE_MAX_BUFFER = 32 * 1024 * 1024;
 const TMUX_HEX_CHUNK_BYTES = 256;
 const COMPOSER_LINE = /^[ \t]*(?:┃|❯|>)(?:[ \t]|$)/;
-const AUTH_ENV_KEYS = [
-  "AI_GATEWAY_API_KEY",
-  "VERCEL_OIDC_TOKEN",
-] as const;
-export const DEFAULT_UNSET_ENV_KEYS = [
-  ...AUTH_ENV_KEYS,
-  "FX_TEST_GATEWAY_CHAT_URL",
-  "FX_TEST_GATEWAY_MODELS_URL",
-  "FX_TEST_GATEWAY_CREDITS_URL",
-  "FX_TEST_UPGRADE_BASE_URL",
-  "FX_PERMISSION_MODE",
-  "FX_HOME",
-  // A pane inherits the tmux server's environment, which a developer's shell
-  // may have filled: their terminal recording would start on every test's fx,
-  // and the bridge of the fx session that started the server would point
-  // `fx mcp call` at that session.
-  "FX_DEBUG_RECORD",
-  "FX_DEBUG_RECORD_SILENT_BANNER",
-  "FX_RECORD",
-  "FX_RECORD_INPUT",
-  "FX_MCP_CALL_SOCKET",
-  "FX_MCP_CALL_TOKEN",
-  // fx reads its test holds in release builds, so a hold left there would
-  // stop every test's fx at it. A test that sets one passes it in `env`.
-  "FX_TEST_REPORT_DELIVERY_HELD",
-  "FX_TEST_REPORT_DELIVERY_RELEASE",
-  "FX_TEST_SESSION_WRITE_HELD",
-  "FX_TEST_SESSION_WRITE_RELEASE",
-  "FX_TEST_SHELL_YIELD_HELD",
-  "FX_TEST_SHELL_YIELD_RELEASE",
-  "FX_TEST_SUBAGENT_CLOSE_HELD",
-  "FX_TEST_SUBAGENT_CLOSE_RELEASE",
-  "FX_TEST_SUBAGENT_END_HELD",
-  "FX_TEST_SUBAGENT_END_RELEASE",
-  "FX_TEST_SUBAGENT_PUBLISH_HELD",
-  "FX_TEST_SUBAGENT_PUBLISH_RELEASE",
-  "FX_TEST_SUBAGENT_SETTLE_HELD",
-  "FX_TEST_SUBAGENT_SETTLE_RELEASE",
-  "FX_TEST_SUBAGENT_START_HELD",
-  "FX_TEST_SUBAGENT_START_RELEASE",
-  "FX_TEST_WORKSPACE_CAPTURE_START_HELD",
-  "FX_TEST_WORKSPACE_CAPTURE_START_RELEASE",
-  "FX_TEST_GREP_RELEASE",
-  "FX_TEST_ACP_PROMPT_TERMINAL_READY",
-  "FX_TEST_ACP_PROMPT_REAP_READY",
-  "FX_TEST_ACP_PROMPT_RELEASE",
-] as const;
 const MIRRORED_ENV_KEYS = [
   "FX_GATEWAY_BASE_URL",
   "FX_GATEWAY_CHAT_URL",
@@ -85,6 +48,11 @@ export function terminalFixtureShell(): string {
   throw new Error("terminal fixtures require Bash or zsh");
 }
 
+/// The tmux option that starts a server with no config file, so a developer's
+/// tmux.conf cannot change a test's server. It acts only when the call starts
+/// the server: a server that already runs keeps the config it loaded.
+export const TMUX_NO_CONFIG = ["-f", "/dev/null"] as const;
+
 const TMUX_RAW_PASTE_FLAGS = (() => {
   try {
     const version = execFileSync("tmux", ["-V"], { encoding: "utf8" })
@@ -101,6 +69,48 @@ const TMUX_RAW_PASTE_FLAGS = (() => {
 
 export function tmuxRawPasteFlags(): readonly string[] {
   return TMUX_RAW_PASTE_FLAGS;
+}
+
+/// Whether tmux's error says that the server it was asked about does not run:
+/// its socket refuses the connection or is not there. A test's server exits
+/// once its last session ends.
+export function tmuxReportsServerGone(stderr: string): boolean {
+  return /^no server running on |^error connecting to .* \((?:No such file or directory|Connection refused)\)$/m.test(stderr);
+}
+
+const PANE_STATUS_FORMAT = "#{pane_id}:#{pane_dead}:#{pane_dead_status}";
+
+/// What tmux answered for `PANE_STATUS_FORMAT`, or the error it printed.
+export type PaneStatusReply = { output: string } | { error: string };
+
+/// Whether the pane at `target` is dead, and its command's exit status when
+/// known, from tmux's `reply`. A pane whose session or whole server is gone
+/// is dead, with `recordedStatus()`, the status the observer wrote. Any other
+/// tmux error throws: it says nothing about the pane, so it must not read as
+/// an exit.
+export function paneStatusFromTmux(
+  target: string,
+  reply: PaneStatusReply,
+  recordedStatus: () => number | null,
+): { dead: boolean; status: number | null } {
+  if ("error" in reply) {
+    if (!tmuxReportsServerGone(reply.error)) throw new Error(`tmux could not report pane ${target}: ${reply.error}`);
+    return { dead: true, status: recordedStatus() };
+  }
+  const [paneId, dead, status] = reply.output.trim().split(":");
+  // display-message exits 0 for a target it cannot find, with no pane_id.
+  if (!paneId) return { dead: true, status: recordedStatus() };
+  const parsed = status && status.length > 0 ? parseInt(status, 10) : null;
+  const parsedStatus = parsed !== null &&
+      Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= 255
+    ? parsed
+    : null;
+  return {
+    dead: dead === "1",
+    status: dead === "1" && parsedStatus === null
+      ? recordedStatus()
+      : parsedStatus,
+  };
 }
 
 export function paneExitMatches(
@@ -666,7 +676,8 @@ export function startDynamicFakeGateway(
 // logs its argv to argvLogPath and execs the real FX_BIN, so upgrade relaunch
 // tests can drive the handoff without shipping a second binary. The relaunched
 // fx, which the fake upgrade installs, runs with `relaunchEnv`'s variables,
-// such as its own FX_RECORD tape.
+// such as its own FX_RECORD tape. Each dev revision's wrapper names its
+// revision in a comment, and `setRevision` publishes a newer dev build.
 export function startUpgradeServer(
   root: string,
   argvLogPath: string,
@@ -674,18 +685,22 @@ export function startUpgradeServer(
     revision?: string;
     relaunchEnv?: Record<string, string>;
   } = {},
-): { baseUrl: string; stop: () => void } {
-  const artifactDir = join(root, "release-artifact");
-  const wrapperPath = join(artifactDir, "fx");
-  const archivePath = join(root, "fx.tar.gz");
+): { baseUrl: string; setRevision: (revision: string) => void; stop: () => void } {
   const relaunchExports = Object.entries(options.relaunchEnv ?? {})
     .map(([name, value]) => {
       if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) throw new Error(`relaunchEnv name ${name} is not a shell variable name`);
       return `export ${name}=${shellQuote(value)}\n`;
     })
     .join("");
-  mkdirSync(artifactDir);
-  const script = `#!/bin/sh
+  const archives = new Map<string, { archive: Buffer; checksum: string }>();
+  const archiveFor = (revision: string) => {
+    const built = archives.get(revision);
+    if (built) return built;
+    const artifactDir = join(root, `release-artifact-${revision}`);
+    const archivePath = join(root, `fx-${revision}.tar.gz`);
+    mkdirSync(artifactDir);
+    const script = `#!/bin/sh
+# fake fx release ${revision}
 {
   printf '%s' "$0"
   for arg in "$@"; do
@@ -695,37 +710,44 @@ export function startUpgradeServer(
 } >> ${shellQuote(argvLogPath)}
 ${relaunchExports}exec ${shellQuote(FX_BIN)} "$@"
 `;
-  writeFileSync(wrapperPath, script);
-  chmodSync(wrapperPath, 0o755);
-  const tar = Bun.spawnSync(["tar", "-czf", archivePath, "-C", artifactDir, "fx"]);
-  if (tar.exitCode !== 0) throw new Error(tar.stderr.toString());
+    writeFileSync(join(artifactDir, "fx"), script);
+    chmodSync(join(artifactDir, "fx"), 0o755);
+    const tar = Bun.spawnSync(["tar", "-czf", archivePath, "-C", artifactDir, "fx"]);
+    if (tar.exitCode !== 0) throw new Error(tar.stderr.toString());
+    const archive = readFileSync(archivePath);
+    const entry = { archive, checksum: createHash("sha256").update(archive).digest("hex") };
+    archives.set(revision, entry);
+    return entry;
+  };
 
-  const archive = readFileSync(archivePath);
-  const checksum = createHash("sha256").update(archive).digest("hex");
   const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
-  const revision = options.revision ?? "abcdef0123456789abcdef0123456789abcdef01";
+  let revision = options.revision ?? "abcdef0123456789abcdef0123456789abcdef01";
+  const stableRevision = revision;
+  archiveFor(revision);
   const stableArchiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
-  const devArchiveRoute = `/dev/${revision}/fx-${platform}.tar.gz`;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(request) {
       const path = new URL(request.url).pathname;
+      const devArchiveRoute = `/dev/${revision}/fx-${platform}.tar.gz`;
       if (path === "/latest.txt") return new Response("v9.9.9\n");
       if (path === "/dev.json") {
         return Response.json({ version: "9.9.9", commit: revision });
       }
-      if (path === stableArchiveRoute || path === devArchiveRoute) {
-        return new Response(archive);
-      }
-      if (path === `${stableArchiveRoute}.sha256` || path === `${devArchiveRoute}.sha256`) {
-        return new Response(`${checksum}\n`);
-      }
+      if (path === stableArchiveRoute) return new Response(archiveFor(stableRevision).archive);
+      if (path === devArchiveRoute) return new Response(archiveFor(revision).archive);
+      if (path === `${stableArchiveRoute}.sha256`) return new Response(`${archiveFor(stableRevision).checksum}\n`);
+      if (path === `${devArchiveRoute}.sha256`) return new Response(`${archiveFor(revision).checksum}\n`);
       return new Response("not found", { status: 404 });
     },
   });
   return {
     baseUrl: `http://127.0.0.1:${server.port}`,
+    setRevision: (next: string) => {
+      archiveFor(next);
+      revision = next;
+    },
     stop: () => server.stop(true),
   };
 }
@@ -768,7 +790,7 @@ export class TmuxSession {
       isolated = false,
       socketName,
     } = opts ?? {};
-    const env = localCreditsEnv(providerVersionTestEnv(requestedEnv));
+    const env = localCreditsEnv(requestedEnv);
 
     if (
       minimumHistoryLines !== undefined &&
@@ -788,7 +810,7 @@ export class TmuxSession {
     const exitStatusPath = join(tmpdir(), `${name}.exit-status`);
     rmSync(exitStatusPath, { force: true });
 
-    const authEnvKeys = new Set<string>(AUTH_ENV_KEYS);
+    const authEnvKeys = new Set<string>(CREDENTIAL_ENV_KEYS);
     const unsetArgs = Object.entries(env).flatMap(([key, value]) =>
       value === undefined ? ["-u", shellQuote(key)] : []
     );
@@ -849,7 +871,7 @@ export class TmuxSession {
     const tmuxCommand = gatedLaunch
       ? `tmux wait-for ${shellQuote(startGate)} && exec ${observedCmd}`
       : observedCmd;
-    const tmuxPrefix = resolvedSocketName ? ["-L", resolvedSocketName] : [];
+    const tmuxPrefix = [...(resolvedSocketName ? ["-L", resolvedSocketName] : []), ...TMUX_NO_CONFIG];
     const setupSessionName = `${name}-setup`;
     const killSetupSession = () => {
       try {
@@ -978,7 +1000,7 @@ export class TmuxSession {
     }
     const session = new TmuxSession(name, exitStatusPath, resolvedSocketName);
     try {
-      for (const key of AUTH_ENV_KEYS) {
+      for (const key of CREDENTIAL_ENV_KEYS) {
         try {
           execFileSync(
             "tmux",
@@ -1374,26 +1396,21 @@ export class TmuxSession {
   }
 
   paneStatus(): { dead: boolean; status: number | null } {
+    const target = `${this.name}:0.0`;
+    let reply: PaneStatusReply;
     try {
-      const raw = execSync(
-        `${this.tmuxCommand()} display-message -t ${this.name}:0.0 -p "#{pane_dead}:#{pane_dead_status}"`,
-        { stdio: "pipe", encoding: "utf-8" },
-      ).trim();
-      const [dead, status] = raw.split(":");
-      const parsed = status && status.length > 0 ? parseInt(status, 10) : null;
-      const parsedStatus = parsed !== null &&
-          Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= 255
-        ? parsed
-        : null;
-      return {
-        dead: dead === "1",
-        status: dead === "1" && parsedStatus === null
-          ? this.recordedExitStatus()
-          : parsedStatus,
+      reply = {
+        output: execFileSync(
+          "tmux",
+          this.tmuxArgs(["display-message", "-t", target, "-p", PANE_STATUS_FORMAT]),
+          { stdio: "pipe", encoding: "utf-8" },
+        ),
       };
-    } catch {
-      return { dead: true, status: this.recordedExitStatus() };
+    } catch (err) {
+      const stderr = String((err as { stderr?: unknown }).stderr ?? "").trim();
+      reply = { error: stderr || String(err) };
     }
+    return paneStatusFromTmux(target, reply, () => this.recordedExitStatus());
   }
 
   /// The pane's `remain-on-exit-format`, the text tmux expands into its
