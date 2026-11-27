@@ -3916,7 +3916,11 @@ const App = struct {
 
     fn handleThemeMonitorByte(self: *App, byte: u8) !void {
         const now_ms = io_mod.milliTimestamp();
-        switch (self.terminal_input_runtime.terminal_theme_monitor.feed(byte, now_ms)) {
+        const monitor = &self.terminal_input_runtime.terminal_theme_monitor;
+        if (comptime !host_target.is_wasm) {
+            monitor.expectClipboardReply(self.terminal_input_runtime.terminal_clipboard_reader.pending());
+        }
+        switch (monitor.feed(byte, now_ms)) {
             .pending, .consumed => {},
             // The WebAssembly hosts never ask for the clipboard.
             .clipboard_packet => if (comptime !host_target.is_wasm) {
@@ -3964,7 +3968,6 @@ const App = struct {
         switch (ui_input.terminalInputOwner(
             &self.terminal_input_runtime.terminal_theme_monitor,
             InputAppRuntime.terminalPasteActive(self),
-            !host_target.is_wasm and clipboard_reader.pending(),
         )) {
             .theme_monitor => {
                 try self.handleThemeMonitorByte(byte);

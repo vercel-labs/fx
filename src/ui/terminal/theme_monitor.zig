@@ -76,6 +76,13 @@ pub const Monitor = struct {
     /// `poll` dropped the start of a clipboard reply that stalled; the
     /// clipboard reader must drop its rest (`takeDroppedClipboardStart`).
     dropped_clipboard_start: bool = false,
+    /// A clipboard request is open, so more reply starts are held
+    /// (`clipboard_protocol.holdsReplyStart`). The input loop sets it before
+    /// each byte (`expectClipboardReply`).
+    clipboard_reply_expected: bool = false,
+    /// The candidate is a clipboard reply start that `poll` drops, not types,
+    /// when it stalls.
+    candidate_holds_clipboard: bool = false,
 
     pub fn start(self: *Monitor) void {
         self.enabled = true;
@@ -116,6 +123,10 @@ pub const Monitor = struct {
         };
     }
 
+    pub fn expectClipboardReply(self: *Monitor, expected: bool) void {
+        self.clipboard_reply_expected = expected;
+    }
+
     pub fn feed(self: *Monitor, byte: u8, now_ms: i64) FeedResult {
         if (!self.enabled) return forwardByte(byte);
         if (self.candidate_len == 0 and byte != 0x1b) return forwardByte(byte);
@@ -129,9 +140,15 @@ pub const Monitor = struct {
             clipboard_protocol.replyStartIsCertain(self.candidate[0..self.candidate_len]);
         self.candidate[self.candidate_len] = byte;
         self.candidate_len += 1;
-        self.candidate_deadline_ms = io_mod.addMillis(now_ms, response_idle_timeout_ms);
-
         const candidate = self.candidate[0..self.candidate_len];
+        // The rest of a reply comes before any later key, so a held clipboard
+        // reply start waits through a stall instead of being typed.
+        self.candidate_holds_clipboard = clipboard_replies and
+            clipboard_protocol.holdsReplyStart(candidate, self.clipboard_reply_expected);
+        self.candidate_deadline_ms = io_mod.addMillis(now_ms, if (self.candidate_holds_clipboard)
+            clipboard_protocol.packet_idle_timeout_ms
+        else
+            response_idle_timeout_ms);
         if (std.mem.eql(u8, candidate, dark_response)) {
             self.candidate_len = 0;
             self.queueRefresh(false);
@@ -164,14 +181,7 @@ pub const Monitor = struct {
                     self.candidate_deadline_ms = 0;
                     return self.feed(byte, now_ms);
                 },
-                .pending => {
-                    // No key starts this way, and the rest of the reply comes
-                    // before any later key, so a stall cannot type it.
-                    if (clipboard_protocol.replyStartIsCertain(candidate)) {
-                        self.candidate_deadline_ms = io_mod.addMillis(now_ms, clipboard_protocol.packet_idle_timeout_ms);
-                    }
-                    return .pending;
-                },
+                .pending => return .pending,
                 .packet => {
                     self.candidate_len = 0;
                     self.candidate_deadline_ms = 0;
@@ -234,7 +244,7 @@ pub const Monitor = struct {
                 );
                 self.candidate_len = 0;
                 self.candidate_deadline_ms = 0;
-            } else if (clipboard_replies and clipboard_protocol.replyStartIsCertain(candidate)) {
+            } else if (self.candidate_holds_clipboard) {
                 // The clipboard reader drops the rest when it comes.
                 debug_trace.logf(
                     "theme",
@@ -849,7 +859,7 @@ test "theme monitor drops a broken clipboard reply start and reads the next byte
     try std.testing.expectEqual(@as(u8, 1), monitor.candidate_len);
 }
 
-test "theme monitor types a short start that may be a key after the short timeout" {
+test "theme monitor types a short start that may be a key when no clipboard request is open" {
     const starts = [_][]const u8{ "\x1b", "\x1b]", "\x1b]5", "\x1b[?", "\x1b[?5" };
     for (starts) |start| {
         var monitor = Monitor{};
@@ -879,4 +889,50 @@ test "theme monitor passes an Escape key right before a clipboard reply on once"
     try std.testing.expectEqualStrings("\x1b", forwarded.slice());
     for ("]5522") |byte| try std.testing.expect(monitor.feed(byte, 10) == .pending);
     try std.testing.expect(monitor.feed(';', 10) == .clipboard_packet);
+}
+
+test "theme monitor holds clipboard reply starts but ESC and ESC [ while a request is open" {
+    const held = [_][]const u8{ "\x1b]", "\x1b]5", "\x1b[?", "\x1b[?5" };
+    for (held) |start| {
+        var monitor = Monitor{};
+        monitor.start();
+        monitor.expectClipboardReply(true);
+        for (start) |byte| try std.testing.expect(monitor.feed(byte, 0) == .pending);
+        monitor.poll(response_idle_timeout_ms + 1);
+        try std.testing.expect(monitor.hasPendingInput());
+        monitor.poll(clipboard_protocol.packet_idle_timeout_ms);
+        try std.testing.expect(!monitor.hasPendingInput());
+        try std.testing.expect(monitor.takeDeferredByte() == null);
+        try std.testing.expect(monitor.takeDroppedClipboardStart());
+    }
+
+    // These start the Escape and arrow keys, so they are typed as before.
+    const keys = [_][]const u8{ "\x1b", "\x1b[" };
+    for (keys) |start| {
+        var monitor = Monitor{};
+        monitor.start();
+        monitor.expectClipboardReply(true);
+        for (start) |byte| try std.testing.expect(monitor.feed(byte, 0) == .pending);
+        monitor.poll(response_idle_timeout_ms);
+        try std.testing.expect(!monitor.takeDroppedClipboardStart());
+        var typed: usize = 0;
+        while (monitor.takeDeferredByte()) |_| {
+            typed += 1;
+            try std.testing.expect(monitor.consumeDeferredInputDispatch());
+        }
+        try std.testing.expectEqual(start.len, typed);
+    }
+}
+
+test "theme monitor still reads device attributes while a clipboard request is open" {
+    var monitor = Monitor{};
+    monitor.start();
+    monitor.expectClipboardReply(true);
+    for ("\x1b[?") |byte| try std.testing.expect(monitor.feed(byte, 0) == .pending);
+    monitor.poll(500);
+    try std.testing.expect(monitor.hasPendingInput());
+    const rest = "62;22;52c";
+    for (rest[0 .. rest.len - 1]) |byte| try std.testing.expect(monitor.feed(byte, 500) == .pending);
+    try std.testing.expect(monitor.feed(rest[rest.len - 1], 500) == .consumed);
+    try std.testing.expect(!monitor.takeDroppedClipboardStart());
 }

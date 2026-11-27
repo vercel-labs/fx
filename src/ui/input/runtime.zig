@@ -45,17 +45,12 @@ pub const TerminalInputOwner = enum {
     fx_input,
 };
 
-/// Who reads the next terminal byte. While a clipboard reply may still come,
-/// a paste goes through the theme monitor too, so a reply that arrives inside
-/// it reaches the clipboard reader; the monitor hands every other byte back to
-/// the paste.
 pub fn terminalInputOwner(
     monitor: *const theme_monitor.Monitor,
     paste_active: bool,
-    clipboard_reply_expected: bool,
 ) TerminalInputOwner {
     if (monitor.ownsInput()) return .theme_monitor;
-    if (paste_active and !(clipboard_reply_expected and monitor.enabled)) return .paste;
+    if (paste_active) return .paste;
     if (monitor.enabled) return .theme_monitor;
     return .fx_input;
 }
@@ -368,7 +363,7 @@ test "terminal reply ownership precedes active paste transport" {
     );
     try std.testing.expectEqual(
         TerminalInputOwner.theme_monitor,
-        terminalInputOwner(&monitor, true, false),
+        terminalInputOwner(&monitor, true),
     );
 
     for ("\x1b[?1;2;4c") |byte| {
@@ -376,24 +371,8 @@ test "terminal reply ownership precedes active paste transport" {
     }
     try std.testing.expectEqual(
         TerminalInputOwner.paste,
-        terminalInputOwner(&monitor, true, false),
+        terminalInputOwner(&monitor, true),
     );
-}
-
-test "a paste goes through the theme monitor while a clipboard reply may come" {
-    var monitor = theme_monitor.Monitor{};
-    monitor.start();
-    try std.testing.expectEqual(TerminalInputOwner.paste, terminalInputOwner(&monitor, true, false));
-    try std.testing.expectEqual(TerminalInputOwner.theme_monitor, terminalInputOwner(&monitor, true, true));
-    try std.testing.expectEqual(TerminalInputOwner.theme_monitor, terminalInputOwner(&monitor, false, true));
-
-    // The monitor sees a reply inside the paste, and hands paste text back.
-    try std.testing.expect(monitor.feed('a', 0) == .forward);
-    for ("\x1b]5522") |byte| try std.testing.expect(monitor.feed(byte, 0) == .pending);
-    try std.testing.expect(monitor.feed(';', 0) == .clipboard_packet);
-
-    const stopped = theme_monitor.Monitor{};
-    try std.testing.expectEqual(TerminalInputOwner.paste, terminalInputOwner(&stopped, true, true));
 }
 
 test "approval bytes translate to typed decision actions" {

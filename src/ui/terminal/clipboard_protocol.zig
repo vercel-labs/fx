@@ -12,12 +12,14 @@
 //! the state of the one outstanding request.
 //!
 //! The input stream keeps its order, so a network stall inside a reply delays
-//! the keys typed after it too; nothing lands inside a reply. A reply start
-//! that can only be a clipboard reply (`replyStartIsCertain`) is held through
-//! a stall of up to `packet_idle_timeout_ms`, then dropped with its rest. A
-//! stall within a reply's first bytes, which may still be a key such as
-//! Escape, is handled like any other partial terminal reply: after the theme
-//! monitor's short timeout those bytes reach fx as keys.
+//! the keys typed after it too; nothing lands inside a reply. The theme
+//! monitor holds a reply start through a stall of up to
+//! `packet_idle_timeout_ms`, then drops it with its rest (`holdsReplyStart`):
+//! a start that can only be a clipboard reply, and, while a request is open,
+//! any start of two bytes or more. A stall right after a reply's ESC, or after
+//! `ESC [`, which start the Escape and arrow keys, is handled like any other
+//! partial terminal reply: after the monitor's short timeout those bytes reach
+//! fx as keys.
 
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
@@ -94,6 +96,18 @@ pub fn classifyReplyStart(candidate: []const u8) ReplyStart {
 pub fn replyStartIsCertain(candidate: []const u8) bool {
     if (candidate.len >= 4 and std.mem.startsWith(u8, packet_prefix, candidate[0..4])) return true;
     return candidate.len >= 5 and std.mem.startsWith(u8, mode_report_prefix, candidate[0..5]);
+}
+
+/// Whether the theme monitor holds a partial clipboard reply through a stall
+/// of up to `packet_idle_timeout_ms`, then drops it, instead of typing it
+/// after its short timeout. A certain start is always held. While a request
+/// is open, `ESC ]`, `ESC [ ?`, and longer starts are held too, so Alt+]
+/// pressed then is lost. A lone ESC and `ESC [`, which start the Escape and
+/// arrow keys, are never held.
+pub fn holdsReplyStart(candidate: []const u8, request_open: bool) bool {
+    if (classifyReplyStart(candidate) != .pending) return false;
+    if (replyStartIsCertain(candidate)) return true;
+    return request_open and candidate.len >= 2 and !std.mem.eql(u8, candidate, "\x1b[");
 }
 
 pub const Outcome = union(enum) {
@@ -594,6 +608,17 @@ test "only a reply start that no key or other reply shares is certain" {
     }
 }
 
+test "a clipboard reply start is held while a request is open, unless a key starts it" {
+    try testing.expect(holdsReplyStart("\x1b]55", false));
+    try testing.expect(!holdsReplyStart("\x1b]5", false));
+    for ([_][]const u8{ "\x1b]", "\x1b]5", "\x1b[?", "\x1b[?5", "\x1b]55" }) |start| {
+        try testing.expect(holdsReplyStart(start, true));
+    }
+    for ([_][]const u8{ "\x1b", "\x1b[", "\x1b[A", "\x1b[?6" }) |start| {
+        try testing.expect(!holdsReplyStart(start, true));
+    }
+}
+
 test "the image read request asks for the mode and for image/png" {
     try testing.expectEqualStrings("\x1b[?5522$p\x1b]5522;type=read;aW1hZ2UvcG5n\x1b\\", image_read_request);
     var decoded: [16]u8 = undefined;
@@ -917,6 +942,7 @@ test "the clipboard reader stays bounded and gives one outcome per request on fu
             "\x16\x1b]5522;type=read:status=DATA:mime=" ++ png_mime_base64 ++ ";!!!!\x1b\\\x16",
             "\x1b]5522;\x1b[A\x00\x1b[?5522;2$y\x16",
             "\x1b[?5522;2$y\x1b]55\x0022;type=read:status=OK\x1b\\abc\x16\x1b[?55\x0022;2$y\r",
+            "\x1b[?5522;2$y\x1b]5\x00522;type=read:status=OK\x1b\\\x1b]\x005522;\x07\x1b[?\x00\r",
         }) ++ @import("fuzz_corpus").terminal_clipboard_reply.*),
     });
 }
@@ -969,6 +995,9 @@ const FuzzDrive = struct {
     outcomes: usize = 0,
     candidate: [16]u8 = undefined,
     candidate_len: usize = 0,
+    /// The theme monitor holds the candidate through a stall
+    /// (`holdsReplyStart`), decided as each byte arrives.
+    candidate_held: bool = false,
 
     fn route(self: *FuzzDrive, byte: u8) !void {
         if (self.reader.ownsInput() and self.reader.feedOwnedByte(testing.allocator, byte, self.now_ms)) return;
@@ -976,6 +1005,7 @@ const FuzzDrive = struct {
         const clipboard_start = replyStartIsCertain(self.candidate[0..self.candidate_len]);
         self.candidate[self.candidate_len] = byte;
         self.candidate_len += 1;
+        self.candidate_held = holdsReplyStart(self.candidate[0..self.candidate_len], self.reader.pending());
         switch (classifyReplyStart(self.candidate[0..self.candidate_len])) {
             .pending => if (self.candidate_len == self.candidate.len) self.flushCandidate(),
             .packet => {
@@ -994,6 +1024,7 @@ const FuzzDrive = struct {
                 if (byte != 0x1b) return self.typed(byte);
                 self.candidate[0] = byte;
                 self.candidate_len = 1;
+                self.candidate_held = false;
             },
         }
     }
@@ -1010,10 +1041,10 @@ const FuzzDrive = struct {
         self.candidate_len = 0;
     }
 
-    /// A pause past every deadline. The theme monitor drops a certain reply
+    /// A pause past every deadline. The theme monitor drops a held reply
     /// start, and the reader then drops its rest; it types any other start.
     fn pause(self: *FuzzDrive) void {
-        if (replyStartIsCertain(self.candidate[0..self.candidate_len])) {
+        if (self.candidate_len > 0 and self.candidate_held) {
             self.reader.dropReplyStart(testing.allocator, self.now_ms + packet_idle_timeout_ms);
         }
         self.candidate_len = 0;

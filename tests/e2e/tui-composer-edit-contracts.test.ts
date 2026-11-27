@@ -1401,17 +1401,17 @@ test(
     await requestClipboardImage();
     writeToFx("\x1b[?5522;2$y");
 
-    // The network stalls after the first bytes of the next packet. fx holds
-    // them, gives up after a second, and says so.
+    // The network stalls after the first bytes of the next packet. With a
+    // request open, fx holds them, gives up after a second, and says so.
     const beforeStall = ptyOutput.length;
-    writeToFx("\x1b]55");
+    writeToFx("\x1b]5");
     await waitForOutput(
       () => visibleText(ptyOutput.slice(beforeStall)).includes("didn't send the clipboard image"),
       "the timeout notice",
     );
 
     // The rest of the packet arrives late, then the person types.
-    writeToFx("22;type=read:status=OK\x1b\\");
+    writeToFx("522;type=read:status=OK\x1b\\");
     writeToFx("zq9");
     await waitForOutput(() => visibleText(ptyOutput.slice(beforeStall)).includes("zq9"), "the typed text");
 
