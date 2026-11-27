@@ -785,6 +785,41 @@ test "resume projection preserves turn timestamps and usage rows" {
     );
 }
 
+test "resume projection stores the turn recap on the turn summary entry" {
+    const alloc = std.testing.allocator;
+    var source: TranscriptRuntime = .{};
+    source.layout.cols = 120;
+    defer source.deinit(alloc);
+
+    var projection = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
+    defer projection.deinit();
+    _ = try projection.appendUserTurn(.{ .text = @constCast("prompt") });
+    const entry_id = try projection.appendToolStatus(.completed, "Read a.txt");
+    try projection.attachHistoricalToolDetail(entry_id, .{
+        .id = "read-a",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"a.txt\"}",
+    }, .read, .{
+        .tool_call_id = @constCast("read-a"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("contents\n"),
+        .output_bytes = 9,
+        .stored_output_bytes = 9,
+        .created_at_ms = 42,
+    });
+    try projection.appendAssistantText("response");
+    try projection.appendTurnSummary(.{ .turn_duration_ms = 1200 });
+
+    const summary_entry = projection.runtime.notebook.entries.items[projection.runtime.notebook.entries.items.len - 1].raw_bytes;
+    try std.testing.expectEqual(transcript_runtime.RawEntryClass.turn_summary, summary_entry.class);
+    try std.testing.expectEqualStrings("Explored 1 file · ", summary_entry.turn_recap.text);
+
+    var prepared = try source_preparation.prepareTranscriptSource(&projection.runtime, alloc, null);
+    defer prepared.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, prepared.bytes, "Explored 1 file") != null);
+}
+
 test "live resume projection preserves an incomplete command block" {
     const alloc = std.testing.allocator;
     var source: TranscriptRuntime = .{};

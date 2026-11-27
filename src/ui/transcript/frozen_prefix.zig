@@ -200,12 +200,17 @@ fn hashEntry(start: u64, entry: TranscriptEntry) u64 {
         // Most entries are tool and status lines, so these are keyed field by
         // field. A new field must be keyed here too.
         .raw_bytes => |value| {
-            comptime std.debug.assert(@typeInfo(@TypeOf(value)).@"struct".field_names.len == 6);
+            comptime std.debug.assert(@typeInfo(@TypeOf(value)).@"struct".field_names.len == 7);
             h = mix(h, value.id);
             h = mix(h, @bitCast(value.created_at_ms));
             h = mix(h, flags(value.inline_hidden, value.lifecycle_pinned));
             h = mix(h, @backingInt(value.class));
             h = mix(h, bytesHash(value.bytes));
+            h = mix(h, @backingInt(std.meta.activeTag(value.turn_recap)));
+            switch (value.turn_recap) {
+                .text => |text| h = mix(h, bytesHash(text)),
+                .uncomputed, .empty => {},
+            }
         },
         // The text buffer's capacity differs between clones; only its bytes count.
         .assistant_turn => |value| {

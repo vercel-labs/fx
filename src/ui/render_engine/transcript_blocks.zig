@@ -333,6 +333,14 @@ pub const EntryRenderAction = union(enum) {
 
 pub const default_block_gap_policy: BlockGapPolicy = .{};
 
+pub const TurnRecap = union(enum) {
+    /// A turn summary made without `appendTurnSummaryEntry` has no stored
+    /// recap, so projection computes it from the entries before it.
+    uncomputed,
+    empty,
+    text: []const u8,
+};
+
 pub const TranscriptEntry = union(enum) {
     /// Banners, command-output summaries, system notices, spinners:
     /// content with a fixed byte shape that does not reshape across
@@ -365,6 +373,7 @@ pub const TranscriptEntry = union(enum) {
         bytes: []const u8,
         class: RawEntryClass = .unknown_raw,
         lifecycle_pinned: bool = false,
+        turn_recap: TurnRecap = .uncomputed,
     };
 
     pub const SemanticNoticeEntry = struct {
@@ -454,6 +463,10 @@ pub const TranscriptEntry = union(enum) {
         switch (self.*) {
             .raw_bytes => |e| {
                 alloc.free(e.bytes);
+                switch (e.turn_recap) {
+                    .text => |recap| alloc.free(recap),
+                    .uncomputed, .empty => {},
+                }
             },
             .semantic_notice => |e| {
                 alloc.free(e.topic);

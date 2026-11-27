@@ -5852,7 +5852,7 @@ fn formatTurnRecap(scratch: std.mem.Allocator, tally: StoryTally) ![]const u8 {
 /// Index of the first entry of the turn that the turn summary at
 /// `summary_index` ends: the entry after its prompt, or after the turn
 /// summary or cancellation before it when the prompt is gone.
-pub fn turnSummaryTurnStart(entries: []const TranscriptEntry, summary_index: usize) usize {
+fn turnSummaryTurnStart(entries: []const TranscriptEntry, summary_index: usize) usize {
     var turn_start = summary_index;
     while (turn_start > 0) {
         const boundary = switch (entries[turn_start - 1]) {
@@ -5864,6 +5864,45 @@ pub fn turnSummaryTurnStart(entries: []const TranscriptEntry, summary_index: usi
         turn_start -= 1;
     }
     return turn_start;
+}
+
+fn computeTurnRecapText(
+    scratch: std.mem.Allocator,
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+    summary_index: usize,
+) ![]const u8 {
+    const turn_start = turnSummaryTurnStart(entries, summary_index);
+    var tally: StoryTally = .{};
+    for (entries[turn_start..summary_index]) |entry| {
+        const entry_id = toolStatusEntryId(entry) orelse continue;
+        const detail = detailForEntry(details, detail_indices, entry_id, null);
+        if (statusNamesAsk(entry, detail)) continue;
+        try tally.observe(scratch, entry, detail);
+    }
+    return formatTurnRecap(scratch, tally);
+}
+
+/// Computes the recap for a turn summary about to be appended after `entries`.
+/// Caller owns any `.text` slice returned.
+pub fn computeTurnRecap(
+    alloc: std.mem.Allocator,
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+) !transcript_blocks.TurnRecap {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer mem_utils.deinit_arena(scratch_state);
+    const scratch = scratch_state.allocator();
+
+    var detail_indices: std.AutoHashMapUnmanaged(u32, usize) = .empty;
+    for (details, 0..) |detail, detail_index| {
+        const result = try detail_indices.getOrPut(scratch, detail.entry_id);
+        if (!result.found_existing) result.value_ptr.* = detail_index;
+    }
+    const recap = try computeTurnRecapText(scratch, entries, details, &detail_indices, entries.len);
+    if (recap.len == 0) return .empty;
+    return .{ .text = try alloc.dupe(u8, recap) };
 }
 
 /// Inserts the turn recap before the first visible character of a turn
@@ -5878,32 +5917,28 @@ fn recapTurnSummary(
     summary_index: usize,
     cols: u16,
 ) !?[]u8 {
-    const summary_bytes = switch (entries[summary_index]) {
-        .raw_bytes => |raw| raw.bytes,
+    const raw = switch (entries[summary_index]) {
+        .raw_bytes => |value| value,
         else => return null,
     };
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
-    const turn_start = turnSummaryTurnStart(entries, summary_index);
-    var tally: StoryTally = .{};
-    for (entries[turn_start..summary_index]) |entry| {
-        const entry_id = toolStatusEntryId(entry) orelse continue;
-        const detail = detailForEntry(details, detail_indices, entry_id, null);
-        if (statusNamesAsk(entry, detail)) continue;
-        try tally.observe(scratch, entry, detail);
-    }
-    const recap = try formatTurnRecap(scratch, tally);
+    const recap = switch (raw.turn_recap) {
+        .empty => return null,
+        .text => |text| text,
+        .uncomputed => try computeTurnRecapText(scratch, entries, details, detail_indices, summary_index),
+    };
     if (recap.len == 0) return null;
 
     var insert_at: usize = 0;
-    while (insert_at < summary_bytes.len) {
-        if (skipSgrSequence(summary_bytes, &insert_at)) continue;
-        if (summary_bytes[insert_at] != ' ') break;
+    while (insert_at < raw.bytes.len) {
+        if (skipSgrSequence(raw.bytes, &insert_at)) continue;
+        if (raw.bytes[insert_at] != ' ') break;
         insert_at += 1;
     }
-    const recapped = try std.mem.concat(scratch, u8, &.{ summary_bytes[0..insert_at], recap, summary_bytes[insert_at..] });
+    const recapped = try std.mem.concat(scratch, u8, &.{ raw.bytes[0..insert_at], recap, raw.bytes[insert_at..] });
     if (display_width.visibleWidthIgnoringAnsi(std.mem.trimEnd(u8, recapped, "\n")) > cols) return null;
     return try alloc.dupe(u8, recapped);
 }

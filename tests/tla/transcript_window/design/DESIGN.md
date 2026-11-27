@@ -54,10 +54,10 @@ current code.
   until it scrolls into terminal history or a resize clears the screen,
   because the painter repaints the live area from the entries. A failed store
   drop keeps the entries still in the notebook pending, and the next sync tries
-  them again (`dropPendingEntries`). An entry of a
-  turn whose summary stays is held too, back to the turn's prompt, also when
-  a resize clears the screen, because the summary's recap counts the turn's
-  tool calls. A resumed transcript holds every entry until a frame has
+  them again (`dropPendingEntries`). A turn summary stores its turn's recap when
+  it is created (`appendTurnSummaryEntry`), so pre-compaction and scrolled-off
+  entries of a turn drop without losing the summary's recap. A resumed
+  transcript holds every entry until a frame has
   repainted it from the entries: its first paint is the prepared resume
   flow, so the reset before that paint keeps them, and the commit anchor
   that paint leaves holds the prepared flow's rows, not the entries'. The

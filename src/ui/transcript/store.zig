@@ -189,7 +189,10 @@ pub fn retainedStructuredBytes(self: anytype) usize {
 
 fn entryRetainedBytes(entry: TranscriptEntry) usize {
     return switch (entry) {
-        .raw_bytes => |e| e.bytes.len,
+        .raw_bytes => |e| e.bytes.len + switch (e.turn_recap) {
+            .text => |recap| recap.len,
+            .uncomputed, .empty => 0,
+        },
         .semantic_notice => |e| e.topic.len + e.body.len + e.detail.len,
         .user_turn => |e| blk: {
             var total = e.turn.text.len;
@@ -1859,14 +1862,24 @@ fn cloneEntries(
 
 pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !TranscriptEntry {
     return switch (entry) {
-        .raw_bytes => |raw| .{ .raw_bytes = .{
-            .id = raw.id,
-            .created_at_ms = raw.created_at_ms,
-            .inline_hidden = raw.inline_hidden,
-            .bytes = try alloc.dupe(u8, raw.bytes),
-            .class = raw.class,
-            .lifecycle_pinned = raw.lifecycle_pinned,
-        } },
+        .raw_bytes => |raw| blk: {
+            const bytes = try alloc.dupe(u8, raw.bytes);
+            errdefer alloc.free(bytes);
+            const turn_recap: transcript_blocks.TurnRecap = switch (raw.turn_recap) {
+                .uncomputed => .uncomputed,
+                .empty => .empty,
+                .text => |recap| .{ .text = try alloc.dupe(u8, recap) },
+            };
+            break :blk .{ .raw_bytes = .{
+                .id = raw.id,
+                .created_at_ms = raw.created_at_ms,
+                .inline_hidden = raw.inline_hidden,
+                .bytes = bytes,
+                .class = raw.class,
+                .lifecycle_pinned = raw.lifecycle_pinned,
+                .turn_recap = turn_recap,
+            } };
+        },
         .semantic_notice => |notice| blk: {
             const owned = try types.dupeSemanticNotice(alloc, .{
                 .topic = notice.topic,

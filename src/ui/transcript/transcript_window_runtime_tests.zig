@@ -316,11 +316,12 @@ test "a turn summary on screen still counts every file its turn read after the w
     const anchor = &runtime.transcript_commit_state.stable;
     anchor.history_visual_offset = summary_first_row.?;
 
-    // A compaction, then a turn that ends. The window would drop turn 1's rows
-    // in history, but the summary is on screen, so it holds the whole turn.
+    // A compaction, then a turn that ends. Turn 1's rows in history leave
+    // memory while the summary stays on screen, and its stored recap keeps
+    // all three reads.
     try runtime.transcriptWindowCompacted(alloc);
     try runTurn(alloc, &runtime, &metrics, "NEXT_PROMPT", "NEXT_ANSWER\n");
-    try std.testing.expect(holds(&runtime, "READS_PROMPT") and holds(&runtime, "Read a.txt"));
+    try std.testing.expect(!holds(&runtime, "READS_PROMPT") and !holds(&runtime, "Read a.txt"));
     var summary_held = false;
     for (runtime.notebook.entries.items) |entry| {
         if (entry.id() == summary_id) summary_held = true;
@@ -333,7 +334,7 @@ test "a turn summary on screen still counts every file its turn read after the w
     try std.testing.expect(std.mem.find(u8, after.bytes, "Explored 3 files") != null);
 
     // Once the summary's row is in terminal history too, the next sync drops
-    // the whole turn.
+    // the summary entry.
     const later = &runtime.transcript_commit_state.stable;
     later.history_visual_offset = later.total_visual_rows;
     try runtime.syncTranscriptWindow(alloc);
@@ -368,10 +369,14 @@ test "a compaction inside a turn leaves the turn summary's recap counting every 
     // has no row in the committed frame yet.
     try commitStableFrame(alloc, &runtime);
     runtime.transcript_commit_state.stable.history_visual_offset = history_rows;
+    try std.testing.expect(holds(&runtime, "SPLIT_PROMPT") and holds(&runtime, "Read a.txt"));
     _ = try runtime.appendTurnSummaryEntry(alloc, .{ .turn_duration_ms = 1200 });
 
-    // The turn stays whole, and its recap counts all five reads.
-    try std.testing.expect(holds(&runtime, "SPLIT_PROMPT") and holds(&runtime, "Read a.txt"));
+    // Once the turn ends, the pre-compaction entries in history are dropped
+    // while the post-compaction entries stay, and the recap still counts all
+    // five reads.
+    try std.testing.expect(!holds(&runtime, "SPLIT_PROMPT") and !holds(&runtime, "Read a.txt"));
+    try std.testing.expect(holds(&runtime, "Read d.txt") and holds(&runtime, "SPLIT_ANSWER"));
     var after = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
     defer after.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, after.bytes, "Explored 5 files") != null);
@@ -402,34 +407,37 @@ test "a resize after a compaction inside a turn keeps the turn whole for its sum
     runtime.transcript_commit_state.stable.history_visual_offset = history_rows;
     _ = try runtime.appendTurnSummaryEntry(alloc, .{ .turn_duration_ms = 1200 });
 
-    // The screen clear releases no entry of the split turn while its summary
-    // stays.
+    // The pre-compaction rows in history already left when the turn ended;
+    // the post-compaction cycle and the summary's recap survive the screen
+    // clear.
     try runtime.transcriptWindowScreenCleared(alloc);
-    try std.testing.expect(holds(&runtime, "SPLIT_PROMPT") and holds(&runtime, "Read a.txt"));
+    try std.testing.expect(!holds(&runtime, "SPLIT_PROMPT") and !holds(&runtime, "Read a.txt"));
+    try std.testing.expect(holds(&runtime, "Read d.txt") and holds(&runtime, "SPLIT_ANSWER"));
     var after = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
     defer after.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, after.bytes, "Explored 5 files") != null);
     try expectWindowMatchesEntries(&runtime);
 
-    // The replay paints the summary, and the turn's rows go into terminal
-    // history. The summary is in the current cycle, so it stays, and the split
-    // turn stays whole with it. The screen clear leaves the commit state
-    // stable, so the test resets the anchor, as the visual epoch reset does,
-    // before the new frame commits.
+    // The replay paints the summary, and the post-compaction rows go into
+    // terminal history. The summary is in the current cycle, so the current
+    // cycle stays and the stored recap still counts all five reads. The screen
+    // clear leaves the commit state stable, so the test resets the anchor, as
+    // the visual epoch reset does, before the new frame commits.
     runtime.resetTranscriptAnchor("transcript_window_test_screen_reset");
     try commitStableFrame(alloc, &runtime);
     const later = &runtime.transcript_commit_state.stable;
     later.history_visual_offset = later.total_visual_rows;
     try runtime.syncTranscriptWindow(alloc);
-    try std.testing.expect(holds(&runtime, "SPLIT_PROMPT") and holds(&runtime, "Read a.txt"));
+    try std.testing.expect(!holds(&runtime, "SPLIT_PROMPT") and !holds(&runtime, "Read a.txt"));
+    try std.testing.expect(holds(&runtime, "Read d.txt") and holds(&runtime, "SPLIT_ANSWER"));
     var whole = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
     defer whole.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, whole.bytes, "Explored 5 files") != null);
     try expectWindowMatchesEntries(&runtime);
 
-    // A compaction closes the cycle that holds the summary. The split turn
-    // leaves with its summary, once the next turn ends and the window drops
-    // that cycle.
+    // A compaction closes the cycle that holds the summary. The remaining turn
+    // entries leave with its summary, once the next turn ends and the window
+    // drops that cycle.
     try runtime.transcriptWindowCompacted(alloc);
     try runTurn(alloc, &runtime, &metrics, "LATER_PROMPT", "LATER_ANSWER\n");
     runtime.resetTranscriptAnchor("transcript_window_test_screen_reset");
@@ -465,14 +473,106 @@ test "a turn that ends before its frame commits keeps the turn whole for its sum
     _ = try runtime.appendAssistantTurnEntry(alloc);
     _ = try runtime.streamAssistantChunk(alloc, &metrics, "SPLIT_ANSWER\n");
     try std.testing.expect(runtime.transcript_commit_state == .invalid);
+    try std.testing.expect(holds(&runtime, "SPLIT_PROMPT") and holds(&runtime, "Read a.txt"));
     _ = try runtime.appendTurnSummaryEntry(alloc, .{ .turn_duration_ms = 1200 });
 
-    // The turn stays whole, and its recap counts all five reads.
-    try std.testing.expect(holds(&runtime, "SPLIT_PROMPT") and holds(&runtime, "Read a.txt"));
+    // With no committed frame holding them, the pre-compaction entries drop at
+    // turn end while the post-compaction entries stay and the stored recap
+    // counts all five reads.
+    try std.testing.expect(!holds(&runtime, "SPLIT_PROMPT") and !holds(&runtime, "Read a.txt"));
+    try std.testing.expect(holds(&runtime, "Read d.txt") and holds(&runtime, "SPLIT_ANSWER"));
     var after = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
     defer after.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, after.bytes, "Explored 5 files") != null);
     try expectWindowMatchesEntries(&runtime);
+}
+
+test "a turn that compacts mid-turn drops its pre-compaction entries when it ends" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+
+    const prompt = try alloc.dupe(u8, "COMPACT_PROMPT");
+    defer alloc.free(prompt);
+    _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = prompt }, false, &.{});
+    try readFiles(alloc, &runtime, &metrics, &.{ "a.txt", "b.txt", "c.txt" });
+    try commitStableFrame(alloc, &runtime);
+    const history_rows = runtime.transcript_commit_state.stable.total_visual_rows;
+    runtime.transcript_commit_state.stable.history_visual_offset = history_rows;
+
+    try runtime.transcriptWindowCompacted(alloc);
+    try readFiles(alloc, &runtime, &metrics, &.{ "d.txt", "e.txt" });
+    _ = try runtime.appendAssistantTurnEntry(alloc);
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "COMPACT_ANSWER\n");
+    try commitStableFrame(alloc, &runtime);
+    runtime.transcript_commit_state.stable.history_visual_offset = history_rows;
+
+    const entries_before_end = runtime.notebook.entries.items.len;
+    const retained_before_end = transcript_store.retainedStructuredBytes(&runtime);
+    try std.testing.expect(holds(&runtime, "COMPACT_PROMPT") and holds(&runtime, "Read a.txt"));
+
+    _ = try runtime.appendTurnSummaryEntry(alloc, .{ .turn_duration_ms = 1200 });
+
+    try std.testing.expect(!holds(&runtime, "COMPACT_PROMPT") and !holds(&runtime, "Read a.txt"));
+    try std.testing.expect(holds(&runtime, "Read d.txt") and holds(&runtime, "COMPACT_ANSWER"));
+    try std.testing.expectEqual(@as(usize, 4), runtime.notebook.entries.items.len);
+    try std.testing.expect(runtime.notebook.entries.items.len < entries_before_end);
+    try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) < retained_before_end);
+    var after = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
+    defer after.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, after.bytes, "Explored 5 files") != null);
+    try expectWindowMatchesEntries(&runtime);
+}
+
+test "a turn summary keeps its recap after its turn's entries are dropped" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+
+    const prompt = try alloc.dupe(u8, "RECAP_PROMPT");
+    defer alloc.free(prompt);
+    _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = prompt }, false, &.{});
+    try readFiles(alloc, &runtime, &metrics, &.{"a.txt"});
+    _ = try runtime.appendAssistantTurnEntry(alloc);
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "MID_ANSWER\n");
+    try runtime.transcriptWindowCompacted(alloc);
+    try readFiles(alloc, &runtime, &metrics, &.{ "b.txt", "c.txt" });
+    _ = try runtime.appendAssistantTurnEntry(alloc);
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "RECAP_ANSWER\n");
+    try commitStableFrame(alloc, &runtime);
+    // All rows remain on screen (`history_visual_offset == 0`), so the
+    // pre-compaction entries stay held in `pending_drops` at turn end.
+    _ = try runtime.appendTurnSummaryEntry(alloc, .{ .turn_duration_ms = 1200 });
+    try std.testing.expect(holds(&runtime, "RECAP_PROMPT") and holds(&runtime, "Read a.txt"));
+
+    var before = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
+    defer before.deinit(alloc);
+    const summary_before = findLineContaining(before.bytes, "Explored 3 files") orelse return error.MissingSummaryLine;
+
+    // Scroll the pre-compaction rows into terminal history and sync so they drop.
+    const anchor = &runtime.transcript_commit_state.stable;
+    anchor.history_visual_offset = anchor.total_visual_rows;
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "RECAP_PROMPT") and !holds(&runtime, "Read a.txt"));
+    try std.testing.expect(holds(&runtime, "Read c.txt"));
+
+    var after = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
+    defer after.deinit(alloc);
+    const summary_after = findLineContaining(after.bytes, "Explored 3 files") orelse return error.MissingSummaryLine;
+    try std.testing.expectEqualStrings(summary_before, summary_after);
+    try expectWindowMatchesEntries(&runtime);
+}
+
+fn findLineContaining(bytes: []const u8, needle: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.find(u8, line, needle) != null) return line;
+    }
+    return null;
 }
 
 /// The window holds every entry it has reported (`seen_through`), once each,

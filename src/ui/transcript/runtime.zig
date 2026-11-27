@@ -7703,8 +7703,16 @@ pub const TranscriptRuntime = struct {
         var line_buf: [128]u8 = undefined;
         const line = formatTurnSummaryLine(&line_buf, summary);
         const entry = try alloc.print("{s}{s}{s}\n", .{ ui_render.dim_style, line, ui_render.reset_style });
-        // The notebook owns `entry` once the append succeeds, so only a failed
-        // append frees it.
+        const turn_recap = tool_group_projection.computeTurnRecap(
+            alloc,
+            self.notebook.entries.items,
+            self.notebook.tool_details.items,
+        ) catch |err| {
+            alloc.free(entry);
+            return err;
+        };
+        // The notebook owns `entry` and `turn_recap` once the append succeeds,
+        // so only a failed append frees them here.
         const entry_id = transcript_store.appendRawBytesEntryClassifiedAt(
             self,
             alloc,
@@ -7712,9 +7720,14 @@ pub const TranscriptRuntime = struct {
             .turn_summary,
             if (summary.completed_at_ms > 0) summary.completed_at_ms else io_mod.milliTimestamp(),
         ) catch |err| {
+            switch (turn_recap) {
+                .text => |text| alloc.free(text),
+                .uncomputed, .empty => {},
+            }
             alloc.free(entry);
             return err;
         };
+        self.notebook.entries.items[self.notebook.entries.items.len - 1].raw_bytes.turn_recap = turn_recap;
         self.markTranscriptContentDirtyFrom(entry_id);
         try self.syncTranscriptWindow(alloc);
         return entry_id;
@@ -7814,7 +7827,6 @@ pub const TranscriptRuntime = struct {
         }
         const kept = window.pending_drops.items.len - ready.items.len;
         if (kept > 0) debug_trace.logf("transcript_window", "drop held entries={d} on screen", .{kept});
-        try self.keepTurnsOfStayingSummaries(alloc, &ready);
         if (ready.items.len == 0) return 0;
 
         var going: transcript_store.EntryIdSet = .empty;
@@ -7917,45 +7929,6 @@ pub const TranscriptRuntime = struct {
             if (owner) |id| try set.put(alloc, id, {});
         }
         return .{ .entries = set };
-    }
-
-    /// Takes out of `ready` every entry of each turn whose summary stays, back
-    /// to the turn's prompt. A turn summary recaps its turn from the turn's
-    /// entries (`tool_group_projection.recapTurnSummary`), so a turn leaves only
-    /// together with its summary. The kept entries stay pending.
-    fn keepTurnsOfStayingSummaries(
-        self: *TranscriptRuntime,
-        alloc: Allocator,
-        ready: *std.ArrayList(u32),
-    ) !void {
-        if (ready.items.len == 0) return;
-        var leaving: std.AutoHashMapUnmanaged(u32, void) = .empty;
-        defer leaving.deinit(alloc);
-        for (ready.items) |id| try leaving.put(alloc, id, {});
-        var keep: std.AutoHashMapUnmanaged(u32, void) = .empty;
-        defer keep.deinit(alloc);
-        const entries = self.notebook.entries.items;
-        for (entries, 0..) |entry, index| {
-            const raw = switch (entry) {
-                .raw_bytes => |value| value,
-                else => continue,
-            };
-            if (raw.class != .turn_summary or leaving.contains(raw.id)) continue;
-            var start = tool_group_projection.turnSummaryTurnStart(entries, index);
-            if (start > 0 and std.meta.activeTag(entries[start - 1]) == .user_turn) start -= 1;
-            for (entries[start..index]) |held| {
-                if (leaving.contains(held.id())) try keep.put(alloc, held.id(), {});
-            }
-        }
-        if (keep.count() == 0) return;
-        var still: usize = 0;
-        for (ready.items) |id| {
-            if (keep.contains(id)) continue;
-            ready.items[still] = id;
-            still += 1;
-        }
-        ready.shrinkRetainingCapacity(still);
-        debug_trace.logf("transcript_window", "drop kept turn entries={d} for their summary", .{keep.count()});
     }
 
     /// Swap the bytes of the `raw_bytes` entry with `entry_id` to a dup of
