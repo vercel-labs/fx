@@ -342,6 +342,10 @@ pub const PromptRunResult = struct {
     /// main's alone.
     subagents: []subagent_usage.Entry = &.{},
 
+    fn isPartial(self: PromptRunResult) bool {
+        return self.exit_code != 0 and self.assistant_output.len > 0 and self.final_output.len == 0;
+    }
+
     pub fn deinit(self: PromptRunResult, alloc: Allocator) void {
         subagent_usage.freeEntries(alloc, self.subagents);
         alloc.free(self.assistant_output);
@@ -4329,6 +4333,9 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
         try out.writer.writeAll(",\"recovery\":");
         try recovery.report(&label_buf).writeJson(&out.writer);
+    }
+    if (result.isPartial()) {
+        try out.writer.writeAll(",\"partial\":true");
     }
     try out.writer.writeAll("}\n");
     return try out.toOwnedSlice();
@@ -9884,4 +9891,45 @@ test "cli ask output classifier maps closed TestPty EIO to TerminalHungUp and pr
     master.?.close(io_mod.getIo());
     master = null;
     try std.testing.expectEqual(@as(anyerror, error.TerminalHungUp), classifyRealOutputError(slave.handle, error.InputOutput, error.OutputWriteFailed));
+}
+
+test "renderFinalJsonResult sets partial true only when failed with output and empty final_output" {
+    const alloc = std.testing.allocator;
+
+    const partial_fail = PromptRunResult{
+        .exit_code = 1,
+        .assistant_output = try alloc.dupe(u8, "partial reply"),
+        .final_output = &.{},
+        .error_code = "ModelError",
+    };
+    defer partial_fail.deinit(alloc);
+    const partial_json = try renderFinalJsonResult(alloc, partial_fail);
+    defer alloc.free(partial_json);
+    var parsed_partial = try std.json.parseFromSlice(std.json.Value, alloc, partial_json, .{});
+    defer parsed_partial.deinit();
+    const partial_field = parsed_partial.value.object.get("partial") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(true, partial_field.bool);
+
+    // Failed without output: partial must be omitted.
+    const empty_fail = PromptRunResult{
+        .exit_code = 1,
+        .assistant_output = try alloc.dupe(u8, ""),
+        .final_output = &.{},
+        .error_code = "ModelError",
+    };
+    defer empty_fail.deinit(alloc);
+    const empty_json = try renderFinalJsonResult(alloc, empty_fail);
+    defer alloc.free(empty_json);
+    try std.testing.expect(std.mem.find(u8, empty_json, "\"partial\"") == null);
+
+    // Success with empty final_output (e.g. legacy test case) or non-empty final_output: partial omitted.
+    const ok_res = PromptRunResult{
+        .exit_code = 0,
+        .assistant_output = try alloc.dupe(u8, "full reply"),
+        .final_output = try alloc.dupe(u8, "full reply"),
+    };
+    defer ok_res.deinit(alloc);
+    const ok_json = try renderFinalJsonResult(alloc, ok_res);
+    defer alloc.free(ok_json);
+    try std.testing.expect(std.mem.find(u8, ok_json, "\"partial\"") == null);
 }

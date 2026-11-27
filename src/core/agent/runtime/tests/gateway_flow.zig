@@ -9363,6 +9363,7 @@ test "processQueuedPrompt resends a content-filtered request three times when th
     try expectModuleStatus(&hooks, 1, .retrying, "Blocked by the content filter · retrying (2/3)");
     try expectModuleStatus(&hooks, 2, .retrying, "Blocked by the content filter · retrying (3/3)");
     try expectRouteStatus(&hooks, 3, .content_filter, "⚠ blocked · content_filter: filtered · content filter");
+    try std.testing.expectEqual(@as(usize, 4), hooks.route_recovery_statuses.items[3].attempt);
     try std.testing.expect(needUserText(&hooks) == null);
 }
 

@@ -445,7 +445,7 @@ Options:
 
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
-Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
+Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent. When a failed run produced partial text with no completed final response, \`partial\` is \`true\`.
 JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Subagent usage and dollar spend are excluded.
 JSON subagents appears only when a subagent did work in this request. It lists each one in the order it first ran, with its name, id, and usage in the same shape, counted for this request alone. fx session <session_id>/<name> reads one and prints the same id.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
@@ -8218,6 +8218,126 @@ describe("fx login Token Pass status", () => {
       } finally {
         gateway.stop();
         cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --json reports recovery.attempt and partial across content-filter outcomes",
+    async () => {
+      const sseContentFilter = (partialText?: string) =>
+        fakeGatewaySse([
+          ...(partialText ? [{ type: "text-delta", id: "t_cf", delta: partialText }] : []),
+          { type: "finish", finishReason: { unified: "content-filter", raw: "content_filter" } },
+        ]);
+
+      // (a) blocked 4 times before output: attempt 4, no partial field
+      {
+        const home = createIsolatedTestHome();
+        const workspace = join(home, "workspace");
+        mkdirSync(workspace, { recursive: true });
+        const gateway = startFakeGateway([
+          sseContentFilter(),
+          sseContentFilter(),
+          sseContentFilter(),
+          sseContentFilter(),
+        ]);
+        try {
+          const env = {
+            AI_GATEWAY_API_KEY: "fake-cf-a-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            HOME: home,
+            FX_MODEL: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          };
+          const res = await runFx(["ask", "--json", "--no-save", "blocked 4x"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+          expect(res.code).toBe(1);
+          const json = JSON.parse(res.stdout);
+          expect(json.exit_code).toBe(1);
+          expect(json.output).toBe("");
+          expect(json.final_output).toBe("");
+          expect(json.error).toBe("ModelError");
+          expect(json.recovery).toMatchObject({ state: "failed", attempt: 4, cause: "content_filter" });
+          expect("partial" in json).toBe(false);
+        } finally {
+          gateway.stop();
+          cleanupIsolatedTestHome(home);
+        }
+      }
+
+      // (b) partial text on all 4: attempt 4, "partial": true, exit 1
+      {
+        const home = createIsolatedTestHome();
+        const workspace = join(home, "workspace");
+        mkdirSync(workspace, { recursive: true });
+        const gateway = startFakeGateway([
+          sseContentFilter("PARTIAL_1 "),
+          sseContentFilter("PARTIAL_2 "),
+          sseContentFilter("PARTIAL_3 "),
+          sseContentFilter("PARTIAL_4"),
+        ]);
+        try {
+          const env = {
+            AI_GATEWAY_API_KEY: "fake-cf-b-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            HOME: home,
+            FX_MODEL: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          };
+          const res = await runFx(["ask", "--json", "--no-save", "partial 4x"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+          expect(res.code).toBe(1);
+          const json = JSON.parse(res.stdout);
+          expect(json.exit_code).toBe(1);
+          expect(json.output).toBe("PARTIAL_4");
+          expect(json.final_output).toBe("");
+          expect(json.partial).toBe(true);
+          expect(json.error).toBe("ModelError");
+          expect(json.recovery).toMatchObject({ state: "failed", attempt: 4, cause: "content_filter" });
+        } finally {
+          gateway.stop();
+          cleanupIsolatedTestHome(home);
+        }
+      }
+
+      // (c) partial then a good resend: exit 0, no partial field, recovery recovered
+      {
+        const home = createIsolatedTestHome();
+        const workspace = join(home, "workspace");
+        mkdirSync(workspace, { recursive: true });
+        const gateway = startFakeGateway([
+          sseContentFilter("PARTIAL_BEFORE_RECOVERY "),
+          fakeGatewayFinalText("CLEAN_FINAL_ANSWER"),
+        ]);
+        try {
+          const env = {
+            AI_GATEWAY_API_KEY: "fake-cf-c-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            HOME: home,
+            FX_MODEL: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          };
+          const res = await runFx(["ask", "--json", "--no-save", "partial then recovered"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+          expect(res.code, res.stderr).toBe(0);
+          const json = JSON.parse(res.stdout);
+          expect(json.exit_code).toBe(0);
+          expect(json.output).toBe("CLEAN_FINAL_ANSWER");
+          expect(json.final_output).toBe("CLEAN_FINAL_ANSWER");
+          expect("partial" in json).toBe(false);
+          expect(json.recovery).toMatchObject({ state: "recovered", attempt: 2, cause: "content_filter" });
+        } finally {
+          gateway.stop();
+          cleanupIsolatedTestHome(home);
+        }
       }
     },
     TIMEOUT,

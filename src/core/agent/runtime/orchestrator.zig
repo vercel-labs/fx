@@ -6299,6 +6299,7 @@ fn pushTerminalProviderFailureStatus(
     if (reason == .content_filter) {
         try request.replaceStatus(.{
             .kind = .content_filter,
+            .attempt = request.attempt(),
             .diagnostic = diagnostic,
         });
         return;
