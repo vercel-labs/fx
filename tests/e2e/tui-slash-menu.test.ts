@@ -4989,6 +4989,29 @@ describe.skipIf(SKIP)("tui: custom shortcuts", () => {
     TEST_TIMEOUT,
   );
 
+  test.each([
+    { earlier: {}, outcome: "no shortcuts are active", wrong: "previous shortcuts stay active" },
+    { earlier: { "ctrl+f": "/fast" }, outcome: "your previous shortcuts stay active", wrong: "no shortcuts are active" },
+  ])(
+    "custom shortcut edit that does not parse says '$outcome' at the turn end",
+    async ({ earlier, outcome, wrong }) => {
+      const fixture = createModelsMenuFixture();
+      writeProfile(fixture.settingsPath, { shortcuts: earlier });
+      const fake = startFakeGateway([fakeGatewayFinalText("EDIT_REPLY")], { models: CATALOG });
+      session = await openShell(fixture, fake);
+
+      // The broken edit lands while fx runs; the next turn end reads it.
+      writeProfile(fixture.settingsPath, { shortcuts: { ...earlier, "ctrl+not-a-key": "/fast" } });
+      await session.sendText("un pedido");
+      await session.waitForPane(replySettled("EDIT_REPLY"), TIMEOUT);
+      const notice = `profile shortcut "ctrl+not-a-key" is invalid; ${outcome}`;
+      await session.waitForPane((pane) => pane.includes(notice), TIMEOUT);
+      expect(await session.capturePane()).not.toContain(wrong);
+      expect(session.isAlive()).toBe(true);
+    },
+    TEST_TIMEOUT,
+  );
+
   test("custom shortcut from an existing profile cannot stage a permission command", async () => {
     const fixture = createModelsMenuFixture();
     writeProfile(fixture.settingsPath, {

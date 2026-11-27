@@ -27,13 +27,15 @@ pub fn reconcile(state: *State, stamp: ?profile_shortcuts.Stamp, load: profile_s
 }
 
 /// The one-line transcript notice for a profile edit that did not apply. It
-/// names the failing chord when the parser found one, and says the previous
-/// shortcuts stay active.
-pub fn formatInvalidNotice(writer: *std.Io.Writer, invalid: profile_shortcuts.Invalid) !void {
+/// names the failing chord when the parser found one. `active` is how many
+/// shortcuts the app keeps; the notice says they stay active only when there
+/// are some.
+pub fn formatInvalidNotice(writer: *std.Io.Writer, invalid: profile_shortcuts.Invalid, active: usize) !void {
+    const outcome: []const u8 = if (active == 0) "no shortcuts are active" else "your previous shortcuts stay active";
     if (invalid.chord().len == 0) {
-        return writer.writeAll("profile shortcuts could not be read; your previous shortcuts stay active");
+        return writer.print("profile shortcuts could not be read; {s}", .{outcome});
     }
-    try writer.print("profile shortcut \"{s}\" is invalid; your previous shortcuts stay active", .{invalid.chord()});
+    try writer.print("profile shortcut \"{s}\" is invalid; {s}", .{ invalid.chord(), outcome });
 }
 
 test "invalid profile notice names the chord and keeps the previous shortcuts" {
@@ -42,16 +44,36 @@ test "invalid profile notice names the chord and keeps the previous shortcuts" {
     var named: profile_shortcuts.Invalid = .{};
     @memcpy(named.chord_bytes[0..14], "ctrl+not-a-key");
     named.chord_len = 14;
-    try formatInvalidNotice(&writer, named);
+    try formatInvalidNotice(&writer, named, 1);
     try std.testing.expectEqualStrings(
         "profile shortcut \"ctrl+not-a-key\" is invalid; your previous shortcuts stay active",
         writer.buffered(),
     );
 
     var unnamed: std.Io.Writer = .fixed(&buffer);
-    try formatInvalidNotice(&unnamed, .{});
+    try formatInvalidNotice(&unnamed, .{}, 2);
     try std.testing.expectEqualStrings(
         "profile shortcuts could not be read; your previous shortcuts stay active",
+        unnamed.buffered(),
+    );
+}
+
+test "invalid profile notice never claims previous shortcuts when none are active" {
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    var named: profile_shortcuts.Invalid = .{};
+    @memcpy(named.chord_bytes[0..14], "ctrl+not-a-key");
+    named.chord_len = 14;
+    try formatInvalidNotice(&writer, named, 0);
+    try std.testing.expectEqualStrings(
+        "profile shortcut \"ctrl+not-a-key\" is invalid; no shortcuts are active",
+        writer.buffered(),
+    );
+
+    var unnamed: std.Io.Writer = .fixed(&buffer);
+    try formatInvalidNotice(&unnamed, .{}, 0);
+    try std.testing.expectEqualStrings(
+        "profile shortcuts could not be read; no shortcuts are active",
         unnamed.buffered(),
     );
 }
@@ -148,7 +170,7 @@ pub fn Runtime(comptime App: type) type {
         fn writeInvalidNotice(app: *App, invalid: profile_shortcuts.Invalid) !void {
             var body: std.Io.Writer.Allocating = .init(app.alloc);
             defer body.deinit();
-            try formatInvalidNotice(&body.writer, invalid);
+            try formatInvalidNotice(&body.writer, invalid, app.personal_shortcuts.map.items().len);
             const text = try body.toOwnedSlice();
             defer app.alloc.free(text);
             try app.writeDomainNotice(.{ .topic = "shortcut", .tone = .warning, .body = text }, true);
