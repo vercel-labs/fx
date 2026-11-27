@@ -30,8 +30,7 @@ test("render-lab lists gated Plan B native scenarios", () => {
 
   expect(output).toContain("same-shell-relaunch");
   expect(output).toContain("buffer-system-frame-bench");
-  expect(output).toContain("startup-scrollback-disabled-overflow");
-  expect(output).toContain("startup-scrollback-enabled-overflow");
+  expect(output).toContain("startup-overflow");
   expect(output).toContain("active-tool-placement");
   expect(output).toContain("user-card-resize-replay-scrollback");
   expect(output).toContain("tui-observability-gauntlet");
@@ -773,31 +772,11 @@ describe.skipIf(SKIP)("tui: render lab", () => {
   );
 
   test(
-    "startup scrollback disabled overflow artifacts pass tape oracle",
+    "startup overflow artifacts pass tape oracle",
     () => {
-      const artifacts = runScenarioArtifacts("startup-scrollback-disabled-overflow");
+      const artifacts = runScenarioArtifacts("startup-overflow");
       expect(artifacts.manifest.failures).toEqual([]);
       expect(artifacts.trace).toMatch(/\[scroll\] preserved_row_release .*accepted=[1-9]\d* .*owned_top=1(?:\s|$)/);
-      expect(artifacts.manifest.frames.some((frame) => frame.event === "overflow-long-prompt-editor-tail-visible")).toBe(true);
-      expect(artifacts.manifest.frames.some((frame) => frame.event === "overflow-submitted-prompt-tail-visible")).toBe(true);
-      expect(artifacts.finalFrame.grid.some((row) => row.includes(artifacts.manifest.markers.submitted[0]!))).toBe(true);
-      expect(artifacts.manifest.markers.history?.every((marker) => artifacts.finalFrame.scrollback.includes(marker))).toBe(true);
-      expect(artifacts.finalFrame.grid.some((row) => /^┃\s*$/.test(row))).toBe(true);
-      expect(artifacts.finalFrame.grid.some((row) => row.includes("HTTP 401"))).toBe(false);
-      expect(artifacts.finalFrame.grid.some((row) => row.includes("RENDER_LAB_LOCAL_GATEWAY_OK"))).toBe(false);
-      expect(artifacts.gatewayRequests).toEqual(["GET /coding-agent/v1/models", "POST /v4/ai/language-model"]);
-      expect(artifacts.stderr).toBe("");
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "startup scrollback enabled overflow starts eagerly without progressive release",
-    () => {
-      const artifacts = runScenarioArtifacts("startup-scrollback-enabled-overflow");
-      expect(artifacts.manifest.failures).toEqual([]);
-      expect(artifacts.trace).toMatch(/\[frame_layout\] fixed_point .*prior_owned_top=1 post_scroll_owned_top=1/);
-      expect(artifacts.trace).not.toMatch(/\[scroll\] preserved_row_release .*accepted=[1-9]\d*/);
       expect(artifacts.manifest.frames.some((frame) => frame.event === "overflow-long-prompt-editor-tail-visible")).toBe(true);
       expect(artifacts.manifest.frames.some((frame) => frame.event === "overflow-submitted-prompt-tail-visible")).toBe(true);
       expect(artifacts.finalFrame.grid.some((row) => row.includes(artifacts.manifest.markers.submitted[0]!))).toBe(true);

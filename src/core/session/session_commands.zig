@@ -193,7 +193,6 @@ fn appendShadowedUserSources(
     try appendShadowedUserSource(writer, "effort", patch.effort != null, sources.effort, &wrote_header);
     try appendShadowedUserSource(writer, "fast_mode", patch.fast_mode != null, sources.fast_mode, &wrote_header);
     try appendShadowedUserSource(writer, "ultrafast_mode", patch.ultrafast_mode != null, sources.ultrafast_mode, &wrote_header);
-    try appendShadowedUserSource(writer, "startup_scrollback", patch.startup_scrollback != null, sources.startup_scrollback, &wrote_header);
     try appendShadowedUserSource(writer, "prompt_history", patch.prompt_history_enabled != null, sources.prompt_history_enabled, &wrote_header);
     if (patch.statusline_item) |item| {
         const source: ?config_runtime.ConfigSource = switch (item.item) {
@@ -426,41 +425,7 @@ pub fn Commands(comptime App: type) type {
                 try writeSettingsStatus(app);
                 return;
             }
-
-            const first = splitFirstWord(trimmed) orelse {
-                try writeSettingsUsage(app);
-                return;
-            };
-            if (!std.ascii.eqlIgnoreCase(first.word, "startup-scrollback")) {
-                try writeSettingsUsage(app);
-                return;
-            }
-
-            const value_split = splitFirstWord(first.rest);
-            if (value_split) |split| {
-                if (split.rest.len != 0) {
-                    try writeSettingsUsage(app);
-                    return;
-                }
-                if (std.ascii.eqlIgnoreCase(split.word, "on")) {
-                    try saveStartupScrollbackSetting(app, true);
-                    return;
-                }
-                if (std.ascii.eqlIgnoreCase(split.word, "off")) {
-                    try saveStartupScrollbackSetting(app, false);
-                    return;
-                }
-                try writeSettingsUsage(app);
-                return;
-            }
-
-            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
-                try writeSettingsLoadError(app, err);
-                return;
-            };
-            defer settings.deinit(app.alloc);
-
-            try saveStartupScrollbackSetting(app, !(settings.startup_scrollback orelse true));
+            try writeSettingsUsage(app);
         }
 
         pub fn handleModel(app: *App, agent: *AppAgent, query: []const u8) !void {
@@ -1332,79 +1297,22 @@ pub fn Commands(comptime App: type) type {
                 return;
             };
             defer detailed.deinit(app.alloc);
-            const settings = &detailed.settings;
-
-            const startup_scrollback_label = if (settings.startup_scrollback orelse true) "on" else "off";
-            const msg = try app.alloc.print("model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
+            const msg = try app.alloc.print("model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}", .{
                 provider_runtime.model(app),
                 @tagName(detailed.sources.models.get(model_provider.NameKey.fromProvider(.gateway))),
                 permissions.permissionModeDisplayLabel(app_permission_runtime.Runtime(App).viewOf(app, agents.screenAgentOf(app)).mode),
                 app.workspace_root,
                 app.agent_step_limit,
-                startup_scrollback_label,
             });
             defer app.alloc.free(msg);
             try app.writeDomainNotice(.{ .topic = "settings", .tone = .neutral, .body = msg }, true);
-        }
-
-        fn saveStartupScrollbackSetting(app: *App, enabled: bool) !void {
-            var attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
-                .{ .startup_scrollback = enabled },
-            );
-            defer attempt.deinit(app.alloc);
-            switch (attempt) {
-                .failure => |failure| {
-                    try reportUserSettingsFailure(
-                        app,
-                        "startup-scrollback",
-                        failure.err,
-                        failure.cleanup,
-                        false,
-                    );
-                    return;
-                },
-                .outcome => |outcome| {
-                    const sources = try reportUserSettingsCommit(
-                        app,
-                        "startup-scrollback",
-                        .{ .startup_scrollback = enabled },
-                        outcome,
-                        null,
-                        false,
-                    );
-                    const label = if (enabled) "on" else "off";
-                    var out: std.Io.Writer.Allocating = .init(app.alloc);
-                    defer out.deinit();
-                    try out.writer.print("startup_scrollback: {s} ", .{label});
-                    if (sources) |resolved| {
-                        switch (resolved.startup_scrollback) {
-                            .user_global => try out.writer.writeAll(
-                                "(applies on next launch)",
-                            ),
-                            else => try out.writer.print(
-                                "(saved user default; current source={s})",
-                                .{@tagName(resolved.startup_scrollback)},
-                            ),
-                        }
-                    } else {
-                        try out.writer.writeAll(
-                            "(saved user default; next-launch source unknown)",
-                        );
-                    }
-                    const msg = try out.toOwnedSlice();
-                    defer app.alloc.free(msg);
-                    try app.writeDomainNotice(.{ .topic = "settings", .tone = .neutral, .body = msg }, true);
-                    return;
-                },
-            }
         }
 
         fn writeSettingsUsage(app: *App) !void {
             try app.writeDomainNotice(.{
                 .topic = "",
                 .tone = .@"error",
-                .body = "usage: /settings [startup-scrollback [on|off]]",
+                .body = "usage: /settings",
             }, true);
         }
 
@@ -2526,7 +2434,7 @@ test "session_commands history setting toggles durable input history" {
     try std.testing.expectEqual(true, enabled.prompt_history_enabled.?);
 }
 
-test "session_commands handleSettings shows startup scrollback status" {
+test "session_commands handleSettings shows settings status" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2551,94 +2459,7 @@ test "session_commands handleSettings shows startup scrollback status" {
     try expectTranscriptContains(&app, "model: anthropic/test-model");
     try expectTranscriptContains(&app, "permission_mode: auto");
     try expectTranscriptContains(&app, "step_limit: 12");
-    try expectTranscriptContains(&app, "startup_scrollback: off");
-}
-
-test "session_commands handleSettings toggles and persists startup scrollback" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-
-    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
-    defer home.deinit();
-
-    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/test-model");
-    defer app.deinit();
-
-    try Commands(FakeApp).handleSettings(&app, "startup-scrollback");
-    try expectTranscriptContains(&app, "startup_scrollback: off (applies on next launch)");
-
-    var toggled = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
-    defer toggled.deinit(std.testing.allocator);
-    try std.testing.expectEqual(false, toggled.startup_scrollback.?);
-
-    app.clearTranscript();
-    try Commands(FakeApp).handleSettings(&app, "startup-scrollback on");
-    try expectTranscriptContains(&app, "startup_scrollback: on (applies on next launch)");
-
-    var enabled = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
-    defer enabled.deinit(std.testing.allocator);
-    try std.testing.expectEqual(true, enabled.startup_scrollback.?);
-
-    app.clearTranscript();
-    try Commands(FakeApp).handleSettings(&app, "startup-scrollback off");
-    try expectTranscriptContains(&app, "startup_scrollback: off (applies on next launch)");
-
-    var disabled = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
-    defer disabled.deinit(std.testing.allocator);
-    try std.testing.expectEqual(false, disabled.startup_scrollback.?);
-}
-
-test "session_commands startup scrollback ignores project profile-only shadowing" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeFixtureFile(
-        tmp.dir,
-        "workspace/.fx.json",
-        "{\"startup_scrollback\":true}\n",
-    );
-    const home_root = try io_mod.dirRealpathAlloc(
-        std.testing.allocator,
-        tmp.dir,
-        "home",
-    );
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(
-        std.testing.allocator,
-        tmp.dir,
-        "workspace",
-    );
-    defer std.testing.allocator.free(workspace_root);
-
-    const home = try SessionCommandTestHome.install(
-        std.testing.allocator,
-        home_root,
-    );
-    defer home.deinit();
-
-    var app = try FakeApp.init(
-        std.testing.allocator,
-        workspace_root,
-        "anthropic/test-model",
-    );
-    defer app.deinit();
-
-    try Commands(FakeApp).handleSettings(
-        &app,
-        "startup-scrollback off",
-    );
-
-    try expectTranscriptContains(&app, "startup_scrollback: off (applies on next launch)");
-    try std.testing.expect(std.mem.find(u8, app.text(), "higher-precedence startup_scrollback=project") == null);
+    try std.testing.expect(std.mem.find(u8, app.text(), "startup_scrollback") == null);
 }
 
 test "session_commands statusline shadow notice names the preference field" {
@@ -2684,7 +2505,7 @@ test "session_commands notification shadow notice preserves valid workspace scop
     );
 }
 
-test "session_commands handleSettings reports usage and save failures" {
+test "session_commands handleSettings reports usage" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2699,15 +2520,11 @@ test "session_commands handleSettings reports usage and save failures" {
     defer app.deinit();
 
     try Commands(FakeApp).handleSettings(&app, "bogus");
-    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]]");
+    try expectTranscriptContains(&app, "usage: /settings");
 
     app.clearTranscript();
     try Commands(FakeApp).handleSettings(&app, "startup-scrollback off extra");
-    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]]");
-
-    app.clearTranscript();
-    try Commands(FakeApp).handleSettings(&app, "startup-scrollback off");
-    try expectTranscriptContains(&app, "✗ startup-scrollback: not saved to global settings (HomeNotSet)");
+    try expectTranscriptContains(&app, "usage: /settings");
     try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
 }
 

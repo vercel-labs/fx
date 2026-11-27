@@ -347,12 +347,12 @@ test "parse extracts settings command payload" {
         .settings => |rest| try std.testing.expectEqualStrings("", rest),
         else => return error.TestExpectedEqual,
     }
-    switch (parse(testSlashRegistry(), "/settings startup-scrollback")) {
-        .settings => |rest| try std.testing.expectEqualStrings("startup-scrollback", rest),
+    switch (parse(testSlashRegistry(), "/settings foo")) {
+        .settings => |rest| try std.testing.expectEqualStrings("foo", rest),
         else => return error.TestExpectedEqual,
     }
-    switch (parse(testSlashRegistry(), "/settings startup-scrollback off")) {
-        .settings => |rest| try std.testing.expectEqualStrings("startup-scrollback off", rest),
+    switch (parse(testSlashRegistry(), "/settings foo bar")) {
+        .settings => |rest| try std.testing.expectEqualStrings("foo bar", rest),
         else => return error.TestExpectedEqual,
     }
 }
@@ -630,12 +630,12 @@ test "route forwards settings payload" {
     var ctx: TestContext = .{};
     var handlers = testHandlers(&ctx);
     handlers.handle_settings = recordSettings;
-    const cmd = "/settings startup-scrollback off";
+    const cmd = "/settings foo bar";
 
     try route(testSlashRegistry(), &handlers, cmd);
 
     try std.testing.expectEqualStrings("settings", ctx.called);
-    try std.testing.expectEqualStrings("startup-scrollback off", ctx.payload);
+    try std.testing.expectEqualStrings("foo bar", ctx.payload);
 }
 
 test "route forwards notifications payload" {

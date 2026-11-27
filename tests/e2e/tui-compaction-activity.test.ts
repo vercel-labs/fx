@@ -98,7 +98,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   mkdirSync(workspace);
   writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
   writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-    model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    model: FAKE_GATEWAY_MODEL, auto_upgrade: false,
   }));
   // Failure attempts need an older exchange outside the retained suffix, but
   // must leave the next ordinary request below the automatic pressure threshold.
@@ -330,7 +330,7 @@ async function foldedReadAfterReopen(trigger: "auto" | "overflow") {
   writeFileSync(join(workspace, "b.txt"), "bravo\n");
   writeFileSync(join(workspace, "c.txt"), "charlie\n");
   writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-    model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    model: FAKE_GATEWAY_MODEL, auto_upgrade: false,
     ...(trigger === "auto" ? { auto_compact_percent: 10 } : {}),
   }));
   const PROMPT = "Read the three files.";
@@ -972,7 +972,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     mkdirSync(join(home, ".fx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-      model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+      model: FAKE_GATEWAY_MODEL, auto_upgrade: false,
     }));
     for (let n = 1; n <= 30; n++) {
       writeFileSync(join(workspace, `probe-${n}.txt`), `STEER_PROBE_${n}_8d4 context pressure line\n`.repeat(250));
@@ -1079,7 +1079,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     mkdirSync(join(home, ".fx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-      model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+      model: FAKE_GATEWAY_MODEL, auto_upgrade: false,
     }));
     const answers = [
       "CTRLO_OLDER_FIRST_5c1",
@@ -1164,7 +1164,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     mkdirSync(workspace);
     writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
     writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-      model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+      model: FAKE_GATEWAY_MODEL, auto_upgrade: false,
     }));
     const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
     writeFxLogin(home, issuer.issuerUrl, "launch-token");
@@ -1293,7 +1293,7 @@ async function readAroundNotice(middle: NoticeMiddle) {
   writeFileSync(join(workspace, "b.txt"), "bravo\n");
   writeFileSync(join(workspace, "c.txt"), "charlie\n");
   writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-    model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    model: FAKE_GATEWAY_MODEL, auto_upgrade: false,
     ...(middle === "auto" ? { auto_compact_percent: 10 } : {}),
   }));
   // The earlier turn gives compaction something to fold. It reports no
@@ -1519,7 +1519,7 @@ describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live
       writeFileSync(join(workspace, `part${part}.txt`), `${body(`part${part}`, 300)}\n`);
     }
     writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-      model: LIVE_MODEL, auto_compact_percent: 10, auto_upgrade: false, startup_scrollback: false,
+      model: LIVE_MODEL, auto_compact_percent: 10, auto_upgrade: false,
     }));
     // A local gateway plays the earlier turn, so only this turn and its
     // compaction reach the live model.

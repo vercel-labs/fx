@@ -19,6 +19,8 @@ export const EXPANDED_TERMINAL_TOOL_MARKER = "Ran sleep 1; i=1";
 const ACTIVE_TOOL_FINAL_MARKER = "RENDER_LAB_LOCAL_GATEWAY_OK";
 const OBSERVABILITY_PERMISSION_PROMPT = "Would you like to run the following command?";
 const OBSERVABILITY_PERMISSION_REVIEW = "Permission needed";
+// The shell prompt the scenarios print before each fx launch.
+export const PROMPT_TEXT = "FX_RENDER_LAB%";
 
 export function commandMoreCount(text: string): number | null {
   const match = text.match(/│ … (\d+) (?:(?:line|lines) more \(ctrl(?:\+| )o to view\)|more \(ctrl(?:\+| )o\)|more)/);
@@ -71,6 +73,7 @@ export function analyzeRun(manifest: RenderLabManifest) {
       input_rows.push(footers.find((footer) => footer.multiline)!.input);
     }
     const logoRows = findLogoRows(frame.grid);
+    const activeLogoRows = logoRows.filter((row) => row >= activeRegionStart(frame.grid, footers[0]));
     const expectsChrome = expectsFxChrome(frame, manifest, logoRows, input_rows);
     const viewerFooterPresent = hasTranscriptViewerFooter(frame.grid);
 
@@ -87,7 +90,7 @@ export function analyzeRun(manifest: RenderLabManifest) {
     assertUserCardResizeScenario(failures, frame, manifest);
     assertTuiObservabilityFrame(failures, frame, manifest);
 
-    if (countLogoBlocks(frame.grid, logoRows) > 1) {
+    if (countLogoBlocks(frame.grid, activeLogoRows) > 1) {
       push(failures, "single-active-logo", frame, "more than one active fx logo block is visible");
     }
 
@@ -163,7 +166,7 @@ export function analyzeRun(manifest: RenderLabManifest) {
       }
     }
 
-    const fxBand = findFxBand(frame.grid, logoRows, footers[0]);
+    const fxBand = findFxBand(frame.grid, activeLogoRows, footers[0]);
     if (fxBand) {
       for (const marker of manifest.markers.shell) {
         const badRows = frame.grid
@@ -240,7 +243,7 @@ export function analyzeRun(manifest: RenderLabManifest) {
     }
   }
   if (traceFrame && isStartupOverflowScenario(manifest.scenario)) {
-    assertStartupOverflowTrace(failures, traceFrame, manifest, trace);
+    assertStartupOverflowTrace(failures, traceFrame, trace);
     assertStartupOverflowTape(failures, traceFrame, manifest);
   }
   if (traceFrame && manifest.scenario === "tui-observability-gauntlet") {
@@ -1034,6 +1037,16 @@ function semanticText(line: string): string {
   return line;
 }
 
+// The active fx starts below the last shell prompt above its footer. Output
+// from an earlier fx session sits above that prompt, so it is not part of the band.
+function activeRegionStart(grid: string[], footer: Footer | undefined): number {
+  const end = footer ? footer.input : grid.length;
+  for (let index = end - 1; index >= 0; index -= 1) {
+    if (semanticText(grid[index] ?? "").trimStart().startsWith(PROMPT_TEXT)) return index + 1;
+  }
+  return 0;
+}
+
 function findFxBand(grid: string[], logoRows: number[], footer: Footer | undefined): { start: number; end: number } | null {
   if (logoRows.length === 0 || !footer) return null;
   const start = Math.min(...logoRows);
@@ -1145,10 +1158,7 @@ function capturesFullScrollback(manifest: RenderLabManifest): boolean {
 }
 
 function isStartupOverflowScenario(scenario: string): boolean {
-  return (
-    scenario === "startup-scrollback-disabled-overflow" ||
-    scenario === "startup-scrollback-enabled-overflow"
-  );
+  return scenario === "startup-overflow";
 }
 
 export function multilineInputMarkersForFrame(
@@ -1163,7 +1173,6 @@ export function multilineInputMarkersForFrame(
 function assertStartupOverflowTrace(
   failures: RenderLabFailure[],
   frame: RenderLabFrame,
-  manifest: RenderLabManifest,
   trace: string,
 ): void {
   if (!trace.includes("[frame_layout] fixed_point iteration=")) {
@@ -1175,20 +1184,11 @@ function assertStartupOverflowTrace(
   if (!/\[frame_commit\] terminal_movement .*materialized_rows=[1-9]\d*/.test(trace)) {
     push(failures, "document-materialization-trace", frame, "trace has no physically materialized transcript rows");
   }
-  if (manifest.scenario === "startup-scrollback-disabled-overflow") {
-    if (!/\[scroll\] preserved_row_release .*accepted=[1-9]\d*/.test(trace)) {
-      push(failures, "progressive-release-trace", frame, "trace has no accepted preserved-row release");
-    }
-    if (!/\[scroll\] preserved_row_release .*owned_top=1(?:\s|$)/.test(trace)) {
-      push(failures, "progressive-release-row-one", frame, "trace never releases ownership through row 1");
-    }
-  } else {
-    if (/\[scroll\] preserved_row_release .*accepted=[1-9]\d*/.test(trace)) {
-      push(failures, "eager-startup-progressive-release", frame, "eager startup unexpectedly released preserved rows");
-    }
-    if (!/\[frame_layout\] fixed_point .*prior_owned_top=1 post_scroll_owned_top=1/.test(trace)) {
-      push(failures, "eager-startup-row-one", frame, "eager startup did not begin from row 1 ownership");
-    }
+  if (!/\[scroll\] preserved_row_release .*accepted=[1-9]\d*/.test(trace)) {
+    push(failures, "progressive-release-trace", frame, "trace has no accepted preserved-row release");
+  }
+  if (!/\[scroll\] preserved_row_release .*owned_top=1(?:\s|$)/.test(trace)) {
+    push(failures, "progressive-release-row-one", frame, "trace never releases ownership through row 1");
   }
 }
 

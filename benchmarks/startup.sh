@@ -60,7 +60,7 @@ mkdir -p "$SESSION_FIXTURE_HOME" "$SESSION_FIXTURE_WORKSPACE" "$GENERAL_FIXTURE_
 mkdir -p "$GENERAL_FIXTURE_HOME/.fx"
 chmod 700 "$GENERAL_FIXTURE_HOME/.fx"
 printf '%s\n' \
-  '{"model":"openai/gpt-5.4","effort":"high","fast_mode":false,"startup_scrollback":true,"prompt_history":{"enabled":true},"statusLine":{"sandbox":true,"context":true},"permission":{"bash":{"git status *":"allow"}}}' \
+  '{"model":"openai/gpt-5.4","effort":"high","fast_mode":false,"prompt_history":{"enabled":true},"statusLine":{"sandbox":true,"context":true},"permission":{"bash":{"git status *":"allow"}}}' \
   > "$GENERAL_FIXTURE_HOME/.fx/settings.json"
 chmod 600 "$GENERAL_FIXTURE_HOME/.fx/settings.json"
 python3 "${REPO_ROOT}/benchmarks/session_list_fixture.py" \

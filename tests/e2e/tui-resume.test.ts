@@ -399,7 +399,7 @@ test.skipIf(!tmuxAvailable())(
     const tapePath = join(root, "resume.fxtape");
     mkdirSync(join(home, ".fx"), { recursive: true });
     mkdirSync(workspace);
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ startup_scrollback: false }));
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
     const labels = Array.from({ length: 67 }, (_, i) => `RESUME_ROW_${String(i).padStart(3, "0")}`);
     const gateway = startFakeGateway([
       fakeGatewayFinalText(labels.join("\n\n")),
@@ -7542,7 +7542,6 @@ type CtrlGScreens = {
 async function captureCtrlGRelaunch(options: {
   label: string;
   reply: string | null;
-  startupScrollback?: boolean;
   prefillShellLines?: number;
   cols?: number;
   rows?: number;
@@ -7559,14 +7558,6 @@ async function captureCtrlGRelaunch(options: {
   mkdirSync(home);
   mkdirSync(workspace);
   mkdirSync(installDir);
-  if (options.startupScrollback !== undefined) {
-    mkdirSync(join(home, ".fx"), { mode: 0o700 });
-    writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ startup_scrollback: options.startupScrollback }) + "\n",
-      { mode: 0o600 },
-    );
-  }
   const workspaceRoot = realpathSync(workspace);
   const installedFx = join(installDir, "fx");
   copyFileSync(FX_BIN, installedFx);
@@ -7680,44 +7671,36 @@ const CTRL_G_SCREEN_REPLY = [
   "CTRL_G_SCREEN_LAST_LINE",
 ].join("\n\n");
 
-for (const startupScrollback of [undefined, false] as const) {
-  const setting = startupScrollback === undefined ? "startup_scrollback on by default" : "startup_scrollback off";
-  test.skipIf(!tmuxAvailable())(
-    `upgrade ctrl-g keeps the old screen in place until the new build redraws it (${setting})`,
-    async () => {
-      const screens = await captureCtrlGRelaunch({
-        label: startupScrollback === undefined ? "default" : "no-scrollback",
-        reply: CTRL_G_SCREEN_REPLY,
-        startupScrollback,
-      });
-      expectGapKeepsScreen(screens, "CTRL_G_SCREEN_LAST_LINE");
-      expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_FIRST_LINE")).toBe(1);
-      expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_LAST_LINE")).toBe(1);
-    },
-    UPGRADE_TIMEOUT * 2,
-  );
-}
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g keeps the old screen in place until the new build redraws it",
+  async () => {
+    const screens = await captureCtrlGRelaunch({
+      label: "default",
+      reply: CTRL_G_SCREEN_REPLY,
+    });
+    expectGapKeepsScreen(screens, "CTRL_G_SCREEN_LAST_LINE");
+    expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_FIRST_LINE")).toBe(1);
+    expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_LAST_LINE")).toBe(1);
+  },
+  UPGRADE_TIMEOUT * 2,
+);
 
-for (const startupScrollback of [undefined, false] as const) {
-  const setting = startupScrollback === undefined ? "startup_scrollback on by default" : "startup_scrollback off";
-  test.skipIf(!tmuxAvailable())(
-    `upgrade ctrl-g without a saved turn keeps the old screen in place until the new build redraws it (${setting})`,
-    async () => {
-      // The session saved nothing, so the new build starts twice: once for
-      // the session it cannot find and once for a fresh one (D81). With
-      // startup scrollback off, the short screen leaves the cursor above the
-      // rows a launch keeps free, so no launch moves it.
-      const screens = await captureCtrlGRelaunch({
-        label: startupScrollback === undefined ? "fresh-default" : "fresh-no-scrollback",
-        reply: null,
-        startupScrollback,
-      });
-      expectGapKeepsScreen(screens, "Run /help for commands");
-      expect(countOccurrences(screens.redrawn, "Run /help for commands")).toBe(1);
-    },
-    UPGRADE_TIMEOUT * 2,
-  );
-}
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g without a saved turn keeps the old screen in place until the new build redraws it",
+  async () => {
+    // The session saved nothing, so the new build starts twice: once for
+    // the session it cannot find and once for a fresh one (D81). The short
+    // screen leaves the cursor above the rows a launch keeps free, so no
+    // launch moves it.
+    const screens = await captureCtrlGRelaunch({
+      label: "fresh",
+      reply: null,
+    });
+    expectGapKeepsScreen(screens, "Run /help for commands");
+    expect(countOccurrences(screens.redrawn, "Run /help for commands")).toBe(1);
+  },
+  UPGRADE_TIMEOUT * 2,
+);
 
 test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g without a saved turn on a filled screen keeps the old screen in place until the new build redraws it",
@@ -7726,9 +7709,8 @@ test.skipIf(!tmuxAvailable())(
     // SessionNotFound teardown (D81) must not wipe rows above the footer
     // before the retry clears and redraws the screen.
     const screens = await captureCtrlGRelaunch({
-      label: "fresh-filled-no-scrollback",
+      label: "fresh-filled",
       reply: null,
-      startupScrollback: false,
       prefillShellLines: 25,
     });
     expectGapKeepsScreen(screens, "Run /help for commands");
@@ -7738,7 +7720,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "startup_scrollback off does not push ten blank lines when resuming at the bottom of the terminal",
+  "resuming at the bottom of the terminal does not push ten blank lines",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-no-blank-block-")));
     const home = join(root, "home");
@@ -7748,12 +7730,6 @@ test.skipIf(!tmuxAvailable())(
     const launchGate = join(root, "launch-gate");
     mkdirSync(home);
     mkdirSync(workspace);
-    mkdirSync(join(home, ".fx"), { mode: 0o700 });
-    writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ startup_scrollback: false }) + "\n",
-      { mode: 0o600 },
-    );
     const workspaceRoot = realpathSync(workspace);
     const gateway = startFakeGateway([fakeGatewayFinalText("RESUME_NO_BLANK_REPLY")]);
     let first: TmuxSession | null = null;
@@ -12860,7 +12836,7 @@ async function resumeLongHistory(options: DrainCase) {
   mkdirSync(workspace);
   writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
   writeFileSync(join(workspace, "a.txt"), "alpha\n");
-  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false }));
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model: FAKE_GATEWAY_MODEL, auto_upgrade: false }));
   const history = Array.from({ length: options.lines }, (_, i) => `history line ${String(i + 1).padStart(5, "0")} alpha beta gamma`);
   const hold = heldFakeGatewayFinalText();
   let seeding = true;
@@ -13054,7 +13030,7 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
     mkdirSync(join(home, ".fx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
-    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false }));
+    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model: FAKE_GATEWAY_MODEL, auto_upgrade: false }));
     const mcpFixture = startModernMcpHttpFixture("stall_call");
     writeStalledMcpConfig(home, mcpFixture.url);
     const history = Array.from({ length: lines }, (_, i) => `history line ${String(i + 1).padStart(5, "0")} alpha beta gamma`);

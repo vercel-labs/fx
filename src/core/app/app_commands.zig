@@ -1292,14 +1292,12 @@ pub fn Handlers(comptime App: type) type {
                     try session_commands.Commands(App).handleSettings(app, rest);
                     return;
                 };
-                defer settings.deinit(app.alloc);
+                settings.deinit(app.alloc);
                 if (comptime @hasField(App, "skills")) app.skills.closeMenu();
                 if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
                 closeHelpMenuIfPresent(app);
                 closeInlineCommandMenusIfPresent(app);
-                app.input_runtime.settings_menu.openWithStartupScrollback(
-                    settings.startup_scrollback orelse true,
-                );
+                app.input_runtime.settings_menu.open();
                 app.shell.render_requests.request(.footer);
                 return;
             }
@@ -1947,7 +1945,6 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     }
     if (comptime @hasField(App, "permission_engine")) snapshot.permission_mode = @tagName(app_permission_runtime.Runtime(App).viewOf(app, agents.screenAgentOf(app)).mode);
     if (comptime @hasField(App, "input_runtime")) {
-        snapshot.startup_scrollback = app.input_runtime.settings_menu.startup_scrollback;
         if (comptime @hasField(@TypeOf(app.input_runtime), "slash_menu_categories")) {
             snapshot.slash_menu_categories = app.input_runtime.slash_menu_categories;
         }
@@ -2095,16 +2092,6 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         },
         .permission_mode => try session_commands.Commands(@TypeOf(app.*)).handlePermissions(app, agents.screenAgentOf(app), change.value),
         .sound_level => try handleNotificationsCommand(app, change.value),
-        .startup_scrollback => {
-            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            try session_commands.Commands(@TypeOf(app.*)).handleSettings(
-                app,
-                if (enabled) "startup-scrollback on" else "startup-scrollback off",
-            );
-            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch return;
-            defer settings.deinit(app.alloc);
-            app.input_runtime.settings_menu.startup_scrollback = settings.startup_scrollback orelse true;
-        },
         .prompt_history => try session_commands.Commands(@TypeOf(app.*)).handleHistory(app, change.value),
     }
 }

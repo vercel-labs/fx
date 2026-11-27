@@ -114,7 +114,6 @@ pub const UserSettingsPatch = struct {
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
     update_channel: ?update_target.Channel = null,
-    startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
     statusline_item: ?StatuslineItemPatch = null,
     session_titles: ?bool = null,
@@ -150,7 +149,6 @@ pub const UserSettingsPatch = struct {
             self.slash_menu_categories == null and
             self.collapse_tool_calls == null and
             self.update_channel == null and
-            self.startup_scrollback == null and
             self.prompt_history_enabled == null and
             self.statusline_item == null and
             self.session_titles == null and
@@ -262,7 +260,6 @@ const UserPreferenceField = enum(u4) {
     slash_menu_categories,
     collapse_tool_calls,
     update_channel,
-    startup_scrollback,
     prompt_history_enabled,
     statusline_context,
     statusline_session,
@@ -282,7 +279,6 @@ const UserPreferenceField = enum(u4) {
             .slash_menu_categories => "settings.json.preference-migration.slash_menu_categories.json",
             .collapse_tool_calls => "settings.json.preference-migration.collapse_tool_calls.json",
             .update_channel => "settings.json.preference-migration.update_channel.json",
-            .startup_scrollback => "settings.json.preference-migration.startup_scrollback.json",
             .prompt_history_enabled => "settings.json.preference-migration.prompt_history_enabled.json",
             .statusline_context => "settings.json.preference-migration.statusline_context.json",
             .statusline_session => "settings.json.preference-migration.statusline_session.json",
@@ -300,7 +296,6 @@ const user_preference_fields = [_]UserPreferenceField{
     .slash_menu_categories,
     .collapse_tool_calls,
     .update_channel,
-    .startup_scrollback,
     .prompt_history_enabled,
     .statusline_context,
     .statusline_session,
@@ -1285,7 +1280,6 @@ fn applyUserPatchToRoot(
     if (patch.slash_menu_categories) |value| application.changed = try putBool(arena, &root.object, "slash_menu_categories", value) or application.changed;
     if (patch.collapse_tool_calls) |value| application.changed = try putBool(arena, &root.object, "collapse_tool_calls", value) or application.changed;
     if (patch.update_channel) |value| application.changed = try putString(arena, &root.object, "update_channel", value.label()) or application.changed;
-    if (patch.startup_scrollback) |value| application.changed = try putBool(arena, &root.object, "startup_scrollback", value) or application.changed;
     if (patch.session_titles) |value| application.changed = try putBool(arena, &root.object, "session_titles", value) or application.changed;
 
     if (patch.prompt_history_enabled) |enabled| {
@@ -1442,13 +1436,6 @@ fn cleanupLegacyWorkspacePreferences(
             "update_channel",
             .update_channel,
             patch.update_channel != null,
-            application,
-        );
-        removeLegacyLeaf(
-            &entry.value_ptr.object,
-            "startup_scrollback",
-            .startup_scrollback,
-            patch.startup_scrollback != null,
             application,
         );
         removeLegacyLeaf(
@@ -2259,7 +2246,7 @@ fn validateKnownSettingsObject(
             }
         }
     }
-    inline for (&.{ "context", "fast_mode", "ultrafast_mode", "auto_upgrade", "slash_menu_categories", "startup_scrollback", "yolo_acknowledged", "provider_strict" }) |key| {
+    inline for (&.{ "context", "fast_mode", "ultrafast_mode", "auto_upgrade", "slash_menu_categories", "yolo_acknowledged", "provider_strict" }) |key| {
         if (object.get(key)) |value| {
             if (value != .bool) return error.InvalidSettingsFormat;
         }
@@ -2496,7 +2483,7 @@ test "user patch writes user preferences at top level" {
         .fast_mode = true,
         .slash_menu_categories = false,
         .update_channel = .dev,
-        .startup_scrollback = false,
+        .auto_upgrade = false,
         .prompt_history_enabled = false,
         .statusline_item = .{ .item = .context, .enabled = true },
         .notification_turn_end = true,
@@ -2517,7 +2504,7 @@ test "user patch writes user preferences at top level" {
     try std.testing.expect(std.mem.find(u8, bytes, "\"fast_mode\":true") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"slash_menu_categories\":false") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"update_channel\":\"dev\"") != null);
-    try std.testing.expect(std.mem.find(u8, bytes, "\"startup_scrollback\":false") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"auto_upgrade\":false") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"prompt_history\":{\"enabled\":false}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"status_line\":{\"context\":true}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"sound\":{\"turn_end\":true,\"attention_required\":false}") != null);
@@ -2644,7 +2631,7 @@ test "durable validation rejects malformed workspace statusline" {
 
     try std.testing.expectError(
         error.InvalidSettingsFormat,
-        store.applyUserPatch(alloc, .{ .startup_scrollback = false }),
+        store.applyUserPatch(alloc, .{ .fast_mode = false }),
     );
 }
 
@@ -2926,7 +2913,7 @@ test "user patch preserves unknown fields in unrelated workspaces" {
 
     var outcome = try store.applyUserPatch(
         alloc,
-        .{ .startup_scrollback = false },
+        .{ .fast_mode = false },
     );
     defer outcome.deinit(alloc);
     try std.testing.expect(outcome == .committed);
@@ -3376,7 +3363,7 @@ test "missing user settings is created through private durable commit" {
     var store = try Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
 
-    var outcome = try store.applyUserPatch(alloc, .{ .startup_scrollback = false });
+    var outcome = try store.applyUserPatch(alloc, .{ .fast_mode = false });
     defer outcome.deinit(alloc);
     const stat = try store.primaryStatForTest();
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
@@ -3446,48 +3433,6 @@ test "oversized candidate leaves prior primary unchanged" {
     try std.testing.expectEqualStrings("{}\n", primary);
 }
 
-test "startup scrollback false is a present user patch" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{\"startup_scrollback\":false}\n");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    var store = try Store.initFromHome(alloc, home, .writable);
-    defer store.deinit(alloc);
-
-    var outcome = try store.applyUserPatch(alloc, .{ .startup_scrollback = false });
-    defer outcome.deinit(alloc);
-    try std.testing.expect(outcome == .unchanged);
-}
-
-test "startup scrollback user patch removes matching legacy workspace value" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const fixture = try alloc.print("{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n", .{workspace});
-    defer alloc.free(fixture);
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
-    var store = try Store.initFromHome(alloc, home, .writable);
-    defer store.deinit(alloc);
-
-    var outcome = try store.applyUserPatch(alloc, .{ .startup_scrollback = false });
-    defer outcome.deinit(alloc);
-    try std.testing.expect(outcome == .committed);
-    try std.testing.expectEqual(@as(usize, 1), outcome.committed.cleanup.fields_removed);
-    try std.testing.expectEqual(@as(usize, 1), outcome.committed.cleanup.workspaces_changed);
-}
-
 test "unrelated user patch preserves inert output level values" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3507,7 +3452,7 @@ test "unrelated user patch preserves inert output level values" {
     var store = try Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
 
-    var outcome = try store.applyUserPatch(alloc, .{ .startup_scrollback = false });
+    var outcome = try store.applyUserPatch(alloc, .{ .fast_mode = false });
     defer outcome.deinit(alloc);
     try std.testing.expect(outcome == .committed);
     try std.testing.expectEqual(@as(usize, 0), outcome.committed.cleanup.fields_removed);
@@ -3519,7 +3464,7 @@ test "unrelated user patch preserves inert output level values" {
     try std.testing.expect(std.mem.find(u8, primary, "\"output_level\":{\"legacy\":true}") != null);
     try std.testing.expect(std.mem.find(u8, primary, "\"output_level\":[\"quiet\",7]") != null);
     try std.testing.expect(std.mem.find(u8, primary, "\"future\":true") != null);
-    try std.testing.expect(std.mem.find(u8, primary, "\"startup_scrollback\":false") != null);
+    try std.testing.expect(std.mem.find(u8, primary, "\"fast_mode\":false") != null);
 }
 
 test "second settings commit creates a sequenced private backup" {
@@ -3784,7 +3729,7 @@ test "post-rename failure returns SettingsCommitIndeterminate" {
 
     try std.testing.expectError(
         error.SettingsCommitIndeterminate,
-        store.applyUserPatch(alloc, .{ .startup_scrollback = false }),
+        store.applyUserPatch(alloc, .{ .fast_mode = false }),
     );
 }
 

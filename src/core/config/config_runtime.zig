@@ -69,7 +69,6 @@ pub const Settings = struct {
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
     theme: ?[]const u8 = null,
-    startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
     effort: ?types.ReasoningEffort = null,
     /// Optional review-model override for automatic permission review. Owned by
@@ -155,7 +154,6 @@ pub const ConfigSources = struct {
     fast_mode_model_bound: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
     collapse_tool_calls: ConfigSource = .compiled_default,
-    startup_scrollback: ConfigSource = .compiled_default,
     prompt_history_enabled: ConfigSource = .compiled_default,
     statusline_context: ConfigSource = .compiled_default,
     statusline_session: ConfigSource = .compiled_default,
@@ -942,7 +940,6 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
             "fast_mode_model_bound",
             "slash_menu_categories",
             "collapse_tool_calls",
-            "startup_scrollback",
         }) |key| {
             if (workspace.contains(key)) return true;
         }
@@ -1033,7 +1030,6 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
     if (settings.session_titles != null) sources.session_titles = source;
     if (settings.cache_warming != null) sources.cache_warming = source;
-    if (settings.startup_scrollback != null) sources.startup_scrollback = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
     if (settings.statusline_context != null) sources.statusline_context = source;
     if (settings.statusline_session != null) sources.statusline_session = source;
@@ -1988,12 +1984,6 @@ fn parseProfileOnlyFields(
         if (value.string.len > 0) settings.theme = try alloc.dupe(u8, value.string);
     }
 
-    if (root.object.get("startup_scrollback")) |startup_scrollback_value| {
-        const value = startup_scrollback_value;
-        if (value != .bool) return error.InvalidStartupScrollbackType;
-        settings.startup_scrollback = value.bool;
-    }
-
     if (root.object.get("skill_symlink_authorities")) |value| {
         const paths = try parseSkillSymlinkAuthorities(alloc, value);
         if (settings.skill_symlink_authorities) |old| freeStringSlice(alloc, old);
@@ -2210,7 +2200,6 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
         target.theme = value;
         incoming.theme = null;
     }
-    if (incoming.startup_scrollback) |value| target.startup_scrollback = value;
     if (incoming.skill_symlink_authorities) |value| {
         if (target.skill_symlink_authorities) |old| freeStringSlice(alloc, old);
         target.skill_symlink_authorities = value;
@@ -2816,36 +2805,6 @@ test "loadStartupStatusSettings merges project defaults before profile layers" {
     try std.testing.expectEqual(@as(usize, 8), settings.max_agent_steps.?);
 }
 
-test "loadMergedSettings applies startup scrollback precedence with normalized workspace root" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-
-    const user_settings = try std.testing.allocator.print(
-        "{{\"startup_scrollback\":false,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}",
-        .{workspace_root},
-    );
-    defer std.testing.allocator.free(user_settings);
-
-    const workspace_with_slash = try std.testing.allocator.print("{s}/", .{workspace_root});
-    defer std.testing.allocator.free(workspace_with_slash);
-
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
-    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"startup_scrollback\":true}");
-
-    var settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_with_slash);
-    defer settings.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(false, settings.startup_scrollback.?);
-}
-
 test "max_agent_steps absence and explicit values resolve distinctly" {
     var absent = try parseSettingsJson(std.testing.allocator, "{}");
     defer absent.deinit(std.testing.allocator);
@@ -2936,33 +2895,13 @@ test "skill_match_fuzzy returns a migration-specific parse error" {
 test "retired presentation settings are ignored regardless of type" {
     var settings = try parseSettingsJson(
         std.testing.allocator,
-        "{\"model\":\"openai/gpt-5.4\",\"input_appearance\":false,\"maxxing_mode\":7}",
+        "{\"model\":\"openai/gpt-5.4\",\"input_appearance\":false,\"maxxing_mode\":7,\"startup_scrollback\":true}",
     );
     defer settings.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("openai/gpt-5.4", settings.models.get(.gateway).?);
-}
 
-test "startup_scrollback parses merges rejects invalid type and round trips" {
-    var absent = try parseSettingsJson(std.testing.allocator, "{}");
-    defer absent.deinit(std.testing.allocator);
-    try std.testing.expect(absent.startup_scrollback == null);
-
-    var first = try parseSettingsJson(std.testing.allocator, "{\"startup_scrollback\":true}");
-    defer first.deinit(std.testing.allocator);
-    try std.testing.expectEqual(true, first.startup_scrollback.?);
-
-    var second = try parseSettingsJson(std.testing.allocator, "{\"startup_scrollback\":false}");
-    defer second.deinit(std.testing.allocator);
-    try mergeSettings(&first, &second, std.testing.allocator);
-    try std.testing.expectEqual(false, first.startup_scrollback.?);
-
-    try std.testing.expectError(error.InvalidStartupScrollbackType, parseSettingsJson(std.testing.allocator, "{\"startup_scrollback\":\"off\"}"));
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"startup_scrollback\":false}", .{});
-    defer parsed.deinit();
-    const json = try serializeJsonObject(std.testing.allocator, parsed.value);
-    defer std.testing.allocator.free(json);
-    try std.testing.expect(std.mem.find(u8, json, "\"startup_scrollback\":false") != null);
+    var retired_off = try parseSettingsJson(std.testing.allocator, "{\"startup_scrollback\":\"off\"}");
+    defer retired_off.deinit(std.testing.allocator);
 }
 
 test "skill_symlink_authorities parses replaces on merge and rejects invalid entries" {
@@ -3939,47 +3878,6 @@ test "user fast mode preference writes bool and preserves unrelated keys" {
     try std.testing.expect((try workspaceOverrideObject(&parsed.value, workspace_root)).get("fast_mode") == null);
 }
 
-test "user startup scrollback preference writes bool and preserves unrelated keys" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-
-    const fixture = try std.testing.allocator.print(
-        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"my-model\",\"permission_mode\":\"auto\"}}}}}}",
-        .{workspace_root},
-    );
-    defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
-
-    const home = try TestHome.install(std.testing.allocator, home_root);
-    defer home.deinit();
-
-    var outcome = try setUserPreferences(
-        std.testing.allocator,
-        .{ .startup_scrollback = false },
-    );
-    defer outcome.deinit(std.testing.allocator);
-
-    var settings = try loadMergedSettings(std.testing.allocator, workspace_root);
-    defer settings.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("my-model", settings.models.get(.gateway).?);
-    try std.testing.expectEqual(types.PermissionMode.auto, settings.permission_mode.?);
-    try std.testing.expectEqual(false, settings.startup_scrollback.?);
-
-    const bytes = try readSettingsBytesForTest(std.testing.allocator, home_root);
-    defer std.testing.allocator.free(bytes);
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(false, parsed.value.object.get("startup_scrollback").?.bool);
-    try std.testing.expect((try workspaceOverrideObject(&parsed.value, workspace_root)).get("startup_scrollback") == null);
-}
-
 test "project profile-only settings are ignored and diagnosed by key" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3988,12 +3886,12 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try writeFixtureFile(
         tmp.dir,
         "home/.fx/settings.json",
-        "{\"model\":\"profile/model\",\"permission_mode\":\"auto\",\"permission\":{\"bash\":{\"profile *\":\"allow\"}},\"prompt_history\":{\"enabled\":true},\"status_line\":{\"sandbox\":true,\"context\":false},\"first_call_tool_choice\":\"none\",\"review_model\":\"profile/review\",\"auto_upgrade\":false,\"update_channel\":\"dev\",\"fast_mode\":false,\"input_appearance\":\"tint\",\"maxxing_mode\":\"minimal\",\"slash_menu_categories\":false,\"effort\":\"high\",\"output_level\":\"quiet\",\"startup_scrollback\":false}\n",
+        "{\"model\":\"profile/model\",\"permission_mode\":\"auto\",\"permission\":{\"bash\":{\"profile *\":\"allow\"}},\"prompt_history\":{\"enabled\":true},\"status_line\":{\"sandbox\":true,\"context\":false},\"first_call_tool_choice\":\"none\",\"review_model\":\"profile/review\",\"auto_upgrade\":false,\"update_channel\":\"dev\",\"fast_mode\":false,\"input_appearance\":\"tint\",\"maxxing_mode\":\"minimal\",\"slash_menu_categories\":false,\"effort\":\"high\",\"output_level\":\"quiet\"}\n",
     );
     try writeFixtureFile(
         tmp.dir,
         "workspace/.fx.json",
-        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"status_line\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"review_model\":\"project/review\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"max_agent_steps\":17}\n",
+        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"status_line\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"review_model\":\"project/review\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"max_agent_steps\":17}\n",
     );
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -4016,11 +3914,10 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try std.testing.expectEqual(false, result.settings.fast_mode.?);
     try std.testing.expectEqual(false, result.settings.slash_menu_categories.?);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), result.settings.effort.?);
-    try std.testing.expectEqual(false, result.settings.startup_scrollback.?);
     try std.testing.expectEqual(@as(usize, 1), result.settings.permission_rules.rules.len);
     try expectPermissionRule(result.settings.permission_rules.rules[0], "bash", "profile *", .allow);
 
-    try std.testing.expectEqual(@as(usize, 14), result.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 13), result.diagnostics.len);
     inline for (&.{
         "model",
         "permission_mode",
@@ -4035,7 +3932,6 @@ test "project profile-only settings are ignored and diagnosed by key" {
         "fast_mode",
         "slash_menu_categories",
         "effort",
-        "startup_scrollback",
     }) |key| {
         try expectIgnoredProjectKey(result.diagnostics, key);
     }
@@ -4205,25 +4101,25 @@ test "ordinary and detailed loads agree on workspace overrides with legacy statu
     defer std.testing.allocator.free(workspace_root);
 
     const user_settings = try std.testing.allocator.print(
-        "{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"status_line\":7,\"startup_scrollback\":false}}}}}}\n",
+        "{{\"fast_mode\":true,\"workspaces\":{{\"{s}\":{{\"status_line\":7,\"fast_mode\":false}}}}}}\n",
         .{workspace_root},
     );
     defer std.testing.allocator.free(user_settings);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
-    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"startup_scrollback\":true,\"max_agent_steps\":42}\n");
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"fast_mode\":true,\"max_agent_steps\":42}\n");
 
     var ordinary = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
     defer ordinary.deinit(std.testing.allocator);
-    try std.testing.expectEqual(false, ordinary.startup_scrollback.?);
+    try std.testing.expectEqual(false, ordinary.fast_mode.?);
     try std.testing.expectEqual(@as(usize, 42), ordinary.max_agent_steps.?);
 
     var detailed = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer detailed.deinit(std.testing.allocator);
-    try std.testing.expectEqual(false, detailed.settings.startup_scrollback.?);
+    try std.testing.expectEqual(false, detailed.settings.fast_mode.?);
     try std.testing.expectEqual(@as(usize, 42), detailed.settings.max_agent_steps.?);
-    try std.testing.expectEqual(ConfigSource.user_workspace, detailed.sources.startup_scrollback);
+    try std.testing.expectEqual(ConfigSource.user_workspace, detailed.sources.fast_mode);
     try std.testing.expectEqual(@as(usize, 2), detailed.diagnostics.len);
-    try expectIgnoredProjectKey(detailed.diagnostics, "startup_scrollback");
+    try expectIgnoredProjectKey(detailed.diagnostics, "fast_mode");
     try std.testing.expectEqual(
         ConfigDiagnosticCause.legacy_workspace_preferences,
         detailed.diagnostics[1].cause,
@@ -4377,7 +4273,7 @@ test "detailed settings expose target sources and permission views" {
     defer std.testing.allocator.free(workspace_root);
 
     const user_settings = try std.testing.allocator.print(
-        "{{\"model\":\"user/model\",\"permission_mode\":\"ask\",\"fast_mode\":true,\"input_appearance\":\"tint\",\"startup_scrollback\":false," ++
+        "{{\"model\":\"user/model\",\"permission_mode\":\"ask\",\"fast_mode\":true,\"input_appearance\":\"tint\"," ++
             "\"prompt_history\":{{\"enabled\":false}},\"status_line\":{{\"sandbox\":true,\"context\":false,\"session\":true}}," ++
             "\"permission\":{{\"bash\":{{\"user *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{" ++
             "\"model\":\"workspace/model\",\"permission_mode\":\"auto\",\"input_appearance\":\"lines\",\"sandbox\":\"none\",\"permission\":{{\"bash\":{{\"local *\":\"allow\"}}}}" ++
@@ -4399,7 +4295,6 @@ test "detailed settings expose target sources and permission views" {
     try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.permission_mode);
     try std.testing.expectEqual(ConfigSource.compiled_default, result.sources.effort);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.fast_mode);
-    try std.testing.expectEqual(ConfigSource.user_global, result.sources.startup_scrollback);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.prompt_history_enabled);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.statusline_context);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.statusline_session);

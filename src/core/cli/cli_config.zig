@@ -138,7 +138,6 @@ const Writable = enum {
     @"sound.attention_required",
     @"sound.max",
     @"sound.turn_end",
-    startup_scrollback,
     @"status_line.context",
     @"status_line.session",
     @"status_line.workspace",
@@ -238,7 +237,6 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .@"sound.attention_required" => patch.notification_attention_required = enabled,
         .@"sound.max" => patch.notification_max = enabled,
         .@"sound.turn_end" => patch.notification_turn_end = enabled,
-        .startup_scrollback => patch.startup_scrollback = enabled,
         .@"status_line.context" => patch.statusline_item = .{ .item = .context, .enabled = enabled },
         .@"status_line.session" => patch.statusline_item = .{ .item = .session, .enabled = enabled },
         .@"status_line.workspace" => patch.statusline_item = .{ .item = .workspace, .enabled = enabled },
@@ -456,9 +454,9 @@ pub const resolved_keys = [_][]const u8{
     "prompt_history.enabled",         "provider",                 "provider_order",
     "provider_strict",                "review_model",             "session_titles",
     "slash_menu_categories",          "sound.attention_required", "sound.max",
-    "sound.turn_end",                 "startup_scrollback",       "status_line.context",
-    "status_line.session",            "status_line.workspace",    "theme",
-    "ultrafast_mode",                 "update_channel",
+    "sound.turn_end",                 "status_line.context",      "status_line.session",
+    "status_line.workspace",          "theme",                    "ultrafast_mode",
+    "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -510,7 +508,6 @@ pub fn effectiveValue(
     if (eql(u8, key, "sound.attention_required")) return boolean(state.notification_attention_required);
     if (eql(u8, key, "sound.max")) return boolean(state.notification_max);
     if (eql(u8, key, "sound.turn_end")) return boolean(state.notification_turn_end);
-    if (eql(u8, key, "startup_scrollback")) return boolean(state.startup_scrollback);
     if (eql(u8, key, "status_line.context")) return boolean(state.statusline_context);
     if (eql(u8, key, "status_line.session")) return boolean(state.statusline_session);
     if (eql(u8, key, "status_line.workspace")) return boolean(state.statusline_workspace);
