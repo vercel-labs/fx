@@ -498,6 +498,8 @@ pub fn buildSessionStatusLine(
     return display_width.prefixByWidthIgnoringAnsi(out[0..end], width);
 }
 
+/// Builds the hint line from the segments that suit `width` columns. It is not
+/// cut to `width`: the caller cuts it, so it can mark the cut.
 pub fn buildHintLine(
     awaiting_permission: bool,
     has_api_key: bool,
@@ -524,10 +526,7 @@ pub fn buildHintLine(
         appendStatusSegment(out, &end, permission_label);
     }
     appendSessionStatusSegments(out, &end, status_limit, model, effort, model_supports_effort, fast_indicator_active, statusline);
-
-    const width_usize: usize = width;
-    if (width_usize == 0) return "";
-    return display_width.prefixByWidthIgnoringAnsi(out[0..end], width_usize);
+    return out[0..end];
 }
 
 pub fn buildInputLine(input: []const u8, cursor: usize, width: u16, out: []u8) InputLineView {
@@ -1166,10 +1165,6 @@ test "buildHintLine uses one vivid yellow lightning marker for Ultrafast in both
             }
             try std.testing.expectEqual(@as(usize, 1), markers);
             try std.testing.expect(grid.current_style.fg.eql(.{ .indexed = if (light) 241 else 245 }));
-            for (0..32) |width| {
-                const clipped = buildHintLine(false, true, "openai/gpt-6-astra", .auto, false, types.ReasoningEffort.literal("xhigh"), true, .{ .ultrafast_indicator_active = true }, @intCast(width), &buf);
-                try std.testing.expect(display_width.visibleWidthIgnoringAnsi(clipped) <= width);
-            }
         }
     }
 }
@@ -1344,7 +1339,7 @@ test "buildHintLine renders full access with subdued permission styling" {
     try std.testing.expectEqualStrings(expected, line);
 }
 
-test "buildHintLine clips styled auto mode by visible width" {
+test "buildHintLine fits styled auto mode by visible width" {
     initTheme(false, null);
     defer initTheme(false, null);
 

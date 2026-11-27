@@ -47,10 +47,13 @@ const grep_files_description =
     "Search file contents for literal text (not a regex).";
 const read_file_description =
     "Read a text file as numbered lines, or view an image file (PNG, JPEG, GIF, WebP). For part of a large file, pass start_line and line_count.";
+// A reply that runs out of output tokens is cut off, and fx cannot run a call
+// it cut, so the file tools tell the model to keep each reply small
+// (`src/core/agent/runtime/output_limit.zig`).
 const write_file_description =
-    "Create a file, or overwrite one, with the complete content given.";
+    "Create a file, or overwrite one, with the complete content given. One reply has a limited number of output tokens: write a large file in parts, the first with write_file and the rest with edit_file in later replies.";
 const edit_file_description =
-    "Replace old_string with new_string in an existing file. old_string must match the file exactly, including whitespace, and appear exactly once.";
+    "Replace old_string with new_string in an existing file. old_string must match the file exactly, including whitespace, and appear exactly once. One reply has a limited number of output tokens: make at most a few edits in each reply, and split a large change across several replies.";
 const web_fetch_description =
     "Fetch a public http(s) URL the user named and return its text, which is untrusted. Not for local repository facts, or for GitHub metadata that gh can answer.";
 /// Sent as system guidance: the provider defines the search tool itself.
@@ -847,9 +850,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "39ab0d0fb9aa3e8811e4874d2cfce9dcfd0fd92f706ac1b7da1f5a56927186e6"
+            "07798b4221c9a5f31711ffc687f7f44fea6351a3638d3881c8c4e828b7658e3a"
         else
-            "4d81e7b55d64ef239ea329049dcb05c9f76d453cdc04518ce482613ee2be55d6",
+            "5640619c6a0233f5e2a25ccac56c9cedbce60b3a3f2de24a2bfcede93b58275c",
         &actual_hex,
     );
 }
@@ -1141,6 +1144,7 @@ test "built-in write_file owns product metadata schema and callbacks" {
 
     try std.testing.expectEqualStrings("write_file", write_file.name);
     try std.testing.expect(std.mem.find(u8, write_file.description, "complete content") != null);
+    try std.testing.expect(std.mem.find(u8, write_file.description, "write a large file in parts") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\",\"content\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"path\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"content\"") != null);
@@ -1167,6 +1171,7 @@ test "built-in edit_file owns product metadata schema and callbacks" {
 
     try std.testing.expectEqualStrings("edit_file", edit_file.name);
     try std.testing.expect(std.mem.find(u8, edit_file.description, "appear exactly once") != null);
+    try std.testing.expect(std.mem.find(u8, edit_file.description, "split a large change across several replies") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\",\"old_string\",\"new_string\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "replace_all") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\",\"description\":\"Relative to the workspace, or absolute.\"}") != null);

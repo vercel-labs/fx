@@ -18,8 +18,11 @@ on:
 permissions:
   contents: read
 
+# A run whose metadata job will skip (the same condition as its `if`) gets a
+# group of its own, so it cannot replace the real run that waits in its
+# channel's group, such as one held for npm approval.
 concurrency:
-  group: publish-libfx-${{ (github.event.workflow_run.name == 'Release' || inputs.channel == 'stable') && 'stable' || 'dev' }}
+  group: ${{ (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository)) && format('publish-libfx-{0}', (github.event.workflow_run.name == 'Release' || inputs.channel == 'stable') && 'stable' || 'dev') || format('publish-libfx-skip-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
@@ -348,7 +351,7 @@ jobs:
       contents: read
       id-token: write
     outputs:
-      skipped: ${{ steps.confirm.outputs.skip == 'true' }}
+      skipped: ${{ steps.confirm.outputs.move == 'false' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -372,10 +375,9 @@ jobs:
           RELEASE_SHA: ${{ needs.metadata.outputs.sha }}
         run: |
           set -euo pipefail
-          # Move forward only. CI on main often ends after newer commits merge,
-          # and the npm environment can hold this job for approval, so this
-          # build may be behind main and still newer than the dev tag. Dev
-          # versions end in .g<first 12 characters of the commit>.
+          # The npm environment can hold this job for approval, so this build
+          # may be behind main and still newer than the dev tag. Dev versions
+          # end in .g<first 12 characters of the commit>.
           CURRENT_VERSION=$(npm view libfx dist-tags.dev --registry=https://registry.npmjs.org/) || CURRENT_VERSION=""
           CURRENT_SHA=""
           if [[ "$CURRENT_VERSION" =~ \.g([0-9a-f]{12})$ ]]; then
@@ -384,22 +386,14 @@ jobs:
           if [ -z "$CURRENT_SHA" ]; then
             echo "::warning::could not read a commit from the libfx dev tag '${CURRENT_VERSION}'; only main's newest commit may replace it"
           fi
-          if [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" != "$RELEASE_SHA" ] &&
-            git merge-base --is-ancestor "$RELEASE_SHA" "$CURRENT_SHA"; then
-            echo "the dev tag names libfx@${CURRENT_VERSION}, which already includes ${RELEASE_SHA}; skipping this publish"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          elif [ -n "$CURRENT_SHA" ] && git merge-base --is-ancestor "$CURRENT_SHA" "$RELEASE_SHA"; then
-            echo "the dev tag names libfx@${CURRENT_VERSION}; moving it to ${RELEASE_SHA}"
-          else
-            MAIN_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
-            if [ "$MAIN_SHA" != "$RELEASE_SHA" ]; then
-              echo "::warning::main advanced to ${MAIN_SHA} and the dev tag names no commit in the history of ${RELEASE_SHA}; skipping this publish"
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-            fi
-          fi
+          MAIN_SHA=$(timeout 60 git ls-remote origin refs/heads/main | cut -f1) || MAIN_SHA=""
+          # The rule comes from this workflow's own commit, since the build's
+          # checkout can be older than the script.
+          git show "${GITHUB_SHA}:scripts/dev-channel-forward.sh" > "$RUNNER_TEMP/dev-channel-forward.sh"
+          bash "$RUNNER_TEMP/dev-channel-forward.sh" "$CURRENT_SHA" "$RELEASE_SHA" "$MAIN_SHA"
 
       - name: Publish the verified archive with npm trusted publishing
-        if: steps.confirm.outputs.skip != 'true'
+        if: steps.confirm.outputs.move != 'false'
         env:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
           NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}

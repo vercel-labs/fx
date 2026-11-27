@@ -3,6 +3,7 @@ const agents = @import("core/agents/agents.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
+const self_exe = @import("core/shared/self_exe.zig");
 const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
@@ -165,6 +166,7 @@ const shell_runtime = @import("ui/shell_runtime.zig");
 const ui_terminal = @import("ui/terminal/terminal.zig");
 const cursor_probe = @import("ui/terminal/cursor_probe.zig");
 const ui_program_status = @import("ui/terminal/program_status.zig");
+const ui_program_resume = @import("ui/terminal/program_resume.zig");
 const transcript_runtime = @import("ui/transcript/runtime.zig");
 const resume_projection = @import("ui/transcript/resume_projection.zig");
 const assistant_pacer = @import("ui/assistant/pacer.zig");
@@ -566,8 +568,36 @@ const App = struct {
         return ui_render.terminalTitleFor(&self.shell.stdout_file);
     }
 
+    pub fn hasProgramResumeToken() bool {
+        return ui_program_resume.keptToken() != null;
+    }
+
+    pub fn putProgramResumeToken(environ: *std.process.Environ.Map) !bool {
+        return ui_program_resume.putToken(environ);
+    }
+
+    pub fn programResumeToken() ?[]const u8 {
+        return ui_program_resume.keptToken();
+    }
+
+    /// The name the terminal runs to resume: the bare name fx was started with,
+    /// else the path of this binary written into `buffer`.
+    pub fn programResumeExecutable(buffer: []u8) ?[]const u8 {
+        if (ui_program_resume.programName()) |name| return name;
+        var fixed = std.heap.FixedBufferAllocator.init(buffer);
+        return self_exe.pathForPeerReexec(fixed.allocator()) catch null;
+    }
+
     pub fn writeProgramStatus(self: *Self, report: []const u8) void {
         self.shell.writeProgramStatus(&self.metrics, report);
+    }
+
+    pub fn writeProgramResume(self: *Self, report: []const u8) void {
+        self.shell.writeProgramResume(&self.metrics, report);
+    }
+
+    pub fn clearProgramResume(self: *Self) void {
+        SessionAppRuntime.clearProgramResume(self);
     }
 
     alloc: Allocator,
@@ -603,6 +633,7 @@ const App = struct {
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
     program_status: ui_program_status.Reporter = .{},
+    program_resume: ui_program_resume.Reporter = .{},
 
     prompt_history: PromptHistoryRuntime = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
@@ -904,7 +935,8 @@ const App = struct {
         NotificationAppRuntime.queue(self, notification);
     }
 
-    pub fn notificationPresentationFinished(self: *App) void {
+    /// Plays turn-end cues once the reply is shown and the work on screen is done.
+    fn releaseHeldNotifications(self: *App) void {
         NotificationAppRuntime.presentationFinished(self);
     }
 
@@ -959,6 +991,21 @@ const App = struct {
         AgentsAppRuntime.requestYields(self);
     }
 
+    /// Lets the turns held for an upgrade's restart return.
+    pub fn releaseTurnYields(self: *App) void {
+        AgentsAppRuntime.releaseYields(self);
+    }
+
+    /// Takes back `requestTurnYields` when the upgrade's restart is cancelled.
+    pub fn cancelTurnYields(self: *App) void {
+        AgentsAppRuntime.cancelYields(self);
+    }
+
+    /// Whether a turn runs that the restart has not already held at its step boundary.
+    pub fn anyTurnUnheld(self: *App) bool {
+        return AgentsAppRuntime.anyTurnUnheld(self);
+    }
+
     /// Whether any agent's turn still runs, which an upgrade's restart waits for.
     pub fn anyTurnRunning(self: *App) bool {
         return AgentsAppRuntime.anyTurnRunning(self);
@@ -966,6 +1013,14 @@ const App = struct {
 
     pub fn anySubagentWorking(self: *App) bool {
         return AgentsAppRuntime.anySubagentWorking(self);
+    }
+
+    pub fn screenSubagentsWorking(self: *App) bool {
+        return AgentsAppRuntime.screenSubagentsWorking(self);
+    }
+
+    pub fn screenWorkGoing(self: *App) bool {
+        return AgentsAppRuntime.screenWorkGoing(self);
     }
 
     /// Logs the queued work fx drops as it exits for an upgrade's restart.
@@ -1008,6 +1063,10 @@ const App = struct {
 
     pub fn requestResumeHandoffForUpgrade(_: *App, agent: *agents.Agent) void {
         SessionAppRuntime.requestUpgradeResumeHandoff(agent);
+    }
+
+    pub fn cancelResumeHandoffForUpgrade(_: *App, agent: *agents.Agent) void {
+        SessionAppRuntime.cancelUpgradeResumeHandoff(agent);
     }
 
     pub fn takeUpgradeRelaunchRequest(
@@ -3126,7 +3185,7 @@ const App = struct {
     pub fn pacerFinish(ctx: *anyopaque, finished: types.FinishedPrompt) anyerror!assistant_pacer.FinishResult {
         const self: *App = @ptrCast(@alignCast(ctx));
         const result = try app_callbacks.Bindings(App).finishPromptPresentation(self, self.screenAgent(), finished);
-        if (result == .committed) self.notificationPresentationFinished();
+        if (result == .committed) self.releaseHeldNotifications();
         return result;
     }
 
@@ -3597,10 +3656,12 @@ const App = struct {
         // its own context.
         try AgentsAppRuntime.tickChildren(self, {}, tickAgentInContext);
         AgentsAppRuntime.noteFinishedTurns(self);
+        self.releaseHeldNotifications();
         AgentsAppRuntime.settleChildRuns(self);
         AgentsAppRuntime.settleLentQuestion(self);
         AgentsAppRuntime.lendPrompt(self);
         HerdrAppRuntime.reconcile(self);
+        SessionAppRuntime.reportProgramResume(self);
     }
 
     /// Gives a subagent's question lent to main's prompt back to it, before
@@ -4014,6 +4075,9 @@ pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char)
 }
 
 fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !void {
+    // Before any mode reads the environment or starts a program, so none inherits the terminal's token.
+    ui_program_resume.takeToken(c_envp);
+    if (c_argc > 0) ui_program_resume.rememberProgramName(c_argv[0]);
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
     // Before any mode runs, since terminal helpers write under fx's folder too.
@@ -5619,6 +5683,7 @@ test {
     _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/subagent_turn_metrics.zig");
+    _ = @import("core/workspace/output_limit_metrics.zig");
     _ = @import("core/workspace/workspace_access.zig");
     _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("core/workspace/workspace_commands.zig");
@@ -5700,7 +5765,7 @@ test {
     _ = @import("core/auth/grok_oauth.zig");
     _ = @import("core/auth/subscription_logout.zig");
     _ = @import("gateway/xai_grok_models.zig");
-    _ = @import("gateway/provider_versions.zig");
+    _ = @import("core/gateway/provider_versions.zig");
     _ = @import("gateway/xai_grok.zig");
     _ = @import("gateway/xai_grok_permission_reviewer.zig");
     _ = credentials;
@@ -5912,6 +5977,32 @@ test "the busiest agent wins herdr's state: an approval over work, work over idl
     app.main_agent.worker.worker_processing = false;
 }
 
+test "the screen's subagents count as working until their host is quiet" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+
+    // Only the fields `quiet` reads are set: a busy child keeps the host open.
+    var busy_host: subagent_tool_host.Runtime = undefined;
+    busy_host.admission_mutex = .init;
+    busy_host.pending = .empty;
+    busy_host.busy = .empty;
+    defer {
+        for (busy_host.busy.items) |id| alloc.free(id);
+        busy_host.busy.deinit(alloc);
+    }
+    try busy_host.busy.append(alloc, try alloc.dupe(u8, "reviewer"));
+    app.main_agent.session_persistence.subagent_host = &busy_host;
+    defer app.main_agent.session_persistence.subagent_host = null;
+
+    try std.testing.expect(app.screenSubagentsWorking());
+    alloc.free(busy_host.busy.swapRemove(0));
+    try std.testing.expect(!app.screenSubagentsWorking());
+}
+
 test "an upgrade waits for agents that need the user, stops instances between steps, and lets subagents finish" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
@@ -5942,6 +6033,24 @@ test "an upgrade waits for agents that need the user, stops instances between st
     try std.testing.expect(!runtime.anySubagentWorking(&app));
     try std.testing.expect(!runtime.anyTurnRunning(&app));
 
+    // A turn held at its step boundary for the restart counts as stopped
+    // for the release, and still runs until it returns.
+    app.main_agent.worker.worker_processing = true;
+    second.agent.worker.worker_processing = true;
+    app.main_agent.worker.yield_held = true;
+    try std.testing.expect(runtime.anyTurnUnheld(&app));
+    second.agent.worker.yield_held = true;
+    try std.testing.expect(!runtime.anyTurnUnheld(&app));
+    try std.testing.expect(runtime.anyTurnRunning(&app));
+    // A subagent is never held, so its work keeps the release waiting.
+    reviewer.agent.worker.worker_processing = true;
+    try std.testing.expect(runtime.anyTurnUnheld(&app));
+    reviewer.agent.worker.worker_processing = false;
+    app.main_agent.worker.yield_held = false;
+    second.agent.worker.yield_held = false;
+    app.main_agent.worker.worker_processing = false;
+    second.agent.worker.worker_processing = false;
+
     // One that waits for the user does, by name.
     try std.testing.expect(try reviewer.agent.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     const waiting = runtime.needsUserElsewhere(&app, &buf).?;
@@ -5968,6 +6077,9 @@ test "an upgrade waits for agents that need the user, stops instances between st
     try std.testing.expect(app.main_agent.worker.yield_requested.load(.seq_cst));
     try std.testing.expect(second.agent.worker.yield_requested.load(.seq_cst));
     try std.testing.expect(!reviewer.agent.worker.yield_requested.load(.seq_cst));
+    runtime.cancelYields(&app);
+    try std.testing.expect(!app.main_agent.worker.yield_requested.load(.seq_cst));
+    try std.testing.expect(!second.agent.worker.yield_requested.load(.seq_cst));
 }
 
 test "an upgrade refuses for queued work of main or another instance, not of a subagent" {
@@ -8410,6 +8522,39 @@ test "a subagent's run ends only once the turn carrying its work id is saved" {
             App.AgentsAppRuntime.commitChildTurn(a, agent, saved("work-1"));
             try std.testing.expectEqual(agents.ChildRunCompletion.Outcome.completed, done.outcome.?);
             try std.testing.expect(!agent.child_run.?.inFlight());
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, &completion, Check.run);
+}
+
+test "a subagent turn a cut reply failed tells its parent output_limit, and a provider's own error stays first" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    var completion: agents.ChildRunCompletion = .{};
+    var child_run = try testChildRun(alloc, &resolver, false, null);
+    child_run.work_id = try alloc.dupe(u8, "work-1");
+    child_run.completion = &completion;
+    App.AgentsAppRuntime.installChildRun(&app, child, child_run);
+
+    const Check = struct {
+        fn run(_: *agents.ChildRunCompletion, a: *App, agent: *agents.Agent) anyerror!void {
+            // A failure with no reason the parent could use says nothing more.
+            App.AgentsAppRuntime.noteChildTurnFinished(a, agent, .{ .turn_id = 1, .outcome = .failed });
+            try std.testing.expect(agent.child_run.?.failure == null);
+            App.AgentsAppRuntime.noteChildTurnFinished(a, agent, .{ .turn_id = 2, .outcome = .failed, .disposition = .length_limited });
+            try std.testing.expectEqualStrings(
+                "output_limit: the reply was cut off at its output-token limit",
+                agent.child_run.?.failure.?.view(),
+            );
+            agent.child_run.?.failure = types.ModelFailureDiagnostic.init("provider_http_error: HTTP 500");
+            App.AgentsAppRuntime.noteChildTurnFinished(a, agent, .{ .turn_id = 3, .outcome = .failed, .disposition = .length_limited });
+            try std.testing.expectEqualStrings("provider_http_error: HTTP 500", agent.child_run.?.failure.?.view());
         }
     };
     try App.AgentsAppRuntime.visit(&app, child, &completion, Check.run);

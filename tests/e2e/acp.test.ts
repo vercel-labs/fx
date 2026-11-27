@@ -20,7 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { FX_BIN, fxChildEnv, HAS_API_KEY, providerVersionTestEnv, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, HAS_API_KEY, pinnedClientVersions, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import {
   AUTO_EXA_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
@@ -721,11 +721,11 @@ class AcpClient {
       }
     }
     const proc = nodeSpawn(FX_BIN, args, {
-      env: localCreditsEnv(providerVersionTestEnv({
+      env: localCreditsEnv({
         ...inheritedEnv,
         NO_COLOR: "1",
         PATH: inheritedEnv.PATH ?? "",
-      })),
+      }),
       cwd: opts?.cwd ?? REPO_ROOT,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -11000,13 +11000,14 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "provider length with tool calls returns max output tokens without execution",
+    "provider length with tool calls three times in a row returns max output tokens without execution",
     async () => {
       const root = createIsolatedRoot("fx-acp-length-tool-");
       const sentinelPath = join(root.workspace, "command-must-not-run.txt");
-      const gateway = startFakeGateway([
-        lengthLimitedCommandCall("printf executed > command-must-not-run.txt"),
-      ]);
+      // Two notes, then the third cut reply in a row ends the turn.
+      const gateway = startFakeGateway([1, 2, 3].map(() =>
+        lengthLimitedCommandCall("printf executed > command-must-not-run.txt")
+      ));
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
@@ -11023,7 +11024,7 @@ describe("acp: model-independent", () => {
         expect(JSON.stringify(result.messages)).toContain("ACP partial output");
         expect(JSON.stringify(result.messages)).toContain("did not run them");
         expect(existsSync(sentinelPath)).toBe(false);
-        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests).toHaveLength(3);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -11035,7 +11036,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "provider length after silent tools returns max output tokens without continuation",
+    "provider length before any text three times in a row after silent tools returns max output tokens without a summary",
     async () => {
       const root = createIsolatedRoot("fx-acp-silent-tools-length-");
       writeFileSync(join(root.workspace, "a.txt"), "a\n");
@@ -11045,7 +11046,7 @@ describe("acp: model-independent", () => {
         fakeGatewayToolCall("read_2", "read_file", { path: "b.txt" }),
         noToolLength(),
         noToolLength(),
-        finalText("UNEXPECTED_CONTINUATION"),
+        noToolLength(),
       ]);
       try {
         client = await AcpClient.create({
@@ -11060,13 +11061,16 @@ describe("acp: model-independent", () => {
         );
 
         expect(result.promptResult.result.stopReason).toBe("max_output_tokens");
-        // The empty reply's one retry sends the same request with an output
-        // limit; neither request asks for a summary.
-        expect(gateway.requests).toHaveLength(4);
+        // Each empty cut reply gets a note with an output limit, the third
+        // ends the turn, and no request asks for a summary.
+        expect(gateway.requests).toHaveLength(5);
         expect(JSON.parse(gateway.requests[2]!.body).maxOutputTokens).toBeUndefined();
         const retryLimit = JSON.parse(gateway.requests[3]!.body).maxOutputTokens;
         expect(retryLimit).toBeGreaterThan(0);
         expect(retryLimit).toBeLessThanOrEqual(32_768);
+        expect(gateway.requests[3]!.body).toContain("before any text or tool call, likely while thinking.");
+        expect(gateway.requests[4]!.body).toContain("again before any text or tool call");
+        expect(JSON.stringify(result.messages)).toContain("so fx stopped the turn");
         expect(gateway.requests.some(({ body }) =>
           body.includes("Summarize what you just did.")
         )).toBe(false);
@@ -14816,7 +14820,7 @@ describe("acp: model catalog authentication", () => {
           expect(request.tokenAuth).toBe("xai-grok-cli");
           expect(request.authenticateResponse).toBe("authenticate-response");
           expect(request.clientIdentifier).toBe("fx");
-          expect(request.clientVersion).toBe("1.0.6");
+          expect(request.clientVersion).toBe(pinnedClientVersions.grok);
           expect(request.modelOverride).toBe("grok-4.20");
           expect(request.grokUserId).toBe("acct_grok_acp");
         }

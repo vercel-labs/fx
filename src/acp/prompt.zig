@@ -197,6 +197,12 @@ fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
     };
 }
 
+/// A yielded turn stays open in the journal for its host to resume; ending
+/// it would lose it (`tests/tla/recovery/Resume.tla` Relaunch).
+fn yieldedTurnStop(err: anyerror) ?TerminalOutcome {
+    return if (err == error.TurnYielded) .{ .stop_reason = .yielded } else null;
+}
+
 /// Sent to the client when the content filter blocked a reply and every
 /// resend of it.
 const content_filter_refusal_text = "Blocked by the content filter. Change your request and send it again.";
@@ -880,6 +886,60 @@ fn hostToolArguments(
     return repaired.arguments_json;
 }
 
+/// Fails every frame, as a closed client pipe does.
+fn failEveryFrame(_: ?*anyopaque, _: []const u8) anyerror!void {
+    return error.BrokenPipe;
+}
+
+/// Fails only the permission request, so the other frames are written.
+fn failPermissionRequestFrame(_: ?*anyopaque, bytes: []const u8) anyerror!void {
+    if (std.mem.find(u8, bytes, "session/request_permission") == null) return;
+    return error.BrokenPipe;
+}
+
+test "a host tool request whose write fails leaves nothing in the outbound registry" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = jsonrpc.Writer.initCallback(null, failEveryFrame);
+
+    const result = try callHostTool(&state, alloc, "todo", "call_1", "{}", 1024, null);
+    try std.testing.expectEqualStrings("Host tool request failed", result.failure);
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+}
+
+test "a permission request whose write fails leaves nothing in the outbound registry" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = jsonrpc.Writer.initCallback(null, failPermissionRequestFrame);
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+
+    const call: ToolCall = .{ .id = "call_1", .name = "shell", .arguments_json = "{}" };
+    try std.testing.expectError(
+        error.BrokenPipe,
+        requestAcpPermission(&ctx, alloc, .{ .label = "run a command" }, call, null, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+}
+
+test "a journal flush whose write fails leaves nothing in the outbound registry" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = jsonrpc.Writer.initCallback(null, failEveryFrame);
+
+    try std.testing.expectError(error.JournalFlushFailed, flushJournal(&state, alloc, "session_1"));
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+}
+
 test "host tool arguments are sent as the types the tool's schema names" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -956,7 +1016,13 @@ fn callHostTool(
         .{ .integer = @intCast(outbound_id) },
         "libfx/tool_call",
         params.written(),
-    ) catch return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
+    ) catch {
+        // The client never got the request, so no answer comes. Forget it
+        // here: the errdefer above runs only on an error return, and a
+        // leftover entry would keep one of the outbound slots for good.
+        server.discardOutboundRequest(state, outbound_id);
+        return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
+    };
 
     var response = server.awaitOutboundResponse(state, outbound_id, .host_tool) orelse
         return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
@@ -1534,11 +1600,9 @@ pub fn handlePromptWithInputId(
     // is: a checkpoint saves it.
     usage_total.add(session.session_rt.agent.turn_usage);
     first_turn catch |err| {
-        if (err == error.TurnYielded) {
-            // The journal keeps the turn open for a later resume; nothing
-            // ends it here.
+        if (yieldedTurnStop(err)) |stop| {
             prompt_input.retainImageSnapshots();
-            return .{ .stop_reason = .yielded };
+            return stop;
         }
         if (err == error.NonInteractivePermissionRequired) {
             ctx.stop_reason = .refused;
@@ -3533,6 +3597,7 @@ fn runReportTurns(
         }, agent_config, job);
         usage_total.add(session.session_rt.agent.turn_usage);
         report_turn catch |err| {
+            if (yieldedTurnStop(err)) |stop| return stop;
             endJournalTurn(alloc, state.alloc, session) catch |end_err| {
                 debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
             };
@@ -3732,6 +3797,7 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
     var yields = false;
+    const stop_requested = hostAskedToYield(session);
     const barrier = barrier: {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -3745,7 +3811,7 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
             .compaction
         else
             .request;
-        if (journal.yieldsAt(io_mod.milliTimestamp(), kind)) {
+        if (journal.yieldsAt(io_mod.milliTimestamp(), kind, stop_requested)) {
             try journal.appendMarked(ctx.alloc, session.session_id, .turn_yielded, true);
             yields = true;
         }
@@ -3765,8 +3831,16 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
         try journal.keepYielded(ctx.state.alloc, checkpoint);
     }
-    debug_trace.logf("session", "event=libfx_journal_turn_yielded session={s}", .{session.session_id});
+    debug_trace.logf("session", "event=libfx_journal_turn_yielded session={s} requested={s}", .{ session.session_id, if (stop_requested) "host" else "deadline" });
     return error.TurnYielded;
+}
+
+/// Whether the host asked the running turn to stop at its next safe point: a
+/// web host through its import, since the web core reads no ACP message while a
+/// prompt runs, and a native host through `libfx/yield`.
+fn hostAskedToYield(session: *const server.ActiveSessionState) bool {
+    if (comptime host_target.is_wasm) return js_host_steering.yieldRequested();
+    return session.yield_requested.load(.seq_cst);
 }
 
 fn keepCancelledProgress(session_alloc: Allocator, session: *server.ActiveSessionState, checkpoint: session_codec.RecoveryCheckpoint) !void {
@@ -6573,4 +6647,83 @@ test "ACP prompt agent config carries request options from active session" {
     try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
     try std.testing.expect(tool_ctx.ultrafast_mode);
+}
+
+test "a report turn that yields stops as yielded and leaves its journal turn open" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    // Declared before the state, so the state closes its session before the store ends.
+    var store = try session_adapter.Store.open(alloc, home);
+    defer store.deinit(alloc);
+    var state = try initTestAcpState(alloc, workspace, .auto);
+    defer state.deinit();
+    // Test runs use stdout as their protocol channel, so no notice may reach it.
+    const Silent = struct {
+        fn write(_: ?*anyopaque, _: []const u8) !void {}
+    };
+    state.writer = jsonrpc.Writer.initCallback(null, Silent.write);
+    state.active_session.?.v2 = try session_adapter.Session.create(alloc, &store, home, .acp, .{
+        .preferences = .{ .model = @constCast("test-model"), .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+    state.active_session.?.journal = .{ .writer = &state.writer };
+
+    server.enableSubagentHost(&state);
+    try std.testing.expect(state.subagent_host != null);
+    const subagents = state.subagent_host.?;
+    try subagents.report_sink.?.post(subagents, .{ .report = .{ .agent = "reviewer", .child_id = "child-1", .work_id = "work-1", .call_id = "call-1", .outcome = .completed, .output = "done" } });
+    try std.testing.expectEqual(@as(usize, 1), state.worker.queuedPromptCount());
+
+    // Stands in for setJournalProgress yielding at the report turn's first request save.
+    const StandIn = struct {
+        var saw_report_text = false;
+
+        fn set(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) anyerror!void {
+            if (std.mem.find(u8, checkpoint.user.text, "done") != null) saw_report_text = true;
+            const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+            ctx.state.active_session.?.journal.?.progress_open = true;
+            return error.TurnYielded;
+        }
+        fn clear(_: *anyopaque) anyerror!void {}
+        fn capabilities(_: *anyopaque, _: []const u8) model_capabilities.Capabilities {
+            return .{ .context_window = 1_000_000, .image_input_support = .non_native };
+        }
+        fn resolveCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities {
+            return capabilities(raw_ctx, model);
+        }
+    };
+    StandIn.saw_report_text = false;
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+    var deps = agentRuntimeDeps(&ctx);
+    deps.recovery_checkpoint = .{ .set = StandIn.set, .clear = StandIn.clear };
+    deps.available_model_capabilities = StandIn.capabilities;
+    deps.resolve_model_capabilities = StandIn.resolveCapabilities;
+
+    const agent_config = buildAgentConfig(&state, &state.active_session.?, .{ .custom_tool_guidance = "" });
+    const base: worker_runtime.QueuedPrompt = .{
+        .prompt = &.{},
+        .images = &.{},
+        .model = @constCast("test-model"),
+        .api_key = &.{},
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+    };
+    var usage_total: types.Usage = .{};
+    const stop = try runReportTurns(&state, &state.active_session.?, alloc, &ctx, &deps, agent_config, base, &usage_total);
+    try std.testing.expectEqual(@as(?TerminalOutcome, .{ .stop_reason = .yielded }), stop);
+    try std.testing.expectEqual(@as(usize, 0), state.worker.queuedPromptCount());
+    // A yielded turn carries the report, so a resume continues it with nothing lost.
+    try std.testing.expect(StandIn.saw_report_text);
+    // The journal keeps the yielded turn open for the host to resume.
+    try std.testing.expect(state.active_session.?.journal.?.progress_open);
 }
