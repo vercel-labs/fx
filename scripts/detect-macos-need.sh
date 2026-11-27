@@ -64,7 +64,10 @@ for revision in "$base" "$head"; do
   fi
 done
 
-if ! changed_files="$(git diff --name-only --no-renames "$base" "$head")"; then
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+if ! git -c core.quotePath=false diff --name-only --no-renames -z "$base" "$head" > "$tmp"; then
   printf 'error: git diff %s %s failed; the macOS check cannot decide\n' "$base" "$head" >&2
   exit 1
 fi
@@ -80,7 +83,7 @@ if [ "${SDK_NATIVE_REQUESTED:-false}" = true ]; then
   require_sdk_native "native SDK addon check requested"
 fi
 
-while IFS= read -r path; do
+while IFS= read -r -d '' path; do
   [ -n "$path" ] || continue
   case "$path" in
     .github/workflows/macos.yml)
@@ -107,7 +110,7 @@ while IFS= read -r path; do
         require "$path: shared E2E helper has a platform branch"
       fi ;;
   esac
-done <<<"$changed_files"
+done < "$tmp"
 
 if [ "$needed" = true ]; then
   printf 'macOS arm64 checks needed:\n'

@@ -238,7 +238,7 @@ fn send(
 }
 
 fn now(_: ?*anyopaque) i64 {
-    if (io_mod.getenv(clock_file_env)) |path| {
+    if (io_mod.getenvAbsolutePath(clock_file_env)) |path| {
         if (readClockFile(path)) |ms| return ms;
     }
     return io_mod.milliTimestamp();
@@ -282,4 +282,14 @@ test "the usage label names a login's team only by a valid team name" {
     var neither_buf: LabelBuffer = undefined;
     const neither = fromParts(.fx_login, "token", "team 123", "\xe2\x80\xaeslug", null, &neither_buf).?;
     try std.testing.expectEqualStrings("no team (fx login)", neither.label);
+}
+
+test "a clock file given as a relative path is not read" {
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put(clock_file_env, "relative-clock");
+    io_mod.setEnvironMap(&map);
+    defer io_mod.resetEnvironForTest();
+    const before = io_mod.milliTimestamp();
+    try std.testing.expect(now(null) >= before);
 }

@@ -25,6 +25,7 @@ const max_poll_ticks: u32 = 400;
 const Op = struct {
     op: []const u8,
     @"resume": bool = false,
+    continues: bool = false,
     name: []const u8 = "",
     kind: []const u8 = "",
 };
@@ -46,6 +47,8 @@ const StateOut = struct {
     deaths: u8,
     clean: bool,
     flowing: bool,
+    streak: u8,
+    streak_kind: ?[]const u8,
 };
 
 const DiskOut = struct {
@@ -125,6 +128,8 @@ fn stateOut(state: *const recovery.State) StateOut {
         .deaths = state.abrupt_deaths,
         .clean = state.flags.clean_exit,
         .flowing = state.flowing,
+        .streak = state.streak,
+        .streak_kind = if (state.streak_kind) |kind| @tagName(kind) else null,
     };
 }
 
@@ -183,7 +188,7 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         lab.* = .{};
     } else if (is(op.op, "start")) {
         const resume_from = if (op.@"resume") lab.disk else null;
-        result.plan = planOut(lab.step(.{ .start = .{ .resume_from = resume_from } }));
+        result.plan = planOut(lab.step(.{ .start = .{ .resume_from = resume_from, .continues = op.continues } }));
     } else if (is(op.op, "event")) {
         const event = eventNamed(op.name) orelse {
             result.@"error" = "unknown event";
@@ -202,6 +207,11 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         result.plan = planOut(lab.poll());
     } else if (is(op.op, "handoff")) {
         result.plan = planOut(lab.handOff());
+    } else if (is(op.op, "abandon")) {
+        // fx ends a request nobody can answer on its own error. That host
+        // keeps no record, so nothing is left to resume.
+        lab.state = .{};
+        lab.disk = null;
     } else if (is(op.op, "exit")) {
         // The process ends, by a crash or after `closing`; the record stays.
         lab.state = .{};
