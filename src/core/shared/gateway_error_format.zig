@@ -62,13 +62,85 @@ pub fn formatSchemaDiagnostic(alloc: Allocator, detail: []const u8) !?[]u8 {
     return try out.toOwnedSlice();
 }
 
+fn httpErrorTitle(status_code: u16) []const u8 {
+    return if (status_code == 401 or status_code == 403) "API access denied" else "API request failed";
+}
+
 pub fn formatHttpErrorMessage(alloc: Allocator, status: std.http.Status, detail: []const u8) ![]u8 {
     const status_code = @backingInt(status);
-    const title = if (status_code == 401 or status_code == 403)
-        "API access denied"
-    else
-        "API request failed";
-    return formatHttpDiagnostic(alloc, status, detail, title, max_published_error_bytes);
+    return formatHttpDiagnostic(alloc, status, detail, httpErrorTitle(status_code), max_published_error_bytes);
+}
+
+pub const HttpErrorNotice = struct {
+    body: []u8,
+    codes: []u8,
+
+    pub fn deinit(self: HttpErrorNotice, alloc: Allocator) void {
+        alloc.free(self.body);
+        alloc.free(self.codes);
+    }
+};
+
+/// The provider's message for the transcript and the codes for its full-transcript row. Both are owned by `alloc`.
+pub fn formatHttpErrorNotice(alloc: Allocator, status: std.http.Status, detail: []const u8) !HttpErrorNotice {
+    const status_code = @backingInt(status);
+    var parsed: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(std.json.Value, alloc, detail, .{}) catch null;
+    defer if (parsed) |*value| value.deinit();
+
+    const error_object = if (parsed) |value| errorObjectOf(value.value) else null;
+    const fields = if (error_object) |object| errorCodeAndMessage(object) else null;
+    const message = nonEmptyText(if (fields) |found| found.message else null);
+    const code = if (fields) |found| found.code else null;
+    const provider = if (error_object) |object| (stringField(object, "provider") orelse providerFromGatewayMessage(message)) else null;
+
+    const title = httpErrorTitle(status_code);
+    const body_source = message orelse (if (error_object == null and detail.len > 0) detail else title);
+    var body = try sanitizeExternalText(alloc, body_source, max_published_error_bytes);
+    errdefer alloc.free(body);
+    if (status_code == 403) {
+        if (message) |text| {
+            if (token_pass.deniedCause(text)) |cause| {
+                const with_rows = try alloc.print("{s}\n{s}", .{ body, token_pass.deniedActionRows(cause) });
+                alloc.free(body);
+                body = with_rows;
+            }
+        }
+    }
+
+    var codes_out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer codes_out.deinit();
+    try codes_out.writer.print("HTTP {d}", .{status_code});
+    if (code) |text| try codes_out.writer.print(" · {s}", .{text});
+    if (provider) |text| try codes_out.writer.print(" · Provider: {s}", .{text});
+    const codes_raw = try codes_out.toOwnedSlice();
+    defer alloc.free(codes_raw);
+    const codes = try sanitizeExternalText(alloc, codes_raw, max_published_error_bytes);
+
+    return .{ .body = body, .codes = codes };
+}
+
+fn errorObjectOf(root: std.json.Value) ?std.json.ObjectMap {
+    const root_object = objectValue(root) orelse return null;
+    const error_value = root_object.get("error") orelse return null;
+    return objectValue(error_value);
+}
+
+const CodeAndMessage = struct { code: ?[]const u8, message: ?[]const u8 };
+
+/// Some providers put their code and message only under `error.param`, so each falls back to it.
+fn errorCodeAndMessage(error_object: std.json.ObjectMap) CodeAndMessage {
+    const param_object = if (error_object.get("param")) |param_value| objectValue(param_value) else null;
+    const code = stringField(error_object, "code") orelse
+        stringField(error_object, "type") orelse
+        if (param_object) |param| stringField(param, "name") else null;
+    const message = nonEmptyText(stringField(error_object, "message")) orelse
+        if (param_object) |param| nonEmptyText(stringField(param, "message")) else null;
+    return .{ .code = code, .message = message };
+}
+
+fn nonEmptyText(text: ?[]const u8) ?[]const u8 {
+    const value = text orelse return null;
+    return if (value.len > 0) value else null;
 }
 
 pub fn formatHttpRecoveryDiagnostic(alloc: Allocator, status: std.http.Status, detail: []const u8) ![]u8 {
@@ -127,11 +199,9 @@ fn formatHttpDiagnostic(
         return formatFallbackBounded(alloc, status, detail, max_bytes);
     const error_object = objectValue(error_value) orelse
         return formatFallbackBounded(alloc, status, detail, max_bytes);
-    const param_object = if (error_object.get("param")) |param_value| objectValue(param_value) else null;
-    const code = stringField(error_object, "code") orelse
-        stringField(error_object, "type") orelse
-        if (param_object) |param| stringField(param, "name") else null;
-    const message = stringField(error_object, "message") orelse if (param_object) |param| stringField(param, "message") else null;
+    const fields = errorCodeAndMessage(error_object);
+    const code = fields.code;
+    const message = fields.message;
     const provider = stringField(error_object, "provider") orelse providerFromGatewayMessage(message);
 
     const raw = try formatParsedHttpMessage(
@@ -206,6 +276,15 @@ test "a Token Pass 403 names what to do next" {
     );
     defer alloc.free(other_status);
     try std.testing.expect(std.mem.find(u8, other_status, "spends only Token Pass") == null);
+}
+
+test "formatHttpErrorNotice falls back to the param when the message is empty" {
+    const alloc = std.testing.allocator;
+    const notice = try formatHttpErrorNotice(alloc, .forbidden,
+        \\{"error":{"message":"","param":{"message":"Restricted."}}}
+    );
+    defer notice.deinit(alloc);
+    try std.testing.expectEqualStrings("Restricted.", notice.body);
 }
 
 pub fn formatMarkedLine(alloc: Allocator, marker_prefix: []const u8, message: []const u8, cols: u16) ![]u8 {
@@ -491,6 +570,98 @@ test "formatHttpErrorMessage masks structured and fallback secrets" {
     defer alloc.free(fallback);
     try std.testing.expectEqualStrings("HTTP 503: API_KEY=[redacted]", fallback);
     try std.testing.expect(std.mem.find(u8, fallback, secret) == null);
+}
+
+test "formatHttpErrorNotice keeps the provider message and puts Token Pass rows after it" {
+    const alloc = std.testing.allocator;
+    const detail =
+        \\{"error":{"message":"This model requires an active Vercel Token Pass.","type":"no_providers_available"}}
+    ;
+    const notice = try formatHttpErrorNotice(alloc, .forbidden, detail);
+    defer notice.deinit(alloc);
+
+    try std.testing.expect(std.mem.startsWith(u8, notice.body, "This model requires an active Vercel Token Pass."));
+    try std.testing.expect(std.mem.find(u8, notice.body, "\n├ \x1b]8;;") != null);
+    try std.testing.expect(std.mem.find(u8, notice.body, "Subscribe to Token Pass") != null);
+    try std.testing.expectEqualStrings("HTTP 403 · no_providers_available", notice.codes);
+}
+
+test "formatHttpErrorNotice reads a message and name that only the param holds" {
+    const alloc = std.testing.allocator;
+    const detail =
+        \\{"error":{"param":{"name":"RestrictedProvidersError","message":"Your team has restricted access to this provider."}}}
+    ;
+    const notice = try formatHttpErrorNotice(alloc, .forbidden, detail);
+    defer notice.deinit(alloc);
+
+    try std.testing.expectEqualStrings("Your team has restricted access to this provider.", notice.body);
+    try std.testing.expectEqualStrings("HTTP 403 · RestrictedProvidersError", notice.codes);
+}
+
+test "formatHttpErrorNotice keeps Token Pass rows for a param-only denial" {
+    const alloc = std.testing.allocator;
+    const detail =
+        \\{"error":{"param":{"message":"This model requires an active Vercel Token Pass."}}}
+    ;
+    const notice = try formatHttpErrorNotice(alloc, .forbidden, detail);
+    defer notice.deinit(alloc);
+
+    try std.testing.expect(std.mem.startsWith(u8, notice.body, "This model requires an active Vercel Token Pass."));
+    try std.testing.expect(std.mem.find(u8, notice.body, "Subscribe to Token Pass") != null);
+}
+
+test "formatHttpErrorNotice names a quota code and no provider" {
+    const alloc = std.testing.allocator;
+    const detail =
+        \\{"error":{"code":"quota_for_entity_exceeded","message":"User budget exceeded."}}
+    ;
+    const notice = try formatHttpErrorNotice(alloc, .payment_required, detail);
+    defer notice.deinit(alloc);
+
+    try std.testing.expectEqualStrings("User budget exceeded.", notice.body);
+    try std.testing.expectEqualStrings("HTTP 402 · quota_for_entity_exceeded", notice.codes);
+}
+
+test "formatHttpErrorNotice shows plain provider text as the body" {
+    const alloc = std.testing.allocator;
+    const notice = try formatHttpErrorNotice(alloc, .bad_request, "Gemini request failed.");
+    defer notice.deinit(alloc);
+
+    try std.testing.expectEqualStrings("Gemini request failed.", notice.body);
+    try std.testing.expectEqualStrings("HTTP 400", notice.codes);
+}
+
+test "formatHttpErrorNotice falls back to the status title without a body" {
+    const alloc = std.testing.allocator;
+    const notice = try formatHttpErrorNotice(alloc, .forbidden, "");
+    defer notice.deinit(alloc);
+
+    try std.testing.expectEqualStrings("API access denied", notice.body);
+    try std.testing.expectEqualStrings("HTTP 403", notice.codes);
+}
+
+test "formatHttpErrorNotice shows the title for a JSON error without a message" {
+    const alloc = std.testing.allocator;
+    const detail =
+        \\{"error":{"code":"rate_limited"}}
+    ;
+    const notice = try formatHttpErrorNotice(alloc, .too_many_requests, detail);
+    defer notice.deinit(alloc);
+
+    try std.testing.expectEqualStrings("API request failed", notice.body);
+    try std.testing.expectEqualStrings("HTTP 429 · rate_limited", notice.codes);
+}
+
+test "formatHttpErrorNotice keeps outside escape sequences off the screen" {
+    const alloc = std.testing.allocator;
+    const detail =
+        \\{"error":{"message":"Bad \u001b[2J input"}}
+    ;
+    const notice = try formatHttpErrorNotice(alloc, .bad_request, detail);
+    defer notice.deinit(alloc);
+
+    try std.testing.expect(std.mem.find(u8, notice.body, "\x1b") == null);
+    try std.testing.expect(std.mem.find(u8, notice.body, "Bad") != null);
 }
 
 test "formatHttpRecoveryDiagnostic keeps status code and provider error identity" {
