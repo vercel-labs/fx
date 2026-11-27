@@ -1411,10 +1411,14 @@ const App = struct {
         const file_listing_in_flight = picker.active and !picker.indexed and picker.directory_request != null;
         const model_loading = self.model_cache.menu.active and self.model_cache.isLoading();
         const mcp_loading = self.mcp.host_menu.active and self.mcp.host_menu_tools == .loading;
+        const session_picker = &self.screenAgent().session_persistence.session_picker;
+        const session_loading = session_picker.isLoading() or
+            (session_picker.active and session_picker.loading_more);
         return self.input_runtime.usage_menu.active or
             file_listing_in_flight or
             model_loading or
-            mcp_loading;
+            mcp_loading or
+            session_loading;
     }
 
     /// Whether any agent's budgeted drain put events back for the loop's next
@@ -4757,6 +4761,24 @@ test "poll timeout stays active 8 ms while theme monitor buffers an escape byte"
     try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
 
     try std.testing.expectEqual(.pending, app.terminal_input_runtime.terminal_theme_monitor.feed(0x1b, 1_000));
+    try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
+}
+
+test "poll timeout stays active 8 ms while session picker loads" {
+    var app = App{ .alloc = std.testing.allocator };
+    defer app.lifecycle_runtime.deinit();
+
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
+
+    const picker = &app.screenAgent().session_persistence.session_picker;
+    picker.active = true;
+    picker.load_state = .loading;
+    try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
+
+    picker.load_state = .ready;
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
+
+    picker.loading_more = true;
     try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
 }
 
