@@ -1,0 +1,51 @@
+%% One fx process refreshing a shared DPoP-bound Google Gemini login in Design A
+%% (GeminiDpopRefresh.tla). Design A holds all seven safety invariants and Settles.
+stateDiagram-v2
+    state "Starting, reading saved login" as Starting
+    state "Holding an access token" as Ready
+    state "Waiting for the shared login lock" as WaitingLock
+    state "Inside lock, checking saved login" as CheckingSaved
+    state "Sending DPoP refresh request" as Refreshing
+    state "Writing tokens and DPoP nonce atomically" as Saving
+    state "Retrying API request with live token" as RetryingAPI
+    state "Request succeeded" as Done
+    state "Request failed, saved login kept" as Failed
+    state "Saved login cleared, asking user to sign in" as NeedsSignIn
+
+    [*] --> Starting
+    Starting --> Ready : saved login found
+    Starting --> NeedsSignIn : no saved login
+    Ready --> Done : API accepts token
+    Ready --> WaitingLock : 401 or under 300 s left
+    WaitingLock --> CheckingSaved : lock acquired
+    CheckingSaved --> NeedsSignIn : saved login gone
+    CheckingSaved --> RetryingAPI : saved token is live, adopt and release lock
+    CheckingSaved --> Refreshing : saved token is stale or rejected
+    Refreshing --> Refreshing : 400 use_dpop_nonce on first try, update nonce
+    Refreshing --> Failed : second use_dpop_nonce, or offline / 429 / 5xx
+    Refreshing --> NeedsSignIn : 400 invalid_grant (grant expired or token spent), clear login
+    Refreshing --> Saving : 200 OK with new tokens and rotated nonce
+    Saving --> RetryingAPI : atomic write done, release lock
+    RetryingAPI --> Done : API accepts token
+    RetryingAPI --> Failed : second 401
+
+%% Rule breaks in Design B and the mutants (check.sh shows each one fails):
+%% design-b-no-rotate and design-b-rotate break SignOutSticks. Shortest path
+%%   (7 steps): p1 reads token 0, refreshes at /token, and pauses before Save;
+%%   SignOut deletes the saved login; p1's late Save restores it on disk.
+%%   (design-b-rotate also breaks NoSpentRefresh at 10 steps when p1 and p2 race.)
+%% mutant-signout-unlocked breaks SignOutSticks in the same 7-step trace.
+%% mutant-decide-outside-lock breaks NoSpentRefresh. Shortest path (12 steps):
+%%   p1 and p2 both read token 0 before locking; p1 locks, redeems 0 -> 1, and
+%%   saves; p2 locks, decides from its stale pre-lock read 0, and sends spent 0.
+%% mutant-unbounded-nonce-retry breaks NonceRetryAtMostOnce. Shortest path (9
+%%   steps): server rotates nonce twice while p1 retries use_dpop_nonce 3 times.
+%% mutant-clear-on-offline breaks ClearOnlyWithCause. Shortest path (6 steps):
+%%   p1 hits an offline/429/5xx error and deletes the saved login.
+%%
+%% Events this chart leaves out:
+%%   process killed at any step before settling (kernel drops any held lock;
+%%     only a kill in Saving leaves a spent refresh token unpersisted),
+%%   user sign-out (acquires lock in Design A and deletes the saved login),
+%%   server nonce rotation, access token expiry, and 7-day grant expiry,
+%%   Design B (no lock, in-memory nonce) and RotatesRefresh = FALSE.
