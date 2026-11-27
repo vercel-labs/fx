@@ -104,11 +104,7 @@ const Context = struct {
         result.permission_state_override = &self.admission.permission_state;
         result.advertised_dynamic_tool_names = self.admission.integration_names;
         result.mcp_access = if (self.admission.mcp_view) |*view|
-            .{ .scoped = .{
-                .captured = view,
-                .admission_authority_generation = self.admission.authority_generation,
-                .live = .{ .context = self, .resolve_fn = resolveLiveMcpView },
-            } }
+            .{ .scoped = .{ .captured = view } }
         else
             .disabled;
         result.subagent_host = self.config.host;
@@ -135,15 +131,6 @@ const Context = struct {
             .subagent_id = self.subagent_id,
         };
         return result;
-    }
-
-    fn resolveLiveMcpView(
-        raw: *anyopaque,
-        alloc: Allocator,
-    ) !tool_mcp_runtime.ResolvedLiveView {
-        const self: *Context = @ptrCast(@alignCast(raw));
-        var authority = try self.turn.resolveLiveAuthority(alloc);
-        return execution.liveMcpViewFrom(alloc, &authority);
     }
 };
 
