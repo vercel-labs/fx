@@ -6,9 +6,6 @@ const workspace_access = @import("../../core/workspace/workspace_access.zig");
 const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
 const render_input = @import("render_input.zig");
 const info_panel_presentation = @import("info_panel_presentation.zig");
-const usage_presentation = @import("usage_presentation.zig");
-
-pub const usageVisibleModelItems = usage_presentation.visibleModelItems;
 const row_text = @import("row_text.zig");
 const ui_render = @import("../render.zig");
 
@@ -31,7 +28,6 @@ pub fn desiredRowCount(projection: CompactCommandMenuProjection, width: u16) u16
     const count: usize = switch (projection) {
         .statusline => settings_row_offset + settings_catalog.statuslineChoiceCount(),
         .info_panel => |panel| info_panel_presentation.desiredRowCount(panel, width),
-        .usage => |usage| usage_presentation.desiredRowCount(usage),
         .workspace => |workspace| workspace_pinned_rows +
             workspace_menu.State.rowCount(workspace.entries),
     };
@@ -58,7 +54,6 @@ pub noinline fn composeCompactCommandMenuRow(
     return switch (projection) {
         .statusline => composeSettingsRow(alloc, projection, row_index, visible_rows, width),
         .info_panel => |panel| info_panel_presentation.composeRow(alloc, panel, row_index, visible_rows, width),
-        .usage => |usage| usage_presentation.composeRow(alloc, usage, row_index, visible_rows, width),
         .workspace => |workspace| composeWorkspaceRow(alloc, workspace, row_index, visible_rows, width),
     };
 }
@@ -73,7 +68,7 @@ fn composeSettingsRow(
     const empty: std.ArrayList(u8) = .empty;
     const statusline = switch (projection) {
         .statusline => |value| value,
-        .info_panel, .usage, .workspace => return empty,
+        .info_panel, .workspace => return empty,
     };
     const choice_count = settings_catalog.statuslineChoiceCount();
     if (choice_count == 0) return empty;
@@ -113,7 +108,7 @@ fn choiceView(projection: CompactCommandMenuProjection, choice_index: usize) ?Ch
                 .selected = choice_index == statusline.selected_index % settings_catalog.statuslineChoiceCount(),
             };
         },
-        .info_panel, .usage, .workspace => null,
+        .info_panel, .workspace => null,
     };
 }
 

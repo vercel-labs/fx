@@ -544,7 +544,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
                 .insert_newline => {
-                    if (commandSkillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(agent)) return;
+                    if (commandSkillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(agent) or usageMenuActive(app)) return;
                     dismissActiveMenusThenRedraw(app, agent);
                     switch (try insertComposerSliceBounded(app, agent, "\n", max_input_len, false)) {
                         .inserted => app.shell.render_requests.request(.footer),
@@ -1061,6 +1061,16 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
+            if (usageMenuActive(app) and
+                app.input_runtime.edit_state.input.items.len == 0 and
+                (resolved == .cursor_left or resolved == .cursor_right))
+            {
+                if (try cycleUsageMenuPeriod(app, if (resolved == .cursor_left) -1 else 1)) {
+                    app.shell.render_requests.request(.footer);
+                }
+                return .done;
+            }
+
             if (settingsMenuActive(app) and
                 (resolved == .cursor_left or resolved == .cursor_right))
             {
@@ -1153,6 +1163,8 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     } else if (cycleModelMenuProvider(app, -1) or cycleSkillsMenuSource(app, -1)) {
                         app.shell.render_requests.request(.footer);
+                    } else if (try cycleUsageMenuPeriod(app, -1)) {
+                        app.shell.render_requests.request(.footer);
                     } else {
                         try app_permission_runtime.Runtime(App).toggleMode(app, agents.screenAgentOf(app));
                     }
@@ -1161,7 +1173,7 @@ pub fn Runtime(comptime App: type) type {
                     if (comptime agents.hasAgentField(App, "session_persistence") and
                         runtime_profile.allows(App, .durable_sessions))
                     {
-                        if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app)) return .done;
+                        if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or usageMenuActive(app)) return .done;
                         if (try refuseSessionActionWithDraft(app, agents.screenAgentOf(app), "submit or clear the draft before switching sessions")) return .done;
                         dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
                         try app_session_runtime.Runtime(App).openAllSessionPicker(app, agents.screenAgentOf(app));
@@ -1335,15 +1347,7 @@ pub fn Runtime(comptime App: type) type {
                     return true;
                 }
                 switch (byte) {
-                    '\t' => if (menu == .usage) {
-                        try refreshUsageMenu(app, app.input_runtime.usage_menu.period.next());
-                    },
                     '\r' => try submitCompactCommandMenuSelection(app, menu, max_input_len),
-                    'r', 'R' => if (menu == .usage) {
-                        if (comptime runtime_profile.allows(App, .profile_usage)) {
-                            try reloadUsageMenu(app, app.input_runtime.usage_menu.period);
-                        }
-                    },
                     10 => {
                         _ = moveCompactCommandMenu(app, menu, 1);
                         app.shell.render_requests.request(.footer);
@@ -1496,6 +1500,8 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     } else if (cycleModelMenuProvider(app, 1) or cycleSkillsMenuSource(app, 1)) {
                         app.shell.render_requests.request(.footer);
+                    } else if (try cycleUsageMenuPeriod(app, 1)) {
+                        app.shell.render_requests.request(.footer);
                     } else if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
                         try completion_rt.openCurrentModelPicker(app);
                     } else if (picker_state.isBareEffortCommandAtCursor(&app.input_runtime.edit_state)) {
@@ -1563,6 +1569,13 @@ pub fn Runtime(comptime App: type) type {
                         }
                     }
                 },
+                18 => {
+                    if (usageMenuActive(app)) {
+                        if (comptime runtime_profile.allows(App, .profile_usage)) {
+                            try reloadUsageMenu(app, app.input_runtime.usage_menu.period);
+                        }
+                    }
+                },
                 22 => {
                     if (paste_rt.modelPickerBorrowsComposer(app)) {
                         debug_trace.logf("input", "image attach skipped reason=model_picker_borrows_composer", .{});
@@ -1575,6 +1588,7 @@ pub fn Runtime(comptime App: type) type {
                 },
                 '\r' => {
                     if (try submitEffortMenuSelection(app, agent)) return;
+                    if (submitUsageMenuSelection(app)) return;
                     if (try submitAgentsMenuSelection(app)) return;
                     if (try submitSettingsMenuSelection(app, agent)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
@@ -1647,7 +1661,7 @@ pub fn Runtime(comptime App: type) type {
                             selection.start
                         else
                             app.input_runtime.edit_state.cursor;
-                        if (byte == '$' and !file_picker_path.contains_position(app.input_runtime.edit_state.input.items, insertion_start) and !helpMenuActive(app) and !commandSkillsMenuActive(app) and !modelMenuActive(app)) {
+                        if (byte == '$' and !file_picker_path.contains_position(app.input_runtime.edit_state.input.items, insertion_start) and !helpMenuActive(app) and !commandSkillsMenuActive(app) and !modelMenuActive(app) and !usageMenuActive(app)) {
                             if ((try insertComposerSliceBounded(app, agent, &.{byte}, max_input_len, false)) == .limit_exceeded) {
                                 try input_limit_feedback.report(App, app, .composer, 1);
                                 return;
@@ -1811,6 +1825,7 @@ pub fn Runtime(comptime App: type) type {
             if (mcpHostMenuActive(app)) return true;
             if (helpMenuActive(app)) return true;
             if (modelMenuActive(app)) return true;
+            if (usageMenuActive(app)) return true;
             if (sessionMenuActive(agent)) return true;
             if (comptime !@hasField(App, "skills")) return false;
             if (!app.skills.menu.active) return false;
@@ -2244,17 +2259,19 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        fn usageMenuActive(app: *App) bool {
+            return app.input_runtime.usage_menu.active;
+        }
+
         const CompactCommandMenuKind = enum {
             statusline,
             info_panel,
-            usage,
             workspace,
         };
 
         fn activeCompactCommandMenu(app: *App) ?CompactCommandMenuKind {
             if (app.input_runtime.statusline_menu.active) return .statusline;
             if (app.input_runtime.info_panel.active) return .info_panel;
-            if (app.input_runtime.usage_menu.active) return .usage;
             if (app.input_runtime.workspace_menu.active) return .workspace;
             return null;
         }
@@ -2379,7 +2396,7 @@ pub fn Runtime(comptime App: type) type {
         fn modelPickerShortcutBlocked(app: *App, agent: *AppAgent) bool {
             if (settingsMenuActive(app) or helpMenuActive(app) or
                 skillsMenuActive(app) or sessionMenuActive(agent) or forkMenuActive(agent) or mcpHostMenuActive(app) or
-                agentsMenuActive(app)) return true;
+                agentsMenuActive(app) or usageMenuActive(app)) return true;
             if (comptime @hasField(App, "auth")) {
                 if (app.auth.pickerView().active) return true;
             }
@@ -2559,14 +2576,10 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return;
             }
-            if (menu == .usage) {
-                if (app.input_runtime.usage_menu.openDetail()) app.shell.render_requests.request(.footer);
-                return;
-            }
             const snapshot = app_commands.settingsCatalogSnapshot(app);
             const change = switch (menu) {
                 .statusline => app.input_runtime.statusline_menu.selectedChange(snapshot),
-                .info_panel, .usage, .workspace => unreachable,
+                .info_panel, .workspace => unreachable,
             } orelse return;
             if (comptime @hasDecl(App, "notificationPreferences")) {
                 try app_commands.applySettingsCatalogMenuChange(app, change);
@@ -2609,10 +2622,6 @@ pub fn Runtime(comptime App: type) type {
             return switch (menu) {
                 .statusline => app.input_runtime.statusline_menu.move(delta),
                 .info_panel => scrollInfoPanel(app, delta),
-                .usage => app.input_runtime.usage_menu.moveModel(
-                    delta,
-                    usageMenuVisibleModelItems(app),
-                ),
                 .workspace => if (comptime @hasDecl(App, "workspaceAccess"))
                     app.input_runtime.workspace_menu.move(
                         delta,
@@ -2635,24 +2644,22 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        fn usageMenuVisibleModelItems(app: *App) u16 {
-            const projection = render_input.usageMenuProjection(
-                &app.input_runtime.usage_menu,
-            );
-            const menu: render_input.CompactCommandMenuProjection = .{
-                .usage = projection,
-            };
-            const visible_rows = @min(
-                compact_command_menu_presentation.desiredRowCount(
-                    menu,
-                    app.shell.layout.cols,
-                ),
-                app.shell.layout.rows -| 3,
-            );
-            return std.math.cast(u16, compact_command_menu_presentation.usageVisibleModelItems(
-                projection,
-                visible_rows,
-            )) orelse std.math.maxInt(u16);
+        fn submitUsageMenuSelection(app: *App) bool {
+            if (!usageMenuActive(app)) return false;
+            if (app.input_runtime.usage_menu.openDetail(app.input_runtime.edit_state.input.items)) {
+                app.shell.render_requests.request(.footer);
+            }
+            return true;
+        }
+
+        fn cycleUsageMenuPeriod(app: *App, delta: i32) !bool {
+            if (!usageMenuActive(app)) return false;
+            const current = app.input_runtime.usage_menu.period;
+            const next = if (delta < 0) current.previous() else current.next();
+            if (next != current) {
+                try refreshUsageMenu(app, next);
+            }
+            return true;
         }
 
         fn routeCompactCommandMenuEscapeAction(
@@ -2660,23 +2667,6 @@ pub fn Runtime(comptime App: type) type {
             menu: CompactCommandMenuKind,
             resolved: input_action.Action,
         ) !void {
-            if (menu == .usage and
-                (resolved == .cursor_left or resolved == .cursor_right))
-            {
-                const current = app.input_runtime.usage_menu.period;
-                const next = if (resolved == .cursor_left)
-                    current.previous()
-                else
-                    current.next();
-                if (next != current) {
-                    try refreshUsageMenu(app, next);
-                }
-                return;
-            }
-            if (menu == .usage and resolved == .toggle_permission_mode) {
-                try refreshUsageMenu(app, app.input_runtime.usage_menu.period.previous());
-                return;
-            }
             if (menu == .statusline and
                 (resolved == .cursor_left or resolved == .cursor_right))
             {
@@ -2684,7 +2674,7 @@ pub fn Runtime(comptime App: type) type {
                 const delta: i32 = if (resolved == .cursor_left) -1 else 1;
                 const change = switch (menu) {
                     .statusline => app.input_runtime.statusline_menu.changeSelectedOption(&snapshot, delta),
-                    .info_panel, .usage, .workspace => unreachable,
+                    .info_panel, .workspace => unreachable,
                 } orelse return;
                 if (comptime @hasDecl(App, "notificationPreferences")) {
                     try app_commands.applySettingsCatalogMenuChange(app, change);
@@ -2950,8 +2940,14 @@ pub fn Runtime(comptime App: type) type {
             syncHelpMenu(app);
             syncSkillsMenu(app);
             syncModelMenu(app);
+            syncUsageMenu(app);
             syncSessionMenu(app, agent);
             syncMcpHostMenu(app);
+        }
+
+        fn syncUsageMenu(app: *App) void {
+            if (!app.input_runtime.usage_menu.active) return;
+            app.input_runtime.usage_menu.resetForQuery();
         }
 
         fn syncMcpHostMenu(app: *App) void {
@@ -3208,7 +3204,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "approval_prompt");
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
+                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelUsageMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
                     _ = disarmEscapeClear(app);
                     _ = disarmEscapeInterrupt(app, "menu");
                     app.shell.render_requests.request(.footer);
@@ -3262,7 +3258,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 return;
             }
-            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
+            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelUsageMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -3333,20 +3329,26 @@ pub fn Runtime(comptime App: type) type {
                 app.input_runtime.info_panel.close();
                 return true;
             }
-            if (app.input_runtime.usage_menu.active) {
-                // Esc on a model's detail screen goes back to the tables.
-                if (app.input_runtime.usage_menu.closeDetail()) {
-                    app.shell.render_requests.request(.footer);
-                } else {
-                    app_commands.Handlers(App).closeUsageMenu(app);
-                }
-                return true;
-            }
             if (app.input_runtime.workspace_menu.active) {
                 app.input_runtime.workspace_menu.close();
                 return true;
             }
             return false;
+        }
+
+        fn cancelUsageMenu(app: *App) bool {
+            if (!usageMenuActive(app)) return false;
+            const query = app.input_runtime.edit_state.input.items;
+            if (query.len > 0) {
+                const prev_name = app.input_runtime.usage_menu.selectedModelName(query);
+                app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+                app.input_runtime.usage_menu.preserveSelectionAfterQueryClear(prev_name);
+                return true;
+            }
+            if (app.input_runtime.usage_menu.closeDetail()) return true;
+            app_commands.Handlers(App).closeUsageMenu(app);
+            return true;
         }
 
         fn cancelHelpMenu(app: *App) bool {
@@ -3965,6 +3967,7 @@ const RoutingFakeApp = struct {
     expected_file_completion_kind: ?file_index.CandidateKind = null,
     validated_file_completion_kind: ?file_index.CandidateKind = null,
     file_completion_error: ?file_index.SearchError = null,
+    usage_reload_count: usize = 0,
     file_completions_depend_on_index: bool = true,
     file_index_refresh_count: usize = 0,
     file_index_loading: bool = false,
@@ -4118,6 +4121,13 @@ const RoutingFakeApp = struct {
         period: usage.Period,
     ) !void {
         self.input_runtime.usage_menu.period = period;
+    }
+
+    pub fn reloadUsageMenu(
+        self: *RoutingFakeApp,
+        _: usage.Period,
+    ) !void {
+        self.usage_reload_count += 1;
     }
 
     pub fn isCurrentFileCompletion(self: *RoutingFakeApp, _: []const u8, _: []const u8, kind: file_index.CandidateKind) bool {
@@ -8455,6 +8465,39 @@ test "app_input_runtime Ghostty Escape release leaves the usage dashboard open" 
     try feedRoutingBytes(&app, "\x1b[27;1:3u");
 
     try std.testing.expect(app.input_runtime.usage_menu.active);
+}
+
+test "app_input_runtime usage dashboard accepts search typing, refreshes on ctrl+r, and clears query before detail on Esc" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.input_runtime.usage_menu.active = true;
+
+    try feedRoutingBytes(&app, "rop");
+    try std.testing.expectEqualStrings("rop", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.usage_reload_count);
+
+    app.input_runtime.usage_menu.detail = true;
+    try Runtime(RoutingFakeApp).handleByte(&app, 18, 4096, 100);
+    try std.testing.expectEqual(@as(usize, 1), app.usage_reload_count);
+    try std.testing.expect(app.input_runtime.usage_menu.active);
+    try std.testing.expect(!app.agent().session_persistence.session_picker.active);
+    try std.testing.expectEqualStrings("rop", app.input_runtime.edit_state.input.items);
+
+    try feedRoutingBytes(&app, "\x1b[114;9u");
+    try std.testing.expect(!app.agent().session_persistence.session_picker.active);
+
+    try feedRoutingBytes(&app, "\x1b[27;1:1u");
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.usage_menu.active);
+    try std.testing.expect(app.input_runtime.usage_menu.detail);
+
+    try feedRoutingBytes(&app, "\x1b[27;1:1u");
+    try std.testing.expect(app.input_runtime.usage_menu.active);
+    try std.testing.expect(!app.input_runtime.usage_menu.detail);
+
+    try feedRoutingBytes(&app, "\x1b[27;1:1u");
+    try std.testing.expect(!app.input_runtime.usage_menu.active);
 }
 
 test "app_input_runtime decoded kitty Backspace edits the draft without cancelling" {

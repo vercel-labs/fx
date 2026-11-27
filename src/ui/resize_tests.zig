@@ -1074,7 +1074,8 @@ test "responsive compact menus stay inline across the VT width matrix" {
         h.frame_redraw = true;
         try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
         try h.flush();
-        try expectGridContains(&h, "model (month)");
+        try expectGridContains(&h, "Usage 25");
+        try expectGridContains(&h, "  model ");
         try std.testing.expectEqual(
             @as(usize, 10),
             try countGridOccurrences(&h, "provider/model"),

@@ -868,6 +868,7 @@ pub fn Runtime(comptime App: type) type {
                 ),
                 .usage_menu = render_input.usageMenuProjection(
                     &app.input_runtime.usage_menu,
+                    if (app.input_runtime.usage_menu.active) app.input_runtime.edit_state.input.items else "",
                 ),
                 .workspace_menu = if (comptime @hasDecl(App, "workspaceAccess"))
                     render_input.workspaceMenuProjection(

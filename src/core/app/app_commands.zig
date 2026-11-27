@@ -874,7 +874,7 @@ pub fn Handlers(comptime App: type) type {
             if (app.input_runtime.usage_menu.setPeriod(period)) app.shell.render_requests.request(.footer);
         }
 
-        /// `r`: fetches unless a fetch is already running, then redraws.
+        /// `ctrl+r`: fetches unless a fetch is already running, then redraws.
         pub fn reloadUsageMenu(app: *App, period: usage.Period) !void {
             if (comptime !@hasField(App, "usage_dashboard")) return;
             _ = period;
@@ -909,7 +909,11 @@ pub fn Handlers(comptime App: type) type {
             const generation = app.usage_dashboard.generationCount();
             const snapshot = try app.usage_dashboard.snapshot(app.alloc);
             const menu = &app.input_runtime.usage_menu;
-            if (menu.active) menu.replace(snapshot, generation) else menu.open(snapshot, generation);
+            const query = if (comptime @hasField(@TypeOf(app.input_runtime), "edit_state"))
+                app.input_runtime.edit_state.input.items
+            else
+                "";
+            if (menu.active) menu.replace(snapshot, generation, query) else menu.open(snapshot, generation);
             app.shell.render_requests.request(.footer);
         }
 

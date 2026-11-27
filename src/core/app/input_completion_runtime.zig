@@ -40,6 +40,7 @@ const agents_menu_presentation = @import("../../ui/footer/agents_menu_presentati
 const app_agents_runtime = @import("app_agents_runtime.zig");
 const help_menu_presentation = @import("../../ui/footer/help_menu_presentation.zig");
 const settings_menu_presentation = @import("../../ui/footer/settings_menu_presentation.zig");
+const usage_presentation = @import("../../ui/footer/usage_presentation.zig");
 const surface_frame = @import("../../ui/footer/surface_frame.zig");
 const footer_paint_plan = @import("../../ui/footer/paint_plan.zig");
 const render_request = @import("../../ui/render_request.zig");
@@ -418,6 +419,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (try routeHelpMenuMove(app, agent, delta)) return true;
             if (try routeModelMenuMove(app, agent, delta)) return true;
             if (try routeEffortMenuMove(app, agent, delta)) return true;
+            if (try routeUsageMenuMove(app, agent, delta)) return true;
             if (routeAuthPickerMove(app, agent, delta)) return true;
             if (try routeSkillsMenuMove(app, agent, delta)) return true;
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
@@ -553,6 +555,24 @@ pub fn CompletionRuntime(comptime App: type) type {
                 render_input.effortMenuProjection(menu),
                 try inlineMenuRowBudget(app, agent, effort_menu_presentation.max_inline_rows),
             );
+            return true;
+        }
+
+        fn routeUsageMenuMove(app: *App, agent: *AppAgent, delta: i32) !bool {
+            const menu = &app.input_runtime.usage_menu;
+            if (!menu.active) return false;
+            const query = app.input_runtime.edit_state.input.items;
+            const projection = render_input.usageMenuProjection(menu, query);
+            const visible_rows = try inlineMenuRowBudget(
+                app,
+                agent,
+                @intCast(@min(usage_presentation.desiredRowCount(projection), std.math.maxInt(u16))),
+            );
+            const visible_models = std.math.cast(
+                u16,
+                usage_presentation.visibleModelItems(projection, visible_rows),
+            ) orelse std.math.maxInt(u16);
+            _ = menu.moveModel(delta, visible_models, query);
             return true;
         }
 

@@ -81,13 +81,14 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/usage");
-      const month = await session.waitForText("model (month)", TIMEOUT);
-      expect(month).toContain("usage: API key (AI_GATEWAY_API_KEY)");
+      const month = await session.waitForText("Usage 2  today  7d  [month]", TIMEOUT);
+      expect(month).toContain("  model");
       expect(month).toMatch(/today\s+\$0\.5000\s+2\s/);
       expect(month).toMatch(/month\s+\$2\.50\s+6\s/);
       expect(month.indexOf("provider/month")).toBeLessThan(month.indexOf("provider/today"));
       expect(month).not.toContain("provider/week");
       expect(month).toContain("tab period");
+      expect(month).toContain("ctrl+r refresh");
       expect(month).toContain("esc close");
       expect(fake.reportRanges()).toEqual([
         `${TODAY}..${TODAY}`,
@@ -96,23 +97,23 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       ]);
 
       await session.sendKeys("Tab");
-      const today = await session.waitForText("model (today)", TIMEOUT);
+      const today = await session.waitForText("Usage 1  [today]  7d  month", TIMEOUT);
       expect(today).not.toContain("provider/month");
       await session.sendKeys("Tab");
-      const week = await session.waitForText("model (7d)", TIMEOUT);
+      const week = await session.waitForText("Usage 2  today  [7d]  month", TIMEOUT);
       expect(week).toContain("provider/week");
       expect(week).not.toContain("provider/month");
 
-      // r refreshes at once, inside the one-minute floor, and reads only today.
-      await session.sendKeys("r");
+      // ctrl+r refreshes at once, inside the one-minute floor, and reads only today.
+      await session.sendHexBytes(["12"]);
       await session.waitForPane(() => fake.reportRanges().length === 4, TIMEOUT);
       expect(fake.reportRanges()[3]).toBe(`${TODAY}..${TODAY}`);
 
       await session.sendKeys("Escape");
-      await session.waitForComposer(TIMEOUT);
+      await session.waitForPane(async () => !(await session!.capturePane()).includes("tab period"), TIMEOUT);
       // Reopening inside the floor shows the cache without reading again.
       await session.sendText("/usage");
-      await session.waitForText("model (", TIMEOUT);
+      await session.waitForText("Usage 2  today  [7d]  month", TIMEOUT);
       expect(fake.reportRanges()).toHaveLength(4);
       const pane = await session.capturePane();
       expect(pane).not.toContain("e2e-usage-key");
@@ -145,8 +146,7 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       // Another fx renews the shared login after this one read it.
       rotateFxLogin(home, "rotated-token");
       await session.sendText("/usage");
-      const month = await session.waitForText("model (month)", TIMEOUT);
-      expect(month).toContain("(fx login)");
+      const month = await session.waitForText("Usage 2  today  7d  [month]", TIMEOUT);
       expect(month).toMatch(/month\s+\$2\.50\s+6\s/);
       expect(fake.requests.filter((request) => request.path === "/v1/report").map((request) => request.authorization)).toEqual([
         "Bearer launch-token",
@@ -174,7 +174,7 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/usage");
       const pane = await session.waitForText("gpt-e2e-large", TIMEOUT);
-      expect(pane).toContain("usage: codex (ChatGPT), samdoe");
+      expect(pane).toContain("Usage 2  today  7d  [month]");
       expect(pane).toContain("42%");
       expect(pane).toContain("pro");
       expect(pane).toContain("12.40");
@@ -198,11 +198,11 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/usage");
       const pane = await session.waitForText("SuperGrok Heavy", TIMEOUT);
-      expect(pane).toContain("usage: grok (xAI)");
+      expect(pane).toContain("Usage 2");
       expect(pane).toMatch(/63%\s+in 2d 5h/);
       expect(pane).toContain("$12.50");
       expect(pane).toContain("$3.00 of $100.00");
-      expect(pane).toContain("r refresh");
+      expect(pane).toContain("ctrl+r refresh");
       expect(pane).not.toContain("tab period");
       expect(fake.requests.map((request) => request.path).sort()).toEqual(["/billing", "/settings"]);
       for (const request of fake.requests) {
@@ -210,5 +210,85 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       }
     },
     TIMEOUT,
+  );
+
+  test(
+    "/usage shows catalog header, composer search, ctrl+r refresh, and Esc order at 80 and 50 columns",
+    async () => {
+      const monthModels: ReportRow[] = [
+        { model: "anthropic/claude-opus-4-6", request_count: 18, input_tokens: 120_000, output_tokens: 24_000, total_cost: 4.82 },
+        { model: "openai/gpt-5", request_count: 14, input_tokens: 95_000, output_tokens: 18_000, total_cost: 2.65 },
+        { model: "anthropic/claude-sonnet-4-5", request_count: 22, input_tokens: 180_000, output_tokens: 32_000, total_cost: 1.94 },
+        { model: "openai/gpt-5-pro", request_count: 4, input_tokens: 28_000, output_tokens: 6_200, total_cost: 1.48 },
+        { model: "google/gemini-2.5-pro", request_count: 9, input_tokens: 64_000, output_tokens: 11_000, total_cost: 0.72 },
+        { model: "xai/grok-4", request_count: 6, input_tokens: 41_000, output_tokens: 7_500, total_cost: 0.54 },
+        { model: "deepseek/deepseek-r1", request_count: 8, input_tokens: 55_000, output_tokens: 14_000, total_cost: 0.31 },
+        { model: "meta/llama-4-maverick", request_count: 5, input_tokens: 30_000, output_tokens: 4_800, total_cost: 0.19 },
+        { model: "mistral/mistral-large", request_count: 3, input_tokens: 19_000, output_tokens: 3_100, total_cost: 0.14 },
+        { model: "cohere/command-a", request_count: 2, input_tokens: 12_000, output_tokens: 2_000, total_cost: 0.09 },
+        { model: "qwen/qwen3-coder", request_count: 4, input_tokens: 24_000, output_tokens: 5_400, total_cost: 0.07 },
+        { model: "perplexity/sonar-pro", request_count: 2, input_tokens: 8_000, output_tokens: 1_200, total_cost: 0.05 },
+        { model: "moonshot/kimi-k2", request_count: 1, input_tokens: 6_000, output_tokens: 900, total_cost: 0.03 },
+        { model: "minimax/minimax-m1", request_count: 1, input_tokens: 4_000, output_tokens: 600, total_cost: 0.02 },
+      ];
+      const todayModels: ReportRow[] = [
+        { model: "anthropic/claude-opus-4-6", request_count: 3, input_tokens: 20_000, output_tokens: 4_000, total_cost: 0.80 },
+        { model: "openai/gpt-5", request_count: 2, input_tokens: 12_000, output_tokens: 2_200, total_cost: 0.35 },
+      ];
+      const weekModels: ReportRow[] = [
+        { model: "anthropic/claude-opus-4-6", request_count: 10, input_tokens: 70_000, output_tokens: 14_000, total_cost: 2.80 },
+        { model: "openai/gpt-5", request_count: 8, input_tokens: 50_000, output_tokens: 9_000, total_cost: 1.40 },
+        { model: "openai/gpt-5-pro", request_count: 2, input_tokens: 14_000, output_tokens: 3_000, total_cost: 0.70 },
+      ];
+      const { fake, env } = start("fx-tui-usage-search-", {
+        report: (from) => from === TODAY ? todayModels : from === "2026-10-01" ? monthModels : weekModels,
+      });
+      session = await TmuxSession.create({
+        env: { ...env, AI_GATEWAY_API_KEY: "e2e-usage-key", FX_THEME: "dark" },
+        width: 80,
+        height: 34,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/usage");
+      const pane80 = await session.waitForText("Usage 14  today  7d  [month]", TIMEOUT);
+      expect(pane80).toContain("4 more");
+      expect(pane80).toContain("↑↓ navigate     tab period     enter detail     ctrl+r refresh     esc close");
+      expect(pane80).not.toContain("❯");
+
+      await session.sendHexBytes(["6f", "70"]);
+      const filtered80 = await session.waitForText("Usage 4  today  7d  [month]", TIMEOUT);
+      expect(filtered80).toContain("┃ op");
+      expect(filtered80).toContain("anthropic/claude-opus-4-6");
+      expect(filtered80).toContain("openai/gpt-5");
+      expect(filtered80).toContain("anthropic/claude-sonnet-4-5");
+      expect(filtered80).toContain("openai/gpt-5-pro");
+      expect(filtered80).not.toContain("4 more");
+
+      await session.resizeWindow(50, 34, 400);
+      const filtered50 = await session.waitForText("↑↓ move  tab period  enter detail  ctrl+r  esc", TIMEOUT);
+      expect(filtered50).toContain("Usage 4  today  7d  [month]");
+      expect(filtered50).toContain("┃ op");
+
+      await session.sendKeys("Down");
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      const detail = await session.waitForText("model 3 of 4", TIMEOUT);
+      expect(detail).toContain("perf");
+
+      const beforeReload = fake.reportRanges().length;
+      await session.sendHexBytes(["12"]);
+      await session.waitForPane(() => fake.reportRanges().length > beforeReload, TIMEOUT);
+
+      // Esc 1: clear query while staying in detail
+      await session.sendKeys("Escape");
+      await session.waitForText("3 of 14", TIMEOUT);
+      // Esc 2: leave detail back to table
+      await session.sendKeys("Escape");
+      await session.waitForText("Usage 14  today  7d  [month]", TIMEOUT);
+      // Esc 3: close /usage
+      await session.sendKeys("Escape");
+      await session.waitForPane(async () => !(await session!.capturePane()).includes("Usage 14"), TIMEOUT);
+    },
+    TIMEOUT * 2,
   );
 });
