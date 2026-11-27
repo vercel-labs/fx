@@ -586,7 +586,7 @@ pub fn steering_message_layout_with_author(
     const limit = @min(row_limit, max_message_layout_rows);
     var offset: usize = 0;
     while (layout.row_count < limit) {
-        if (layout.content_width == 0) {
+        if (author == .parent and layout.content_width == 0) {
             layout.rows[layout.row_count] = "";
             layout.row_count += 1;
             layout.truncated = message.len > 0;
@@ -637,7 +637,7 @@ pub fn steering_message_layout_with_author(
         layout.row_count += 1;
         if (offset == message.len) break;
         const first_parent_row_deferred = author == .parent and layout.row_count == 1 and limit > 1 and layout.content_width > row_width;
-        if (layout.row_count == limit or (row_width > 0 and !hard_break and end == start and !first_parent_row_deferred)) {
+        if (layout.row_count == limit or (!hard_break and end == start and !first_parent_row_deferred)) {
             layout.rows[layout.row_count - 1] = message[start..@min(end, ellipsis_end)];
             layout.truncated = true;
             break;
@@ -740,6 +740,24 @@ test "parent steering layout advances past narrow first row instead of dropping 
     try std.testing.expectEqual(@as(u16, 1), zero.row_count);
     try std.testing.expectEqualStrings("", zero.rows[0]);
     try std.testing.expect(zero.truncated);
+}
+
+test "user steering layout keeps zero-width behavior unchanged" {
+    const word = steering_message_layout_with_author("ab", .user, 2, true, 2);
+    try std.testing.expectEqual(@as(u16, 1), word.row_count);
+    try std.testing.expectEqualStrings("", word.rows[0]);
+    try std.testing.expect(word.truncated);
+
+    const space = steering_message_layout_with_author(" ", .user, 2, true, 2);
+    try std.testing.expectEqual(@as(u16, 1), space.row_count);
+    try std.testing.expectEqualStrings("", space.rows[0]);
+    try std.testing.expect(!space.truncated);
+
+    const newline = steering_message_layout_with_author("\nab", .user, 2, true, 2);
+    try std.testing.expectEqual(@as(u16, 2), newline.row_count);
+    try std.testing.expectEqualStrings("", newline.rows[0]);
+    try std.testing.expectEqualStrings("", newline.rows[1]);
+    try std.testing.expect(newline.truncated);
 }
 
 pub fn transientActivityGapRows(shell: *const TranscriptRuntime, tool_before_activity: bool) u16 {
