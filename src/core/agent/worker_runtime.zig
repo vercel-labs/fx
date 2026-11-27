@@ -4121,7 +4121,23 @@ fn appendHistoryTurnProjection(
         copied += 1;
     }
     next[retained.len] = try types.dupeHistoryTurn(alloc, turn);
+    types.dropSavedExecution(alloc, &next[retained.len]);
     return next;
+}
+
+test "a queued prompt's history keeps a cut turn as the model sees it, without the whole turn only the log saves (D87)" {
+    const alloc = std.testing.allocator;
+    var kept = [_]types.ToolExecutionStep{.{ .assistant = @constCast("kept step") }};
+    var whole = [_]types.ToolExecutionStep{ .{ .assistant = @constCast("folded step") }, .{ .assistant = @constCast("kept step") } };
+    const next = try appendHistoryTurnProjection(alloc, &.{}, .{ .assistant = .{
+        .user = .{ .text = @constCast("two steps") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = &kept },
+        .saved_execution = .{ .tool_steps = &whole },
+    } }, 0);
+    defer types.freeHistoryTurnSlice(alloc, next);
+    try std.testing.expectEqual(@as(usize, 1), next[0].assistant.execution.tool_steps.len);
+    try std.testing.expect(next[0].assistant.saved_execution == null);
 }
 
 /// Copies one leftover steered message into `taken`, marking its receipt

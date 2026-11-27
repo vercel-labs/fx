@@ -11,6 +11,7 @@ const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const versions = @import("../core/gateway/provider_versions.zig");
 const version_lookup = @import("provider_versions.zig");
+const catalog_fetch_failure = @import("catalog_fetch_failure.zig");
 
 const max_catalog_models: usize = 128;
 pub const title_model = "grok-4.5";
@@ -174,76 +175,8 @@ fn catalogRequestAuth(access: credentials.CatalogAccess) ?CatalogRequestAuth {
 }
 
 fn catalogFetchFailure(err: anyerror) model_catalog.Failure {
-    if (err == error.Cancelled) return .{ .category = .cancellation };
-    if (isCutOffCatalogAnswer(err)) return .{ .category = .malformed_response, .retryable = true };
-    if (isBrokenCatalogAnswer(err)) return .{ .category = .malformed_response };
-    return .{ .category = .transport, .retryable = true };
-}
-
-/// Errors from an answer that arrived but cannot be read, other than the std
-/// decoder errors that `isBrokenCatalogAnswer` finds. Repeating the request gets
-/// the same answer, so these are not retryable. `ReadFailed` is not here: the
-/// same name is returned for a read that failed before the answer's head.
-const broken_answer_errors = [_]anyerror{
-    error.GrokModelCatalogTooLarge,
-    error.HttpHeadersInvalid,
-    error.HttpHeadersOversize,
-    error.HttpContentEncodingUnsupported,
-    error.UnsupportedCompressionMethod,
-    error.HttpChunkInvalid,
-};
-
-/// The error sets of the std gzip, deflate, and zstd decoders.
-const decoder_error_sets = .{
-    std.compress.flate.Decompress.Error,
-    std.compress.zstd.Decompress.Error,
-};
-
-/// Whether a std decoder returns `err`. `ReadFailed` is excluded: a decoder
-/// reports a failed input read with it, and `decompressError` maps it to null.
-fn isDecoderError(err: anyerror) bool {
-    inline for (decoder_error_sets) |Set| {
-        inline for (@typeInfo(Set).error_set.error_names.?) |name| {
-            if (!std.mem.eql(u8, name, "ReadFailed") and err == @field(Set, name)) return true;
-        }
-    }
-    return false;
-}
-
-/// An answer cut off before its end. A retry can get the whole answer.
-const cut_off_answer_errors = [_]anyerror{
-    error.HttpChunkTruncated,
-    error.EndOfStream,
-    error.HttpBodyCutOff,
-};
-
-/// fx's own zstd buffer sizes, not the answer, so these stay transport.
-const fx_buffer_errors = [_]anyerror{
-    error.OutputBufferUndersize,
-    error.InputBufferUndersize,
-};
-
-fn isCutOffCatalogAnswer(err: anyerror) bool {
-    for (cut_off_answer_errors) |cut_off| {
-        if (err == cut_off) return true;
-    }
-    return false;
-}
-
-fn isFxBufferError(err: anyerror) bool {
-    for (fx_buffer_errors) |buffer_error| {
-        if (err == buffer_error) return true;
-    }
-    return false;
-}
-
-fn isBrokenCatalogAnswer(err: anyerror) bool {
-    if (isCutOffCatalogAnswer(err) or isFxBufferError(err)) return false;
-    if (isDecoderError(err)) return true;
-    for (broken_answer_errors) |broken| {
-        if (err == broken) return true;
-    }
-    return false;
+    if (err == error.GrokModelCatalogTooLarge) return .{ .category = .malformed_response };
+    return catalog_fetch_failure.classify(err);
 }
 
 const FetchResponse = struct {
@@ -733,51 +666,6 @@ test "Grok oversized catalog responses are terminal malformed data" {
     const failure = catalogFetchFailure(error.GrokModelCatalogTooLarge);
     try std.testing.expectEqual(model_catalog.FailureCategory.malformed_response, failure.category);
     try std.testing.expect(!failure.retryable);
-}
-
-fn expectCatalogFetchFailure(err: anyerror, category: model_catalog.FailureCategory, retryable: bool) !void {
-    const failure = catalogFetchFailure(err);
-    try std.testing.expectEqual(category, failure.category);
-    try std.testing.expectEqual(retryable, failure.retryable);
-}
-
-test "Grok catalog fetch failures split unreadable answers from connection failures" {
-    inline for (decoder_error_sets) |Set| {
-        inline for (@typeInfo(Set).error_set.error_names.?) |name| {
-            const err = @field(Set, name);
-            if (!std.mem.eql(u8, name, "ReadFailed")) {
-                if (isFxBufferError(err)) {
-                    try expectCatalogFetchFailure(err, .transport, true);
-                } else {
-                    try expectCatalogFetchFailure(err, .malformed_response, isCutOffCatalogAnswer(err));
-                }
-            }
-        }
-    }
-    try expectCatalogFetchFailure(error.HttpChunkTruncated, .malformed_response, true);
-    try expectCatalogFetchFailure(error.EndOfStream, .malformed_response, true);
-    try expectCatalogFetchFailure(error.HttpBodyCutOff, .malformed_response, true);
-    const broken = [_]anyerror{
-        error.BadGzipHeader,
-        error.WrongGzipChecksum,
-        error.HttpChunkInvalid,
-        error.HttpHeadersInvalid,
-        error.GrokModelCatalogTooLarge,
-    };
-    for (broken) |err| try expectCatalogFetchFailure(err, .malformed_response, false);
-    for (fx_buffer_errors) |err| try expectCatalogFetchFailure(err, .transport, true);
-    for (broken_answer_errors) |err| try expectCatalogFetchFailure(err, .malformed_response, false);
-
-    const refused = catalogFetchFailure(error.ConnectionRefused);
-    try std.testing.expectEqual(model_catalog.FailureCategory.transport, refused.category);
-    try std.testing.expect(refused.retryable);
-
-    const reset = catalogFetchFailure(error.ReadFailed);
-    try std.testing.expectEqual(model_catalog.FailureCategory.transport, reset.category);
-    try std.testing.expect(reset.retryable);
-
-    const cancelled = catalogFetchFailure(error.Cancelled);
-    try std.testing.expectEqual(model_catalog.FailureCategory.cancellation, cancelled.category);
 }
 
 test "Grok model ids enforce the exact provider-local bound" {
