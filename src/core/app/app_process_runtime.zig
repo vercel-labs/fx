@@ -28,6 +28,15 @@ fn settleCompactionWorkFailure(worker: *worker_runtime.WorkerRuntime, work: work
     }
 }
 
+/// What the transcript says when a turn stopped between steps for an
+/// upgrade's restart. As an `error_text` event it also ends the screen's
+/// turn, which no finished prompt does for a turn that yielded.
+const yielded_notice: types.SemanticNotice = .{
+    .topic = "upgrade",
+    .tone = .neutral,
+    .body = "stopped between steps for the upgrade; this turn goes on after fx restarts",
+};
+
 /// Whether `App` runs its agent on the main loop, without worker threads.
 pub fn cooperativeHost(comptime App: type) bool {
     return @hasDecl(App, "host_profile") and App.host_profile.cooperative_agent;
@@ -99,6 +108,8 @@ pub fn Runtime(comptime App: type) type {
                 settleCompactionWorkFailure(&agent.worker, work, err);
                 if (compactionErrorHandled(work, failure_provenance, err)) {
                     compactor.traceLog(true, "interactive error retained err={s}", .{@errorName(err)});
+                } else if (err == error.TurnYielded) {
+                    try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = yielded_notice });
                 } else if (err != error.RouteRecoveryStopped) {
                     const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
                     defer std.heap.c_allocator.free(body);
@@ -209,6 +220,8 @@ pub fn Runtime(comptime App: type) type {
                     settleCompactionWorkFailure(&agent.worker, work, err);
                     if (compactionErrorHandled(work, failure_provenance, err)) {
                         compactor.traceLog(true, "interactive error retained err={s}", .{@errorName(err)});
+                    } else if (err == error.TurnYielded) {
+                        try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = yielded_notice });
                     } else if (err != error.RouteRecoveryStopped) {
                         const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
                         defer std.heap.c_allocator.free(body);
@@ -530,4 +543,9 @@ test "worker continues after project context selector failures" {
         };
         try std.testing.expectEqual(@as(usize, 1), error_count);
     }
+}
+
+test "a turn that yielded ends with a neutral upgrade notice" {
+    try std.testing.expectEqual(types.NoticeTone.neutral, yielded_notice.tone);
+    try std.testing.expectEqualStrings("upgrade", yielded_notice.topic);
 }

@@ -29,8 +29,8 @@ const mutants: Mutant[] = [
   {
     name: "wait-never-crosses",
     file: "src/core/execution/managed_execution.zig",
-    from: "prepared.snapshot.quiet_crossed = prepared.snapshot.quiet_notice;",
-    to: "prepared.snapshot.quiet_crossed = false;",
+    from: "        var prepared = try self.prepareSnapshotForEntry(alloc, entry);\n        // A command that ended as the wait finished is no crossing.\n        if (quiet_crossed) prepared.snapshot.quiet_crossed = prepared.snapshot.quiet_notice;",
+    to: "        var prepared = try self.prepareSnapshotForEntry(alloc, entry);\n        prepared.snapshot.quiet_crossed = false;",
   },
   {
     name: "memory-drops-crossing",
@@ -81,7 +81,7 @@ const mutants: Mutant[] = [
     to: "const masked = searched;",
   },
   {
-    name: "row-hides-call-time",
+    name: "row-hides-turn-time",
     file: "src/core/app/app_agents_runtime.zig",
     from: "            return writer.buffered();\n",
     to: "            return null;\n",
@@ -95,7 +95,7 @@ const unitFilters = [
   "a call ends only itself",
   "the quiet note names",
   "a quiet note for a child",
-  "only a running result that ended",
+  "only a result whose wait ended past the limit after seeing it under",
   "working subagent's row",
   "dupeToolResultMemory",
   "command sidebands merge",
@@ -104,7 +104,7 @@ const unitFilters = [
 const commands: Array<{ name: string; argv: string[]; cwd: string }> = [
   { name: "unit", argv: ["zig", "build", "quiet-relay-unit", ...unitFilters.map((f) => `-Dquiet-relay-filter=${f}`)], cwd: REPO_ROOT },
   { name: "fx ask E2E", argv: ["bun", "test", "./gateway-stream-lifecycle.test.ts", "-t", "quiet subagent command wakes|relayed again"], cwd: join(REPO_ROOT, "tests", "e2e") },
-  { name: "agent list tmux", argv: ["bun", "test", "./tui-host-switch.test.ts", "-t", "row keeps its title and shows its call's time"], cwd: join(REPO_ROOT, "tests", "e2e") },
+  { name: "agent list tmux", argv: ["bun", "test", "./tui-host-switch.test.ts", "-t", "row keeps its title and shows how long its turn has run"], cwd: join(REPO_ROOT, "tests", "e2e") },
 ];
 
 const buildFile = join(REPO_ROOT, "build.zig");

@@ -6,7 +6,7 @@
     "MethodName": {
       "description": "The name of an sh.fx method or notification: `_sh.fx/` followed by `<area>/<action>` in snake_case.",
       "type": "string",
-      "pattern": "^_sh\\.fx/[a-z][a-z0-9_]*(/[a-z][a-z0-9_]*)+$"
+      "pattern": "^_sh\\.fx/[a-z][a-z0-9_]*/[a-z][a-z0-9_]*$"
     },
     "CapabilityName": {
       "description": "The name of an sh.fx capability: `sh.fx/` followed by a camelCase name.",
@@ -25,6 +25,10 @@
     "AgentCapabilitiesMeta": {
       "description": "The sh.fx entries that fx lists in `agentCapabilities._meta` of its `initialize` response.",
       "type": "object",
+      "propertyNames": {
+        "if": { "pattern": "^sh\\.fx/" },
+        "then": { "pattern": "^sh\\.fx/[a-z][A-Za-z0-9]*$" }
+      },
       "properties": {
         "sh.fx/promptDelivery": { "$ref": "#/$defs/PromptDeliveryCapability" },
         "sh.fx/hostSteering": { "$ref": "#/$defs/Capability" }
@@ -36,6 +40,10 @@
     "ClientCapabilitiesMeta": {
       "description": "The sh.fx entries that a client lists in `clientCapabilities._meta` of its `initialize` request.",
       "type": "object",
+      "propertyNames": {
+        "if": { "pattern": "^sh\\.fx/" },
+        "then": { "pattern": "^sh\\.fx/[a-z][A-Za-z0-9]*$" }
+      },
       "properties": {
         "sh.fx/promptDelivery": { "$ref": "#/$defs/Capability" }
       },

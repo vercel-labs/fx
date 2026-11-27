@@ -436,9 +436,9 @@ pub fn extractTarGz(alloc: Allocator, archive_path: []const u8, dest_dir: []cons
     }
 }
 
-pub fn replaceBinary(new_path: []const u8, target_path: []const u8) !void {
+pub fn replaceBinary(alloc: Allocator, new_path: []const u8, target_path: []const u8) !void {
     std.Io.Dir.renameAbsolute(new_path, target_path, io_mod.getIo()) catch {
-        copyBinary(new_path, target_path) catch return error.ReplaceFailed;
+        io_mod.copyFileAtomic(alloc, new_path, target_path) catch return error.ReplaceFailed;
         return;
     };
 }
@@ -459,30 +459,6 @@ pub fn currentExecutablePath(out: []u8) ExecutablePathError![]const u8 {
         return path[0 .. path.len - linux_deleted_suffix.len];
     }
     return path;
-}
-
-fn copyBinary(src_path: []const u8, dest_path: []const u8) !void {
-    const zio = io_mod.getIo();
-    var src = std.Io.Dir.openFileAbsolute(zio, src_path, .{}) catch return error.ReplaceFailed;
-    defer src.close(zio);
-
-    const stat = src.stat(zio) catch return error.ReplaceFailed;
-
-    std.Io.Dir.deleteFileAbsolute(zio, dest_path) catch {};
-
-    var dest = std.Io.Dir.createFileAbsolute(zio, dest_path, .{}) catch return error.ReplaceFailed;
-    defer dest.close(zio);
-
-    var rbuf: [8192]u8 = undefined;
-    var r = src.readerStreaming(zio, &rbuf);
-    var transfer_buf: [64 * 1024]u8 = undefined;
-    while (true) {
-        const n = r.interface.readSliceShort(&transfer_buf) catch return error.ReplaceFailed;
-        if (n == 0) break;
-        dest.writeStreamingAll(zio, transfer_buf[0..n]) catch return error.ReplaceFailed;
-    }
-
-    dest.setPermissions(zio, stat.permissions) catch {};
 }
 
 fn writeTempFile(dir: std.Io.Dir, name: []const u8, content: []const u8) !void {
@@ -551,9 +527,30 @@ test "replaceBinary moves replacement over target path" {
     const target_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-old" });
     defer alloc.free(target_path);
 
-    try replaceBinary(new_path, target_path);
+    try replaceBinary(alloc, new_path, target_path);
 
     const replaced = try readAbsoluteFile(alloc, target_path);
     defer alloc.free(replaced);
     try std.testing.expectEqualStrings("new", replaced);
+}
+
+test "replaceBinary keeps the target when the copy fallback fails" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(tmp.dir, "fx-old", "old");
+    try tmp.dir.createDirPath(io_mod.getIo(), "fx-new");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const new_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-new" });
+    defer alloc.free(new_path);
+    const target_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-old" });
+    defer alloc.free(target_path);
+
+    try std.testing.expectError(error.ReplaceFailed, replaceBinary(alloc, new_path, target_path));
+
+    const kept = try readAbsoluteFile(alloc, target_path);
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("old", kept);
 }

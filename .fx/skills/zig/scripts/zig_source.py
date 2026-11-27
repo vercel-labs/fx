@@ -84,8 +84,17 @@ def code_mask(text):
 
 
 def aliases(text, target):
-    pat = re.compile(r"\bconst\s+([A-Za-z_]\w*)\s*=\s*" + re.escape(target) + r"\s*;")
-    return {m.group(1) for m in pat.finditer(text)}
+    """Names a top-level `const NAME = target;` gives `target`. A name the
+    file declares again, as a local, parameter, field, or capture, is left out:
+    a call through it may not mean `target`."""
+    pat = re.compile(r"^(?:pub\s+)?const\s+([A-Za-z_]\w*)\s*=\s*" + re.escape(target) + r"\s*;", re.M)
+    names = set()
+    for m in pat.finditer(text):
+        name = re.escape(m.group(1))
+        declarations = re.findall(rf"\b(?:const|var)\s+{name}\b|(?<![\w.@]){name}\s*:|\|\s*\*?{name}\s*[|,]", text)
+        if len(declarations) == 1:
+            names.add(m.group(1))
+    return names
 
 
 class Lines:

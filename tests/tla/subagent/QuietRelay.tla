@@ -2,10 +2,11 @@
 (***************************************************************************)
 (* A subagent's quiet shell command, relayed to its parent.                *)
 (*                                                                         *)
-(* A shell wait that ends at the quiet crossing (fix 1: quiet_notice.zig,  *)
-(* tests/tla/managed_execution/QuietWait.tla) carries the crossing on its  *)
-(* result. fx then posts one note from that subagent to its parent's       *)
-(* mailbox (noteChildQuiet in src/core/subagent/tool_host.zig, raised by   *)
+(* A shell wait that ends past the quiet limit after seeing the command    *)
+(* under it (quiet_notice.zig, tests/tla/managed_execution/QuietWait.tla)  *)
+(* carries the crossing on its result. fx then posts one note from that    *)
+(* subagent to its parent's mailbox (noteChildQuiet in                     *)
+(* src/core/subagent/tool_host.zig, raised by                              *)
 (* agent_adapter.zig for fx ask and ACP, and by app_worker_runtime.zig for *)
 (* the interactive app), and the note wakes the parent's subagent wait     *)
 (* (waitForMail).                                                          *)
@@ -99,7 +100,8 @@ Woken(p) == IF p \in {"registered", "blocked"} THEN "woken" ELSE p
 -----------------------------------------------------------------------------
 \* The subagent's command.
 
-\* A wait ends at the crossing; its result carries the crossing.
+\* A wait ends past the limit after seeing the command under it; its result
+\* carries the crossing.
 Cross(c) ==
     /\ open[c]
     /\ ~crossed[c]

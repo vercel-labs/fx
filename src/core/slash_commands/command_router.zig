@@ -63,8 +63,6 @@ pub const CommandHandlers = struct {
     login: *const fn (ctx: *anyopaque) anyerror!void,
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     provider: *const fn (ctx: *anyopaque) anyerror!void,
-    /// `/setup`, the deprecated alias of `/provider`: warn, then run `/provider`.
-    setup_alias: *const fn (ctx: *anyopaque) anyerror!void,
     show_status: *const fn (ctx: *anyopaque) anyerror!void,
     attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -157,13 +155,12 @@ pub fn parse(registry: SlashRegistry, cmd: []const u8) ParsedCommand {
     return .unknown;
 }
 
-/// The deprecated alias of `/provider`. It keeps working with a warning
-/// until it is removed.
-pub const deprecated_setup_alias = "/setup";
-
-fn typedSetupAlias(registry: SlashRegistry, cmd: []const u8) bool {
-    const matched = registry.matchExact(cmd) orelse return false;
-    return std.mem.eql(u8, matched.token, deprecated_setup_alias);
+/// The notice for a removed slash command, which names its replacement, or
+/// null for any other command. `cmd` is the whole composer text.
+pub fn removedSlashNotice(cmd: []const u8) ?[]const u8 {
+    const end = std.mem.findScalar(u8, cmd, ' ') orelse cmd.len;
+    if (std.mem.eql(u8, cmd[0..end], "/setup")) return "/setup was removed; use /provider";
+    return null;
 }
 
 pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []const u8) !void {
@@ -181,10 +178,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .help => try handlers.show_help(handlers.ctx),
         .login => try handlers.login(handlers.ctx),
         .logout => |rest| try handlers.logout(handlers.ctx, rest),
-        .provider => if (typedSetupAlias(registry, cmd))
-            try handlers.setup_alias(handlers.ctx)
-        else
-            try handlers.provider(handlers.ctx),
+        .provider => try handlers.provider(handlers.ctx),
         .status => try handlers.show_status(handlers.ctx),
         .image => |path| try handlers.attach_image(handlers.ctx, path),
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
@@ -527,7 +521,6 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .login = unexpectedNoPayload,
         .logout = unexpectedPayload,
         .provider = unexpectedNoPayload,
-        .setup_alias = unexpectedNoPayload,
         .show_status = unexpectedNoPayload,
         .attach_image = unexpectedPayload,
         .manage_images = unexpectedPayload,
@@ -570,26 +563,11 @@ test "route passes shell payload" {
     try std.testing.expectEqualStrings("reload", ctx.payload);
 }
 
-test "/setup warns through its own handler and /provider does not" {
-    const Record = struct {
-        fn provider(ctx: *anyopaque) anyerror!void {
-            testContext(ctx).called = "provider";
-        }
-        fn setupAlias(ctx: *anyopaque) anyerror!void {
-            testContext(ctx).called = "setup_alias";
-        }
-    };
-    for ([_]struct { cmd: []const u8, called: []const u8 }{
-        .{ .cmd = "/provider", .called = "provider" },
-        .{ .cmd = deprecated_setup_alias, .called = "setup_alias" },
-    }) |case| {
-        var ctx: TestContext = .{};
-        var handlers = testHandlers(&ctx);
-        handlers.provider = Record.provider;
-        handlers.setup_alias = Record.setupAlias;
-        try route(testSlashRegistry(), &handlers, case.cmd);
-        try std.testing.expectEqualStrings(case.called, ctx.called);
-    }
+test "removed /setup names /provider, and other commands get no removed notice" {
+    try std.testing.expectEqualStrings("/setup was removed; use /provider", removedSlashNotice("/setup").?);
+    try std.testing.expectEqualStrings("/setup was removed; use /provider", removedSlashNotice("/setup extra").?);
+    try std.testing.expect(removedSlashNotice("/provider") == null);
+    try std.testing.expect(removedSlashNotice("/setupx") == null);
 }
 
 test "route calls expected no-payload handler" {

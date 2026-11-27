@@ -122,7 +122,7 @@ pub const Options = struct {
     cwd: ?[]const u8 = null,
     config: core.Config = .{},
     /// The longest stdout line; a longer one is a connection error.
-    max_line: usize = 16 * 1024 * 1024,
+    max_line: usize = @import("limits.zig").max_message_bytes,
     /// The longest stderr line kept for logs; the rest of that line is dropped.
     max_stderr_line: usize = 8 * 1024,
     /// How often the exit watcher checks on the process.

@@ -658,23 +658,28 @@ test "maskLiteral masks every occurrence in place" {
 }
 
 pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    return maskSecretsWith(arena, text, null);
+}
+
+/// `maskSecrets`, which also puts each secret value it masks in `values` when
+/// one is given. The values are slices of `text`, not copies, so `text` must
+/// outlive them.
+fn maskSecretsWith(arena: std.mem.Allocator, text: []const u8, values: ?*SecretValues) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     defer out.deinit();
+    var spans: SecretSpans = .{ .text = text };
+    var written: usize = 0;
     var modified = false;
-    var i: usize = 0;
-    while (i < text.len) {
-        if (findSecretSpan(text, i)) |span| {
-            modified = true;
-            try out.writer.writeAll(text[i..span.prefix_end]);
-            try out.writer.writeAll("[redacted]");
-            debug_trace.logf("core", "secret redacted kind={s} bytes={d}", .{ span.kind, span.value_len });
-            i = span.prefix_end + span.value_len;
-        } else {
-            try out.writer.writeByte(text[i]);
-            i += 1;
-        }
+    while (spans.next()) |span| {
+        modified = true;
+        if (values) |collected| try collected.put(arena, text[span.prefix_end..][0..span.value_len]);
+        try out.writer.writeAll(text[written..span.prefix_end]);
+        try out.writer.writeAll("[redacted]");
+        debug_trace.logf("core", "secret redacted kind={s} bytes={d}", .{ span.kind, span.value_len });
+        written = span.prefix_end + span.value_len;
     }
     if (!modified) return text;
+    try out.writer.writeAll(text[written..]);
     return try out.toOwnedSlice();
 }
 
@@ -689,6 +694,309 @@ fn inSecretRun(c: u8) bool {
         '"', '\'', '`', '\\', ',', ';', '(', ')', '[', ']', '{', '}', '<', '>', '|' => false,
         else => true,
     };
+}
+
+/// The secret spans of a text in order, as `findSecretSpan` finds them. The
+/// masking walk and `SecretValues.collect` both use it, so they find the same
+/// secrets. A caller writes or keeps the bytes between spans itself.
+const SecretSpans = struct {
+    text: []const u8,
+    at: usize = 0,
+
+    fn next(self: *SecretSpans) ?SecretSpan {
+        while (self.at < self.text.len) {
+            if (findSecretSpan(self.text, self.at)) |span| {
+                self.at = span.prefix_end + span.value_len;
+                return span;
+            }
+            self.at += 1;
+        }
+        return null;
+    }
+};
+
+/// The public prefix of a `Bearer` token, which holds a space.
+const bearer_prefix = "Bearer ";
+
+/// The whole secret values that `maskSecretsCutShortCollect` masks, each kept
+/// once, so a later pass can mask the pieces that a wrap leaves of them. A
+/// value is a slice of the text it was found in, not a copy, and `arena` holds
+/// only the set's own storage, so that text must outlive the set.
+pub const SecretValues = struct {
+    /// Past this many distinct values, `overflow` is set and no more are
+    /// kept, so a transcript full of keys cannot make masking slow.
+    pub const max_values = 1024;
+
+    values: std.ArrayList([]const u8) = .empty,
+    seen: std.array_hash_map.String(void) = .empty,
+    overflow: bool = false,
+
+    /// Keeps `value` once. A distinct value past `max_values` sets `overflow`
+    /// and is not kept. A `Bearer` value also keeps its token, the part after
+    /// the prefix: a row that wraps at the space holds the token alone, which
+    /// the whole value would never match.
+    fn put(self: *SecretValues, arena: std.mem.Allocator, value: []const u8) !void {
+        try self.keep(arena, value);
+        if (value.len > bearer_prefix.len and std.mem.startsWith(u8, value, bearer_prefix)) {
+            try self.keep(arena, value[bearer_prefix.len..]);
+        }
+    }
+
+    /// `put` without the `Bearer` split.
+    fn keep(self: *SecretValues, arena: std.mem.Allocator, value: []const u8) !void {
+        // `[redacted]` is what masking writes, and a bare `Bearer` is a word, not
+        // a token: `TOKEN=Bearer xoxb-...` collects it. Keeping either would make
+        // every occurrence of it a piece of a secret.
+        if (std.mem.eql(u8, value, "[redacted]") or std.mem.eql(u8, value, "Bearer")) return;
+        if (self.overflow or self.seen.contains(value)) return;
+        if (self.values.items.len == max_values) {
+            self.overflow = true;
+            return;
+        }
+        try self.seen.put(arena, value, {});
+        try self.values.append(arena, value);
+    }
+
+    /// Puts every secret value that `maskSecretsWith` would mask in `text`, and
+    /// masks nothing. A caller uses it for text it shows in pieces, where the
+    /// masked copy would be thrown away. Like `put`, the values are slices of
+    /// `text`.
+    pub fn collect(self: *SecretValues, arena: std.mem.Allocator, text: []const u8) !void {
+        var spans: SecretSpans = .{ .text = text };
+        while (spans.next()) |span| try self.put(arena, text[span.prefix_end..][0..span.value_len]);
+    }
+};
+
+/// The fewest bytes of a secret value that `maskSecretPieces` masks at the start
+/// or the end of a row. A piece of one to three bytes is a documented limit at
+/// those edges: an overlap that short occurs in too many ordinary words, so the
+/// row keeps it.
+const min_secret_piece_bytes = 4;
+
+/// The fewest bytes of a lone run that `maskSecretPieces` masks as a piece of a
+/// secret. A table column can shrink to the narrowest width, `table_min_column_width`
+/// in transcript_blocks.zig, which is three cells, so one row of a narrow cell can
+/// show three bytes of a token. A lone run wholly inside the value's public prefix
+/// is still common text, whatever its length.
+pub const min_secret_cell_piece_bytes = 3;
+
+/// The most bytes that `maskSecretPieces` may compare across one trace. A crafted
+/// set of values or a long row would otherwise make the comparison slow. A trace
+/// shares one budget over all of its rows. At about five nanoseconds a byte,
+/// this bounds the comparison work of a trace to about 20 milliseconds.
+pub const max_piece_compare_bytes = 4 * 1024 * 1024;
+
+/// `row` with each piece of a known secret value replaced by `[redacted]`.
+/// A row splits into segments at bytes that are not ASCII, such as box-drawing
+/// borders and CJK text, and at `|`. A wrap cuts a value where a row ends, so
+/// its pieces sit at the edges of a segment: the last run of secret bytes, when
+/// the run's end is the value's start; the first run, when the run's start is
+/// the value's end; and a segment's only run, when a value holds all of it. A
+/// whole value in the middle of a segment is left to `maskSecrets`. A start or
+/// end piece must be at least `min_secret_piece_bytes` long, and a lone run at
+/// least `min_secret_cell_piece_bytes`. A lone run is a piece only where
+/// it runs past the value's public prefix, such as `sk-` or `Bearer `, since a
+/// run wholly inside that prefix is common text. A start piece is that case at
+/// the value's start. The first run's end piece is the value's own tail, so it
+/// has no such rule.
+/// Every comparison is charged to `budget`, the bytes that a trace may still
+/// compare. When the budget would go below zero, the call returns
+/// `error.SecretPieceBudgetSpent` and masks nothing: the caller decides what to
+/// show in its place.
+/// Returns `row` itself when nothing is masked or `values` is empty; otherwise
+/// the result is allocated in `arena`.
+pub fn maskSecretPieces(arena: std.mem.Allocator, row: []const u8, values: []const []const u8, budget: *usize) ![]const u8 {
+    if (values.len == 0) return row;
+    var marks: ?[]bool = null;
+    var segment_start: usize = 0;
+    for (row, 0..) |byte, at| {
+        if (!isSegmentBreak(byte)) continue;
+        try markSegmentPieces(arena, row, segment_start, at, values, &marks, budget);
+        segment_start = at + 1;
+    }
+    try markSegmentPieces(arena, row, segment_start, row.len, values, &marks, budget);
+
+    const masked = marks orelse return row;
+    var out: std.ArrayList(u8) = .empty;
+    var index: usize = 0;
+    while (index < row.len) {
+        const is_masked = masked[index];
+        var end = index + 1;
+        while (end < row.len and masked[end] == is_masked) end += 1;
+        if (is_masked) {
+            try out.appendSlice(arena, "[redacted]");
+        } else {
+            try out.appendSlice(arena, row[index..end]);
+        }
+        index = end;
+    }
+    return out.items;
+}
+
+/// Whether `byte` ends a segment for `maskSecretPieces`. A byte that is not
+/// ASCII belongs to a glyph such as a border or CJK text, which no secret
+/// holds, and `|` is the ASCII table border.
+fn isSegmentBreak(byte: u8) bool {
+    return byte >= 0x80 or byte == '|';
+}
+
+/// A half-open byte range of a row.
+const ByteRange = struct {
+    start: usize,
+    end: usize,
+};
+
+/// The first and the last run of secret bytes in a segment.
+const SegmentRunEdges = struct {
+    first: ByteRange,
+    last: ByteRange,
+};
+
+/// The first and the last runs of `inSecretRun` bytes in `row[start..end]`, or
+/// null when the segment has none.
+fn secretRunEdges(row: []const u8, start: usize, end: usize) ?SegmentRunEdges {
+    var edges: ?SegmentRunEdges = null;
+    var index = start;
+    while (index < end) {
+        if (!inSecretRun(row[index])) {
+            index += 1;
+            continue;
+        }
+        const run_start = index;
+        while (index < end and inSecretRun(row[index])) index += 1;
+        const run: ByteRange = .{ .start = run_start, .end = index };
+        if (edges) |*found| {
+            found.last = run;
+        } else {
+            edges = .{ .first = run, .last = run };
+        }
+    }
+    return edges;
+}
+
+/// The length of the longest public prefix that `value` starts with: the longest
+/// key or token start that `maskSecrets` finds, such as `sk-`, `ghp_`, or
+/// `Bearer `. Such a prefix is common text, so a run that lies wholly inside it
+/// is not masked.
+fn publicPrefixLen(value: []const u8) usize {
+    var longest: usize = 0;
+    for (token_prefixes ++ [_][]const u8{bearer_prefix}) |prefix| {
+        if (prefix.len > longest and std.mem.startsWith(u8, value, prefix)) longest = prefix.len;
+    }
+    return longest;
+}
+
+/// The number of leading bytes that `a` and `b` share.
+fn commonPrefixLen(a: []const u8, b: []const u8) usize {
+    const limit = @min(a.len, b.len);
+    var index: usize = 0;
+    while (index < limit and a[index] == b[index]) index += 1;
+    return index;
+}
+
+/// Charges `budget` for one comparison of `a` with `b`: the bytes they share,
+/// plus one for the step that decides the comparison. When the budget cannot pay
+/// for it, the call fails with `error.SecretPieceBudgetSpent` and leaves zero.
+fn chargeComparison(budget: *usize, a: []const u8, b: []const u8) !void {
+    const cost = commonPrefixLen(a, b) + 1;
+    if (cost > budget.*) {
+        budget.* = 0;
+        return error.SecretPieceBudgetSpent;
+    }
+    budget.* -= cost;
+}
+
+/// Whether `piece` occurs in `value` at a position where it runs past the first
+/// `public_len` bytes, the value's public prefix. A piece wholly inside that
+/// prefix is common text, so the search starts at the first position where the
+/// piece reaches past it. Each position it tries is a comparison that the
+/// budget pays for, so a long value cannot make the search unbounded.
+fn containsPastPrefix(value: []const u8, piece: []const u8, public_len: usize, budget: *usize) !bool {
+    // A piece at `at` runs past the prefix once `at + piece.len > public_len`.
+    var at: usize = (public_len + 1) -| piece.len;
+    while (at + piece.len <= value.len) : (at += 1) {
+        try chargeComparison(budget, piece, value[at..]);
+        if (std.mem.startsWith(u8, value[at..], piece)) return true;
+    }
+    return false;
+}
+
+/// The offset of the longest suffix of `run` that is a prefix of `value`, when
+/// that suffix is longer than the value's public prefix and at least
+/// `min_secret_piece_bytes` long. The last run of a row ends in a value's start
+/// when a wrap cut the value there.
+fn lastRunPieceStart(run: []const u8, value: []const u8, budget: *usize) !?usize {
+    const shortest = @max(min_secret_piece_bytes, publicPrefixLen(value) + 1);
+    // A piece longer than the value cannot start it, so the search begins at the
+    // first offset whose piece fits.
+    var offset: usize = run.len -| value.len;
+    while (run.len - offset >= shortest) : (offset += 1) {
+        const piece = run[offset..];
+        try chargeComparison(budget, piece, value);
+        if (std.mem.startsWith(u8, value, piece)) return offset;
+    }
+    return null;
+}
+
+/// The length of the longest prefix of `run` that is a suffix of `value`, when
+/// that prefix is at least `min_secret_piece_bytes` long. The first run of a
+/// row starts with a value's end when a wrap cut the value there.
+fn firstRunPieceLen(run: []const u8, value: []const u8, budget: *usize) !?usize {
+    var len = @min(run.len, value.len);
+    while (len >= min_secret_piece_bytes) : (len -= 1) {
+        const piece = run[0..len];
+        const tail = value[value.len - len ..];
+        try chargeComparison(budget, piece, tail);
+        if (std.mem.eql(u8, piece, tail)) return len;
+    }
+    return null;
+}
+
+/// Marks in `marks` the pieces of `values` that `row[start..end]` holds, as
+/// `maskSecretPieces` describes. Runs between the first and the last are not
+/// looked at, so `maskSecrets` keeps the job of masking a whole value there.
+fn markSegmentPieces(
+    arena: std.mem.Allocator,
+    row: []const u8,
+    start: usize,
+    end: usize,
+    values: []const []const u8,
+    marks: *?[]bool,
+    budget: *usize,
+) !void {
+    const edges = secretRunEdges(row, start, end) orelse return;
+    const first = edges.first;
+    const last = edges.last;
+    const only_run = first.start == last.start;
+    const first_len = first.end - first.start;
+    for (values) |value| {
+        // A lone run is a piece of the value where it runs past the value's
+        // public prefix. Where it lies wholly inside the prefix, it is common text.
+        const only_run_in_value = only_run and
+            first_len >= min_secret_cell_piece_bytes and
+            (try containsPastPrefix(value, row[first.start..first.end], publicPrefixLen(value), budget));
+        if (only_run_in_value) {
+            try markRange(arena, row.len, marks, first.start, first.end);
+            continue;
+        }
+        if (try lastRunPieceStart(row[last.start..last.end], value, budget)) |offset| {
+            try markRange(arena, row.len, marks, last.start + offset, last.end);
+        }
+        if (try firstRunPieceLen(row[first.start..first.end], value, budget)) |len| {
+            try markRange(arena, row.len, marks, first.start, first.start + len);
+        }
+    }
+}
+
+/// Marks `row[from..to]` in `marks`. The marks are allocated on the first mark,
+/// so a row that holds no piece costs no memory.
+fn markRange(arena: std.mem.Allocator, row_len: usize, marks: *?[]bool, from: usize, to: usize) !void {
+    if (marks.* == null) {
+        const fresh = try arena.alloc(bool, row_len);
+        @memset(fresh, false);
+        marks.* = fresh;
+    }
+    @memset(marks.*.?[from..to], true);
 }
 
 /// Length of the longest prefix of `value` no longer than `limit` bytes that
@@ -824,7 +1132,18 @@ const max_cut_short_secret_len = 512;
 /// shortened unmasked. Returns `text` when nothing is masked; otherwise the
 /// result is allocated in `arena`.
 pub fn maskSecretsCutShort(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
-    const masked = try maskSecrets(arena, text);
+    return maskCutShortMarkers(arena, try maskSecrets(arena, text));
+}
+
+/// `maskSecretsCutShort`, and each whole secret value it masks is put in
+/// `values`, for `maskSecretPieces` to find the pieces a wrap leaves of them.
+pub fn maskSecretsCutShortCollect(arena: std.mem.Allocator, text: []const u8, values: *SecretValues) ![]const u8 {
+    return maskCutShortMarkers(arena, try maskSecretsWith(arena, text, values));
+}
+
+/// The cut-marker pass of `maskSecretsCutShort`, over text that `maskSecrets`
+/// has already masked. It is kept apart so the collecting entry point shares it.
+fn maskCutShortMarkers(arena: std.mem.Allocator, masked: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var copied: usize = 0;
     var changed = false;
@@ -881,35 +1200,72 @@ fn cutShortSecretStart(text: []const u8, floor: usize, end: usize) ?usize {
     return earliest;
 }
 
+/// What a redacted value is shown as.
+const redacted_marker = "[redacted]";
+
+/// Where a URL's authority is, from after "://" to the first '/', '?', or
+/// '#', and where its host starts (`urlUserInfoEnd`).
+pub const UrlAuthority = struct {
+    start: usize,
+    host_start: usize,
+    end: usize,
+};
+
+/// Null for text with no "://".
+pub fn urlAuthority(url: []const u8) ?UrlAuthority {
+    const scheme_end = std.mem.find(u8, url, "://") orelse return null;
+    const start = scheme_end + "://".len;
+    const end = firstDelimiter(url, start, "/?#");
+    return .{ .start = start, .host_start = urlUserInfoEnd(url, start, end), .end = end };
+}
+
+/// Where a user name and password that start at `start` end, in a URL whose
+/// authority may end at `end`: after the last '@' before it, as a browser
+/// reads them, so a password with an unescaped '@' stays in them. `start`
+/// when there is no '@'.
+fn urlUserInfoEnd(url: []const u8, start: usize, end: usize) usize {
+    return if (std.mem.findScalarLast(u8, url[start..end], '@')) |at| start + at + 1 else start;
+}
+
+/// `redactUrlForDisplay` for a URL whose host the caller cannot trust, which
+/// also redacts what comes before the last '@' after the scheme: a '/', '?',
+/// or '#' in a password ends the authority before its '@'. Caller owns the
+/// result.
+pub fn redactUrlWithNoHost(alloc: std.mem.Allocator, raw_url: []const u8) error{OutOfMemory}![]u8 {
+    const redacted = try redactUrlForDisplay(alloc, raw_url);
+    const start = if (urlAuthority(redacted)) |authority| authority.start else 0;
+    const user_info_end = urlUserInfoEnd(redacted, start, redacted.len);
+    if (user_info_end == start) return redacted;
+    defer alloc.free(redacted);
+    return std.mem.concat(alloc, u8, &.{ redacted[0..start], redacted_marker ++ "@", redacted[user_info_end..] });
+}
+
 pub fn redactUrlForDisplay(alloc: std.mem.Allocator, raw_url: []const u8) error{OutOfMemory}![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
 
-    const scheme_end = std.mem.find(u8, raw_url, "://");
+    const authority = urlAuthority(raw_url);
     var query_search_start: usize = 0;
-    if (scheme_end) |end| {
-        const authority_start = end + "://".len;
-        const authority_end = firstDelimiter(raw_url, authority_start, "/?#");
-        if (std.mem.findScalar(u8, raw_url[authority_start..authority_end], '@')) |at| {
-            out.writer.writeAll(raw_url[0..authority_start]) catch return error.OutOfMemory;
-            out.writer.writeAll("[redacted]@") catch return error.OutOfMemory;
-            out.writer.writeAll(raw_url[authority_start + at + 1 .. authority_end]) catch return error.OutOfMemory;
+    if (authority) |parts| {
+        if (parts.host_start > parts.start) {
+            out.writer.writeAll(raw_url[0..parts.start]) catch return error.OutOfMemory;
+            out.writer.writeAll(redacted_marker ++ "@") catch return error.OutOfMemory;
+            out.writer.writeAll(raw_url[parts.host_start..parts.end]) catch return error.OutOfMemory;
         } else {
-            out.writer.writeAll(raw_url[0..authority_end]) catch return error.OutOfMemory;
+            out.writer.writeAll(raw_url[0..parts.end]) catch return error.OutOfMemory;
         }
-        query_search_start = authority_end;
+        query_search_start = parts.end;
     }
 
-    if (scheme_end == null) query_search_start = 0;
     const query_marker = std.mem.findScalarPos(u8, raw_url, query_search_start, '?') orelse {
-        if (scheme_end == null) {
+        if (authority == null) {
             out.writer.writeAll(raw_url) catch return error.OutOfMemory;
         } else {
             out.writer.writeAll(raw_url[query_search_start..]) catch return error.OutOfMemory;
         }
         return out.toOwnedSlice() catch return error.OutOfMemory;
     };
-    if (scheme_end == null) {
+    if (authority == null) {
         out.writer.writeAll(raw_url[0 .. query_marker + 1]) catch return error.OutOfMemory;
     } else {
         out.writer.writeAll(raw_url[query_search_start .. query_marker + 1]) catch return error.OutOfMemory;
@@ -924,7 +1280,7 @@ pub fn redactUrlForDisplay(alloc: std.mem.Allocator, raw_url: []const u8) error{
         if (equals < segment_end) {
             out.writer.writeByte('=') catch return error.OutOfMemory;
             if (sensitiveUrlQueryKey(raw_url[segment_start..equals])) {
-                out.writer.writeAll("[redacted]") catch return error.OutOfMemory;
+                out.writer.writeAll(redacted_marker) catch return error.OutOfMemory;
             } else {
                 out.writer.writeAll(raw_url[equals + 1 .. segment_end]) catch return error.OutOfMemory;
             }
@@ -1914,44 +2270,48 @@ test "secretSafePrefixLen and secretSafeSuffixStart leave no part of a planted s
     }
 }
 
+/// Texts with a cut marker, and what `maskSecretsCutShort` makes of each. The
+/// tests share them, so the collecting entry point is checked on the same
+/// inputs.
+const cut_short_cases = [_]struct { text: []const u8, masked: []const u8 }{
+    .{
+        .text = "sent to keeper · deploy with ghp_AAAAAAAAAAAA...",
+        .masked = "sent to keeper · deploy with [redacted]...",
+    },
+    .{
+        .text = "curl -H \"Authorization: Bearer abc...",
+        .masked = "curl -H \"Authorization: Bearer [redacted]...",
+    },
+    // With a longer body the dots join the token, so `maskSecrets` masks
+    // it whole, marker and all.
+    .{
+        .text = "curl -H \"Authorization: Bearer abcdefgh...",
+        .masked = "curl -H \"Authorization: [redacted]",
+    },
+    .{
+        .text = "clone https://admin:P\u{e4}ss...",
+        .masked = "clone https://[redacted]...",
+    },
+    .{ .text = "aws AKIA1234\u{2026} done", .masked = "aws [redacted]\u{2026} done" },
+    .{
+        .text = "key sk-proj-abc... and xoxb-12... end",
+        .masked = "key [redacted]... and [redacted]... end",
+    },
+    .{ .text = "x ghp_AAAA........ y", .masked = "x [redacted]........ y" },
+    .{ .text = "and so on...", .masked = "and so on..." },
+    .{ .text = "see https://example.com/docs...", .masked = "see https://example.com/docs..." },
+    .{ .text = "it costs 3.50...", .masked = "it costs 3.50..." },
+    .{ .text = "ghp_ is a prefix", .masked = "ghp_ is a prefix" },
+    .{ .text = "wait...", .masked = "wait..." },
+    .{ .text = "", .masked = "" },
+};
+
 test "maskSecretsCutShort masks a secret a cut marker ends and leaves other text alone" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const cases = [_]struct { text: []const u8, masked: []const u8 }{
-        .{
-            .text = "sent to keeper · deploy with ghp_AAAAAAAAAAAA...",
-            .masked = "sent to keeper · deploy with [redacted]...",
-        },
-        .{
-            .text = "curl -H \"Authorization: Bearer abc...",
-            .masked = "curl -H \"Authorization: Bearer [redacted]...",
-        },
-        // With a longer body the dots join the token, so `maskSecrets` masks
-        // it whole, marker and all.
-        .{
-            .text = "curl -H \"Authorization: Bearer abcdefgh...",
-            .masked = "curl -H \"Authorization: [redacted]",
-        },
-        .{
-            .text = "clone https://admin:P\u{e4}ss...",
-            .masked = "clone https://[redacted]...",
-        },
-        .{ .text = "aws AKIA1234\u{2026} done", .masked = "aws [redacted]\u{2026} done" },
-        .{
-            .text = "key sk-proj-abc... and xoxb-12... end",
-            .masked = "key [redacted]... and [redacted]... end",
-        },
-        .{ .text = "x ghp_AAAA........ y", .masked = "x [redacted]........ y" },
-        .{ .text = "and so on...", .masked = "and so on..." },
-        .{ .text = "see https://example.com/docs...", .masked = "see https://example.com/docs..." },
-        .{ .text = "it costs 3.50...", .masked = "it costs 3.50..." },
-        .{ .text = "ghp_ is a prefix", .masked = "ghp_ is a prefix" },
-        .{ .text = "wait...", .masked = "wait..." },
-        .{ .text = "", .masked = "" },
-    };
-    for (cases) |case| {
+    for (cut_short_cases) |case| {
         try std.testing.expectEqualStrings(case.masked, try maskSecretsCutShort(arena, case.text));
     }
 
@@ -1974,6 +2334,517 @@ test "maskSecretsCutShort masks a secret a cut marker ends and leaves other text
     _ = try maskSecretsCutShort(arena, long_partial);
 }
 
+test "maskSecretsCutShortCollect matches maskSecretsCutShort and collects each whole value in order" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for (cut_short_cases) |case| {
+        var values: SecretValues = .{};
+        try std.testing.expectEqualStrings(
+            try maskSecretsCutShort(arena, case.text),
+            try maskSecretsCutShortCollect(arena, case.text, &values),
+        );
+    }
+
+    const token = "ghp_" ++ repeat("A", 36);
+    const assignment = "hunter2hunter2";
+    const bearer = "Bearer " ++ repeat("B", 20);
+    const text = "push " ++ token ++ " then API_KEY=" ++ assignment ++ " and Authorization: " ++ bearer ++ " done";
+    var values: SecretValues = .{};
+    const masked = try maskSecretsCutShortCollect(arena, text, &values);
+    try std.testing.expectEqualStrings(
+        "push [redacted] then API_KEY=[redacted] and Authorization: [redacted] done",
+        masked,
+    );
+    // The Bearer value is kept whole, and so is its token after the prefix.
+    try std.testing.expectEqual(@as(usize, 4), values.values.items.len);
+    try std.testing.expectEqualStrings(token, values.values.items[0]);
+    try std.testing.expectEqualStrings(assignment, values.values.items[1]);
+    try std.testing.expectEqualStrings(bearer, values.values.items[2]);
+    try std.testing.expectEqualStrings(repeat("B", 20), values.values.items[3]);
+}
+
+test "SecretValues keeps a repeated value once" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var values: SecretValues = .{};
+    try values.put(arena, "ghp_" ++ repeat("A", 36));
+    try values.put(arena, "ghp_" ++ repeat("A", 36));
+    try std.testing.expectEqual(@as(usize, 1), values.values.items.len);
+    try std.testing.expectEqual(@as(usize, 1), values.seen.count());
+    try std.testing.expect(!values.overflow);
+}
+
+test "SecretValues sets overflow past max_values and keeps no more" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var values: SecretValues = .{};
+    for (0..SecretValues.max_values + 1) |index| {
+        try values.put(arena, try arena.print("token-{d}", .{index}));
+    }
+    try std.testing.expect(values.overflow);
+    try std.testing.expectEqual(@as(usize, SecretValues.max_values), values.values.items.len);
+    try std.testing.expectEqual(@as(usize, SecretValues.max_values), values.seen.count());
+
+    // Once overflowed, a kept value is still a no-op and a new one is not kept.
+    try values.put(arena, "token-0");
+    try values.put(arena, "token-late");
+    try std.testing.expectEqual(@as(usize, SecretValues.max_values), values.values.items.len);
+}
+
+test "SecretValues collect puts each secret value of a text in order and none for plain text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const token = "ghp_" ++ repeat("A", 36);
+    const assignment = "hunter2hunter2";
+    const bearer = "Bearer " ++ repeat("B", 20);
+    const text = "push " ++ token ++ " then API_KEY=" ++ assignment ++ " and Authorization: " ++ bearer ++ " done";
+    var values: SecretValues = .{};
+    try values.collect(arena, text);
+    try std.testing.expectEqual(@as(usize, 4), values.values.items.len);
+    try std.testing.expectEqualStrings(token, values.values.items[0]);
+    try std.testing.expectEqualStrings(assignment, values.values.items[1]);
+    try std.testing.expectEqualStrings(bearer, values.values.items[2]);
+    try std.testing.expectEqualStrings(repeat("B", 20), values.values.items[3]);
+
+    var none: SecretValues = .{};
+    try none.collect(arena, "ordinary words, and a token mention without a value");
+    try std.testing.expectEqual(@as(usize, 0), none.values.items.len);
+}
+
+/// `maskSecretPieces` with a full compare budget, for tests that do not test the budget.
+fn maskPieces(arena: std.mem.Allocator, row: []const u8, values: []const []const u8) ![]const u8 {
+    var budget: usize = max_piece_compare_bytes;
+    return maskSecretPieces(arena, row, values, &budget);
+}
+
+/// Expects `maskSecretPieces` to turn `row` into `expected` for `values`.
+fn expectSecretPieces(expected: []const u8, row: []const u8, values: []const []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectEqualStrings(expected, try maskPieces(arena_state.allocator(), row, values));
+}
+
+test "maskSecretPieces returns the row itself when no value is known" {
+    const token = "ghp_" ++ repeat("A", 40);
+    const row: []const u8 = "  ghp_AAAAAAAAAAAA";
+    const unchanged = try maskPieces(std.testing.allocator, row, &[_][]const u8{});
+    try std.testing.expect(unchanged.ptr == row.ptr);
+
+    const empty: []const u8 = "";
+    const empty_out = try maskPieces(std.testing.allocator, empty, &[_][]const u8{token});
+    try std.testing.expect(empty_out.ptr == empty.ptr);
+}
+
+test "maskSecretPieces masks a row end that starts a value and keeps the text before it" {
+    const values = [_][]const u8{"ghp_" ++ repeat("A", 40)};
+    try expectSecretPieces("token: [redacted]", "token: " ++ "ghp_" ++ repeat("A", 8), &values);
+    // The longest end that starts a value is masked; the `x` before it stays.
+    try expectSecretPieces("token: x[redacted]", "token: xghp_" ++ repeat("A", 8), &values);
+}
+
+test "maskSecretPieces masks a value's tail after a gutter and keeps the words after it" {
+    const values = [_][]const u8{"ghp_" ++ repeat("A", 40)};
+    try expectSecretPieces("  [redacted] here.", "  " ++ repeat("A", 10) ++ " here.", &values);
+}
+
+test "maskSecretPieces masks a row that is a whole middle piece of a value" {
+    const values = [_][]const u8{"ghp_" ++ repeat("A", 40)};
+    try expectSecretPieces("[redacted]", repeat("A", 20), &values);
+}
+
+test "maskSecretPieces masks pieces across table rows with box-drawing and ASCII borders" {
+    const values = [_][]const u8{"ghp_" ++ repeat("A", 40)};
+    // The first row holds the value's start, and the next row a middle piece.
+    try expectSecretPieces("│ [redacted]   │", "│ ghp_" ++ repeat("A", 8) ++ "   │", &values);
+    try expectSecretPieces("│ [redacted]  │", "│ " ++ repeat("A", 20) ++ "  │", &values);
+    try expectSecretPieces("| [redacted]   |", "| ghp_" ++ repeat("A", 8) ++ "   |", &values);
+    try expectSecretPieces("| [redacted]  |", "| " ++ repeat("A", 20) ++ "  |", &values);
+}
+
+test "maskSecretPieces leaves ordinary words alone while a value is present" {
+    const values = [_][]const u8{"ghp_" ++ repeat("A", 40)};
+    const row: []const u8 = "the quick brown fox jumps over the lazy dog";
+    const out = try maskPieces(std.testing.allocator, row, &values);
+    try std.testing.expect(out.ptr == row.ptr);
+}
+
+test "maskSecretPieces leaves one- and two-byte pieces alone and masks three-byte and four-byte ones" {
+    const values = [_][]const u8{"ghp_" ++ repeat("A", 40)};
+    // A lone run under three bytes occurs in too many words to be a piece of a
+    // secret, so the row keeps it. A three-byte lone run is a piece in a narrow
+    // cell, and a start or end piece needs four bytes.
+    try expectSecretPieces("token g", "token g", &values);
+    try expectSecretPieces("  AA", "  AA", &values);
+    try expectSecretPieces("   [redacted]", "   AAA", &values);
+    try expectSecretPieces("  [redacted]", "  AAAA", &values);
+}
+
+test "maskSecretPieces masks a piece glued to a period" {
+    const values = [_][]const u8{"ghp_" ++ repeat("A", 40)};
+    try expectSecretPieces("  [redacted].", "  " ++ repeat("A", 10) ++ ".", &values);
+}
+
+test "maskSecretPieces keeps the Bearer prefix and masks the token after it" {
+    // `SecretValues` keeps the token after `Bearer ` as a value of its own, so a
+    // row that wraps at the space shows the token alone. The prefix is public.
+    const values = [_][]const u8{ "Bearer " ++ repeat("A", 20), repeat("A", 20) };
+    try expectSecretPieces("Authorization: Bearer", "Authorization: Bearer", &values);
+    try expectSecretPieces("[redacted]", repeat("A", 20), &values);
+}
+
+test "maskSecretPieces keeps non-ASCII bytes and stays valid UTF-8" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const values = [_][]const u8{"ghp_" ++ repeat("A", 40)};
+    const out = try maskPieces(arena_state.allocator(), "日本語 ghp_AAAAAAAA字", &values);
+    try std.testing.expectEqualStrings("日本語 [redacted]字", out);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+}
+
+test "maskSecretPieces leaves a whole value in the middle of a segment to maskSecrets" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const token = "ghp_" ++ repeat("A", 40);
+    const values = [_][]const u8{token};
+    const row: []const u8 = "x " ++ token ++ " y";
+    const pieces = try maskPieces(arena, row, &values);
+    try std.testing.expect(pieces.ptr == row.ptr);
+    try std.testing.expectEqualStrings("x [redacted] y", try maskSecretsCutShort(arena, row));
+}
+
+/// Values shaped like real keys and tokens. The piece tests use them, not
+/// repeated letters, so that a short overlap is a real overlap with prose.
+const realistic_sk_key = "sk-" ++ "Q7xk2Pz9LmR4vT1nB8cD" ++ "wE3fG6hJ0kS5";
+const realistic_github_pat = "github_pat_" ++ "11ABCDEFG0hIjKlMnOpQrS_tUvWxYz0123456789abcdef";
+const realistic_ghp = "ghp_" ++ "x9Q2mN7pL4kR8sT1vW3yZ6aB5cD0eF2gH4jK";
+/// A token that holds `42` and `ok`, so a short cell or row of either is a piece of it.
+const realistic_cell_token = "gho_42ok9Qw2Er7Ty3Ui5Op8As";
+
+test "maskSecretPieces leaves ordinary words, short cells, and short rows alone beside realistic tokens" {
+    const values = [_][]const u8{ realistic_sk_key, realistic_github_pat, realistic_ghp, realistic_cell_token };
+    try expectSecretPieces("  run the task", "  run the task", &values);
+    try expectSecretPieces("  see git", "  see git", &values);
+    try expectSecretPieces("  open github", "  open github", &values);
+    try expectSecretPieces("  through", "  through", &values);
+    try expectSecretPieces("│ github │", "│ github │", &values);
+    try expectSecretPieces("│ 42 │", "│ 42 │", &values);
+    try expectSecretPieces("  ok", "  ok", &values);
+}
+
+test "maskSecretPieces masks a realistic token's four-byte end piece and keeps its three-byte one" {
+    const values = [_][]const u8{realistic_ghp};
+    try expectSecretPieces("  [redacted] here.", "  H4jK here.", &values);
+    try expectSecretPieces("  4jK here.", "  4jK here.", &values);
+}
+
+test "maskSecretPieces masks a start piece only past the value's public prefix" {
+    const values = [_][]const u8{realistic_ghp};
+    try expectSecretPieces("  ghp_", "  ghp_", &values);
+    try expectSecretPieces("  [redacted]", "  ghp_x9Q2", &values);
+}
+
+test "maskSecretPieces masks an eight-byte middle piece of a token's random part in a narrow cell" {
+    // The random part starts after the public prefix `github_pat_`. This piece
+    // starts 20 bytes into the random part and is shorter than the prefix, yet
+    // it runs past the prefix, so it is a piece of the token.
+    const values = [_][]const u8{realistic_github_pat};
+    try expectSecretPieces(
+        "  │      │ [redacted] │",
+        "  │      │ " ++ realistic_github_pat["github_pat_".len + 20 ..][0..8] ++ " │",
+        &values,
+    );
+}
+
+test "maskSecretPieces masks a four-byte middle piece of a token's random part in a narrow cell" {
+    const values = [_][]const u8{realistic_github_pat};
+    try expectSecretPieces(
+        "  │      │ [redacted] │",
+        "  │      │ " ++ realistic_github_pat["github_pat_".len + 20 ..][0..4] ++ " │",
+        &values,
+    );
+}
+
+test "maskSecretPieces keeps a lone run that lies wholly inside the public prefix" {
+    const values = [_][]const u8{realistic_github_pat};
+    try expectSecretPieces("│ github │", "│ github │", &values);
+    try expectSecretPieces("│ github_p │", "│ github_p │", &values);
+}
+
+test "maskSecretPieces masks a lone run that starts inside the public prefix and runs past it" {
+    const values = [_][]const u8{realistic_github_pat};
+    try expectSecretPieces("│ [redacted] │", "│ pat_11AB │", &values);
+}
+
+test "maskSecretPieces masks every three-byte slice of a token past its prefix in a narrow table cell" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A 42-byte token. A table column can shrink to three cells, so one row of
+    // its cell can hold any three bytes of the token.
+    const token = "ghp_" ++ "x9Q2mN7pL4kR8sT1vW3yZ6aB5cD0eF2gH4jKLm";
+    comptime std.debug.assert(token.len == 42);
+    const values = [_][]const u8{token};
+    for (0..token.len - 2) |start| {
+        const row = try arena.print("  │ {s} │ some │", .{token[start..][0..3]});
+        // A slice that lies wholly inside the public prefix `ghp_` is common text.
+        const expected: []const u8 = if (start < 2) row else "  │ [redacted] │ some │";
+        try expectSecretPieces(expected, row, &values);
+    }
+}
+
+test "SecretValues keeps no bare Bearer word as a value" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var values: SecretValues = .{};
+    // The assignment's value is the word `Bearer`, which is not a token.
+    try values.collect(arena, "TOKEN=Bearer xoxb-77Hh");
+    for (values.values.items) |value| try std.testing.expect(!std.mem.eql(u8, value, "Bearer"));
+    const before = values.values.items.len;
+    try values.put(arena, "Bearer");
+    try std.testing.expectEqual(before, values.values.items.len);
+}
+
+test "maskSecretPieces masks a bearer token that a wrap splits, once collected" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var values: SecretValues = .{};
+    try values.collect(arena, "Authorization: Bearer Q7xk2Pz9LmR4vT1nB8cDwE3f");
+    try std.testing.expectEqualStrings(
+        "  Authorization: Bearer [redacted]",
+        try maskPieces(arena, "  Authorization: Bearer Q7xk2Pz9", values.values.items),
+    );
+}
+
+test "SecretValues never keeps the redaction marker as a secret value" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var values: SecretValues = .{};
+    try values.collect(arena, "API_KEY=[redacted]");
+    try values.put(arena, "[redacted]");
+    try std.testing.expectEqual(@as(usize, 0), values.values.items.len);
+}
+
+test "SecretValues keeps the part of a Bearer value after its prefix as a value of its own" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const token = repeat("B", 20);
+    var values: SecretValues = .{};
+    try values.put(arena, "Bearer " ++ token);
+    try std.testing.expectEqual(@as(usize, 2), values.values.items.len);
+    try std.testing.expectEqualStrings("Bearer " ++ token, values.values.items[0]);
+    try std.testing.expectEqualStrings(token, values.values.items[1]);
+}
+
+test "SecretValues counts the Bearer token toward max_values" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var values: SecretValues = .{};
+    for (0..SecretValues.max_values - 1) |index| {
+        try values.put(arena, try arena.print("token-{d}", .{index}));
+    }
+    try values.put(arena, "Bearer " ++ repeat("B", 20));
+    // The Bearer value fills the last slot, so its token is the 1025th distinct value.
+    try std.testing.expect(values.overflow);
+    try std.testing.expectEqual(@as(usize, SecretValues.max_values), values.values.items.len);
+}
+
+test "maskSecretPieces stops with an error once its compare budget is spent" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const values = [_][]const u8{"ghp_" ++ repeat("A", 40)};
+    var budget: usize = 8;
+    // The first run is compared with the value's tail, which costs more than 8 bytes.
+    try std.testing.expectError(
+        error.SecretPieceBudgetSpent,
+        maskSecretPieces(arena_state.allocator(), "  " ++ repeat("A", 20) ++ "  Q9", &values, &budget),
+    );
+}
+
+test "maskSecretPieces charges the compare budget for the bytes it compares" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const values = [_][]const u8{realistic_ghp};
+    var budget: usize = max_piece_compare_bytes;
+    _ = try maskSecretPieces(arena_state.allocator(), "word", &values, &budget);
+    // "word" is a lone run, so it is compared at each of the 36 positions past
+    // the 4-byte public prefix `ghp_`. None of them shares a byte with it, so
+    // each costs one byte. Its end-piece comparison with the value's last four
+    // bytes costs one more: 37 bytes in all.
+    try std.testing.expectEqual(max_piece_compare_bytes - 37, budget);
+}
+
+/// One fuzz input's bytes, read in order. A read past the end gives zero, so an
+/// input of any length decides the whole fuzz test.
+const PieceFuzzInput = struct {
+    bytes: []const u8,
+    at: usize = 0,
+
+    fn next(self: *PieceFuzzInput) u8 {
+        if (self.at == self.bytes.len) return 0;
+        self.at += 1;
+        return self.bytes[self.at - 1];
+    }
+
+    /// The next byte, taken modulo `len`, which must be at least 1.
+    fn pick(self: *PieceFuzzInput, len: usize) usize {
+        return @as(usize, self.next()) % len;
+    }
+
+    fn fill(self: *PieceFuzzInput, out: []u8) void {
+        for (out) |*byte| byte.* = self.next();
+    }
+};
+
+/// Room for one fuzz input: four values of up to 64 bytes, a row of up to 256,
+/// and a wrapped value of up to 80, with their choices.
+const piece_input_capacity = 1024;
+/// Room for every allocation that one fuzz input makes.
+const piece_arena_bytes = 64 * 1024;
+/// The gutters, words, and tails that a wrapped value is laid out with.
+const piece_gutters = [_][]const u8{ "", "  ", "  │ ", "│ ", "| " };
+const piece_words = [_][]const u8{ "", "see " };
+const piece_tails = [_][]const u8{ " here.", " │", "" };
+/// The bytes a wrapped value is built from. Each is a secret-run byte.
+const piece_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+
+/// Checks `maskSecretPieces` on a fuzzed row and values, then on one fuzzed
+/// value that a wrap has split across rows. The input is read in this order:
+/// the number of values (up to 4), then each value's length (up to 64) and
+/// bytes; the row's length (up to 256) and bytes; the wrapped value's gutter,
+/// word, length (8 to 80), and bytes; its split, which leaves a start piece and
+/// an end piece of at least `min_secret_piece_bytes` each, a flag and a choice
+/// for a middle piece, its tail, and the gutters of the next two rows. The
+/// budget is large, so the fuzzed inputs never spend it.
+fn fuzzMaskSecretPieces(_: void, smith: *std.testing.Smith) !void {
+    var input_buf: [piece_input_capacity]u8 = undefined;
+    var input: PieceFuzzInput = .{ .bytes = input_buf[0..smith.slice(&input_buf)] };
+    var storage: [piece_arena_bytes]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&storage);
+    const arena = fba.allocator();
+
+    // Any row and values: no error, valid UTF-8 stays valid, and the bytes at
+    // or above 0x80 keep their order.
+    var value_bufs: [4][64]u8 = undefined;
+    var values: [4][]const u8 = undefined;
+    const value_count = input.pick(5);
+    for (0..value_count) |index| {
+        const len = input.pick(65);
+        input.fill(value_bufs[index][0..len]);
+        values[index] = value_bufs[index][0..len];
+    }
+    var row_buf: [256]u8 = undefined;
+    const row_len = input.pick(257);
+    input.fill(row_buf[0..row_len]);
+    const row = row_buf[0..row_len];
+    const row_out = try maskPieces(arena, row, values[0..value_count]);
+    if (std.unicode.utf8ValidateSlice(row)) try std.testing.expect(std.unicode.utf8ValidateSlice(row_out));
+    try expectSameHighBytes(row, row_out);
+
+    // One value, split into a start piece and an end piece of at least four
+    // bytes (`min_secret_piece_bytes`), and a middle piece when it splits in
+    // three. The start piece ends
+    // its row, the end piece starts the next, and the middle piece stands alone,
+    // so the masked row must show the marker where each piece was.
+    const gutter = piece_gutters[input.pick(piece_gutters.len)];
+    const word = piece_words[input.pick(piece_words.len)];
+    const value_len = 2 * min_secret_piece_bytes + input.pick(81 - 2 * min_secret_piece_bytes);
+    var value_buf: [80]u8 = undefined;
+    for (value_buf[0..value_len]) |*byte| byte.* = piece_alphabet[input.pick(piece_alphabet.len)];
+    const value = value_buf[0..value_len];
+    const split = min_secret_piece_bytes + input.pick(value_len - 2 * min_secret_piece_bytes + 1);
+    const three = input.pick(2) == 1 and split + 2 * min_secret_piece_bytes <= value_len;
+    const split_end = if (three)
+        split + min_secret_piece_bytes + input.pick(value_len - split - 2 * min_secret_piece_bytes + 1)
+    else
+        split;
+    const tail = piece_tails[input.pick(piece_tails.len)];
+    const gutter_after = piece_gutters[input.pick(piece_gutters.len)];
+    const gutter_middle = piece_gutters[input.pick(piece_gutters.len)];
+    const one: []const []const u8 = &.{value};
+
+    const start_row = try std.mem.concat(arena, u8, &.{ gutter, word, value[0..split] });
+    const start_out = try maskPieces(arena, start_row, one);
+    // A start piece is masked once it is longer than the value's public prefix.
+    if (split > publicPrefixLen(value)) try std.testing.expect(std.mem.endsWith(u8, start_out, "[redacted]"));
+
+    const end_row = try std.mem.concat(arena, u8, &.{ gutter_after, value[split_end..], tail });
+    const end_out = try maskPieces(arena, end_row, one);
+    try std.testing.expectEqualStrings(
+        try std.mem.concat(arena, u8, &.{ gutter_after, "[redacted]", tail }),
+        end_out,
+    );
+
+    // A middle piece sits at `split` in the value, so it is masked whole once it
+    // runs past the public prefix, that is once `split_end` is past the prefix.
+    if (three and split_end > publicPrefixLen(value)) {
+        const middle_row = try std.mem.concat(arena, u8, &.{ gutter_middle, value[split..split_end] });
+        const middle_out = try maskPieces(arena, middle_row, one);
+        try std.testing.expectEqualStrings(
+            try std.mem.concat(arena, u8, &.{ gutter_middle, "[redacted]" }),
+            middle_out,
+        );
+    }
+}
+
+/// Expects the bytes of `row` at or above 0x80 to be the bytes of `out` at or
+/// above 0x80, in the same order: masking never drops or moves a non-ASCII byte.
+fn expectSameHighBytes(row: []const u8, out: []const u8) !void {
+    var row_at: usize = 0;
+    var out_at: usize = 0;
+    while (true) {
+        const want = nextHighByte(row, &row_at);
+        try std.testing.expectEqual(want, nextHighByte(out, &out_at));
+        if (want == null) return;
+    }
+}
+
+/// The next byte at or above 0x80 in `bytes` from `at`, moving `at` past it.
+fn nextHighByte(bytes: []const u8, at: *usize) ?u8 {
+    while (at.* < bytes.len) : (at.* += 1) {
+        if (bytes[at.*] >= 0x80) {
+            at.* += 1;
+            return bytes[at.* - 1];
+        }
+    }
+    return null;
+}
+
+/// An inline seed for the fuzz test: a row with a `ghp_` value, then a 34-byte
+/// value (of `q`s) that splits in three. Its length byte, 26, reads as a value of
+/// 8 + 26 = 34 bytes. Its first row has gutter `gutter`, its words `word`, and its
+/// tail `tail`.
+fn pieceSeed(comptime gutter: u8, comptime word: u8, comptime tail: u8) []const u8 {
+    return "\x01\x04ghp_" ++ "\x0ax ghp_AAAA" ++
+        &[_]u8{ gutter, word, 26 } ++
+        repeat("\x2a", 34) ++
+        &[_]u8{ 5, 1, 3, tail, (gutter + 1) % 5, (gutter + 2) % 5 };
+}
+
+test "maskSecretPieces masks every piece of a wrapped value and keeps other bytes on fuzzed rows" {
+    try std.testing.fuzz({}, fuzzMaskSecretPieces, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            pieceSeed(0, 0, 0),
+            pieceSeed(1, 1, 1),
+            pieceSeed(2, 0, 2),
+            pieceSeed(3, 1, 0),
+            pieceSeed(4, 0, 1),
+        }) ++ @import("fuzz_corpus").secret_pieces.*),
+    });
+}
+
 test "redactUrlForDisplay masks credential-like query values" {
     const alloc = std.testing.allocator;
     const redacted = try redactUrlForDisplay(
@@ -1986,6 +2857,36 @@ test "redactUrlForDisplay masks credential-like query values" {
         "https://[redacted]@example.com/docs?safe=ok&token=[redacted]&X-Amz-%43redential=[redacted]&X-Amz-Signature=[redacted]",
         redacted,
     );
+}
+
+test "redactUrlForDisplay hides a password that holds an unescaped @" {
+    const alloc = std.testing.allocator;
+    const redacted = try redactUrlForDisplay(alloc, "https://user:p@ss@example.com/docs?token=abc");
+    defer alloc.free(redacted);
+    try std.testing.expectEqualStrings("https://[redacted]@example.com/docs?token=[redacted]", redacted);
+
+    // An '@' in the path is not part of the authority.
+    const path = try redactUrlForDisplay(alloc, "https://example.com/@user/post");
+    defer alloc.free(path);
+    try std.testing.expectEqualStrings("https://example.com/@user/post", path);
+}
+
+test "redactUrlWithNoHost hides a user name and password that hold a '/', '?', or '#'" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { url: []const u8, shown: []const u8 }{
+        .{ .url = "https://user:pass?x@host/", .shown = "https://[redacted]@host/" },
+        .{ .url = "https://user:pa/ss@127.0.0.1/x", .shown = "https://[redacted]@127.0.0.1/x" },
+        .{ .url = "https://user:pa#ss@host/", .shown = "https://[redacted]@host/" },
+        .{ .url = "https://user:p@ss@127.0.0.1/x?token=abc", .shown = "https://[redacted]@127.0.0.1/x?token=[redacted]" },
+        .{ .url = "https://user:secret@/docs", .shown = "https://[redacted]@/docs" },
+        .{ .url = "user:secret@agentclientprotocol.com/docs", .shown = "[redacted]@agentclientprotocol.com/docs" },
+        .{ .url = "file://srv/share/x", .shown = "file://srv/share/x" },
+    };
+    for (cases) |case| {
+        const shown = try redactUrlWithNoHost(alloc, case.url);
+        defer alloc.free(shown);
+        try std.testing.expectEqualStrings(case.shown, shown);
+    }
 }
 
 test "redactUrlForDisplay preserves benign keys containing sig" {
