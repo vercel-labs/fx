@@ -82,6 +82,8 @@ const ISOLATED_KEYS = [
   "FX_TEST_ACP_PROMPT_TERMINAL_READY",
   "FX_TEST_ACP_PROMPT_REAP_READY",
   "FX_TEST_ACP_PROMPT_RELEASE",
+  "FX_TEST_ACP_REQUEST_INSERTED",
+  "FX_TEST_ACP_REQUEST_RELEASE",
 ] as const;
 const tmuxFxTest = test.skipIf(!tmuxAvailable() || !existsSync(FX_BIN));
 const HELD_ENV_REPLY = "NO_HOLD_REACHED_FX";
