@@ -36,6 +36,14 @@
 # start still takes the lock and empties the record a dead holder left. Its
 # Today config shows fx acp before the record.
 #
+# AcpCompactionAudience: who hears a compaction in a shared session, as
+# MCAcpCompactionAudience. Design a delivers the end and the done line in one
+# audience step; design b sends the done line in a second step, which a joiner
+# can fall into, so its row names the rule it breaks. The simulate rows run
+# design a with and without churn during an end. The current-* rows are today's
+# code and the mutant-* rows remove one guard from design a; they run in the
+# full check only, since --ci leaves them out.
+#
 # AcpJoin: a second connection joins a session another connection of the same
 # process has open. Its load replays the saved turns, the running copy, a notice
 # when the copy dropped part of the turn, and the answer; a resume gives the
@@ -120,6 +128,7 @@
 #   bun ../drivers/acp/approvals/check-spec.ts
 #   bun ../drivers/acp/approvals/driver.ts   # the real fx acp with a follower's permission question, against AcpApprovalsTrace
 #   bun ../drivers/acp/shared_session/driver.ts   # the real fx acp with the clients of one session, against AcpSharedSessionTrace
+#   bun ../drivers/acp/compaction_audience/driver.ts   # the real fx acp with the clients of one compaction, against AcpCompactionAudienceTrace; --model rules (the default) fails on today's code until the fix lands, --model today is fx acp before it, --self-check plants faults
 #
 # With --ci it also runs every ../drivers/acp/*/driver.ts against
 # zig-out/bin/fx, as CI does; the planted bugs stay local, since they measure
@@ -140,7 +149,8 @@ cd "$(dirname "$0")"
 . ../lib/tlc.sh
 
 status=0
-tlc_verdicts "$@" <<'EOF' || status=1
+{
+cat <<'EOF'
 MCAcpPermissionModes MCAcpPermissionModes -
 MCAcpSpeed MCAcpSpeed -
 MCAcpSessionTarget MCAcpSessionTarget -
@@ -227,6 +237,13 @@ AcpTakeover AcpTakeover-witness-busy NoBusyLoad
 AcpTakeover AcpTakeover-witness-repair NoRepairedTurn
 AcpTakeover AcpTakeover-witness-cleanup NoDeadFolderRemoved
 AcpTakeover AcpTakeover-witness-reconnect NoFollowerConnected
+MCAcpCompactionAudience AcpCompactionAudience-design-a -
+MCAcpCompactionAudience AcpCompactionAudience-design-a-main-plain -
+MCAcpCompactionAudience AcpCompactionAudience-design-a-no-lister -
+MCAcpCompactionAudience AcpCompactionAudience-design-b PlainGetsExactlyOneDone
+MCAcpCompactionAudience AcpCompactionAudience-design-b-ideal -
+MCAcpCompactionAudience AcpCompactionAudience-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
+MCAcpCompactionAudience AcpCompactionAudience-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
 MCAcpJoin MCAcpJoin -
 MCAcpJoin AcpJoinToday temporal
 MCAcpSessionReaders MCAcpSessionReaders -
@@ -278,6 +295,25 @@ AcpApprovals approvals-witness-always NoAlwaysWin
 AcpApprovals approvals-single-a -
 AcpApprovals approvals-single-b -
 EOF
+if [ "$ci" = false ]; then
+cat <<'EOF'
+MCAcpCompactionAudience AcpCompactionAudience-current-gate OnlyListingGetsUpdates
+MCAcpCompactionAudience AcpCompactionAudience-current-no-done PlainGetsExactlyOneDone
+MCAcpCompactionAudience AcpCompactionAudience-current-no-done-plain-only PlainGetsExactlyOneDone
+MCAcpCompactionAudience AcpCompactionAudience-mutant-gate-per-session OnlyListingGetsUpdates
+MCAcpCompactionAudience AcpCompactionAudience-mutant-replay-to-plain OnlyListingGetsUpdates
+MCAcpCompactionAudience AcpCompactionAudience-mutant-done-to-listing ListingGetsNoDone
+MCAcpCompactionAudience AcpCompactionAudience-mutant-two-done PlainGetsExactlyOneDone
+MCAcpCompactionAudience AcpCompactionAudience-mutant-end-before-progress ProgressThenEnd
+MCAcpCompactionAudience AcpCompactionAudience-mutant-drop-progress ListingGetsProgress
+MCAcpCompactionAudience AcpCompactionAudience-mutant-drop-end ListingGetsEnd
+MCAcpCompactionAudience AcpCompactionAudience-mutant-drop-done ExactlyOneEndOrDone
+MCAcpCompactionAudience AcpCompactionAudience-mutant-stall-end temporal
+MCAcpCompactionAudience AcpCompactionAudience-mutant-failover-resend OnlyListingGetsUpdates
+MCAcpCompactionAudience AcpCompactionAudience-mutant-no-replay-after-end JoinerSeesSameAsPresent
+EOF
+fi
+} | tlc_verdicts "$@" || status=1
 
 if [ "$ci" = true ]; then
     for driver in ../drivers/acp/*/driver.ts; do
