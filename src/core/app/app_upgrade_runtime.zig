@@ -10,6 +10,7 @@ const io_mod = @import("../shared/io.zig");
 const upgrade_helpers = @import("../upgrade/upgrade_helpers.zig");
 const composer_stash = @import("../input/composer_stash.zig");
 const core_input_runtime = @import("../input/runtime.zig");
+const ui_input_runtime = @import("../../ui/input/runtime.zig");
 const paste_framing = @import("../input/paste_framing.zig");
 const workspace_trust = @import("../workspace_trust/workspace_trust.zig");
 
@@ -451,6 +452,11 @@ pub fn Runtime(comptime App: type) type {
                     if (app.input_runtime.hasStashedDraft()) return true;
                 }
             }
+            if (comptime @hasField(App, "terminal_input_runtime") and
+                @hasDecl(@FieldType(App, "terminal_input_runtime"), "hasDeferredSessionInput"))
+            {
+                if (app.terminal_input_runtime.hasDeferredSessionInput()) return true;
+            }
             if (comptime agents.hasAgentField(App, "pending_images")) {
                 if (agent.pending_images.items.len > 0) return true;
             }
@@ -600,9 +606,18 @@ const TestWorker = struct {
 
 const TestTerminalInputRuntime = struct {
     terminal_action_pending: bool = false,
+    inner: ui_input_runtime.Runtime = .{},
+
+    fn deinit(self: *TestTerminalInputRuntime, alloc: std.mem.Allocator) void {
+        self.inner.deinit(alloc);
+    }
 
     fn hasPendingTerminalAction(self: *const TestTerminalInputRuntime) bool {
         return self.terminal_action_pending;
+    }
+
+    pub fn hasDeferredSessionInput(self: *const TestTerminalInputRuntime) bool {
+        return self.inner.hasDeferredSessionInput();
     }
 };
 
@@ -760,6 +775,7 @@ const TestApp = struct {
 
     fn deinit(self: *TestApp) void {
         self.input_runtime.deinit(self.alloc);
+        self.terminal_input_runtime.deinit(self.alloc);
         self.main_screen.draft.deinit(self.alloc);
         if (self.instances.agents_menu.draft) |*draft| draft.deinit(self.alloc);
         self.main_agent.pending_images.deinit(self.alloc);
@@ -1660,6 +1676,19 @@ test "app_upgrade_runtime auto-restart holds while a terminal key sequence is pe
     try expectAutoRestartHeldUntilCleared(&app, struct {
         fn clear(target: *TestApp) void {
             target.terminal_input_runtime.terminal_action_pending = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while deferred session input is waiting" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    try std.testing.expect(try app.terminal_input_runtime.inner.deferSessionInputByte(app.alloc, 'x', 64));
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            _ = target.terminal_input_runtime.inner.discardDeferredSessionInput();
         }
     }.clear);
 }

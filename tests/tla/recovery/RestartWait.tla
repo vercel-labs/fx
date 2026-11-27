@@ -56,7 +56,7 @@ VARIABLES
     st,         \* each agent's turn
     asked,      \* each worker's stop request (yield_requested)
     released,   \* each worker's release (yield_released)
-    draft,      \* whether any composer/stashed draft, paste, image, pending send, or menu/picker holds Idle
+    draft,      \* whether any composer/stashed draft, deferred session input, paste, image, pending send, or menu/picker holds Idle
     autoStarted \* whether the automatic idle trigger started the restart
 
 vars == <<wait, st, asked, released, draft, autoStarted>>
