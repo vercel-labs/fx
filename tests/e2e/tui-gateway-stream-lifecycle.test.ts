@@ -4735,6 +4735,71 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "TUI names the model in turn context, announces /model switches in <fx-context-update>, and keeps frozen instructions identical",
+    async () => {
+      const modelB = "openai/gpt-5.4";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-model-identity-",
+        [
+          fakeGatewayFinalText("TUI_MODEL_TURN_1"),
+          fakeGatewayFinalText("TUI_MODEL_TURN_2"),
+          fakeGatewayFinalText("TUI_MODEL_TURN_3"),
+        ],
+        {
+          models: [
+            { id: MODEL, type: "language", tags: ["tool-use"] },
+            { id: modelB, type: "language", tags: ["tool-use"] },
+          ],
+        },
+      );
+
+      await session!.sendText("First model turn.");
+      await session!.waitForPane((pane) => pane.includes("TUI_MODEL_TURN_1") && turnSettled(pane), TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+
+      await session!.sendText(`/model ${modelB}`);
+      await session!.waitForText(`Switched to ${modelB}`, TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+
+      await session!.sendText("Second model turn.");
+      await session!.waitForPane((pane) => pane.includes("TUI_MODEL_TURN_2") && turnSettled(pane), TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+
+      await session!.sendText("Third model turn.");
+      await session!.waitForPane((pane) => pane.includes("TUI_MODEL_TURN_3") && turnSettled(pane), TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+
+      expect(queuedGateway.requests).toHaveLength(3);
+      const parseReq = (body: string) => JSON.parse(body) as { prompt: Array<{ role: string; content: unknown; providerOptions?: unknown }> };
+      const leadingSystem = (req: ReturnType<typeof parseReq>) => {
+        const firstNonSystem = req.prompt.findIndex((m) => m.role !== "system");
+        return req.prompt.slice(0, firstNonSystem < 0 ? req.prompt.length : firstNonSystem);
+      };
+      const req1 = parseReq(queuedGateway.requests[0]!.body);
+      const req2 = parseReq(queuedGateway.requests[1]!.body);
+      const req3 = parseReq(queuedGateway.requests[2]!.body);
+
+      const sys1 = leadingSystem(req1);
+      const sys2 = leadingSystem(req2);
+      const sys3 = leadingSystem(req3);
+      expect(JSON.stringify(sys2)).toBe(JSON.stringify(sys1));
+      expect(JSON.stringify(sys3)).toBe(JSON.stringify(sys1));
+
+      const turnCtx1 = sys1.map((m) => contentText(m.content)).find((text) => text.includes("<fx-turn-context>")) ?? "";
+      expect(turnCtx1).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${MODEL}\\n`));
+
+      const latestUser2 = contentText(req2.prompt.filter((m) => m.role === "user").at(-1)?.content);
+      expect(latestUser2).toContain("<fx-context-update>");
+      expect(latestUser2).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelB}\\n`));
+
+      const latestUser3 = contentText(req3.prompt.filter((m) => m.role === "user").at(-1)?.content);
+      expect(latestUser3).not.toContain("<fx-context-update>");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "provider error after assistant output restarts the response in its place",
     async () => {
       const firstCatalogModel = "anthropic/claude-fable-5";
