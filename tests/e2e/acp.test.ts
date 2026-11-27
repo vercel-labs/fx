@@ -12617,6 +12617,60 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP report turn reuses a grant approved in its first turn",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-report-turn-grant-");
+      const tracePath = join(root.root, "trace.log");
+      const target = join(root.external, "approved.txt");
+      const firstWrite = "acp_grant_first_write";
+      const reportWrite = "acp_grant_report_write";
+      const sendId = "acp_grant_send";
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({ permission: { edit: { [`${root.external}/**`]: "ask" } } }),
+      );
+      const gateway = startDynamicFakeGateway((body) => {
+        if (!body.includes('"name":"subagent"')) return finalText("Child finished.");
+        if (acpLatestUserIsReport(body)) {
+          if (acpHasCurrentToolResult(body, reportWrite)) return finalText("Report finished.");
+          return fileToolCall(reportWrite, target, "report\n");
+        }
+        if (acpHasCurrentToolResult(body, sendId)) return finalText("Work sent.");
+        if (acpHasCurrentToolResult(body, firstWrite)) {
+          return fakeGatewayToolCall(sendId, "subagent", {
+            request: { action: "message", agent: "helper", message: "Reply without using tools." },
+          });
+        }
+        return fileToolCall(firstWrite, target, "first\n");
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "permission" },
+        });
+        await startAutoSession(client);
+        client.setPermissionOption("allow_always");
+
+        const result = await runPrompt(client, "Approve a write, then delegate work.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        const approvals = result.messages.filter((message: any) => message.method === "session/request_permission");
+        expect(approvals.map((message: any) => message.params.toolCall.toolCallId)).toEqual([firstWrite]);
+        expect(readFileSync(target, "utf8")).toBe("report\n");
+        // The ACP host can also see session grants. Check what the turn carried into admission.
+        const admissions = readFileSync(tracePath, "utf8").split("\n").filter((line) => line.includes("before_permission_wait"));
+        expect(admissions.find((line) => line.includes(`call_id=${firstWrite} `))).toContain("local_grants=0 ");
+        expect(admissions.find((line) => line.includes(`call_id=${reportWrite} `))).toContain("local_grants=1 ");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP report turn sends the sign-in its first turn refreshed",
     async () => {
       const root = createIsolatedRoot("fx-acp-report-refreshed-sign-in-");

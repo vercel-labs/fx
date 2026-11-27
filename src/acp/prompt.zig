@@ -3610,7 +3610,13 @@ fn runReportTurns(
         // current one, as a turn the user starts does.
         var sign_in = try TurnSignIn.capture(alloc, state, session);
         defer sign_in.deinit(alloc);
+        // The first turn's grants array was freed if a grant was added while
+        // it ran. The report turn reads the session's current grants, copied
+        // under the lock that adds them.
+        const grants = try copySessionGrants(alloc, state, session);
+        defer alloc.free(grants);
         var job = base;
+        job.grants = grants;
         sign_in.apply(&job);
         job.turn_id = 0;
         job.prompt = next.prompt;
@@ -3911,6 +3917,17 @@ fn retainAcpGrant(raw_ctx: *anyopaque, tool_name: []const u8, target_path: []con
     defer ctx.state.subagent_authority_mutex.unlock(io_mod.getIo());
     const session = if (ctx.state.active_session) |*active| active else return;
     try session.retainGrant(ctx.alloc, tool_name, target_path);
+}
+
+/// The session's grants as they are now, in `alloc`, which the caller frees.
+/// `retainGrant` replaces the session's array and frees the old one under
+/// `subagent_authority_mutex`, so a turn that keeps the array past the next
+/// grant reads freed memory. Only the array is copied: the names and targets
+/// it holds live until the session ends.
+fn copySessionGrants(alloc: Allocator, state: *server.ServerState, session: *const server.ActiveSessionState) ![]types.PermissionGrant {
+    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+    return alloc.dupe(types.PermissionGrant, session.session_grants);
 }
 
 fn pushEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
@@ -5819,6 +5836,34 @@ test "ACP propagateGrant stores deduped runtime session grants" {
     const tool_ctx = ctx.toolContext();
     try std.testing.expectEqual(session.session_grants.len, tool_ctx.permission_grants.len);
     try std.testing.expect(tool_ctx.permission_grants.ptr == session.session_grants.ptr);
+}
+
+test "ACP report turn grants are a copy that a later grant leaves intact" {
+    const alloc = std.testing.allocator;
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .state = &state,
+        .session_id = "session_1",
+    };
+    try retainAcpGrant(&ctx, "run_command", "echo grant-a*");
+
+    const session = &state.active_session.?;
+    const first = try copySessionGrants(alloc, &state, session);
+    defer alloc.free(first);
+    // A grant added while the prompt runs frees the array the session held.
+    try retainAcpGrant(&ctx, "run_command", "echo grant-b*");
+
+    try std.testing.expect(first.ptr != session.session_grants.ptr);
+    try std.testing.expectEqual(@as(usize, 1), first.len);
+    try std.testing.expectEqualStrings("echo grant-a*", first[0].target_path);
+
+    // The next report turn sees both.
+    const next = try copySessionGrants(alloc, &state, session);
+    defer alloc.free(next);
+    try std.testing.expectEqual(@as(usize, 2), next.len);
+    try std.testing.expectEqualStrings("echo grant-b*", next[1].target_path);
 }
 
 test "a subagent's model route is its own copy, which a switch of the session leaves as it was" {
