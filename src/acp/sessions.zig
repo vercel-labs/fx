@@ -1478,6 +1478,48 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
     return listV2Sessions(state, alloc, msg, v2_store, params);
 }
 
+/// The v1 roots of the paged listing in progress, kept for the page its
+/// last cursor names, so one listing reads v1's folder once.
+pub const SessionListing = struct {
+    v1_roots: session_adapter.V1Roots,
+    next_updated_at_ms: i64,
+    /// Owned.
+    next_id: []u8,
+
+    pub fn deinit(listing: *SessionListing, alloc: Allocator) void {
+        listing.v1_roots.deinit(alloc);
+        alloc.free(listing.next_id);
+        listing.* = undefined;
+    }
+
+    fn continuesAt(listing: *const SessionListing, continuation: session_store.ResumableSessionContinuation) bool {
+        return listing.next_updated_at_ms == continuation.updated_at_ms and std.mem.eql(u8, listing.next_id, continuation.id);
+    }
+};
+
+/// The v1 roots for one page: the kept read when `continuation` names its
+/// page, else a fresh read. Any other kept listing is freed. The caller owns
+/// the result.
+fn takeV1Roots(
+    state: *server.ServerState,
+    v2_store: *session_adapter.Store,
+    continuation: ?session_store.ResumableSessionContinuation,
+) !session_adapter.V1Roots {
+    const held = state.session_listing;
+    state.session_listing = null;
+    if (held) |listing| {
+        if (continuation) |position| {
+            if (listing.continuesAt(position)) {
+                state.alloc.free(listing.next_id);
+                return listing.v1_roots;
+            }
+        }
+        var stale = listing;
+        stale.deinit(state.alloc);
+    }
+    return session_adapter.readV1Roots(v2_store, state.alloc);
+}
+
 /// `session/list` on v2, paged as v1 pages it: newest first, one
 /// workspace when `cwd` is given, and only what follows the cursor.
 fn listV2Sessions(
@@ -1489,12 +1531,25 @@ fn listV2Sessions(
 ) !void {
     // Matched as v1 matches it: exactly, after trailing slashes.
     const cwd = if (params.cwd) |value| session_store_paths.normalizeWorkspaceRoot(value) else null;
-    var page = session_adapter.listPage(v2_store, alloc, cwd, params.continuation, session_store.session_list_default_limit) catch |err| {
+    var v1_roots = takeV1Roots(state, v2_store, params.continuation) catch |err| {
+        debug_trace.logf("acp", "session operation=list outcome=failed backend=v2 error={s}", .{@errorName(err)});
+        try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
+        return;
+    };
+    var kept = false;
+    defer if (!kept) v1_roots.deinit(state.alloc);
+    var page = session_adapter.listPageWithV1Roots(v2_store, alloc, &v1_roots, cwd, params.continuation, session_store.session_list_default_limit) catch |err| {
         debug_trace.logf("acp", "session operation=list outcome=failed backend=v2 error={s}", .{@errorName(err)});
         try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
         return;
     };
     defer page.deinit(alloc);
+    if (page.has_more and page.summaries.items.len > 0) {
+        const last = page.summaries.items[page.summaries.items.len - 1];
+        const next_id = try state.alloc.dupe(u8, last.id);
+        state.session_listing = .{ .v1_roots = v1_roots, .next_updated_at_ms = last.updated_at_ms, .next_id = next_id };
+        kept = true;
+    }
     try writeSessionPage(state, alloc, msg, page.summaries.items, page.has_more);
 }
 
@@ -3621,6 +3676,127 @@ test "a switch away from a session drops the reports its host queued and closes 
     try server.releaseActiveSession(&state);
     server.stopSubagentsForSwitch(&state);
     try std.testing.expect(state.active_session == null);
+}
+
+test "a paged session/list reads v1's sessions once for the whole listing" {
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    const profile_paths = @import("../core/shared/profile_paths.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io, "home/.fx");
+    try tmp.dir.createDirPath(io, "workspace");
+
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+
+    var capture = try tmp.dir.createFile(io, "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io);
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    // 101 v2 root sessions: one more than a page holds, so the listing takes two pages.
+    const v2_session_count: u64 = 101;
+    var id_buf: [32]u8 = undefined;
+    var i: u64 = 0;
+    while (i < v2_session_count) : (i += 1) {
+        const id = try std.mem.print(&id_buf, "list-{d:0>3}", .{i});
+        const s = try state.sessions_v2.?.manager.openImport(.{ .id = id, .workspace = workspace_path, .host = .ask, .created_ms = 1000 });
+        defer s.release();
+        _ = try s.appendAt(&.{ .turn_started, .turn_committed }, 5000 + i);
+        try s.publishImport();
+    }
+
+    // One v1 root session, copied as v1 left it: its folder and its three files, private.
+    const v1_id = "cb1PK0RGxCmY";
+    const fixture_dir_path = try std.Io.Dir.path.join(arena, &.{ @import("test_paths").source_root, "..", "tests", "fixtures", "v1-sessions", "plain", "sessions", v1_id });
+    var fixture_dir = try std.Io.Dir.cwd().openDir(io, fixture_dir_path, .{});
+    defer fixture_dir.close(io);
+    var home_dir = try tmp.dir.openDir(io, "home", .{});
+    defer home_dir.close(io);
+    var fx_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(home_dir, profile_paths.root_dir_name);
+    defer fx_dir.close();
+    var sessions_dir = try io_mod.openOrCreateVerifiedPrivateDir(&fx_dir, profile_paths.sessions_dir_name);
+    defer sessions_dir.close();
+    var v1_dir = try io_mod.openOrCreateVerifiedPrivateDir(&sessions_dir, v1_id);
+    defer v1_dir.close();
+    for ([_][]const u8{ "session.json", "events.jsonl", "permissions.json" }) |name| {
+        const bytes = try fixture_dir.readFileAlloc(io, name, arena, .limited(1 << 24));
+        try v1_dir.dir.writeFile(io, .{ .sub_path = name, .data = bytes, .flags = .{ .permissions = .fromMode(0o600) } });
+    }
+
+    const tmp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+    defer alloc.free(tmp_path);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ tmp_path, "trace.log" });
+    defer alloc.free(trace_path);
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "core");
+    defer debug_trace.resetForTest();
+
+    // Page through the listing as a client does, following each nextCursor.
+    const max_list_pages: usize = 10;
+    const expected_total_ids: usize = 102;
+    var seen = std.StringHashMap(void).init(alloc);
+    defer seen.deinit();
+    var total_ids: usize = 0;
+    var v1_hits: usize = 0;
+    var pages: usize = 0;
+    var next_id: i64 = 10;
+    var cursor: ?[]const u8 = null;
+    while (pages < max_list_pages) {
+        pages += 1;
+        var params_raw: ?[]const u8 = null;
+        if (cursor) |value| {
+            var params_out: std.Io.Writer.Allocating = .init(arena);
+            try std.json.Stringify.value(.{ .cursor = value }, .{}, &params_out.writer);
+            params_raw = params_out.written();
+        }
+        var msg = jsonrpc.Message{ .id = .{ .integer = next_id }, .method = "session/list", .params_raw = params_raw };
+        next_id += 1;
+        try handleListSessions(&state, arena, &msg);
+
+        const captured = try readCaptured(&capture, arena);
+        var lines = std.mem.splitScalar(u8, captured, '\n');
+        var last_line: []const u8 = "";
+        while (lines.next()) |raw| {
+            const text = std.mem.trim(u8, raw, " \r\t");
+            if (text.len > 0) last_line = text;
+        }
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, last_line, .{});
+        const result = parsed.object.get("result") orelse return error.TestUnexpectedResult;
+        const sessions = result.object.get("sessions") orelse return error.TestUnexpectedResult;
+        for (sessions.array.items) |item| {
+            const id = (item.object.get("sessionId") orelse return error.TestUnexpectedResult).string;
+            total_ids += 1;
+            if (std.mem.eql(u8, id, v1_id)) v1_hits += 1;
+            try seen.put(id, {});
+        }
+        cursor = if (result.object.get("nextCursor")) |value| value.string else null;
+        if (cursor == null) break;
+    }
+    try std.testing.expect(cursor == null);
+
+    try std.testing.expectEqual(@as(usize, 2), pages);
+    try std.testing.expectEqual(expected_total_ids, total_ids);
+    try std.testing.expectEqual(total_ids, seen.count());
+    try std.testing.expectEqual(@as(usize, 1), v1_hits);
+
+    // Closing the trace flushes it to disk before it is read.
+    debug_trace.resetForTest();
+    const trace = try tmp.dir.readFileAlloc(io, "trace.log", arena, .limited(1 << 20));
+    var reused_reads: usize = 0;
+    var trace_lines = std.mem.splitScalar(u8, trace, '\n');
+    while (trace_lines.next()) |trace_line| {
+        if (std.mem.find(u8, trace_line, "session catalog cache reused=") != null) reused_reads += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), reused_reads);
 }
 
 test "a reload under another cwd and a libfx/new drop what the host they replace queued" {

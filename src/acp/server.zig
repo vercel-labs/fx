@@ -411,6 +411,8 @@ pub const ServerState = struct {
     /// Open for the whole connection on native hosts; the wasm host keeps
     /// its sessions in the JS host's snapshot store (D63).
     sessions_v2: ?session_adapter.Store = null,
+    /// The v1 roots of the paged `session/list` in progress, owned by `sessions.zig`.
+    session_listing: ?sessions.SessionListing = null,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     terminate_connection: bool = false,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
@@ -454,6 +456,7 @@ pub const ServerState = struct {
         // Retention's maintenance, if one runs, ends with the server.
         if (comptime turn_capture.supported) turn_capture.finishMaintenance();
         if (self.sessions_v2) |*store| store.deinit(self.alloc);
+        if (self.session_listing) |*listing| listing.deinit(self.alloc);
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         if (self.api_key.len > 0) secret.zeroAndFree(self.alloc, self.api_key);
