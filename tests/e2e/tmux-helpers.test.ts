@@ -217,6 +217,45 @@ tmuxTest("reading the remain-on-exit format throws when tmux has no such pane or
   }
 });
 
+tmuxTest("a test that times out does not leave its tmux server or pane process after Bun exits", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fx-tmux-timeout-"));
+  const socketName = `fx-timeout-${process.pid}-${Date.now().toString(36)}`;
+  const report = join(dir, "report.json");
+  const helperUrl = pathToFileURL(join(import.meta.dir, "tmux-helpers.ts")).href;
+  writeFileSync(
+    join(dir, "timed-out.test.ts"),
+    [
+      `import { writeFileSync } from "node:fs";`,
+      `import { test } from "bun:test";`,
+      `import { TmuxSession } from ${JSON.stringify(helperUrl)};`,
+      `test("body keeps waiting after its timeout", async () => {`,
+      `  const session = await TmuxSession.create({ cmd: "sleep 60", startupWaitMs: 300, socketName: ${JSON.stringify(socketName)} });`,
+      `  writeFileSync(${JSON.stringify(report)}, JSON.stringify({ name: session.name, pane: session.processPid() }));`,
+      `  await session.waitForPane(() => false, 30_000);`,
+      `}, 3_000);`,
+      `test("a later test ends the file", () => {});`,
+    ].join("\n"),
+  );
+  try {
+    // The child fails by design: its first test times out. Only its leftovers matter.
+    spawnSync(process.execPath, ["test", join(dir, "timed-out.test.ts")], {
+      cwd: import.meta.dir,
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    const { name, pane } = JSON.parse(readFileSync(report, "utf8")) as { name: string; pane: number };
+    const hasSession = spawnSync("tmux", ["-L", socketName, "has-session", "-t", name], { stdio: "pipe" });
+    expect(hasSession.status).not.toBe(0);
+    const paneState = spawnSync("ps", ["-o", "stat=", "-p", String(pane)], { encoding: "utf8" }).stdout.trim();
+    expect(paneState === "" || paneState.startsWith("Z")).toBe(true);
+  } finally {
+    try {
+      execFileSync("tmux", ["-L", socketName, "kill-server"], { stdio: "pipe" });
+    } catch {}
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 60_000);
+
 test("held gateway response disposes before it is requested", async () => {
   const held = heldFakeGatewayFinalText();
 
