@@ -3061,6 +3061,7 @@ describe("slice 6: fx tool skill and agent bridge", () => {
 
   test("killing fx tool agent wait inside bash ends the wait through the bridge while a subagent still works", async () => {
     const root = createRoot();
+    const tracePath = join(root.root, "bridge-wait.trace.log");
     let releaseChild!: (response: Response) => void;
     const childReply = new Promise<Response>((resolve) => {
       releaseChild = resolve;
@@ -3092,7 +3093,11 @@ describe("slice 6: fx tool skill and agent bridge", () => {
         await childSeen;
         bashStartedAt = Date.now();
         return fakeGatewayToolCall("bash_wait", "bash", {
-          command: `${JSON.stringify(FX_BIN)} tool agent wait & w=$!; sleep 1; kill $w; wait $w; echo "wait-exit=$?"`,
+          command: [
+            `${JSON.stringify(FX_BIN)} tool agent wait & w=$!`,
+            `seen=no; for i in $(seq 1 200); do if grep -q event=wait_begin ${JSON.stringify(tracePath)}; then seen=yes; break; fi; sleep 0.05; done`,
+            `kill $w; wait $w; echo "wait-exit=$?"; echo "seen=$seen"`,
+          ].join("\n"),
         });
       }
       if (parentStep === 3) {
@@ -3110,7 +3115,7 @@ describe("slice 6: fx tool skill and agent bridge", () => {
         ["ask", "--json", "--yolo", ...BASH_SETTING, "Start a helper subagent, then run bash to wait and kill it."],
         {
           cwd: root.workspace,
-          env: gatewayEnv(root.home, gateway),
+          env: { ...gatewayEnv(root.home, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "mailbox,subagent,mcp-call" },
           timeoutMs: TIMEOUT,
         },
       );
@@ -3124,6 +3129,7 @@ describe("slice 6: fx tool skill and agent bridge", () => {
       const match = /wait-exit=(\d+)/.exec(out);
       expect(match).not.toBeNull();
       expect(Number(match![1])).toBeGreaterThan(0);
+      expect(out).toContain("seen=yes");
 
       const output = JSON.parse(result.stdout) as {
         output: string;
@@ -3541,7 +3547,9 @@ describe("slice 6 break-it", () => {
         await Bun.sleep(20);
       }
       await childSeen;
-      await Bun.sleep(200);
+      const waitBegins = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").split("wait_begin").length - 1;
+      const bothWaitsDeadline = Date.now() + TIMEOUT;
+      while (waitBegins() < 2 && Date.now() < bothWaitsDeadline) await Bun.sleep(20);
       releaseChild(fakeGatewayFinalText("One report posted.\n"));
 
       const result = await fxPromise;
