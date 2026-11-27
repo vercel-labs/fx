@@ -293,7 +293,7 @@ jobs:
             const names = new Set(report.files.map(({ path }) => path));
             const required = [
               "package.json", "README.md", "LICENSE", "browser.js", "browser-agent.js", "browser-terminal.js", "node.js", "node.cjs", "node-wasm.js", "bundled-asset.js", "fx-sdk.js", "engine.js", "xterm.js", "wasm-runtime.js", "wasm-terminal.js", "wasm-module.js",
-              "core-output.js", "tool-observation.js", "fetch-cleanup.js", "mcp.js", "skills.js", "skills-node.js", "subscription.js", "oauth.js", "chatgpt.js", "chatgpt-sign-in.js", "grok.js", "grok-sign-in.js", "custom-provider.js",
+              "core-output.js", "tool-observation.js", "fetch-cleanup.js", "mcp.js", "skills.js", "skills-node.js", "subscription.js", "oauth.js", "chatgpt.js", "chatgpt-sign-in.js", "grok.js", "grok-sign-in.js", "google.js", "custom-provider.js",
               "durable.js", "fx-harness.js", "durable/local.mjs", "durable/vercel.mjs", "durable/world.mjs", "durable/local.mjs.map", "durable/vercel.mjs.map", "durable/world.mjs.map",
               "types/browser.d.ts", "types/chatgpt.d.ts", "types/durable-local.d.ts", "types/durable-vercel.d.ts", "types/durable-world.d.ts", "types/grok.d.ts", "types/libfx.d.cts", "types/mcp.d.ts", "types/node.d.cts", "types/node.d.ts", "types/skills-node.d.ts", "types/skills.d.ts", "types/wasm.d.ts",
               "fx-core.wasm", "fx-term.wasm",
