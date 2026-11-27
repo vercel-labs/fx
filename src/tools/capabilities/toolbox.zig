@@ -124,10 +124,11 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     var limit: usize = capability_retrieval.default_limit;
     if (args.get("limit")) |value| {
         if (chosen != .search) return failure(ctx.allocator, "toolbox limit goes with search");
-        if (value != .integer or value.integer < 1 or value.integer > capability_retrieval.max_limit) {
+        if (value != .integer or value.integer < 0) {
             return failure(ctx.allocator, std.fmt.comptimePrint("toolbox limit must be a whole number from 1 to {d}", .{capability_retrieval.max_limit}));
         }
-        limit = @intCast(value.integer);
+        const raw: usize = @intCast(value.integer);
+        limit = std.math.clamp(raw, @as(usize, 1), capability_retrieval.max_limit);
     }
     const cursor_value = args.get("cursor");
     if (cursor_value) |value| {
@@ -857,9 +858,9 @@ test "toolbox checks kind, limit, and cursor where each goes" {
     const bad = [_]Bad{
         .{ .args = "{\"open\":\"x\",\"kind\":\"server\"}", .says = "kind must be skill, mcp_server, or tool" },
         .{ .args = "{\"search\":\"x\",\"kind\":\"skill\"}", .says = "kind goes with open" },
-        .{ .args = "{\"search\":\"x\",\"limit\":0}", .says = "limit must be a whole number from 1 to 20" },
-        .{ .args = "{\"search\":\"x\",\"limit\":21}", .says = "limit must be a whole number from 1 to 20" },
+        .{ .args = "{\"search\":\"x\",\"limit\":-1}", .says = "limit must be a whole number from 1 to 20" },
         .{ .args = "{\"search\":\"x\",\"limit\":\"5\"}", .says = "limit must be a whole number from 1 to 20" },
+        .{ .args = "{\"search\":\"x\",\"limit\":1.5}", .says = "limit must be a whole number from 1 to 20" },
         .{ .args = "{\"open\":\"x\",\"limit\":5}", .says = "limit goes with search" },
         // Skills and MCP tools page apart, so a cursor pages one server's.
         .{ .args = "{\"search\":\"x\",\"cursor\":\"c1\"}", .says = "cursor goes with a search of one server" },
@@ -893,6 +894,26 @@ test "toolbox checks kind, limit, and cursor where each goes" {
     const kinded = (try decodeForTest("{\"open\":\"linear\",\"kind\":\"mcp_server\"}")).input;
     defer kinded.deinit(std.testing.allocator);
     try std.testing.expectEqual(toolbox_core.Kind.mcp_server, kinded.as(Input).kind.?);
+    switch (try decodeForTest("{\"search\":\"x\",\"limit\":0}")) {
+        .input => |clamped_low| {
+            defer clamped_low.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 1), clamped_low.as(Input).limit);
+        },
+        .failure => |reason| {
+            std.testing.allocator.free(reason);
+            return error.TestExpectedEqual;
+        },
+    }
+    switch (try decodeForTest("{\"search\":\"x\",\"limit\":21}")) {
+        .input => |clamped_high| {
+            defer clamped_high.deinit(std.testing.allocator);
+            try std.testing.expectEqual(capability_retrieval.max_limit, clamped_high.as(Input).limit);
+        },
+        .failure => |reason| {
+            std.testing.allocator.free(reason);
+            return error.TestExpectedEqual;
+        },
+    }
 }
 
 test "a skill's name the menu also lists as a server or tool opens nothing and names both" {

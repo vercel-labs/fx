@@ -70,7 +70,7 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         return .{ .failure = try ctx.allocator.dupe(u8, "grep_files field \"mode\" must be one of matches, files_with_matches, count") };
     } else .matches;
 
-    const head_limit = switch (try parseOptionalInteger(ctx.allocator, object, "head_limit", 1, "positive")) {
+    const head_limit = switch (try parseOptionalHeadLimit(ctx.allocator, object)) {
         .missing => output_cap,
         .value => |value| @min(value, output_cap),
         .failure => |body| return .{ .failure = body },
@@ -124,6 +124,14 @@ const OptionalIntegerParse = union(enum) {
     value: usize,
     failure: []u8,
 };
+
+/// Zero counts as absent: models send `head_limit: 0` to mean "no limit",
+/// so it uses the default output cap instead of failing.
+fn parseOptionalHeadLimit(alloc: Allocator, object: std.json.ObjectMap) tool_dispatch.DispatchError!OptionalIntegerParse {
+    const value = object.get("head_limit") orelse return .missing;
+    if (value == .integer and value.integer == 0) return .missing;
+    return parseOptionalInteger(alloc, object, "head_limit", 1, "positive");
+}
 
 fn parseOptionalInteger(
     alloc: Allocator,
@@ -1007,6 +1015,27 @@ test "grep_files decodes defaults and all fields" {
         2,
     );
     try expectDecodeInput("{\"pattern\":\"needle\",\"path\":null,\"include\":null,\"case_insensitive\":null,\"mode\":null}", "needle", ".", null, false, output_cap, 0);
+}
+
+test "grep_files treats head_limit 0 like absent and refuses negative or non-integer head_limit" {
+    try expectDecodeInput("{\"pattern\":\"needle\",\"head_limit\":0}", "needle", ".", null, false, output_cap, 0);
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"head_limit\":-1}", "grep_files field \"head_limit\" must be a positive integer");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"head_limit\":\"5\"}", "grep_files field \"head_limit\" must be a positive integer");
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "sample.txt", "needle one\nneedle two\n");
+    defer alloc.free(path);
+
+    var zero = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"needle\",\"head_limit\":0}");
+    defer zero.deinit(alloc);
+    var absent = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"needle\"}");
+    defer absent.deinit(alloc);
+    try std.testing.expectEqual(.success, zero.status);
+    try std.testing.expectEqualStrings(absent.body, zero.body);
 }
 
 test "grep_files decodes context_lines above cap as bounded" {

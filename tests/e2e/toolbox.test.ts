@@ -799,4 +799,36 @@ describe("toolbox", () => {
     expect(childTools).not.toContain("glob_files");
     expect(resultValue(body(childBodies[1]!), "child_glob")).toContain("FINDER_NOTES.md");
   }, 60_000);
+
+  test("toolbox search clamps limit above 20 and returns results without refusal", async () => {
+    const root = createRoot();
+    const many = startManyMcpHttpServers({ servers: 1, toolsPerServer: 25 });
+    try {
+      const serverName = manyMcpServerName(0);
+      const config = JSON.parse(readFileSync(join(root.home, ".fx", "mcp.json"), "utf8")) as { mcp: Record<string, unknown> };
+      config.mcp[serverName] = { type: "http", url: many.url(0) };
+      writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify(config));
+      const active = start([
+        fakeGatewayToolCall("search_limit_50", "toolbox", { search: "echoes text", server: serverName, limit: 50 }),
+        fakeGatewayFinalText("TOOLBOX_LIMIT_50_DONE"),
+      ]);
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Search with limit 50."], {
+        cwd: root.workspace,
+        env: env(root, active),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("TOOLBOX_LIMIT_50_DONE");
+      const raws = modelRequests(active);
+      expect(raws.length).toBe(2);
+      const text = resultValue(body(raws[1]!), "search_limit_50");
+      expect(text, text).not.toContain("toolbox limit must be a whole number");
+      const parsed = JSON.parse(text) as { mcp_tools?: SearchRow[]; next_cursor?: string };
+      expect(parsed.mcp_tools).toHaveLength(20);
+      expect(typeof parsed.next_cursor).toBe("string");
+      expectEveryRequestExtendsThePrevious(raws);
+    } finally {
+      many.stop();
+    }
+  }, 40_000);
 });
