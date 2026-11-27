@@ -706,17 +706,19 @@ fn sensitiveAutoWriteTarget(path: []const u8) bool {
 /// permission rules, and the review model, so a write there changes what
 /// later sessions allow, whether or not the file exists yet.
 fn profileRootContains(path: []const u8) bool {
-    const home = io_mod.homeDir() orelse return false;
     var buf: [3 * std.Io.Dir.max_path_bytes]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const alloc = fba.allocator();
-    const parent = profile_paths.rootParent(home);
-    const name = profile_paths.rootName();
-    const typed_root = std.Io.Dir.path.join(alloc, &.{ parent, name }) catch return true;
+    const typed_root = (profile_paths.activeRoot(alloc, io_mod.homeDir()) catch return true) orelse return false;
     // The target path has its symlinks resolved, so compare against the resolved folder.
-    const root = io_mod.realpathAlloc(alloc, typed_root) catch blk: {
-        const real_parent = io_mod.realpathAlloc(alloc, parent) catch parent;
-        break :blk std.Io.Dir.path.join(alloc, &.{ real_parent, name }) catch return true;
+    const root = io_mod.realpathAlloc(alloc, typed_root) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            const parent = std.Io.Dir.path.dirname(typed_root) orelse return true;
+            const real_parent = io_mod.realpathAlloc(alloc, parent) catch return true;
+            break :blk std.Io.Dir.path.join(alloc, &.{ real_parent, std.Io.Dir.path.basename(typed_root) }) catch return true;
+        },
+        // fx cannot tell where its folder is, so it cannot tell the write is outside it.
+        else => return true,
     };
 
     var path_parts = std.mem.tokenizeScalar(u8, path, std.Io.Dir.path.sep);
@@ -6880,13 +6882,16 @@ test "automatic write reviews new files in fx's own folder in any spelling" {
     );
     input.workspace_root = workspace;
 
-    // The last target is the control: a new file elsewhere in the home folder.
-    const targets = [_]struct { path: []const u8, reviews: usize }{
+    // `notes.txt` is the control: a new file elsewhere in the home folder. Before
+    // the last target, fx's folder becomes a link to itself, which cannot be resolved.
+    const targets = [_]struct { path: []const u8, reviews: usize, unresolvable: bool = false }{
         .{ .path = ".fx/settings.json", .reviews = 1 },
         .{ .path = ".FX/skills/demo/SKILL.md", .reviews = 2 },
         .{ .path = "notes.txt", .reviews = 2 },
+        .{ .path = "other.txt", .reviews = 3, .unresolvable = true },
     };
     for (targets) |target| {
+        if (target.unresolvable) try tmp.dir.symLink(io_mod.getIo(), ".fx", "home/.fx", .{});
         const target_path = try std.Io.Dir.path.join(arena, &.{ home, target.path });
         const arguments_json = try arena.print(
             "{{\"path\":\"{s}\",\"content\":\"test\\n\"}}",
@@ -6901,6 +6906,10 @@ test "automatic write reviews new files in fx's own folder in any spelling" {
         );
         try std.testing.expectEqual(target.reviews, fake.calls);
     }
+
+    const unknown_home = try std.Io.Dir.path.join(arena, &.{ home, "missing-parent" });
+    try environ.put("HOME", unknown_home);
+    try std.testing.expect(profileRootContains(workspace));
 }
 
 test "automatic trusted-root overwrite preserves configured read disclosure review" {
