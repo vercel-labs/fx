@@ -31,6 +31,7 @@ pub const Options = struct {
     max_session_bytes: u64 = max_session_bytes,
     sync_interval_ms: u32 = sync_interval_ms,
     fail_prealloc_from_index: ?u64 = null,
+    fail_seal_for_test: bool = false,
     fault_once_for_test: ?FaultSite = null,
     on_gap_written_for_test: ?GapHook = null,
     test_ctx: ?*anyopaque = null,
@@ -70,6 +71,7 @@ pub const Writer = struct {
     max_session_bytes: u64,
     sync_interval_ms: u32,
     fail_prealloc_from_index: ?u64,
+    fail_seal_for_test: bool,
     fault_once_for_test: ?FaultSite,
     on_gap_written_for_test: ?GapHook,
     test_ctx: ?*anyopaque,
@@ -84,16 +86,18 @@ pub const Writer = struct {
     pin_counts: [2]std.atomic.Value(u32),
 
     stopping: std.atomic.Value(bool),
+    /// Set while the folder is still over `max_session_bytes` after eviction, so no new segment is prepared.
+    over_cap: std.atomic.Value(bool),
     wake_state: std.atomic.Value(u32),
     tick_count: std.atomic.Value(u64),
-    thread: ?std.Thread,
+    recorder: ?std.Io.Future(void),
     open_segments: std.ArrayList(*segment.Segment),
 
     startup_mutex: std.Io.Mutex,
     startup_buf: ?[]u8,
     startup_len: usize,
     startup_count: u32,
-    startup_dropped: u64,
+    startup_dropped: std.atomic.Value(u64),
 
     // Failures the recorder thread counts and recovers from, so recording goes on. Read through `Recorder.stats`.
     sync_failures: std.atomic.Value(u64),
@@ -116,6 +120,7 @@ pub const Writer = struct {
             .max_session_bytes = options.max_session_bytes,
             .sync_interval_ms = options.sync_interval_ms,
             .fail_prealloc_from_index = options.fail_prealloc_from_index,
+            .fail_seal_for_test = options.fail_seal_for_test,
             .fault_once_for_test = options.fault_once_for_test,
             .on_gap_written_for_test = options.on_gap_written_for_test,
             .test_ctx = options.test_ctx,
@@ -126,22 +131,23 @@ pub const Writer = struct {
             .pin_epoch = .init(0),
             .pin_counts = .{ .init(0), .init(0) },
             .stopping = .init(false),
+            .over_cap = .init(false),
             .wake_state = .init(@backingInt(WakeState.idle)),
             .tick_count = .init(0),
-            .thread = null,
+            .recorder = null,
             .open_segments = .empty,
             .startup_mutex = .init,
             .startup_buf = startup_buf,
             .startup_len = 0,
             .startup_count = 0,
-            .startup_dropped = 0,
+            .startup_dropped = .init(0),
             .sync_failures = .init(0),
             .evict_failures = .init(0),
             .seal_failures = .init(0),
             .prealloc_failures = .init(0),
         };
 
-        self.thread = try std.Thread.spawn(.{}, recorderMain, .{self});
+        self.recorder = try self.io.concurrent(recorderMain, .{self});
     }
 
     pub fn emit(self: *Writer, kind: u16, thread: u32, payload: []const u8) void {
@@ -156,9 +162,9 @@ pub const Writer = struct {
     pub fn stop(self: *Writer) void {
         self.stopping.store(true, .release);
         self.wake();
-        if (self.thread) |t| {
-            t.join();
-            self.thread = null;
+        if (self.recorder) |*recorder| {
+            recorder.await(self.io);
+            self.recorder = null;
         }
         self.finalizeOnStop();
     }
@@ -196,6 +202,11 @@ pub const Writer = struct {
                 _ = seg.overflowedPtr().fetchAdd(1, .monotonic);
                 const maybe_next = self.next.load(.acquire);
                 if (maybe_next == null or maybe_next.? == seg) {
+                    // SwitchSegment in tests/tla/flight_recorder/FlightRecorder.tla: a loser of the switch retries in the new segment.
+                    if (self.current.load(.seq_cst) != seg) {
+                        _ = seg.in_flight.fetchSub(1, .release);
+                        continue;
+                    }
                     _ = seg.droppedPtr().fetchAdd(1, .monotonic);
                     _ = seg.in_flight.fetchSub(1, .release);
                     return;
@@ -271,13 +282,13 @@ pub const Writer = struct {
         defer self.startup_mutex.unlock(self.io);
 
         const buf = self.startup_buf orelse {
-            self.startup_dropped += 1;
+            _ = self.startup_dropped.fetchAdd(1, .monotonic);
             return;
         };
         const max_usable = @min(buf.len, self.segment_bytes - format.segment_header_bytes);
         const needed = format.frameBytes(payload.len);
         if (self.startup_len + needed > max_usable) {
-            self.startup_dropped += 1;
+            _ = self.startup_dropped.fetchAdd(1, .monotonic);
             return;
         }
 
@@ -292,7 +303,7 @@ pub const Writer = struct {
             .mono_ns = mono_ns,
             .wall_ms = wall_ms,
         }, payload) catch {
-            self.startup_dropped += 1;
+            _ = self.startup_dropped.fetchAdd(1, .monotonic);
             return;
         };
         self.startup_len += written;
@@ -371,7 +382,7 @@ pub const Writer = struct {
         if (self.current.load(.acquire) == null) {
             self.initFirstSegment();
         }
-        if (self.current.load(.acquire) != null and self.next.load(.acquire) == null and !self.stopping.load(.acquire)) {
+        if (self.current.load(.acquire) != null and self.next.load(.acquire) == null and !self.stopping.load(.acquire) and !self.over_cap.load(.acquire)) {
             self.prepareNextSegment();
         }
         self.sealReadySegments();
@@ -395,6 +406,7 @@ pub const Writer = struct {
     }
 
     fn sealOne(self: *Writer, seg: *segment.Segment) !void {
+        if (self.fail_seal_for_test) return error.InjectedFault;
         if (self.takeTestFault(.seal)) return error.InjectedFault;
         try seg.seal(self.gpa);
     }
@@ -449,8 +461,9 @@ pub const Writer = struct {
                     .count = self.startup_count,
                 }), .release);
             }
-            if (self.startup_dropped > 0) {
-                seg0.droppedPtr().store(self.startup_dropped, .release);
+            const startup_dropped = self.startup_dropped.load(.monotonic);
+            if (startup_dropped > 0) {
+                seg0.droppedPtr().store(startup_dropped, .release);
             }
             stale_buf = buf;
             self.startup_buf = null;
@@ -559,6 +572,9 @@ pub const Writer = struct {
                 .mtime_ns = stat.mtime.nanoseconds,
             });
         }
+
+        // Runs after every path below, including a failed eviction, so the flag reflects the folder as it is.
+        defer self.over_cap.store(total_bytes > self.max_session_bytes, .release);
 
         if (total_bytes <= self.max_session_bytes or sealed.items.len == 0) return;
 

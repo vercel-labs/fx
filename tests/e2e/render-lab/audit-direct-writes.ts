@@ -76,6 +76,8 @@ const allowlist: AllowRule[] = [
   rule("src/core/shared/terminal_env.zig", "(?:stdoutIsTerminal|stdoutColumns|stderrColumns|terminalColumns)", /fixed_descriptor/, "terminal_probe", "stdout and stderr terminal probes for top-level help, session lists, and doctor progress"),
   rule("src/core/shell_command/command_effect.zig", "(?:expectDirect|expectNativePrintfEquivalent)", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/app/app_render_runtime.zig", "checkRewritePublicationRetry", /debug_print/, "tests", "test diagnostics"),
+  rule("src/core/flight_recorder/lab.zig", ".+", /^stdio_acquisition_write$/, "noninteractive_output", "flight-recorder-lab test program output"),
+  rule("src/core/flight_recorder/lab_script.zig", ".+", /^(?:stdio_acquisition|stdio_acquisition_write|debug_print)$/, "noninteractive_output", "flight-recorder-lab test program output"),
   rule("src/core/indexer/scan.zig", "expectEntries", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/indexer/wildmatch.zig", "expectCases", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/shell_command/safe_git.zig", "(?:plainOutput|ready|expectOk|expectFacts)", /debug_print/, "tests", "test diagnostics"),

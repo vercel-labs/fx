@@ -286,7 +286,7 @@ fn runEmit(gpa: std.mem.Allocator, io: std.Io, cfg: EmitConfig) !void {
 
     const had_segment_before_stop = rec.inner.current.load(.acquire) != null;
     const pre_stop_startup_buffered: u64 = if (had_segment_before_stop) 0 else rec.inner.startup_count;
-    const pre_stop_startup_dropped: u64 = if (had_segment_before_stop) 0 else rec.inner.startup_dropped;
+    const pre_stop_startup_dropped: u64 = if (had_segment_before_stop) 0 else rec.inner.startup_dropped.load(.monotonic);
 
     rec.stop();
 
