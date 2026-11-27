@@ -3,19 +3,17 @@ const display_width = @import("../../core/shared/display_width.zig");
 const input_presentation = @import("input_presentation.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
-const text_utils = @import("../../core/shared/text_utils.zig");
 const ui_render = @import("../render.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
 const ForkMenuProjection = render_input.ForkMenuProjection;
+const MessageLayout = render_input.SteeringMessageLayout;
 
 const header_rows: u16 = 1;
 const roomy_top_gap_rows: u16 = 1;
 /// Each prompt shows as at most this many wrapped lines.
 const max_prompt_lines = render_input.max_message_layout_rows;
-/// The subagent question wraps across at most this many lines on narrow terminals.
-const max_question_lines: u16 = 3;
 /// Header, top gap, and up to six prompts of three lines.
 pub const max_inline_rows: u16 = header_rows + roomy_top_gap_rows + 6 * max_prompt_lines;
 
@@ -23,6 +21,9 @@ const header_subtitle = "Select a prompt to fork before";
 const empty_prompt_label = "(empty prompt)";
 /// Minimum text columns required before showing the prompt number gutter.
 const min_text_cols_with_number: u16 = 4;
+/// Upper bound for copying a prompt's non-blank lines into a stack scratch buffer
+/// when skipping blank-only lines; three wrapped rows never need more than this.
+const compact_prompt_scratch_bytes: usize = 1024;
 
 /// The keys the prompt list takes, strictly widest to narrowest.
 pub const list_hint_variants = [_][]const u8{
@@ -74,12 +75,17 @@ fn digitCount(n: usize) u16 {
     return digits;
 }
 
-const WrappedLines = struct {
-    rows: [max_prompt_lines][]const u8 = @splat(""),
-    row_count: u16 = 0,
-    content_width: u16 = 0,
-    truncated: bool = false,
-};
+fn formatDecimal(buf: *[24]u8, value: usize) []const u8 {
+    var n = value;
+    var idx: usize = buf.len;
+    while (true) {
+        idx -= 1;
+        buf[idx] = @intCast('0' + (n % 10));
+        n /= 10;
+        if (n == 0) break;
+    }
+    return buf[idx..];
+}
 
 fn isBlankSlice(bytes: []const u8) bool {
     for (bytes) |byte| {
@@ -88,128 +94,60 @@ fn isBlankSlice(bytes: []const u8) bool {
     return true;
 }
 
-fn trimTrailingSpaces(bytes: []const u8) []const u8 {
-    var end = bytes.len;
-    while (end > 0 and (bytes[end - 1] == ' ' or bytes[end - 1] == '\t')) end -= 1;
-    return bytes[0..end];
-}
-
-fn unitDisplayWidth(raw: []const u8, unit_cell_width: usize) usize {
-    if (raw.len == 1 and raw[0] == '\t') return 1;
-    if (text_utils.isTerminalSafe(raw)) return unit_cell_width;
-    return text_utils.terminalSafeVisibleWidth(raw);
-}
-
-fn hasMoreNonBlankText(text: []const u8, start: usize, skip_blank_lines: bool) bool {
-    if (start >= text.len) return false;
-    if (!skip_blank_lines) return true;
-    return !isBlankSlice(text[start..]);
-}
-
-/// Wraps `text` into at most `row_limit` visual lines of `max_width` cells.
-/// When `skip_blank_lines` is true, blank-only physical lines are omitted so
-/// prompts with empty lines show real text instead of empty rows and lone `…`.
-fn wrapText(text: []const u8, max_width: u16, row_limit: u16, skip_blank_lines: bool) WrappedLines {
-    const limit = @min(row_limit, max_prompt_lines);
-    var layout: WrappedLines = .{ .content_width = max_width };
-    if (max_width == 0 or limit == 0) return layout;
-
+fn hasBlankLine(bytes: []const u8) bool {
     var pos: usize = 0;
-    while (pos <= text.len and layout.row_count < limit) {
-        const nl = std.mem.findScalarPos(u8, text, pos, '\n') orelse text.len;
-        const line_end = if (nl > pos and text[nl - 1] == '\r') nl - 1 else nl;
-        const next_line_start = if (nl < text.len) nl + 1 else text.len;
-        const line = text[pos..line_end];
-
-        if (skip_blank_lines and isBlankSlice(line)) {
-            if (nl == text.len) break;
-            pos = next_line_start;
-            continue;
-        }
-
-        if (line.len == 0) {
-            layout.rows[layout.row_count] = "";
-            layout.row_count += 1;
-            if (nl == text.len) break;
-            pos = next_line_start;
-            continue;
-        }
-
-        var offset: usize = 0;
-        while (offset < line.len and layout.row_count < limit) {
-            const start = offset;
-            var cells: usize = 0;
-            var ellipsis_end = start;
-            var last_space: ?usize = null;
-            while (offset < line.len) {
-                const unit = display_width.displayUnitAt(line, offset);
-                if (unit.byte_len == 0) break;
-                const raw = line[offset .. offset + unit.byte_len];
-                const unit_width = unitDisplayWidth(raw, unit.cell_width);
-                if (unit_width > max_width - cells) break;
-                if (line[offset] == ' ' or line[offset] == '\t') last_space = offset;
-                cells += unit_width;
-                offset += unit.byte_len;
-                if (cells < max_width) ellipsis_end = offset;
-            }
-            var end = offset;
-            const soft_separator = offset < line.len and (line[offset] == ' ' or line[offset] == '\t');
-            if (soft_separator) {
-                while (offset < line.len and (line[offset] == ' ' or line[offset] == '\t')) offset += 1;
-            } else if (offset < line.len) {
-                if (last_space) |space| {
-                    if (space > start) {
-                        end = space;
-                        offset = space + 1;
-                    }
-                }
-            }
-            const more_in_line = offset < line.len;
-            const more_after = more_in_line or (nl < text.len and hasMoreNonBlankText(text, next_line_start, skip_blank_lines));
-            const stalled = end == start and more_in_line;
-            const is_last_row = layout.row_count + 1 == limit or stalled;
-
-            if (is_last_row and more_after) {
-                const cut = trimTrailingSpaces(line[start..@min(end, ellipsis_end)]);
-                layout.rows[layout.row_count] = cut;
-                layout.row_count += 1;
-                layout.truncated = true;
-                return layout;
-            }
-
-            layout.rows[layout.row_count] = line[start..end];
-            layout.row_count += 1;
-            if (!more_in_line) break;
-        }
-
-        if (nl == text.len) break;
-        pos = next_line_start;
+    while (pos <= bytes.len) {
+        const nl = std.mem.findScalarPos(u8, bytes, pos, '\n') orelse bytes.len;
+        if (isBlankSlice(bytes[pos..nl])) return true;
+        if (nl == bytes.len) break;
+        pos = nl + 1;
     }
+    return false;
+}
 
-    if (layout.row_count == 0) {
-        layout.rows[0] = "";
-        layout.row_count = 1;
+/// Returns `prompt` unchanged when it has no blank-only lines, `empty_prompt_label`
+/// when it is blank-only, or a compacted copy in `scratch` with blank-only lines
+/// removed so multi-line prompts show real text instead of empty gaps and lone `…`.
+fn promptSource(prompt: []const u8, scratch: *[compact_prompt_scratch_bytes]u8) []const u8 {
+    if (isBlankSlice(prompt)) return empty_prompt_label;
+    if (!hasBlankLine(prompt)) return prompt;
+
+    var out_len: usize = 0;
+    var pos: usize = 0;
+    while (pos <= prompt.len) {
+        const nl = std.mem.findScalarPos(u8, prompt, pos, '\n') orelse prompt.len;
+        const line_end = if (nl > pos and prompt[nl - 1] == '\r') nl - 1 else nl;
+        const line = prompt[pos..line_end];
+        if (!isBlankSlice(line)) {
+            if (out_len > 0) {
+                if (out_len >= scratch.len) break;
+                scratch[out_len] = '\n';
+                out_len += 1;
+            }
+            const copy_len = @min(line.len, scratch.len - out_len);
+            @memcpy(scratch[out_len..][0..copy_len], line[0..copy_len]);
+            out_len += copy_len;
+            if (out_len >= scratch.len) break;
+        }
+        if (nl == prompt.len) break;
+        pos = nl + 1;
     }
+    return if (out_len == 0) empty_prompt_label else scratch[0..out_len];
+}
+
+fn trimTruncatedTail(layout: *MessageLayout) void {
+    if (!layout.truncated or layout.row_count == 0) return;
+    const last = layout.rows[layout.row_count - 1];
+    var end = last.len;
+    while (end > 0 and (last[end - 1] == ' ' or last[end - 1] == '\t')) end -= 1;
+    layout.rows[layout.row_count - 1] = last[0..end];
+}
+
+fn promptLayout(prompt: []const u8, scratch: *[compact_prompt_scratch_bytes]u8, text_width: u16, row_limit: u16) MessageLayout {
+    const source = promptSource(prompt, scratch);
+    var layout = render_input.steering_message_layout(source, text_width, false, row_limit);
+    trimTruncatedTail(&layout);
     return layout;
-}
-
-fn promptLayout(prompt: []const u8, text_width: u16, row_limit: u16) WrappedLines {
-    const source = if (isBlankSlice(prompt)) empty_prompt_label else prompt;
-    return wrapText(source, text_width, row_limit, true);
-}
-
-fn appendWrappedRow(alloc: Allocator, row: *std.ArrayList(u8), layout: WrappedLines, index: usize) !void {
-    const slice = layout.rows[index];
-    const normalized = try alloc.dupe(u8, slice);
-    defer alloc.free(normalized);
-    for (normalized) |*byte| {
-        if (byte.* == '\t') byte.* = ' ';
-    }
-    var safe = try text_utils.encodeTerminalSafe(alloc, normalized, std.math.maxInt(usize));
-    defer safe.deinit(alloc);
-    const ellipsis = layout.truncated and index + 1 == layout.row_count and layout.content_width > 0;
-    try row_text.appendClipped(alloc, row, safe.bytes, layout.content_width - @as(u16, @intFromBool(ellipsis)));
-    if (ellipsis) try row.appendSlice(alloc, "…");
 }
 
 /// The menu's prompt lines in order, and where the selected prompt sits.
@@ -220,9 +158,10 @@ const Lines = struct {
 
     fn measure(projection: ForkMenuProjection, text_width: u16) Lines {
         var lines: Lines = .{};
+        var scratch: [compact_prompt_scratch_bytes]u8 = undefined;
         for (projection.points, 0..) |point, index| {
             if (index == projection.selected) lines.selected_start = lines.total;
-            lines.total += promptLayout(point.prompt, text_width, max_prompt_lines).row_count;
+            lines.total += promptLayout(point.prompt, &scratch, text_width, max_prompt_lines).row_count;
             if (index == projection.selected) lines.selected_end = lines.total;
         }
         return lines;
@@ -269,14 +208,13 @@ const QuestionLayout = struct {
     question_rows: u16 = 0,
     row_count: u16 = 0,
     columns: Columns = .{ .indent = 0, .number_digits = 0, .number_col = 0, .text_width = 0, .question_width = 0 },
-    question_wrapped: WrappedLines = .{},
 
     fn build(projection: ForkMenuProjection, count: usize, width: u16, row_budget: u16) QuestionLayout {
         if (width == 0 or row_budget == 0 or projection.points.len == 0) return .{};
         const columns = Columns.of(projection.points.len, width);
         var q_buf: [64]u8 = undefined;
         const q_text = questionText(&q_buf, count);
-        const q_wrapped = wrapText(q_text, columns.question_width, max_question_lines, false);
+        const q_wrapped = render_input.steering_message_layout(q_text, columns.question_width, false, max_prompt_lines);
         const q_rows: u16 = @min(row_budget, q_wrapped.row_count);
         const rem = row_budget - q_rows;
 
@@ -286,11 +224,11 @@ const QuestionLayout = struct {
                 .question_rows = q_rows,
                 .row_count = q_rows,
                 .columns = columns,
-                .question_wrapped = q_wrapped,
             };
         }
 
-        const full_prompt = promptLayout(projection.points[projection.selected].prompt, columns.question_width, max_prompt_lines);
+        var scratch: [compact_prompt_scratch_bytes]u8 = undefined;
+        const full_prompt = promptLayout(projection.points[projection.selected].prompt, &scratch, columns.question_width, max_prompt_lines);
         if (rem == 1) {
             return .{
                 .prompt_start = 0,
@@ -299,7 +237,6 @@ const QuestionLayout = struct {
                 .question_rows = q_rows,
                 .row_count = 1 + q_rows,
                 .columns = columns,
-                .question_wrapped = q_wrapped,
             };
         }
 
@@ -318,7 +255,6 @@ const QuestionLayout = struct {
             .question_rows = q_rows,
             .row_count = question_start + q_rows,
             .columns = columns,
-            .question_wrapped = q_wrapped,
         };
     }
 };
@@ -331,16 +267,29 @@ pub fn menuRowCount(projection: ForkMenuProjection, width: u16, row_budget: u16)
 }
 
 /// The question after a prompt is chosen where the session had subagents.
-fn questionText(buf: []u8, count: usize) []const u8 {
+fn questionText(buf: *[64]u8, count: usize) []const u8 {
     if (count == 1) return "Bring 1 subagent into the fork?";
-    return std.mem.print(buf, "Bring {d} subagents into the fork?", .{count}) catch "Bring the subagents into the fork?";
+    const prefix = "Bring ";
+    const suffix = " subagents into the fork?";
+    var num_buf: [24]u8 = undefined;
+    const num = formatDecimal(&num_buf, count);
+    if (prefix.len + num.len + suffix.len > buf.len) return "Bring the subagents into the fork?";
+    @memcpy(buf[0..prefix.len], prefix);
+    @memcpy(buf[prefix.len..][0..num.len], num);
+    @memcpy(buf[prefix.len + num.len ..][0..suffix.len], suffix);
+    return buf[0 .. prefix.len + num.len + suffix.len];
 }
 
 fn composeListHeaderRow(alloc: Allocator, point_count: usize, width: u16) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
+    var num_buf: [24]u8 = undefined;
+    const num = formatDecimal(&num_buf, point_count);
     var title_buf: [32]u8 = undefined;
-    const title = std.mem.print(&title_buf, "Fork {d}", .{point_count}) catch "Fork";
+    const prefix = "Fork ";
+    @memcpy(title_buf[0..prefix.len], prefix);
+    @memcpy(title_buf[prefix.len..][0..num.len], num);
+    const title = title_buf[0 .. prefix.len + num.len];
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     try row_text.appendClipped(alloc, &row, title, width);
     try row.appendSlice(alloc, ui_render.reset_style);
@@ -379,8 +328,10 @@ fn composeQuestionRow(
     if (layout.show_header and row_index == 0) return composeQuestionHeaderRow(alloc, width);
 
     if (layout.prompt_rows > 0 and row_index >= layout.prompt_start and row_index < layout.prompt_start + layout.prompt_rows) {
+        var scratch: [compact_prompt_scratch_bytes]u8 = undefined;
         const prompt_wrapped = promptLayout(
             projection.points[projection.selected].prompt,
+            &scratch,
             layout.columns.question_width,
             layout.prompt_rows,
         );
@@ -390,7 +341,7 @@ fn composeQuestionRow(
         errdefer row.deinit(alloc);
         try row.appendNTimes(alloc, ' ', layout.columns.indent);
         try row.appendSlice(alloc, ui_render.dim_style);
-        try appendWrappedRow(alloc, &row, prompt_wrapped, prompt_line);
+        try input_presentation.appendMessageLayoutRow(alloc, &row, prompt_wrapped, prompt_line);
         try row.appendSlice(alloc, ui_render.reset_style);
         return row;
     }
@@ -398,14 +349,15 @@ fn composeQuestionRow(
     if (row_index >= layout.question_start and row_index < layout.question_start + layout.question_rows) {
         var q_buf: [64]u8 = undefined;
         const q_text = questionText(&q_buf, count);
-        const q_wrapped = wrapText(q_text, layout.columns.question_width, layout.question_rows, false);
+        var q_wrapped = render_input.steering_message_layout(q_text, layout.columns.question_width, false, layout.question_rows);
+        trimTruncatedTail(&q_wrapped);
         const q_line = row_index - layout.question_start;
         if (q_line >= q_wrapped.row_count) return .empty;
         var row: std.ArrayList(u8) = .empty;
         errdefer row.deinit(alloc);
         try row.appendNTimes(alloc, ' ', layout.columns.indent);
         try row.appendSlice(alloc, ui_render.selected_completion_style);
-        try appendWrappedRow(alloc, &row, q_wrapped, q_line);
+        try input_presentation.appendMessageLayoutRow(alloc, &row, q_wrapped, q_line);
         try row.appendSlice(alloc, ui_render.reset_style);
         return row;
     }
@@ -435,7 +387,7 @@ fn appendNumberGutter(alloc: Allocator, row: *std.ArrayList(u8), columns: Column
         return;
     }
     var num_buf: [24]u8 = undefined;
-    const num_text = std.mem.print(&num_buf, "{d}", .{index + 1}) catch "";
+    const num_text = formatDecimal(&num_buf, index + 1);
     const pad = columns.number_digits -| @as(u16, @intCast(num_text.len));
     try row.appendNTimes(alloc, ' ', pad);
     try row.appendSlice(alloc, num_text);
@@ -460,8 +412,9 @@ pub fn composeForkMenuRow(
 
     const line = listWindowStart(projection, list) + (row_index - list.first_item_row);
     var first: usize = 0;
+    var scratch: [compact_prompt_scratch_bytes]u8 = undefined;
     for (projection.points, 0..) |point, index| {
-        const layout = promptLayout(point.prompt, list.columns.text_width, max_prompt_lines);
+        const layout = promptLayout(point.prompt, &scratch, list.columns.text_width, max_prompt_lines);
         if (line < first + layout.row_count) {
             var row: std.ArrayList(u8) = .empty;
             errdefer row.deinit(alloc);
@@ -469,7 +422,7 @@ pub fn composeForkMenuRow(
             try row.appendNTimes(alloc, ' ', list.columns.indent);
             try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
             try appendNumberGutter(alloc, &row, list.columns, index, line == first);
-            try appendWrappedRow(alloc, &row, layout, line - first);
+            try input_presentation.appendMessageLayoutRow(alloc, &row, layout, line - first);
             try row.appendSlice(alloc, ui_render.reset_style);
             return row;
         }
