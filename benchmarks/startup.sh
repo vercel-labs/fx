@@ -20,7 +20,8 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FX_BIN="${REPO_ROOT}/zig-out/bin/fx"
 RESULTS_DIR="${REPO_ROOT}/benchmarks/results"
 ROUNDS_DIR="${RESULTS_DIR}/rounds"
-ALTERNATING_ROUNDS=5
+# An even round count gives each side the first slot in half the rounds.
+ALTERNATING_ROUNDS=4
 SESSION_FIXTURE_ROOT="${TMPDIR:-/tmp}/fx-session-list-benchmark-$$"
 SESSION_FIXTURE_HOME="${SESSION_FIXTURE_ROOT}/home"
 SESSION_FIXTURE_WORKSPACE="${SESSION_FIXTURE_ROOT}/workspace"

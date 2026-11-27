@@ -39,6 +39,7 @@ jobs:
     if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
     name: Startup Latency
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -74,6 +75,10 @@ jobs:
               git fetch --no-tags --depth=1 origin main
               base_sha="$(git rev-parse FETCH_HEAD)" ;;
           esac
+          if [[ "$base_sha" =~ ^0+$ ]]; then
+            echo "::error::$EVENT_NAME event has no previous commit (all-zero base), so there is nothing to compare with"
+            exit 1
+          fi
           if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::no base commit for a $EVENT_NAME event"
             exit 1

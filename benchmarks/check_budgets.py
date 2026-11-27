@@ -25,6 +25,10 @@ PR_SIDE = "pr"
 BASE_SIDE = "base"
 
 
+class RoundFileError(ValueError):
+    """A round file that is not a readable hyperfine export."""
+
+
 def command_budget(system_name, command):
     if system_name != "Linux":
         return None
@@ -35,9 +39,16 @@ def load_pooled(side_dir):
     """Return {command: [run seconds]} pooled over every round file of one side."""
     pooled = {}
     for path in sorted(glob.glob(os.path.join(side_dir, "*.json"))):
-        with open(path) as file:
-            result = json.load(file)["results"][0]
-        pooled.setdefault(result["command"], []).extend(result["times"])
+        try:
+            with open(path) as file:
+                result = json.load(file)["results"][0]
+                command = result["command"]
+                times = [float(t) for t in result["times"]]
+        except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
+            raise RoundFileError(f"{path}: {error}") from error
+        if not times:
+            raise RoundFileError(f"{path}: no run times")
+        pooled.setdefault(command, []).extend(times)
     return pooled
 
 
@@ -63,11 +74,14 @@ def failure_reason(pr_mean, base_mean, guard):
 
 
 def check_command(name, pr_times, base_times, guard):
-    if not base_times or mean(base_times) <= 0:
+    if not base_times:
         print(f"  FAIL  {name:<25} no base result for {name}, so the margin cannot be checked")
         return False
-    pr_mean = mean(pr_times)
     base_mean = mean(base_times)
+    if base_mean <= 0:
+        print(f"  FAIL  {name:<25} base mean is not positive, so the margin cannot be checked")
+        return False
+    pr_mean = mean(pr_times)
     reason = failure_reason(pr_mean, base_mean, guard)
     tag = "FAIL" if reason else "PASS"
     suffix = f"  ({reason})" if reason else ""
@@ -88,8 +102,15 @@ def check_results(pr, base, system_name):
         print(f"\nLinux budget not evaluated on {system_name}; raw local means are informational")
         return True
     failed = False
-    for name in sorted(pr):
+    for name in sorted(set(pr) | set(base)):
         if name == PROCESS_BASELINE:
+            continue
+        if name not in pr:
+            print(
+                f"  FAIL  {name:<25} no PR result for {name}, "
+                "so a renamed or dropped benchmark cannot pass silently"
+            )
+            failed = True
             continue
         guard = command_budget(system_name, name)
         if not check_command(name, pr[name], base.get(name, []), guard):
@@ -99,8 +120,12 @@ def check_results(pr, base, system_name):
 
 def main():
     rounds_dir = os.environ.get(ROUNDS_DIR_ENV, DEFAULT_ROUNDS_DIR)
-    pr = load_pooled(os.path.join(rounds_dir, PR_SIDE))
-    base = load_pooled(os.path.join(rounds_dir, BASE_SIDE))
+    try:
+        pr = load_pooled(os.path.join(rounds_dir, PR_SIDE))
+        base = load_pooled(os.path.join(rounds_dir, BASE_SIDE))
+    except RoundFileError as error:
+        print(f"FAIL  malformed benchmark round file {error}")
+        return 1
     if check_results(pr, base, platform.system()):
         print("\nAll commands within budget")
         return 0
