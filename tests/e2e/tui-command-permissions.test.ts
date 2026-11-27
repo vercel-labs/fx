@@ -305,6 +305,18 @@ function currentUserText(body: string): string {
   );
 }
 
+// Every user message at the end of the prompt, in order. Joined subagent
+// reports arrive as several consecutive user messages.
+function trailingUserTexts(body: string): string[] {
+  const request = JSON.parse(body) as {
+    prompt?: Array<{ role?: string; content?: unknown }>;
+  };
+  const prompt = request.prompt ?? [];
+  let first = prompt.length;
+  while (first > 0 && prompt[first - 1].role === "user") first -= 1;
+  return prompt.slice(first).map((message) => contentText(message.content));
+}
+
 function occurrenceCount(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
@@ -1906,12 +1918,14 @@ describe("effect-aware command permissions", () => {
         }
         return finalText("unexpected request");
       }
-      // A failed ship tells main that its request waits; that message stays
-      // in main's history, so only the report itself names who reported.
-      const current = currentUserText(body);
-      if (current.startsWith("Subagent report")) {
-        for (const name of ["cards", "ship"]) {
-          if (current.includes(`"agent":"${name}"`)) reported.add(name);
+      // A failed ship tells main that its request waits. That message can
+      // trail a report in the same request, so only report texts name who reported.
+      const reports = trailingUserTexts(body).filter((text) => text.startsWith("Subagent report"));
+      if (reports.length > 0) {
+        for (const text of reports) {
+          for (const name of ["cards", "ship"]) {
+            if (text.includes(`"agent":"${name}"`)) reported.add(name);
+          }
         }
         return finalText(`report noted ${reported.size}`);
       }
@@ -2938,6 +2952,80 @@ describe("effect-aware command permissions", () => {
       expect(await activeSession.waitForSessionEnd()).toBe(true);
       await activeSession.kill();
       activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace records the gateway generation, served-by, and effort the request sent",
+    async () => {
+      // An ID in the AI Gateway's form (types.validGatewayGenerationId): gen_ and 26 Crockford characters.
+      const GENERATION_ID = "gen_01JC7P5XQ2M8VZ000000000001";
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "trace-effort-stderr.log");
+      writeFileSync(stderrPath, "");
+      const gateway = startDynamicFakeGateway(
+        () =>
+          sse([
+            { type: "text-delta", id: "answer_1", delta: "EFFORT_TRACE_OK" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: { inputTokens: { total: 3 }, outputTokens: { total: 5 } },
+              providerMetadata: {
+                gateway: { generationId: GENERATION_ID, routing: { finalProvider: "bedrock" } },
+              },
+            },
+          ]),
+        {
+          models: [{
+            id: MODEL,
+            type: "language",
+            tags: ["tool-use", "reasoning"],
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          }],
+        },
+      );
+      gateways.push(gateway);
+      activeSession = await TmuxSession.create({
+        cmd: `${FX_BIN} --effort high`,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          TMPDIR: root.root,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Say the effort is high.");
+      await activeSession.waitForPane((pane) => pane.includes("EFFORT_TRACE_OK") && turnSettled(pane), TIMEOUT);
+      await activeSession.waitForComposer(TIMEOUT);
+
+      await activeSession.sendText("/trace");
+      const report = await waitForNewTraceReport(root.root);
+
+      const prompt = gateway.requests.find((request) => request.body.includes("Say the effort is high."));
+      expect(prompt).toBeDefined();
+      expect(JSON.parse(prompt!.body)).toMatchObject({ reasoning: "high" });
+      expect(report.records[0]).toMatchObject({ type: "fx_trace", update_channel: "stable" });
+      const turnCalls = report.all("network_call").filter((call) => call.generation_id === GENERATION_ID);
+      expect(turnCalls).toHaveLength(1);
+      expect(turnCalls[0]).toMatchObject({
+        kind: "gateway",
+        model: MODEL,
+        generation_id: GENERATION_ID,
+        served_by: "bedrock",
+        effort: "high",
+      });
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
   );

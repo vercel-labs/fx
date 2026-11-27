@@ -106,6 +106,20 @@ pub fn isDevelopmentBuildPath(path: []const u8) bool {
         std.mem.find(u8, path, "\\zig-out\\bin\\") != null;
 }
 
+/// Where a Ctrl+G restart that waits for running turns stands. Main loop
+/// only (`tests/tla/recovery/RestartWait.tla`).
+pub const RestartWait = enum {
+    none,
+    /// The running turns stop at their next step boundary and hold there;
+    /// a second Ctrl+G cancels.
+    waiting,
+    /// Every turn held or ended, and the held turns were let go; fx exits
+    /// for the relaunch once none runs.
+    releasing,
+};
+
+const restart_wait_label = "restart waits: ctrl+g to cancel";
+
 pub const AutoUpgrade = struct {
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@backingInt(State.idle)),
     should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -127,10 +141,9 @@ pub const AutoUpgrade = struct {
     install_mutex: std.Io.Mutex = .init,
 
     relaunch_request: ?RelaunchRequest = null,
-    /// Main loop only. Ctrl+G accepted the upgrade while turns ran: they
-    /// stop at their next step boundary, and fx exits for the relaunch once
-    /// none runs (`app_upgrade_runtime` `collectUpgradeFacts`).
-    restart_waits: bool = false,
+    /// Main loop only. Ctrl+G accepted the upgrade while turns ran
+    /// (`app_upgrade_runtime` `collectUpgradeFacts`).
+    restart: RestartWait = .none,
 
     pub fn configure_channel(self: *AutoUpgrade, selected: update_target.Channel) void {
         self.selected_channel = selected;
@@ -221,14 +234,24 @@ pub const AutoUpgrade = struct {
     pub fn takeRelaunchRequest(self: *AutoUpgrade) ?RelaunchRequest {
         const request = self.relaunch_request;
         self.relaunch_request = null;
-        if (self.restart_waits) {
+        if (self.restart != .none) {
             if (request != null) debug_trace.logf("upgrade", "event=relaunch_dropped reason=exit_while_restart_waits", .{});
             return null;
         }
         return request;
     }
 
+    /// A second Ctrl+G cancelled the waiting restart: the relaunch it
+    /// prepared is dropped, so a later exit quits
+    /// (`tests/tla/recovery/Resume.tla` CancelledRestartStays).
+    pub fn cancelRestart(self: *AutoUpgrade) void {
+        if (self.relaunch_request != null) debug_trace.logf("upgrade", "event=relaunch_dropped reason=restart_cancelled", .{});
+        self.relaunch_request = null;
+        self.restart = .none;
+    }
+
     pub fn statusLabel(self: *AutoUpgrade, buf: []u8) []const u8 {
+        if (self.restart == .waiting) return restart_wait_label;
         const state = self.getState();
         switch (state) {
             .downloading => {
@@ -667,11 +690,29 @@ test "relaunch request owns its path and previous revision and is consumed once"
 test "an exit while the restart waits for turns drops the relaunch" {
     var au = AutoUpgrade{};
     try au.requestRelaunch("/tmp/fx");
-    au.restart_waits = true;
+    au.restart = .waiting;
     try std.testing.expect(au.takeRelaunchRequest() == null);
     // Dropped, not kept for a later exit.
-    au.restart_waits = false;
+    au.restart = .none;
     try std.testing.expect(au.takeRelaunchRequest() == null);
+}
+
+test "a cancelled restart drops the relaunch it prepared" {
+    var au = AutoUpgrade{};
+    try au.requestRelaunch("/tmp/fx-upgraded");
+    au.restart = .waiting;
+    au.cancelRestart();
+    try std.testing.expectEqual(RestartWait.none, au.restart);
+    try std.testing.expect(au.takeRelaunchRequest() == null);
+}
+
+test "a waiting restart says how to cancel it" {
+    var au = AutoUpgrade{};
+    var buf: [64]u8 = undefined;
+    au.restart = .waiting;
+    try std.testing.expectEqualStrings("restart waits: ctrl+g to cancel", au.statusLabel(&buf));
+    au.restart = .none;
+    try std.testing.expect(!std.mem.eql(u8, "restart waits: ctrl+g to cancel", au.statusLabel(&buf)));
 }
 
 test "statusLabel waiting returns empty" {

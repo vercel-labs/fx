@@ -114,6 +114,9 @@ pub const Status = struct {
     /// the words, so `publish` copies them into the snapshot and `statusesNow` copies them into each caller's
     /// allocator, like the other strings.
     tools_error: ?[]const u8 = null,
+    /// The HTTP status behind `tools_error` when its words say the server is temporarily unavailable (429, 503), else
+    /// 0: `fx mcp show` and the `/mcp` screen say "unavailable (HTTP n)" for it. A number, so every copy carries it.
+    tools_unavailable: u16 = 0,
     /// How many tools of the list fx left out of what the model gets, by reason, for a server that is `ready`: the ones
     /// the engine skipped (`mcp.tools.Store.addPage`) and the ones the host's reading refuses (`dropped_tools`). Plain
     /// counts, so every copy of a `Status` carries them as it is.
@@ -1569,7 +1572,7 @@ pub const Runtime = struct {
         switch (event.kind) {
             // A failed attempt ends the waits for tools with its reason; the
             // engine keeps trying, so a later request may still get them.
-            .phase => |phase| if (phase == .backoff or phase == .failed) {
+            .phase => |phase| if (explainsFailure(phase)) {
                 r.endToolWaiters(i, .failed);
                 // The request that checks a new login failed to get an answer. Not a refusal,
                 // unless the server's 401 stands (`checkFailed`).
@@ -1640,7 +1643,7 @@ pub const Runtime = struct {
                     "its reply was larger than fx reads in one message, so fx dropped it";
             }
             if (result == .ended and result.ended.outcome == .transport_failed) {
-                const down = if (r.enginePhase(index)) |p| p == .backoff or p == .failed else false;
+                const down = if (r.enginePhase(index)) |p| explainsFailure(p) else false;
                 if (down) result.ended.why = r.failureText(req.alloc, index) catch null;
             }
             // The server sent something fx could not read: a 2xx body that is no JSON-RPC message,
@@ -2429,10 +2432,7 @@ pub const Runtime = struct {
             o.tools = st.tools;
             // The engine keeps its last failure; it explains a server that is
             // down, not one that is back or stopped to wait for a sign-in.
-            o.last_error = switch (o.state) {
-                .failed, .retrying => try r.failureText(a, i),
-                else => null,
-            };
+            o.last_error = if (explainsFailure(st.phase)) try r.failureText(a, i) else null;
             // A shared server runs in the owner, which keeps no sign-in state
             // for this session: a login there belongs to no session.
             const on_owner = if (r.shared) |*sh| sh.has(s.name) else false;
@@ -2452,7 +2452,10 @@ pub const Runtime = struct {
                 }
             }
             // The engine lends the words until its next refusal.
-            if (o.state == .ready and !o.needs_login) o.tools_error = if (st.list_refusal) |words| try a.dupe(u8, words) else null;
+            if (o.state == .ready and !o.needs_login) {
+                o.tools_error = if (st.list_refusal) |words| try a.dupe(u8, words) else null;
+                o.tools_unavailable = if (o.tools_error != null) st.list_unavailable else 0;
+            }
             if (o.state == .ready) {
                 o.dropped = st.dropped;
                 o.dropped.merge(r.hostDropped(i, s.name));
@@ -2721,7 +2724,20 @@ pub const Runtime = struct {
 
     fn lastError(r: *Runtime, alloc: Allocator, i: usize) Allocator.Error![]u8 {
         if (try r.unreadText(alloc, i)) |why| return why;
-        return (try r.failureText(alloc, i)) orelse try alloc.dupe(u8, "the server is unavailable");
+        if (r.statusOf(i)) |st| switch (saysWhy(st.phase, st.last_error != null, st.list_refusal != null)) {
+            .failure => if (try r.failureText(alloc, i)) |why| return why,
+            .refusal => if (try r.refusalText(alloc, i)) |why| return why,
+            .none => {},
+        };
+        return try alloc.dupe(u8, "the server is unavailable");
+    }
+
+    /// Why fx refused server `i`'s last tool list, in `alloc`: the words `Status.tools_error` has, so a screen, a
+    /// status and what the model is told all give one reason. Null when it refused none.
+    fn refusalText(r: *Runtime, alloc: Allocator, i: usize) Allocator.Error!?[]u8 {
+        const st = r.statusOf(i) orelse return null;
+        // The engine lends the words until its next refusal.
+        return if (st.list_refusal) |words| try alloc.dupe(u8, words) else null;
     }
 
     /// Why server `i` has no login, in `alloc`, when that's because the
@@ -3076,6 +3092,24 @@ test "a failed sign-in says why in words, with the server's own" {
     try std.testing.expect(said.len < 340);
 }
 
+/// Whether the engine's last failure explains a server in `phase`: it is down (retrying or failed), not back and not
+/// stopped to wait for a sign-in. The engine keeps the failure after the server is ready again, so the status and
+/// what the model is told both ask this before they say it.
+fn explainsFailure(phase: engine.Phase) bool {
+    return switch (phase) {
+        .backoff, .failed => true,
+        .idle, .connecting, .ready => false,
+    };
+}
+
+/// What says why a server has no tools: its failure while it is down, else the refusal of its list, else nothing.
+const WhySaid = enum { failure, refusal, none };
+
+fn saysWhy(phase: engine.Phase, has_failure: bool, has_refusal: bool) WhySaid {
+    if (has_failure and explainsFailure(phase)) return .failure;
+    return if (has_refusal) .refusal else .none;
+}
+
 fn writeFailure(w: *std.Io.Writer, why: []const u8, exit: ?mcp.stdio.Exit, stray: ?[]const u8, tail: ?[]const u8) std.Io.Writer.Error!void {
     try w.writeAll(describeFailure(why));
     // "its process exited" says how; another failure adds it.
@@ -3420,6 +3454,20 @@ const refusing_server_script =
     \\
 ;
 
+/// A 2025 server in sh whose every tool list is no list (`tools` is a number).
+const always_refusing_server_script =
+    \\#!/bin/sh
+    \\while IFS= read -r line; do
+    \\  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    \\  case "$line" in
+    \\    *'"method":"server/discover"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
+    \\    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    \\    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":7}}\n' "$id" ;;
+    \\  esac
+    \\done
+    \\
+;
+
 /// Asks for server `fake`'s tools until its status says `want`, for up to thirty seconds: the snapshot follows the engine a moment later,
 /// and a loaded machine can take longer. It stops as soon as the status is right.
 fn statusAfterListing(r: *Runtime, arena: Allocator, want_refused: bool) !Status {
@@ -3535,6 +3583,144 @@ test "a refused tool list shows in the status beside the older list still served
     status = try statusAfterListing(&r, a, false);
     try testing.expect(status.tools_error == null);
     try testing.expectEqual(@as(usize, 1), status.tools);
+}
+
+test "a server whose tool list is refused fails the request for its tools with the refusal's words, as its status says them" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "server", .data = always_refusing_server_script, .flags = .{ .permissions = .executable_file } });
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The `/mcp` screen, the catalog and `toolbox` all read the words of this failure, so they say what the status says
+    // and not that the server is unavailable.
+    const why = switch (try r.tools(a, "fake", null)) {
+        .failed => |text| text,
+        else => return error.TestExpectedFailure,
+    };
+    try testing.expectEqualStrings("\"tools\" is not a list", why);
+    const status = try statusAfterListing(&r, a, true);
+    try testing.expectEqualStrings(why, status.tools_error orelse return error.TestExpectedRefusal);
+    try testing.expectEqual(@as(usize, 0), status.tools);
+    try testing.expectEqual(@as(u16, 0), status.tools_unavailable);
+}
+
+test "a server's failure is said while it is down, and its list's refusal when it is back, whatever the engine still keeps" {
+    const phases = [_]engine.Phase{ .idle, .connecting, .ready, .backoff, .failed };
+    for (phases) |phase| {
+        const down = phase == .backoff or phase == .failed;
+        // A failure and a refusal: the failure of a server that is down, the refusal of one that is not.
+        try testing.expectEqual(if (down) WhySaid.failure else WhySaid.refusal, saysWhy(phase, true, true));
+        // A failure the engine kept, and no refusal: said only while the server is down.
+        try testing.expectEqual(if (down) WhySaid.failure else WhySaid.none, saysWhy(phase, true, false));
+        // A refusal alone is said in every phase, and neither says nothing.
+        try testing.expectEqual(WhySaid.refusal, saysWhy(phase, false, true));
+        try testing.expectEqual(WhySaid.none, saysWhy(phase, false, false));
+    }
+}
+
+// The server's first start dies; the next one is ready and refuses its list, as `always_refusing_server_script` does.
+const crashes_once_then_refuses_script =
+    \\#!/bin/sh
+    \\marker="$0.started"
+    \\if [ ! -e "$marker" ]; then : > "$marker"; echo "first start crashes" >&2; exit 3; fi
+    \\while IFS= read -r line; do
+    \\  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    \\  case "$line" in
+    \\    *'"method":"server/discover"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
+    \\    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    \\    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":7}}\n' "$id" ;;
+    \\  esac
+    \\done
+    \\
+;
+
+test "a server that crashed once and is ready again tells the model its list's refusal, not its old crash" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "server", .data = crashes_once_then_refuses_script, .flags = .{ .permissions = .executable_file } });
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // While the first process is down, the failure is said: that is the server's reason.
+    var saw_crash = false;
+    var why: []const u8 = "";
+    for (0..600) |_| {
+        why = switch (try r.tools(a, "fake", null)) {
+            .failed => |text| text,
+            else => return error.TestExpectedFailure,
+        };
+        if (std.mem.find(u8, why, "its process exited") != null) saw_crash = true else break;
+        // A sleep that ends early only polls sooner, and the loop is bounded.
+        std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
+    }
+    try testing.expect(saw_crash);
+    // The second process is ready and refuses its list. The engine still keeps the crash, and the words are the refusal's.
+    try testing.expectEqualStrings("\"tools\" is not a list", why);
+    const status = (try r.statuses(a))[0];
+    try testing.expectEqual(State.ready, status.state);
+    try testing.expectEqualStrings(why, status.tools_error orelse return error.TestExpectedRefusal);
+    try testing.expect(status.last_error == null);
+}
+
+// The server's first process refuses its list and dies; every later one dies as it starts.
+const refuses_then_crashes_script =
+    \\#!/bin/sh
+    \\marker="$0.started"
+    \\if [ -e "$marker" ]; then echo "later start crashes" >&2; exit 3; fi
+    \\: > "$marker"
+    \\while IFS= read -r line; do
+    \\  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    \\  case "$line" in
+    \\    *'"method":"server/discover"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
+    \\    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    \\    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":7}}\n' "$id"; exit 4 ;;
+    \\  esac
+    \\done
+    \\
+;
+
+test "a server that refused its list and then went down tells the model its failure, not the refusal" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "server", .data = refuses_then_crashes_script, .flags = .{ .permissions = .executable_file } });
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The first process refuses the list, and then it dies.
+    var why: []const u8 = "";
+    for (0..600) |_| {
+        why = switch (try r.tools(a, "fake", null)) {
+            .failed => |text| text,
+            else => return error.TestExpectedFailure,
+        };
+        if (std.mem.find(u8, why, "its process exited") != null) break;
+        // A sleep that ends early only polls sooner, and the loop is bounded.
+        std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
+    }
+    // The engine still holds the refusal while the server is down; what the model is told is the failure.
+    const st = r.statusOf(0) orelse return error.TestExpectedStatus;
+    try testing.expect(st.list_refusal != null);
+    try testing.expect(explainsFailure(st.phase));
+    try testing.expect(std.mem.startsWith(u8, why, "its process exited"));
 }
 
 test "a cancelled call ends, and stopping ends a call that never answers" {

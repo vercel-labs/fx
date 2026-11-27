@@ -4,6 +4,11 @@
 
 const durabilityTag = Symbol.for("libfx.durability");
 
+// setTimeout and setInterval run a longer delay at once. This module imports
+// nothing from libfx, so it keeps its own copy of the limit.
+// The other copy is maxTimerDelayMs in sdk/durable.js; change both together.
+const maxTimerDelayMs = 2 ** 31 - 1;
+
 /**
  * `source` is the World, or a function that creates it. libfx starts and
  * closes a World it creates. A World passed in stays the app's: the app
@@ -57,6 +62,9 @@ export function world(source, options = {}) {
   if (leaseMs !== undefined && !(Number.isSafeInteger(leaseMs) && leaseMs >= 1000)) throw new TypeError(`${name}() leaseMs must be an integer of at least 1000`);
   for (const [key, value] of Object.entries({ maxDurationMs, reserveMs })) {
     if (value !== undefined && !(Number.isSafeInteger(value) && value >= 0)) throw new TypeError(`${name}() ${key} must be a non-negative integer`);
+  }
+  for (const [key, value] of Object.entries({ pollMs, leaseMs, maxDurationMs })) {
+    if (value > maxTimerDelayMs) throw new TypeError(`${name}() ${key} must be at most ${maxTimerDelayMs}`);
   }
   for (const [key, value] of Object.entries({ alive, holderInfo, gatewayKey, waitUntil })) {
     if (value !== undefined && typeof value !== "function") throw new TypeError(`${name}() ${key} must be a function`);
