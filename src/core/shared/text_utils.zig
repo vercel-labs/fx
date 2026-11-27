@@ -1669,6 +1669,30 @@ fn nextPercentDecodedByte(text: []const u8, index: *usize) ?u8 {
     return text[index.*];
 }
 
+/// Where a URL's authority is, from after "://" to the first '/', '?', or
+/// '#', and where its host starts (`urlUserInfoEnd`).
+pub const UrlAuthority = struct {
+    start: usize,
+    host_start: usize,
+    end: usize,
+};
+
+/// Null for text with no "://".
+pub fn urlAuthority(url: []const u8) ?UrlAuthority {
+    const scheme_end = std.mem.find(u8, url, "://") orelse return null;
+    const start = scheme_end + "://".len;
+    const end = firstDelimiter(url, start, "/?#");
+    return .{ .start = start, .host_start = urlUserInfoEnd(url, start, end), .end = end };
+}
+
+/// Where a user name and password that start at `start` end, in a URL whose
+/// authority may end at `end`: after the last '@' before it, as a browser
+/// reads them, so a password with an unescaped '@' stays in them. `start`
+/// when there is no '@'.
+fn urlUserInfoEnd(url: []const u8, start: usize, end: usize) usize {
+    return if (std.mem.findScalarLast(u8, url[start..end], '@')) |at| start + at + 1 else start;
+}
+
 fn firstDelimiter(text: []const u8, start: usize, delimiters: []const u8) usize {
     var index = start;
     while (index < text.len) : (index += 1) {
