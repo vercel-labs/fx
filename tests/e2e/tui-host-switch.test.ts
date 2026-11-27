@@ -16,6 +16,7 @@ import {
   turnSettled,
   hasEmptyComposer,
 } from "./tmux-helpers";
+import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
 
 // Switching between main and its subagents through the agent list, in one fx
 // process: ↓ on an empty composer or Ctrl+X opens it, moving through it shows
@@ -34,8 +35,12 @@ function mainRow(state = ""): RegExp {
   return new RegExp(`^ {2}main {2,}${state ? `.* {2,}${state}(?: {2,}|$)` : ""}`, "m");
 }
 
+// The time a working subagent's row shows after its state, such as "3s" or "1h2m3s".
+const ROW_ELAPSED = String.raw`\d+(?:h\d+m\d+s|m\d+s|s)`;
+
 function subagentRow(name: string, state = ""): RegExp {
-  return new RegExp(`^ {2}[\u251c\u2514] ${name} {2,}${state ? `.* {2,}${state}(?: {2,}|$)` : ""}`, "m");
+  const shown = state === "working" ? `working(?: ${ROW_ELAPSED})?` : state;
+  return new RegExp(`^ {2}[\u251c\u2514] ${name} {2,}${state ? `.* {2,}${shown}(?: {2,}|$)` : ""}`, "m");
 }
 
 // Expects the agent list in `pane` to show `rows` in this order, top to bottom.
@@ -60,10 +65,11 @@ function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean
 }
 
 // Shows `agent`, "main" or a subagent's name, through the agent list: Ctrl+X
-// opens it whatever the composer holds, each arrow shows the next row's agent,
-// and Enter keeps it. Main's row comes first, then its working subagents, then
-// the rest by their latest reply. Those rows can move while the list is
-// open, so each step reads the rows again instead of counting them.
+// opens it whatever the composer holds, once fx has another agent to switch to
+// (`openAgentList`), each arrow shows the next row's agent, and Enter keeps it.
+// Main's row comes first, then its working subagents, then the rest by their
+// latest reply. Those rows can move while the list is open, so each step reads
+// the rows again instead of counting them.
 async function showAgent(session: TmuxSession, agent: string) {
   await selectAgent(session, agent);
   await session.sendKeys("Enter");
@@ -83,10 +89,53 @@ async function waitForSelectedRow(session: TmuxSession, agent: string, timeoutMs
   }
 }
 
+// The trace file of the fx that `withFx` started last, which names why fx
+// refused a Ctrl+X. Empty when a test runs fx another way, which leaves
+// `openAgentList` no evidence to act on.
+let switchTrace = "";
+
+// That trace file's text, "" when fx has written none yet.
+function traceText(): string {
+  return switchTrace.length > 0 && existsSync(switchTrace) ? readFileSync(switchTrace, "utf8") : "";
+}
+
+// The refusal fx's trace holds after `mark`, the trace's length before a send,
+// such as "open_agent_list refused reason=no_other_agent", or "" when it holds
+// none.
+function refusedSince(mark: number): string {
+  const seen = traceText().slice(mark);
+  const line = seen.split("\n").find((value) => value.includes("open_agent_list refused"));
+  return line === undefined ? "" : line.slice(line.indexOf("open_agent_list refused"));
+}
+
+// Opens the agent list, which shows `LIST_HINT` while it is open. Ctrl+X opens
+// it whatever the composer holds, but fx drops the key when it has no other
+// agent to switch to: a subagent's "Started" row reaches the screen a moment
+// before the list can switch to it, so a send in that gap is lost. One more
+// send follows only fx's own trace line that says it refused the first one, so
+// a key fx handles late opens the list within the wait and nothing is sent to
+// close it. A test that runs fx without a trace file leaves no such evidence,
+// and its one send waits as long as this always did.
+async function openAgentList(session: TmuxSession): Promise<string> {
+  const mark = traceText().length;
+  await session.sendKeys("C-x");
+  try {
+    return await session.waitForPane((pane) => pane.includes(LIST_HINT), 10_000);
+  } catch (error) {
+    // No refusal of that send in the trace: fx has not handled the key yet, or
+    // it is not tracing. A second Ctrl+X could then close the list the first
+    // one opens.
+    if (refusedSince(mark).length === 0) throw error;
+  }
+  // fx refused the key, so no list is open to close: one more send, and the
+  // list it opens stays.
+  await session.sendKeys("C-x");
+  return session.waitForText(LIST_HINT, 10_000);
+}
+
 // Opens the agent list and moves its highlight to `agent`'s row.
 async function selectAgent(session: TmuxSession, agent: string) {
-  await session.sendKeys("C-x");
-  await session.waitForText(LIST_HINT, 10_000);
+  await openAgentList(session);
   const deadline = Date.now() + 15_000;
   let rows = agentRows(await session.capturePaneEscapes());
   for (;;) {
@@ -322,6 +371,14 @@ function held() {
   return { promise, release };
 }
 
+// The seconds a "worker" row in the agent list shows after "working", or -1
+// when no such row shows a time.
+function workerTurnSeconds(pane: string): number {
+  const match = /^ {2}[\u251c\u2514] worker .*working (?:(\d+)h)?(?:(\d+)m)?(\d+)s\b/m.exec(pane);
+  if (!match) return -1;
+  return Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3]);
+}
+
 // What main's report request has to carry, because the report missed main's
 // first turn: the user's prompt, the turn's tool calls and its answer. A
 // report that is queued with the history the app had when it was posted lacks
@@ -432,7 +489,7 @@ async function withFx(
   run: (session: TmuxSession, context: Run) => Promise<void>,
   setupHome: (home: string) => void = () => {},
   record = false,
-  env: Record<string, string> = {},
+  env: Record<string, string | undefined> = {},
   gatewayOptions: Parameters<typeof startDynamicFakeGateway>[1] = {},
 ) {
   const gateway = startDynamicFakeGateway(respond, gatewayOptions);
@@ -443,6 +500,9 @@ async function withFx(
   setupHome(home);
   const sessions: TmuxSession[] = [];
   const tape = join(workspace, "fx.fxtape");
+  // Every fx here traces the input scope, so a test can see why a switch key
+  // opened no list. A test that reads its own trace passes its path in `env`.
+  switchTrace = env.FX_TRACE_LOG ?? join(home, "fx-trace.log");
   const launch = async (args = "") => {
     const session = await TmuxSession.create({
       cmd: args ? `${JSON.stringify(FX_BIN)} ${args}` : FX_BIN,
@@ -457,6 +517,10 @@ async function withFx(
         FX_PERMISSION_MODE: "auto",
         FX_AUTO_UPGRADE: "0",
         FX_SOUND: "0",
+        FX_TRACE_LOG: switchTrace,
+        // A test that reads its own trace decides what it records; every other
+        // fx here records the input scope, which holds the refusal lines.
+        ...(env.FX_TRACE_LOG === undefined && env.FX_TRACE_SCOPES === undefined ? { FX_TRACE_SCOPES: "input" } : {}),
         ...(record && sessions.length === 0 ? { FX_RECORD: tape } : {}),
         ...env,
       },
@@ -1514,6 +1578,81 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await showAgent(session, "main");
         await session.waitForText("SWITCH_MAIN_GOT_HI", 30_000);
       });
+      expect(markedByUser).toBe(true);
+      expect(typed).toEqual(["SWITCH_TELL_MAIN tell main I said hi"]);
+    },
+    TIMEOUT,
+  );
+  test(
+    "a subagent's message says the user started its turn when that turn ends before the main loop delivers the message",
+    async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "fx-message-starter-")));
+      const deliveryHeld = join(dir, "delivery-held");
+      const deliveryRelease = join(dir, "delivery-release");
+      const tracePath = join(dir, "fx-trace.log");
+      const heldDeliveries = () => readdirSync(dir).filter((name) => name.startsWith("delivery-held.")).length;
+      let markedByUser = false;
+      let typed: unknown = null;
+      try {
+        await withFx((body) => {
+          if (!isMainRequest(body)) {
+            if (latestUserText(body).includes("SWITCH_TELL_MAIN") || body.includes('"child_up"')) {
+              if (!body.includes('"child_up"')) {
+                return toolCall("child_up", "subagent", {
+                  request: { action: "message", agent: "parent", message: "SWITCH_HI_FROM_CHILD" },
+                });
+              }
+              return text("child_told", "SWITCH_CHILD_TOLD_MAIN");
+            }
+            return text("child_answer", "SWITCH_CHILD_FIRST");
+          }
+          if (body.includes("SWITCH_HI_FROM_CHILD")) {
+            const frame = userTexts(body).find((t) => t.includes("SWITCH_HI_FROM_CHILD")) ?? "";
+            markedByUser = frame.includes('"started_by":"user"');
+            typed = JSON.parse(frame.slice(frame.indexOf("{"))).user_typed ?? null;
+            return text("main_got_hi", "SWITCH_MAIN_GOT_HI");
+          }
+          if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", {
+              request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look for nothing" },
+            });
+          }
+          return text("main_done", "SWITCH_MAIN_DONE");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          // Each report before the message waits in the main loop's hand-off
+          // until it is let through.
+          const releaseHeld = () => {
+            for (let n = 1; n <= heldDeliveries(); n += 1) writeFileSync(`${deliveryRelease}.${n}`, "");
+          };
+          await session.waitForPane((pane) => {
+            releaseHeld();
+            return pane.includes("SWITCH_MAIN_SAW_FIRST") && hasEmptyComposer(pane) && turnSettled(pane);
+          }, 30_000);
+          releaseHeld();
+          const before = heldDeliveries();
+          await showAgent(session, "reviewer");
+          await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("SWITCH_TELL_MAIN tell main I said hi");
+          // The message waits in the hand-off, and the turn that sent it ends.
+          await until("the message's held delivery", () => heldDeliveries() > before);
+          await session.waitForText("SWITCH_CHILD_TOLD_MAIN", 30_000);
+          await until("the end of the turn that sent the message", () => traceHas(tracePath, "event=user_work_ended"));
+          expect(traceHas(tracePath, "kind=message")).toBe(false);
+          writeFileSync(`${deliveryRelease}.${before + 1}`, "");
+          await showAgent(session, "main");
+          await session.waitForText("SWITCH_MAIN_GOT_HI", 30_000);
+        }, () => {}, false, {
+          FX_TRACE_LOG: tracePath,
+          FX_TEST_REPORT_DELIVERY_HELD: deliveryHeld,
+          FX_TEST_REPORT_DELIVERY_RELEASE: deliveryRelease,
+        });
+      } finally {
+        writeFileSync(deliveryRelease, "");
+        rmSync(dir, { recursive: true, force: true });
+      }
       expect(markedByUser).toBe(true);
       expect(typed).toEqual(["SWITCH_TELL_MAIN tell main I said hi"]);
     },
@@ -2684,6 +2823,23 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // The person's ruling on a Ctrl+X that lands before fx can switch is "trace
+  // only": fx keeps dropping the key, and the trace says why. This case pins
+  // both halves of that, so it fails on a build whose refusal is silent.
+  test(
+    "Ctrl+X with one agent open opens no list, and the trace says why",
+    async () => {
+      await withFx(() => text("unused", "unused"), async (session) => {
+        await session.sendKeys("C-x");
+        await until("fx to trace the switch key it refused", () =>
+          traceText().includes("open_agent_list refused reason=no_other_agent"));
+        const pane = await session.capturePane();
+        expect(pane).not.toContain(LIST_HINT);
+      });
+    },
+    TIMEOUT,
+  );
+
   test(
     "with no subagent, Option+Right jumps by word",
     async () => {
@@ -2971,7 +3127,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           expectRowOrder(list, mainRow(), subagentRow("stuck1"), subagentRow("stuck2"), subagentRow("busy"), subagentRow("idler"));
           // Only busy runs in a profile other than main, and its row names it
           // after its model.
-          expect(list).toMatch(/^ {2}\u251c busy {2,}.* {2,}working {2,}\S+ {2,}notes\s*$/m);
+          expect(list).toMatch(/^ {2}\u251c busy {2,}.* {2,}working(?: \d+(?:h\d+m\d+s|m\d+s|s))? {2,}\S+ {2,}notes\s*$/m);
           expect(list).toMatch(/^ {2}\u2514 idler {2,}.* {2,}idle {2,}\S+\s*$/m);
           expect(list).not.toMatch(/ {2}main\s*$/m);
           await session.sendKeys("Escape");
@@ -3022,7 +3178,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("Down");
         // The reviewer's title is the title model's, from its task, as main's is.
         // The model follows the state; the main profile goes unnamed.
-        const list = await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}working {2,}\S+\s*$/m.test(pane), 15_000);
+        const list = await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}working(?: \d+(?:h\d+m\d+s|m\d+s|s))? {2,}\S+\s*$/m.test(pane), 15_000);
         expect(list).toMatch(/^ {2}main {2,}Plan the parser work {2,}idle {2,}\S+\s*$/m);
         expect(list).toContain("Agents 2");
         // Main's row stays first and selected, above a working child.
@@ -3033,6 +3189,75 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         reviewer.release();
         await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), 30_000);
       }, () => {}, false, {}, subagentTitles);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the main agent's turn ending while its subagent works keeps the terminal busy and holds the completion sound until the subagent finishes",
+    async () => {
+      const reviewer = held();
+      const folder = mkdtempSync(join(tmpdir(), "fx-turn-end-sound-"));
+      const tracePath = join(folder, "trace.log");
+      const tapePath = join(folder, "fx.fxtape");
+      const traceText = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
+      const traceLines = (trace: string, needle: string) => trace.split("\n").filter((line) => line.includes(needle));
+      const statusReports = (stdout: Buffer) =>
+        [...stdout.toString("latin1").matchAll(/\x1b\]7501;([^\x1b]*)\x1b\\/g)].map((match) => match[1]!.replace(/:msg=.*$/, ""));
+      let childCalls = 0;
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            childCalls += 1;
+            await reviewer.promise;
+            return text("child_answer", "HOLD_CHILD_DONE");
+          }
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", { request: { action: "message", agent: "reviewer", message: "Review src/parser.zig for bugs" } });
+          }
+          return text("main_wait", "HOLD_MAIN_WAITING");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER plan it");
+          await session.waitForPane((pane) => pane.includes("HOLD_MAIN_WAITING") && turnSettled(pane), 30_000);
+          await until("the reviewer's turn", () => childCalls >= 1);
+          await session.waitForPane((pane) => /\u2022 waiting on 1 subagent \(\d+s\) \u00b7 \u2193 to view/.test(pane), 15_000);
+
+          // Main's turn has ended while the reviewer still works: no turn-end
+          // sound has played, and the program status still reads working.
+          expect(traceLines(traceText(), "sound play kind=turn_end")).toEqual([]);
+          const reportsWhileWorking = statusReports(
+            Buffer.concat(readTapeFrames(tapePath, { ignoreTruncatedTail: true }).filter((frame) => frame.kind === 1).map((frame) => frame.payload)),
+          );
+          expect(reportsWhileWorking.at(-1)).toBe("state=working:app=fx");
+
+          reviewer.release();
+          await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), TIMEOUT);
+          await until("the turn-end sound", () => traceLines(traceText(), "sound play kind=turn_end").length > 0);
+          await session.waitForPane((pane) => turnSettled(pane) && !pane.includes("subagent working"), TIMEOUT);
+
+          expect(traceLines(traceText(), "sound play kind=turn_end cue=success")).toHaveLength(1);
+          await session.sendText("/quit");
+          expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+
+          const reports = statusReports(Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)));
+          const cleared = reports.lastIndexOf("state=clear");
+          expect(cleared).toBeGreaterThan(0);
+          expect(reports[cleared - 1]).toBe("state=done:app=fx");
+          const lastWorking = reports.lastIndexOf("state=working:app=fx");
+          expect(lastWorking).toBeGreaterThan(-1);
+          expect(reports.slice(0, lastWorking)).not.toContain("state=done:app=fx");
+        }, (home) => {
+          writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", sound: { turn_end: true, attention_required: true } }));
+        }, false, {
+          FX_SOUND: undefined,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "notifications,program_status",
+          FX_RECORD: tapePath,
+        });
+      } finally {
+        reviewer.release();
+        rmSync(folder, { recursive: true, force: true });
+      }
     },
     TIMEOUT,
   );
@@ -4073,8 +4298,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER start them, then close tester");
         await until("main's turn that closes tester", () => mainCalls >= 3);
         await session.waitForPane((pane) => pane.includes("Started tester"), 15_000);
-        await session.sendKeys("C-x");
-        await session.waitForText(LIST_HINT, 10_000);
+        // "Started tester" comes before the list can switch to it, so open the
+        // list the way every other test does.
+        await openAgentList(session);
         const rows = agentRows(await session.capturePaneEscapes()).map((row) => row.name);
         expect([...rows].sort()).toEqual(["main", "reviewer", "tester"]);
         target = rows.at(-1)!;
@@ -4904,12 +5130,16 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "a working subagent's row keeps its title and shows its call's time, and its quiet command wakes main's wait",
+    "a working subagent's row keeps its title and shows how long its turn has run, and its quiet command wakes main's wait",
     async () => {
       const command = "sh -c 'printf TUI-QUIET-READY; exec sleep 600'";
       // The shell session the child's run started, from its result.
       const sessionOf = (body: string) => /shell-\d+/.exec(body.slice(body.indexOf("TUI-QUIET-READY")))?.[0];
       let childWaiting = false;
+      let childAsked = false;
+      let childWait1Start = 0;
+      let childWait1Ms = -1;
+      const firstChildRequest = held();
       await withFx(async (body) => {
         if (!isMainRequest(body)) {
           // The latest call comes first: every earlier call stays in the turn.
@@ -4918,16 +5148,21 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
             return toolCall("child_stop", "shell", { request: { action: "stop", session_id: sessionOf(body) } });
           }
           if (body.includes('"child_wait_1"')) {
+            childWait1Ms = Date.now() - childWait1Start;
             return toolCall("child_wait_2", "shell", {
-              request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 20_000 },
+              request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 5_000 },
             });
           }
           if (body.includes('"child_run"')) {
             childWaiting = true;
+            childWait1Start = Date.now();
             return toolCall("child_wait_1", "shell", {
-              request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 20_000 },
+              request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 5_000 },
             });
           }
+          // The child's first request waits until the list has shown its turn's time.
+          childAsked = true;
+          await firstChildRequest.promise;
           return toolCall("child_run", "shell", { request: { action: "run", command, yield_time_ms: 300 } });
         }
         if (body.includes('"main_wait"')) {
@@ -4942,23 +5177,36 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         });
       }, async (session) => {
         await session.sendText("SWITCH_USER");
-        await until("the child's first wait", () => childWaiting);
-        // The row of the working subagent keeps its title, not its current
-        // call, and shows how long that call has run.
+        await until("the child's first request", () => childAsked);
+        // While its first request waits on the model, no call is open, and the
+        // row shows how long its turn has run.
         await session.sendKeys("C-x");
         await session.waitForText(LIST_HINT, 10_000);
-        const list = await session.waitForPane((pane) =>
-          /^ {2}[\u251c\u2514] worker .*working \d+s\b/m.test(pane), 15_000);
+        const thinking = await session.waitForPane((pane) => workerTurnSeconds(pane) >= 3, 15_000);
+        const before = workerTurnSeconds(thinking);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+        firstChildRequest.release();
+        await until("the child's first wait", () => childWaiting);
+        // The row keeps its title, not its current call, and a new call does
+        // not start its clock again.
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        const list = await session.waitForPane((pane) => workerTurnSeconds(pane) >= 0, 15_000);
+        expect(workerTurnSeconds(list)).toBeGreaterThanOrEqual(before);
         const workerRow = list.split("\n").find((line) => /^ {2}[\u251c\u2514] worker /.test(line)) ?? "";
         expect(workerRow).not.toContain("Waiting for");
         expect(workerRow).not.toContain("TUI-QUIET-READY");
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
-        // The child's command crosses the quiet limit while main waits, and
+        // The child's wait ends past the quiet limit while main waits, and
         // fx's note wakes main's wait before the child ends.
         const pane = await session.waitForPane((pane) =>
           pane.includes("TUI_MAIN_SAW_RELAY") || pane.includes("TUI_MAIN_NO_RELAY"), 30_000);
         expect(pane).toContain("TUI_MAIN_SAW_RELAY");
+        await until("the child's first wait to finish", () => childWait1Ms >= 0, 15_000);
+        expect(childWait1Ms).toBeGreaterThanOrEqual(5_000);
+        expect(childWait1Ms).toBeLessThanOrEqual(10_000);
       }, () => {}, false, { FX_TEST_SHELL_QUIET_NOTICE_MS: "3000" });
     },
     TIMEOUT,

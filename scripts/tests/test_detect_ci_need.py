@@ -71,7 +71,14 @@ class DetectCiNeedTests(unittest.TestCase):
         return result.returncode, outputs, result.stdout + result.stderr
 
     def assert_needs(
-        self, *, libfx: bool, mcp: bool, transcript_window: bool = False, subagent: bool = False, **env: str,
+        self,
+        *,
+        libfx: bool,
+        mcp: bool,
+        transcript_window: bool = False,
+        subagent: bool = False,
+        managed_execution: bool = False,
+        **env: str,
     ) -> str:
         code, outputs, text = self.detect(**env)
         self.assertEqual(0, code, text)
@@ -81,6 +88,7 @@ class DetectCiNeedTests(unittest.TestCase):
                 "mcp": str(mcp).lower(),
                 "transcript_window": str(transcript_window).lower(),
                 "subagent": str(subagent).lower(),
+                "managed_execution": str(managed_execution).lower(),
             },
             outputs,
             text,
@@ -88,18 +96,33 @@ class DetectCiNeedTests(unittest.TestCase):
         return text
 
     def commit_each(
-        self, paths: tuple[str, ...], *, libfx: bool, mcp: bool, transcript_window: bool = False, subagent: bool = False,
+        self,
+        paths: tuple[str, ...],
+        *,
+        libfx: bool,
+        mcp: bool,
+        transcript_window: bool = False,
+        subagent: bool = False,
+        managed_execution: bool = False,
     ) -> None:
         for path in paths:
             with self.subTest(path=path):
                 self.write(path, f"// {path}\n")
                 self.commit(path)
-                text = self.assert_needs(libfx=libfx, mcp=mcp, transcript_window=transcript_window, subagent=subagent)
+                text = self.assert_needs(
+                    libfx=libfx,
+                    mcp=mcp,
+                    transcript_window=transcript_window,
+                    subagent=subagent,
+                    managed_execution=managed_execution,
+                )
                 self.assertIn(path, text)
                 self.base = self.git("rev-parse", "HEAD")
 
     def test_change_outside_both_checks_skips_them(self) -> None:
         self.write("README.md", "fx docs\n")
+        self.write("docs/x.md", "note\n")
+        self.write("src/ui/foo.zig", "pub fn draw() void {}\n")
         self.write("src/ui/composer.zig", "pub fn draw() void {}\n")
         self.write("src/core/agent/loop.zig", "pub fn run() void {}\n")
         self.write("src/wasm_term_main.zig", "pub fn main() void {}\n")
@@ -143,7 +166,7 @@ class DetectCiNeedTests(unittest.TestCase):
         self.commit_each((
             "tests/e2e/tmux-helpers.ts",
             "tests/evals/eval-helpers.ts",
-        ), libfx=False, mcp=True, subagent=True)
+        ), libfx=False, mcp=True, subagent=True, managed_execution=True)
 
     def test_subagent_and_session_write_paths_need_only_that_check(self) -> None:
         self.commit_each((
@@ -161,8 +184,30 @@ class DetectCiNeedTests(unittest.TestCase):
             "tests/tla/drivers/subagent/stop-message.test.ts",
             "tests/tla/drivers/session/write.test.ts",
             "tests/tla/drivers/session/live.test.ts",
-            "tests/tla/lib/tlc.sh",
         ), libfx=False, mcp=False, subagent=True)
+
+    def test_managed_execution_paths_need_only_that_check(self) -> None:
+        self.commit_each((
+            "src/core/execution/quiet_notice.zig",
+            "src/core/execution/managed_execution.zig",
+            "src/tools/shell/shell.zig",
+            "src/tools/shell/format.zig",
+            "tests/tla/managed_execution/QuietWait.tla",
+            "tests/tla/managed_execution/check.sh",
+            "tests/tla/drivers/managed_execution/walk.ts",
+            "tests/tla/drivers/managed_execution/binary.ts",
+            "tests/tla/drivers/managed_execution/lab.zig",
+        ), libfx=False, mcp=False, managed_execution=True)
+
+    def test_other_execution_and_tool_files_need_no_managed_execution_check(self) -> None:
+        self.write("src/core/execution/command_runner.zig", "pub fn run() void {}\n")
+        self.write("src/tools/fs/read.zig", "pub fn read() void {}\n")
+        self.commit("head")
+
+        self.assert_needs(libfx=False, mcp=False, managed_execution=False)
+
+    def test_shared_tla_lib_needs_subagent_and_managed_execution(self) -> None:
+        self.commit_each(("tests/tla/lib/tlc.sh",), libfx=False, mcp=False, subagent=True, managed_execution=True)
 
     def test_other_session_and_agent_files_need_no_subagent_check(self) -> None:
         self.write("tests/tla/session/ShellSession.tla", "---- MODULE ShellSession ----\n")
@@ -189,8 +234,21 @@ class DetectCiNeedTests(unittest.TestCase):
         self.assert_needs(libfx=False, mcp=False, transcript_window=False)
 
     def test_shared_driver_code_needs_each_check_that_loads_it(self) -> None:
-        self.commit_each(("tests/tla/drivers/lib/context.ts",), libfx=False, mcp=True, transcript_window=True, subagent=True)
-        self.commit_each(("tests/tla/drivers/graph.mjs",), libfx=True, mcp=False, transcript_window=True)
+        self.commit_each(
+            ("tests/tla/drivers/lib/context.ts",),
+            libfx=False,
+            mcp=True,
+            transcript_window=True,
+            subagent=True,
+            managed_execution=True,
+        )
+        self.commit_each(
+            ("tests/tla/drivers/graph.mjs",),
+            libfx=True,
+            mcp=False,
+            transcript_window=True,
+            managed_execution=True,
+        )
 
     def test_build_and_check_inputs_need_every_check(self) -> None:
         self.commit_each((
@@ -198,7 +256,7 @@ class DetectCiNeedTests(unittest.TestCase):
             "build.zig.zon",
             ".github/workflows/ci.yml",
             "scripts/detect-ci-need.sh",
-        ), libfx=True, mcp=True, transcript_window=True, subagent=True)
+        ), libfx=True, mcp=True, transcript_window=True, subagent=True, managed_execution=True)
 
     def test_mcp_driver_folders_do_not_need_the_libfx_check(self) -> None:
         self.write("tests/tla/drivers/mcp/scenarios/u01-wire.mjs", "export {};\n")
@@ -222,7 +280,14 @@ class DetectCiNeedTests(unittest.TestCase):
         self.assertIn("src/mcp/engine.zig", text)
 
     def test_request_forces_every_check(self) -> None:
-        text = self.assert_needs(libfx=True, mcp=True, transcript_window=True, subagent=True, CI_NEED_REQUESTED="push to main")
+        text = self.assert_needs(
+            libfx=True,
+            mcp=True,
+            transcript_window=True,
+            subagent=True,
+            managed_execution=True,
+            CI_NEED_REQUESTED="push to main",
+        )
         self.assertIn("push to main", text)
 
     def test_unreadable_revision_fails_instead_of_skipping(self) -> None:
@@ -231,6 +296,40 @@ class DetectCiNeedTests(unittest.TestCase):
         self.assertNotEqual(0, code, text)
         self.assertEqual({}, outputs)
         self.assertIn("cannot read revision", text)
+
+    def test_non_ascii_path_triggers_its_check(self) -> None:
+        self.write("src/mcp/café.zig", "pub fn cafe() void {}\n")
+        self.commit("non-ascii path")
+
+        text = self.assert_needs(libfx=False, mcp=True)
+        self.assertIn("src/mcp/café.zig", text)
+
+    def test_quoted_path_triggers_its_check(self) -> None:
+        self.write('src/core/subagent/a "quoted" name.zig', "pub fn run() void {}\n")
+        self.commit("quoted path")
+
+        text = self.assert_needs(libfx=False, mcp=False, subagent=True)
+        self.assertIn('src/core/subagent/a "quoted" name.zig', text)
+
+    def test_newline_in_path_triggers_its_check_without_crashing(self) -> None:
+        self.write("src/ui/transcript/transcript_window_x\ny.zig", "pub fn draw() void {}\n")
+        self.commit("newline path")
+
+        text = self.assert_needs(libfx=False, mcp=False, transcript_window=True)
+        self.assertIn("src/ui/transcript/transcript_window_x\ny.zig", text)
+
+    def test_git_diff_failure_exits_nonzero(self) -> None:
+        tree_sha = self.git("rev-parse", "HEAD^{tree}")
+        obj_path = self.root / ".git" / "objects" / tree_sha[:2] / tree_sha[2:]
+        obj_path.chmod(0o644)
+        obj_path.unlink()
+
+        code, outputs, text = self.detect()
+
+        self.assertNotEqual(0, code, text)
+        self.assertEqual({}, outputs)
+        self.assertIn("git diff", text)
+        self.assertIn("failed", text)
 
 
 if __name__ == "__main__":

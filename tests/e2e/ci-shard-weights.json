@@ -8,6 +8,7 @@
   { "file": "ci-shards.test.ts", "weight": 15 },
   { "file": "cli.test.ts", "weight": 19 },
   { "file": "compaction-policy.test.ts", "weight": 1 },
+  { "file": "provider-compaction.test.ts", "weight": 6 },
   { "file": "config-persistence.test.ts", "weight": 64 },
   { "file": "configured-providers.test.ts", "weight": 3 },
   { "file": "context-limits-live.test.ts", "weight": 1 },

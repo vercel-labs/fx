@@ -4367,6 +4367,68 @@ test "retained context automatic compaction archives oversized parallel results 
     try std.testing.expect(std.mem.find(u8, second, result_b) != null);
 }
 
+test "a turn whose step a compaction summarized hands the session its whole turn, however the turn ends (D87)" {
+    const alloc = std.testing.allocator;
+    const old_text = "OLDER_HISTORY_SENTINEL " ++ text_utils.repeat("o", 52_000);
+    const result_a = "RECENT_EXACT_A\n" ++ text_utils.repeat("a", 13_000);
+    const result_b = "RECENT_EXACT_B\n" ++ text_utils.repeat("b", 13_000);
+    const calls = [_]ToolCall{
+        toolCall("retained-a", "read_file", "{\"path\":\"a.txt\"}"),
+        toolCall("retained-b", "read_file", "{\"path\":\"b.txt\"}"),
+    };
+    const later_calls = [_]ToolCall{toolCall("cut-off", "read_file", "{\"path\":\"c.txt\"}")};
+    const first: FakeCompletion = .{ .tool_calls = &calls };
+    const summary: FakeCompletion = .{ .content = "Turn 1\nIn between: Earlier work established the project facts." };
+    const cut_off: FakeCompletion = .{ .tool_calls = &later_calls, .finish_reason = .length };
+    const Ending = struct { name: []const u8, completions: []const FakeCompletion };
+    // A reply, two empty replies (`finishFailedTurnWithNotice`), and a reply
+    // cut off again after its resend.
+    const endings = [_]Ending{
+        .{ .name = "completed", .completions = &.{ first, summary, .{ .content = "Continued from the observed results." } } },
+        .{ .name = "empty", .completions = &.{ first, summary, .{}, .{} } },
+        .{ .name = "length", .completions = &.{ first, summary, cut_off, cut_off } },
+    };
+    for (endings) |ending| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(result_dir);
+        var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(old_text) }};
+        const history = [_]HistoryTurn{.{ .assistant = .{
+            .user = .{ .text = @constCast("previous work") },
+            .assistant = @constCast("previous work done"),
+            .execution = .{ .tool_steps = &old_steps },
+        } }};
+        var gateway = FakeGateway.init(alloc, ending.completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        const model = "provider/retained-context";
+        const context_window = (estimateTextTokens(old_text) + (estimateTextTokens(result_a) + estimateTextTokens(result_b)) / 2) * 5 / 4;
+        const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = @intCast(context_window) } }};
+        hooks.available_capability_overrides = &capabilities;
+        hooks.permission_decisions = &.{ .once, .once };
+        hooks.exec_plans = &.{ .{ .result = .{ .model_output = result_a } }, .{ .result = .{ .model_output = result_b } } };
+        var tool_store = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, result_dir, .tool_results, .writable);
+        defer tool_store.deinit();
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.session_child_capability = &tool_store;
+        var job = fixture.job();
+        job.model = @constCast(model);
+        job.history = @constCast(&history);
+        try runFakePrompt(&gateway, &hooks, config, job);
+        errdefer std.debug.print("ending {s}\n", .{ending.name});
+        const turn = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant;
+        // fx's history goes on from the cut; the log gets the step it summarized.
+        try std.testing.expectEqual(@as(usize, 0), turn.execution.tool_steps.len);
+        const whole = turn.saved_execution orelse return error.TestExpectedSavedExecution;
+        try std.testing.expectEqual(@as(usize, 1), whole.tool_steps.len);
+        try std.testing.expectEqualStrings(result_a, whole.tool_steps[0].tool_results[0].output);
+        try std.testing.expectEqualStrings(result_b, whole.tool_steps[0].tool_results[1].output);
+    }
+}
+
 test "retained context compaction preserves recovered historical replay" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -10268,7 +10330,7 @@ test "processQueuedPrompt stops nonretryable provider outcomes without releasing
     try std.testing.expectEqual(@as(usize, 0), interrupted.execution.tool_steps.len);
 }
 
-test "processQueuedPrompt spacer newline is skipped for ask first tool" {
+test "processQueuedPrompt spacer newline also ends the prose before a question" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{"Using tool"};
     const read_calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
@@ -10296,7 +10358,7 @@ test "processQueuedPrompt spacer newline is skipped for ask first tool" {
     defer ask_hooks.deinit();
     var ask_fixture = PromptFixture{};
     try runFakePrompt(&ask_gateway, &ask_hooks, ask_fixture.config(), ask_fixture.job());
-    try std.testing.expectEqual(@as(usize, 1), countText(&ask_hooks, "\n"));
+    try std.testing.expectEqual(@as(usize, 2), countText(&ask_hooks, "\n"));
 }
 
 test "processQueuedPrompt uses configured tool choice only for first call" {
@@ -10956,6 +11018,143 @@ test "tool presentation groups span silent steps and split on visible assistant 
     }
     try std.testing.expectEqual(@as(usize, 2), group_a_terminal_count);
     try std.testing.expect(group_b_start_index != null);
+}
+
+test "tool calls after a question start a new presentation group" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const ask = [_]ToolCall{toolCall("call_ask", "ask_user_question", "{\"questions\":[]}")};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const read_third = [_]ToolCall{toolCall("call_3", "read_file", "{\"path\":\"c\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &ask },
+        .{ .tool_calls = &read_second },
+        .{ .tool_calls = &read_third },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    var groups: [3]types.ToolPresentationGroupId = undefined;
+    var group_count: usize = 0;
+    for (hooks.lifecycle_events.items) |event| {
+        if (event != .authoritative_started) continue;
+        try std.testing.expect(group_count < groups.len);
+        groups[group_count] = event.authoritative_started.presentation_group_id.?;
+        group_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), group_count);
+    try std.testing.expect(!std.meta.eql(groups[0], groups[1]));
+    try std.testing.expectEqual(groups[1], groups[2]);
+}
+
+test "tool calls after a question asked through toolbox start a new presentation group" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const toolbox_ask = [_]ToolCall{toolCall(
+        "call_ask",
+        "toolbox",
+        "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}",
+    )};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const read_third = [_]ToolCall{toolCall("call_3", "read_file", "{\"path\":\"c\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &toolbox_ask },
+        .{ .tool_calls = &read_second },
+        .{ .tool_calls = &read_third },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expect(startedPresentationGroup(&hooks, "call_ask") == null);
+    const first = startedPresentationGroup(&hooks, "call_1").?;
+    const second = startedPresentationGroup(&hooks, "call_2").?;
+    try std.testing.expect(!std.meta.eql(first, second));
+    try std.testing.expectEqual(second, startedPresentationGroup(&hooks, "call_3").?);
+}
+
+test "prose before a question ends its line as it does before any other tool" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("call_ask", "ask_user_question", "{\"questions\":[]}"),
+        toolCall("call_ask", "toolbox", "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}"),
+        toolCall("call_read", "read_file", "{\"path\":\"a\"}"),
+    };
+    var line_breaks: [calls.len]usize = @splat(0);
+    for (calls, &line_breaks) |call, *count| {
+        const ask = [_]ToolCall{call};
+        const completions = [_]FakeCompletion{
+            .{ .content = "One question first.", .tool_calls = &ask },
+            .{ .content = "Final" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        for (hooks.texts.items) |text| {
+            if (std.mem.eql(u8, text, "\n")) count.* += 1;
+        }
+    }
+    // `fx ask` shows no question, so this break is what ends the prose there.
+    try std.testing.expect(line_breaks[2] > 0);
+    try std.testing.expectEqual(line_breaks[2], line_breaks[0]);
+    try std.testing.expectEqual(line_breaks[2], line_breaks[1]);
+}
+
+/// The presentation group of the call `call_id` when it started.
+fn startedPresentationGroup(hooks: *const FakeAgentRuntimeDeps, call_id: []const u8) ?types.ToolPresentationGroupId {
+    for (hooks.lifecycle_events.items) |event| {
+        if (event != .authoritative_started) continue;
+        const started = event.authoritative_started;
+        if (std.mem.eql(u8, started.id.call_id, call_id)) return started.presentation_group_id;
+    }
+    return null;
+}
+
+test "a question dropped from a length-cut reply and sent again leaves the presentation group open" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const cut_ask = [_]ToolCall{toolCall("call_ask", "ask_user_question", "{\"questions\":[]}")};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &cut_ask, .finish_reason = .length },
+        .{ .tool_calls = &read_second },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    for (hooks.executed_names.items) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "ask_user_question"));
+    }
+    try std.testing.expectEqual(
+        startedPresentationGroup(&hooks, "call_1").?,
+        startedPresentationGroup(&hooks, "call_2").?,
+    );
 }
 
 test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {

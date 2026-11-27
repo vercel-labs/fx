@@ -325,6 +325,7 @@ export type FxSessionEvent = FxEventBase & (
   | { type: "session.refused"; sessionId?: string; messageId?: string; reason: "unknown message" | "malformed message" }
   /** `cutoffs`: the times in a row the deadline cut off the same step, this one included. */
   | { type: "session.deadline"; sessionId: string; epoch: number; cutoffs: number }
+  | { type: "session.handoff"; sessionId: string; epoch: number; cutoffs: number }
   | { type: "ui.error"; sessionId: string; error: string }
 );
 
@@ -588,6 +589,8 @@ export interface FxEngineTurn {
   steer(input: FxSteeringInput, id?: string): FxSteer;
   /** Takes a steer back before the model sees it. */
   withdraw(id: string): Promise<"withdrawn" | "already_placed">;
+  /** Stops the turn at its next safe point, the save before a model request after its first: it ends `"yielded"`, and `resume()` continues it. Resolves once fx has the request. Needs persistence. */
+  yield(): Promise<void>;
   [Symbol.asyncIterator](): AsyncIterator<FxTurnEvent>;
 }
 
@@ -747,7 +750,7 @@ export interface Durability {
 
 /** Options for `memory()`. */
 export interface MemoryOptions {
-  /** Each delivery runs as if its function stopped after this long. No limit by default. */
+  /** Each delivery runs as if its function stopped after this long, at most 2147483647. No limit by default. */
   maxDurationMs?: number;
   /** How long before the deadline each delivery stops. Default 30000. */
   reserveMs?: number;
@@ -926,6 +929,8 @@ export interface FxAgent {
   checkpoint(): Promise<Uint8Array>;
   /** The request handler a deployment mounts for queue deliveries; it delivers to whichever agent in the process a message names. */
   wakeHandler(): (request: Request) => Promise<Response>;
+  /** Stops every turn this process runs at its next safe point, so another process continues it, and sends new work to other processes. A turn that reaches no safe point within `within` milliseconds, from 0 to 2147483647, is cut off as at its deadline; when several calls give a bound, the earliest cut-off holds. Resolves once this process let go of its sessions. */
+  handOff(options?: { within?: number }): Promise<void>;
   /** Waits for the turns this process is running, then lets their sessions go. */
   close(): Promise<void>;
 }

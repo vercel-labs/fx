@@ -155,6 +155,22 @@ printf 'error: %s \\377\\376 end\\n' "$(printf 'x%.0s' $(seq 1 500))"
 exit 3
 `;
 
+// sh styled-build.sh fails with its message between escapes a real build
+// writes: ones that pick a character set, then the style reset that
+// `tput sgr0` writes, ESC ( B ESC [ m.
+const STYLED_BUILD_SH = `printf '\\033%%G\\033)0\\033#8Build failed\\033(B\\033[m\\n'
+exit 1
+`;
+
+// sh linked-check.sh fails with its message in an OSC 8 link that ends with
+// ST, and sh bel-linked-check.sh with one that ends with BEL.
+const LINKED_CHECK_SH = `printf '\\033]8;;file:///x\\033\\\\Problems found\\033]8;;\\033\\\\\\n'
+exit 1
+`;
+const BEL_LINKED_CHECK_SH = `printf '\\033]8;;file:///x\\007Problems found\\033]8;;\\007\\n'
+exit 1
+`;
+
 const CHECK_SH = `case "$1" in
   status) echo "## main...origin/main"; echo "109de9e Add APP_URL override" ;;
   remote) printf '0\\t0\\n' ;;
@@ -176,6 +192,9 @@ export function createStoryRoot(settings: Record<string, unknown> = {}): StoryRo
     "build.sh": BUILD_SH,
     "test.sh": TEST_SH,
     "hostile.sh": HOSTILE_SH,
+    "styled-build.sh": STYLED_BUILD_SH,
+    "linked-check.sh": LINKED_CHECK_SH,
+    "bel-linked-check.sh": BEL_LINKED_CHECK_SH,
     "check.sh": CHECK_SH,
   })) {
     writeFileSync(join(workspace, name), body);

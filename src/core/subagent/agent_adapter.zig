@@ -1066,8 +1066,8 @@ fn pushLiveToolLifecycle(
 }
 
 /// Keeps the turn's current call, with the label its own rows use, for the
-/// parent's status and agent list, and relays a shell command that crossed
-/// the quiet limit to the parent (`Runtime.noteChildQuiet`).
+/// parent's status, and relays a shell command that crossed the quiet limit
+/// to the parent (`Runtime.noteChildQuiet`).
 fn noteCallActivity(context: *Context, event: types.ToolLifecycleEvent) void {
     switch (event) {
         .authoritative_started => |started| {

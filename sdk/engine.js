@@ -2134,6 +2134,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
         return rawTurn.steer(normalizeSteeringInput(input), id);
       },
       withdraw(id) { return rawTurn.withdraw(id); },
+      yield() { return rawTurn.yield(); },
       [engineInternals]: rawTurn[engineInternals],
       [Symbol.asyncIterator]() {
         const iterator = (async function* () {
@@ -2266,6 +2267,24 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
     const toolControllers = new Set();
     let finished = false;
     let cancelled = false;
+    let yieldSent = null;
+    // Asks the core about this turn's running prompt: with the runtime's own
+    // `direct` call when it has one (WebAssembly), or else with `method`. It
+    // asks once the prompt starts, and not at all when the prompt never starts
+    // or the turn has ended.
+    const askCore = (direct, method) => {
+      const send = () => {
+        if (finished || cancelled || activeTurn !== turn || closing) return undefined;
+        if (typeof runtime[direct] === "function") {
+          runtime[direct]();
+          return undefined;
+        }
+        return request(method, { sessionId }).then(() => undefined);
+      };
+      return promptStarted && resolvePromptStart
+        ? promptStarted.then((started) => (started === true ? send() : undefined))
+        : Promise.resolve().then(send);
+    };
     const turn = {
       // The host's id: the one it gave, or for a resumed turn, the one the
       // turn started with.
@@ -2326,21 +2345,19 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
           return "withdrawn";
         });
       },
+      // Stops the turn at its next safe point: it ends "yielded", and resume()
+      // or the next agent continues it. Resolves once the core has the request.
+      yield() {
+        if (!journal) throw new TypeError("a yield needs persistence to keep the turn in");
+        yieldSent ??= askCore("requestYield", "libfx/yield");
+        return yieldSent;
+      },
       // For libfx's session worker: a steer that cannot join the turn, such
       // as one with images, ends the turn at its next safe point, at once
       // while the model streams a reply, so that steer can run next.
       [engineInternals]: {
         endForSteer() {
-          const send = () => {
-            if (finished || cancelled || activeTurn !== turn || closing) return undefined;
-            if (typeof runtime.handOffSteering === "function") {
-              runtime.handOffSteering();
-              return undefined;
-            }
-            return request("libfx/handoff", { sessionId }).then(() => undefined);
-          };
-          const sent = promptStarted && resolvePromptStart ? promptStarted.then((started) => (started === true ? send() : undefined)) : Promise.resolve().then(send);
-          return sent.catch(() => {});
+          return askCore("handOffSteering", "libfx/handoff").catch(() => {});
         },
       },
       cancel(cancelOptions = {}) {

@@ -354,7 +354,7 @@ fn batchSegmentIsInterrupted(events: []const WorkerEvent, cancelled_turn_id: ?u6
 /// Whether `event` begins a new prompt, and so a new segment.
 fn startsSegment(event: WorkerEvent) bool {
     return switch (event) {
-        .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt, .begin_resumed_prompt => true,
+        .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt, .begin_resumed_prompt, .begin_continued_prompt => true,
         else => false,
     };
 }
@@ -381,7 +381,7 @@ fn scanSegment(state: HeadSegmentScan, events: []const WorkerEvent) HeadSegmentS
 fn scanSegmentEvent(state: HeadSegmentScan, event: WorkerEvent) HeadSegmentScan {
     if (state == .settled) return state;
     return switch (event) {
-        .begin_presented_prompt, .begin_resumed_prompt => |id| .{ .turn = id },
+        .begin_presented_prompt, .begin_resumed_prompt, .begin_continued_prompt => |id| .{ .turn = id },
         .turn_phase_update => |phase| .{ .turn = phase.turn_id },
         .tool_lifecycle => |lifecycle| switch (lifecycle) {
             .turn_finished => |finished| .{ .settled = finished.outcome == .interrupted },
@@ -454,6 +454,7 @@ pub fn Runtime(comptime App: type) type {
                 .begin_prompt_with_skill_bindings,
                 .begin_presented_prompt,
                 .begin_resumed_prompt,
+                .begin_continued_prompt,
                 .append_user_feedback,
                 .append_agent_message,
                 .notification,
@@ -978,6 +979,11 @@ pub fn Runtime(comptime App: type) type {
             return app.subagentIdOf(agent);
         }
 
+        fn screenSubagentsWorking(app: *App) bool {
+            if (comptime !@hasDecl(App, "screenSubagentsWorking")) return false;
+            return app.screenSubagentsWorking();
+        }
+
         /// True when `agent` is a subagent's, on screen or not.
         fn isSubagent(_: *const App, agent: *const AppAgent) bool {
             if (comptime !@hasField(App, "screen_owner")) return false;
@@ -1004,7 +1010,7 @@ pub fn Runtime(comptime App: type) type {
                 } }
             else if (agent.question_prompt.isActive())
                 .{ .blocked = .{ .kind = .question, .message = activeQuestionText(app, agent) } }
-            else if (busy)
+            else if (busy or screenSubagentsWorking(app))
                 .working
             else
                 .settled;
@@ -1309,19 +1315,22 @@ pub fn Runtime(comptime App: type) type {
                             return error.PresentedPromptUnsupported;
                         }
                     },
-                    .begin_resumed_prompt => {
+                    .begin_resumed_prompt, .begin_continued_prompt => {
                         if (!try requireAssistantTextDrain(handlers)) {
                             try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
                         resetStream(app, agent, true);
-                        // A resumed request is the user's own, resent on resume.
+                        // A resumed or continued request is the user's own, sent again after a restart.
                         noteTurnStarted(app, agent, .user);
                         agent.stream.active = true;
                         agent.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
-                        try handlers.semantic_notice(handlers.ctx, session_notices.resumed_request_notice);
+                        try handlers.semantic_notice(handlers.ctx, if (event == .begin_continued_prompt)
+                            session_notices.continued_turn_notice
+                        else
+                            session_notices.resumed_request_notice);
                     },
                     .append_user_feedback, .append_agent_message => |text| {
                         if (!try requireAssistantTextDrain(handlers)) {
@@ -1377,6 +1386,11 @@ pub fn Runtime(comptime App: type) type {
                                 // ends where this attempt's output begins.
                                 if (comptime @hasDecl(@TypeOf(app.shell), "markAssistantAttemptStart")) {
                                     app.shell.markAssistantAttemptStart();
+                                }
+                            },
+                            .operational_text_shown => {
+                                if (comptime @hasDecl(@TypeOf(app.shell), "markOperationalText")) {
+                                    app.shell.markOperationalText();
                                 }
                             },
                             .attempt_restart => |fallback| {

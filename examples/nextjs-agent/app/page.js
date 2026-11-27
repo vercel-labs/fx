@@ -42,6 +42,6 @@ export default function Page() {
     <p role="status">{status}</p>
     <label htmlFor="reply">Reply</label><br />
     <textarea id="reply" rows={12} cols={30} readOnly value={reply} />
-    <p><a href="https://github.com/vercel-labs/fx/blob/91ee71fe820940b986945c7a2e0d78aa537fe745/examples/README.md#run-an-example">Code and setup</a></p>
+    <p><a href="https://github.com/vercel-labs/fx/blob/87eea42e5e9c52e2ee40abeb6656d9f346fbbfb4/examples/README.md#run-an-example">Code and setup</a></p>
   </main>
 }

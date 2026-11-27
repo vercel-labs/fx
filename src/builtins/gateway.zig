@@ -14,6 +14,8 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
 const gateway_client = @import("../gateway/client.zig");
+const catalog_fetch_failure = @import("../gateway/catalog_fetch_failure.zig");
+const raw_answer_testing = @import("../gateway/raw_answer_testing.zig");
 const chat_completions_protocol = @import("../gateway/chat_completions_protocol.zig");
 const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
 const vercel_protocol = @import("../gateway/vercel_protocol.zig");
@@ -150,6 +152,8 @@ pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .stream_fn = streamAgentCompletion,
     .build_request_fn = buildAgentRequestForProvider,
     .project_replay_fn = vercel_protocol.selectReplayParts,
+    .provider_compaction_fn = vercel_model_policy.providerCompaction,
+    .holds_compaction_block_fn = vercel_protocol.holdsCompactionBlock,
 };
 
 pub const provider_bundle = provider_set.Bundle{
@@ -2705,30 +2709,15 @@ test "model catalog names an fx login team in the query and other teams in the h
 
 fn catalogRequestFailure(err: anyerror) model_catalog.Failure {
     if (err == error.OutOfMemory) return .{ .category = .resource_exhausted };
-    if (err == error.Cancelled) return .{ .category = .cancellation };
-    if (isInvalidGatewayResponse(err)) return .{ .category = .malformed_response };
+    // The size cap is the gateway's own limit, so catalog_fetch_failure.classify does not sort it.
+    if (err == error.GatewayJsonResponseTooLarge) return .{ .category = .malformed_response };
+    const sorted = catalog_fetch_failure.classify(err);
+    // The gateway keeps its own transport policy below, so a refused connection stays not retryable.
+    if (sorted.category != .transport) return sorted;
     return .{
         .category = .transport,
         // A request that hit the fetch deadline is worth retrying.
         .retryable = err == error.Timeout or gateway_client.isRetryableGatewayError(err),
-    };
-}
-
-fn isInvalidGatewayResponse(err: anyerror) bool {
-    return switch (err) {
-        error.HttpConnectionHeaderUnsupported,
-        error.HttpContentEncodingUnsupported,
-        error.HttpHeaderContinuationsUnsupported,
-        error.HttpHeadersInvalid,
-        error.HttpTransferEncodingUnsupported,
-        error.InvalidContentLength,
-        error.HttpChunkInvalid,
-        error.HttpChunkTruncated,
-        error.HttpHeadersOversize,
-        error.UnsupportedCompressionMethod,
-        error.GatewayJsonResponseTooLarge,
-        => true,
-        else => false,
     };
 }
 
@@ -2751,6 +2740,124 @@ test "catalog request failures preserve transport and cancellation facts" {
 
     const oversized = catalogRequestFailure(error.GatewayJsonResponseTooLarge);
     try std.testing.expectEqual(model_catalog.FailureCategory.malformed_response, oversized.category);
+}
+
+const loaded_catalog_json = "{\"data\":[{\"id\":\"fx/test-model\",\"type\":\"language\"}]}";
+
+/// Serves `answer` once, then fetches the AI Gateway catalog through the provider the product uses.
+fn fetchCatalogFromLoopbackAnswer(alloc: std.mem.Allocator, answer: []const u8) !model_catalog.ProviderResult {
+    var server = try raw_answer_testing.AnswerServer.start(alloc, answer);
+    const models_url = try server.url(alloc, models_path);
+    defer alloc.free(models_url);
+    const env = try ModelsUrlTestEnv.install(alloc, models_url);
+    defer env.deinit();
+    const result = try model_catalog_provider.fetch(alloc, .{
+        .access = .{ .public_only = .no_credential },
+        .endpoint = models_path,
+    });
+    try server.finish();
+    return result;
+}
+
+fn expectCatalogFailure(result: model_catalog.ProviderResult, category: model_catalog.FailureCategory, retryable: bool) !void {
+    switch (result) {
+        .failure => |failure| {
+            try std.testing.expectEqual(category, failure.category);
+            try std.testing.expectEqual(retryable, failure.retryable);
+        },
+        .catalog => return error.TestExpectedCatalogFailure,
+    }
+}
+
+fn gzipForTest(alloc: std.mem.Allocator, plain: []const u8) ![]u8 {
+    var compressed = try std.Io.Writer.Allocating.initCapacity(alloc, 64);
+    defer compressed.deinit();
+    var flate_scratch: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&compressed.writer, &flate_scratch, .gzip, .fastest);
+    try compressor.writer.writeAll(plain);
+    try compressor.finish();
+    return alloc.dupe(u8, compressed.written());
+}
+
+fn closedLoopbackPort() !u16 {
+    const zio = io_mod.getIo();
+    const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&address, zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    return server.socket.address.getPort();
+}
+
+test "AI Gateway catalog marks a 200 body cut inside its Content-Length malformed and retryable" {
+    const alloc = std.testing.allocator;
+    var result = try fetchCatalogFromLoopbackAnswer(alloc, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"data\":[]}");
+    defer if (result == .catalog) freeModelCatalog(alloc, &result.catalog);
+    try expectCatalogFailure(result, .malformed_response, true);
+}
+
+test "AI Gateway catalog marks a chunked body cut inside a chunk malformed and retryable" {
+    const alloc = std.testing.allocator;
+    var result = try fetchCatalogFromLoopbackAnswer(alloc, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nb\r\n{\"data\":[");
+    defer if (result == .catalog) freeModelCatalog(alloc, &result.catalog);
+    try expectCatalogFailure(result, .malformed_response, true);
+}
+
+test "AI Gateway catalog marks an answer cut inside its head malformed and retryable" {
+    const alloc = std.testing.allocator;
+    var result = try fetchCatalogFromLoopbackAnswer(alloc, "HTTP/1.1 200 OK\r\nContent-Ty");
+    defer if (result == .catalog) freeModelCatalog(alloc, &result.catalog);
+    try expectCatalogFailure(result, .malformed_response, true);
+}
+
+test "AI Gateway catalog marks a body marked gzip that is not gzip malformed and not retryable" {
+    const alloc = std.testing.allocator;
+    var result = try fetchCatalogFromLoopbackAnswer(alloc, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}");
+    defer if (result == .catalog) freeModelCatalog(alloc, &result.catalog);
+    try expectCatalogFailure(result, .malformed_response, false);
+}
+
+test "AI Gateway catalog marks a gzip body cut early malformed and retryable" {
+    const alloc = std.testing.allocator;
+    const gzip_body = try gzipForTest(alloc, loaded_catalog_json);
+    defer alloc.free(gzip_body);
+    const cut_body = gzip_body[0 .. gzip_body.len / 2];
+    const answer = try alloc.print(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ cut_body.len, cut_body },
+    );
+    defer alloc.free(answer);
+    var result = try fetchCatalogFromLoopbackAnswer(alloc, answer);
+    defer if (result == .catalog) freeModelCatalog(alloc, &result.catalog);
+    try expectCatalogFailure(result, .malformed_response, true);
+}
+
+test "AI Gateway catalog loads a complete chunked answer whose Content-Length is wrong" {
+    const alloc = std.testing.allocator;
+    const answer = try alloc.print(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{x}\r\n{s}\r\n0\r\n\r\n",
+        .{ loaded_catalog_json.len, loaded_catalog_json },
+    );
+    defer alloc.free(answer);
+    var result = try fetchCatalogFromLoopbackAnswer(alloc, answer);
+    defer if (result == .catalog) freeModelCatalog(alloc, &result.catalog);
+    switch (result) {
+        .catalog => |catalog| try std.testing.expectEqual(@as(usize, 1), catalog.items.len),
+        .failure => return error.TestExpectedCatalog,
+    }
+}
+
+test "AI Gateway catalog keeps a refused connection transport and not retryable" {
+    const alloc = std.testing.allocator;
+    const port = try closedLoopbackPort();
+    const models_url = try alloc.print("http://127.0.0.1:{d}{s}", .{ port, models_path });
+    defer alloc.free(models_url);
+    const env = try ModelsUrlTestEnv.install(alloc, models_url);
+    defer env.deinit();
+    var result = try model_catalog_provider.fetch(alloc, .{
+        .access = .{ .public_only = .no_credential },
+        .endpoint = models_path,
+    });
+    defer if (result == .catalog) freeModelCatalog(alloc, &result.catalog);
+    try expectCatalogFailure(result, .transport, false);
 }
 
 fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]const u8) ![]u8 {

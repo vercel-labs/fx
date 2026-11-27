@@ -545,6 +545,8 @@ pub const FakeAgentRuntimeDeps = struct {
     exec_plans: []const FakeExecPlan = &.{},
     execute_delegate: ?ExecuteDelegate = null,
     exec_index: usize = 0,
+    /// Set to true when a tool runs, as Ctrl+G during a step does.
+    set_on_exec: ?*std.atomic.Value(bool) = null,
     successful_effect_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     execute_timeout_started_ms: std.ArrayList(?i64) = .empty,
     permission_target: []const u8 = "/tmp/workspace/file.txt",
@@ -586,6 +588,7 @@ pub const FakeAgentRuntimeDeps = struct {
     terminal_lease_cleanup_index: usize = 0,
     finish_assistant_text: ?[]u8 = null,
     finish_presentation_text: ?[]u8 = null,
+    finish_user_input_id: ?u64 = null,
     finish_summary: ?types.TurnSummary = null,
     finish_projection: ?types.FinishedPromptProjection = null,
     finish_terminal_outcome: ?types.TurnPresentationOutcome = null,
@@ -614,6 +617,8 @@ pub const FakeAgentRuntimeDeps = struct {
     continue_on_need_user: ?*std.atomic.Value(bool) = null,
     /// Presses Esc (sets the flag) when a request waits for the user.
     cancel_on_need_user: ?*std.atomic.Value(bool) = null,
+    /// Closes the sign-in (sets the flag) when a request waits for one.
+    sign_in_closed_on_sign_in_wait: ?*std.atomic.Value(bool) = null,
     /// Records prompts handed back to the composer.
     record_restored_prompt: bool = false,
     cancel_on_permission: ?*std.atomic.Value(bool) = null,
@@ -685,6 +690,8 @@ pub const FakeAgentRuntimeDeps = struct {
     /// tool the turn executes, in order in `capture_log`.
     record_workspace_capture: bool = false,
     capture_log: std.ArrayList([]u8) = .empty,
+    /// How many `capture:settle` lines `capture_log` held when the turn was marked.
+    settles_when_marked: ?usize = null,
     /// Keeps the recovery module's record, as a host that resumes requests
     /// does.
     enable_recovery_record: bool = false,
@@ -692,8 +699,27 @@ pub const FakeAgentRuntimeDeps = struct {
     recovery_record: ?[32]u8 = null,
     recovery_record_writes: usize = 0,
     recovery_record_clears: usize = 0,
+    /// The next record saves through `save_recovery_record` fail, as a
+    /// write that does not land.
+    recovery_record_save_failures: usize = 0,
     /// The turn has pieces on disk, so a save between sends lands.
     recovery_turn_written: bool = true,
+    /// How many times the turn was marked as yielded (`mark_turn_yielded`).
+    turn_yielded_marks: usize = 0,
+    /// The host marks a yielded turn; false is a host that saves no session.
+    enable_turn_yield_marks: bool = true,
+    /// Returned by `mark_turn_yielded` instead of marking.
+    turn_yield_mark_error: ?anyerror = null,
+    /// What `hold_for_restart` returns; null is a host with no hold.
+    restart_hold_end: ?AgentRuntimeDeps.RestartHoldEnd = null,
+    /// How many times a turn held for a restart.
+    restart_holds: usize = 0,
+    /// The stop request a `go_on` hold clears, as a cancelled restart does
+    /// (`WorkerRuntime.cancelYield`).
+    restart_yield_flag: ?*std.atomic.Value(bool) = null,
+    /// `recovery_record_writes` when the turn held, so a test can see the
+    /// writes after it.
+    recovery_record_writes_at_hold: usize = 0,
     /// Returned by every session writer check; null confirms the writer.
     session_writer_error: ?anyerror = null,
     session_writer_checks: usize = 0,
@@ -868,6 +894,8 @@ pub const FakeAgentRuntimeDeps = struct {
             .ask_out_of_credits = askOutOfCredits,
             .ask_daily_limit = askDailyLimit,
             .save_recovery_record = if (self.enable_recovery_record) saveRecoveryRecord else null,
+            .mark_turn_yielded = if (self.enable_turn_yield_marks) markTurnYielded else null,
+            .hold_for_restart = if (self.restart_hold_end != null) holdForRestart else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
             .model_catalog_failure = catalogFailure,
@@ -1063,7 +1091,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .continue_turn => |owned| blk: {
                 defer worker_runtime.freeSteeringMessages(self.alloc, owned);
                 const messages = try arena.alloc(worker_runtime.SteeringMessage, owned.len);
-                for (owned, messages) |message, *copy| copy.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author };
+                for (owned, messages) |message, *copy| copy.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author, .input_id = message.input_id };
                 break :blk .{ .continue_turn = messages };
             },
             .none => .none,
@@ -1078,6 +1106,10 @@ pub const FakeAgentRuntimeDeps = struct {
         switch (write) {
             .keep => return false,
             .save => |bytes| {
+                if (self.recovery_record_save_failures > 0) {
+                    self.recovery_record_save_failures -= 1;
+                    return error.WriteFailed;
+                }
                 self.recovery_record = bytes;
                 self.recovery_record_writes += 1;
             },
@@ -1087,6 +1119,26 @@ pub const FakeAgentRuntimeDeps = struct {
             },
         }
         return true;
+    }
+
+    fn markTurnYielded(raw: *anyopaque) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (self.turn_yield_mark_error) |err| return err;
+        self.turn_yielded_marks += 1;
+        var settles: usize = 0;
+        for (self.capture_log.items) |line| {
+            if (std.mem.eql(u8, line, "capture:settle")) settles += 1;
+        }
+        self.settles_when_marked = settles;
+    }
+
+    fn holdForRestart(raw: *anyopaque) AgentRuntimeDeps.RestartHoldEnd {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.restart_holds += 1;
+        self.recovery_record_writes_at_hold = self.recovery_record_writes;
+        const end = self.restart_hold_end.?;
+        if (end == .go_on) if (self.restart_yield_flag) |flag| flag.store(false, .seq_cst);
+        return end;
     }
 
     fn askOutOfCredits(raw: *anyopaque) !runtime_deps.OutOfCreditsChoice {
@@ -1645,6 +1697,7 @@ pub const FakeAgentRuntimeDeps = struct {
             else
                 .{ .result = .{ .model_output = "ok" } };
             self.exec_index += 1;
+            if (self.set_on_exec) |flag| flag.store(true, .seq_cst);
             should_cancel = (self.cancel_on_execute_index == null or
                 self.cancel_on_execute_index.? == execution_index) and if (self.cancel_on_execute != null)
                 if (self.cancel_on_execute_name) |name|
@@ -1852,10 +1905,14 @@ pub const FakeAgentRuntimeDeps = struct {
                 }
                 switch (finished.turn) {
                     .assistant => |entry| {
+                        self.finish_user_input_id = entry.user.input_id;
                         if (self.finish_assistant_text) |value| self.alloc.free(value);
                         self.finish_assistant_text = try self.alloc.dupe(u8, entry.assistant);
                     },
-                    .interrupted => self.interrupted_event_count += 1,
+                    .interrupted => |entry| {
+                        self.finish_user_input_id = entry.user.input_id;
+                        self.interrupted_event_count += 1;
+                    },
                     .compacted_summary => {},
                 }
                 try self.record("event:finish_prompt", .{});
@@ -1979,6 +2036,9 @@ pub const FakeAgentRuntimeDeps = struct {
         if (status.kind == .need_user) {
             if (self.continue_on_need_user) |flag| flag.store(true, .seq_cst);
             if (self.cancel_on_need_user) |flag| flag.store(true, .seq_cst);
+            if (status.need) |need| if (need == .sign_in) {
+                if (self.sign_in_closed_on_sign_in_wait) |flag| flag.store(true, .seq_cst);
+            };
         }
         // Presses Esc while the request waits after the matching attempt.
         if (status.kind == .waiting) {

@@ -38,7 +38,12 @@ pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 /// Borrowed only for the call; a sink copies or serializes what it keeps.
 pub const TurnProgress = struct {
     user: types.UserTurn,
+    /// The turn as fx's history keeps it: after a compaction inside it,
+    /// only the part after the cut. A reload sends the model this again.
     execution: types.ExecutionMemory,
+    /// The whole turn, with the steps that compaction summarized, once one
+    /// cut some; null otherwise. Only the session log saves it (D87).
+    saved_execution: ?types.ExecutionMemory = null,
     /// Tool calls the model issued that have no result yet, in their saved
     /// form, so a crash while they run leaves them in the session (D28).
     running_calls: []const types.ToolCall = &.{},
@@ -213,6 +218,9 @@ pub const AgentRuntimeDeps = struct {
     /// The steps of `start_workspace_capture`.
     pub const WorkspaceCaptureStep = enum { begin, capture, settle };
 
+    /// How a turn held for an upgrade's restart ends.
+    pub const RestartHoldEnd = worker_runtime.WorkerRuntime.RestartHoldEnd;
+
     /// What `wait_for_handoff_mail` ended on.
     pub const HandoffMailWait = enum {
         /// Nothing waits in the hand-off for this agent, so the call did not wait.
@@ -316,6 +324,15 @@ pub const AgentRuntimeDeps = struct {
     /// pieces on disk yet. Null on hosts that never resume a request, which
     /// keep no record.
     save_recovery_record: ?*const fn (ctx: *anyopaque, record: types.RecoveryRecordWrite) anyerror!bool = null,
+    /// Marks the open turn as one that stopped between steps for its host,
+    /// after its record was saved clean, so the next launch continues it as
+    /// the same turn (`tests/tla/recovery/Resume.tla` Hold). Null on
+    /// hosts that never stop a turn this way.
+    mark_turn_yielded: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    /// Holds a turn that stopped for an upgrade's restart until the restart
+    /// goes ahead or is cancelled (`WorkerRuntime.holdForRestart`). Null: the
+    /// turn returns `error.TurnYielded` at once.
+    hold_for_restart: ?*const fn (ctx: *anyopaque) RestartHoldEnd = null,
     /// Called once with each main-model completion's provider usage, as soon
     /// as it arrives, so a saved session keeps the usage of every reply even
     /// when the turn never ends. A failure is traced and never fails the turn.
@@ -382,6 +399,9 @@ pub const AgentRuntimeDeps = struct {
     /// A turn that can never recover hands the user's prompt back to the
     /// composer so nothing typed is lost. Null: host keeps the prompt as-is.
     restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
+    /// Records `input_withdrawn` when a failed turn hands a queued prompt back
+    /// to the composer so resume does not restore it a second time.
+    withdraw_accepted_input: ?*const fn (ctx: *anyopaque, input_id: u64) anyerror!void = null,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
     /// `rejected_token` is the access token the provider just answered 401
@@ -393,6 +413,10 @@ pub const AgentRuntimeDeps = struct {
     /// Asks the user what to do when a provider's daily limit is reached, and
     /// blocks until they answer. Only the TUI sets it.
     ask_daily_limit: ?*const fn (ctx: *anyopaque, model: []const u8, offer_api_key: bool) anyerror!DailyLimitChoice = null,
+    /// A request that waited for a sign-in found the login another fx
+    /// process stored, and sends again with no answer from the host. The TUI
+    /// marks the turn as working for Herdr. Null: nothing marks it.
+    stored_sign_in_resumed: ?*const fn (ctx: *anyopaque) void = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
     /// The failure that keeps the model catalog down, so capability drops are

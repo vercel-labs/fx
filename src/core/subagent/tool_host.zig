@@ -62,6 +62,8 @@ const reads_now_several = "They follow this result.";
 const reads_next_one = "It starts your next turn once this one ends, so end your turn to read it.";
 const reads_next_several = "They start your next turn once this one ends, so end your turn to read them.";
 const answer_user_first = "Answer the user in text first, then call wait again if you still need a report.";
+/// What `wait` says when no report or message can still reach its caller.
+const nothing_can_arrive = "No subagent is working and no message is waiting, so no report or message will arrive. If shell returned running, call shell with action interact and the session_id from that result. Otherwise continue, or end your turn.";
 const answer_owed = "You have not answered the user's message yet, so wait returned at once. " ++ answer_user_first;
 /// How the result of a `wait` held back for the user's answer starts, as
 /// `encodeManaged` writes it.
@@ -341,9 +343,18 @@ pub const ReportSink = struct {
     /// Called with the host the delivery comes from. It never blocks: the
     /// runtime copies what it keeps and delivers it later.
     post_fn: *const fn (?*anyopaque, *Runtime, Delivery) PostReportError!void,
+    /// Whether mail this runtime took is still on its way to the worker of
+    /// the agent that owns the host, called on that agent's thread. Null
+    /// when `post_fn` queues mail on the worker before it returns.
+    mail_waiting_fn: ?*const fn (?*anyopaque, *Runtime) bool = null,
 
     pub fn post(self: ReportSink, host: *Runtime, delivery: Delivery) PostReportError!void {
         return self.post_fn(self.context, host, delivery);
+    }
+
+    pub fn mailWaiting(self: ReportSink, host: *Runtime) bool {
+        const waiting = self.mail_waiting_fn orelse return false;
+        return waiting(self.context, host);
     }
 };
 
@@ -358,7 +369,9 @@ pub const Delivery = union(enum) {
 /// `QueueFull`: the receiving agent's queue already holds
 /// `agent_frame.queue_cap` messages from other agents. Only a message is
 /// refused this way, never a report.
-pub const PostReportError = error{ OutOfMemory, AgentGone, QueueFull };
+/// `ReceiverRestarting`: the receiving agent stops its turn for fx's restart
+/// and takes no message before fx exits; the sender puts it in its report.
+pub const PostReportError = error{ OutOfMemory, AgentGone, QueueFull, ReceiverRestarting };
 
 pub const ProgressSink = struct {
     context: *anyopaque,
@@ -1218,6 +1231,40 @@ pub const Runtime = struct {
     /// only then.
     pub fn quiet(self: *Runtime) bool {
         return !self.anyWorking();
+    }
+
+    /// Whether mail for this host's owner is still in its runtime's hands,
+    /// not yet on the owner's worker (`ReportSink.mail_waiting_fn`).
+    fn mailOnTheWay(self: *Runtime) bool {
+        const sink = self.report_sink orelse return false;
+        return sink.mailWaiting(self);
+    }
+
+    /// Whether no mail can still reach `worker`, the owner's: no child works,
+    /// no mail is on its way, and none waits in the queue, read in that
+    /// order. A child posts its report before it stops counting as working,
+    /// and its runtime keeps the report until the worker has it, so each read
+    /// still sees what the read before it missed.
+    fn nothingCanArrive(self: *Runtime, worker: *worker_runtime.WorkerRuntime) bool {
+        if (self.anyWorking()) return false;
+        if (self.mailOnTheWay()) return false;
+        return worker.queuedPromptCount() == 0;
+    }
+
+    /// How long a `wait` blocks before it looks again at mail on its way,
+    /// which can be dropped without a post or nudge to wake the wait.
+    const handoff_recheck_ms = 50;
+
+    /// Blocks `wait` until a post, a nudge, or a stop. While mail is on its
+    /// way it looks again every `handoff_recheck_ms`, and once nothing can
+    /// arrive it returns null.
+    fn awaitPost(self: *Runtime, worker: *worker_runtime.WorkerRuntime) ?worker_runtime.WorkerRuntime.PostWake {
+        const recheck: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(handoff_recheck_ms), .clock = .awake } };
+        while (self.mailOnTheWay()) {
+            if (worker.waitForPostOrNudgeTimeout(recheck)) |wake| return wake;
+        }
+        if (self.nothingCanArrive(worker)) return null;
+        return worker.waitForPostOrNudge();
     }
 
     pub const TreeWake = enum { mail, quiet, stopped };
@@ -2235,16 +2282,19 @@ pub const Runtime = struct {
         // still ends it.
         self.setWaiter(worker);
         defer self.setWaiter(null);
-        if (worker.queuedPromptCount() == 0 and !self.anyWorking()) {
+        if (self.nothingCanArrive(worker)) {
             debug_trace.eventf("mailbox", "wait_skipped", .{}, "agent={s} reason=quiet", .{self.ownerName()});
-            return self.encodeManaged(alloc, .{ .ok = true, .result = "No subagent is working and no message is waiting, so no report or message will arrive. If shell returned running, call shell with action interact and the session_id from that result. Otherwise continue, or end your turn." });
+            return self.encodeManaged(alloc, .{ .ok = true, .result = nothing_can_arrive });
         }
         // The ones it waits for, named in its result for its row.
         var roster_arena = std.heap.ArenaAllocator.init(alloc);
         defer roster_arena.deinit();
         const waited_for = try self.roster(roster_arena.allocator(), true);
         debug_trace.eventf("mailbox", "wait_begin", .{}, "agent={s}", .{self.ownerName()});
-        const wake = worker.waitForPostOrNudge();
+        const wake = self.awaitPost(worker) orelse {
+            debug_trace.eventf("mailbox", "wait_end", .{}, "agent={s} reason=quiet", .{self.ownerName()});
+            return self.encodeManaged(alloc, .{ .ok = true, .result = nothing_can_arrive, .subagents = waited_for });
+        };
         // Mail joins the owner's running turn only where the host marks its
         // turns; elsewhere, as in ACP, it starts the next one, and the owner
         // must end this turn to read it (`tests/tla/subagent/MainMail.tla`
@@ -2265,7 +2315,7 @@ pub const Runtime = struct {
                 .result = try mailArrivedText(roster_arena.allocator(), senders, read),
                 .subagents = waited_for,
             }),
-            .nudged => self.encodeManaged(alloc, .{ .ok = true, .result = "A subagent's turn ended without a report. Call status to see where things stand, or wait again.", .subagents = waited_for }),
+            .nudged => self.encodeManaged(alloc, .{ .ok = true, .result = nudgedWaitResult(worker.yield_requested.load(.seq_cst)), .subagents = waited_for }),
             .stopped => error.Cancelled,
         };
     }
@@ -2913,7 +2963,11 @@ pub const Runtime = struct {
             .child_id = options.caller_id,
             .text = text,
             .user_typed = typed,
-        } }) catch |err| return self.refuse(alloc, if (err == error.QueueFull) .{ .queue_full = .parent } else .{ .no_parent = .unreachable_now });
+        } }) catch |err| return self.refuse(alloc, switch (err) {
+            error.QueueFull => .{ .queue_full = .parent },
+            error.ReceiverRestarting => .{ .no_parent = .restarting },
+            else => .{ .no_parent = .unreachable_now },
+        });
         debug_trace.eventf("mailbox", "post", .{}, "from={s} to={s} typed={d}", .{ options.caller_id, if (from_root) "owners_parent" else self.ownerName(), typed.len });
         return self.encodeManaged(alloc, .{ .ok = true, .result = "Sent to your parent. It arrives as your message, never as the user's." });
     }
@@ -2974,16 +3028,11 @@ pub const Runtime = struct {
     }
 
     /// Records the start, or with a null `label` the end, of call `call_id`
-    /// in child `child_id`'s running turn, for status and the agent list:
+    /// in child `child_id`'s running turn, for status:
     /// the interactive app calls it for its hosted children, whose events
     /// reach the app instead of the turn.
     pub fn noteChildCall(self: *Runtime, child_id: []const u8, call_id: []const u8, label: ?[]const u8) void {
         self.managed.noteCall(child_id, call_id, label, io_mod.milliTimestamp());
-    }
-
-    /// Child `child_id`'s current tool call, while its turn runs.
-    pub fn childCall(self: *Runtime, child_id: []const u8) ?live_metrics.Call {
-        return self.managed.currentCall(child_id);
     }
 
     const ChildProfile = union(enum) {
@@ -3706,6 +3755,24 @@ fn callToolResult(runtime: *Runtime, arena: Allocator, input: model_contract.Req
         .timestamp_ms = 1,
         .caller_worker = worker,
     });
+}
+
+/// What a `wait` that a nudge ended returns: a subagent's turn ended without
+/// a report, or fx asked the caller's turn to stop for an upgrade's restart
+/// while its subagents keep working (`WorkerRuntime.requestYield`).
+fn nudgedWaitResult(restarting: bool) []const u8 {
+    return if (restarting)
+        "fx may restart for an upgrade, so this wait ends here. The subagents keep working, and their reports still arrive."
+    else
+        "A subagent's turn ended without a report. Call status to see where things stand, or wait again.";
+}
+
+test "a wait that the upgrade's restart ends says the reports still arrive" {
+    try std.testing.expect(std.mem.find(u8, nudgedWaitResult(true), "their reports still arrive") != null);
+    try std.testing.expectEqualStrings(
+        "A subagent's turn ended without a report. Call status to see where things stand, or wait again.",
+        nudgedWaitResult(false),
+    );
 }
 
 fn waitForRuns(fixture: *MailboxFixture, count: usize) !void {
@@ -6952,6 +7019,89 @@ test "wait returns at once when nothing works, and when a report arrives" {
     try std.testing.expectEqual(types.MessageAuthor.child, queued.author);
 }
 
+/// A report sink that keeps each report in a hand-off until the test gives
+/// it to the caller's worker, as the app's does until its main loop runs
+/// (`deliverReports` in src/core/app/app_agents_runtime.zig).
+const HandOffSink = struct {
+    worker: *worker_runtime.WorkerRuntime,
+    held: std.atomic.Value(bool) = .init(false),
+
+    fn post(raw: ?*anyopaque, _: *Runtime, _: Delivery) PostReportError!void {
+        const self: *HandOffSink = @ptrCast(@alignCast(raw.?));
+        self.held.store(true, .seq_cst);
+    }
+
+    fn waiting(raw: ?*anyopaque, _: *Runtime) bool {
+        const self: *HandOffSink = @ptrCast(@alignCast(raw.?));
+        return self.held.load(.seq_cst);
+    }
+
+    /// After `delay_ms`, gives the held report to the worker, or with
+    /// `drop` lets it go without posting it, as the app does for an agent
+    /// that is gone. The mail leaves the hand-off only once the worker has it.
+    fn handOver(self: *HandOffSink, delay_ms: u64, drop: bool) void {
+        io_mod.sleep(delay_ms * std.time.ns_per_ms);
+        defer self.held.store(false, .seq_cst);
+        if (drop) return;
+        const text = std.testing.allocator.dupe(u8, "reviewer report") catch return;
+        self.worker.postMail(std.testing.allocator, .{
+            .prompt = text,
+            .images = &.{},
+            .model = &.{},
+            .api_key = &.{},
+            .permission_mode = .auto,
+            .history = &.{},
+            .grants = &.{},
+            .author = .child,
+            .mail = .report,
+        }) catch std.testing.allocator.free(text);
+    }
+};
+
+test "wait waits for a report its runtime still holds after the subagent went idle" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    var hand_off = HandOffSink{ .worker = &worker };
+    runtime.report_sink = .{ .context = &hand_off, .post_fn = HandOffSink.post, .mail_waiting_fn = HandOffSink.waiting };
+
+    for ([_]bool{ false, true }) |drop| {
+        const call = if (drop) "call-dropped" else "call-delivered";
+        _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = call } }, call, &worker);
+        try waitForRuns(&fixture, if (drop) 2 else 1);
+        fixture.release.set(io_mod.getIo());
+        // The subagent is idle and its report is in the hand-off, not yet
+        // on the worker: the window a slow main loop leaves open.
+        while (!runtime.quiet() or !hand_off.held.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+        fixture.release.reset();
+        const hand_over = try std.Thread.spawn(.{}, HandOffSink.handOver, .{ &hand_off, 100, drop });
+        const result = try callTool(runtime, arena, .wait, if (drop) "wait-dropped" else "wait-delivered", &worker);
+        hand_over.join();
+        errdefer std.debug.print("{s}: {s}\n", .{ call, result });
+        if (drop) {
+            // Mail the hand-off lets go without a post never comes, so the
+            // wait does not block on it.
+            try std.testing.expect(std.mem.find(u8, result, "no report or message will arrive") != null);
+            try std.testing.expectEqual(@as(usize, 0), worker.queuedPromptCount());
+        } else {
+            try std.testing.expect(std.mem.find(u8, result, "A report or message arrived") != null);
+            try std.testing.expectEqual(@as(usize, 1), worker.queuedPromptCount());
+            const queued = worker.takeQueuedPrompt(alloc).?;
+            worker_runtime.freeQueuedPrompt(alloc, queued);
+        }
+    }
+}
+
 test "wait asks the model to answer the user's message first, once, before it waits" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -7714,6 +7864,11 @@ fn postFull(_: ?*anyopaque, _: *Runtime, _: Delivery) PostReportError!void {
     return error.QueueFull;
 }
 
+/// A sink whose receiver stops its turn for fx's restart.
+fn postRestarting(_: ?*anyopaque, _: *Runtime, _: Delivery) PostReportError!void {
+    return error.ReceiverRestarting;
+}
+
 /// A sink that posts into a real worker queue, as the app's, `fx ask`'s and
 /// ACP's do, so the cap on messages is that queue's own.
 fn postToWorker(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
@@ -7781,6 +7936,10 @@ test "every refusal the host returns tells the model what happened and what to d
     try checkRefusalSentence(&problems, "the parent is gone", "no_parent", try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-10", null));
     runtime.report_sink = .{ .context = null, .post_fn = postFull };
     try checkRefusalSentence(&problems, "the parent's queue is full", "queue_full", try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-11", null));
+    runtime.report_sink = .{ .context = null, .post_fn = postRestarting };
+    const restarting = try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-11r", null);
+    try checkRefusalSentence(&problems, "the parent restarts for an upgrade", "no_parent", restarting);
+    if (std.mem.find(u8, restarting, "restarting for an upgrade") == null) try problems.print(alloc, "the parent restarts for an upgrade: the refusal does not name the restart: {s}\n", .{restarting});
     runtime.report_sink = sink;
 
     // A subagent that is being closed.

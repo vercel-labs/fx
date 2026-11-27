@@ -32,6 +32,7 @@ const image_attachments = @import("../core/images/image_attachments.zig");
 const image_data = @import("../core/images/image_data.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
+const prompt_test_controls = @import("prompt_test_controls.zig");
 const server = @import("server.zig");
 const mcp_host = @import("../core/mcp_host/host.zig");
 const sessions = @import("sessions.zig");
@@ -194,6 +195,12 @@ fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
         } },
         else => err,
     };
+}
+
+/// A yielded turn stays open in the journal for its host to resume; ending
+/// it would lose it (`tests/tla/recovery/Resume.tla` Relaunch).
+fn yieldedTurnStop(err: anyerror) ?TerminalOutcome {
+    return if (err == error.TurnYielded) .{ .stop_reason = .yielded } else null;
 }
 
 /// Sent to the client when the content filter blocked a reply and every
@@ -919,9 +926,13 @@ fn callHostTool(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const state: *server.ServerState = @ptrCast(@alignCast(raw_state));
     if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+    if (server.outboundClosedOrCancelled(state)) return error.Cancelled;
     const outbound_id = (server.beginOutboundRequest(state, .host_tool) catch
         return .{ .failure = try alloc.dupe(u8, "Host tool request failed") }) orelse
-        return .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
+        return if (server.outboundClosedOrCancelled(state))
+            error.Cancelled
+        else
+            .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
     var awaiting = true;
     errdefer if (awaiting) {
         server.cancelOutboundRequest(state, outbound_id);
@@ -1030,6 +1041,7 @@ const AcpElicitationResponderContext = struct {
             .capabilities = capabilities,
             .callback = respondToAcpMcpInput,
             .continuation_terminal = finishAcpUrlElicitations,
+            .declined_notice = tellAcpMcpDeclined,
         };
     }
 };
@@ -1159,21 +1171,47 @@ pub fn handlePrompt(
     captured_permission_mode: PermissionMode,
     usage_total: *types.Usage,
 ) !TerminalOutcome {
+    return handlePromptWithInputId(state, alloc, msg, captured_mode, captured_permission_mode, usage_total, null);
+}
+
+fn withdrawUnusedV2Input(session: *server.ActiveSessionState, maybe_id: ?u64) void {
+    if (comptime !server.has_v2_session_store) return;
+    const id = maybe_id orelse return;
+    const v2 = session.v2 orelse return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    v2.recordInputWithdrawn(id) catch |err| {
+        debug_trace.logf("session", "event=input_withdrawn_write_failed surface=acp id={d} err={s}", .{ id, @errorName(err) });
+    };
+}
+
+pub fn handlePromptWithInputId(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    captured_mode: []const u8,
+    captured_permission_mode: PermissionMode,
+    usage_total: *types.Usage,
+    v2_input_id: ?u64,
+) !TerminalOutcome {
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
     };
-    const selected = server.selectCredentialForProvider(state, session.provider) catch |err| switch (err) {
-        error.GoogleSignInRequired => return .{ .rpc_error = .{
-            .code = ErrorCode.invalid_request,
-            .message = credentials.google_sign_in_required_message,
-        } },
-        error.GoogleSessionDamaged => return .{ .rpc_error = .{
-            .code = ErrorCode.invalid_request,
-            .message = credentials.google_session_damaged_message,
-        } },
-        else => return err,
+    var unused_v2_input_id = v2_input_id;
+    errdefer withdrawUnusedV2Input(session, unused_v2_input_id);
+    const selected = server.selectCredentialForProvider(state, session.provider) catch |err| {
+        const message = switch (err) {
+            error.GoogleSignInRequired => credentials.google_sign_in_required_message,
+            error.GoogleSessionDamaged => credentials.google_session_damaged_message,
+            else => return err,
+        };
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
+        return .{ .rpc_error = .{ .code = ErrorCode.invalid_request, .message = message } };
     };
     if (!selected) {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
             .message = if (session.provider == .codex)
@@ -1185,17 +1223,23 @@ pub fn handlePrompt(
         } };
     }
     if (!ultrafastPromptAllowed(state, session)) {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
             .message = "Ultrafast mode requires a verified compatible Gateway model",
         } };
     }
 
-    const params = msg.params_raw orelse return .{
-        .rpc_error = .{
-            .code = ErrorCode.invalid_params,
-            .message = "Missing params",
-        },
+    const params = msg.params_raw orelse {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
+        return .{
+            .rpc_error = .{
+                .code = ErrorCode.invalid_params,
+                .message = "Missing params",
+            },
+        };
     };
 
     var prior_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, &.{});
@@ -1214,33 +1258,56 @@ pub fn handlePrompt(
         params,
         next_image_id,
         state.cfg.host_attachments,
-    ) catch |err| return promptInputFailure(err);
+    ) catch |err| {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
+        return promptInputFailure(err);
+    };
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
         if (session.wasm_state == null and session.v2 == null) {
             // libfx kernel session: images stay in memory and ride the kernel
             // checkpoint, so no filesystem snapshot backend is needed.
-            if (!fitsLibfxPrompt(prompt_input.pending_images)) return promptInputFailure(error.PromptImagesTooLarge);
-            prompt_input.captureImagesInline(alloc) catch |err|
+            if (!fitsLibfxPrompt(prompt_input.pending_images)) {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
+                return promptInputFailure(error.PromptImagesTooLarge);
+            }
+            prompt_input.captureImagesInline(alloc) catch |err| {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
                 return promptInputFailure(err);
+            };
             if (session.journal) |*journal| try prompt_input.noteStoredImages(state.alloc, journal);
         } else {
-            if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
+            if (comptime host_target.is_wasm) {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
+                return promptInputFailure(error.UnsupportedPromptImage);
+            }
             var temporary_snapshot_dir: ?[]u8 = null;
             defer if (temporary_snapshot_dir) |path| alloc.free(path);
             // Captured into a temporary folder; the turn keeps the bytes
             // (D44).
             const snapshot_dir = try session_store.imageSnapshotTempDir(alloc, &temporary_snapshot_dir);
             defer alloc.free(snapshot_dir);
-            prompt_input.captureImages(alloc, snapshot_dir) catch |err|
+            prompt_input.captureImages(alloc, snapshot_dir) catch |err| {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
                 return promptInputFailure(err);
-            image_attachments.inlineCapturedSnapshots(alloc, prompt_input.images) catch |err|
+            };
+            image_attachments.inlineCapturedSnapshots(alloc, prompt_input.images) catch |err| {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
                 return promptInputFailure(err);
+            };
         }
     }
     const prompt_text = prompt_input.text;
 
     if (prompt_input.continue_recovery and prompt_text.len != 0) {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
         return .{
             .rpc_error = .{
                 .code = ErrorCode.invalid_params,
@@ -1249,6 +1316,8 @@ pub fn handlePrompt(
         };
     }
     if (!prompt_input.continue_recovery and prompt_text.len == 0) {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
         return .{
             .rpc_error = .{
                 .code = ErrorCode.invalid_params,
@@ -1416,6 +1485,7 @@ pub fn handlePrompt(
     defer sign_in.deinit(alloc);
     var job: worker_runtime.QueuedPrompt = .{
         .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
+        .input_id = unused_v2_input_id,
         .prompt = @constCast(owned_prompt),
         .images = @constCast(current_images),
         .authorized_image_catalog = authorized_image_catalog,
@@ -1465,6 +1535,7 @@ pub fn handlePrompt(
     };
     maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null, ctx.observer);
     defer if (session.title_task != null) completeAcpTitleTask(state, session);
+    unused_v2_input_id = null;
     const first_turn = agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
         .view = state.lifecycle_view,
         .scope = .{
@@ -1479,11 +1550,9 @@ pub fn handlePrompt(
     // is: a checkpoint saves it.
     usage_total.add(session.session_rt.agent.turn_usage);
     first_turn catch |err| {
-        if (err == error.TurnYielded) {
-            // The journal keeps the turn open for a later resume; nothing
-            // ends it here.
+        if (yieldedTurnStop(err)) |stop| {
             prompt_input.retainImageSnapshots();
-            return .{ .stop_reason = .yielded };
+            return stop;
         }
         if (err == error.NonInteractivePermissionRequired) {
             ctx.stop_reason = .refused;
@@ -2431,7 +2500,13 @@ fn takeSteeringBoundary(
     }
     // An ACP client's steering is the user's own.
     const messages = try arena.alloc(worker_runtime.SteeringMessage, drained.texts.len);
-    for (drained.texts, messages) |text, *message| message.* = .{ .text = text };
+    for (drained.texts, messages, 0..) |text, *message, index| {
+        const v2_input_id: ?u64 = if (comptime server.has_v2_session_store)
+            (if (index < drained.v2_input_ids.len) drained.v2_input_ids[index] else null)
+        else
+            null;
+        message.* = .{ .text = text, .input_id = v2_input_id };
+    }
     return .{ .continue_turn = messages };
 }
 
@@ -2801,7 +2876,13 @@ fn requestAcpPermission(
     try writeValidatedToolArguments(alloc, &validated_arguments.writer, call.arguments_json);
 
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const request_id = server.beginPermissionRequest(ctx.state) orelse return error.PermissionRequestAlreadyPending;
+    prompt_test_controls.pauseBeforePermissionInsert();
+    if (server.outboundClosedOrCancelled(ctx.state)) return error.Cancelled;
+    const request_id = server.beginPermissionRequest(ctx.state) orelse
+        return if (server.outboundClosedOrCancelled(ctx.state))
+            error.Cancelled
+        else
+            error.PermissionRequestAlreadyPending;
     errdefer {
         server.cancelPermissionRequest(ctx.state, request_id);
         _ = server.awaitPermissionDecision(ctx.state, request_id);
@@ -3192,7 +3273,7 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const v2 = session.v2 orelse return;
-    v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }) catch |err| {
+    v2.appendProgressWithRecord(progress.user, progress.execution, progress.saved_execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }, .keep) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
     };
 }
@@ -3332,8 +3413,13 @@ fn appendJournalToolIntent(raw_ctx: *anyopaque, progress: agent_runtime.TurnProg
 /// Waits until the host holds every journal event sent so far.
 fn flushJournal(state: *server.ServerState, alloc: Allocator, session_id: []const u8) !void {
     if (comptime host_target.is_wasm) return js_host_journal.flush();
+    if (server.outboundClosedOrCancelled(state)) return error.Cancelled;
     const outbound_id = (server.beginOutboundRequest(state, .journal) catch
-        return error.JournalFlushFailed) orelse return error.JournalFlushFailed;
+        return error.JournalFlushFailed) orelse
+        return if (server.outboundClosedOrCancelled(state))
+            error.Cancelled
+        else
+            error.JournalFlushFailed;
     var awaiting = true;
     errdefer if (awaiting) {
         server.cancelOutboundRequest(state, outbound_id);
@@ -3461,6 +3547,7 @@ fn runReportTurns(
         }, agent_config, job);
         usage_total.add(session.session_rt.agent.turn_usage);
         report_turn catch |err| {
+            if (yieldedTurnStop(err)) |stop| return stop;
             endJournalTurn(alloc, state.alloc, session) catch |end_err| {
                 debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
             };
@@ -3660,6 +3747,7 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
     var yields = false;
+    const stop_requested = hostAskedToYield(session);
     const barrier = barrier: {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -3667,9 +3755,13 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         try journal.appendProgress(ctx.alloc, ctx.state.alloc, session.session_id, checkpoint, session.model);
         // Only the progress right before a request can yield; a compaction
         // or a paused retry finishes where it is.
-        if (checkpoint.outstanding_reservation and checkpoint.cause != .compaction_prepared and
-            journal.yieldsAt(io_mod.milliTimestamp()))
-        {
+        const kind: libfx_journal.QuiesceKind = if (!checkpoint.outstanding_reservation)
+            .other
+        else if (checkpoint.cause == .compaction_prepared)
+            .compaction
+        else
+            .request;
+        if (journal.yieldsAt(io_mod.milliTimestamp(), kind, stop_requested)) {
             try journal.appendMarked(ctx.alloc, session.session_id, .turn_yielded, true);
             yields = true;
         }
@@ -3689,8 +3781,16 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
         try journal.keepYielded(ctx.state.alloc, checkpoint);
     }
-    debug_trace.logf("session", "event=libfx_journal_turn_yielded session={s}", .{session.session_id});
+    debug_trace.logf("session", "event=libfx_journal_turn_yielded session={s} requested={s}", .{ session.session_id, if (stop_requested) "host" else "deadline" });
     return error.TurnYielded;
+}
+
+/// Whether the host asked the running turn to stop at its next safe point: a
+/// web host through its import, since the web core reads no ACP message while a
+/// prompt runs, and a native host through `libfx/yield`.
+fn hostAskedToYield(session: *const server.ActiveSessionState) bool {
+    if (comptime host_target.is_wasm) return js_host_steering.yieldRequested();
+    return session.yield_requested.load(.seq_cst);
 }
 
 fn keepCancelledProgress(session_alloc: Allocator, session: *server.ActiveSessionState, checkpoint: session_codec.RecoveryCheckpoint) !void {
@@ -3874,6 +3974,15 @@ const AcpInputResponse = struct {
         self.* = undefined;
     }
 };
+
+/// A question fx declined, said by the two paths `pushContextNotice` chooses between: an ACP v1 notice for a client that
+/// advertised them, else an operational message. A repeat is not dropped, so each refused call is told.
+fn tellAcpMcpDeclined(raw_ctx: *anyopaque, text: []const u8) void {
+    const responder: *AcpElicitationResponderContext = @ptrCast(@alignCast(raw_ctx));
+    const ctx = responder.acp;
+    if (ctx.state.client_notices) return ctx.sendNotice(text) catch |err| debug_trace.logf("mcp", "MCP declined-question notice not sent err={s}", .{@errorName(err)});
+    pushSystemNotice(@ptrCast(ctx), text) catch |err| debug_trace.logf("mcp", "MCP declined-question notice not sent err={s}", .{@errorName(err)});
+}
 
 fn respondToAcpMcpInput(
     raw_ctx: *anyopaque,
@@ -5256,6 +5365,14 @@ test "stripAnsiAlloc returns the original slice for clean text and strips escape
     try std.testing.expect(std.mem.find(u8, stripped, "\x1b") == null);
 }
 
+test "stripAnsiAlloc drops an escape with intermediate bytes whole" {
+    const alloc = std.testing.allocator;
+    // Command output that resets its style as `tput sgr0` does.
+    const stripped = try stripAnsiAlloc(alloc, "Build failed\x1b(B\x1b[m\n");
+    defer alloc.free(stripped);
+    try std.testing.expectEqualStrings("Build failed\n", stripped);
+}
+
 test "stripAnsiAlloc converts OSC-8 hyperlinks with params and BEL terminators" {
     const alloc = std.testing.allocator;
     const with_params = try stripAnsiAlloc(alloc, "\x1b]8;id=fx-1;https://ziglang.org/download/\x1b\\Zig downloads\x1b]8;;\x1b\\ ready");
@@ -6480,4 +6597,83 @@ test "ACP prompt agent config carries request options from active session" {
     try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
     try std.testing.expect(tool_ctx.ultrafast_mode);
+}
+
+test "a report turn that yields stops as yielded and leaves its journal turn open" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    // Declared before the state, so the state closes its session before the store ends.
+    var store = try session_adapter.Store.open(alloc, home);
+    defer store.deinit(alloc);
+    var state = try initTestAcpState(alloc, workspace, .auto);
+    defer state.deinit();
+    // Test runs use stdout as their protocol channel, so no notice may reach it.
+    const Silent = struct {
+        fn write(_: ?*anyopaque, _: []const u8) !void {}
+    };
+    state.writer = jsonrpc.Writer.initCallback(null, Silent.write);
+    state.active_session.?.v2 = try session_adapter.Session.create(alloc, &store, home, .acp, .{
+        .preferences = .{ .model = @constCast("test-model"), .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+    state.active_session.?.journal = .{ .writer = &state.writer };
+
+    server.enableSubagentHost(&state);
+    try std.testing.expect(state.subagent_host != null);
+    const subagents = state.subagent_host.?;
+    try subagents.report_sink.?.post(subagents, .{ .report = .{ .agent = "reviewer", .child_id = "child-1", .work_id = "work-1", .call_id = "call-1", .outcome = .completed, .output = "done" } });
+    try std.testing.expectEqual(@as(usize, 1), state.worker.queuedPromptCount());
+
+    // Stands in for setJournalProgress yielding at the report turn's first request save.
+    const StandIn = struct {
+        var saw_report_text = false;
+
+        fn set(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) anyerror!void {
+            if (std.mem.find(u8, checkpoint.user.text, "done") != null) saw_report_text = true;
+            const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+            ctx.state.active_session.?.journal.?.progress_open = true;
+            return error.TurnYielded;
+        }
+        fn clear(_: *anyopaque) anyerror!void {}
+        fn capabilities(_: *anyopaque, _: []const u8) model_capabilities.Capabilities {
+            return .{ .context_window = 1_000_000, .image_input_support = .non_native };
+        }
+        fn resolveCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities {
+            return capabilities(raw_ctx, model);
+        }
+    };
+    StandIn.saw_report_text = false;
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+    var deps = agentRuntimeDeps(&ctx);
+    deps.recovery_checkpoint = .{ .set = StandIn.set, .clear = StandIn.clear };
+    deps.available_model_capabilities = StandIn.capabilities;
+    deps.resolve_model_capabilities = StandIn.resolveCapabilities;
+
+    const agent_config = buildAgentConfig(&state, &state.active_session.?, .{ .custom_tool_guidance = "" });
+    const base: worker_runtime.QueuedPrompt = .{
+        .prompt = &.{},
+        .images = &.{},
+        .model = @constCast("test-model"),
+        .api_key = &.{},
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+    };
+    var usage_total: types.Usage = .{};
+    const stop = try runReportTurns(&state, &state.active_session.?, alloc, &ctx, &deps, agent_config, base, &usage_total);
+    try std.testing.expectEqual(@as(?TerminalOutcome, .{ .stop_reason = .yielded }), stop);
+    try std.testing.expectEqual(@as(usize, 0), state.worker.queuedPromptCount());
+    // A yielded turn carries the report, so a resume continues it with nothing lost.
+    try std.testing.expect(StandIn.saw_report_text);
+    // The journal keeps the yielded turn open for the host to resume.
+    try std.testing.expect(state.active_session.?.journal.?.progress_open);
 }
