@@ -1,13 +1,13 @@
 {
   "libfx": {
-    "packed": 4050000,
+    "packed": 4060000,
     "unpacked": 11647000
   },
   "fx-core.wasm": {
     "bytes": 2505000
   },
   "fx-term.wasm": {
-    "bytes": 4358000
+    "bytes": 4375000
   },
   "engine.js": {
     "gzip": 34600

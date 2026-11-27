@@ -242,11 +242,7 @@ pub fn Runtime(comptime App: type) type {
             ctx.permission_state_override = &run.admission.permission_state;
             ctx.advertised_dynamic_tool_names = run.admission.integration_names;
             ctx.mcp_access = if (run.admission.mcp_view) |*view|
-                .{ .scoped = .{
-                    .captured = view,
-                    .admission_authority_generation = run.admission.authority_generation,
-                    .live = .{ .context = run, .resolve_fn = resolveChildLiveMcpView },
-                } }
+                .{ .scoped = .{ .captured = view } }
             else
                 .disabled;
             // A child's `subagent` calls go to its own host, which the tool
@@ -295,15 +291,6 @@ pub fn Runtime(comptime App: type) type {
         /// through the child's profile, which gives the same mode again.
         fn userPermissionMode(run: *const agents.ChildRun) ?types.PermissionMode {
             return if (run.inFlight()) null else run.admission.permission_mode;
-        }
-
-        fn resolveChildLiveMcpView(raw: *anyopaque, alloc: Allocator) !tool_mcp_runtime.ResolvedLiveView {
-            const run: *agents.ChildRun = @ptrCast(@alignCast(raw));
-            var authority = if (userPermissionMode(run)) |mode|
-                try run.authority_resolver.resolveForUser(alloc, run.child_id, mode)
-            else
-                try run.authority_resolver.resolve(alloc, run.child_id);
-            return subagent_execution.liveMcpViewFrom(alloc, &authority);
         }
 
         fn resolveChildLiveToolAction(
