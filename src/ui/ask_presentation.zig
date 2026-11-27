@@ -8,6 +8,7 @@ const render_request = @import("render_request.zig");
 const shared_theme = @import("../core/shared/theme.zig");
 const shell_runtime = @import("shell_runtime.zig");
 const shimmer_runtime = @import("transcript/shimmer_runtime.zig");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const transcript_painter = @import("transcript/painter.zig");
 const transcript_runtime = @import("transcript/runtime.zig");
 const ui_render = @import("render.zig");
@@ -20,6 +21,8 @@ const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const restore_terminal_sequence = "\x1b[0m\x1b]8;;\x1b\\\x1b[?25h\x1b[?7h\n";
 const prepare_terminal_sequence = "\x1b[0m\x1b]8;;\x1b\\\x1b[?7l";
 const thinking_activity_label = "• Thinking";
+/// Autowrap is on only while an outside prompt prints; see `beginOutsidePrompt`.
+const outside_prompt_terminal_sequence = "\x1b[?7h";
 
 pub const Runtime = struct {
     alloc: Allocator,
@@ -29,7 +32,14 @@ pub const Runtime = struct {
     thinking: bool = true,
     terminal_prepared: bool = false,
     finished: bool = false,
+    /// True once an outside prompt has restarted this presentation. Tool events
+    /// for calls that started before the prompt have no row here; see `pushToolLifecycle`.
+    restarted_below_prompt: bool = false,
     pending_error: ?anyerror = null,
+    /// Taken by every push, so only one thread writes the live area at a time.
+    /// `beginOutsidePrompt` takes it too and keeps it until `endOutsidePrompt`,
+    /// so pushes from other threads wait while a prompt owns the screen.
+    mutex: std.Io.Mutex = .init,
 
     pub fn init(
         alloc: Allocator,
@@ -38,7 +48,7 @@ pub const Runtime = struct {
     ) !Runtime {
         const layout = zeroFooterLayout(try ui_terminal.queryLayout(std.posix.STDOUT_FILENO, 0));
         var terminal = shell_runtime.TerminalState{};
-        const cursor = probeTerminal(&terminal, layout, no_color);
+        const cursor = probeTerminal(&terminal, layout, no_color, .startup);
         return initConfigured(
             alloc,
             header,
@@ -59,6 +69,32 @@ pub const Runtime = struct {
         cursor: shell_runtime.CursorPosition,
         sync_updates_enabled: bool,
     ) !Runtime {
+        var self = try initBare(alloc, no_color, stdout_file, layout, cursor, sync_updates_enabled);
+        errdefer self.deinit();
+        self.thinking = true;
+
+        const banner = try ui_render.askHeaderMessage(alloc, header);
+        defer alloc.free(banner);
+        try self.shell.writeTranscriptClassified(
+            alloc,
+            &self.metrics,
+            banner,
+            true,
+            .welcome,
+        );
+        try self.render();
+        return self;
+    }
+
+    /// A presentation whose live area starts at `cursor`, with no transcript yet.
+    fn initBare(
+        alloc: Allocator,
+        no_color: bool,
+        stdout_file: std.Io.File,
+        layout: types.Layout,
+        cursor: shell_runtime.CursorPosition,
+        sync_updates_enabled: bool,
+    ) !Runtime {
         var self = Runtime{
             .alloc = alloc,
             .shell = .{
@@ -69,6 +105,7 @@ pub const Runtime = struct {
                 .notebook = .{ .transcript_release = .{ .policy = .append_only } },
             },
             .no_color = no_color,
+            .thinking = false,
         };
         errdefer self.deinit();
 
@@ -86,17 +123,6 @@ pub const Runtime = struct {
         self.terminal_prepared = true;
         try self.writeTerminalBytes(prepare_terminal_sequence);
         try self.shell.initViewport(&self.metrics, start.row);
-
-        const banner = try ui_render.askHeaderMessage(alloc, header);
-        defer alloc.free(banner);
-        try self.shell.writeTranscriptClassified(
-            alloc,
-            &self.metrics,
-            banner,
-            true,
-            .welcome,
-        );
-        try self.render();
         return self;
     }
 
@@ -125,6 +151,8 @@ pub const Runtime = struct {
     }
 
     pub fn setThinking(self: *Runtime, active: bool) !void {
+        self.lock();
+        defer self.unlock();
         try self.checkPendingError();
         if (self.finished) return;
         if (self.thinking == active) return;
@@ -135,6 +163,8 @@ pub const Runtime = struct {
     /// The open tail is applied at once: `fx ask` writes committed text without a pacer.
     fn pushAssistantTail(raw: *anyopaque, alloc: std.mem.Allocator, events: []assistant_presentation.Event) !void {
         const self: *Runtime = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.unlock();
         self.checkPendingError() catch |err| {
             assistant_presentation.freeEventSlice(alloc, events);
             return err;
@@ -145,6 +175,8 @@ pub const Runtime = struct {
     }
 
     pub fn pushText(self: *Runtime, text: []const u8) !void {
+        self.lock();
+        defer self.unlock();
         try self.checkPendingError();
         if (text.len > 0) self.thinking = false;
         _ = self.shell.streamAssistantChunk(self.alloc, &self.metrics, text) catch |err| return self.failWith(err);
@@ -152,9 +184,15 @@ pub const Runtime = struct {
     }
 
     pub fn pushToolLifecycle(self: *Runtime, event: types.ToolLifecycleEvent) !void {
+        self.lock();
+        defer self.unlock();
         try self.checkPendingError();
         self.thinking = false;
-        _ = self.shell.applyToolLifecycle(self.alloc, event) catch |err| return self.failWith(err);
+        _ = self.shell.applyToolLifecycle(self.alloc, event) catch |err| {
+            if (err != error.UnknownToolLifecycleIdentity or !self.restarted_below_prompt) return self.failWith(err);
+            debug_trace.logf("ask", "tool event for a call that started above the prompt has no row here", .{});
+            return;
+        };
         self.render() catch |err| return self.failWith(err);
         switch (event) {
             .turn_finished => self.shell.finishLifecycleBatch(self.alloc) catch |err| return self.failWith(err),
@@ -164,6 +202,8 @@ pub const Runtime = struct {
 
     pub fn pushDiffBlock(self: *Runtime, payload: diff_mod.DiffEntryPayload) !void {
         defer diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
+        self.lock();
+        defer self.unlock();
         try self.checkPendingError();
         self.thinking = false;
         _ = self.shell.appendRawTranscriptEntryClassified(
@@ -175,6 +215,8 @@ pub const Runtime = struct {
     }
 
     pub fn pushNotice(self: *Runtime, notice: types.SemanticNotice) !void {
+        self.lock();
+        defer self.unlock();
         try self.checkPendingError();
         if (notice.visibility != .full_only) self.thinking = false;
         _ = self.shell.appendSemanticNotice(self.alloc, notice) catch |err| return self.failWith(err);
@@ -182,13 +224,15 @@ pub const Runtime = struct {
     }
 
     pub fn finish(self: *Runtime) !void {
+        self.lock();
+        defer self.unlock();
         try self.checkPendingError();
         if (self.finished) return;
         if (self.thinking) {
             self.thinking = false;
             try self.render();
-        } else if (self.shell.render_requests.hasPending()) {
-            try self.render();
+        } else {
+            try self.renderPending();
         }
         try self.restoreTerminal();
         self.finished = true;
@@ -196,6 +240,8 @@ pub const Runtime = struct {
 
     fn pushTable(raw: *anyopaque, table: assistant_presentation.TablePayload) !void {
         const self: *Runtime = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.unlock();
         try self.checkPendingError();
         self.thinking = false;
         _ = self.shell.appendAssistantTableOwned(self.alloc, table) catch |err| return self.failWith(err);
@@ -206,6 +252,8 @@ pub const Runtime = struct {
 
     fn pushCodeBlock(raw: *anyopaque, block: assistant_presentation.CodeBlockPayload) !void {
         const self: *Runtime = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.unlock();
         try self.checkPendingError();
         self.thinking = false;
         _ = self.shell.appendAssistantCodeBlockOwned(self.alloc, block) catch |err| return self.failWith(err);
@@ -216,10 +264,20 @@ pub const Runtime = struct {
 
     fn pushThematicRule(raw: *anyopaque) !void {
         const self: *Runtime = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.unlock();
         try self.checkPendingError();
         self.thinking = false;
         _ = self.shell.appendAssistantThematicRule(self.alloc) catch |err| return self.failWith(err);
         self.render() catch |err| return self.failWith(err);
+    }
+
+    fn lock(self: *Runtime) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+    }
+
+    fn unlock(self: *Runtime) void {
+        self.mutex.unlock(io_mod.getIo());
     }
 
     fn checkPendingError(self: *Runtime) !void {
@@ -236,6 +294,11 @@ pub const Runtime = struct {
         return err;
     }
 
+    /// Draws rows that are still pending.
+    fn renderPending(self: *Runtime) !void {
+        if (!self.shell.render_requests.hasPending()) return;
+        try self.render();
+    }
     fn render(self: *Runtime) !void {
         if (!self.shell.render_requests.hasPending()) self.shell.render_requests.request(.transcript);
         var attempt = (try self.shell.render_requests.beginAttempt()) orelse return;
@@ -243,6 +306,13 @@ pub const Runtime = struct {
 
         var source = try self.shell.prepareTranscriptSource(self.alloc, null);
         defer source.deinit(self.alloc);
+        // A presentation restarted below a prompt can hold only rows that paint
+        // nothing, such as a marker entry, until a push adds visible rows. Keep the
+        // request pending for that push instead of asking the renderer for a paint.
+        if (source.preview.natural_visual_rows == 0) {
+            attempt.restore();
+            return;
+        }
         var prepared: ?transcript_painter.PreparedTranscriptSurfacePaint = null;
         defer if (prepared) |*paint| paint.deinit(self.alloc);
         var resolved_target: ?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget = null;
@@ -359,6 +429,56 @@ pub const Runtime = struct {
         self.terminal_prepared = false;
         try self.writeTerminalBytes(restore_terminal_sequence);
     }
+
+    /// Called before a prompt writes below the presentation. Pending rows are
+    /// drawn first, so the screen is complete. Autowrap is on while the prompt
+    /// prints, so a long prompt line wraps instead of overwriting its last column.
+    /// On success the lock stays held until `endOutsidePrompt`, so no other
+    /// thread can write while the prompt owns the screen.
+    pub fn beginOutsidePrompt(self: *Runtime) !void {
+        self.lock();
+        errdefer self.unlock();
+        try self.checkPendingError();
+        if (self.finished or !self.terminal_prepared) return;
+        if (self.thinking) {
+            self.thinking = false;
+            self.render() catch |err| return self.failWith(err);
+        } else {
+            self.renderPending() catch |err| return self.failWith(err);
+        }
+        // The presentation's last row can end mid-line, so the prompt starts on a fresh row.
+        if (self.shell.shadow_vt.?.cursor_col > 1) self.writeTerminalBytes("\r\n") catch |err| return self.failWith(err);
+        self.writeTerminalBytes(outside_prompt_terminal_sequence) catch |err| return self.failWith(err);
+    }
+
+    /// Called after a prompt has read its answers. The rows the prompt wrote
+    /// stay as they are: the presentation starts a new live area below the
+    /// cursor, so it never paints over them. Releases the lock that
+    /// `beginOutsidePrompt` took.
+    pub fn endOutsidePrompt(self: *Runtime) void {
+        defer self.unlock();
+        if (self.finished or !self.terminal_prepared) return;
+        // The presentation never saw the rows the prompt wrote or the echoed answer,
+        // so the cursor comes from the terminal. The layout is the one the presentation
+        // last drew with: a resize during the prompt is applied at the next draw.
+        const layout = self.shell.layout;
+        var terminal = shell_runtime.TerminalState{};
+        const cursor = probeTerminal(&terminal, layout, self.no_color, .after_outside_prompt);
+        debug_trace.logf("ask", "presentation restarts below an outside prompt cursor={d},{d} layout={d}x{d}", .{ cursor.row, cursor.col, layout.rows, layout.cols });
+        self.restartBelow(layout, cursor) catch |err| self.rememberFailure(err);
+    }
+
+    /// Replaces the finished live area with an empty one at `cursor`. The old
+    /// transcript is dropped, not repainted: its rows are already on screen above.
+    /// Only the live area changes. The lock, the pending error and the shared
+    /// flags stay as they are, so the caller's lock still covers the new area.
+    fn restartBelow(self: *Runtime, layout: types.Layout, cursor: shell_runtime.CursorPosition) !void {
+        const next = try initBare(self.alloc, self.no_color, self.shell.stdout_file, layout, cursor, self.shell.sync_updates_enabled);
+        self.shell.deinit(self.alloc);
+        self.shell = next.shell;
+        self.metrics = next.metrics;
+        self.restarted_below_prompt = true;
+    }
 };
 
 const SolveContext = struct {
@@ -461,15 +581,24 @@ const PaintContext = struct {
     }
 };
 
+/// Why the terminal is probed. Startup also sets the theme. A probe after an
+/// outside prompt only reads the cursor: the theme is already set, and the
+/// prompt must not change it.
+const TerminalProbe = enum { startup, after_outside_prompt };
+
+/// The one terminal probe: raw mode on stdin, then the cursor position. Without
+/// an answer from the terminal, the last row of `layout` is used.
 fn probeTerminal(
     terminal: *shell_runtime.TerminalState,
     layout: types.Layout,
     no_color: bool,
+    probe: TerminalProbe,
 ) shell_runtime.CursorPosition {
     const fallback = shell_runtime.CursorPosition{ .row = layout.rows, .col = 1 };
+    const sets_theme = probe == .startup;
     // A light/dark pin was applied before presentation setup; leave it alone.
     const theme_locked = ui_render.themeInputLocked();
-    if (!theme_locked) {
+    if (sets_theme and !theme_locked) {
         const fallback_light = if (no_color) false else ui_render.explicitThemeOverride() orelse false;
         ui_render.initTheme(fallback_light, null);
     }
@@ -478,7 +607,7 @@ fn probeTerminal(
     terminal.enableRawMode() catch return fallback;
     defer terminal.disableRawMode();
 
-    if (!no_color and !theme_locked) {
+    if (sets_theme and !no_color and !theme_locked) {
         const theme = ui_render.detectTheme(std.heap.c_allocator, terminal);
         if (shared_theme.sourceName()) |name| {
             // Custom themes resolve after detection picks the variant, same
@@ -829,6 +958,54 @@ test "ask presentation restores thinking after tool lifecycle and clears on setT
     try std.testing.expect(std.mem.find(u8, bytes, "\x1bc") == null);
 }
 
+test "ask presentation restarts below an outside prompt without repainting earlier rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output = try tmp.dir.createFile(std.testing.io, "ask-outside-prompt.log", .{ .read = true });
+    defer output.close(io_mod.getIo());
+
+    const layout = zeroFooterLayout(.{
+        .rows = 20,
+        .cols = 60,
+        .content_bottom = 20,
+        .divider_top_row = 20,
+        .input_row = 20,
+        .divider_bottom_row = 20,
+        .hint_row = 20,
+    });
+    var runtime = try Runtime.initConfigured(
+        alloc,
+        .{ .model = "openai/gpt-5" },
+        false,
+        output,
+        layout,
+        .{ .row = 1, .col = 1 },
+        true,
+    );
+    defer runtime.deinit();
+    try runtime.pushText("alpha line\nbeta line\n");
+
+    const before_prompt: usize = @intCast(try output.length(io_mod.getIo()));
+    try runtime.beginOutsidePrompt();
+    try runtime.writeTerminalBytes("\nEnter a value: local-value\r\n");
+    const after_prompt: usize = @intCast(try output.length(io_mod.getIo()));
+    try runtime.restartBelow(layout, .{ .row = runtime.shell.shadow_vt.?.cursor_row, .col = 1 });
+    runtime.unlock();
+    try runtime.pushText("gamma line\n");
+    try runtime.finish();
+
+    const bytes = try io_mod.readFileToEnd(alloc, &output, 1 << 20);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes[before_prompt..after_prompt], outside_prompt_terminal_sequence) != null);
+    const restarted = bytes[after_prompt..];
+    try std.testing.expect(std.mem.find(u8, restarted, prepare_terminal_sequence) != null);
+    try std.testing.expect(std.mem.find(u8, restarted, "gamma line") != null);
+    try std.testing.expect(std.mem.find(u8, restarted, "alpha line") == null);
+    try std.testing.expect(std.mem.find(u8, restarted, "𝒇x v") == null);
+    try std.testing.expect(std.mem.find(u8, restarted, "Run /help") == null);
+}
+
 test "ask presentation neutralizes thinking row styling under no_color" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -866,4 +1043,48 @@ test "ask presentation neutralizes thinking row styling under no_color" {
     try std.testing.expect(std.mem.find(u8, bytes, "\x1b[2J") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\x1b[3J") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\x1bc") == null);
+}
+
+test "an outside prompt holds the presentation lock until it ends" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output = try tmp.dir.createFile(std.testing.io, "ask-outside-lock.log", .{ .read = true });
+    defer output.close(io_mod.getIo());
+
+    const layout = zeroFooterLayout(.{
+        .rows = 20,
+        .cols = 60,
+        .content_bottom = 20,
+        .divider_top_row = 20,
+        .input_row = 20,
+        .divider_bottom_row = 20,
+        .hint_row = 20,
+    });
+    var runtime = try Runtime.initConfigured(
+        alloc,
+        .{ .model = "openai/gpt-5" },
+        false,
+        output,
+        layout,
+        .{ .row = 1, .col = 1 },
+        true,
+    );
+    defer runtime.deinit();
+
+    try runtime.beginOutsidePrompt();
+    try std.testing.expect(!runtime.mutex.tryLock());
+    var pushed = std.atomic.Value(bool).init(false);
+    const worker = try std.Thread.spawn(.{}, pushFromWorker, .{ &runtime, &pushed });
+    try std.testing.expect(!pushed.load(.seq_cst));
+    runtime.unlock();
+    worker.join();
+    try std.testing.expect(pushed.load(.seq_cst));
+    try std.testing.expect(runtime.mutex.tryLock());
+    runtime.unlock();
+}
+
+fn pushFromWorker(runtime: *Runtime, pushed: *std.atomic.Value(bool)) void {
+    runtime.pushText("worker line\n") catch return;
+    pushed.store(true, .seq_cst);
 }

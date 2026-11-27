@@ -2125,10 +2125,15 @@ fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) 
     }
 }
 
-/// Reports a pending shell snapshot fallback once, on stderr.
+/// Reports a pending shell snapshot fallback once.
 fn writeShellSnapshotNotice(ctx: *AskContext) void {
     var buffer: [shell_snapshot.max_notice_bytes]u8 = undefined;
     const notice = shell_snapshot.processOwner().takeUiNotice(&buffer) orelse return;
+    if (ctx.presenter) |presenter| {
+        // A failed draw stays pending in the presentation and is reported at finish.
+        presenter.pushNotice(.{ .topic = "startup", .tone = .warning, .body = notice }) catch return;
+        return;
+    }
     ctx.writeStderr("fx ask: warning: ") catch return;
     ctx.writeStderr(notice) catch return;
     ctx.writeStderr("\n") catch return;
@@ -2645,6 +2650,13 @@ fn writeBlockedActionGuidance(
     reason: []const u8,
     hint: []const u8,
 ) !void {
+    // In terminal mode the guidance goes to the presentation, so it starts on its own row.
+    // Writing it at the presentation's cursor would run it into the tool header above.
+    if (ctx.presenter) |presenter| {
+        const body = try ctx.alloc.print("{s}\nfx ask: blocked action: {s}\nfx ask: reason={s}\n{s}", .{ headline, label, reason, std.mem.trimEnd(u8, hint, "\n") });
+        defer ctx.alloc.free(body);
+        return presenter.pushNotice(.{ .topic = "permission", .tone = .warning, .body = body });
+    }
     try ctx.writeLine(headline);
     try ctx.writeStderr("fx ask: blocked action: ");
     try ctx.writeStderr(label);
@@ -2675,6 +2687,11 @@ fn promptCliPermissionApproval(
     label: []const u8,
 ) !PermissionApprovalPromptResult {
     if (!cliContextPermissionPromptAllowed(ctx)) return .unavailable;
+    // The approval prompt writes rows only when it can read an answer, which needs a
+    // terminal on stdin. Only then does the presentation restart around it.
+    const outside = ctx.presenter != null and (std.Io.File.stdin().isTty(io_mod.getIo()) catch false);
+    if (outside) try ctx.presenter.?.beginOutsidePrompt();
+    defer if (outside) ctx.presenter.?.endOutsidePrompt();
     return try ctx.deps.permission_approval_prompt(
         ctx.deps.permission_approval_prompt_ctx,
         ctx.deps.stderr_ctx,
@@ -3734,6 +3751,10 @@ fn askTerminalMcpQuestion(
         for (answers[0..answered]) |answer| alloc.free(answer);
         alloc.free(answers);
     }
+    // The prompt writes rows the presentation does not track, so the presentation
+    // draws first and restarts below the prompt once the answers are read.
+    if (ctx.presenter) |presenter| try presenter.beginOutsidePrompt();
+    defer if (ctx.presenter) |presenter| presenter.endOutsidePrompt();
     for (entries) |entry| {
         try ctx.writeStderr("\n");
         try ctx.writeStderr(entry.question);
