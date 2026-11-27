@@ -34,10 +34,10 @@ pub const Deps = struct {
 /// provider runs to its end (`orchestrator.zig` `canStopForRestart`), and
 /// the ways out of the wait.
 const restart_ways_out = "Ctrl+G cancels the restart, Esc twice interrupts the turn, /quit exits without the restart";
-const restart_waits_notice = "fx restarts for the upgrade when the running turns stop or end; " ++ restart_ways_out;
-const restart_waits_for_subagents_notice = "fx restarts for the upgrade when the running turns stop or end and the subagents finish; " ++ restart_ways_out;
-const restart_cancelled_notice = "restart cancelled; Ctrl+G restarts for the upgrade later";
-const restart_releasing_notice = "fx is restarting for the upgrade now";
+const restart_waits_notice = "fx restarts for the update when the running turns stop or end; " ++ restart_ways_out;
+const restart_waits_for_subagents_notice = "fx restarts for the update when the running turns stop or end and the subagents finish; " ++ restart_ways_out;
+const restart_cancelled_notice = "restart cancelled; Ctrl+G restarts for the update later";
+const restart_releasing_notice = "fx is restarting for the update now";
 
 /// Whether `App` can stop running turns between steps for the restart.
 /// Without it, Ctrl+G still refuses while a response streams.
@@ -107,15 +107,15 @@ pub fn Runtime(comptime App: type) type {
         /// while one is there (`draftPending`).
         fn draftNotice(app: *App, agent: *AppAgent) ?[]const u8 {
             if (comptime @hasField(App, "input_runtime")) {
-                if (app.input_runtime.paste.active()) return "finish the paste before upgrading";
-                if (app.input_runtime.edit_state.input.items.len > 0) return "submit or clear the current prompt before upgrading";
+                if (app.input_runtime.paste.active()) return "finish the paste before updating";
+                if (app.input_runtime.edit_state.input.items.len > 0) return "submit or clear the current prompt before updating";
             }
             if (comptime agents.hasAgentField(App, "pending_images")) {
-                if (agent.pending_images.items.len > 0) return "submit or clear pending images before upgrading";
+                if (agent.pending_images.items.len > 0) return "submit or clear pending images before updating";
             }
             // The worker holds its queue while it yields, so a sent prompt
             // that has not started would wait there until fx exits.
-            if (submissionPending(app)) return "upgrade is unavailable while a sent prompt waits to go out";
+            if (submissionPending(app)) return "update is unavailable while a sent prompt waits to go out";
             return null;
         }
 
@@ -178,7 +178,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "needsUserElsewhere")) {
                 var name_buf: [32]u8 = undefined;
                 if (app.needsUserElsewhere(&name_buf)) |busy| {
-                    const notice = try app.alloc.print("upgrade is unavailable while {s} {s}", .{ busy.name, busyPhrase(busy.doing) });
+                    const notice = try app.alloc.print("update is unavailable while {s} {s}", .{ busy.name, busyPhrase(busy.doing) });
                     defer app.alloc.free(notice);
                     try writeUpgradeNotice(app, .neutral, notice);
                     return .unavailable;
@@ -191,7 +191,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "queuedWorkElsewhere")) {
                 var queue_name_buf: [32]u8 = undefined;
                 if (app.queuedWorkElsewhere(&queue_name_buf)) |name| {
-                    const notice = try app.alloc.print("upgrade is unavailable while {s} has queued prompts", .{name});
+                    const notice = try app.alloc.print("update is unavailable while {s} has queued prompts", .{name});
                     defer app.alloc.free(notice);
                     try writeUpgradeNotice(app, .neutral, notice);
                     return .unavailable;
@@ -205,14 +205,14 @@ pub fn Runtime(comptime App: type) type {
 
             if (comptime @hasField(App, "upgrader")) {
                 if (app.upgrader.getState() != auto_upgrade.State.ready) {
-                    try writeUpgradeNotice(app, .neutral, "no installed upgrade is ready");
+                    try writeUpgradeNotice(app, .neutral, "no installed update is ready");
                     return .not_ready;
                 }
             }
 
             app.prepareResumeHandoffForUpgrade(agent) catch |err| {
                 const notice = try app.alloc.print(
-                    "upgrade paused because this conversation is not safely resumable: {s}; run `fx doctor` for recovery guidance",
+                    "update paused because this conversation is not safely resumable: {s}; run `fx doctor` for recovery guidance",
                     .{@errorName(err)},
                 );
                 defer app.alloc.free(notice);
@@ -226,7 +226,7 @@ pub fn Runtime(comptime App: type) type {
                 &executable_buf,
             ) catch |err| {
                 const notice = try app.alloc.print(
-                    "upgrade installed, but the executable path could not be resolved: {s}; restart fx manually",
+                    "update installed, but the executable path could not be resolved: {s}; restart fx manually",
                     .{@errorName(err)},
                 );
                 defer app.alloc.free(notice);
@@ -236,7 +236,7 @@ pub fn Runtime(comptime App: type) type {
 
             app.requestUpgradeRelaunch(executable_path) catch |err| {
                 const notice = try app.alloc.print(
-                    "upgrade installed, but relaunch could not be prepared: {s}; restart fx manually",
+                    "update installed, but relaunch could not be prepared: {s}; restart fx manually",
                     .{@errorName(err)},
                 );
                 defer app.alloc.free(notice);
@@ -297,38 +297,38 @@ pub fn Runtime(comptime App: type) type {
         fn upgradeUnavailableNotice(app: *App, agent: *AppAgent) ?[]const u8 {
             // A host that stops turns between steps waits for them instead.
             if (comptime agents.hasAgentField(App, "stream") and !supportsYield(App)) {
-                if (agent.stream.active) return "upgrade is unavailable until the response finishes";
+                if (agent.stream.active) return "update is unavailable until the response finishes";
             }
             if (comptime agents.hasAgentField(App, "worker")) {
                 if (comptime @hasDecl(@TypeOf(agent.worker), "queuedPromptCount")) {
                     if (agent.worker.queuedPromptCount() > 0) {
-                        return "upgrade is unavailable while prompts are queued";
+                        return "update is unavailable while prompts are queued";
                     }
                 }
             }
             if (comptime agents.hasAgentField(App, "question_prompt")) {
-                if (agent.question_prompt.isActive()) return "upgrade is unavailable while a question is open";
+                if (agent.question_prompt.isActive()) return "update is unavailable while a question is open";
             }
             if (comptime agents.hasAgentField(App, "approval_prompt")) {
-                if (agent.approval_prompt.isActive()) return "upgrade is unavailable while an approval is open";
+                if (agent.approval_prompt.isActive()) return "update is unavailable while an approval is open";
             }
             if (comptime @hasField(App, "auth") and
                 @hasDecl(@TypeOf(app.auth), "apiKeyEntryActive"))
             {
-                if (app.auth.apiKeyEntryActive()) return "upgrade is unavailable during API key entry";
+                if (app.auth.apiKeyEntryActive()) return "update is unavailable during API key entry";
             }
             if (comptime @hasField(App, "subagents")) {
-                if (app.subagents.isViewActive()) return "close the subagent view before upgrading";
+                if (app.subagents.isViewActive()) return "close the subagent view before updating";
             }
             if (comptime agents.hasAgentField(App, "session_persistence")) {
-                if (agent.session_persistence.session_picker.active) return "close the session picker before upgrading";
+                if (agent.session_persistence.session_picker.active) return "close the session picker before updating";
             }
             if (comptime @hasField(App, "terminal")) {
-                if (app.terminal.fullTranscriptScreenActive()) return "close the transcript view before upgrading";
+                if (app.terminal.fullTranscriptScreenActive()) return "close the transcript view before updating";
             }
             if (draftNotice(app, agent)) |notice| return notice;
             if (comptime @hasField(App, "terminal_input_runtime")) {
-                if (app.terminal_input_runtime.hasPendingTerminalAction()) return "finish the key sequence before upgrading";
+                if (app.terminal_input_runtime.hasPendingTerminalAction()) return "finish the key sequence before updating";
             }
             return null;
         }
@@ -599,7 +599,7 @@ test "app_upgrade_runtime refuses while another agent needs the user, and names 
     const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
 
     try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
-    try std.testing.expectEqualStrings("upgrade is unavailable while reviewer needs approval", app.notices.items);
+    try std.testing.expectEqualStrings("update is unavailable while reviewer needs approval", app.notices.items);
     try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
     try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
     try std.testing.expect(!app.should_exit);
@@ -616,7 +616,7 @@ test "app_upgrade_runtime refuses while another instance has queued prompts, and
     const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
 
     try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
-    try std.testing.expectEqualStrings("upgrade is unavailable while fx 2 has queued prompts", app.notices.items);
+    try std.testing.expectEqualStrings("update is unavailable while fx 2 has queued prompts", app.notices.items);
     try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
     try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
     try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
@@ -750,7 +750,7 @@ test "app_upgrade_runtime rejects ctrl+g while upgrade is not ready" {
 
     try std.testing.expectEqual(ApplyOutcome.not_ready, outcome);
     try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
-    try std.testing.expect(std.mem.find(u8, app.notices.items, "no installed upgrade is ready") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items, "no installed update is ready") != null);
 }
 
 test "app_upgrade_runtime requires an active session before reload" {
@@ -1038,7 +1038,7 @@ test "app_upgrade_runtime names the ways out of the restart wait" {
     const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
     try std.testing.expectEqual(ApplyOutcome.waiting, outcome);
     try std.testing.expectEqualStrings(
-        "fx restarts for the upgrade when the running turns stop or end; Ctrl+G cancels the restart, Esc twice interrupts the turn, /quit exits without the restart",
+        "fx restarts for the update when the running turns stop or end; Ctrl+G cancels the restart, Esc twice interrupts the turn, /quit exits without the restart",
         app.notices.items,
     );
 }

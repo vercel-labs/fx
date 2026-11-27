@@ -6709,7 +6709,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Ctrl+G while the turn runs: the upgrade waits instead of refusing.
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
+      await active.waitForText("fx restarts for the update when the running turns stop or end", TIMEOUT);
       // A draft in the composer holds the restart, so the screen before it
       // can be checked.
       await active.sendLiteralText("HOLD");
@@ -6723,13 +6723,13 @@ test.skipIf(!tmuxAvailable())(
       // With the composer empty, fx relaunches and the new build continues
       // the same turn, with one line that says so.
       await active.sendKeys("BSpace BSpace BSpace BSpace");
-      await active.waitForText("continuing the turn after the upgrade", UPGRADE_TIMEOUT);
+      await active.waitForText("continuing the turn after the update", UPGRADE_TIMEOUT);
       // While the continued request waits, its status line is the plain
       // one, never a retry's.
       await continuedAsked.fired;
       expect(gateway.requests.length).toBe(2);
       const waiting = await active.waitForPane((pane) => {
-        const at = pane.lastIndexOf("continuing the turn after the upgrade");
+        const at = pane.lastIndexOf("continuing the turn after the update");
         return at >= 0 && pane.indexOf("Thinking", at) > at;
       }, UPGRADE_TIMEOUT);
       expect(waiting).not.toContain("Resuming the interrupted request");
@@ -6738,7 +6738,7 @@ test.skipIf(!tmuxAvailable())(
       const scrollback = await active.captureFullScrollback();
       expect(scrollback).not.toContain("What can fx do differently?");
       expect(scrollback).not.toContain("Resuming the interrupted request");
-      expect(countOccurrences(scrollback, "continuing the turn after the upgrade")).toBe(1);
+      expect(countOccurrences(scrollback, "continuing the turn after the update")).toBe(1);
       const argvLines = readFileSync(argvLogPath, "utf8").trim().split("\n");
       expect(argvLines.some((line) => line.split("\t")[3] === "--upgrade-relaunch")).toBe(true);
 
@@ -6778,8 +6778,8 @@ test.skipIf(!tmuxAvailable())(
       expect(tapesShowed([tapeBefore, tapeAfter], ["What can fx do differently?", "Cancelled", "Resuming the interrupted request"], frames)).toEqual([]);
       // The tapes hold each process's output: the stop before the relaunch,
       // the continuation after it.
-      expect(tapesShowed([tapeBefore], ["stopped between steps for the upgrade"], join(frames, "before"))).toEqual(["stopped between steps for the upgrade"]);
-      expect(tapesShowed([tapeAfter], ["continuing the turn after the upgrade"], join(frames, "after"))).toEqual(["continuing the turn after the upgrade"]);
+      expect(tapesShowed([tapeBefore], ["stopped between steps for the update"], join(frames, "before"))).toEqual(["stopped between steps for the update"]);
+      expect(tapesShowed([tapeAfter], ["continuing the turn after the update"], join(frames, "after"))).toEqual(["continuing the turn after the update"]);
       // The yielded turn stays open, so the first launch never reports it to
       // the terminal as failed, only as work in progress.
       const writtenBefore = readTapeFrames(tapeBefore, { ignoreTruncatedTail: true })
@@ -6876,7 +6876,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendHexBytes(["07"]);
       await active.waitForText(
-        "fx restarts for the upgrade when the running turns stop or end; Ctrl+G cancels the restart, Esc twice interrupts the turn, /quit exits without the restart",
+        "fx restarts for the update when the running turns stop or end; Ctrl+G cancels the restart, Esc twice interrupts the turn, /quit exits without the restart",
         TIMEOUT,
       );
       await active.waitForText("restart waits: ctrl+g to cancel", TIMEOUT);
@@ -6889,7 +6889,7 @@ test.skipIf(!tmuxAvailable())(
       expect(relaunched()).toBe(false);
 
       await active.sendHexBytes(["07"]);
-      await active.waitForText("restart cancelled; Ctrl+G restarts for the upgrade later", TIMEOUT);
+      await active.waitForText("restart cancelled; Ctrl+G restarts for the update later", TIMEOUT);
       await secondAsked.fired;
       expect(gateway.requests.length).toBe(2);
       expect(relaunched()).toBe(false);
@@ -7015,7 +7015,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendHexBytes(["07"]);
       await active.waitForText(
-        "fx restarts for the upgrade when the running turns stop or end; Ctrl+G cancels the restart, Esc twice interrupts the turn, /quit exits without the restart",
+        "fx restarts for the update when the running turns stop or end; Ctrl+G cancels the restart, Esc twice interrupts the turn, /quit exits without the restart",
         TIMEOUT,
       );
       await active.sendLiteralText("HOLD");
@@ -7024,7 +7024,7 @@ test.skipIf(!tmuxAvailable())(
 
       await waitForCondition(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=turn_held_for_restart"), "the turn held for the restart");
       await active.sendHexBytes(["07"]);
-      await active.waitForText("restart cancelled; Ctrl+G restarts for the upgrade later", TIMEOUT);
+      await active.waitForText("restart cancelled; Ctrl+G restarts for the update later", TIMEOUT);
       await secondAsked.fired;
 
       await active.sendKeys("BSpace BSpace BSpace BSpace");
@@ -7046,7 +7046,7 @@ test.skipIf(!tmuxAvailable())(
       expect(relaunched()).toBe(false);
 
       await active.sendKeys("BSpace BSpace BSpace BSpace");
-      await active.waitForText("continuing the turn after the upgrade", UPGRADE_TIMEOUT);
+      await active.waitForText("continuing the turn after the update", UPGRADE_TIMEOUT);
       await thirdAsked.fired;
       await active.waitForText("AFTER_CANCEL_RESTART_DONE", UPGRADE_TIMEOUT);
       expect(relaunched()).toBe(true);
@@ -7182,7 +7182,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Ctrl+G while the turn runs: the upgrade waits instead of refusing.
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
+      await active.waitForText("fx restarts for the update when the running turns stop or end", TIMEOUT);
       releaseFirst();
 
       // The tool runs, the turn stops between steps, fx relaunches with the
@@ -7350,7 +7350,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Ctrl+G while request 6 is held: the upgrade waits for the turn to stop.
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
+      await active.waitForText("fx restarts for the update when the running turns stop or end", TIMEOUT);
       releaseStep5();
 
       // The step ends, the turn stops between steps, fx relaunches, and the
@@ -7791,7 +7791,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
       // The restart waits for the subagent to finish its work.
-      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
+      await active.waitForText("fx restarts for the update when the running turns stop or end", TIMEOUT);
       await active.waitForText("and the subagents finish", TIMEOUT);
       expect(relaunched()).toBe(false);
 
@@ -7937,7 +7937,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
       // The restart waits for the subagent to finish its work.
-      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
+      await active.waitForText("fx restarts for the update when the running turns stop or end", TIMEOUT);
       await active.waitForText("and the subagents finish", TIMEOUT);
       expect(relaunched()).toBe(false);
 
@@ -8050,7 +8050,7 @@ test.skipIf(!tmuxAvailable())(
       await soloAsked.fired;
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
+      await active.waitForText("fx restarts for the update when the running turns stop or end", TIMEOUT);
 
       // A prompt waits for the restart, but /quit still quits, with no relaunch.
       await active.sendText("/quit");
@@ -8156,8 +8156,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("Enter");
       await active.waitForPane((pane) => pane.includes("fx 1/2") && !pane.includes(LIST_HINT), TIMEOUT);
       await active.sendHexBytes(["07"]);
-      const refused = await active.waitForText("upgrade is unavailable while fx 2 has queued prompts", TIMEOUT);
-      expect(refused).not.toContain("fx restarts for the upgrade");
+      const refused = await active.waitForText("update is unavailable while fx 2 has queued prompts", TIMEOUT);
+      expect(refused).not.toContain("fx restarts for the update");
       expect(relaunched()).toBe(false);
 
       // The command ends, the turn answers, and fx 1 quits.
@@ -8261,7 +8261,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("UPGRADE_MAIN start solo");
       await mainAsked.fired;
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
+      await active.waitForText("fx restarts for the update when the running turns stop or end", TIMEOUT);
 
       // Main starts the subagent, then stops before its next request. The
       // subagent keeps working, so fx waits for it.
@@ -8290,7 +8290,7 @@ test.skipIf(!tmuxAvailable())(
       expect(tapesShowed([tapeBefore, tapeAfter], ["solo was cancelled", "What can fx do differently?", "Cancelled"], frames)).toEqual([]);
       // The tapes hold main's stop in the first process and main's report in
       // the second.
-      expect(tapesShowed([tapeBefore], ["stopped between steps for the upgrade"], join(frames, "before"))).toEqual(["stopped between steps for the upgrade"]);
+      expect(tapesShowed([tapeBefore], ["stopped between steps for the update"], join(frames, "before"))).toEqual(["stopped between steps for the update"]);
       expect(tapesShowed([tapeAfter], ["MAIN_SAW_REPORT"], join(frames, "after"))).toEqual(["MAIN_SAW_REPORT"]);
       await active.kill();
       active = null;

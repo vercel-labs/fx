@@ -165,7 +165,7 @@ pub const resumed_request_notice: core_types.SemanticNotice = .{
 pub const continued_turn_notice: core_types.SemanticNotice = .{
     .topic = "upgrade",
     .tone = .neutral,
-    .body = "continuing the turn after the upgrade",
+    .body = "continuing the turn after the update",
 };
 
 pub fn projectSnapshotLocator(buffer: []u8, path: []const u8) ![]const u8 {

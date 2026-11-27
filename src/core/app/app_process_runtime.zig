@@ -35,13 +35,13 @@ fn settleCompactionWorkFailure(worker: *worker_runtime.WorkerRuntime, work: work
 const yielded_notice: types.SemanticNotice = .{
     .topic = "upgrade",
     .tone = .neutral,
-    .body = "stopped between steps for the upgrade; this turn goes on after fx restarts",
+    .body = "stopped between steps for the update; this turn goes on after fx restarts",
 };
 
 /// What the transcript says when a turn held for an upgrade's restart could
 /// not save its next request again after the restart was cancelled
 /// (`RequestRecovery.reopenAfterYield`).
-const reopen_failed_text = "The turn stopped because fx could not save its next request after the upgrade restart was cancelled. Send a prompt to go on.";
+const reopen_failed_text = "The turn stopped because fx could not save its next request after the update restart was cancelled. Send a prompt to go on.";
 
 /// Whether `App` runs its agent on the main loop, without worker threads.
 pub fn cooperativeHost(comptime App: type) bool {
@@ -375,7 +375,7 @@ test "formatErrorBody says why a turn stopped after a cancelled restart and what
     const body = try Runtime(DummyApp).formatErrorBody(alloc, "request failed", error.RecordNotSaved);
     defer alloc.free(body);
     try std.testing.expectEqualStrings(
-        "The turn stopped because fx could not save its next request after the upgrade restart was cancelled. Send a prompt to go on.",
+        "The turn stopped because fx could not save its next request after the update restart was cancelled. Send a prompt to go on.",
         body,
     );
 }

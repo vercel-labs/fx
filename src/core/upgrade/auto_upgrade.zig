@@ -257,10 +257,10 @@ pub const AutoUpgrade = struct {
             .downloading => {
                 var ver_buf: [32]u8 = undefined;
                 const ver = self.getLatestVersion(&ver_buf);
-                return std.mem.print(buf, "upgrading to {s}...", .{ver}) catch "";
+                return std.mem.print(buf, "updating to {s}...", .{ver}) catch "";
             },
             .ready => return "update ready: ctrl+g to reload",
-            .failed => return "upgrade failed",
+            .failed => return "update failed",
             else => return "",
         }
     }
@@ -647,7 +647,7 @@ test "statusLabel downloading shows ellipsis" {
     au.setState(.downloading);
     var buf: [64]u8 = undefined;
     const label = au.statusLabel(&buf);
-    try std.testing.expectEqualStrings("upgrading to 0.3.0...", label);
+    try std.testing.expectEqualStrings("updating to 0.3.0...", label);
 }
 
 test "statusLabel ready explains ctrl+g reload" {
@@ -731,12 +731,23 @@ test "statusLabel checking returns empty" {
     try std.testing.expectEqual(@as(usize, 0), label.len);
 }
 
-test "statusLabel failed shows upgrade failed" {
+test "statusLabel failed shows update failed" {
     var au = AutoUpgrade{};
     au.setState(.failed);
     var buf: [64]u8 = undefined;
     const label = au.statusLabel(&buf);
-    try std.testing.expectEqualStrings("upgrade failed", label);
+    try std.testing.expectEqualStrings("update failed", label);
+}
+
+test "footer statuses for downloading, ready and failed all say updat" {
+    var au = AutoUpgrade{};
+    au.setLatestVersion("v0.3.0");
+    var buf: [64]u8 = undefined;
+    for ([_]State{ .downloading, .ready, .failed }) |state| {
+        au.setState(state);
+        const label = au.statusLabel(&buf);
+        try std.testing.expect(std.mem.find(u8, label, "updat") != null);
+    }
 }
 
 test "getState returns the current atomic state" {

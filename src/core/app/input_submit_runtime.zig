@@ -71,7 +71,7 @@ fn buildPendingPromptDraft(
     };
 }
 
-const restart_held_submit_notice = "fx restarts for the upgrade once the running turns stop and the prompt is empty; send this after the restart";
+const restart_held_submit_notice = "fx restarts for the update once the running turns stop and the prompt is empty; send this after the restart";
 
 /// What a prompt sent while fx waits to restart for an upgrade gets. Ctrl+G
 /// cancels a restart only while it waits for its turns, not once the held
