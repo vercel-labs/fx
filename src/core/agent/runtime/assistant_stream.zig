@@ -60,6 +60,102 @@ pub const SemanticPresentationSink = struct {
     assistant_tail: ?*const fn (ctx: *anyopaque, alloc: Allocator, events: []assistant_presentation.Event) anyerror!void,
 };
 
+/// The tool calls a reply started, every tool alike, kept without allocation
+/// so a reply cut off at its output limit can tell which calls it never
+/// finished. Starts past `capacity` are counted, not kept.
+pub const StreamedToolStarts = struct {
+    pub const capacity = 64;
+    const max_name_bytes = 64;
+    const Start = struct {
+        id_hash: u64,
+        name_len: u8,
+        name: [max_name_bytes]u8,
+    };
+
+    starts: [capacity]Start = undefined,
+    kept: usize = 0,
+
+    fn hash(id: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, id);
+    }
+
+    pub fn record(self: *StreamedToolStarts, id: []const u8, name: []const u8) void {
+        const id_hash = hash(id);
+        for (self.starts[0..self.kept]) |start| {
+            if (start.id_hash == id_hash) return;
+        }
+        if (self.kept == capacity) return;
+        const kept_name = text_utils.utf8PrefixByBytes(name, max_name_bytes);
+        var start: Start = .{ .id_hash = id_hash, .name_len = @intCast(kept_name.len), .name = undefined };
+        @memcpy(start.name[0..kept_name.len], kept_name);
+        self.starts[self.kept] = start;
+        self.kept += 1;
+    }
+
+    pub fn clear(self: *StreamedToolStarts) void {
+        self.kept = 0;
+    }
+
+    pub const Unfinished = struct {
+        count: usize = 0,
+        /// Borrowed from the record until the next `clear`.
+        first_tool: ?[]const u8 = null,
+    };
+
+    fn isCall(start: Start, call: ToolCall) bool {
+        if (hash(call.id) == start.id_hash) return true;
+        const provisional_id = call.provisional_id orelse return false;
+        return hash(provisional_id) == start.id_hash;
+    }
+
+    /// The starts that none of `calls` finished, by id or by the id the
+    /// stream first gave the call.
+    pub fn unfinished(self: *const StreamedToolStarts, calls: []const ToolCall) Unfinished {
+        var result: Unfinished = .{};
+        starts: for (self.starts[0..self.kept]) |*start| {
+            for (calls) |call| {
+                if (isCall(start.*, call)) continue :starts;
+            }
+            result.count += 1;
+            if (result.first_tool == null) result.first_tool = start.name[0..start.name_len];
+        }
+        return result;
+    }
+
+    /// Whether another call started after `call` did: the stream moved on,
+    /// so `call` was whole before the reply was cut. The call that started
+    /// last, and a call the record never saw start, may be the one the limit
+    /// stopped.
+    pub fn startedBefore(self: *const StreamedToolStarts, call: ToolCall) bool {
+        for (self.starts[0..self.kept], 0..) |start, index| {
+            if (isCall(start, call)) return index + 1 < self.kept;
+        }
+        return false;
+    }
+};
+
+test "streamed tool starts tell which calls a cut reply never finished" {
+    var starts: StreamedToolStarts = .{};
+    starts.record("read_a", "read_file");
+    starts.record("cut_1", "edit_file");
+    starts.record("cut_1", "edit_file");
+    starts.record("cut_2", "write_file");
+    const finished = [_]ToolCall{
+        .{ .id = "read_a", .name = "read_file", .arguments_json = "{}" },
+        .{ .id = "fx_call_1", .name = "write_file", .arguments_json = "{}", .provisional_id = "cut_2" },
+    };
+    const unfinished = starts.unfinished(&finished);
+    try std.testing.expectEqual(@as(usize, 1), unfinished.count);
+    try std.testing.expectEqualStrings("edit_file", unfinished.first_tool.?);
+    try std.testing.expectEqual(@as(usize, 3), starts.unfinished(&.{}).count);
+    // Only a call another call started after is known to be whole.
+    try std.testing.expect(starts.startedBefore(finished[0]));
+    try std.testing.expect(!starts.startedBefore(finished[1]));
+    try std.testing.expect(!starts.startedBefore(.{ .id = "never_started", .name = "read_file", .arguments_json = "{}" }));
+    starts.clear();
+    try std.testing.expectEqual(@as(usize, 0), starts.unfinished(&.{}).count);
+}
+
 pub const StreamChunkContext = struct {
     hooks: *const AgentRuntimeDeps,
     flush_assistant_stream_per_content_chunk: bool = false,
@@ -70,6 +166,7 @@ pub const StreamChunkContext = struct {
     alloc: Allocator = std.heap.c_allocator,
     saw_visible_text: bool = false,
     saw_tool_start: bool = false,
+    tool_starts: StreamedToolStarts = .{},
     saw_provider_tool_start: bool = false,
     /// A started tool may run at the provider and does more than read, so a
     /// failed attempt cannot run it again without checking.
@@ -171,6 +268,7 @@ pub const StreamChunkContext = struct {
         self.response_language_accepted = false;
         self.response_language_next_probe_bytes = 5;
         self.saw_tool_start = false;
+        self.tool_starts.clear();
         self.saw_provider_tool_start = false;
         self.saw_unrepeatable_provider_tool_start = false;
         self.saw_visible_text_after_tool_start = false;
@@ -333,7 +431,7 @@ pub fn pushTokenProgressUpdate(stream_ctx: *StreamChunkContext, update: runtime_
 pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []const u8, label_value: ?[]const u8, arguments_json: ?[]const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
     const first_tool_in_step = !stream_ctx.saw_tool_start;
-    recordStreamToolStart(ctx, tool_name);
+    recordStreamToolStart(ctx, tool_id, tool_name);
     const preflight = runtime_tool_presentation.ProvisionalToolStatuses.preflight(stream_ctx.hooks.tool_registry, tool_name) orelse {
         publishTurnPhase(stream_ctx, .running);
         return;
@@ -374,9 +472,10 @@ pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []cons
     }
 }
 
-pub fn recordStreamToolStart(ctx: *anyopaque, tool_name: []const u8) void {
+pub fn recordStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
     stream_ctx.saw_tool_start = true;
+    stream_ctx.tool_starts.record(tool_id, tool_name);
     if (runtime_tool_presentation.streamStartMayHaveExecutedAtProvider(
         stream_ctx.hooks.tool_registry,
         tool_name,
@@ -657,24 +756,31 @@ fn deliverSemanticThematicRule(raw: *anyopaque, out: *std.ArrayList(u8)) !void {
     stream_ctx.recordSemanticBoundary();
 }
 
-pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, arena: Allocator, disposition: types.ProviderCompletionDisposition) !void {
+pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, disposition: types.ProviderCompletionDisposition) !void {
     if (disposition != .length_limited) return;
-    const line = try arena.print("response hit provider length limit; output may be incomplete", .{});
-    try hooks.push_system_notice(hooks.ctx, line);
+    try hooks.pushWarningNotice("The response hit the provider's length limit and may be incomplete.");
 }
 
+/// Shows a cut reply's text, then `blocker`, which says why the turn stopped,
+/// and returns the turn's final text: `earlier`, the parts of an answer that
+/// earlier cut replies wrote and that were already shown, then the reply's
+/// text, then `blocker`.
 pub fn finishLengthLimitedToolCallCompletion(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
     completion: types.ModelCompletion,
     streamed_content_len: usize,
+    earlier: []const u8,
+    blocker: []const u8,
 ) ![]const u8 {
-    const blocker = "The reply ran out of output tokens before its tool calls were complete, so I did not run them. Send your message again to retry, or ask for a smaller step.";
-
     const has_content = completion.content != null and completion.content.?.len > 0;
     const normalized = if (has_content) try normalizeAssistantTextForDisplay(arena, completion.content.?) else "";
-    const rendered = if (normalized.len > 0)
-        try arena.print("{s}\n\n{s}", .{ normalized, blocker })
+    const whole = if (earlier.len == 0)
+        normalized
+    else
+        try normalizeAssistantTextForDisplay(arena, try std.mem.concat(arena, u8, &.{ earlier, completion.content orelse "" }));
+    const rendered = if (whole.len > 0)
+        try arena.print("{s}\n\n{s}", .{ whole, blocker })
     else
         blocker;
 
@@ -2328,13 +2434,10 @@ test "emitProviderLengthNotice emits exact length notice" {
     defer capture.deinit(alloc);
     const hooks = capture.hooks();
 
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-
-    try emitProviderLengthNotice(&hooks, arena_state.allocator(), .length_limited);
+    try emitProviderLengthNotice(&hooks, .length_limited);
 
     try std.testing.expectEqual(@as(usize, 1), capture.notices.items.len);
-    try std.testing.expectEqualStrings("response hit provider length limit; output may be incomplete", capture.notices.items[0]);
+    try std.testing.expectEqualStrings("The response hit the provider's length limit and may be incomplete.", capture.notices.items[0]);
 }
 
 test "emitProviderLengthNotice ignores non-length finish reasons" {
@@ -2343,10 +2446,7 @@ test "emitProviderLengthNotice ignores non-length finish reasons" {
     defer capture.deinit(alloc);
     const hooks = capture.hooks();
 
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-
-    try emitProviderLengthNotice(&hooks, arena_state.allocator(), .completed);
+    try emitProviderLengthNotice(&hooks, .completed);
 
     try std.testing.expectEqual(@as(usize, 0), capture.notices.items.len);
 }

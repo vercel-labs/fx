@@ -36,7 +36,11 @@ pub const Runtime = struct {
         header: ui_render.AskHeader,
         no_color: bool,
     ) !Runtime {
-        const layout = zeroFooterLayout(try ui_terminal.queryLayout(std.posix.STDOUT_FILENO, 0));
+        const raw_layout = ui_terminal.queryLayout(std.posix.STDOUT_FILENO, 0) catch |err| {
+            if (ui_terminal.terminalInputGone(std.posix.STDOUT_FILENO)) return error.TerminalHungUp;
+            return err;
+        };
+        const layout = zeroFooterLayout(raw_layout);
         var terminal = shell_runtime.TerminalState{};
         const cursor = probeTerminal(&terminal, layout, no_color);
         return initConfigured(
@@ -349,7 +353,10 @@ pub const Runtime = struct {
     }
 
     fn writeTerminalBytes(self: *Runtime, bytes: []const u8) !void {
-        try self.shell.stdout_file.writeStreamingAll(io_mod.getIo(), bytes);
+        self.shell.stdout_file.writeStreamingAll(io_mod.getIo(), bytes) catch |err| {
+            if (ui_terminal.terminalGone(self.shell.stdout_file.handle, err)) return error.TerminalHungUp;
+            return err;
+        };
         self.metrics.ansi_bytes += bytes.len;
         if (self.shell.shadow_vt) |shadow| try shadow.feed(bytes);
     }
@@ -866,4 +873,43 @@ test "ask presentation neutralizes thinking row styling under no_color" {
     try std.testing.expect(std.mem.find(u8, bytes, "\x1b[2J") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\x1b[3J") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\x1bc") == null);
+}
+
+test "ask presentation maps closed TestPty EIO to TerminalHungUp and keeps open-file errors" {
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |file| file.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+
+    var runtime = Runtime{
+        .alloc = alloc,
+        .shell = .{
+            .stdout_file = slave,
+            .sync_updates_enabled = false,
+            .history_reset_uses_ris = false,
+            .layout = zeroFooterLayout(.{
+                .rows = 12,
+                .cols = 64,
+                .content_bottom = 12,
+                .divider_top_row = 12,
+                .input_row = 12,
+                .divider_bottom_row = 12,
+                .hint_row = 12,
+            }),
+            .notebook = .{ .transcript_release = .{ .policy = .append_only } },
+        },
+        .no_color = true,
+    };
+    master.?.close(io_mod.getIo());
+    master = null;
+    try std.testing.expectError(error.TerminalHungUp, runtime.writeTerminalBytes("abc"));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "readonly.txt", .{ .read = true });
+    defer file.close(io_mod.getIo());
+    try std.testing.expect(!ui_terminal.terminalGone(file.handle, error.InputOutput));
 }

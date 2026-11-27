@@ -1,6 +1,8 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
+const wait_card = @import("../agent/wait_card.zig");
+const workspace_trust = @import("../workspace_trust/workspace_trust.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
@@ -900,7 +902,9 @@ pub fn Runtime(comptime App: type) type {
                     "",
                 .esc_clear_armed = app.input_runtime.gestures.escapeClearArmed(),
                 .esc_interrupt_armed = app.input_runtime.gestures.escapeInterruptArmed(),
+                .trust_prompt = shownTrustPrompt(app),
                 .question = shownQuestion(app, agent),
+                .wait_card = shownWaitCard(app, agent),
                 .statusline = statusline,
                 .activity = activityProjection(app),
                 .input = &app.input_runtime,
@@ -2102,6 +2106,21 @@ pub fn Runtime(comptime App: type) type {
         fn shownQuestion(app: *const App, agent: *AppAgent) ?question_prompt.Projection {
             if (agentsMenuActive(app)) return null;
             return agent.question_prompt.projection();
+        }
+
+        /// The wait card the agent on screen holds. The open agent list takes
+        /// the footer, and `waitCardFor` holds it under the alternate screen,
+        /// so the card returns when either closes. The Folder access screen
+        /// takes the footer ahead of it and the card returns when it closes.
+        fn shownWaitCard(app: *const App, agent: *const AppAgent) ?*const wait_card.WaitCardPrompt {
+            if (agentsMenuActive(app)) return null;
+            return @import("app_agents_runtime.zig").Runtime(App).waitCardFor(app, agent);
+        }
+
+        fn shownTrustPrompt(app: *const App) ?*const workspace_trust.prompt.Prompt {
+            if (comptime !@hasField(App, "trust")) return null;
+            if (app.trust.prompt) |*prompt| return prompt;
+            return null;
         }
 
         fn forkMenuActive(_: *const App, agent: *const AppAgent) bool {
@@ -6294,7 +6313,7 @@ test "core.app_render_runtime file approval returns to the preserved inline skil
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
 
     try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, request));
-    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
@@ -6387,7 +6406,7 @@ test "core.app_render_runtime file approvals commit the alternate screen for eac
         alloc,
         request_a,
     ));
-    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     app.shell.render_requests.request(.first_frame);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
@@ -6423,7 +6442,7 @@ test "core.app_render_runtime file approvals commit the alternate screen for eac
         alloc,
         request_b,
     ));
-    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
     app.shell.render_requests.request(.modal);
     try std.testing.expect(!approval_screen.fileApprovalAffirmativeReady(
         &app.shell,
@@ -6515,7 +6534,7 @@ test "core.app_render_runtime restores file review before rendering a generic ap
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
     try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, file_request));
-    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     app.shell.render_requests.request(.first_frame);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
@@ -6733,7 +6752,7 @@ test "core.app_render_runtime file approval takes over the full transcript alter
     try app.shell.writeTranscript(alloc, &app.metrics, "prior transcript\n", true);
     try app_lifecycle.openFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
     try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, request));
-    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
@@ -6857,7 +6876,7 @@ test "core.app_render_runtime lifecycle rewrite recovers normal buffer after fil
     var review = try diff_mod.FileReview.init(alloc, "", "pending\n");
     defer review.deinit(alloc);
     try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, request));
-    try std.testing.expect(app.agent().approval_prompt.syncReview(&review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(app.terminal.fileApprovalScreenActive());

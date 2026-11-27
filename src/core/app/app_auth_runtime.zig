@@ -650,7 +650,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn reject_provider_picker_if_busy(app: *App, agent: *AppAgent) !bool {
             // A request waiting for the sign-in fx opened has nothing in
             // flight; it reads the new credential when it continues.
-            const turn_busy = agent.stream.active and !requestWaitsForSignIn(app);
+            const turn_busy = agent.stream.active and !requestWaitsForSignIn(app, agent);
             if (!auth_transition.provider_work_busy(turn_busy, agent.worker.queuedPromptCount())) return false;
             try app.writeDomainNotice(.{
                 .topic = "provider",
@@ -1036,7 +1036,7 @@ pub fn Runtime(comptime App: type) type {
                     // A request waits for this sign-in, and its saved login
                     // may still work: it tries that login once now, and the
                     // notice says how to try again.
-                    if (requestWaitsForSignIn(app)) if (expiredWhileWaitingNotice(sign_in_source, err)) |body| {
+                    if (requestWaitsForSignIn(app, agent)) if (expiredWhileWaitingNotice(sign_in_source, err)) |body| {
                         debug_trace.logf("auth", "sign-in code expired; the waiting request tries its saved login source={t}", .{sign_in_source});
                         try writeAuthNotice(app, .{ .topic = "auth", .tone = .warning, .body = body });
                         if (comptime @hasDecl(@TypeOf(agent.worker), "requestRecoverySignInClosed")) {
@@ -1766,6 +1766,23 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Where a finished provider switch lands: the agent on screen's own
+        /// selection, or a subagent's, so a switch a view started for a
+        /// subagent never moves the provider or model on screen
+        /// (`src/core/app/provider_runtime.zig` `replaceSelectionFor`).
+        fn adoptProviderSwitch(
+            app: *App,
+            agent: *AppAgent,
+            target: model_provider.ProviderId,
+            model: []const u8,
+        ) !void {
+            if (comptime provider_runtime.supported(App) and @hasField(App, "screen_owner")) {
+                if (agent.role == .subagent) return provider_runtime.replaceSelectionFor(app, agent, target, model);
+            }
+            var owned = try app.alloc.dupe(u8, model);
+            app.provider_selection.adoptOwned(target, &owned);
+        }
+
         fn finishProviderSwitch(app: *App, agent: *AppAgent, task: *auth_runtime.ProviderPreparation) !bool {
             const request = task.input.intent.provider;
             const target = request.target;
@@ -1856,10 +1873,10 @@ pub fn Runtime(comptime App: type) type {
             task.credential = null;
             defer if (credential) |*value| value.deinit(app.alloc);
             const access: credentials.CatalogAccess = if (hostManagesAuth(app)) .host_managed else credentials.catalogAccessForCredentialAndAccount(credential.?.source, credential.?.token, credential.?.gatewayTeam(), credential.?.accountId());
-            var owned_model = try app.alloc.dupe(u8, selected_model);
+            const owned_model = try app.alloc.dupe(u8, selected_model);
             defer app.alloc.free(owned_model);
 
-            const turn_busy = agent.stream.active and !requestWaitsForSignIn(app);
+            const turn_busy = agent.stream.active and !requestWaitsForSignIn(app, agent);
             if (auth_transition.provider_work_busy(turn_busy, agent.worker.queuedPromptCount())) {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
@@ -1874,7 +1891,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             app.model_cache.adoptOwnedCatalog(access, &catalog, task.input.catalog_provider.shows_display_names);
-            app.provider_selection.adoptOwned(target, &owned_model);
+            try adoptProviderSwitch(app, agent, target, owned_model);
             if (credential) |*value| _ = app.auth.adoptCredential(app.alloc, value);
 
             const body = try app.alloc.print(
@@ -2602,7 +2619,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(@TypeOf(app.shell), "worker_status_state") and
                 @hasDecl(@TypeOf(agent.worker), "requestRecoveryContinue"))
             {
-                if (app.shell.worker_status_state().waitsForSignIn()) {
+                if (requestWaitsForSignIn(app, agent)) {
                     debug_trace.logf("auth", "signed in; continuing the waiting request", .{});
                     agent.worker.requestRecoveryContinue();
                 }
@@ -2612,7 +2629,11 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn requestWaitsForSignIn(app: *App) bool {
+        /// Whether `agent`'s own wait is for a sign-in. A view signs in for the
+        /// subagent that waits, which may be hidden, so this reads that
+        /// agent's row and never the screen's.
+        fn requestWaitsForSignIn(app: *App, agent: *AppAgent) bool {
+            if (comptime @hasDecl(App, "agentWaitsForSignIn")) return app.agentWaitsForSignIn(agent);
             if (comptime !@hasDecl(@TypeOf(app.shell), "worker_status_state")) return false;
             return app.shell.worker_status_state().waitsForSignIn();
         }
@@ -2623,7 +2644,7 @@ pub fn Runtime(comptime App: type) type {
         /// block it.
         fn renewsWaitingRequest(app: *App, agent: *AppAgent, provider: model_provider.ProviderId) bool {
             if (comptime !provider_runtime.supported(App)) return false;
-            return requestWaitsForSignIn(app) and provider_runtime.providerOf(app, agent).eql(provider);
+            return requestWaitsForSignIn(app, agent) and provider_runtime.providerOf(app, agent).eql(provider);
         }
 
         /// A request waits for the user to sign in again: opens the sign-in
@@ -2957,6 +2978,56 @@ test "post OAuth catalog selection keeps valid current then saved then first" {
     try std.testing.expectEqualStrings("saved", selectCatalogModel(&entries, "missing", "saved").?);
     try std.testing.expectEqualStrings("first", selectCatalogModel(&entries, "missing", "also-missing").?);
     try std.testing.expect(selectCatalogModel(&.{}, "current", "saved") == null);
+}
+
+/// Just what a finished provider switch needs: the app's own selection, the
+/// agent on screen, and a subagent that keeps its own preferences.
+const ProviderSwitchFakeApp = struct {
+    alloc: std.mem.Allocator = std.testing.allocator,
+    main_agent: agents.Agent = .{},
+    child_agent: agents.Agent = .{},
+    screen_owner: ?*agents.Agent = null,
+    provider_selection: provider_runtime.Runtime,
+
+    fn init(alloc: std.mem.Allocator) ProviderSwitchFakeApp {
+        return .{ .alloc = alloc, .provider_selection = provider_runtime.Runtime.init(alloc) };
+    }
+
+    fn deinit(self: *ProviderSwitchFakeApp) void {
+        self.provider_selection.deinit();
+        if (self.child_agent.session_persistence.session_preferences) |*preferences| preferences.deinit(self.alloc);
+    }
+
+    pub fn agent(self: *ProviderSwitchFakeApp) *agents.Agent {
+        return &self.main_agent;
+    }
+};
+
+test "wait card: a provider switch for a subagent leaves the agent on screen's provider and model" {
+    const alloc = std.testing.allocator;
+    var app = ProviderSwitchFakeApp.init(alloc);
+    defer app.deinit();
+    try app.provider_selection.replaceSelection(.gateway, "openai/gpt-5");
+    app.child_agent.role = .subagent;
+    app.child_agent.session_persistence.session_preferences = .{
+        .provider = .gateway,
+        .model = try alloc.dupe(u8, "openai/gpt-5"),
+        .effort = .auto,
+        .fast_mode = false,
+    };
+
+    // The sign-in the card started for the subagent finished on another
+    // provider: the switch lands in that subagent's session alone.
+    try Runtime(ProviderSwitchFakeApp).adoptProviderSwitch(&app, &app.child_agent, .codex, "codex-mini");
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, app.provider_selection.selection().provider);
+    try std.testing.expectEqualStrings("openai/gpt-5", app.provider_selection.selection().model);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, app.child_agent.session_persistence.session_preferences.?.provider);
+    try std.testing.expectEqualStrings("codex-mini", app.child_agent.session_persistence.session_preferences.?.model);
+
+    // For the agent on screen the switch lands on the app's own selection.
+    try Runtime(ProviderSwitchFakeApp).adoptProviderSwitch(&app, &app.main_agent, .codex, "codex-mini");
+    try std.testing.expectEqual(model_provider.ProviderId.codex, app.provider_selection.selection().provider);
+    try std.testing.expectEqualStrings("codex-mini", app.provider_selection.selection().model);
 }
 
 const TestModelCache = struct {

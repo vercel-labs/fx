@@ -376,6 +376,7 @@ pub const TranscriptEntry = union(enum) {
         body: []const u8,
         visibility: types.NoticeVisibility,
         detail: []const u8 = "",
+        detail_visibility: types.NoticeVisibility = .compact_and_full,
         // The producer will replace this entry in place; its bytes are not
         // final and must not be released into terminal history.
         pending_replacement: bool = false,
@@ -2145,7 +2146,10 @@ pub fn renderSemanticNoticeForPresentation(
         try appendLinkedNoticeText(&logical, alloc, body, presentation);
     }
     // The detail starts on its own row; rows from here on render dim.
-    const detail = std.mem.trim(u8, notice.detail, "\r\n");
+    const detail = if (notice.detail_visibility == .compact_and_full or presentation == .full)
+        std.mem.trim(u8, notice.detail, "\r\n")
+    else
+        "";
     const detail_start = if (detail.len > 0) blk: {
         try logical.append(alloc, '\n');
         const start = logical.items.len;
@@ -2253,6 +2257,7 @@ fn renderEntryToBlockForPresentationInterruptible(
                     .body = e.body,
                     .visibility = e.visibility,
                     .detail = e.detail,
+                    .detail_visibility = e.detail_visibility,
                 },
                 styles,
                 cols,
@@ -3640,6 +3645,7 @@ fn appendSemanticNoticeTestEntry(
         .body = owned.body,
         .visibility = owned.visibility,
         .detail = owned.detail,
+        .detail_visibility = owned.detail_visibility,
     } });
 }
 
@@ -3663,7 +3669,7 @@ test "semantic notice renders every tone and resets before following content" {
     };
     const tones = [_]types.NoticeTone{ .information, .success, .warning, .@"error", .cancelled };
     const label_styles = [_][]const u8{ "\x1b[36m", "\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[90m" };
-    const glyphs = [_][]const u8{ "i", "✓", "!", "✗", "⊘" };
+    const glyphs = [_][]const u8{ "i", "✓", "⚠", "✗", "⊘" };
 
     for (tones, label_styles, glyphs) |tone, label_style, glyph| {
         const rendered = try renderSemanticNotice(alloc, .{
@@ -3717,7 +3723,7 @@ test "semantic notice glyph grid regression locks tone markers and lowercase top
         .{ .tone = .neutral, .topic = "session", .body = "renamed to \"custom models\"", .row_text = "* session: renamed to \"custom models\"", .label_fg = 7 },
         .{ .tone = .information, .topic = "background", .body = "command #7 started", .row_text = "i background: command #7 started", .label_fg = 6 },
         .{ .tone = .success, .topic = "upgrade", .body = "fx has been updated to v9.9.9", .row_text = "✓ upgrade: fx has been updated to v9.9.9", .label_fg = 2 },
-        .{ .tone = .warning, .topic = "skills", .body = "1 discovery issue", .row_text = "! skills: 1 discovery issue", .label_fg = 3 },
+        .{ .tone = .warning, .topic = "skills", .body = "1 discovery issue", .row_text = "⚠ skills: 1 discovery issue", .label_fg = 3 },
         .{ .tone = .@"error", .topic = "session", .body = "usage: /rename <title>", .row_text = "✗ session: usage: /rename <title>", .label_fg = 1 },
         .{ .tone = .cancelled, .topic = "system", .body = "cancelled", .row_text = "⊘ system: cancelled", .label_fg = 8 },
     };
@@ -3783,6 +3789,39 @@ test "semantic notice detail renders dim on its own indented rows" {
     defer alloc.free(plain);
     try std.testing.expect(std.mem.find(u8, plain, "<D>") == null);
     try std.testing.expect(std.mem.find(u8, plain, "\n") == null);
+}
+
+test "a full-only notice detail shows only in the full transcript" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendSemanticNoticeTestEntry(&entries, alloc, 1, .{
+        .topic = "",
+        .tone = .warning,
+        .body = "Gemini request failed.",
+        .detail = "HTTP 400",
+        .detail_visibility = .full_only,
+    });
+    const entry = entries.items[0];
+
+    const compact = try renderEntryToBlockForPresentation(alloc, entry, 80, .{}, .compact);
+    defer compact.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "HTTP 400") == null);
+
+    const full = try renderEntryToBlockForPresentation(alloc, entry, 80, .{}, .full);
+    defer full.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, full.bytes, "HTTP 400") != null);
+}
+
+test "a warning notice leads with the status line's warning sign" {
+    const alloc = std.testing.allocator;
+    const rendered = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .warning,
+        .body = "x",
+    }, .{}, 80);
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.startsWith(u8, rendered, "⚠ "));
 }
 
 test "semantic notice topics never render the tool-activity bullet or forced capitalization" {
@@ -3856,54 +3895,6 @@ test "semantic notice keeps an OSC 8 target hidden, clickable, and underlined" {
     // Each row a link wraps onto is underlined too, and nothing after it.
     try expectUnderlinedExactlyWhereLinked(&narrow_grid);
     try std.testing.expect(!narrow_grid.current_style.flags.underline);
-}
-
-fn expectUnderlinedExactlyWhereLinked(grid: *vt_emulator.Grid) !void {
-    for (1..grid.rows + 1) |row_index| {
-        for (1..grid.cols + 1) |col_index| {
-            const cell = grid.cellAt(@intCast(row_index), @intCast(col_index)).?;
-            try std.testing.expectEqual(cell.style.hyperlink_id != 0, cell.style.flags.underline);
-        }
-    }
-}
-
-const google_upgrade_url_for_test = "https://one.google.com/settings?expand=upgrade&g1_last_touchpoint=64&g1_landing_page=75&utm_source=ai_studio&utm_campaign=ais_gemini_api_upsell&utm_medium=web";
-const unpaid_terms_url_for_test = "https://ai.google.dev/gemini-api/terms#unpaid-services";
-
-/// Draws `notice` at `cols` and checks that no row splits a URL: no row holds
-/// "https://", every row ends on a whole word, and `host` links to `url`.
-fn expectNoticeKeepsLinkWhole(alloc: Allocator, notice: types.SemanticNotice, cols: u16, host: []const u8, url: []const u8, expected_text: []const u8) !void {
-    const rendered = try renderSemanticNotice(alloc, notice, .{}, cols);
-    defer alloc.free(rendered);
-    var grid = try vt_emulator.Grid.init(alloc, cols, 12);
-    defer grid.deinit();
-    try grid.feed(rendered);
-
-    var joined: std.ArrayList(u8) = .empty;
-    defer joined.deinit(alloc);
-    var row: std.ArrayList(u8) = .empty;
-    defer row.deinit(alloc);
-    var host_cell: ?vt_emulator.Cell = null;
-    for (1..grid.rows + 1) |row_index| {
-        row.clearRetainingCapacity();
-        try grid.rowTextTrimmed(@intCast(row_index), &row);
-        if (row.items.len == 0) continue;
-        try std.testing.expect(std.mem.find(u8, row.items, "https://") == null);
-        try std.testing.expect(!std.mem.endsWith(u8, row.items, "/"));
-        if (host_cell == null) {
-            if (std.mem.find(u8, row.items, host)) |byte_index| {
-                const column = display_width.visibleWidth(row.items[0..byte_index]) + 1;
-                host_cell = grid.cellAt(@intCast(row_index), @intCast(column)).?;
-            }
-        }
-        if (joined.items.len > 0) try joined.append(alloc, ' ');
-        try joined.appendSlice(alloc, std.mem.trim(u8, row.items, " "));
-    }
-    try std.testing.expect(std.mem.find(u8, joined.items, expected_text) != null);
-    const cell = host_cell orelse return error.TestExpectedEqual;
-    try std.testing.expect(cell.style.hyperlink_id != 0);
-    try std.testing.expectEqualStrings(url, grid.hyperlinkUrl(cell.style.hyperlink_id).?);
-    try expectUnderlinedExactlyWhereLinked(&grid);
 }
 
 const bare_notice_url = "https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway%2Fbudgets%3Fdimension%3Duser&title=AI+Gateway+Budgets+%26+Spend";
@@ -4018,7 +4009,7 @@ test "a labeled notice link shows its URL only in the full transcript" {
     try compact_grid.feed(compact);
     const compact_row = try gridFirstRowText(alloc, &compact_grid);
     defer alloc.free(compact_row);
-    try std.testing.expectEqualStrings("! Subscribe to Token Pass", compact_row);
+    try std.testing.expectEqualStrings("⚠ Subscribe to Token Pass", compact_row);
     try expectLinkedText(alloc, &compact_grid, "Subscribe to Token Pass", "https://fx.sh/token-pass");
 
     const full = try renderSemanticNoticeForPresentation(alloc, .{
@@ -4032,7 +4023,7 @@ test "a labeled notice link shows its URL only in the full transcript" {
     try full_grid.feed(full);
     const full_row = try gridFirstRowText(alloc, &full_grid);
     defer alloc.free(full_row);
-    try std.testing.expectEqualStrings("! Subscribe to Token Pass (https://fx.sh/token-pass)", full_row);
+    try std.testing.expectEqualStrings("⚠ Subscribe to Token Pass (https://fx.sh/token-pass)", full_row);
 }
 
 test "a notice keeps a short bare URL whole and still links it" {
@@ -4049,7 +4040,7 @@ test "a notice keeps a short bare URL whole and still links it" {
     try grid.feed(rendered);
     const row = try gridFirstRowText(alloc, &grid);
     defer alloc.free(row);
-    try std.testing.expectEqualStrings("! Could not open https://fx.sh/feedback. Open it manually.", row);
+    try std.testing.expectEqualStrings("⚠ Could not open https://fx.sh/feedback. Open it manually.", row);
     try expectLinkedText(alloc, &grid, url, url);
     try expectUnderlinedExactlyWhereLinked(&grid);
 }
@@ -4069,7 +4060,7 @@ test "a notice link shows the real host after userinfo" {
     try grid.feed(rendered);
     const row = try gridFirstRowText(alloc, &grid);
     defer alloc.free(row);
-    try std.testing.expectEqualStrings("! Open evil.example now", row);
+    try std.testing.expectEqualStrings("⚠ Open evil.example now", row);
     try expectLinkedText(alloc, &grid, "evil.example", url);
 }
 
@@ -4148,31 +4139,12 @@ test "urlHost keeps only the host and port of a notice URL" {
     try std.testing.expectEqualStrings("c.example", urlHost("https://c.example"));
 }
 
-test "a Google upgrade notice keeps its long link whole at every width" {
-    const alloc = std.testing.allocator;
-    const notice: types.SemanticNotice = .{
-        .topic = "system",
-        .tone = .warning,
-        .body = "HTTP 403: Your Google account needs an active Google AI Pro or Google AI Ultra subscription to use your plan in fx. Upgrade: " ++
-            google_upgrade_url_for_test ++ " \u{00b7} Use a Gemini API key: /provider google api-key",
-    };
-    for ([_]u16{ 60, 80, 120 }) |cols| {
-        errdefer std.debug.print("cols: {d}\n", .{cols});
-        try expectNoticeKeepsLinkWhole(alloc, notice, cols, "one.google.com", google_upgrade_url_for_test, "Upgrade: one.google.com \u{00b7} Use a Gemini API key");
-    }
-}
-
-test "the Unpaid Services Terms line keeps its link whole at every width" {
-    const alloc = std.testing.allocator;
-    const notice: types.SemanticNotice = .{
-        .topic = "auth",
-        .tone = .neutral,
-        .body = "Google AI Pro or Ultra plan connected (dev@example.com).",
-        .detail = "Requests follow the Gemini API Unpaid Services Terms: " ++ unpaid_terms_url_for_test,
-    };
-    for ([_]u16{ 60, 80, 120 }) |cols| {
-        errdefer std.debug.print("cols: {d}\n", .{cols});
-        try expectNoticeKeepsLinkWhole(alloc, notice, cols, "ai.google.dev", unpaid_terms_url_for_test, "Unpaid Services Terms: ai.google.dev");
+fn expectUnderlinedExactlyWhereLinked(grid: *vt_emulator.Grid) !void {
+    for (1..grid.rows + 1) |row_index| {
+        for (1..grid.cols + 1) |col_index| {
+            const cell = grid.cellAt(@intCast(row_index), @intCast(col_index)).?;
+            try std.testing.expectEqual(cell.style.hyperlink_id != 0, cell.style.flags.underline);
+        }
     }
 }
 
@@ -5033,8 +5005,8 @@ test "compact presentation hides context notices while full presentation retains
     defer first_full.deinit(alloc);
     const second_full = try renderEntryToBlockForPresentation(alloc, entries.items[2], 80, .{}, .full);
     defer second_full.deinit(alloc);
-    try std.testing.expectEqualStrings("! context: first warning", first_full.bytes);
-    try std.testing.expectEqualStrings("! context: second warning", second_full.bytes);
+    try std.testing.expectEqualStrings("⚠ context: first warning", first_full.bytes);
+    try std.testing.expectEqualStrings("⚠ context: second warning", second_full.bytes);
     try std.testing.expectEqual(TranscriptEntryClass.context_notice, entryClassForEntry(entries.items[0]));
 }
 

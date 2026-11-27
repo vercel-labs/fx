@@ -223,6 +223,27 @@ pub fn build(b: *std.Build) void {
     const run_bench_step = b.step("run-bench-file-index", "Build and run file_index search benchmark");
     run_bench_step.dependOn(&run_bench.step);
 
+    // --- grep_files scan benchmark ---
+    const grep_bench = b.addExecutable(.{
+        .name = "grep-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/grep_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    grep_bench.root_module.addImport("benchmark_exports", benchmark_exports_mod);
+    const install_grep_bench = b.addInstallArtifact(grep_bench, .{});
+    const bench_grep_step = b.step("bench-grep", "Build the grep_files scan benchmark");
+    bench_grep_step.dependOn(&install_grep_bench.step);
+
+    const run_grep_bench = b.addRunArtifact(grep_bench);
+    run_grep_bench.step.dependOn(&install_grep_bench.step);
+    run_grep_bench.addPassthruArgs();
+    const run_bench_grep_step = b.step("run-bench-grep", "Build and run the grep_files scan benchmark");
+    run_bench_grep_step.dependOn(&run_grep_bench.step);
+
     // --- UI activity progress benchmark ---
     const ui_activity_bench = b.addExecutable(.{
         .name = "ui-activity-progress-bench",

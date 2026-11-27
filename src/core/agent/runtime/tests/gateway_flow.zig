@@ -4382,11 +4382,11 @@ test "a turn whose step a compaction summarized hands the session its whole turn
     const cut_off: FakeCompletion = .{ .tool_calls = &later_calls, .finish_reason = .length };
     const Ending = struct { name: []const u8, completions: []const FakeCompletion };
     // A reply, two empty replies (`finishFailedTurnWithNotice`), and a reply
-    // cut off again after its resend.
+    // cut off three times in a row, which ends the turn at the output limit.
     const endings = [_]Ending{
         .{ .name = "completed", .completions = &.{ first, summary, .{ .content = "Continued from the observed results." } } },
         .{ .name = "empty", .completions = &.{ first, summary, .{}, .{} } },
-        .{ .name = "length", .completions = &.{ first, summary, cut_off, cut_off } },
+        .{ .name = "length", .completions = &.{ first, summary, cut_off, cut_off, cut_off } },
     };
     for (endings) |ending| {
         var tmp = std.testing.tmpDir(.{});
@@ -9613,7 +9613,7 @@ test "processQueuedPrompt sends a refused request again with the team a reload r
     try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
     try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "not allowed for this team") != null);
     try std.testing.expectEqualStrings(
-        "fx sent this request for the Vercel team team-a. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+        "fx sent this request for the Vercel team team-a.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.",
         hooks.system_notices.items[1],
     );
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
@@ -9666,7 +9666,7 @@ test "processQueuedPrompt names a refused login's team by its id when the login 
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
-    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[1], "for the Vercel team team_a. If that is the wrong team") != null);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[1], "for the Vercel team team_a.\n└ Wrong team?") != null);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
@@ -9699,7 +9699,7 @@ test "processQueuedPrompt names a refused login's team by its id when its slug i
 
     try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
     try std.testing.expectEqualStrings(
-        "fx sent this request for the Vercel team team_a. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+        "fx sent this request for the Vercel team team_a.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.",
         hooks.system_notices.items[1],
     );
 }
@@ -9732,7 +9732,7 @@ test "processQueuedPrompt names no team for a refused login whose slug and id ar
 
     try std.testing.expectEqual(@as(usize, 2), hooks.system_notices.items.len);
     try std.testing.expectEqualStrings(
-        "fx sent this request for this login's Vercel team. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+        "fx sent this request for this login's Vercel team.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.",
         hooks.system_notices.items[1],
     );
 }
@@ -11157,16 +11157,18 @@ test "a question dropped from a length-cut reply and sent again leaves the prese
     );
 }
 
-test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {
+test "a question a length-cut reply finished runs, and the calls after it start a new presentation group" {
     const alloc = std.testing.allocator;
-    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
-    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const ask = [_]ToolCall{toolCall("call_ask", "ask_user_question", "{\"questions\":[]}")};
+    // The question is whole, and a call after it was cut.
+    const starts = ask ++ [_]ToolCall{toolCall("call_cut", "edit_file", "{}")};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
     const completions = [_]FakeCompletion{
-        .{ .tool_calls = &call_one },
-        .{ .tool_calls = &call_two },
-        .{ .finish_reason = .length },
-        .{ .finish_reason = .length },
-        .{ .content = "UNEXPECTED_CONTINUATION" },
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &ask, .streamed_tool_starts = &starts, .finish_reason = .length },
+        .{ .tool_calls = &read_second },
+        .{ .content = "Final" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -11176,17 +11178,56 @@ test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    // The empty reply's one retry sends the same request with an output
-    // limit; neither request asks for a summary.
     try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    var asked = false;
+    for (hooks.executed_names.items) |name| {
+        if (std.mem.eql(u8, name, "ask_user_question")) asked = true;
+    }
+    try std.testing.expect(asked);
+    try std.testing.expect(!std.meta.eql(
+        startedPresentationGroup(&hooks, "call_1").?,
+        startedPresentationGroup(&hooks, "call_2").?,
+    ));
+}
+
+test "processQueuedPrompt asks the model to act after replies cut before any text, with no silent-tool summary" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .tool_calls = &call_two },
+        .{ .finish_reason = .length },
+        .{ .finish_reason = .length },
+        .{ .content = "Finished after thinking less" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // Each empty cut reply gets a note alone, never the summary prompt after
+    // silent tool steps, and the provider's default limit that ran out gives
+    // way to fx's own.
+    try std.testing.expectEqual(@as(usize, 5), gateway.request_bodies.items.len);
     try expectBodyNotContains(&gateway, 2, "\"maxOutputTokens\"");
     try expectBodyContains(&gateway, 3, "\"maxOutputTokens\":32768");
-    try expectBodyNotContains(&gateway, 3, "Summarize what you just did.");
+    try expectBodyContains(&gateway, 3, "Your last reply reached its output limit before any text or tool call, likely while thinking. Think less and take one small step now");
+    try expectBodyContains(&gateway, 4, "Your last reply reached the output limit of 32768 tokens again before any text or tool call");
+    for (0..5) |index| try expectBodyNotContains(&gateway, index, "Summarize what you just did.");
+    try expectShownText(&hooks, "The reply reached its output limit before any text or tool call. Asking the model to take a smaller step.");
     try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
-    try std.testing.expectEqual(types.ProviderCompletionDisposition.length_limited, hooks.finalized_disposition.?);
     try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
-    try std.testing.expectEqualStrings("The reply ran out of output tokens before any text.", hooks.finish_assistant_text.?);
+    try std.testing.expectEqualStrings("Finished after thinking less", hooks.finish_assistant_text.?);
+    var stops: [2]diagnostics.OutputLimitStop = undefined;
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.snapshotOutputLimitStops(&stops));
+    try std.testing.expectEqual(diagnostics.OutputLimitAction.asked_to_act, stops[0].action);
 }
 
 test "processQueuedPrompt non-ok gateway response trims and clips HTTP detail" {
@@ -11572,14 +11613,21 @@ test "processQueuedPrompt does not refresh or retry non-refreshable credential s
     }
 }
 
-test "processQueuedPrompt does not execute tool calls from length-truncated completion" {
+test "processQueuedPrompt runs a cut reply's complete calls and tells the model what was cut" {
     const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("call_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}")};
-    const completions = [_]FakeCompletion{.{
-        .content = "Partial answer",
-        .tool_calls = &calls,
-        .finish_reason = .length,
-    }};
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    const complete = [_]ToolCall{
+        toolCall("call_read_a", "read_file", "{\"path\":\"a\"}"),
+        toolCall("call_read_b", "read_file", "{\"path\":\"b\"}"),
+    };
+    // The AI SDK finishes a call only when its arguments are whole, so the
+    // cut call is a start that no call finished.
+    const starts = complete ++ [_]ToolCall{toolCall("call_cut", "edit_file", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .content = "Partial answer", .tool_calls = &complete, .streamed_tool_starts = &starts, .finish_reason = .length },
+        .{ .content = "Finished in smaller steps" },
+    };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -11588,26 +11636,37 @@ test "processQueuedPrompt does not execute tool calls from length-truncated comp
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
-    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "provider length limit") != null);
-    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "Partial answer") != null);
-    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not run them") != null);
-    try std.testing.expectEqual(types.ProviderCompletionDisposition.length_limited, hooks.finalized_disposition.?);
-    try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
-    try std.testing.expect(
-        logIndex(&hooks, "event:turn_finished").? <
-            logIndex(&hooks, "event:finish_prompt").?,
-    );
+    try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[1]);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        "call_read_b",
+        "fx ran its 2 complete tool calls, and the results are above. The call to edit_file after them was cut off, and fx did not run it.",
+    });
+    try expectBodyNotContains(&gateway, 1, "call_cut");
+    // fx sent no limit, so the provider's default ran out: the rest of the
+    // turn asks for fx's own.
+    try expectBodyNotContains(&gateway, 0, "\"maxOutputTokens\"");
+    try expectBodyContains(&gateway, 1, "\"maxOutputTokens\":32768");
+    try expectShownText(&hooks, "fx ran its 2 complete tool calls and asked the model to continue in smaller steps.");
+    try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
+    try std.testing.expectEqualStrings("Finished in smaller steps", hooks.finish_assistant_text.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    var stops: [1]diagnostics.OutputLimitStop = undefined;
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.snapshotOutputLimitStops(&stops));
+    try std.testing.expectEqualStrings("edit_file", stops[0].cutTool().?);
+    try std.testing.expectEqual(@as(u32, 2), stops[0].complete_calls);
+    try std.testing.expectEqual(@as(u32, 1), stops[0].cut_calls);
 }
 
-test "processQueuedPrompt resends a length-cut reply holding only a cut-off call once and never runs the call" {
+test "processQueuedPrompt asks again in smaller steps after a reply holding only a cut-off call and never runs the call" {
     const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("call_cut", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}")};
+    // A chat-completions reply keeps the cut call with its partial arguments.
+    const calls = [_]ToolCall{toolCall("call_cut", "write_file", "{\"path\":\"a.txt\",\"content\":\"x")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls, .finish_reason = .length },
-        .{ .content = "Finished after the resend" },
+        .{ .content = "Finished after the note" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -11619,24 +11678,21 @@ test "processQueuedPrompt resends a length-cut reply holding only a cut-off call
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try expectBodyNotContains(&gateway, 1, "call_cut");
+    try expectBodyContains(&gateway, 1, "Your last reply reached its output limit before its tool call to write_file was complete, so fx did not run it.");
+    try expectBodyContains(&gateway, 1, "\"maxOutputTokens\":32768");
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqualStrings("Finished after the resend", hooks.finish_assistant_text.?);
+    try expectShownText(&hooks, "Asking the model to do it in smaller steps. The next requests allow 32768 output tokens.");
+    try std.testing.expectEqualStrings("Finished after the note", hooks.finish_assistant_text.?);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
-    var notified = false;
-    for (hooks.texts.items) |text| {
-        if (std.mem.find(u8, text, "Retrying with a higher limit.") != null) notified = true;
-    }
-    try std.testing.expect(notified);
 }
 
-test "processQueuedPrompt no-tool length preserves completed presentation with length disposition" {
+test "processQueuedPrompt ends the turn on the third cut reply in a row and says so" {
     const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{.{
-        .content = "Partial answer",
-        .finish_reason = .length,
-    }};
+    const starts = [_]ToolCall{toolCall("call_cut", "edit_file", "{}")};
+    const cut: FakeCompletion = .{ .streamed_tool_starts = &starts, .finish_reason = .length };
+    const completions = [_]FakeCompletion{ cut, cut, cut, .{ .content = "never sent" } };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -11645,14 +11701,208 @@ test "processQueuedPrompt no-tool length preserves completed presentation with l
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 1, "Your last reply reached its output limit before its tool call to edit_file was complete");
+    try expectBodyContains(&gateway, 2, "Your last reply reached the output limit of 32768 tokens again before its tool call to edit_file was complete");
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     try std.testing.expectEqual(types.ProviderCompletionDisposition.length_limited, hooks.finalized_disposition.?);
+    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "The reply reached the output limit of 32768 tokens 3 times in a row before its tool calls were complete, so fx did not run them.") != null);
     try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
-    try std.testing.expectEqualStrings("Partial answer", hooks.finish_assistant_text.?);
+}
+
+test "processQueuedPrompt starts the cut count again after a step that was not cut" {
+    const alloc = std.testing.allocator;
+    const starts = [_]ToolCall{toolCall("call_cut", "edit_file", "{}")};
+    const read = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const cut: FakeCompletion = .{ .streamed_tool_starts = &starts, .finish_reason = .length };
+    const completions = [_]FakeCompletion{ cut, cut, .{ .tool_calls = &read }, cut, cut, .{ .content = "Done after four cuts" } };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 6), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("Done after four cuts", hooks.finish_assistant_text.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt raises fx's own full-window bound once after a cut reply and keeps a model's own limit" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { window: u32, limit: u32, first: []const u8, later: []const u8 }{
+        .{ .window = 1_048_576, .limit = 1_048_576, .first = "\"maxOutputTokens\":32768", .later = "\"maxOutputTokens\":65536" },
+        .{ .window = 256_000, .limit = 32_000, .first = "\"maxOutputTokens\":32000", .later = "\"maxOutputTokens\":32000" },
+    };
+    for (cases) |case| {
+        const available_overrides = [_]ModelCapabilityOverride{.{
+            .model = "provider/model",
+            .capabilities = .{ .context_window = case.window, .max_output_tokens = case.limit },
+        }};
+        const read = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+        const starts = read ++ [_]ToolCall{toolCall("call_cut", "edit_file", "{}")};
+        const cut: FakeCompletion = .{ .tool_calls = &read, .streamed_tool_starts = &starts, .finish_reason = .length };
+        const completions = [_]FakeCompletion{ cut, cut, .{ .content = "Done" } };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        hooks.available_capability_overrides = &available_overrides;
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast("provider/model");
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+        try expectBodyContains(&gateway, 0, case.first);
+        try expectBodyContains(&gateway, 1, case.later);
+        try expectBodyContains(&gateway, 2, case.later);
+        try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
+        try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    }
+}
+
+test "processQueuedPrompt joins an answer cut at its output limit with the reply that finishes it" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .content = "Partial answer", .finish_reason = .length },
+        .{ .content = " and the rest." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        "Partial answer",
+        "Your last reply reached its output limit and was cut off. Its text is above. Continue exactly where it stopped, without repeating it.",
+    });
+    try expectShownText(&hooks, "The reply reached its output limit and was cut off. Asking the model to continue from where it stopped. The next requests allow 32768 output tokens.");
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
+    try std.testing.expectEqualStrings("Partial answer and the rest.", hooks.finish_assistant_text.?);
+    // The saved turn holds the answer once: the part and fx's note leave it.
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items[0].assistant.execution.steering.len);
     try std.testing.expect(
         logIndex(&hooks, "event:turn_finished").? <
             logIndex(&hooks, "event:finish_prompt").?,
     );
+}
+
+test "processQueuedPrompt ends the turn on the third reply in a row cut before any tool call, with every part" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .content = "Part one. ", .finish_reason = .length },
+        .{ .content = "Part two. ", .finish_reason = .length },
+        .{ .content = "Part three.", .finish_reason = .length },
+        .{ .content = "UNEXPECTED_FOURTH_REQUEST" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 2, &.{ "Part one. ", "Part two. ", "reached the output limit of 32768 tokens again and was cut off." });
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(types.ProviderCompletionDisposition.length_limited, hooks.finalized_disposition.?);
+    const text = hooks.finish_assistant_text.?;
+    try std.testing.expect(std.mem.find(u8, text, "Part one. Part two. Part three.") != null);
+    try std.testing.expect(std.mem.find(u8, text, "The reply reached the output limit of 32768 tokens 3 times in a row before it was complete, so fx stopped the turn.") != null);
+}
+
+test "processQueuedPrompt shows a continued answer's text once when the turn ends on cut replies with no text" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        // The part streams, as a provider's text does.
+        .{ .chunks = &.{"Alpha. "}, .content = "Alpha. ", .finish_reason = .length },
+        .{ .finish_reason = .length },
+        .{ .finish_reason = .length },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    // The part was shown when its reply streamed; the end of the turn shows
+    // only the last reply's text, which is none.
+    var shown: usize = 0;
+    for (hooks.texts.items) |text| shown += std.mem.count(u8, text, "Alpha.");
+    try std.testing.expectEqual(@as(usize, 1), shown);
+    // The saved text holds the part once, then why the turn stopped.
+    const saved = hooks.finish_assistant_text.?;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, saved, "Alpha."));
+    try std.testing.expect(std.mem.find(u8, saved, "3 times in a row before it was complete, so fx stopped the turn.") != null);
+}
+
+test "processQueuedPrompt shows a short cut part that waited for the language check before the answer goes on" {
+    const alloc = std.testing.allocator;
+    // Under five letters, the part is still held for the reply language
+    // check when the limit cuts it.
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &.{"Beta."}, .content = "Beta.", .finish_reason = .length },
+        .{ .chunks = &.{" and more text here."}, .content = " and more text here." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var prompt = "Please write a short note about the weather today in plain English.".*;
+    var job = fixture.job();
+    job.prompt = &prompt;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    // The held part reaches the screen once, as the text after it does.
+    var shown: usize = 0;
+    for (hooks.assistant_sources.items) |text| shown += std.mem.count(u8, text, "Beta.");
+    try std.testing.expectEqual(@as(usize, 1), shown);
+    var rest: usize = 0;
+    for (hooks.assistant_sources.items) |text| rest += std.mem.count(u8, text, "and more text here.");
+    try std.testing.expectEqual(@as(usize, 1), rest);
+    try std.testing.expectEqualStrings("Beta. and more text here.", hooks.finish_assistant_text.?);
+}
+
+test "processQueuedPrompt keeps a cut reply's text as its own reply once tools run after it" {
+    const alloc = std.testing.allocator;
+    const read = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .content = "I will read the file first", .finish_reason = .length },
+        .{ .tool_calls = &read },
+        .{ .content = "Read it." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 2, &.{ "I will read the file first", "Continue exactly where it stopped", "call_read" });
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("Read it.", hooks.finish_assistant_text.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
 test "processQueuedPrompt review continuation appends active review prompt after write tool" {

@@ -18,6 +18,7 @@ const pending_revocation = @import("pending_revocation.zig");
 const secret = @import("secret.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
+const ui_terminal = @import("../../ui/terminal/terminal.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -1601,23 +1602,48 @@ const TeamPickerKey = union(enum) {
 };
 
 fn readTeamPickerKey() !TeamPickerKey {
+    return readTeamPickerKeyFromFd(std.posix.STDIN_FILENO);
+}
+
+fn readTeamPickerKeyFromFd(fd: std.posix.fd_t) !TeamPickerKey {
     var buf: [8]u8 = undefined;
-    const first_read = try std.posix.read(std.posix.STDIN_FILENO, buf[0..1]);
-    if (first_read == 0) return .ignored;
+    const first_read = std.posix.read(fd, buf[0..1]) catch |err| {
+        if (ui_terminal.terminalGone(fd, err)) return error.TerminalHungUp;
+        return err;
+    };
+    if (first_read == 0) {
+        if (ui_terminal.terminalInputGone(fd)) return error.TerminalHungUp;
+        return .ignored;
+    }
 
     var len = first_read;
     if (buf[0] == 0x1b) {
         while (len < buf.len) {
             if (escapeSequenceComplete(buf[0..len])) break;
             var fds = [_]std.posix.pollfd{.{
-                .fd = std.posix.STDIN_FILENO,
+                .fd = fd,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
-            const ready = try std.posix.poll(&fds, 25);
-            if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) break;
-            const n = try std.posix.read(std.posix.STDIN_FILENO, buf[len .. len + 1]);
-            if (n == 0) break;
+            const ready = std.posix.poll(&fds, 25) catch |err| {
+                if (ui_terminal.terminalGone(fd, err)) return error.TerminalHungUp;
+                return err;
+            };
+            if (ready == 0) break;
+            if ((fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0 and
+                ui_terminal.terminalInputGone(fd))
+            {
+                return error.TerminalHungUp;
+            }
+            if ((fds[0].revents & std.posix.POLL.IN) == 0) break;
+            const n = std.posix.read(fd, buf[len .. len + 1]) catch |err| {
+                if (ui_terminal.terminalGone(fd, err)) return error.TerminalHungUp;
+                return err;
+            };
+            if (n == 0) {
+                if (ui_terminal.terminalInputGone(fd)) return error.TerminalHungUp;
+                break;
+            }
             len += n;
         }
     }
@@ -1664,7 +1690,10 @@ const TeamPickerRawMode = struct {
         }
 
         var self = TeamPickerRawMode{};
-        self.original = try io_mod.tcgetattr(std.posix.STDIN_FILENO);
+        self.original = io_mod.tcgetattr(std.posix.STDIN_FILENO) catch |err| {
+            if (ui_terminal.terminalInputGone(std.posix.STDIN_FILENO)) return error.TerminalHungUp;
+            return err;
+        };
         var raw = self.original;
 
         raw.iflag.BRKINT = false;
@@ -1944,14 +1973,30 @@ test "login session transfer cleans up allocation failures" {
 }
 
 fn readLine(alloc: Allocator) ![]u8 {
+    return readLineFromFile(alloc, std.Io.File.stdin());
+}
+
+fn readLineFromFile(alloc: Allocator, file: std.Io.File) ![]u8 {
     var read_buf: [1024]u8 = undefined;
-    var reader = std.Io.File.stdin().reader(io_mod.getIo(), &read_buf);
-    const line = reader.interface.takeDelimiter('\n') catch return try alloc.dupe(u8, "");
+    var reader = file.reader(io_mod.getIo(), &read_buf);
+    const line = reader.interface.takeDelimiter('\n') catch |err| {
+        if (ui_terminal.terminalGone(file.handle, err) or
+            ui_terminal.terminalInputGone(file.handle))
+        {
+            return error.TerminalHungUp;
+        }
+        return try alloc.dupe(u8, "");
+    };
+    if (line == null and ui_terminal.terminalInputGone(file.handle)) return error.TerminalHungUp;
     return try alloc.dupe(u8, line orelse "");
 }
 
 fn writeStdout(text: []const u8) !void {
-    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+    std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text) catch |err| {
+        if (err == error.BrokenPipe) return error.OutputReaderGone;
+        if (ui_terminal.terminalGone(std.posix.STDOUT_FILENO, err)) return error.TerminalHungUp;
+        return err;
+    };
 }
 
 fn writeStdoutFmt(comptime fmt: []const u8, args: anytype) !void {
@@ -2921,4 +2966,20 @@ test "login browser opener respects environment tty and platform gates" {
     try std.testing.expect(!browserOpenEnabled(false, false, host.nativeForOs(.macos)));
     try std.testing.expect(!browserOpenEnabled(false, true, host.nativeForOs(.linux)));
     try std.testing.expect(browserOpenEnabled(false, true, host.nativeForOs(.macos)));
+}
+
+test "login team picker readLineFromFile and readTeamPickerKeyFromFd return TerminalHungUp on a closed TestPty" {
+    const shell_runtime = @import("../../ui/shell_runtime.zig");
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |f| f.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+    master.?.close(io_mod.getIo());
+    master = null;
+
+    try std.testing.expectError(error.TerminalHungUp, readLineFromFile(std.testing.allocator, slave));
+    try std.testing.expectError(error.TerminalHungUp, readTeamPickerKeyFromFd(slave.handle));
 }

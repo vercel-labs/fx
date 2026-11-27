@@ -11,6 +11,7 @@ const oauth = @import("oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const subscription_logout = @import("subscription_logout.zig");
+const ui_terminal = @import("../../ui/terminal/terminal.zig");
 
 const Allocator = std.mem.Allocator;
 const FormBody = oauth.FormBody;
@@ -393,20 +394,37 @@ const StdinManualCodeReader = struct {
     closed: bool = false,
 
     fn poll(self: *StdinManualCodeReader) !?[]const u8 {
+        return self.pollFd(std.posix.STDIN_FILENO);
+    }
+
+    fn pollFd(self: *StdinManualCodeReader, fd: std.posix.fd_t) !?[]const u8 {
         if (self.closed) return null;
         var fds = [_]std.posix.pollfd{.{
-            .fd = std.posix.STDIN_FILENO,
+            .fd = fd,
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
-        const ready = try std.posix.poll(&fds, 0);
-        if (ready == 0 or
-            (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) == 0) return null;
+        const ready = std.posix.poll(&fds, 0) catch |err| {
+            if (ui_terminal.terminalGone(fd, err)) return error.TerminalHungUp;
+            return err;
+        };
+        if (ready == 0) return null;
+        if ((fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0 and
+            ui_terminal.terminalInputGone(fd))
+        {
+            return error.TerminalHungUp;
+        }
+        // POLLNVAL is what macOS reports for /dev/null, an open device, so read it to see end of file.
+        if ((fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.NVAL)) == 0) return null;
 
         var chunk: [512]u8 = undefined;
         defer @memset(&chunk, 0);
-        const read_len = try std.posix.read(std.posix.STDIN_FILENO, &chunk);
+        const read_len = std.posix.read(fd, &chunk) catch |err| {
+            if (ui_terminal.terminalGone(fd, err)) return error.TerminalHungUp;
+            return err;
+        };
         if (read_len == 0) {
+            if (ui_terminal.terminalInputGone(fd)) return error.TerminalHungUp;
             self.closed = true;
             return if (self.len == 0) null else self.buffer[0..self.len];
         }
@@ -822,7 +840,11 @@ fn queryValueAlloc(alloc: Allocator, query: []const u8, key: []const u8) ![]u8 {
 }
 
 fn writeStdout(text: []const u8) !void {
-    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+    std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text) catch |err| {
+        if (err == error.BrokenPipe) return error.OutputReaderGone;
+        if (ui_terminal.terminalGone(std.posix.STDOUT_FILENO, err)) return error.TerminalHungUp;
+        return err;
+    };
 }
 
 test "Grok E2E OAuth endpoint overrides accept only loopback HTTP" {
@@ -1027,4 +1049,21 @@ test "a Grok refresh's account lookup is never cut off by a cancel" {
     });
     defer replacement.deinit(alloc);
     try std.testing.expect(state.outlives_cancel);
+}
+
+test "Grok StdinManualCodeReader returns TerminalHungUp on a closed TestPty" {
+    const shell_runtime = @import("../../ui/shell_runtime.zig");
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |f| f.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+    master.?.close(io_mod.getIo());
+    master = null;
+
+    var reader: StdinManualCodeReader = .{};
+    defer reader.deinit();
+    try std.testing.expectError(error.TerminalHungUp, reader.pollFd(slave.handle));
 }

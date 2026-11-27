@@ -751,8 +751,9 @@ tmuxTest(
     expect(pane).not.toContain("Out of credits");
     expect(pane).not.toContain("I added credits, retry");
 
-    const scrollback = await session.captureFullScrollback();
-    const matches = scrollback.match(/! system: HTTP 429:/g) ?? [];
+    // Notices wrap to the pane width, so join the wrapped rows before reading them.
+    const scrollback = (await session.captureFullScrollback()).replace(/\n +/g, " ");
+    const matches = scrollback.match(/Daily limit reached for gemini-4-hydrogen; resets in/g) ?? [];
     expect(matches).toHaveLength(1);
     expect(scrollback).toContain("Switch models: /model");
     expect(scrollback).toContain("Use a Gemini API key: /provider google api-key");
@@ -762,7 +763,7 @@ tmuxTest(
       (value) => value.includes("/provider google api-key") && value.includes("enter save"),
       TIMEOUT,
     );
-    expect(keyPane).toContain("Gemini API key");
+    expect(keyPane).toContain("Paste or type a key");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,

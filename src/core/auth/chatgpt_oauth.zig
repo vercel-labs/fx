@@ -13,6 +13,7 @@ const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const subscription_logout = @import("subscription_logout.zig");
 const types = @import("../shared/types.zig");
+const ui_terminal = @import("../../ui/terminal/terminal.zig");
 
 const Allocator = std.mem.Allocator;
 const FormBody = oauth.FormBody;
@@ -753,7 +754,11 @@ fn queryValueAlloc(alloc: Allocator, query: []const u8, key: []const u8) ![]u8 {
 }
 
 fn writeStdout(text: []const u8) !void {
-    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+    std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text) catch |err| {
+        if (err == error.BrokenPipe) return error.OutputReaderGone;
+        if (ui_terminal.terminalGone(std.posix.STDOUT_FILENO, err)) return error.TerminalHungUp;
+        return err;
+    };
 }
 
 test "ChatGPT E2E OAuth endpoint overrides accept only loopback HTTP" {
