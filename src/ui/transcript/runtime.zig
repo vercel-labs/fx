@@ -9838,6 +9838,7 @@ pub const TranscriptRuntime = struct {
         // history replay can write them; rows already on screen scroll out
         // as they are.
         const history_behind_viewport = committed_projection_offset > anchor.history_visual_offset;
+        const history_beyond_screen = releasable_offset > anchor.total_visual_rows;
         const geometry_history_rows: u32 = if (geometry_rebase and
             ((source_compatible and source_visual_growth) or
                 displaced_history_replay != null))
@@ -9875,7 +9876,7 @@ pub const TranscriptRuntime = struct {
                 // the floor clamps that range, so the budget is measured
                 // from the committed viewport, not from history.
                 releasable_offset -| anchor.visual_offset
-        else if ((!history_behind_viewport or
+        else if (((!history_behind_viewport and !history_beyond_screen) or
             stableHistoryReplayWanted(anchor, false, releasable_offset)) and
             self.compatibleCommittedHistoryReplayRange(
                 prepared,
@@ -9919,7 +9920,7 @@ pub const TranscriptRuntime = struct {
             semantic_rows,
             .paced,
         );
-        if (history_behind_viewport and !geometry_rebase and
+        if ((history_behind_viewport or history_beyond_screen) and !geometry_rebase and
             semantic_rows == 0 and releasable_advance > 0 and
             (recovery_rebase or anchor.history_catchup_pending))
         {

@@ -4259,10 +4259,13 @@ describe.skipIf(SKIP)("tui: resize", () => {
         "first medium width turn with enough words to wrap the user card before resize",
       );
       await session.waitForText(firstMarker, TIMEOUT);
+      await session.waitForPane(turnSettled, TIMEOUT);
       await session.sendText(
         "second medium width turn with enough words to wrap the user card before resize",
       );
       await session.waitForText(secondMarker, TIMEOUT);
+      await session.waitForPane(turnSettled, TIMEOUT);
+      await session.waitForStableComposer(10_000);
       await waitForGatewayRequestCount(gateway, 2);
 
       const beforeResizeLine = readTraceLines(tracePath).length - 1;

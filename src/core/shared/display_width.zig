@@ -972,3 +972,78 @@ fn isDisplayUnitBoundary(text: []const u8, target: usize) bool {
     }
     return index == target;
 }
+
+fn isValidUtf8Boundary(text: []const u8, target: usize) bool {
+    if (target == 0 or target == text.len) return true;
+    var index: usize = 0;
+    while (index < target) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(text[index]) catch {
+            index += 1;
+            continue;
+        };
+        if (index + seq_len > text.len) {
+            for (text[index + 1 ..]) |b| {
+                if ((b & 0b1100_0000) != 0b1000_0000) {
+                    index += 1;
+                    break;
+                }
+            } else return false;
+            continue;
+        }
+        _ = decodeUtf8Sequence(text[index .. index + seq_len]) catch {
+            index += 1;
+            continue;
+        };
+        if (index + seq_len > target) return false;
+        index += seq_len;
+    }
+    return true;
+}
+
+test "nextWordPieceEnd stays within bounds and preserves UTF-8 and ANSI escape boundaries" {
+    try std.testing.fuzz({}, fuzzNextWordPieceEnd, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "hello world\n",
+            "\x1b[31mstyled\x1b[0m text",
+            "\x1b]8;;https://example.com\x07link\x1b]8;;\x07 ",
+            "a\u{1F44D}\u{1F3FD}b",
+            "caf\u{00E9} \u{754C} \u{1F469}\u{200D}\u{1F4BB}",
+            "\xff\xf0\x28\x8c\x28",
+            "tail\x1b[31",
+            "utf8\xe2\x82",
+            "\x9cQ \xf1\x1b\xf1\t\x84",
+        }) ++ @import("fuzz_corpus").next_word_piece_end.*),
+    });
+}
+
+fn fuzzNextWordPieceEnd(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [256]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    const text = buffer[0..len];
+
+    try std.testing.expectEqual(text.len, nextWordPieceEnd(text, text.len, false));
+    try std.testing.expectEqual(text.len, nextWordPieceEnd(text, text.len, true));
+
+    for ([_]bool{ false, true }) |skip_ansi| {
+        var pos: usize = 0;
+        while (pos < text.len) {
+            const end = nextWordPieceEnd(text, pos, skip_ansi);
+            try std.testing.expect(end > pos and end <= text.len);
+            try std.testing.expect(isValidUtf8Boundary(text, end));
+            if (skip_ansi) {
+                var j = pos;
+                while (j < end) {
+                    if (text[j] == 0x1b) {
+                        const esc_end = ansiSequenceEnd(text, j);
+                        try std.testing.expect(esc_end <= end);
+                        j = if (esc_end > j) esc_end else j + 1;
+                    } else {
+                        j += 1;
+                    }
+                }
+            }
+            pos = end;
+        }
+    }
+}

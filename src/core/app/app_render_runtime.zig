@@ -430,9 +430,20 @@ pub fn Runtime(comptime App: type) type {
             const welcome = try ui_render.welcomeMessage(app.alloc);
             defer app.alloc.free(welcome);
 
+            const dropped_save_failure = app.pacer.takeDeferredSaveFailure();
+            errdefer if (dropped_save_failure) |failure| {
+                debug_trace.logf(
+                    "session",
+                    "save failure notice dropped kind=semantic_notice size=1 reason=visual_epoch_reset_failed save_err={s}",
+                    .{@errorName(failure)},
+                );
+            };
             app.pacer.discardDeferredPresentationForVisualEpoch(app.alloc);
 
             try app.shell.resetVisualEpoch(app.alloc, welcome);
+            if (dropped_save_failure) |failure| {
+                app_session_runtime.Runtime(App).writeDroppedSaveFailureNotice(app, failure, "visual_epoch");
+            }
             try app.shell.requestTerminalReset(&app.metrics);
             switch (trigger) {
                 .native_clear_probe => debug_trace.logf(
@@ -3880,6 +3891,11 @@ const CoordinatorTestPacer = struct {
     pub fn completedAssistantPresentationStartedMs(self: *const CoordinatorTestPacer) ?i64 {
         if (self.real) |*p| return p.completedAssistantPresentationStartedMs();
         return self.completed_turn_started_ms;
+    }
+
+    pub fn takeDeferredSaveFailure(self: *CoordinatorTestPacer) ?anyerror {
+        if (self.real) |*p| return p.takeDeferredSaveFailure();
+        return null;
     }
 };
 

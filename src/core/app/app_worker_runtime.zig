@@ -526,7 +526,9 @@ pub fn Runtime(comptime App: type) type {
         /// at drain, so clearing the pacer never drops an unsaved turn.
         pub fn clearPacer(app: *App, agent: *AppAgent, reason: []const u8) void {
             _ = agent;
-            _ = reason;
+            if (app.pacer.takeDeferredSaveFailure()) |failure| {
+                app_session_runtime.Runtime(App).writeDroppedSaveFailureNotice(app, failure, reason);
+            }
             app.pacer.clear(app.alloc);
         }
 
@@ -2357,6 +2359,10 @@ const FakePacer = struct {
     }
 
     fn attachDeferredStreamMetrics(_: *FakePacer, _: ?i64, _: ?types.TurnTokenProgress) void {}
+
+    fn takeDeferredSaveFailure(_: *FakePacer) ?anyerror {
+        return null;
+    }
 };
 
 const FakeSubagents = struct {

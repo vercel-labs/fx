@@ -17,6 +17,7 @@ pub const FinishResult = union(enum) {
 
 pub const DeferredPresentation = struct {
     summary: ?types.TurnSummary = null,
+    save_failure: ?anyerror = null,
     terminal_outcome: ?types.TurnPresentationOutcome = null,
     is_assistant: bool = false,
     turn_started_ms: ?i64 = null,
@@ -481,6 +482,13 @@ pub const AssistantPacer = struct {
         self.deferred_started_ns = null;
         debug_trace.logf("pacer", "finish_deferred backlog={d}", .{self.tail_slots.items.len});
         return true;
+    }
+
+    pub fn takeDeferredSaveFailure(self: *AssistantPacer) ?anyerror {
+        const deferred = &(self.deferred_presentation orelse return null);
+        const failure = deferred.save_failure orelse return null;
+        deferred.save_failure = null;
+        return failure;
     }
 
     fn resetRevealRate(self: *AssistantPacer) void {
@@ -991,6 +999,7 @@ const TestCapture = struct {
     emit_chunks: std.ArrayList([]u8) = .empty,
     finish_count: usize = 0,
     finish_summary: ?types.TurnSummary = null,
+    finish_save_failure: ?anyerror = null,
     /// How much text was out when each held call line was written.
     call_emitted_lens: [4]usize = undefined,
     call_count: usize = 0,
@@ -1010,6 +1019,7 @@ const TestCapture = struct {
         const self: *TestCapture = @ptrCast(@alignCast(ctx));
         self.finish_count += 1;
         self.finish_summary = presentation.summary;
+        self.finish_save_failure = presentation.save_failure;
         self.calls_at_finish = self.call_count;
         return .committed;
     }
@@ -1599,6 +1609,24 @@ test "visual epoch discard drops deferred presentation, pending text, and tail s
     try std.testing.expect(!pacer.hasPending());
     try std.testing.expect(pacer.deferred_presentation == null);
     try std.testing.expect(!pacer.hasTail());
+}
+
+test "takeDeferredSaveFailure claims save_failure once before normal finish or drop" {
+    const alloc = std.testing.allocator;
+    var pacer = AssistantPacer{};
+    defer pacer.deinit(alloc);
+    var cap = TestCapture{};
+    defer cap.deinit();
+
+    try pacer.enqueue(alloc, "hello");
+    try std.testing.expect(pacer.deferFinish(.{ .save_failure = error.FileTooBig }));
+    try std.testing.expectEqual(@as(?anyerror, error.FileTooBig), pacer.takeDeferredSaveFailure());
+    try std.testing.expectEqual(@as(?anyerror, null), pacer.takeDeferredSaveFailure());
+
+    try pacer.tick(alloc, 0, cap.callbacks());
+    try std.testing.expectEqual(@as(usize, 1), cap.finish_count);
+    try std.testing.expectEqual(@as(?anyerror, null), cap.finish_save_failure);
+    try std.testing.expectEqual(@as(?anyerror, null), pacer.takeDeferredSaveFailure());
 }
 
 test "ANSI-styled block emits atomically" {

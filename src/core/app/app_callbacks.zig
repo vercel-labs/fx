@@ -321,6 +321,11 @@ pub fn Bindings(comptime App: type) type {
         }
 
         pub fn finishPromptPresentation(app: *App, presentation: assistant_pacer.DeferredPresentation) assistant_pacer.FinishResult {
+            if (presentation.save_failure) |failure| {
+                app_session_runtime.Runtime(App).writeSaveFailureNotice(app, failure) catch |err| {
+                    return .{ .presentation_failed = err };
+                };
+            }
             if (presentation.summary) |summary| {
                 _ = app.shell.appendTurnSummaryEntry(app.alloc, summary) catch |err| {
                     return .{ .presentation_failed = err };
@@ -1886,10 +1891,15 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeAppendHistoryTurn(ctx: *anyopaque, finished: types.FinishedPrompt) !app_worker_runtime.HistoryDelivery {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            commitFinishedPrompt(app, agent, finished) catch |err| {
+            var presentation = assistant_pacer.DeferredPresentation.fromFinishedPrompt(finished);
+            presentation.save_failure = commitFinishedPrompt(app, agent, finished) catch |err| {
                 return .{ .commit_failed = err };
             };
-            const presentation = assistant_pacer.DeferredPresentation.fromFinishedPrompt(finished);
+            if (app.pacer.hasPendingText() or app.pacer.hasTail()) {
+                if (app.pacer.takeDeferredSaveFailure()) |dropped_failure| {
+                    app_session_runtime.Runtime(App).writeDroppedSaveFailureNotice(app, dropped_failure, "superseded");
+                }
+            }
             if (app.pacer.deferFinish(presentation)) return .retained;
             if (comptime @hasDecl(App, "finishPromptPresentation")) {
                 switch (app.finishPromptPresentation(presentation)) {
@@ -1916,12 +1926,15 @@ pub fn Bindings(comptime App: type) type {
             try app.writeDomainNotice(notice, true);
         }
 
-        fn commitFinishedPrompt(app: *App, agent: *AppAgent, finished: types.FinishedPrompt) !void {
+        fn commitFinishedPrompt(app: *App, agent: *AppAgent, finished: types.FinishedPrompt) !?anyerror {
+            if (comptime @hasDecl(App, "appendFinishedPromptDeferringNotice")) {
+                return try app.appendFinishedPromptDeferringNotice(finished);
+            }
             if (comptime @hasDecl(App, "appendFinishedPrompt")) {
                 try app.appendFinishedPrompt(finished);
-                return;
+                return null;
             }
-            try app_session_runtime.Runtime(App).appendFinishedPrompt(app, agent, finished);
+            return try app_session_runtime.Runtime(App).appendFinishedPromptDeferringNotice(app, agent, finished);
         }
     };
 }
@@ -2078,6 +2091,10 @@ const FakePacer = struct {
     pub fn deferFinish(self: *FakePacer, presentation: assistant_pacer.DeferredPresentation) bool {
         _ = presentation;
         return self.defer_history;
+    }
+
+    pub fn takeDeferredSaveFailure(_: *FakePacer) ?anyerror {
+        return null;
     }
 
     pub fn flushPresentationAtBoundary(
@@ -3525,18 +3542,19 @@ const CommitSplitTestApp = struct {
     metrics: types.Metrics = .{},
     summary_presentations: usize = 0,
     notifications_finished: usize = 0,
+    notice_count: usize = 0,
     fail_presentation: bool = false,
     commit_attempts: usize = 0,
     second_turn: ?types.HistoryTurn = null,
 
-    pub fn appendFinishedPrompt(self: *@This(), finished: types.FinishedPrompt) !void {
+    pub fn appendFinishedPromptDeferringNotice(self: *@This(), finished: types.FinishedPrompt) !?anyerror {
         self.commit_attempts += 1;
         if (self.commit_attempts == 1) {
             if (self.second_turn) |turn| {
                 try self.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = turn } });
             }
         }
-        return app_session_runtime.Runtime(@This()).appendFinishedPrompt(self, self.agent(), finished);
+        return app_session_runtime.Runtime(@This()).appendFinishedPromptDeferringNotice(self, self.agent(), finished);
     }
 
     pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
@@ -3578,7 +3596,10 @@ const CommitSplitTestApp = struct {
 
     pub fn writeUserPromptCard(_: *@This(), _: anytype, _: types.UserTurn) !void {}
     pub fn writeTranscript(_: *@This(), _: []const u8, _: bool) !void {}
-    pub fn writeDomainNotice(_: *@This(), _: types.SemanticNotice, _: bool) !void {}
+    pub fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, record: bool) !void {
+        self.notice_count += 1;
+        try self.shell.writeNotice(self.alloc, &self.metrics, notice, record);
+    }
     pub fn writeCommandOutputChunk(_: *@This(), _: command_output_content.Stream, _: []const u8, _: bool) !void {}
     pub fn flushCommandOutputSummary(_: *@This(), _: bool) !void {}
     pub fn allowToolForSession(_: *@This(), _: anytype, _: []const u8, _: []const u8) !void {}
@@ -3878,4 +3899,147 @@ test "empty assistant tail clear with idle pacer does not block provisional tool
     try std.testing.expect(!app.pacer.hasPending());
     try std.testing.expectEqual(@as(usize, 0), agent.worker.worker_events.items.len);
     try std.testing.expectEqual(@as(usize, 1), app.shell.notebook.entries.items.len);
+}
+
+test "save failure during pending paced reply defers save-failure notice until reply finishes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var app = try CommitSplitTestApp.initWithV2Session(alloc, root);
+    defer app.deinitAll();
+    const agent = app.agent();
+    agent.worker.enableCommitGate();
+
+    try app.pacer.enqueue(alloc, "LONG_UNSAVED_START unsaved LONG_UNSAVED_END\n");
+    var evidence = [_]types.FileEvidence{.{
+        .path = @constCast(""),
+        .tool_call_id = @constCast("call_poison"),
+        .tool_name = @constCast("grep_files"),
+        .action = .search,
+        .status = .success,
+    }};
+    const poisoned: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("disk full") },
+        .assistant = @constCast("LONG_UNSAVED_START unsaved LONG_UNSAVED_END\n"),
+        .execution = .{ .files = evidence[0..] },
+    } };
+    try agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
+        .turn = poisoned,
+        .summary = .{ .turn_duration_ms = 500 },
+    } });
+
+    try app_worker_runtime.Runtime(CommitSplitTestApp).tick(
+        &app,
+        agent,
+        Bindings(CommitSplitTestApp).workerEventHandlers(agent),
+    );
+
+    try std.testing.expectEqual(
+        @as(?anyerror, error.InvalidConversationEvent),
+        agent.session_persistence.shutdown_failure,
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.notice_count);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.notebook.entries.items.len);
+    try std.testing.expect(app.pacer.hasPending());
+
+    var now_ns: i128 = 10 * std.time.ns_per_ms;
+    while (app.pacer.hasPending()) {
+        now_ns += 20 * std.time.ns_per_ms;
+        try app.pacer.tick(alloc, now_ns, app.pacerCallbacks());
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expectEqual(@as(usize, 1), app.summary_presentations);
+    try std.testing.expectEqual(@as(usize, 3), app.shell.notebook.entries.items.len);
+    try std.testing.expect(app.shell.notebook.entries.items[0] == .assistant_turn);
+    try std.testing.expect(app.shell.notebook.entries.items[1] == .semantic_notice);
+    try std.testing.expect(app.shell.notebook.entries.items[2] == .raw_bytes);
+}
+
+test "clearing or superseding a deferred save failure emits its notice exactly once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var app = try CommitSplitTestApp.initWithV2Session(alloc, root);
+    defer app.deinitAll();
+    const agent = app.agent();
+    agent.worker.enableCommitGate();
+
+    var evidence = [_]types.FileEvidence{.{
+        .path = @constCast(""),
+        .tool_call_id = @constCast("call_poison"),
+        .tool_name = @constCast("grep_files"),
+        .action = .search,
+        .status = .success,
+    }};
+    const poisoned: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("disk full") },
+        .assistant = @constCast("pending text\n"),
+        .execution = .{ .files = evidence[0..] },
+    } };
+    const clean: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("second") },
+        .assistant = @constCast("clean reply\n"),
+    } };
+
+    // 1. clearPacer emits the dropped save-failure notice once.
+    try app.pacer.enqueue(alloc, "pending text\n");
+    try agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
+        .turn = poisoned,
+        .summary = .{ .turn_duration_ms = 200 },
+    } });
+    try app_worker_runtime.Runtime(CommitSplitTestApp).tick(
+        &app,
+        agent,
+        Bindings(CommitSplitTestApp).workerEventHandlers(agent),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.notice_count);
+    try std.testing.expect(app.pacer.deferred_presentation != null);
+
+    app_worker_runtime.Runtime(CommitSplitTestApp).clearPacer(&app, agent, "cancel");
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expect(app.pacer.deferred_presentation == null);
+    try app.pacer.tick(alloc, 30 * std.time.ns_per_ms, app.pacerCallbacks());
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+
+    // 2. Superseding an older deferred finish emits its save-failure notice once.
+    try app.pacer.enqueue(alloc, "more pending text\n");
+    try agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
+        .turn = poisoned,
+        .summary = .{ .turn_duration_ms = 200 },
+    } });
+    try app_worker_runtime.Runtime(CommitSplitTestApp).tick(
+        &app,
+        agent,
+        Bindings(CommitSplitTestApp).workerEventHandlers(agent),
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expect(app.pacer.deferred_presentation != null);
+
+    try agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
+        .turn = clean,
+        .summary = .{ .turn_duration_ms = 100 },
+    } });
+    try app_worker_runtime.Runtime(CommitSplitTestApp).tick(
+        &app,
+        agent,
+        Bindings(CommitSplitTestApp).workerEventHandlers(agent),
+    );
+    try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+    try std.testing.expect(app.pacer.deferred_presentation != null);
+    try std.testing.expect(app.pacer.deferred_presentation.?.save_failure == null);
+
+    var now_ns: i128 = 30 * std.time.ns_per_ms;
+    while (app.pacer.hasPending()) {
+        now_ns += 20 * std.time.ns_per_ms;
+        try app.pacer.tick(alloc, now_ns, app.pacerCallbacks());
+    }
+    try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+    try std.testing.expectEqual(@as(usize, 1), app.summary_presentations);
 }

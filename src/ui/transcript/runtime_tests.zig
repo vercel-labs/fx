@@ -15278,6 +15278,96 @@ test "history debt a stable frame could not write is replayed by the next frame"
     try expectDebtFrameReplayed(frame);
 }
 
+test "recovery rebase frame beyond painted screen rows holds history until next frame replays it" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
+    var metrics: Metrics = .{};
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "row-00\nrow-01\nrow-02\n");
+    var tail_events = [_]assistant_presentation.Event{.{ .text = @constCast("provisional tail") }};
+    transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &tail_events));
+    var initial = try runtime.prepareTranscriptSource(alloc, null);
+    defer initial.deinit(alloc);
+    var initial_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &initial);
+    defer initial_prepared.deinit(alloc);
+    try commitPreparedForTest(&runtime, alloc, &initial, &initial_prepared);
+    const initial_anchor = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(@as(u32, 0), initial_anchor.history_visual_offset);
+    try std.testing.expectEqual(@as(u32, 0), initial_anchor.visual_offset);
+    try std.testing.expectEqual(@as(u32, 4), initial_anchor.total_visual_rows);
+
+    runtime.clearAssistantTail(alloc);
+    _ = try runtime.streamAssistantChunk(
+        alloc,
+        &metrics,
+        "row-03\nrow-04\nrow-05\nrow-06\nrow-07\nrow-08\nrow-09\nrow-10\nrow-11\n",
+    );
+    var grown = try runtime.prepareTranscriptSource(alloc, null);
+    defer grown.deinit(alloc);
+    var grown_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &grown);
+    defer grown_prepared.deinit(alloc);
+    const held_facts = runtime.planTranscriptScroll(&grown_prepared);
+    const held_scroll = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        held_facts.planned_rows,
+    );
+    var held_plan = testPaintPlan(&runtime, grown_prepared.selection);
+    var held_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
+        alloc,
+        &grown,
+        &grown_prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(held_plan),
+        &held_plan,
+        held_scroll,
+    );
+    defer held_transition.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), held_facts.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 0), held_scroll.terminal_scroll_rows);
+    try std.testing.expect(held_transition.document_append.isEmpty());
+    try std.testing.expectEqual(@as(u32, 0), held_transition.history_visual_offset);
+
+    try commitPreparedForTest(&runtime, alloc, &grown, &grown_prepared);
+    const held = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(@as(u32, 0), held.history_visual_offset);
+    try std.testing.expect(held.history_catchup_pending);
+
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "row-12\n");
+    var next_src = try runtime.prepareTranscriptSource(alloc, null);
+    defer next_src.deinit(alloc);
+    var next_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &next_src);
+    defer next_prepared.deinit(alloc);
+    const next_facts = runtime.planTranscriptScroll(&next_prepared);
+    const next_scroll = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        next_facts.planned_rows,
+    );
+    var next_plan = testPaintPlan(&runtime, next_prepared.selection);
+    var next_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
+        alloc,
+        &next_src,
+        &next_prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(next_plan),
+        &next_plan,
+        next_scroll,
+    );
+    defer next_transition.deinit(alloc);
+    try std.testing.expect(next_facts.semantic_rows > 0);
+    try std.testing.expect(next_scroll.terminal_scroll_rows > 0);
+    try std.testing.expect(!next_transition.document_append.isEmpty());
+    try std.testing.expect(next_transition.history_visual_offset > 0);
+}
+
 test "catch-up release materializes history before staging a larger finality hold" {
     const alloc = std.testing.allocator;
     const committed_flow =

@@ -2820,7 +2820,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn appendHistoryTurn(app: *App, agent: *AppAgent, turn: types.HistoryTurn) !void {
-            try appendHistoryTurnWithPendingPresentation(app, agent, turn, .strict, null, 0);
+            _ = try appendHistoryTurnWithPendingPresentation(app, agent, turn, .strict, null, 0, false);
         }
 
         /// Tells the agent's worker that a finished turn is committed, or
@@ -2855,24 +2855,71 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             finished: types.FinishedPrompt,
         ) !void {
+            _ = try appendFinishedPromptWithNoticeMode(app, agent, finished, false);
+        }
+
+        pub fn appendFinishedPromptDeferringNotice(
+            app: *App,
+            agent: *AppAgent,
+            finished: types.FinishedPrompt,
+        ) !?anyerror {
+            return appendFinishedPromptWithNoticeMode(app, agent, finished, true);
+        }
+
+        fn appendFinishedPromptWithNoticeMode(
+            app: *App,
+            agent: *AppAgent,
+            finished: types.FinishedPrompt,
+            defer_save_notice: bool,
+        ) !?anyerror {
             var committed: ?types.HistoryTurn = null;
             defer acknowledgeFinishCommitted(agent, committed, finished.snapshot_file_ownership);
             var turn = finished.turn;
             if (finished.summary) |summary| {
                 types.setHistoryTurnSummary(&turn, summary);
             }
-            try appendHistoryTurnWithPendingPresentation(
+            const save_failure = try appendHistoryTurnWithPendingPresentation(
                 app,
                 agent,
                 turn,
                 .finished_prompt,
                 finished.snapshot_file_ownership,
                 finished.capture_turn,
+                defer_save_notice,
             );
             committed = turn;
             if (comptime agents.hasAgentField(App, "child_run")) {
                 @import("app_agents_runtime.zig").Runtime(App).commitChildTurn(app, agent, finished);
             }
+            return save_failure;
+        }
+
+        pub fn writeSaveFailureNotice(app: *App, failure: anyerror) !void {
+            if (comptime @hasDecl(App, "writeDomainNotice")) {
+                var plain_buf: [96]u8 = undefined;
+                const body = try app.alloc.print(
+                    "Couldn't save this turn: {s}. It may be missing when you reopen this session.",
+                    .{types.plainErrorText(@errorName(failure), &plain_buf)},
+                );
+                defer app.alloc.free(body);
+                app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "save failure notice dropped kind=semantic_notice size=1 reason=write_failed err={s} save_err={s}",
+                        .{ @errorName(err), @errorName(failure) },
+                    );
+                };
+            }
+        }
+
+        pub fn writeDroppedSaveFailureNotice(app: *App, failure: anyerror, reason: []const u8) void {
+            writeSaveFailureNotice(app, failure) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "save failure notice dropped kind=semantic_notice size=1 reason={s} err={s} save_err={s}",
+                    .{ reason, @errorName(err), @errorName(failure) },
+                );
+            };
         }
 
         const AppendHistoryMode = enum {
@@ -2892,21 +2939,22 @@ pub fn Runtime(comptime App: type) type {
             /// The turn's workspace capture token from its finished prompt
             /// (`types.FinishedPrompt.capture_turn`); 0 commits no captures.
             capture_turn: u64,
-        ) !void {
+            defer_save_notice: bool,
+        ) !?anyerror {
             if (comptime !agents.hasAgentField(App, "session_persistence")) {
-                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn);
+                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn, defer_save_notice);
             }
             const interrupted = switch (turn) {
                 .interrupted => |entry| entry,
-                else => return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn),
+                else => return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn, defer_save_notice),
             };
             var pending = agent.session_persistence.pending_cancelled_command orelse {
-                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn);
+                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn, defer_save_notice);
             };
             agent.session_persistence.pending_cancelled_command = null;
             const call = interrupted.tool_call orelse {
                 pending.discard(app.alloc);
-                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn);
+                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn, defer_save_notice);
             };
             const is_command = try captured_command.isToolCall(
                 app.alloc,
@@ -2917,7 +2965,7 @@ pub fn Runtime(comptime App: type) type {
                 !std.mem.eql(u8, call.id, pending.lifecycle_id.call_id))
             {
                 pending.discard(app.alloc);
-                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn);
+                return appendHistoryTurnWithOutcome(app, agent, turn, mode, snapshot_file_ownership, capture_turn, defer_save_notice);
             }
             defer pending.discard(app.alloc);
 
@@ -2936,6 +2984,7 @@ pub fn Runtime(comptime App: type) type {
                     mode,
                     snapshot_file_ownership,
                     capture_turn,
+                    defer_save_notice,
                 );
             }
 
@@ -2944,7 +2993,7 @@ pub fn Runtime(comptime App: type) type {
                 .command_artifact_handle = pending.command_artifact_handle,
             };
             const enriched: types.HistoryTurn = .{ .interrupted = enriched_interrupted };
-            return appendHistoryTurnWithOutcome(app, agent, enriched, mode, snapshot_file_ownership, capture_turn);
+            return appendHistoryTurnWithOutcome(app, agent, enriched, mode, snapshot_file_ownership, capture_turn, defer_save_notice);
         }
 
         fn ensurePendingCancelledCommand(
@@ -3009,7 +3058,8 @@ pub fn Runtime(comptime App: type) type {
             mode: AppendHistoryMode,
             snapshot_file_ownership: ?types.SnapshotFileOwnership,
             capture_turn: u64,
-        ) !void {
+            defer_save_notice: bool,
+        ) !?anyerror {
             var prepared = try (if (comptime @hasDecl(@TypeOf(agent.session), "prepareHistoryEntry"))
                 agent.session.prepareHistoryEntry(app.alloc, turn)
             else
@@ -3026,7 +3076,7 @@ pub fn Runtime(comptime App: type) type {
                 if (snapshot_file_ownership) |ownership| ownership.transfer();
                 ensureCachedSessionTitle(app, agent) catch {};
                 commitJsHostSnapshot(app, agent, "history_turn", .clear);
-                return;
+                return null;
             }
             // The turn's end capture was taken on its worker as the turn
             // finished (`endWorkspaceCapture`); this commit, which may run on
@@ -3034,7 +3084,7 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             if (agent.session_persistence.v2) |v2| {
                 defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
-                try commitV2HistoryTurn(app, agent, v2, &prepared, mode, capture_turn);
+                const save_failure = try commitV2HistoryTurn(app, agent, v2, &prepared, mode, capture_turn, defer_save_notice);
                 if (comptime @hasDecl(@TypeOf(agent.session), "commitPreparedHistoryEntry")) {
                     agent.session.commitPreparedHistoryEntry(app.alloc, prepared);
                     prepared_owned = false;
@@ -3043,7 +3093,7 @@ pub fn Runtime(comptime App: type) type {
                 }
                 if (snapshot_file_ownership) |ownership| ownership.transfer();
                 ensureCachedSessionTitle(app, agent) catch {};
-                return;
+                return save_failure;
             }
             agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             if (comptime @hasDecl(@TypeOf(agent.session), "commitPreparedHistoryEntry")) {
@@ -3055,6 +3105,7 @@ pub fn Runtime(comptime App: type) type {
             if (snapshot_file_ownership) |ownership| ownership.transfer();
             ensureCachedSessionTitle(app, agent) catch {};
             commitJsHostSnapshot(app, agent, "history_turn", .clear);
+            return null;
         }
 
         /// Saves a finished turn to v2 with v1's failure modes. Returning
@@ -3067,7 +3118,8 @@ pub fn Runtime(comptime App: type) type {
             prepared: *types.HistoryTurn,
             mode: AppendHistoryMode,
             capture_turn: u64,
-        ) !void {
+            defer_save_notice: bool,
+        ) !?anyerror {
             const failure: anyerror = saved: {
                 v2.prepareTurn(prepared) catch |err| break :saved err;
                 const captures = &agent.session_persistence.turn_capture;
@@ -3085,21 +3137,16 @@ pub fn Runtime(comptime App: type) type {
                     v2.commitTurn(prepared.*, agent.session.languageSnapshot());
                 committed catch |err| break :saved err;
                 captures.committed(capture_token);
-                return;
+                return null;
             };
             switch (mode) {
                 .strict => return failure,
                 .finished_prompt => {
                     recordShutdownFailure(agent, failure);
-                    if (comptime @hasDecl(App, "writeDomainNotice")) {
-                        var plain_buf: [96]u8 = undefined;
-                        const body = try app.alloc.print(
-                            "Couldn't save this turn: {s}. It may be missing when you reopen this session.",
-                            .{types.plainErrorText(@errorName(failure), &plain_buf)},
-                        );
-                        defer app.alloc.free(body);
-                        app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch {};
+                    if (!defer_save_notice) {
+                        try writeSaveFailureNotice(app, failure);
                     }
+                    return @as(?anyerror, failure);
                 },
             }
         }
@@ -6577,6 +6624,9 @@ test "session transition retires queued and running compaction only after worker
         } = .{},
         pacer: struct {
             pub fn clear(_: *@This(), _: Allocator) void {}
+            pub fn takeDeferredSaveFailure(_: *@This()) ?anyerror {
+                return null;
+            }
         } = .{},
 
         pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
