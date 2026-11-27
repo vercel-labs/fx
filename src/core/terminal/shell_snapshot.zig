@@ -1716,6 +1716,28 @@ test "snapshot owner fails the active generation after a replay failure" {
     try testing.expect(std.mem.find(u8, notice, "could not be restored") != null);
 }
 
+test "a replay failure records the failed shell and fingerprint after its generation retires" {
+    FakeCapture.reset(0, false);
+    var owner: Owner = .{ .capture_fn = FakeCapture.capture };
+    defer owner.deinit();
+
+    const lease = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
+    const generation = lease.generation;
+    generation.fingerprint.len = 1;
+    generation.fingerprint.stamps[0] = .{ .present = true, .inode = 7, .size = 42, .mtime_ns = 1000, .ctime_ns = 2000 };
+    const expected_shell = try testing.allocator.dupe(u8, generation.shell_path);
+    defer testing.allocator.free(expected_shell);
+    const expected_fingerprint = generation.fingerprint;
+
+    // Releasing the last lease leaves the generation active but unleased, so
+    // the failure retires and frees it while it records the failure.
+    lease.release();
+    owner.markReplayFailed(generation);
+
+    try testing.expectEqualStrings(expected_shell, owner.failed_shell[0..owner.failed_shell_len]);
+    try testing.expect(owner.failed_fingerprint.eql(&expected_fingerprint));
+}
+
 /// A fake capture whose startup files moved ZDOTDIR to `folder`, or set none
 /// when `folder` is empty.
 const MovedZdotdirCapture = struct {
