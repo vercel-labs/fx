@@ -1691,6 +1691,15 @@ fn emitShutdownCleanupAndResume(shell: *TranscriptRuntime, metrics: *Metrics) vo
     }
     _ = writeLifecycleTerminalBytes(shell, metrics, "\x1b[?7h\x1b[0m") catch {};
 
+    // Before a frame commits, this process has not drawn on the terminal, so
+    // erasing from a clamped startup row or printing a newline would disturb
+    // the previous screen (for example during an upgrade relaunch fallback).
+    if (!shell.has_committed_frame and !shell.footer_viewport.has_frame) {
+        // Best-effort cursor restore during shutdown; caller is already exiting.
+        _ = writeLifecycleTerminalBytes(shell, metrics, "\x1b[?25h") catch {};
+        return;
+    }
+
     var cursor_buf: [32]u8 = undefined;
     if (ui_terminal.moveCursorSequence(&cursor_buf, shutdownCleanupRow(shell), 1)) |cursor| {
         _ = writeLifecycleTerminalBytes(shell, metrics, cursor) catch {};
@@ -2609,6 +2618,42 @@ test "prepare startup viewport uses scrollback setting for launch push only" {
     try std.testing.expectEqualStrings("", disabled_bytes);
 }
 
+test "prepare startup viewport with welcome reservation does not push ten blank lines" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "bottom.out";
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .layout = .{
+            .rows = 49,
+            .cols = 146,
+            .content_bottom = 45,
+            .divider_top_row = 46,
+            .input_row = 47,
+            .divider_bottom_row = 48,
+            .hint_row = 49,
+        },
+    };
+    defer shell.deinit(alloc);
+
+    var metrics = Metrics{};
+    var launch_row: u16 = 45;
+    _ = try prepareStartupViewport(&shell, &metrics, &launch_row, ui_render.welcome_message_reserved_rows, false);
+    shell.stdout_file.close(io_mod.getIo());
+
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 1024);
+    defer alloc.free(bytes);
+
+    try std.testing.expectEqual(@as(u16, 2), ui_render.welcome_message_reserved_rows);
+    try std.testing.expectEqual(@as(u16, 44), launch_row);
+    try std.testing.expectEqualStrings("\x1b[49;1H\n", bytes);
+}
+
 test "shutdown cleanup erases from footer frame top after frame commit" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2653,6 +2698,46 @@ test "shutdown cleanup erases from footer frame top after frame commit" {
 
     try std.testing.expect(std.mem.find(u8, bytes, "\x1b[6;1H\x1b[J") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\x1b[21;1H\x1b[J") != null);
+}
+
+test "shutdown cleanup before first frame leaves existing screen untouched" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out_path = "shutdown_unpainted.out";
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
+    var shell = TranscriptRuntime{
+        .stdout_file = out_file,
+        .sync_updates_enabled = false,
+        .layout = .{
+            .rows = 49,
+            .cols = 146,
+            .content_bottom = 45,
+            .divider_top_row = 46,
+            .input_row = 47,
+            .divider_bottom_row = 48,
+            .hint_row = 49,
+        },
+        .cursor_row = 35,
+        .cursor_col = 1,
+        .has_committed_frame = false,
+    };
+    defer shell.deinit(alloc);
+
+    var metrics = Metrics{};
+    emitShutdownCleanupAndResume(&shell, &metrics);
+    shell.stdout_file.close(io_mod.getIo());
+
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
+    defer read_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 1024);
+    defer alloc.free(bytes);
+
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[35;1H") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[J") == null);
+    try std.testing.expect(std.mem.findScalar(u8, bytes, '\n') == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[?25h") != null);
 }
 
 test "startup credential modes select a refresh policy, never a narrower source set" {
