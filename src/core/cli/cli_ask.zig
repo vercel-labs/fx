@@ -3586,7 +3586,7 @@ fn onWebFetchProgress(raw_ctx: *anyopaque, _: []const u8, progress: types.WebFet
 fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.presenter) |presenter| return presenter.pushNotice(.{
-        .topic = "system",
+        .topic = "",
         .tone = .neutral,
         .body = text,
     });

@@ -430,7 +430,7 @@ async function compactAndWait(tui: TmuxSession, root: FixtureRoot, timeoutMs: nu
   const after = readFileSync(eventsPath, "utf8");
   expect(after.startsWith(before)).toBe(true);
   expect(compactionCount(after)).toBe(checkpoints + 1);
-  expect(pane).not.toContain("request failed:");
+  expect(pane).not.toContain("Request failed:");
   expect(pane).not.toContain("Compaction failed.");
 }
 
@@ -8829,9 +8829,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath, isolated: true });
       await tui.waitForComposer(15_000);
       await tui.sendText("Read sentinel.txt six times, then finish.");
-      const automatic = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("REPLAY_TURN_DONE") || text.includes("request failed:")), 30_000);
+      const automatic = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("REPLAY_TURN_DONE") || text.includes("Request failed:")), 30_000);
       expect(automatic).toContain("REPLAY_TURN_DONE");
-      expect(automatic).not.toContain("request failed:");
+      expect(automatic).not.toContain("Request failed:");
       expect(summaries).toBe(1);
       await tui.sendText("Remember the result and acknowledge this short follow-up.");
       await tui.waitForPane((text) => text.includes("RECENT_TURN_DONE") && hasEmptyComposer(text) && turnSettled(text), 15_000);
@@ -9048,8 +9048,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
         await tui.waitForComposer(15000);
         await tui.sendText("Run the fixture command, then search its output.");
-        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("READ_TEXT_COMPLETE") || text.includes("request failed:")), 30000);
-        expect(pane).not.toContain("request failed:");
+        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("READ_TEXT_COMPLETE") || text.includes("Request failed:")), 30000);
+        expect(pane).not.toContain("Request failed:");
         expect(pane).toContain("READ_TEXT_COMPLETE");
         expect(readOutput).toContain(`${marker} found`);
         expect(readOutput).not.toContain("must be an object");
@@ -9113,8 +9113,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
         await tui.waitForComposer(15000);
         await tui.sendText("Run the fixture command, then search its output for a long text.");
-        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("READ_LONG_COMPLETE") || text.includes("request failed:")), 30000);
-        expect(pane).not.toContain("request failed:");
+        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("READ_LONG_COMPLETE") || text.includes("Request failed:")), 30000);
+        expect(pane).not.toContain("Request failed:");
         expect(pane).toContain("READ_LONG_COMPLETE");
         expect(readOutput).not.toContain("must be an object");
         // The row says what the call does, as it does for a short query, and
@@ -9241,8 +9241,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
           await tui.waitForComposer(15000);
           await tui.sendText("Run and retrieve the fixture output, then read the small follow-up file.");
-          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("RETRIEVAL_TURN_COMPLETE") || text.includes("request failed:")), 30000);
-          expect(pane).not.toContain("request failed:");
+          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("RETRIEVAL_TURN_COMPLETE") || text.includes("Request failed:")), 30000);
+          expect(pane).not.toContain("Request failed:");
           expect(pane).toContain("RETRIEVAL_TURN_COMPLETE");
           // The read names the command whose saved output it searches, by the
           // short form the command's own row shows.
@@ -9657,8 +9657,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const before = readFileSync(logPath, "utf8");
           expect(before).toContain('"reason":"cancelled"');
           await tui.sendText("Read the follow-up file and briefly acknowledge it. Do not rerun the child.");
-          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("CANCEL_FOLLOWUP_COMPLETE") || text.includes("request failed:")), 20000);
-          expect(pane).not.toContain("request failed:");
+          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("CANCEL_FOLLOWUP_COMPLETE") || text.includes("Request failed:")), 20000);
+          expect(pane).not.toContain("Request failed:");
           expect(pane).toContain("CANCEL_FOLLOWUP_COMPLETE");
           if (trigger === "manual") {
             await compactAndWait(tui, root, 20000);
@@ -15019,7 +15019,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       expect(json.output).toContain("visible partial output");
       expect(json.output).not.toContain("did not run them");
       expect(json.tool_calls).toEqual([]);
-      expect(result.stderr).toContain("response hit provider length limit");
+      expect(result.stderr).toContain("[notice] The response hit the provider's length limit and may be incomplete.");
       expect(result.stderr).toContain("3 times in a row before its tool calls were complete, so fx did not run them.");
       expect(existsSync(sentinelPath)).toBe(false);
       // Two notes, then the third cut reply in a row ends the turn.
@@ -15061,7 +15061,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
 
       expect(result.code).toBe(1);
       expect(result.stdout).toContain("visible partial output");
-      expect(result.stderr).toContain("response hit provider length limit");
+      expect(result.stderr).toContain("[notice] The response hit the provider's length limit and may be incomplete.");
       expect(existsSync(sentinelPath)).toBe(false);
       // Two notes, then the third cut reply in a row ends the turn.
       expect(gateway.requestCount()).toBe(3);

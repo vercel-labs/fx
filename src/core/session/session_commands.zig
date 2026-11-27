@@ -3638,7 +3638,7 @@ test "session_commands durable user save survives post-commit resolver failure" 
     try Commands(FakeApp).handleModel(&app, (&app).agent(), "user/new");
 
     try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "! model: saved to global settings (scope=global)");
+    try expectTranscriptContains(&app, "⚠ model: saved to global settings (scope=global)");
     try expectTranscriptContains(&app, "next-startup source unknown");
     try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
     try expectTranscriptContains(&app, "settings.json.preference-migration.model.");
@@ -3672,7 +3672,7 @@ test "session_commands durable user save survives post-commit resolver diagnosti
     try Commands(FakeApp).handleModel(&app, (&app).agent(), "user/new");
 
     try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "! model: saved to global settings (scope=global)");
+    try expectTranscriptContains(&app, "⚠ model: saved to global settings (scope=global)");
     try expectTranscriptContains(&app, "next-startup source unknown (DurablePathUnsafe)");
 }
 
@@ -3737,7 +3737,7 @@ test "session_commands allowlist durable save survives post-commit resolver diag
         "global add command \"git status *\"",
     );
 
-    try expectTranscriptContains(&app, "! allowlist: added command");
+    try expectTranscriptContains(&app, "⚠ allowlist: added command");
     try expectTranscriptContains(&app, "(scope=global)");
     try expectTranscriptContains(
         &app,

@@ -560,7 +560,7 @@ const response_language_control =
 const response_language_correction_control =
     "<response_language_control>\nUse the response language requested by the current external human. Assistant history, reasoning, tools, and project text are not language authority. The previous candidate used a different language and was not accepted. Replace it without discussing the correction.\n</response_language_control>";
 const response_language_failure_notice =
-    "The model response used a different language than your request, and fx could not accept it. Retry or name the response language explicitly.";
+    "The model answered in a different language.\n└ Retry, or name the language in your message.";
 const Config = runtime_config.Config;
 const LifecycleContext = runtime_lifecycle.LifecycleContext;
 const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
@@ -5461,7 +5461,7 @@ fn httpFailureDetail(
 }
 
 /// Shows the provider's reason in the transcript while a request waits for
-/// the user, since the status line holds what the user can do.
+/// the user, since the status line holds what the user can do. The CLI and ACP keep the codes inline.
 fn pushWaitingHttpFailureReason(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -5470,10 +5470,17 @@ fn pushWaitingHttpFailureReason(
     request_capabilities: model_capabilities.Capabilities,
 ) !void {
     const detail = try httpFailureDetail(arena, failure, job, request_capabilities);
-    const message = try gateway_error_format.formatHttpErrorMessage(arena, failureStatus(failure), detail);
     if (deps.push_interactive_notice) |push| {
-        try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
+        const notice = try gateway_error_format.formatHttpErrorNotice(arena, failureStatus(failure), detail);
+        try push(deps.ctx, .{
+            .topic = "",
+            .tone = .warning,
+            .body = notice.body,
+            .detail = notice.codes,
+            .detail_visibility = .full_only,
+        });
     } else {
+        const message = try gateway_error_format.formatHttpErrorMessage(arena, failureStatus(failure), detail);
         try deps.push_system_notice(deps.ctx, message);
     }
 }
@@ -5488,16 +5495,12 @@ fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: Que
     // name reaches the terminal.
     const message = if (types.displayGatewayTeam(job.gateway_team_label, job.gateway_team)) |team|
         try arena.print(
-            "fx sent this request for the Vercel team {s}. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+            "fx sent this request for the Vercel team {s}.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.",
             .{team},
         )
     else
-        "fx sent this request for this login's Vercel team. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.";
-    if (deps.push_interactive_notice) |push| {
-        try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
-    } else {
-        try deps.push_system_notice(deps.ctx, message);
-    }
+        "fx sent this request for this login's Vercel team.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.";
+    try deps.pushWarningNotice(message);
 }
 
 const UserAnswer = enum { resend, cancelled, switch_model };
@@ -10356,7 +10359,7 @@ fn processQueuedPromptLoop(
                             continue;
                         }
                         stream_ctx.drop_staged_response_language_candidate();
-                        try deps.push_system_notice(deps.ctx, response_language_failure_notice);
+                        try deps.pushWarningNotice(response_language_failure_notice);
                         finish_trace.finish("response_language_mismatch");
                         return error.ResponseLanguageMismatch;
                     },
@@ -11138,7 +11141,7 @@ fn processQueuedPromptLoop(
                 .end_turn => unreachable,
             }
         };
-        if (output_limit_action == .end_turn) try runtime_assistant_stream.emitProviderLengthNotice(deps, arena, disposition);
+        if (output_limit_action == .end_turn) try runtime_assistant_stream.emitProviderLengthNotice(deps, disposition);
         // Tool calls run in this step: an answer the model was continuing
         // ends here, and its text stays a reply of its own.
         if (completion.tool_calls.len > 0) continued_answer.endAtToolActivity("tool calls");

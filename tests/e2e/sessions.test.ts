@@ -6453,7 +6453,7 @@ test.skipIf(!tmuxAvailable())("an app whose disk fills keeps running, and the se
     const whole = readFileSync(log);
     let app2 = await launch(id, Math.floor(whole.length / SH_LIMIT_BLOCK));
     await app2.sendText("The disk is already full.");
-    await app2.waitForText("request failed: a file-size limit was reached", TIMEOUT);
+    await app2.waitForText("Request failed: a file-size limit was reached", TIMEOUT);
     await app2.waitForComposer(TIMEOUT);
     await quit();
     expect(gateway.requests.length).toBe(asked);

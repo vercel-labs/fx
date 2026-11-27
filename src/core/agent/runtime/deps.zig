@@ -441,6 +441,12 @@ pub const AgentRuntimeDeps = struct {
         return self.push_system_notice(self.ctx, text);
     }
 
+    /// A warning in the transcript where the host shows one, else the plain system notice.
+    pub fn pushWarningNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
+        if (self.push_interactive_notice) |push| return push(self.ctx, .{ .topic = "", .tone = .warning, .body = text });
+        return self.push_system_notice(self.ctx, text);
+    }
+
     pub fn executeToolCall(self: *const AgentRuntimeDeps, request: ToolExecutionRequest) !ToolExecutionResult {
         // No tool acts before the turn's start capture is saved (D98).
         if (self.start_workspace_capture) |capture| capture(self.ctx, false, .settle);

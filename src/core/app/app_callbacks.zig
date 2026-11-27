@@ -1525,7 +1525,7 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             try app_worker_runtime.Runtime(App).pushSemanticNotice(app, agent, .{
-                .topic = "system",
+                .topic = "",
                 .tone = .neutral,
                 .body = text,
             });
@@ -3080,7 +3080,7 @@ test "agent context and system notices share semantic transport with distinct fi
     try std.testing.expectEqual(types.NoticeVisibility.full_only, context.visibility);
     try std.testing.expect(app.agent().worker.events.items[1] == .semantic_notice);
     const ordinary = app.agent().worker.events.items[1].semantic_notice;
-    try std.testing.expectEqualStrings("system", ordinary.topic);
+    try std.testing.expectEqualStrings("", ordinary.topic);
     try std.testing.expectEqual(types.NoticeTone.neutral, ordinary.tone);
     try std.testing.expectEqualStrings("ordinary-system", ordinary.body);
     try std.testing.expectEqual(types.NoticeVisibility.compact_and_full, ordinary.visibility);
