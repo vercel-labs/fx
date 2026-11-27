@@ -78,7 +78,9 @@ function assertReportRequest(request) {
   assert.equal(request.headers.get("authorization"), `Bearer ${apiKey}`);
 }
 
-// The numbers reach the screen, and `r` reads them again.
+const activePeriod = (t) => t.grid().match(/Usage \d+[^\n]*\[(today|7d|month)\]/)?.[1];
+
+// The numbers reach the screen, and Ctrl+R reads them again.
 {
   const t = await startTerminal();
   try {
@@ -89,21 +91,22 @@ function assertReportRequest(request) {
     assert.doesNotMatch(t.grid(), /nothing fetched today/);
     assert.match(t.grid(), /\$1\.25/);
 
-    // Tab lists another period in the model table without reading again.
-    const period = t.grid().match(/model \((\w+)\)/)?.[1];
-    assert.ok(period, "the model table names its period");
+    // Tab lists another period in the header tab row without reading again.
+    assert.match(t.grid(), /API key \(AI_GATEWAY_API_KEY\) · updated/);
+    const period = activePeriod(t);
+    assert.ok(period, "the header tab row names the active period");
     const reads = t.reports.length;
     t.runtime.write("\t");
-    await t.waitFor(() => t.grid().match(/model \((\w+)\)/)?.[1] !== period, "Tab to change the period");
+    await t.waitFor(() => activePeriod(t) !== period, "Tab to change the period");
     assert.equal(t.reports.length, reads);
 
     const before = t.reports.length;
-    t.runtime.write("r");
+    t.runtime.write("\x12");
     await t.waitFor(() => t.reports.length > before, "refresh");
     assertReportRequest(t.reports.at(-1));
 
     t.runtime.write("\x1b");
-    await t.waitFor(() => !t.grid().includes("usage: API key"), "/usage to close");
+    await t.waitFor(() => !/Usage \d+/.test(t.grid()), "/usage to close");
     t.runtime.write("/exit\r");
     assert.equal(await t.runtime.exited, 0);
     assert.equal(t.stderr(), "");
@@ -123,13 +126,13 @@ function assertReportRequest(request) {
     await t.waitFor(() => t.grid().includes("test/usage-model") && t.grid().includes("updated"), "usage numbers");
     t.holdReads();
     const before = t.reports.length;
-    t.runtime.write("r");
+    t.runtime.write("\x12");
     await t.waitFor(() => t.reports.length === before + 1 && t.grid().includes("updating"), "a waiting refresh");
     const waiting = t.reports.at(-1);
 
-    const period = t.grid().match(/model \((\w+)\)/)?.[1];
+    const period = activePeriod(t);
     t.runtime.write("\t");
-    await t.waitFor(() => t.grid().match(/model \((\w+)\)/)?.[1] !== period, "Tab while the read waits");
+    await t.waitFor(() => activePeriod(t) !== period, "Tab while the read waits");
     assert.equal(waiting.signal?.aborted, false);
 
     t.runtime.write("\x03");
@@ -137,7 +140,7 @@ function assertReportRequest(request) {
     assert.ok(t.grid().includes("test/usage-model"), "the numbers already fetched stay on screen");
 
     t.runtime.write("\x1b");
-    await t.waitFor(() => !t.grid().includes("usage: API key"), "/usage to close");
+    await t.waitFor(() => !/Usage \d+/.test(t.grid()), "/usage to close");
     t.runtime.write("/exit\r");
     assert.equal(await t.runtime.exited, 0);
     assert.equal(t.stderr(), "");

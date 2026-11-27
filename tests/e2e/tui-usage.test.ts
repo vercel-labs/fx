@@ -82,6 +82,7 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/usage");
       const month = await session.waitForText("Usage 2  today  7d  [month]", TIMEOUT);
+      expect(month).toContain("API key (AI_GATEWAY_API_KEY) · updated");
       expect(month).toContain("  model");
       expect(month).toMatch(/today\s+\$0\.5000\s+2\s/);
       expect(month).toMatch(/month\s+\$2\.50\s+6\s/);
@@ -110,7 +111,7 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       expect(fake.reportRanges()[3]).toBe(`${TODAY}..${TODAY}`);
 
       await session.sendKeys("Escape");
-      await session.waitForPane(async () => !(await session!.capturePane()).includes("tab period"), TIMEOUT);
+      await session.waitForPane((pane) => !pane.includes("tab period"), TIMEOUT);
       // Reopening inside the floor shows the cache without reading again.
       await session.sendText("/usage");
       await session.waitForText("Usage 2  today  [7d]  month", TIMEOUT);
@@ -147,6 +148,7 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       rotateFxLogin(home, "rotated-token");
       await session.sendText("/usage");
       const month = await session.waitForText("Usage 2  today  7d  [month]", TIMEOUT);
+      expect(month).toContain("(fx login) · updated");
       expect(month).toMatch(/month\s+\$2\.50\s+6\s/);
       expect(fake.requests.filter((request) => request.path === "/v1/report").map((request) => request.authorization)).toEqual([
         "Bearer launch-token",
@@ -175,6 +177,7 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       await session.sendText("/usage");
       const pane = await session.waitForText("gpt-e2e-large", TIMEOUT);
       expect(pane).toContain("Usage 2  today  7d  [month]");
+      expect(pane).toContain("codex (ChatGPT), samdoe · updated");
       expect(pane).toContain("42%");
       expect(pane).toContain("pro");
       expect(pane).toContain("12.40");
@@ -199,6 +202,7 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       await session.sendText("/usage");
       const pane = await session.waitForText("SuperGrok Heavy", TIMEOUT);
       expect(pane).toContain("Usage 2");
+      expect(pane).toContain("grok (xAI) · updated");
       expect(pane).toMatch(/63%\s+in 2d 5h/);
       expect(pane).toContain("$12.50");
       expect(pane).toContain("$3.00 of $100.00");
@@ -251,6 +255,7 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/usage");
       const pane80 = await session.waitForText("Usage 14  today  7d  [month]", TIMEOUT);
+      expect(pane80).toContain("Usage 14  today  7d  [month]     API key (AI_GATEWAY_API_KEY) · updated just now");
       expect(pane80).toContain("4 more");
       expect(pane80).toContain("↑↓ navigate     tab period     enter detail     ctrl+r refresh     esc close");
       expect(pane80).not.toContain("❯");
@@ -287,7 +292,7 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       await session.waitForText("Usage 14  today  7d  [month]", TIMEOUT);
       // Esc 3: close /usage
       await session.sendKeys("Escape");
-      await session.waitForPane(async () => !(await session!.capturePane()).includes("Usage 14"), TIMEOUT);
+      await session.waitForPane((pane) => !pane.includes("Usage 14"), TIMEOUT);
     },
     TIMEOUT * 2,
   );

@@ -474,7 +474,45 @@ fn appendHeadingStatus(alloc: Allocator, row: *std.ArrayList(u8), p: Projection,
     }
 }
 
-/// `Usage <count>` with period tabs on the left and the freshness/error status
+const HeadingRightPlan = struct {
+    account_room: usize = 0,
+    show_status: bool = false,
+};
+
+fn tryFitHeadingRight(left_width: usize, account_width: usize, status_width: usize, limit: usize) ?HeadingRightPlan {
+    if (left_width > limit) return null;
+    if (status_width == 0) {
+        if (account_width > 0) {
+            if (left_width + 2 + account_width <= limit) {
+                return .{ .account_room = account_width, .show_status = false };
+            }
+            const room = limit -| (left_width + 2);
+            if (room >= @min(account_width, 8)) {
+                return .{ .account_room = room, .show_status = false };
+            }
+        }
+        return .{};
+    }
+
+    if (account_width > 0) {
+        if (left_width + 2 + account_width + 3 + status_width <= limit) {
+            return .{ .account_room = account_width, .show_status = true };
+        }
+        const needed_without_account = left_width + 2 + 3 + status_width;
+        if (limit > needed_without_account) {
+            const room = limit - needed_without_account;
+            if (room >= @min(account_width, 8)) {
+                return .{ .account_room = room, .show_status = true };
+            }
+        }
+    }
+    if (left_width + 2 + status_width <= limit) {
+        return .{ .account_room = 0, .show_status = true };
+    }
+    return null;
+}
+
+/// `Usage <count>` with period tabs on the left and `<account> · <status>`
 /// right-aligned, matching `/model` and `/resume` headers. Unavailable, detail,
 /// and non-list plan views keep `Usage: <who>`.
 fn composeHeading(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(u8) {
@@ -486,6 +524,10 @@ fn composeHeading(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(
 
     if (headingListCount(p)) |count| {
         const show_tabs = headingShowsCatalogTabs(p);
+        var account_buf: [256]u8 = undefined;
+        const account = headingSourceText(&account_buf, p);
+        const account_width = display_width.visibleWidth(account);
+
         var wide_left: std.ArrayList(u8) = .empty;
         defer wide_left.deinit(alloc);
         var title_buf: [32]u8 = undefined;
@@ -494,23 +536,46 @@ fn composeHeading(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(
         if (show_tabs) try appendHeadingTabs(alloc, &wide_left, p.period, false);
         const wide_width = display_width.visibleWidthIgnoringAnsi(wide_left.items);
 
-        var chosen = &wide_left;
-        var chosen_width = wide_width;
         var compact_left: std.ArrayList(u8) = .empty;
         defer compact_left.deinit(alloc);
-        if (show_tabs and ((status_width > 0 and wide_width + 2 + status_width > limit) or wide_width > limit)) {
+        var chosen: *const std.ArrayList(u8) = &wide_left;
+        var chosen_width = wide_width;
+        var right_plan: ?HeadingRightPlan = tryFitHeadingRight(wide_width, account_width, status_width, limit);
+
+        if (right_plan == null and show_tabs) {
             try compact_left.print(alloc, "{s}{s}{s}", .{ ui_render.selected_completion_style, title, ui_render.reset_style });
             try appendHeadingTabs(alloc, &compact_left, p.period, true);
-            chosen = &compact_left;
-            chosen_width = display_width.visibleWidthIgnoringAnsi(compact_left.items);
+            const compact_width = display_width.visibleWidthIgnoringAnsi(compact_left.items);
+            if (tryFitHeadingRight(compact_width, account_width, status_width, limit)) |plan| {
+                chosen = &compact_left;
+                chosen_width = compact_width;
+                right_plan = plan;
+            } else if (compact_width <= limit) {
+                chosen = &compact_left;
+                chosen_width = compact_width;
+                right_plan = .{};
+            }
+        } else if (right_plan == null and wide_width <= limit) {
+            right_plan = .{};
         }
 
-        const show_status = status_width > 0 and chosen_width + 2 + status_width <= limit;
-        if (chosen_width <= limit) {
+        if (right_plan) |plan| {
+            var right: std.ArrayList(u8) = .empty;
+            defer right.deinit(alloc);
+            if (plan.account_room > 0) {
+                try right.appendSlice(alloc, ui_render.dim_style);
+                try row_text.appendSingleLineMiddleEllipsized(alloc, &right, account, plan.account_room);
+                if (plan.show_status) try right.appendSlice(alloc, " · ");
+                try right.appendSlice(alloc, ui_render.reset_style);
+            }
+            if (plan.show_status) {
+                try appendHeadingStatus(alloc, &right, p, status);
+            }
             try row.appendSlice(alloc, chosen.items);
-            if (show_status) {
-                try row.appendNTimes(alloc, ' ', limit - chosen_width - status_width);
-                try appendHeadingStatus(alloc, &row, p, status);
+            const right_width = display_width.visibleWidthIgnoringAnsi(right.items);
+            if (right_width > 0) {
+                try row.appendNTimes(alloc, ' ', limit - chosen_width - right_width);
+                try row.appendSlice(alloc, right.items);
             }
             return row;
         }
@@ -535,6 +600,18 @@ fn composeHeading(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(
     return row;
 }
 
+fn headingSourceText(buf: []u8, p: Projection) []const u8 {
+    const s = p.snapshot orelse return "AI Gateway";
+    if (s.label.len == 0) return "AI Gateway";
+    if (codexProfile(p)) |profile| if (profile.name) |name| {
+        var label_buf: [128]u8 = undefined;
+        var name_buf: [64]u8 = undefined;
+        const label = safeText(&label_buf, s.label);
+        return std.mem.print(buf, "{s}, {s}", .{ label, safeText(&name_buf, name) }) catch safeText(buf, s.label);
+    };
+    return safeText(buf, s.label);
+}
+
 /// Whose numbers these are, or on a detail screen which model.
 fn headingLeft(buf: []u8, p: Projection) []const u8 {
     const s = p.snapshot orelse return "AI Gateway";
@@ -553,14 +630,7 @@ fn headingLeft(buf: []u8, p: Projection) []const u8 {
             return std.mem.print(buf, "{s}, model {d} of {d}", .{ name, selected + 1, count }) catch name;
         }
     }
-    if (s.label.len == 0) return "AI Gateway";
-    if (codexProfile(p)) |profile| if (profile.name) |name| {
-        var label_buf: [128]u8 = undefined;
-        var name_buf: [64]u8 = undefined;
-        const label = safeText(&label_buf, s.label);
-        return std.mem.print(buf, "{s}, {s}", .{ label, safeText(&name_buf, name) }) catch safeText(buf, s.label);
-    };
-    return safeText(buf, s.label);
+    return headingSourceText(buf, p);
 }
 
 fn headingStatus(buf: []u8, p: Projection) []const u8 {
@@ -2620,7 +2690,7 @@ test "the usage dashboard matches the catalog header, period tabs, selection sty
     var at_80 = try draw(p, 80, 40);
     defer at_80.deinit();
     try testing.expectEqualStrings(
-        "Usage 14  today  7d  [month]                                      updated 2m ago",
+        "Usage 14  today  7d  [month]  acme-design-tool…tform (fx login) · updated 2m ago",
         at_80.row(0),
     );
     try testing.expectEqualStrings("period        spent  requests  tokens", at_80.row(2));
@@ -2662,7 +2732,7 @@ test "the usage dashboard matches the catalog header, period tabs, selection sty
     var filtered_80 = try draw(filtered_proj, 80, 40);
     defer filtered_80.deinit();
     try testing.expectEqualStrings(
-        "Usage 4  today  7d  [month]                                       updated 2m ago",
+        "Usage 4  today  7d  [month]  acme-design-tools…tform (fx login) · updated 2m ago",
         filtered_80.row(0),
     );
     try testing.expectEqualStrings("period        spent  requests  tokens", filtered_80.row(2));
@@ -2689,7 +2759,7 @@ test "the usage dashboard matches the catalog header, period tabs, selection sty
     var empty_match = try draw(.{ .active = true, .query = "zzz", .snapshot = &snapshot }, 80, 40);
     defer empty_match.deinit();
     try testing.expectEqualStrings(
-        "Usage 0  today  7d  [month]                                       updated 2m ago",
+        "Usage 0  today  7d  [month]  acme-design-tools…tform (fx login) · updated 2m ago",
         empty_match.row(0),
     );
     try testing.expectEqualStrings("  No matching models", empty_match.row(8));
@@ -2726,4 +2796,99 @@ test "the usage dashboard matches the catalog header, period tabs, selection sty
     defer grok_empty.deinit();
     try testing.expect(std.mem.startsWith(u8, grok_empty.row(0), "Usage 0 "));
     try testing.expect(grok_empty.find("  No matching models") != null);
+}
+
+test "header shows account before freshness at 80 cols, ellipsizes or drops it before collapsing tabs, at 80, 50, and 30 columns" {
+    const alloc = testing.allocator;
+
+    // 1. AI Gateway (API key)
+    var gw_models: [14]ModelRow = undefined;
+    var gw_names: [14][16]u8 = undefined;
+    for (&gw_models, 0..) |*row, i| {
+        row.* = testRow(std.mem.print(&gw_names[i], "provider/m{d:0>2}", .{i}) catch unreachable, @floatFromInt(100 - i), 10, 1000);
+    }
+    var gw = try testSnapshot(.ready, false, &gw_models);
+    defer gw.deinit();
+    gw.label = "API key (AI_GATEWAY_API_KEY)";
+    for (&gw.views) |*v| v.fetched_at_ms = test_now;
+    const gw_proj: Projection = .{ .active = true, .snapshot = &gw };
+
+    var gw_80 = try draw(gw_proj, 80, 40);
+    defer gw_80.deinit();
+    try testing.expectEqualStrings(
+        "Usage 14  today  7d  [month]     API key (AI_GATEWAY_API_KEY) · updated just now",
+        gw_80.row(0),
+    );
+    var gw_80_raw = try composeRow(alloc, gw_proj, 0, 40, 80);
+    defer gw_80_raw.deinit(alloc);
+    var dim_buf: [128]u8 = undefined;
+    try testing.expect(std.mem.find(u8, gw_80_raw.items, try std.mem.print(&dim_buf, "{s}API key (AI_GATEWAY_API_KEY) · ", .{ui_render.dim_style})) != null);
+
+    var gw_65 = try draw(gw_proj, 65, 40);
+    defer gw_65.deinit();
+    try testing.expect(std.mem.startsWith(u8, gw_65.row(0), "Usage 14  today  7d  [month]"));
+    try testing.expect(std.mem.endsWith(u8, gw_65.row(0), " · updated just now"));
+    try testing.expect(std.mem.find(u8, gw_65.row(0), "…") != null);
+
+    var gw_50 = try draw(gw_proj, 50, 40);
+    defer gw_50.deinit();
+    try testing.expectEqualStrings(
+        "Usage 14  today  7d  [month]      updated just now",
+        gw_50.row(0),
+    );
+
+    var gw_30 = try draw(gw_proj, 30, 40);
+    defer gw_30.deinit();
+    try testing.expectEqualStrings("Usage 14  [month]", gw_30.row(0));
+
+    // 2. Codex ("codex (ChatGPT), samdoe")
+    var cx = try codexSnapshot(.ready, test_business);
+    defer cx.deinit();
+    cx.codex_at_ms = test_now;
+    const cx_proj: Projection = .{ .active = true, .snapshot = &cx };
+
+    var cx_80 = try draw(cx_proj, 80, 40);
+    defer cx_80.deinit();
+    try testing.expectEqualStrings(
+        "Usage 9  today  7d  [month]           codex (ChatGPT), samdoe · updated just now",
+        cx_80.row(0),
+    );
+    var cx_80_raw = try composeRow(alloc, cx_proj, 0, 40, 80);
+    defer cx_80_raw.deinit(alloc);
+    try testing.expect(std.mem.find(u8, cx_80_raw.items, try std.mem.print(&dim_buf, "{s}codex (ChatGPT), samdoe · ", .{ui_render.dim_style})) != null);
+
+    var cx_50 = try draw(cx_proj, 50, 40);
+    defer cx_50.deinit();
+    try testing.expectEqualStrings(
+        "Usage 9  today  7d  [month]       updated just now",
+        cx_50.row(0),
+    );
+
+    var cx_30 = try draw(cx_proj, 30, 40);
+    defer cx_30.deinit();
+    try testing.expectEqualStrings("Usage 9  [month]", cx_30.row(0));
+
+    // 3. Grok ("grok (xAI)")
+    var gk = try grokSnapshot(.ready, test_grok);
+    defer gk.deinit();
+    gk.grok_at_ms = test_now;
+    const gk_proj: Projection = .{ .active = true, .snapshot = &gk };
+
+    var gk_80 = try draw(gk_proj, 80, 40);
+    defer gk_80.deinit();
+    try testing.expectEqualStrings(
+        "Usage 2                                            grok (xAI) · updated just now",
+        gk_80.row(0),
+    );
+
+    var gk_50 = try draw(gk_proj, 50, 40);
+    defer gk_50.deinit();
+    try testing.expectEqualStrings(
+        "Usage 2              grok (xAI) · updated just now",
+        gk_50.row(0),
+    );
+
+    var gk_30 = try draw(gk_proj, 30, 40);
+    defer gk_30.deinit();
+    try testing.expectEqualStrings("Usage 2       updated just now", gk_30.row(0));
 }
