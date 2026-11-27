@@ -1,0 +1,30 @@
+%% The TuiClose model as a chart, for today's code. Each red state breaks the rule named.
+%% Events the chart leaves out: the request ending by itself, an alternate-screen close,
+%% the closer thread failing to start (the in-handler fallback), and loop blocking (design b).
+stateDiagram-v2
+    direction LR
+    [*] --> Starting: you start fx
+    Starting --> RawNoHandler: raw mode is on, handlers not yet installed
+    Starting --> Ready: handlers installed after raw mode
+    RawNoHandler --> Ready: handlers installed
+    RawNoHandler --> EndedRawTty: a signal arrives (BREAKS TtyRestored)
+    Ready --> Turn: you send a message
+    Turn --> Ready: the reply ends
+    Ready --> FullScreen: you open the transcript
+    FullScreen --> Ready: you close it
+    Ready --> Shutting: you quit with /exit
+    Turn --> Shutting: you quit with /exit (cancels the request)
+    Shutting --> Ended: releaseTerminal restores the tty
+    Shutting --> Shutting: SIGINT is ignored by the guard
+    Ready --> Closing: SIGTERM or SIGHUP
+    Turn --> Closing: SIGTERM or SIGHUP
+    FullScreen --> Closing: SIGTERM or SIGHUP
+    Closing --> EndedRawTty: screen restored, tty left raw (BREAKS TtyRestored)
+    Ready --> EndedRawTty: SIGINT, no handler (BREAKS TtyRestored)
+    FullScreen --> EndedRawTty: SIGINT, screen left open (BREAKS TtyRestored)
+    Turn --> EndedUnsaved: SIGINT during a turn (BREAKS CloseSavesRequest)
+    Turn --> EndedSaved: SIGTERM during a turn, request saved clean
+    EndedRawTty --> [*]
+    EndedUnsaved --> [*]
+    EndedSaved --> [*]
+    Ended --> [*]

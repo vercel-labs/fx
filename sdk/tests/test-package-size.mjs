@@ -84,6 +84,7 @@ for (const text of toolDescriptions) {
   assert.ok(toolSource.includes(text), `src/builtins/tools.zig no longer contains "${text}"; use another built-in tool's description`);
 }
 const withTools = [];
+const withTrace = [];
 for (const [name, path] of Object.entries(nativeTarballs(nativeDir))) {
   const platform = await measurePackage(path);
   measured[name] = { packed: platform.packed, unpacked: platform.unpacked };
@@ -93,9 +94,11 @@ for (const [name, path] of Object.entries(nativeTarballs(nativeDir))) {
   const frames = frameRecordSetups(addon, name);
   if (frames < 1000) miscompiled.push(`${name}: only ${frames} functions set up a frame record`);
   for (const text of toolDescriptions) if (addon.includes(text)) withTools.push(`${name}: "${text}"`);
+  if (addon.includes("FX_TRACE_SCOPES")) withTrace.push(name);
   await rm(platform.dir, { recursive: true, force: true });
 }
 assert.deepEqual(miscompiled, [], `a native addon was built with the wrong code generation settings; see addNapiArtifact in build.zig:\n${miscompiled.join("\n")}`);
+assert.deepEqual(withTrace, [], `a native addon contains the trace log's environment settings; build it with trace_log false:\n${withTrace.join("\n")}`);
 assert.deepEqual(withTools, [], `a native addon contains fx's built-in tools; build it with builtin_tools false:\n${withTools.join("\n")}`);
 
 if (process.argv.includes("--print")) {
