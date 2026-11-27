@@ -1010,7 +1010,7 @@ async function driveScenario(f: Fixture, dir: string): Promise<NextObservation> 
         const options: Array<{ const: string }> = schema[field]?.oneOf ?? [];
         const content: Record<string, string> = { [field]: options[0]?.const ?? "__create__" };
         // rest_fail: the client picks "Another project" and types a name the fake does not know (U6, E9).
-        // The product reads the typed name only when that choice is picked (setup_host.zig:595).
+        // The product reads the typed name only when that choice is picked (`projectAnswer` in `src/core/runner/setup_host.zig`).
         if (answer === "rest_fail" && !isTeam) {
           content.project = "__other__";
           content.other_project = "fx-missing-project";

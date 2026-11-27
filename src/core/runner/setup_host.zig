@@ -597,9 +597,22 @@ fn projectAnswer(parsed: Parsed) setup.Answer {
         .accept => |found| found,
     };
     const id = stringField(object, "project") orelse return .{ .project_choice = "" };
-    if (std.mem.eql(u8, id, create_choice)) return .project_create;
+    if (std.mem.eql(u8, id, create_choice)) {
+        traceDroppedOtherName(object, "the create choice was picked");
+        return .project_create;
+    }
     if (std.mem.eql(u8, id, other_choice)) return .{ .project_other = stringField(object, "other_project") orelse "" };
+    traceDroppedOtherName(object, "a listed project was picked");
     return .{ .project_choice = id };
+}
+
+/// A typed name that comes with a listed project or the create choice is dropped: the
+/// form asks the name only for another project, and an ACP editor may still send it.
+/// The trace names the size and the reason, never the text.
+fn traceDroppedOtherName(object: std.json.ObjectMap, reason: []const u8) void {
+    const typed = stringField(object, "other_project") orelse return;
+    if (typed.len == 0) return;
+    debug_trace.logf("remote setup", "dropped a typed other project name of {d} bytes: {s}", .{ typed.len, reason });
 }
 
 const Field = struct {
@@ -683,6 +696,9 @@ fn projectSchema(arena: std.mem.Allocator, projects: []const vercel.Project, off
             .{ .key = "other_project", .value = try objectOf(arena, &.{
                 .{ .key = "type", .value = str("string") },
                 .{ .key = "title", .value = str("Project name, for Another project") },
+                .{ .key = elicitation.shown_when_key, .value = try objectOf(arena, &.{
+                    .{ .key = "project", .value = str(other_choice) },
+                }) },
             }) },
         }) },
     });

@@ -1,0 +1,1 @@
+{"message":"Pick a project","requestedSchema":{"type":"object","properties":{"project":{"type":"string","oneOf":[{"const":"__other__","title":"Another project"},{"const":"a","title":"Alpha"}]},"other":{"type":"string","title":"Name","x-fx-shown-when":{"project":"__other__"}}},"required":["project"]}}

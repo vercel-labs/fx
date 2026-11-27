@@ -1588,9 +1588,6 @@ describe("login changes, first use, the model's view and include (V1, R5, AC-5, 
           expect(await session.waitForText("fx asks", TIMEOUT)).toContain("fx asks");
           await session.sendLiteral("1");
           await session.sendKeys("Enter");
-          await session.waitForText("Another project (optional)", TIMEOUT);
-          await session.sendLiteral("2");
-          await session.sendKeys("Enter");
           await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
           await session.sendLiteral("1");
           await session.sendKeys("Enter");
@@ -1626,11 +1623,8 @@ describe("login changes, first use, the model's view and include (V1, R5, AC-5, 
           await session.waitForComposer(TIMEOUT);
           await session.sendText("Run it.");
           expect(await session.waitForText("fx asks", TIMEOUT)).toContain("fx asks");
-          // A digit answers its question at once, so no Enter follows it. The optional name asks
-          // how to fill it first: Enter there picks "Enter value", and "2" picks Skip.
+          // A digit answers its question at once, so no Enter follows it.
           await session.sendLiteral("1");
-          await session.waitForText("choose how to fill", TIMEOUT);
-          await session.sendLiteral("2");
           await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
           await session.sendLiteral("1");
           await session.waitForText("First done.", TIMEOUT);
@@ -1651,6 +1645,11 @@ describe("login changes, first use, the model's view and include (V1, R5, AC-5, 
   }, TIMEOUT * 3);
 });
 
+// The optional name question that the form shows only for "Another project" (x-fx-shown-when).
+const OTHER_NAME_TEXT = "Project name, for Another project";
+const typedProject: SetupProject = { id: "prj_fx_typed", name: "fx-typed-project" };
+const typedNameTeam = { ...fakeTeam, projects: [fakeTeam.projects[0]!, typedProject] };
+
 describe("remote setup in a terminal (AC-25)", () => {
   test.skipIf(!tmuxAvailable())("AC-25: fx ask in a terminal shows the fx asks header, and the command runs after the accept", async () => {
     await withSetup({}, async (setup) => {
@@ -1668,10 +1667,6 @@ describe("remote setup in a terminal (AC-25)", () => {
           expect(header).toContain("fx asks");
           // The form lists the projects as numbers: "1. [1] fx-test-project" is the first.
           await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          // The form then asks the optional "Another project" name. Skip it: option 2.
-          await session.waitForText("Another project (optional)", TIMEOUT);
-          await session.sendLiteral("2");
           await session.sendKeys("Enter");
           // The completed form is reviewed before it is sent. Submit: option 1.
           await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
@@ -1765,9 +1760,6 @@ describe("remote setup in a terminal (AC-25)", () => {
           await session.waitForText("Pick a project in fx-test-team", TIMEOUT);
           await session.sendLiteral("1");
           await session.sendKeys("Enter");
-          await session.waitForText("Another project (optional)", TIMEOUT);
-          await session.sendLiteral("2");
-          await session.sendKeys("Enter");
           await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
           await session.sendLiteral("1");
           await session.sendKeys("Enter");
@@ -1810,6 +1802,85 @@ describe("remote setup in a terminal (AC-25)", () => {
     });
   }, TIMEOUT * 3);
 
+  test.skipIf(!tmuxAvailable())("AC-25: a fresh profile with a remote rule, and a listed project picked: the other-name question never appears", async () => {
+    await withSetup({ teams: [fakeTeam, fakeSecondTeam] }, async (setup) => {
+      await withSandboxFixture(
+        shellCall({ command: "printf 'listed%s\\n' ok-7", runner: "remote" }),
+        async (fixture) => {
+          const session = await TmuxSession.create({
+            cmd: `${FX_BIN} ask --permission-mode full-access "Run it."`,
+            cwd: fixture.workspace,
+            width: 200,
+            env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
+          });
+          sessions.push(session);
+          await session.waitForText("Which Vercel team should remote commands use?", TIMEOUT);
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          // The team is reviewed before the project prompt. Submit: option 1.
+          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          await session.waitForText("Pick a project in fx-test-team", TIMEOUT);
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
+          expect(await session.captureFullScrollback()).not.toContain(OTHER_NAME_TEXT);
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+          expect(await session.captureFullScrollback()).not.toContain(OTHER_NAME_TEXT);
+          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
+          const started = events(fixture).find((event) => event.ev === "start" && JSON.stringify(event.argv).includes("ok-7"));
+          expect(started).toBeDefined();
+          expect(events(fixture).some((event) => event.ev === "exit" && event.id === started!.id && event.code === 0)).toBe(true);
+        },
+        () => ({ remote: undefined, rules: [{ command: "printf*", runner: "remote" }] }),
+        true,
+        setup,
+      );
+    });
+  }, TIMEOUT * 3);
+
+  test.skipIf(!tmuxAvailable())("AC-25: picking Another project asks for the name with no Skip, and the run uses that name", async () => {
+    await withSetup({ teams: [typedNameTeam] }, async (setup) => {
+      await withSandboxFixture(
+        shellCall({ command: "printf 'typed%s\\n' ok-8", runner: "remote" }),
+        async (fixture) => {
+          const session = await TmuxSession.create({
+            cmd: `${FX_BIN} ask --permission-mode full-access "Run it."`,
+            cwd: fixture.workspace,
+            width: 200,
+            env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
+          });
+          sessions.push(session);
+          await session.waitForText("Pick a project in fx-test-team", TIMEOUT);
+          // The menu numbers "Another project" after the listed projects and the create choice.
+          const another = (await session.captureFullScrollback()).match(/^ {2}(\d+)\. Another project \(type its name below\)$/m);
+          expect(another).not.toBeNull();
+          await session.sendLiteral(another![1]!);
+          await session.sendKeys("Enter");
+          await session.waitForText(`${OTHER_NAME_TEXT} (required)`, TIMEOUT);
+          const asked = await session.captureFullScrollback();
+          expect(asked).not.toContain("choose how to fill");
+          expect(asked).not.toContain("Skip");
+          await session.sendText(typedProject.name);
+          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+          expectRemoteWritten(fixture, typedNameTeam, typedProject, fakeUser.id);
+          const started = events(fixture).find((event) => event.ev === "start" && JSON.stringify(event.argv).includes("ok-8"));
+          expect(started).toBeDefined();
+          expect(events(fixture).some((event) => event.ev === "exit" && event.id === started!.id && event.code === 0)).toBe(true);
+        },
+        () => ({ remote: undefined, rules: [{ command: "printf*", runner: "remote" }] }),
+        true,
+        setup,
+      );
+    });
+  }, TIMEOUT * 3);
+
   test.skipIf(!tmuxAvailable())("fx ask --no-save: a decline holds for the second remote call in the same process (U4)", async () => {
     await withSetup({}, async (setup) => {
       await withSandboxFixture(
@@ -1827,9 +1898,6 @@ describe("remote setup in a terminal (AC-25)", () => {
           sessions.push(session);
           await session.waitForText("fx asks project", TIMEOUT);
           await session.sendLiteral("1");
-          await session.sendKeys("Enter");
-          await session.waitForText("Another project (optional)", TIMEOUT);
-          await session.sendLiteral("2");
           await session.sendKeys("Enter");
           await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
           await session.sendLiteral("3");

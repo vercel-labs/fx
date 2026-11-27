@@ -203,6 +203,9 @@ pub fn respond(
 const FieldValue = struct {
     name: []const u8,
     answered: bool = false,
+    /// A host field whose condition does not hold: it has no value, gets no question,
+    /// and is left out of the review.
+    hidden: bool = false,
     json: ?[]u8,
     /// The menu label of the chosen option of a single-select field. The review shows
     /// it; the server still receives `json`.
@@ -212,6 +215,15 @@ const FieldValue = struct {
         if (self.json) |value| alloc.free(value);
         if (self.choice_label) |label| alloc.free(label);
         self.* = undefined;
+    }
+
+    fn hide(self: *FieldValue, alloc: Allocator) void {
+        if (self.json) |value| alloc.free(value);
+        self.json = null;
+        if (self.choice_label) |label| alloc.free(label);
+        self.choice_label = null;
+        self.answered = false;
+        self.hidden = true;
     }
 };
 
@@ -294,11 +306,16 @@ fn answerForm(
         var cancelled = false;
         var invalid = false;
         for (form.fields, values) |field, *current| {
+            if (!try fieldIsShown(alloc, display_speaker, field, values)) {
+                current.hide(alloc);
+                continue;
+            }
+            current.hidden = false;
             const answer = answerField(
                 alloc,
                 display_speaker,
                 display_message,
-                field,
+                askedField(display_speaker, field),
                 current.*,
                 deadline_ms,
                 cancel_flag,
@@ -411,6 +428,33 @@ fn answerForm(
         if (!std.mem.eql(u8, review_answer, "Edit")) continue;
     }
     return error.RetryLimitExceeded;
+}
+
+/// Whether a field is asked now. Only a host form reads `x-fx-shown-when`: its field is
+/// shown while the named field holds the condition's string. Every other field is shown.
+fn fieldIsShown(
+    alloc: Allocator,
+    speaker: Speaker,
+    field: elicitation.Field,
+    values: []const FieldValue,
+) Error!bool {
+    if (speaker.kind != .host) return true;
+    const condition = field.shown_when orelse return true;
+    for (values) |value| {
+        if (!std.mem.eql(u8, value.name, condition.field)) continue;
+        const json = value.json orelse return false;
+        const expected = try stringifyString(alloc, condition.value);
+        defer alloc.free(expected);
+        return std.mem.eql(u8, json, expected);
+    }
+    return false;
+}
+
+/// A shown host field with a condition is required, so its question has no Skip step.
+fn askedField(speaker: Speaker, field: elicitation.Field) elicitation.Field {
+    var asked = field;
+    if (speaker.kind == .host and field.shown_when != null) asked.required = true;
+    return asked;
 }
 
 fn answerField(
@@ -715,7 +759,7 @@ fn askToKeepCurrentValue(
 }
 
 fn allFieldsAnswered(values: []const FieldValue) bool {
-    for (values) |value| if (!value.answered) return false;
+    for (values) |value| if (!value.hidden and !value.answered) return false;
     return true;
 }
 
@@ -926,6 +970,7 @@ fn buildReviewQuestion(
         .{ who, message },
     );
     for (values, 0..) |value, index| {
+        if (value.hidden) continue;
         const label = if (index < form.fields.len) form.fields[index].displayName() else value.name;
         const display_label = try terminalSafeAlloc(alloc, label);
         defer alloc.free(display_label);
@@ -1663,6 +1708,115 @@ test "form controls are separate from literal Skip and Use default values" {
     );
 }
 
+const shown_when_form_json =
+    \\{"form":{"method":"elicitation/create","params":{"message":"Project","requestedSchema":{"type":"object","properties":{"project":{"type":"string","title":"Project","oneOf":[{"const":"__other__","title":"Another project"},{"const":"a","title":"Alpha"}]},"other":{"type":"string","title":"Name","x-fx-shown-when":{"project":"__other__"}}},"required":["project"]}}}}
+;
+
+test "a shown-when field on a host form is asked only while its condition holds, and then with no Skip" {
+    const alloc = std.testing.allocator;
+    var alpha = Fixture{ .answers = &.{ "{\"option\":1}", "Submit" } };
+    const alpha_response = try respond(alloc, originFor(.host, ""), .{ .input_requests_json = shown_when_form_json }, .{
+        .questioner = alpha.questioner(),
+        .browser = alpha.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(alpha_response);
+    try std.testing.expectEqualStrings("{\"form\":{\"action\":\"accept\",\"content\":{\"project\":\"a\"}}}", alpha_response);
+    // Two questions only: the project and the review. The name gets no question.
+    try std.testing.expectEqual(@as(usize, 2), alpha.answer_index);
+
+    var other = Fixture{ .answers = &.{ "{\"option\":0}", "Zed", "Submit" } };
+    const other_response = try respond(alloc, originFor(.host, ""), .{ .input_requests_json = shown_when_form_json }, .{
+        .questioner = other.questioner(),
+        .browser = other.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(other_response);
+    // "Zed" is the answer itself, so the name was asked with no "Enter value" or "Skip" step first.
+    try std.testing.expectEqualStrings(
+        "{\"form\":{\"action\":\"accept\",\"content\":{\"project\":\"__other__\",\"other\":\"Zed\"}}}",
+        other_response,
+    );
+    try std.testing.expectEqual(@as(usize, 3), other.answer_index);
+}
+
+test "a shown-when field that an Edit hides is cleared, and its value stays out of the review" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{
+        .answers = &.{
+            "{\"option\":0}", // project: Another project
+            "Zed", // name
+            "Edit", // review
+            "Edit value", // keep or edit the project
+            "{\"option\":1}", // project: Alpha, which hides the name
+            "Submit",
+        },
+        .hidden_text = "Zed",
+    };
+    const response = try respond(alloc, originFor(.host, ""), .{ .input_requests_json = shown_when_form_json }, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings("{\"form\":{\"action\":\"accept\",\"content\":{\"project\":\"a\"}}}", response);
+    try std.testing.expectEqual(@as(usize, 6), fixture.answer_index);
+    // The review before Edit shows "Zed"; the review after Edit must not.
+    try std.testing.expectEqual(@as(usize, 1), fixture.reviews_with_hidden_text);
+}
+
+test "a shown-when field that an Edit shows again is asked fresh, with no Skip" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{
+        .answers = &.{
+            "{\"option\":1}", // project: Alpha, which hides the name
+            "Edit", // review
+            "Edit value", // keep or edit the project
+            "{\"option\":0}", // project: Another project, which shows the name
+            "Zed", // name, asked for the first time
+            "Submit",
+        },
+    };
+    const response = try respond(alloc, originFor(.host, ""), .{ .input_requests_json = shown_when_form_json }, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings(
+        "{\"form\":{\"action\":\"accept\",\"content\":{\"project\":\"__other__\",\"other\":\"Zed\"}}}",
+        response,
+    );
+    try std.testing.expectEqual(@as(usize, 6), fixture.answer_index);
+}
+
+test "a shown-when key on an MCP form is ignored, and every field is asked as today" {
+    const alloc = std.testing.allocator;
+    // An MCP server's optional name keeps its Skip step, and it is asked whatever the project is.
+    var skipped = Fixture{ .answers = &.{ "{\"option\":1}", "Skip", "Submit" } };
+    const skipped_response = try respond(alloc, originFor(.mcp_server, "docs"), .{ .input_requests_json = shown_when_form_json }, .{
+        .questioner = skipped.questioner(),
+        .browser = skipped.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(skipped_response);
+    try std.testing.expectEqualStrings("{\"form\":{\"action\":\"accept\",\"content\":{\"project\":\"a\"}}}", skipped_response);
+    try std.testing.expectEqual(@as(usize, 3), skipped.answer_index);
+
+    var entered = Fixture{ .answers = &.{ "{\"option\":0}", "Enter value", "Zed", "Submit" } };
+    const entered_response = try respond(alloc, originFor(.mcp_server, "docs"), .{ .input_requests_json = shown_when_form_json }, .{
+        .questioner = entered.questioner(),
+        .browser = entered.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(entered_response);
+    try std.testing.expectEqualStrings(
+        "{\"form\":{\"action\":\"accept\",\"content\":{\"project\":\"__other__\",\"other\":\"Zed\"}}}",
+        entered_response,
+    );
+    try std.testing.expectEqual(@as(usize, 4), entered.answer_index);
+}
+
 test "single-select local identities preserve every colliding wire value" {
     const alloc = std.testing.allocator;
     const raw_titles = [_][]const u8{
@@ -2194,6 +2348,9 @@ const Fixture = struct {
     open_error: bool = false,
     expected_question: ?[]const u8 = null,
     saw_expected_question: bool = false,
+    /// Counts the reviews that show this text, so a test can prove a hidden value stays out.
+    hidden_text: ?[]const u8 = null,
+    reviews_with_hidden_text: usize = 0,
 
     fn origin() @import("../tooling/tool_mcp_runtime.zig").InputOrigin {
         return originWithServer("fixture");
@@ -2241,6 +2398,13 @@ const Fixture = struct {
         if (entries.len != 1 or self.answer_index >= self.answers.len) return null;
         if (self.expected_question) |expected| {
             if (std.mem.eql(u8, entries[0].question, expected)) self.saw_expected_question = true;
+        }
+        if (self.hidden_text) |hidden| {
+            if (std.mem.find(u8, entries[0].question, "Current values:") != null and
+                std.mem.find(u8, entries[0].question, hidden) != null)
+            {
+                self.reviews_with_hidden_text += 1;
+            }
         }
         if (self.require_terminal_safe) {
             if (std.mem.findScalar(u8, entries[0].question, 0x1b) != null or
