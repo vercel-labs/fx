@@ -338,6 +338,188 @@ test "every JSON example in sh-fx.md parses as a JSON object with sh.fx _meta ke
     try std.testing.expect(examples > 0);
 }
 
+/// Returns the text of the `## ` section of `doc` titled `title`, up to the next `## ` heading.
+fn section(doc: []const u8, comptime title: []const u8) ?[]const u8 {
+    const heading = "\n## " ++ title ++ "\n";
+    const start = (std.mem.find(u8, doc, heading) orelse return null) + heading.len;
+    const end = if (std.mem.find(u8, doc[start..], "\n## ")) |offset| start + offset else doc.len;
+    return doc[start..end];
+}
+
+/// Returns the text inside one pair of backticks that wraps all of `cell`, or null.
+fn codeCell(cell: []const u8) ?[]const u8 {
+    if (cell.len < 3 or cell[0] != '`' or cell[cell.len - 1] != '`') return null;
+    const inner = cell[1 .. cell.len - 1];
+    return if (std.mem.findScalar(u8, inner, '`') == null) inner else null;
+}
+
+/// The most rows the names table in sh-fx.md may have. The test keeps them in fixed arrays.
+const max_names_table_rows: usize = 64;
+
+/// The parts of a names-table row split on `|`: the empty text before the first bar, the four
+/// cells, and the empty text after the last bar.
+const names_row_parts: usize = 6;
+
+/// Returns the trimmed parts of a names-table row, or null when the row has a different number of
+/// parts or lacks the bar at its start or its end.
+fn namesRowCells(line: []const u8) ?[names_row_parts][]const u8 {
+    var cells: [names_row_parts][]const u8 = undefined;
+    var count: usize = 0;
+    var parts = std.mem.splitScalar(u8, line, '|');
+    while (count < cells.len) : (count += 1) {
+        const part = parts.next() orelse return null;
+        cells[count] = std.mem.trim(u8, part, " ");
+    }
+    if (parts.next() != null) return null;
+    if (cells[0].len != 0 or cells[names_row_parts - 1].len != 0) return null;
+    return cells;
+}
+
+/// What a names table check got wrong. For `error.MalformedNamesRow`, `line` is the row, so the test
+/// that calls the check can show it. The checks print nothing themselves.
+const NamesTableFailure = struct {
+    line: []const u8 = "",
+};
+
+/// Checks every row of a names table and returns how many rows it has. Any line with a bar is a
+/// row, so a row that lacks an outer bar is checked too and not skipped.
+fn checkNamesTable(
+    table: []const u8,
+    agent_methods: std.json.Value,
+    client_methods: std.json.Value,
+    failure: *NamesTableFailure,
+) !usize {
+    var olds: [max_names_table_rows][]const u8 = undefined;
+    var news: [max_names_table_rows][]const u8 = undefined;
+    var rows: usize = 0;
+    var lines = std.mem.splitScalar(u8, table, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.findScalar(u8, line, '|') == null) continue;
+        if (std.mem.startsWith(u8, line, "| Today |") or std.mem.startsWith(u8, line, "| --- |")) continue;
+        if (rows == max_names_table_rows) return error.NamesTableTooLong;
+        const cells = namesRowCells(line);
+        const old = if (cells) |row| codeCell(row[1]) else null;
+        const new = if (cells) |row| codeCell(row[3]) else null;
+        if (old == null or new == null) {
+            failure.line = line;
+            return error.MalformedNamesRow;
+        }
+        try checkNameRow(old.?, new.?, cells.?[2], agent_methods, client_methods, olds[0..rows], news[0..rows]);
+        olds[rows] = old.?;
+        news[rows] = new.?;
+        rows += 1;
+    }
+    return rows;
+}
+
+/// Checks a names table against the method lists in ACP's `meta.json` and returns its row count.
+fn checkNamesTableAgainstAcp(table: []const u8, failure: *NamesTableFailure) !usize {
+    const meta = try parseSpecFile(acp_meta);
+    defer meta.deinit();
+    const agent_methods = field(meta.value, "agentMethods") orelse return error.TestUnexpectedResult;
+    const client_methods = field(meta.value, "clientMethods") orelse return error.TestUnexpectedResult;
+    return checkNamesTable(table, agent_methods, client_methods, failure);
+}
+
+/// Expects `checkNamesTableAgainstAcp` to fail with `expected` on `table`.
+fn expectNamesTableError(expected: anyerror, table: []const u8) !void {
+    var failure: NamesTableFailure = .{};
+    try std.testing.expectError(expected, checkNamesTableAgainstAcp(table, &failure));
+}
+
+/// Returns a names table of `count` rows, each with its own names, for the row cap.
+fn namesTableWithRows(comptime count: usize) []const u8 {
+    @setEvalBranchQuota(100_000);
+    var table: []const u8 = "";
+    for (0..count) |index| {
+        table = table ++ std.fmt.comptimePrint(
+            "| `libfx/op{d}` | client to fx, request | `_sh.fx/session/op{d}` | Does one thing |\n",
+            .{ index, index },
+        );
+    }
+    return table;
+}
+
+test "the table of names in use today gives each name one valid new name" {
+    const table = section(fx_spec.bytes, "Names in use today") orelse {
+        std.debug.print("sh-fx.md has no \"Names in use today\" section\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    var failure: NamesTableFailure = .{};
+    const rows = checkNamesTableAgainstAcp(table, &failure) catch |err| {
+        switch (err) {
+            error.MalformedNamesRow => std.debug.print("sh-fx.md has a malformed row in its names table: {s}\n", .{failure.line}),
+            error.NamesTableTooLong => std.debug.print("sh-fx.md names table has more than {d} rows, which is more than this test holds\n", .{max_names_table_rows}),
+            else => {},
+        }
+        return err;
+    };
+    try std.testing.expect(rows > 0);
+}
+
+test "a names table row has both outer bars and exactly four cells" {
+    try std.testing.expect(namesRowCells("| `libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text |") != null);
+    for ([_][]const u8{
+        "| `libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text | extra",
+        "| `libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds | text",
+        "`libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text |",
+    }) |line| try std.testing.expect(namesRowCells(line) == null);
+}
+
+test "a names table rejects a row without an opening bar" {
+    try expectNamesTableError(error.MalformedNamesRow, "`libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text |");
+}
+
+test "a names table rejects a repeated name" {
+    try expectNamesTableError(error.TestUnexpectedResult,
+        \\| `libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text |
+        \\| `libfx/steer` | client to fx, request | `_sh.fx/session/other` | Adds text |
+        \\
+    );
+}
+
+test "a names table rejects an unknown direction" {
+    try expectNamesTableError(error.TestUnexpectedResult, "| `libfx/steer` | client to server, request | `_sh.fx/session/steer` | Adds text |");
+}
+
+test "a names table of exactly the row cap passes and one more row fails" {
+    var failure: NamesTableFailure = .{};
+    const rows = try checkNamesTableAgainstAcp(comptime namesTableWithRows(max_names_table_rows), &failure);
+    try std.testing.expectEqual(max_names_table_rows, rows);
+    try expectNamesTableError(error.NamesTableTooLong, comptime namesTableWithRows(max_names_table_rows + 1));
+}
+
+/// Checks one row of the names table: a known direction, an old name that is not already an sh.fx
+/// name, a new name that is an sh.fx method or a standard ACP method sent the same way, and names
+/// that no earlier row used.
+fn checkNameRow(
+    old: []const u8,
+    new: []const u8,
+    direction: []const u8,
+    agent_methods: std.json.Value,
+    client_methods: std.json.Value,
+    seen_olds: []const []const u8,
+    seen_news: []const []const u8,
+) !void {
+    const to_fx = std.mem.cutPrefix(u8, direction, "client to fx, ");
+    const kind = to_fx orelse std.mem.cutPrefix(u8, direction, "fx to client, ") orelse "";
+    if (!std.mem.eql(u8, kind, "request") and !std.mem.eql(u8, kind, "notification")) {
+        std.debug.print("{s} has the unknown direction \"{s}\"\n", .{ old, direction });
+        return error.TestUnexpectedResult;
+    }
+    const standard = hasStringValue(if (to_fx != null) agent_methods else client_methods, new);
+    if (isMethodName(old) or !(isMethodName(new) or standard)) {
+        std.debug.print("{s} maps to {s}, which is not a valid new name\n", .{ old, new });
+        return error.TestUnexpectedResult;
+    }
+    for (seen_olds, seen_news) |seen_old, seen_new| {
+        if (std.mem.eql(u8, seen_old, old) or std.mem.eql(u8, seen_new, new)) {
+            std.debug.print("{s} or {s} appears twice in the names table\n", .{ old, new });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 test "every sh.fx name in sh-fx.md follows the naming rules" {
     var names: usize = 0;
     var spans = std.mem.splitScalar(u8, fx_spec.bytes, '`');
