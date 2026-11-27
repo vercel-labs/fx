@@ -492,8 +492,10 @@ reused as ideas; no v1 code is shared.
 ## Concurrency And Ordering
 
 - **Between processes (native):** one exclusive `flock` on `{id}/lock`, held
-  from open to close. A contender retries for up to 2 s, then gets Busy; a
+  from open to close. A contender retries for up to 2 s on the monotonic
+  clock, however long each sleep between tries lasts, then gets Busy; a
   resume may set its own wait, and fx's session picker sets none (D38). The
+  wait for `index.lock` is measured the same way (`lock_wait.zig`). The
   kernel releases the lock on process death (`WriterLock.tla`).
 - **Between writers (wasm):** single-writer is optimistic. Every commit
   carries the expected revision, and a conflict makes that Session fail with
@@ -1502,7 +1504,15 @@ Settled while removing v1 (2026-10-17):
   messages of the first kept turn that the summary covers
   (`keep_tool_steps`, `keep_steering`), and a resume leaves them out of
   that turn, as fx's history does once it compacts; a later cut inside
-  the same turn counts on from there. The converter takes the same counts
+  the same turn counts on from there. fx streams and commits such a turn
+  whole, the covered steps too (`TurnFinalizationGuard.savedExecution`),
+  so the transcript, Ctrl+O and `session/load` show the turn as it ran;
+  an older fx wrote it again from the cut, superseding the first copy,
+  and a resume reads that copy as it is. When a write still has to
+  supersede such a turn, as after a stream that no longer matches, its
+  fresh copy has a new number, so a resume cannot trim it: that copy holds
+  fx's view after the cut, and a trace line names the steps the transcript
+  loses (`TurnView`, `TurnStream.tla` CopyHoldsView). The converter takes the same counts
   from a v1 checkpoint's coverage, as v1's writer counted them, so a
   converted session shows the model the turn's prompt and the steps after
   the summary, as v1 did. A line without them, or a turn that no longer has

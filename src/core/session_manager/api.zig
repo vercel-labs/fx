@@ -789,8 +789,32 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             if (c.outcome == .lost and !import) return error.InvalidArgument;
             if (c.data) |data| try checkChildData(gpa, data);
         },
+        .input_accepted => |a| {
+            if (a.id == 0 or a.text.len == 0) return error.InvalidArgument;
+            if (a.text.len > max_value_bytes) return error.TooLarge;
+            if (!std.unicode.utf8ValidateSlice(a.text)) return error.InvalidArgument;
+            for (a.blobs) |hash| if (!schema.validBlobHash(hash)) return error.InvalidArgument;
+            if (a.images.len > max_accepted_images) return error.TooLarge;
+            for (a.images) |img| {
+                if (img.id == 0) return error.InvalidArgument;
+                if (img.path.len == 0 or img.path.len > max_image_ref_bytes) return error.InvalidArgument;
+                if (img.media_type.len == 0 or img.media_type.len > max_image_media_type_bytes) return error.InvalidArgument;
+                if (img.snapshot_path.len == 0 or img.snapshot_path.len > max_image_ref_bytes) return error.InvalidArgument;
+                if (!std.unicode.utf8ValidateSlice(img.path) or
+                    !std.unicode.utf8ValidateSlice(img.media_type) or
+                    !std.unicode.utf8ValidateSlice(img.snapshot_path)) return error.InvalidArgument;
+                if (!schema.validBlobHash(img.snapshot_sha256)) return error.InvalidArgument;
+            }
+        },
+        .input_delivered, .input_withdrawn => |r| {
+            if (r.id == 0) return error.InvalidArgument;
+        },
     };
 }
+
+const max_accepted_images = 64;
+const max_image_ref_bytes = std.Io.Dir.max_path_bytes;
+const max_image_media_type_bytes = 128;
 
 /// Folded into every snapshot for each child, so kept small (D22).
 fn checkChildData(gpa: std.mem.Allocator, raw: []const u8) AppendError!void {
@@ -812,6 +836,7 @@ test {
     _ = @import("fold.zig");
     _ = @import("session.zig");
     _ = @import("catalog.zig");
+    _ = @import("lock_wait.zig");
     // Fault injection and traces exist only with -Dhooks=true.
     if (storage.hooks) {
         _ = @import("storage_fault.zig");
@@ -1986,6 +2011,123 @@ const api_tests = struct {
         reopened.release();
     }
 
+    /// `io` with sleeps that return at once and move a fake monotonic clock
+    /// `factor` times as far as they asked, as a loaded machine or a
+    /// background process stretches every sleep. It never waits in real time
+    /// (`RULES.md` R7.3). The copied vtable and the clock are process
+    /// storage, so one test uses it at a time.
+    const SlowSleeps = struct {
+        var vtable: std.Io.VTable = undefined;
+        var awake_ns: i96 = 0;
+        var factor: i96 = 1;
+        var sleeps: u64 = 0;
+        /// Past this, a sleep is canceled, so a wait that never ends fails
+        /// its test instead of hanging it.
+        const max_sleeps: u64 = 100_000;
+
+        fn wrap(sleep_factor: i96) std.Io {
+            vtable = io.vtable.*;
+            vtable.now = now;
+            vtable.sleep = fakeSleep;
+            factor = sleep_factor;
+            restart();
+            return .{ .userdata = io.userdata, .vtable = &vtable };
+        }
+
+        fn now(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+            if (clock == .awake) return .fromNanoseconds(awake_ns);
+            return io.vtable.now(userdata, clock);
+        }
+
+        fn fakeSleep(_: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            switch (timeout) {
+                .duration => |duration| {
+                    sleeps += 1;
+                    if (sleeps > max_sleeps) return error.Canceled;
+                    awake_ns += duration.raw.nanoseconds * factor;
+                },
+                // The lock waits sleep only for a duration; any other sleep is
+                // canceled, which ends the wait early and fails its test.
+                .none, .deadline => return error.Canceled,
+            }
+        }
+
+        fn restart() void {
+            awake_ns = 0;
+            sleeps = 0;
+        }
+
+        /// The fake monotonic milliseconds since `wrap` or `restart`.
+        fn elapsedMs() i96 {
+            return @divTrunc(awake_ns, std.time.ns_per_ms);
+        }
+    };
+
+    /// The wait took its whole budget and at most one stretched sleep more.
+    fn expectWaitEndsAtBudget(budget_ms: i96, longest_sleep_ms: i96) !void {
+        const waited_ms = SlowSleeps.elapsedMs();
+        if (waited_ms < budget_ms or waited_ms > budget_ms + longest_sleep_ms) {
+            std.debug.print("waited {d} ms on the monotonic clock for a budget of {d} ms\n", .{ waited_ms, budget_ms });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    test "a resume behind another writer is Busy once its wait is spent on the monotonic clock, though each sleep lasts three times as long (D38)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const held = try f.manager.openNew(.{ .workspace = "/w", .host = .app });
+        defer held.release();
+        _ = try held.append(&.{ .turn_started, piece, .turn_committed });
+
+        const contender = try api.Manager.init(gpa, SlowSleeps.wrap(3), .{ .root = f.root, .lock_wait_ms = 2000 });
+        defer contender.deinit();
+        try testing.expectError(error.Busy, contender.openResume(.{ .target = .{ .id = held.id() }, .workspace = "/w", .host = .app }));
+        // Each 10 ms retry sleep lasts 30 ms, which 2000 ms is no multiple of.
+        try expectWaitEndsAtBudget(2000, 30);
+    }
+
+    test "an index write behind another process's index lock gives up once its wait is spent on the monotonic clock, though each sleep lasts three times as long (D38)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        var recorder: Recorder = .{};
+        defer recorder.kinds.deinit(gpa);
+        const writer = try api.Manager.init(gpa, SlowSleeps.wrap(3), .{ .root = f.root, .lock_wait_ms = 2000, .diagnostics = recorder.sink() });
+        defer writer.deinit();
+        const s = try writer.openNew(.{ .workspace = "/w", .host = .app });
+        defer s.release();
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+
+        var root = try f.dir();
+        defer root.close(io);
+        const other_process = try root.openFile(io, "index.lock", .{ .mode = .read_write });
+        defer other_process.close(io);
+        try testing.expect(try other_process.tryLock(io, .exclusive));
+        defer other_process.unlock(io);
+
+        SlowSleeps.restart();
+        try s.close();
+        try testing.expectEqual(@as(usize, 1), recorder.count(.index_stale));
+        // Each 5 ms retry sleep lasts 15 ms, which 2000 ms is no multiple of.
+        try expectWaitEndsAtBudget(2000, 15);
+    }
+
+    test "a resume behind another writer still gives up when the monotonic clock never moves (D38)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const held = try f.manager.openNew(.{ .workspace = "/w", .host = .app });
+        defer held.release();
+        _ = try held.append(&.{ .turn_started, piece, .turn_committed });
+
+        const contender = try api.Manager.init(gpa, SlowSleeps.wrap(0), .{ .root = f.root, .lock_wait_ms = 2000 });
+        defer contender.deinit();
+        try testing.expectError(error.Busy, contender.openResume(.{ .target = .{ .id = held.id() }, .workspace = "/w", .host = .app }));
+        // As many 10 ms sleeps as fit in 2000 ms, as before the clock counted.
+        try testing.expectEqual(@as(u64, 200), SlowSleeps.sleeps);
+    }
+
     test "a lost or damaged blob damages its session: verify counts it and a recover fork stops before it (D39)" {
         for ([_]bool{ false, true }) |overwrite| {
             var f: Fixture = undefined;
@@ -2317,6 +2459,102 @@ const api_tests = struct {
         defer st.deinit(gpa);
         try testing.expectEqualStrings("\"You run inside Mini.\"", st.client_prompt.?);
         try testing.expectEqualStrings("{\"mcp_mini_read\":{\"server\":\"mini\",\"tool\":\"read\"}}", st.tool_identities.?);
+    }
+
+    test "Manager.read decodes input_accepted, input_delivered, and input_withdrawn lines" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+
+        const id = "rawapiread01";
+        const session_dir_path = try std.Io.Dir.path.join(gpa, &.{ f.root, id });
+        defer gpa.free(session_dir_path);
+        try std.Io.Dir.cwd().createDirPath(io, session_dir_path);
+        var session_dir = try std.Io.Dir.cwd().openDir(io, session_dir_path, .{});
+        defer session_dir.close(io);
+
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        const payloads = [_][]const u8{
+            "{\"v\":1,\"seq\":1,\"ts\":1,\"kind\":\"session_created\",\"id\":\"rawapiread01\",\"workspace\":\"/w\",\"role\":\"root\",\"host\":\"app\"",
+            "{\"v\":1,\"seq\":2,\"ts\":2,\"kind\":\"input_accepted\",\"id\":1,\"text\":\"hello\"",
+            "{\"v\":1,\"seq\":3,\"ts\":3,\"kind\":\"input_delivered\",\"id\":1",
+            "{\"v\":1,\"seq\":4,\"ts\":4,\"kind\":\"input_withdrawn\",\"id\":2",
+            "{\"v\":1,\"seq\":5,\"ts\":5,\"kind\":\"closed\"",
+        };
+        for (payloads) |p| try log_mod.appendFramed(gpa, &bytes, p);
+        try session_dir.writeFile(io, .{ .sub_path = "log.jsonl", .data = bytes.items });
+
+        var page = try f.manager.read(gpa, id, .start, .forward, 10);
+        defer page.deinit();
+        try testing.expectEqual(@as(usize, 5), page.entries.len);
+        for (page.entries) |entry| {
+            try testing.expect(entry.kind != null);
+            try testing.expect(entry.body != null);
+        }
+    }
+
+    test "input_accepted, input_delivered, and input_withdrawn validate id, text UTF-8, and max_value_bytes" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        defer s.release();
+
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 0, .text = "hi" } }}));
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 1, .text = "" } }}));
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 1, .text = "\xff" } }}));
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_delivered = .{ .id = 0 } }}));
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_withdrawn = .{ .id = 0 } }}));
+
+        const too_large = try gpa.alloc(u8, api.max_value_bytes + 1);
+        defer gpa.free(too_large);
+        @memset(too_large, 'a');
+        try testing.expectError(error.TooLarge, s.append(&.{.{ .input_accepted = .{ .id = 1, .text = too_large } }}));
+
+        const at_limit = try gpa.alloc(u8, api.max_value_bytes);
+        defer gpa.free(at_limit);
+        @memset(at_limit, 'a');
+        _ = try s.append(&.{
+            .{ .input_accepted = .{ .id = 1, .text = at_limit } },
+            .{ .turn_started = {} },
+            .{ .input_delivered = .{ .id = 1 } },
+            .{ .input_accepted = .{ .id = 2, .text = "steer" } },
+            .{ .input_withdrawn = .{ .id = 2 } },
+            .{ .turn_committed = {} },
+        });
+    }
+
+    test "input_accepted validates optional image references" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const s = try f.manager.openNew(.{ .workspace = "/w", .host = .app });
+        defer s.release();
+
+        const valid_sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const valid_img = [_]schema.Body.InputAcceptedImage{.{
+            .id = 1,
+            .path = "/Users/example/a.png",
+            .media_type = "image/png",
+            .snapshot_path = "/tmp/fx-snap/a.bin",
+            .snapshot_sha256 = valid_sha,
+        }};
+        _ = try s.append(&.{.{ .input_accepted = .{ .id = 1, .text = "hi [Image #1]", .images = &valid_img } }});
+
+        var bad = valid_img;
+        bad[0].id = 0;
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 2, .text = "x", .images = &bad } }}));
+        bad = valid_img;
+        bad[0].snapshot_sha256 = "not-a-hash";
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 2, .text = "x", .images = &bad } }}));
+        bad = valid_img;
+        bad[0].snapshot_path = "";
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 2, .text = "x", .images = &bad } }}));
+        bad = valid_img;
+        bad[0].media_type = "\xff";
+        try testing.expectError(error.InvalidArgument, s.append(&.{.{ .input_accepted = .{ .id = 2, .text = "x", .images = &bad } }}));
     }
 };
 

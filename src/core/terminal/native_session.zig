@@ -913,6 +913,7 @@ const SupportedRegistry = struct {
             return self.failure(.inspect, .session_not_found, request.session_id);
         };
         defer self.profile.release_terminal(durable);
+        reachedGap(.copy_held, request.session_id);
         const authorization = durable.authorize(
             request.authority.?,
             .inspect,
@@ -998,6 +999,11 @@ const SupportedRegistry = struct {
         const session_id = try session_layout.generateTerminalSessionId(self.alloc);
         var session_id_owned = true;
         defer if (session_id_owned) self.alloc.free(session_id);
+        // The record is on disk before the registry can find the session, so
+        // no other call of this process may see the id until this call returns.
+        const in_flight = try self.profile.begin_start(session_id);
+        var mark_handed_over = false;
+        defer if (!mark_handed_over) self.profile.end_start(in_flight);
         const session = try self.alloc.create(Session);
         var session_owned = true;
         defer if (session_owned) self.alloc.destroy(session);
@@ -1030,10 +1036,18 @@ const SupportedRegistry = struct {
             );
         };
         session_id_owned = false;
-        self.profile.register_resident(&session.durable) catch {
+        reachedGap(.record_saved, session.id);
+        self.profile.register_resident(&session.durable) catch |err| {
+            debug_trace.logf(
+                "terminal_host",
+                "resident registration failed id={s} err={s}",
+                .{ session.id, @errorName(err) },
+            );
             session.deinitUnlaunched();
-            return error.OutOfMemory;
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return self.failure(.start, .startup_failed, null);
         };
+        reachedGap(.resident_registered, session.id);
 
         const slot = self.reserve(session) orelse {
             session.deinitUnlaunched();
@@ -1077,6 +1091,7 @@ const SupportedRegistry = struct {
             _ = session.hangUpForExit();
             session.killForExit();
         }
+        reachedGap(.launched, session.id);
 
         const condition = request.return_when orelse .started;
         const ceiling = request.wait_ceiling_ms orelse 5_000;
@@ -1086,10 +1101,12 @@ const SupportedRegistry = struct {
             return self.failure(.start, code, session.id);
         };
         if (returnOutcomeIsTerminal(outcome)) session.finalizeBackend();
-        return session.startResult(outcome, .{
+        const result = try session.startResult(outcome, .{
             .actor = persistence.grant.actor,
             .controls = persistence.grant.controls,
         });
+        mark_handed_over = request.retain_in_flight;
+        return result;
     }
 
     fn write(
@@ -2342,7 +2359,7 @@ const Session = struct {
         const payload_len = std.math.cast(u32, payload.len) orelse
             return error.CheckpointTooLarge;
         const envelope = contracts.CheckpointEnvelope{
-            .engine_schema_revision = terminal_engine.checkpoint_schema_revision,
+            .engine_schema_revision = self.engine.checkpointRevision(),
             .applied_cursor = applied_cursor,
             .payload_len = payload_len,
             .checksum = contracts.checkpoint_checksum(payload),
@@ -3840,6 +3857,16 @@ test "terminal output drain reads final bytes after peer close" {
     );
 }
 
+/// The places where a test holds a call to run another while a start has not returned: the record is saved, the resident is registered, the command runs and the start waits for it, and an `inspect` holds the copy that `open_terminal` made.
+pub const GapPoint = enum { record_saved, resident_registered, launched, copy_held };
+
+/// Test builds only, as `test_after_listing` in `doctor_probes.zig`: a test sets it to hold a call at a `GapPoint`.
+pub var test_gap: if (builtin.is_test) ?*const fn (point: GapPoint, session_id: []const u8) void else void = if (builtin.is_test) null else {};
+
+fn reachedGap(point: GapPoint, session_id: []const u8) void {
+    if (builtin.is_test) if (test_gap) |hook| hook(point, session_id);
+}
+
 fn maybeDelayForTest(name: []const u8) void {
     const value = io_mod.getenv(name) orelse return;
     const delay_ms = std.fmt.parseInt(u64, value, 10) catch return;
@@ -4491,14 +4518,37 @@ test "resize recovery never reflows raw output at final dimensions" {
     try session.engine.rowTextTrimmed(1, &row);
     try std.testing.expectEqualStrings("abcd", row.items);
 
-    // The previous revision ends before the flag for saved last-column
-    // cells, which this session does not have.
+    // Outside an escape, the checkpoint names revision three in its envelope
+    // and its payload, which fx before revision four restores too.
+    const revision_three: u16 = 3;
+    {
+        var written = (try session.durable.load_checkpoint(alloc)).?;
+        defer written.deinit(alloc);
+        try std.testing.expectEqual(revision_three, written.envelope.engine_schema_revision);
+        try std.testing.expectEqual(revision_three, std.mem.readInt(u16, written.payload[4..6], .little));
+    }
+    try session.durable.store_checkpoint(.{
+        .engine_schema_revision = revision_three,
+        .applied_cursor = session.durable.output_cursor(),
+        .payload_len = @intCast(live_payload.len),
+        .checksum = contracts.checkpoint_checksum(live_payload),
+    }, live_payload, 5);
+    try std.testing.expect(!session.durable.record.raw_replay_exact);
+    var revision_three_recovered = try reconstructEngine(alloc, &session.durable);
+    defer revision_three_recovered.deinit();
+    const revision_three_payload = try revision_three_recovered.checkpointPayload(alloc);
+    defer alloc.free(revision_three_payload);
+    try std.testing.expectEqualSlices(u8, live_payload, revision_three_payload);
+
+    // Revision two ends before the flag for saved last-column cells, which
+    // this session does not have.
+    const revision_two: u16 = 2;
     try std.testing.expectEqual(@as(u8, 0), live_payload[live_payload.len - 1]);
     const legacy_payload = try alloc.dupe(u8, live_payload[0 .. live_payload.len - 1]);
     defer alloc.free(legacy_payload);
-    std.mem.writeInt(u16, legacy_payload[4..6], terminal_engine.checkpoint_schema_revision - 1, .little);
+    std.mem.writeInt(u16, legacy_payload[4..6], revision_two, .little);
     try session.durable.store_checkpoint(.{
-        .engine_schema_revision = terminal_engine.checkpoint_schema_revision - 1,
+        .engine_schema_revision = revision_two,
         .applied_cursor = session.durable.output_cursor(),
         .payload_len = @intCast(legacy_payload.len),
         .checksum = contracts.checkpoint_checksum(legacy_payload),
@@ -4538,6 +4588,47 @@ test "resize recovery never reflows raw output at final dimensions" {
         contracts.ScreenRecovery{ .unavailable = .unsupported_schema },
         reopened.facts().screen_recovery,
     );
+}
+
+test "a checkpoint inside ESC ( names revision four and restores the escape" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-charset-checkpoint");
+    var session = try Session.init(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+            .dimensions = .{ .rows = 1, .columns = 8 },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    try session.durable.append("A\x1b(", 2);
+    var feed = try session.engine.feedMode("A\x1b(", .native_live);
+    feed.deinit(alloc);
+    try session.checkpointLocked(session.durable.output_cursor(), 3);
+    {
+        var written = (try session.durable.load_checkpoint(alloc)).?;
+        defer written.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 4), written.envelope.engine_schema_revision);
+        try std.testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, written.payload[4..6], .little));
+    }
+
+    var recovered = try reconstructEngine(alloc, &session.durable);
+    defer recovered.deinit();
+    var recovered_feed = try recovered.feedMode("BC", .journal_replay);
+    recovered_feed.deinit(alloc);
+    var row: std.ArrayList(u8) = .empty;
+    defer row.deinit(alloc);
+    try recovered.rowTextTrimmed(1, &row);
+    try std.testing.expectEqualStrings("AC", row.items);
 }
 
 test "native protocol replies are independent of either durable write lease" {
@@ -5073,4 +5164,78 @@ test "a referenced slot is never recycled out from under its holder" {
     const reservation = registry.reserve(&incoming) orelse
         return error.TestExpectedRecycle;
     try std.testing.expectEqual(@as(?*Session, &resident), reservation.evicted);
+}
+
+/// Reads whether a start's id is in flight at each point of `start`.
+const InFlightProbe = struct {
+    var profile: ?*terminal_store.ProfileStore = null;
+    var id_buf: [128]u8 = undefined;
+    var id_len: usize = 0;
+    var saved_in_flight = false;
+    var registered_in_flight = false;
+
+    fn arm(armed: *terminal_store.ProfileStore) void {
+        profile = armed;
+        id_len = 0;
+        saved_in_flight = false;
+        registered_in_flight = false;
+        test_gap = &hook;
+    }
+
+    fn disarm() void {
+        test_gap = null;
+        profile = null;
+    }
+
+    fn id() []const u8 {
+        return id_buf[0..id_len];
+    }
+
+    fn hook(point: GapPoint, session_id: []const u8) void {
+        const armed = profile orelse return;
+        switch (point) {
+            .record_saved => {
+                id_len = @min(session_id.len, id_buf.len);
+                @memcpy(id_buf[0..id_len], session_id[0..id_len]);
+                saved_in_flight = armed.is_starting(session_id);
+            },
+            .resident_registered => registered_in_flight = armed.is_starting(session_id),
+            .launched, .copy_held => {},
+        }
+    }
+};
+
+test "start in flight: a start that cannot reserve a slot leaves nothing in flight" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    var probe: WorkProbe = .{};
+    var registry = SupportedRegistry.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+    );
+    // A registry that is exiting refuses the slot after the record is saved
+    // and the resident is registered.
+    registry.exiting = true;
+    InFlightProbe.arm(&fixture.profile);
+    defer InFlightProbe.disarm();
+
+    const cancelled: std.atomic.Value(bool) = .init(false);
+    var result = try registry.start(.{
+        .cwd = "/workspace",
+        .command = "true",
+        .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        .return_when = .started,
+        .persistence = testPersistence("/workspace"),
+    }, &cancelled);
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result.view() == .failure);
+    try std.testing.expect(InFlightProbe.id_len != 0);
+    try std.testing.expect(InFlightProbe.saved_in_flight);
+    try std.testing.expect(InFlightProbe.registered_in_flight);
+    try std.testing.expect(!fixture.profile.is_starting(InFlightProbe.id()));
 }

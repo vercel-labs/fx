@@ -20,12 +20,15 @@ const tool_call_ids = @import("tool_call_ids.zig");
 const request_deadlines = @import("request_deadlines.zig");
 const json_depth = @import("../core/shared/json_depth.zig");
 const host_stream_provider = @import("host_stream_provider.zig");
-const open_job = @import("open_job.zig");
+const open_job = @import("../core/shared/open_job.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
+const raw_answer_testing = @import("raw_answer_testing.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
         err == error.ConnectionResetByPeer or
+        // ENOTCONN or EPIPE: the connection closed under the request.
+        err == error.SocketUnconnected or
         err == error.ConnectionTimedOut or
         err == error.LocalAddressGone;
 }
@@ -40,6 +43,10 @@ pub fn networkFailureEvidence(
         .connectivity_lost
     else if (isUnreadableReply(err))
         .unreadable_reply
+    else if (err == error.Unexpected)
+        // A socket or resolver call returns it for an errno that Zig has no
+        // name for.
+        .unnamed_os_error
     else if (isRetryableAgentNetworkError(err))
         .transport_interrupted
     else
@@ -127,6 +134,7 @@ test "connected request failures prefer cancellation" {
 test "isRetryableGatewayError matches active retryable transport errors" {
     try std.testing.expect(isRetryableGatewayError(error.HttpConnectionClosing));
     try std.testing.expect(isRetryableGatewayError(error.ConnectionResetByPeer));
+    try std.testing.expect(isRetryableGatewayError(error.SocketUnconnected));
     try std.testing.expect(isRetryableGatewayError(error.ConnectionTimedOut));
     try std.testing.expect(isRetryableGatewayError(error.LocalAddressGone));
     try std.testing.expect(!isRetryableGatewayError(error.AccessDenied));
@@ -158,6 +166,8 @@ test "native network failure evidence covers setup send read and resume failures
         .{ .err = error.ReadFailed },
         .{ .err = error.StreamStalled, .cause = .stream_stalled },
         .{ .err = error.LocalAddressGone },
+        .{ .err = error.SocketUnconnected },
+        .{ .err = error.Unexpected, .cause = .unnamed_os_error },
     };
 
     for (cases) |case| {
@@ -255,6 +265,8 @@ pub const vercel_gateway_extended_time_value = "true";
 pub const user_agent = "fx/" ++ build_options.app_version;
 var resolved_model_trace_emitted = std.atomic.Value(bool).init(false);
 var test_cancel_watcher_spawn_error: ?anyerror = null;
+var test_cancel_watcher_poll_ms: ?i64 = null;
+var test_cancel_watcher_waiting: ?*std.Io.Event = null;
 
 pub const StreamResult = struct {
     status: std.http.Status,
@@ -615,13 +627,13 @@ fn fetchGatewayJsonAtUrlCore(
     if (connected) |flag| flag.store(true, .release);
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    var cancel_watch_done = std.atomic.Value(bool).init(false);
+    var cancel_watch_done: std.Io.Event = .unset;
     const cancel_watcher = if (req.connection) |conn|
         try spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, null, null, conn.stream_writer.stream)
     else
         null;
     defer {
-        cancel_watch_done.store(true, .seq_cst);
+        cancel_watch_done.set(io_mod.getIo());
         if (cancel_watcher) |thread| thread.join();
     }
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -656,6 +668,10 @@ fn fetchGatewayJsonAtUrlCore(
         alloc.free(body);
         return error.Cancelled;
     }
+    if (plainBodyCutOff(&response, body.len)) {
+        alloc.free(body);
+        return error.HttpBodyCutOff;
+    }
     return .{ .success = body };
 }
 
@@ -680,7 +696,13 @@ fn decodeGatewayJsonBody(
 
     var decompress: std.http.Decompress = undefined;
     const reader = std.http.Decompress.init(&decompress, raw_reader, decompress_buffer, encoding);
-    return readGatewayJsonBody(alloc, reader, max_bytes);
+    // ReadFailed alone hides why the body failed; the decoder's error says whether it was cut off or broken.
+    return readGatewayJsonBody(alloc, reader, max_bytes) catch |err| {
+        if (err == error.ReadFailed) {
+            if (decompressError(encoding, &decompress)) |decoded| return decoded;
+        }
+        return err;
+    };
 }
 
 /// Returns the caller-owned body, or `error.GatewayJsonResponseTooLarge` when
@@ -723,10 +745,14 @@ test "gateway JSON body decode rejects malformed gzip and enforces size cap" {
     try std.testing.expectEqualStrings(sample, decoded);
 
     var truncated_reader = std.Io.Reader.fixed(gzip_bytes[0 .. gzip_bytes.len - 4]);
-    try std.testing.expectError(error.ReadFailed, decodeGatewayJsonBody(alloc, .gzip, &truncated_reader, max_gateway_json_bytes));
+    try std.testing.expectError(error.EndOfStream, decodeGatewayJsonBody(alloc, .gzip, &truncated_reader, max_gateway_json_bytes));
 
+    // The fixture ends inside a deflate block header, so the decoder reports the end of its input.
     var corrupt_reader = std.Io.Reader.fixed("\x1f\x8b\x08\x00bad-gzip");
-    try std.testing.expectError(error.ReadFailed, decodeGatewayJsonBody(alloc, .gzip, &corrupt_reader, max_gateway_json_bytes));
+    try std.testing.expectError(error.EndOfStream, decodeGatewayJsonBody(alloc, .gzip, &corrupt_reader, max_gateway_json_bytes));
+
+    var not_gzip_reader = std.Io.Reader.fixed(sample);
+    try std.testing.expectError(error.BadGzipHeader, decodeGatewayJsonBody(alloc, .gzip, &not_gzip_reader, max_gateway_json_bytes));
 
     var compress_reader = std.Io.Reader.fixed(sample);
     try std.testing.expectError(
@@ -739,6 +765,30 @@ test "gateway JSON body decode rejects malformed gzip and enforces size cap" {
         error.GatewayJsonResponseTooLarge,
         decodeGatewayJsonBody(alloc, .gzip, &cap_reader, sample.len - 1),
     );
+}
+
+/// Serves `answer` once, then reads it with the AI Gateway catalog reader.
+fn readGatewayJsonFromLoopbackAnswer(answer: []const u8) !GatewayJsonResult {
+    const alloc = std.testing.allocator;
+    var server = try raw_answer_testing.AnswerServer.start(alloc, answer);
+    const url = try server.url(alloc, "/v1/models");
+    defer alloc.free(url);
+    var cancel = std.atomic.Value(bool).init(false);
+    const result = fetchGatewayJsonAtUrlCancellable(alloc, null, null, url, &cancel, gateway_json_fetch_timeout_ms, null);
+    try server.finish();
+    return result;
+}
+
+test "gateway JSON reader reports a 200 body cut inside its Content-Length as cut off" {
+    try std.testing.expectError(error.HttpBodyCutOff, readGatewayJsonFromLoopbackAnswer(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"data\":[]}",
+    ));
+}
+
+test "gateway JSON reader returns the gzip decoder's error for a body marked gzip that is not gzip" {
+    try std.testing.expectError(error.BadGzipHeader, readGatewayJsonFromLoopbackAnswer(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}",
+    ));
 }
 
 fn fuzzGatewayJsonDecode(_: void, smith: *std.testing.Smith) !void {
@@ -1371,7 +1421,7 @@ const RequestOpenOperation = struct {
 };
 
 /// A request's connection open, on a thread of its own so the request can
-/// walk away from a DNS lookup or connect that hangs (`open_job.zig`).
+/// walk away from a DNS lookup or connect that hangs (`src/core/shared/open_job.zig`).
 ///
 /// A pooled open runs on the pool's client, which the pool keeps until its
 /// jobs are gone (`HttpPool.deinit`). Any other open runs on a client the job
@@ -2201,7 +2251,7 @@ fn streamGatewayCompletionCoreWithOptions(
         debug_trace.eventf("gateway", "after_http_open_connect", trace_ctx, "attempt={d}", .{attempt + 1});
         debug_trace.eventf("gateway", "after_request_open", trace_ctx, "attempt={d}", .{attempt + 1});
 
-        var cancel_watch_done = std.atomic.Value(bool).init(false);
+        var cancel_watch_done: std.Io.Event = .unset;
         var connected_watch = ConnectedRequestWatch.init(core_options.response_head_timing);
         const cancel_watcher = if (watch_connected_socket)
             if (req.connection) |conn|
@@ -2218,7 +2268,7 @@ fn streamGatewayCompletionCoreWithOptions(
         else
             null;
         defer {
-            cancel_watch_done.store(true, .seq_cst);
+            cancel_watch_done.set(io_mod.getIo());
             if (cancel_watcher) |thread| thread.join();
         }
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -2383,7 +2433,7 @@ fn streamGatewayCompletionCoreWithOptions(
             // deadline shuts the socket, turning the hang into a drain error;
             // only reuse is lost, never the response.
             const drain_started = io_mod.milliTimestamp();
-            var drain_watch_done = std.atomic.Value(bool).init(false);
+            var drain_watch_done: std.Io.Event = .unset;
             const drain_deadline = std.Io.Clock.Timestamp{
                 .clock = .awake,
                 .raw = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake).raw.addDuration(.fromMilliseconds(pool_drain_budget_ms)),
@@ -2399,7 +2449,7 @@ fn streamGatewayCompletionCoreWithOptions(
                 debug_trace.eventf("gateway", "pool_body_drain", trace_ctx, "attempt={d} result=error err={s}", .{ attempt + 1, @errorName(err) });
                 break :blk false;
             };
-            drain_watch_done.store(true, .seq_cst);
+            drain_watch_done.set(io_mod.getIo());
             if (drain_thread) |thread| thread.join();
             // The connection returns to the pool NOW, at stream end — the
             // TTL invariant requires last_activity to track the freshest
@@ -2729,16 +2779,22 @@ const LocalAddressWatch = struct {
     }
 };
 
+const cancel_watcher_poll_ms: i64 = 10;
+
 const GatewayCancelWatcher = struct {
     fn run(
-        done: *std.atomic.Value(bool),
+        done: *std.Io.Event,
         cancel_flag: *std.atomic.Value(bool),
         deadline: ?std.Io.Clock.Timestamp,
         connected_watch: ?*ConnectedRequestWatch,
         stream: std.Io.net.Stream,
     ) void {
+        var poll_ms: i64 = cancel_watcher_poll_ms;
+        if (builtin.is_test) {
+            if (test_cancel_watcher_poll_ms) |ms| poll_ms = ms;
+        }
         var address_watch = LocalAddressWatch.init(stream.socket.handle, std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake));
-        while (!done.load(.seq_cst)) {
+        while (!done.isSet()) {
             if (cancel_flag.load(.seq_cst)) {
                 if (connected_watch == null or connected_watch.?.win(.cancelled)) {
                     stream.shutdown(io_mod.getIo(), .both) catch {};
@@ -2771,7 +2827,17 @@ const GatewayCancelWatcher = struct {
                 }
                 if (watch.phase.load(.seq_cst) == .completed) return;
             }
-            io_mod.sleep(10 * std.time.ns_per_ms);
+            if (builtin.is_test) {
+                if (test_cancel_watcher_waiting) |waiting| waiting.set(io_mod.getIo());
+            }
+            done.waitTimeout(io_mod.getIo(), .{ .duration = .{
+                .raw = .fromMilliseconds(poll_ms),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => {},
+                // No Io task owns this thread, so a cancel cannot target it; the loop re-checks every state on its next pass anyway.
+                error.Canceled => {},
+            };
         }
     }
 };
@@ -2877,7 +2943,15 @@ pub fn fetchOnOpenJob(options: std.http.Client.FetchOptions) !std.http.Client.Fe
     std.debug.assert(options.redirect_behavior == .unhandled);
     var opened = try openRequestOnJob(fetchMethod(options), try fetchUri(options), fetchRequestOptions(options));
     defer opened.deinit();
-    return fetchOnRequest(&opened.request, options);
+    return fetchOnRequest(&opened.request, options, false);
+}
+
+/// Like `fetchOnOpenJob`, but a plain body shorter than its Content-Length is `error.HttpBodyCutOff`.
+pub fn fetchWholeBodyOnOpenJob(options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
+    std.debug.assert(options.redirect_behavior == .unhandled);
+    var opened = try openRequestOnJob(fetchMethod(options), try fetchUri(options), fetchRequestOptions(options));
+    defer opened.deinit();
+    return fetchOnRequest(&opened.request, options, true);
 }
 
 /// `std.http.Client.fetch` on a client the caller owns, without its panic on
@@ -2886,7 +2960,7 @@ pub fn fetchWithClient(client: *std.http.Client, options: std.http.Client.FetchO
     std.debug.assert(options.redirect_behavior == .unhandled);
     var req = try client.request(fetchMethod(options), try fetchUri(options), fetchRequestOptions(options));
     defer req.deinit();
-    return fetchOnRequest(&req, options);
+    return fetchOnRequest(&req, options, false);
 }
 
 fn fetchMethod(options: std.http.Client.FetchOptions) std.http.Method {
@@ -2912,7 +2986,7 @@ fn fetchRequestOptions(options: std.http.Client.FetchOptions) std.http.Client.Re
 
 /// Sends an opened request and reads its answer as `std.http.Client.fetch`
 /// does, except that a failed body read returns `bodyReadError`.
-fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
+fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchOptions, require_whole_body: bool) !std.http.Client.FetchResult {
     if (options.payload) |payload| {
         req.transfer_encoding = .{ .content_length = payload.len };
         var body = try req.sendBodyUnflushed(&.{});
@@ -2943,11 +3017,41 @@ fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchO
     var transfer_buffer: [64]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
-        error.ReadFailed => return bodyReadError(&response),
+    const body_len = reader.streamRemaining(response_writer) catch |err| switch (err) {
+        error.ReadFailed => {
+            if (decompressError(response.head.content_encoding, &decompress)) |decoded| return decoded;
+            return bodyReadError(&response);
+        },
         else => |e| return e,
     };
+    if (require_whole_body and plainBodyCutOff(&response, body_len)) return error.HttpBodyCutOff;
     return .{ .status = response.head.status };
+}
+
+/// True when a plain 200 body is shorter than its Content-Length. The std
+/// reader ends a short body quietly, so the caller counts the bytes it read.
+/// Chunked framing wins over Content-Length (RFC 9112 6.3), an error status
+/// keeps its own category, and a compressed body is checked by its decoder.
+fn plainBodyCutOff(response: *const std.http.Client.Response, body_len: usize) bool {
+    const head = &response.head;
+    if (head.status != .ok or head.transfer_encoding != .none or head.content_encoding != .identity) return false;
+    const expected = head.content_length orelse return false;
+    return body_len < expected;
+}
+
+/// The decoder's own error. ReadFailed means the input read failed, and an
+/// identity body with no length leaves decompress unset.
+fn decompressError(content_encoding: std.http.ContentEncoding, decompress: *const std.http.Decompress) ?anyerror {
+    if (content_encoding == .identity) return null;
+    const err: ?anyerror = switch (decompress.*) {
+        .flate => |*flate| flate.err,
+        .zstd => |*zstd| zstd.err,
+        .none => null,
+    };
+    if (err) |decoder_error| {
+        if (decoder_error == error.ReadFailed) return null;
+    }
+    return err;
 }
 
 /// Watches one provider request on its connection with the lifecycle the
@@ -2957,7 +3061,7 @@ fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchO
 /// read the body through an `sse.Reader` given `progress`, pass a failed read
 /// to `failure`, and call `finish` after a complete response.
 pub const ConnectionWatch = struct {
-    done: std.atomic.Value(bool) = .init(false),
+    done: std.Io.Event = .unset,
     thread: ?std.Thread = null,
     state: ConnectedRequestWatch,
 
@@ -2977,7 +3081,7 @@ pub const ConnectionWatch = struct {
     }
 
     pub fn start(self: *ConnectionWatch, cancel: *std.atomic.Value(bool), deadline: ?std.Io.Clock.Timestamp, connection: std.Io.net.Stream) !void {
-        self.done.store(false, .seq_cst);
+        self.done.reset();
         self.thread = try spawn_gateway_cancel_watcher(&self.done, cancel, deadline, &self.state, connection);
     }
 
@@ -3016,7 +3120,7 @@ pub const ConnectionWatch = struct {
     }
 
     pub fn stop(self: *ConnectionWatch) void {
-        self.done.store(true, .seq_cst);
+        self.done.set(io_mod.getIo());
         if (self.thread) |thread| thread.join();
         self.thread = null;
     }
@@ -3125,6 +3229,31 @@ test "connection watch closes a body that stops sending as stalled" {
     try std.testing.expectEqual(@as(?anyerror, error.StreamStalled), body.err);
     try std.testing.expectEqual(@as(usize, 1), body.events);
     try std.testing.expect(body.elapsed_ms >= 70 and body.elapsed_ms < 2_000);
+}
+
+test "gateway cancel watcher wakes when done is set without finishing its poll" {
+    const zio = io_mod.getIo();
+    test_cancel_watcher_poll_ms = 5000;
+    defer test_cancel_watcher_poll_ms = null;
+    defer test_cancel_watcher_waiting = null;
+
+    var listen_address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try listen_address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    const connect_address = std.Io.net.IpAddress{ .ip4 = .loopback(server.socket.address.getPort()) };
+    const stream = try connect_address.connect(zio, .{ .mode = .stream });
+    defer stream.close(zio);
+
+    var done: std.Io.Event = .unset;
+    var cancel = std.atomic.Value(bool).init(false);
+    var watcher_waiting: std.Io.Event = .unset;
+    test_cancel_watcher_waiting = &watcher_waiting;
+    const thread = try spawn_gateway_cancel_watcher(&done, &cancel, null, null, stream);
+    watcher_waiting.waitUncancelable(zio);
+    const started_ms = io_mod.milliTimestamp();
+    done.set(zio);
+    thread.join();
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1000);
 }
 
 test "connection watch never cuts a body whose events arrive inside the window" {
@@ -3312,7 +3441,7 @@ test "a refused probe option is reported instead of failing the request" {
 }
 
 fn spawn_gateway_cancel_watcher(
-    done: *std.atomic.Value(bool),
+    done: *std.Io.Event,
     cancel_flag: *std.atomic.Value(bool),
     deadline: ?std.Io.Clock.Timestamp,
     connected_watch: ?*ConnectedRequestWatch,
@@ -3542,7 +3671,11 @@ const StreamedToolInputState = enum {
 
 const GatewayReplayBuilder = struct {
     const max_bytes = types.ProviderReplay.max_bytes;
-    const Kind = enum { text, reasoning, tool_call };
+    const Kind = enum { text, reasoning, tool_call, custom };
+    /// The `custom` parts a later request must send back, by kind: OpenAI's
+    /// compaction block. Other custom events, such as Anthropic's
+    /// `message_start`, describe the stream and are never replayed.
+    const replayed_custom_kinds = [_][]const u8{types.ProviderReplay.openai_compaction_kind};
     const Part = struct {
         kind: Kind,
         id: []u8,
@@ -3591,6 +3724,7 @@ const GatewayReplayBuilder = struct {
     /// belongs to no part, so a part's first text may follow it.
     fn observe(self: *GatewayReplayBuilder, root: std.json.Value, content_offset: usize, separated: bool) !void {
         const event = root.object.get("type").?.string;
+        if (std.mem.eql(u8, event, "custom")) return self.observeCustom(root);
         const kind: Kind = if (std.mem.startsWith(u8, event, "reasoning-"))
             .reasoning
         else if (std.mem.startsWith(u8, event, "text-"))
@@ -3655,6 +3789,27 @@ const GatewayReplayBuilder = struct {
         }
     }
 
+    /// Keeps a custom part a later request sends back, with its provider
+    /// metadata, as one whole part: the event carries no text of its own.
+    fn observeCustom(self: *GatewayReplayBuilder, root: std.json.Value) !void {
+        const kind_value = root.object.get("kind") orelse return;
+        if (kind_value != .string) return;
+        const replayed = for (replayed_custom_kinds) |candidate| {
+            if (std.mem.eql(u8, kind_value.string, candidate)) break true;
+        } else false;
+        if (!replayed) return;
+        const metadata = root.object.get("providerMetadata") orelse return error.InvalidProviderState;
+        if (metadata != .object) return error.InvalidProviderState;
+        for (metadata.object.values()) |options| if (options != .object) return error.InvalidProviderState;
+        const merged = try mergeReplayMetadata(self.alloc, null, metadata);
+        errdefer self.alloc.free(merged);
+        try self.reserve(@sizeOf(Part) + kind_value.string.len + merged.len);
+        const owned_kind = try self.alloc.dupe(u8, kind_value.string);
+        errdefer self.alloc.free(owned_kind);
+        try self.parts.append(self.alloc, .{ .kind = .custom, .id = owned_kind, .metadata = merged, .has_provider_metadata = true, .ended = true });
+        self.needed = true;
+    }
+
     fn finish(self: *GatewayReplayBuilder, content: []const u8, calls: []const types.ToolCall) !?[]u8 {
         if (!self.needed) return null;
         var out: std.Io.Writer.Allocating = .init(self.alloc);
@@ -3705,6 +3860,10 @@ const GatewayReplayBuilder = struct {
                 .tool_call => {
                     try out.writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":");
                     try std.json.Stringify.value(canonical_call.?.id, .{}, &out.writer);
+                },
+                .custom => {
+                    try out.writer.writeAll("{\"type\":\"custom\",\"kind\":");
+                    try std.json.Stringify.value(part.id, .{}, &out.writer);
                 },
             }
             if (metadata) |value| {
@@ -5610,8 +5769,21 @@ fn consumeSseStreamTraced(
 
     try call_ids.restoreCallsSentAgain(alloc, tool_accumulators.items);
     completion.tool_calls = try materializeToolCalls(alloc, tool_accumulators.items);
-    if (finish_reason_holder == .stop or finish_reason_holder == .tool_calls) {
+    // Anthropic ends an on-demand compaction reply with its own stop reason,
+    // and the block it wrote is replayed like any finished reply.
+    const compaction_finish = finish_reason_holder == .other and std.mem.eql(u8, finish_raw.slice(), "compaction");
+    if (finish_reason_holder == .stop or finish_reason_holder == .tool_calls or compaction_finish) {
         completion.provider_state_json = try replay.finish(completion.content orelse "", completion.tool_calls);
+    } else if (finish_reason_holder == .length) {
+        // fx runs the calls a cut reply finished, and the next request must
+        // carry their provider state, such as Gemini's thought signatures.
+        // A part the cut left open, or state over the size cap, cannot be
+        // replayed; the next request then goes without provider state, as a
+        // cut reply's always did, so a cut reply never fails here.
+        completion.provider_state_json = replay.finish(completion.content orelse "", completion.tool_calls) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
     }
 
     if (error_event_class) |class| {
@@ -6915,6 +7087,51 @@ test "consumeSseStream traces every terminal cause" {
     try std.testing.expect(std.mem.find(u8, trace, "termination cause=eof_without_finish") != null);
     try std.testing.expect(std.mem.find(u8, trace, "termination cause=read_failure") != null);
     try std.testing.expect(std.mem.find(u8, trace, "termination cause=cancellation") != null);
+}
+
+test "Gateway completion keeps each provider's compaction block for its replay" {
+    const alloc = std.testing.allocator;
+    const Noop = struct {
+        fn discard(_: *anyopaque, _: []const u8) void {}
+    };
+    // As AI Gateway streams on-demand compaction replies (recorded in
+    // tests/e2e/fixtures/provider-compaction/).
+    const openai =
+        "data: {\"type\":\"response-metadata\",\"id\":\"resp_1\",\"modelId\":\"gpt-6.1-sol\"}\n\n" ++
+        "data: {\"type\":\"custom\",\"kind\":\"openai.compaction\",\"providerMetadata\":{\"openai\":{\"type\":\"compaction\",\"itemId\":\"cmp_1\",\"encryptedContent\":\"sealed\"}}}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n";
+    var openai_reader = std.Io.Reader.fixed(openai);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var openai_completion = try consumeSseStream(alloc, &openai_reader, undefined, Noop.discard, null, &cancelled);
+    defer deinitGatewayCompletion(alloc, &openai_completion);
+    try std.testing.expectEqualStrings("", openai_completion.content orelse "");
+    const openai_parts = try std.json.parseFromSlice(std.json.Value, alloc, openai_completion.provider_state_json orelse return error.TestExpectedOpenAiReplay, .{});
+    defer openai_parts.deinit();
+    try std.testing.expectEqual(@as(usize, 1), openai_parts.value.array.items.len);
+    const block = openai_parts.value.array.items[0].object;
+    try std.testing.expectEqualStrings("custom", block.get("type").?.string);
+    try std.testing.expectEqualStrings("openai.compaction", block.get("kind").?.string);
+    try std.testing.expectEqualStrings("sealed", block.get("providerOptions").?.object.get("openai").?.object.get("encryptedContent").?.string);
+
+    const anthropic =
+        "data: {\"type\":\"custom\",\"kind\":\"anthropic.message_start\",\"providerMetadata\":{\"anthropic\":{\"id\":\"msg_1\"}}}\n\n" ++
+        "data: {\"type\":\"text-start\",\"id\":\"0\",\"providerMetadata\":{\"anthropic\":{\"type\":\"compaction\",\"signature\":\"signed\"}}}\n\n" ++
+        "data: {\"type\":\"text-delta\",\"id\":\"0\",\"delta\":\"The user asked for PLUM.\"}\n\n" ++
+        "data: {\"type\":\"text-end\",\"id\":\"0\"}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"other\",\"raw\":\"compaction\"}}\n\n";
+    var anthropic_reader = std.Io.Reader.fixed(anthropic);
+    var anthropic_completion = try consumeSseStream(alloc, &anthropic_reader, undefined, Noop.discard, null, &cancelled);
+    defer deinitGatewayCompletion(alloc, &anthropic_completion);
+    try std.testing.expectEqualStrings("The user asked for PLUM.", anthropic_completion.content orelse return error.TestExpectedAnthropicText);
+    const anthropic_parts = try std.json.parseFromSlice(std.json.Value, alloc, anthropic_completion.provider_state_json orelse return error.TestExpectedAnthropicReplay, .{});
+    defer anthropic_parts.deinit();
+    // The stream's message_start is not part of the reply.
+    try std.testing.expectEqual(@as(usize, 1), anthropic_parts.value.array.items.len);
+    const text = anthropic_parts.value.array.items[0].object;
+    try std.testing.expectEqualStrings("text", text.get("type").?.string);
+    const metadata = text.get("providerOptions").?.object.get("anthropic").?.object;
+    try std.testing.expectEqualStrings("compaction", metadata.get("type").?.string);
+    try std.testing.expectEqualStrings("signed", metadata.get("signature").?.string);
 }
 
 test "Gateway completion retains ordered continuation parts and final metadata" {
@@ -8499,6 +8716,48 @@ test "consumeSseStream keeps each repeated-id call's replay part on its own id" 
             "{\"type\":\"tool-call\",\"toolCallId\":\"fx_call_2\",\"providerOptions\":{\"vertex\":{\"thoughtSignature\":\"sig-c\"}}}]",
         completion.provider_state_json.?,
     );
+}
+
+test "consumeSseStream keeps a cut reply's finished calls' provider state and drops the cut call" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\"done\",\"toolName\":\"edit_file\",\"input\":{\"path\":\"a\"},\"providerMetadata\":{\"vertex\":{\"thoughtSignature\":\"sig-done\"}}}\n\n" ++
+        "data: {\"type\":\"tool-input-start\",\"id\":\"cut\",\"toolName\":\"edit_file\"}\n\n" ++
+        "data: {\"type\":\"tool-input-delta\",\"id\":\"cut\",\"delta\":\"{\\\"path\\\":\\\"b\"}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"length\",\"raw\":\"MAX_TOKENS\"}}\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var completion = try consumeSseStream(alloc, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    try std.testing.expectEqual(types.ProviderFinishReason.length, completion.finish_reason.?);
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("done", completion.tool_calls[0].id);
+    try std.testing.expectEqualStrings(
+        "[{\"type\":\"tool-call\",\"toolCallId\":\"done\",\"providerOptions\":{\"vertex\":{\"thoughtSignature\":\"sig-done\"}}}]",
+        completion.provider_state_json.?,
+    );
+}
+
+test "consumeSseStream gives a cut reply no provider state when the cut left a part open" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data: {\"type\":\"reasoning-start\",\"id\":\"r1\",\"providerMetadata\":{\"vertex\":{\"thoughtSignature\":\"sig-open\"}}}\n\n" ++
+        "data: {\"type\":\"reasoning-delta\",\"id\":\"r1\",\"delta\":\"thinking\"}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"length\",\"raw\":\"MAX_TOKENS\"}}\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var completion = try consumeSseStream(alloc, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    try std.testing.expectEqual(types.ProviderFinishReason.length, completion.finish_reason.?);
+    try std.testing.expect(completion.provider_state_json == null);
 }
 
 test "consumeSseStream gives calls with missing, empty, blank, or oversized ids fx ids" {
@@ -11197,6 +11456,168 @@ test "gateway JSON fetch requests compression and decodes gzip responses" {
     joined = true;
     if (state.failure) |err| return err;
     try std.testing.expect(state.accept_encoding_ok);
+}
+
+test "fetchOnOpenJob returns the gzip decoder's error for a body it cannot decode" {
+    const zio = io_mod.getIo();
+    const alloc = std.testing.allocator;
+    const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&address, zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+
+    const ServeOnce = struct {
+        server: *std.Io.net.Server,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            const inner_zio = io_mod.getIo();
+            const stream = self.server.accept(inner_zio) catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer stream.close(inner_zio);
+
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(inner_zio, &read_buf);
+            var request: [16 * 1024]u8 = undefined;
+            var request_len: usize = 0;
+            while (request_len < request.len) {
+                request[request_len] = reader.interface.takeByte() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                request_len += 1;
+                if (std.mem.endsWith(u8, request[0..request_len], "\r\n\r\n")) break;
+            } else {
+                self.failure = error.TestRequestTooLarge;
+                return;
+            }
+
+            var write_buf: [4096]u8 = undefined;
+            var writer = stream.writer(inner_zio, &write_buf);
+            writer.interface.writeAll(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}",
+            ) catch |err| {
+                self.failure = err;
+                return;
+            };
+            writer.interface.flush() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var serve = ServeOnce{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, ServeOnce.run, .{&serve});
+
+    const url = try alloc.print("http://127.0.0.1:{d}/v1/models", .{server.socket.address.getPort()});
+    defer alloc.free(url);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const result = fetchOnOpenJob(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .headers = .{ .accept_encoding = .omit },
+        .redirect_behavior = .unhandled,
+        .response_writer = &out.writer,
+    });
+    thread.join();
+    if (serve.failure) |err| return err;
+    try std.testing.expectError(error.BadGzipHeader, result);
+}
+
+const short_plain_answer = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"data\":[]}";
+
+/// Serves one loopback answer, then fetches it with `fetchWholeBodyOnOpenJob`
+/// when `whole_body` is set, and with `fetchOnOpenJob` otherwise.
+fn fetchOneLoopbackAnswer(answer: []const u8, whole_body: bool) !std.http.Client.FetchResult {
+    const zio = io_mod.getIo();
+    const alloc = std.testing.allocator;
+    const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&address, zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+
+    const ServeOnce = struct {
+        server: *std.Io.net.Server,
+        answer: []const u8,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            const inner_zio = io_mod.getIo();
+            const stream = self.server.accept(inner_zio) catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer stream.close(inner_zio);
+
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(inner_zio, &read_buf);
+            var request: [16 * 1024]u8 = undefined;
+            var request_len: usize = 0;
+            while (request_len < request.len) {
+                request[request_len] = reader.interface.takeByte() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                request_len += 1;
+                if (std.mem.endsWith(u8, request[0..request_len], "\r\n\r\n")) break;
+            } else {
+                self.failure = error.TestRequestTooLarge;
+                return;
+            }
+
+            var write_buf: [4096]u8 = undefined;
+            var writer = stream.writer(inner_zio, &write_buf);
+            writer.interface.writeAll(self.answer) catch |err| {
+                self.failure = err;
+                return;
+            };
+            writer.interface.flush() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var serve = ServeOnce{ .server = &server, .answer = answer };
+    const thread = try std.Thread.spawn(.{}, ServeOnce.run, .{&serve});
+
+    const url = try alloc.print("http://127.0.0.1:{d}/v1/models", .{server.socket.address.getPort()});
+    defer alloc.free(url);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const options: std.http.Client.FetchOptions = .{
+        .location = .{ .url = url },
+        .method = .GET,
+        .headers = .{ .accept_encoding = .omit },
+        .redirect_behavior = .unhandled,
+        .response_writer = &out.writer,
+    };
+    const result = if (whole_body) fetchWholeBodyOnOpenJob(options) else fetchOnOpenJob(options);
+    thread.join();
+    if (serve.failure) |err| return err;
+    return result;
+}
+
+test "fetchWholeBodyOnOpenJob reports a plain body shorter than its Content-Length as cut off" {
+    try std.testing.expectError(error.HttpBodyCutOff, fetchOneLoopbackAnswer(short_plain_answer, true));
+}
+
+test "fetchOnOpenJob still returns a plain body shorter than its Content-Length" {
+    const result = try fetchOneLoopbackAnswer(short_plain_answer, false);
+    try std.testing.expectEqual(std.http.Status.ok, result.status);
+}
+
+test "fetchWholeBodyOnOpenJob returns a plain body that matches its Content-Length" {
+    const result = try fetchOneLoopbackAnswer("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}", true);
+    try std.testing.expectEqual(std.http.Status.ok, result.status);
+}
+
+test "fetchWholeBodyOnOpenJob keeps the status of an error answer whose body is short" {
+    const result = try fetchOneLoopbackAnswer("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"error\":", true);
+    try std.testing.expectEqual(std.http.Status.service_unavailable, result.status);
+}
+
+test "fetchWholeBodyOnOpenJob accepts a complete chunked answer whose Content-Length is wrong" {
+    const result = try fetchOneLoopbackAnswer("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nContent-Length: 4096\r\nConnection: close\r\n\r\nb\r\n{\"data\":[]}\r\n0\r\n\r\n", true);
+    try std.testing.expectEqual(std.http.Status.ok, result.status);
 }
 
 fn readLoopbackGatewayRequest(zio: std.Io, stream: std.Io.net.Stream, fixture: *LoopbackGatewayFixture) !void {

@@ -54,7 +54,107 @@ pub const SemanticPresentationSink = struct {
     /// Takes ownership of `block` only when it returns successfully.
     code_block: *const fn (ctx: *anyopaque, block: CodeBlockPayload) anyerror!void,
     thematic_rule: *const fn (ctx: *anyopaque) anyerror!void,
+    /// Takes ownership of `events` only when it returns successfully. `alloc`
+    /// is the allocator that made them. Null when the sink shows no tail, so
+    /// the stream builds no preview for it.
+    assistant_tail: ?*const fn (ctx: *anyopaque, alloc: Allocator, events: []assistant_presentation.Event) anyerror!void,
 };
+
+/// The tool calls a reply started, every tool alike, kept without allocation
+/// so a reply cut off at its output limit can tell which calls it never
+/// finished. Starts past `capacity` are counted, not kept.
+pub const StreamedToolStarts = struct {
+    pub const capacity = 64;
+    const max_name_bytes = 64;
+    const Start = struct {
+        id_hash: u64,
+        name_len: u8,
+        name: [max_name_bytes]u8,
+    };
+
+    starts: [capacity]Start = undefined,
+    kept: usize = 0,
+
+    fn hash(id: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, id);
+    }
+
+    pub fn record(self: *StreamedToolStarts, id: []const u8, name: []const u8) void {
+        const id_hash = hash(id);
+        for (self.starts[0..self.kept]) |start| {
+            if (start.id_hash == id_hash) return;
+        }
+        if (self.kept == capacity) return;
+        const kept_name = text_utils.utf8PrefixByBytes(name, max_name_bytes);
+        var start: Start = .{ .id_hash = id_hash, .name_len = @intCast(kept_name.len), .name = undefined };
+        @memcpy(start.name[0..kept_name.len], kept_name);
+        self.starts[self.kept] = start;
+        self.kept += 1;
+    }
+
+    pub fn clear(self: *StreamedToolStarts) void {
+        self.kept = 0;
+    }
+
+    pub const Unfinished = struct {
+        count: usize = 0,
+        /// Borrowed from the record until the next `clear`.
+        first_tool: ?[]const u8 = null,
+    };
+
+    fn isCall(start: Start, call: ToolCall) bool {
+        if (hash(call.id) == start.id_hash) return true;
+        const provisional_id = call.provisional_id orelse return false;
+        return hash(provisional_id) == start.id_hash;
+    }
+
+    /// The starts that none of `calls` finished, by id or by the id the
+    /// stream first gave the call.
+    pub fn unfinished(self: *const StreamedToolStarts, calls: []const ToolCall) Unfinished {
+        var result: Unfinished = .{};
+        starts: for (self.starts[0..self.kept]) |*start| {
+            for (calls) |call| {
+                if (isCall(start.*, call)) continue :starts;
+            }
+            result.count += 1;
+            if (result.first_tool == null) result.first_tool = start.name[0..start.name_len];
+        }
+        return result;
+    }
+
+    /// Whether another call started after `call` did: the stream moved on,
+    /// so `call` was whole before the reply was cut. The call that started
+    /// last, and a call the record never saw start, may be the one the limit
+    /// stopped.
+    pub fn startedBefore(self: *const StreamedToolStarts, call: ToolCall) bool {
+        for (self.starts[0..self.kept], 0..) |start, index| {
+            if (isCall(start, call)) return index + 1 < self.kept;
+        }
+        return false;
+    }
+};
+
+test "streamed tool starts tell which calls a cut reply never finished" {
+    var starts: StreamedToolStarts = .{};
+    starts.record("read_a", "read_file");
+    starts.record("cut_1", "edit_file");
+    starts.record("cut_1", "edit_file");
+    starts.record("cut_2", "write_file");
+    const finished = [_]ToolCall{
+        .{ .id = "read_a", .name = "read_file", .arguments_json = "{}" },
+        .{ .id = "fx_call_1", .name = "write_file", .arguments_json = "{}", .provisional_id = "cut_2" },
+    };
+    const unfinished = starts.unfinished(&finished);
+    try std.testing.expectEqual(@as(usize, 1), unfinished.count);
+    try std.testing.expectEqualStrings("edit_file", unfinished.first_tool.?);
+    try std.testing.expectEqual(@as(usize, 3), starts.unfinished(&.{}).count);
+    // Only a call another call started after is known to be whole.
+    try std.testing.expect(starts.startedBefore(finished[0]));
+    try std.testing.expect(!starts.startedBefore(finished[1]));
+    try std.testing.expect(!starts.startedBefore(.{ .id = "never_started", .name = "read_file", .arguments_json = "{}" }));
+    starts.clear();
+    try std.testing.expectEqual(@as(usize, 0), starts.unfinished(&.{}).count);
+}
 
 pub const StreamChunkContext = struct {
     hooks: *const AgentRuntimeDeps,
@@ -66,6 +166,7 @@ pub const StreamChunkContext = struct {
     alloc: Allocator = std.heap.c_allocator,
     saw_visible_text: bool = false,
     saw_tool_start: bool = false,
+    tool_starts: StreamedToolStarts = .{},
     saw_provider_tool_start: bool = false,
     /// A started tool may run at the provider and does more than read, so a
     /// failed attempt cannot run it again without checking.
@@ -89,6 +190,10 @@ pub const StreamChunkContext = struct {
     response_language_accepted: bool = false,
     response_language_hold_until_completion: bool = false,
     response_language_next_probe_bytes: usize = 5,
+    /// The tail last sent to the sink, to skip a send when nothing changed.
+    sent_tail: std.ArrayList(assistant_presentation.Event) = .empty,
+    /// Tail previews this stream has rendered. A test reads it to see that a sink with no tail builds none.
+    tail_previews_built: usize = 0,
 
     fn markModelOutput(self: *StreamChunkContext) void {
         if (self.first_model_output_at_ms == null) self.first_model_output_at_ms = io_mod.milliTimestamp();
@@ -128,6 +233,7 @@ pub const StreamChunkContext = struct {
         self.interrupted_source.deinit(self.alloc);
         self.initial_line_prefix.deinit(self.alloc);
         self.provisional_statuses.deinit(self.alloc);
+        deinitEventList(self.alloc, &self.sent_tail);
     }
 
     pub fn start_response(self: *StreamChunkContext) !void {
@@ -162,12 +268,14 @@ pub const StreamChunkContext = struct {
         self.response_language_accepted = false;
         self.response_language_next_probe_bytes = 5;
         self.saw_tool_start = false;
+        self.tool_starts.clear();
         self.saw_provider_tool_start = false;
         self.saw_unrepeatable_provider_tool_start = false;
         self.saw_visible_text_after_tool_start = false;
         self.first_model_output_at_ms = null;
         self.streamed_output_bytes = 0;
         self.published_phase = null;
+        try sendAssistantTail(self);
     }
 
     pub fn accepted_source(self: *const StreamChunkContext) []const u8 {
@@ -323,7 +431,7 @@ pub fn pushTokenProgressUpdate(stream_ctx: *StreamChunkContext, update: runtime_
 pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []const u8, label_value: ?[]const u8, arguments_json: ?[]const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
     const first_tool_in_step = !stream_ctx.saw_tool_start;
-    recordStreamToolStart(ctx, tool_name);
+    recordStreamToolStart(ctx, tool_id, tool_name);
     const preflight = runtime_tool_presentation.ProvisionalToolStatuses.preflight(stream_ctx.hooks.tool_registry, tool_name) orelse {
         publishTurnPhase(stream_ctx, .running);
         return;
@@ -364,9 +472,10 @@ pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []cons
     }
 }
 
-pub fn recordStreamToolStart(ctx: *anyopaque, tool_name: []const u8) void {
+pub fn recordStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
     stream_ctx.saw_tool_start = true;
+    stream_ctx.tool_starts.record(tool_id, tool_name);
     if (runtime_tool_presentation.streamStartMayHaveExecutedAtProvider(
         stream_ctx.hooks.tool_registry,
         tool_name,
@@ -476,9 +585,11 @@ fn publishAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const
         .code = semantic_code_completion,
         .thematic_rule = semantic_thematic_rule_completion,
     });
-    if (out.items.len == 0) return;
-    try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = out.items });
-    stream_ctx.recordTextOutput(out.items);
+    if (out.items.len > 0) {
+        try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = out.items });
+        stream_ctx.recordTextOutput(out.items);
+    }
+    try sendAssistantTail(stream_ctx);
 }
 
 pub fn flushAssistantStream(stream_ctx: *StreamChunkContext) !void {
@@ -518,13 +629,73 @@ pub fn flushAssistantStream(stream_ctx: *StreamChunkContext) !void {
         .code = semantic_code_completion,
         .thematic_rule = semantic_thematic_rule_completion,
     });
-    if (out.items.len == 0) return;
-    const text = if (stream_ctx.trailing_newline_count >= 2 and beginsFootnoteProjection(out.items))
-        out.items[1..]
-    else
-        out.items;
-    try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = text });
-    stream_ctx.recordTextOutput(text);
+    if (out.items.len > 0) {
+        const text = if (stream_ctx.trailing_newline_count >= 2 and beginsFootnoteProjection(out.items))
+            out.items[1..]
+        else
+            out.items;
+        try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = text });
+        stream_ctx.recordTextOutput(text);
+    }
+    try sendAssistantTail(stream_ctx);
+}
+
+/// Ends the tail of this stream. The empty tail replaces the last one sent.
+pub fn finishAssistantTail(stream_ctx: *StreamChunkContext) !void {
+    if (comptime !assistant_presentation.builds_previews) return;
+    const sink = stream_ctx.semantic_presentation orelse return;
+    if (sink.assistant_tail == null) return;
+    const empty = try stream_ctx.alloc.alloc(assistant_presentation.Event, 0);
+    try deliverAssistantTail(sink, stream_ctx, empty);
+}
+
+/// Sends the rendered tail when it differs from the one sent last. A sink
+/// with no tail consumer gets no preview built.
+fn sendAssistantTail(stream_ctx: *StreamChunkContext) !void {
+    if (comptime !assistant_presentation.builds_previews) return;
+    const sink = stream_ctx.semantic_presentation orelse return;
+    if (sink.assistant_tail == null) return;
+    const alloc = stream_ctx.alloc;
+    var tail: std.ArrayList(assistant_presentation.Event) = .empty;
+    defer deinitEventList(alloc, &tail);
+    stream_ctx.tail_previews_built += 1;
+    _ = try stream_ctx.markdown.renderProvisional(alloc, &tail);
+    if (std.meta.eql(tail.items, stream_ctx.sent_tail.items)) return;
+    try deliverAssistantTail(sink, stream_ctx, try tail.toOwnedSlice(alloc));
+}
+
+/// Hands `events` to the sink and keeps a copy to compare the next tail with.
+/// A failed send keeps the last tail sent, and the sink never gets the events.
+fn deliverAssistantTail(
+    sink: SemanticPresentationSink,
+    stream_ctx: *StreamChunkContext,
+    events: []assistant_presentation.Event,
+) !void {
+    const alloc = stream_ctx.alloc;
+    errdefer assistant_presentation.freeEventSlice(alloc, events);
+    var sent: std.ArrayList(assistant_presentation.Event) = .empty;
+    errdefer deinitEventList(alloc, &sent);
+    try appendClonedEvents(alloc, &sent, events);
+    try sink.assistant_tail.?(sink.ctx, alloc, events);
+    deinitEventList(alloc, &stream_ctx.sent_tail);
+    stream_ctx.sent_tail = sent;
+}
+
+fn appendClonedEvents(
+    alloc: Allocator,
+    list: *std.ArrayList(assistant_presentation.Event),
+    source: []const assistant_presentation.Event,
+) !void {
+    for (source) |event| {
+        var cloned = try event.clone(alloc);
+        errdefer cloned.deinit(alloc);
+        try list.append(alloc, cloned);
+    }
+}
+
+fn deinitEventList(alloc: Allocator, list: *std.ArrayList(assistant_presentation.Event)) void {
+    for (list.items) |*event| event.deinit(alloc);
+    list.deinit(alloc);
 }
 
 fn beginsFootnoteProjection(text: []const u8) bool {
@@ -585,24 +756,31 @@ fn deliverSemanticThematicRule(raw: *anyopaque, out: *std.ArrayList(u8)) !void {
     stream_ctx.recordSemanticBoundary();
 }
 
-pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, arena: Allocator, disposition: types.ProviderCompletionDisposition) !void {
+pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, disposition: types.ProviderCompletionDisposition) !void {
     if (disposition != .length_limited) return;
-    const line = try arena.print("response hit provider length limit; output may be incomplete", .{});
-    try hooks.push_system_notice(hooks.ctx, line);
+    try hooks.pushWarningNotice("The response hit the provider's length limit and may be incomplete.");
 }
 
+/// Shows a cut reply's text, then `blocker`, which says why the turn stopped,
+/// and returns the turn's final text: `earlier`, the parts of an answer that
+/// earlier cut replies wrote and that were already shown, then the reply's
+/// text, then `blocker`.
 pub fn finishLengthLimitedToolCallCompletion(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
     completion: types.ModelCompletion,
     streamed_content_len: usize,
+    earlier: []const u8,
+    blocker: []const u8,
 ) ![]const u8 {
-    const blocker = "The reply ran out of output tokens before its tool calls were complete, so I did not run them. Send your message again to retry, or ask for a smaller step.";
-
     const has_content = completion.content != null and completion.content.?.len > 0;
     const normalized = if (has_content) try normalizeAssistantTextForDisplay(arena, completion.content.?) else "";
-    const rendered = if (normalized.len > 0)
-        try arena.print("{s}\n\n{s}", .{ normalized, blocker })
+    const whole = if (earlier.len == 0)
+        normalized
+    else
+        try normalizeAssistantTextForDisplay(arena, try std.mem.concat(arena, u8, &.{ earlier, completion.content orelse "" }));
+    const rendered = if (whole.len > 0)
+        try arena.print("{s}\n\n{s}", .{ whole, blocker })
     else
         blocker;
 
@@ -727,7 +905,7 @@ const NoticeCapture = struct {
         };
     }
 
-    fn appendRuntimeContext(_: *anyopaque, _: Allocator, _: *std.ArrayList(ChatMessage)) !void {}
+    fn appendRuntimeContext(_: *anyopaque, _: Allocator, _: []const u8, _: *std.ArrayList(ChatMessage)) !void {}
 
     fn requestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: PermissionMode, _: []const PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8, _: ?[]const u8) !command_admission.PermissionOutcome {
         return .{
@@ -843,16 +1021,21 @@ const StreamCapture = struct {
         };
     }
 
+    fn captureAssistantTail(_: *anyopaque, alloc: Allocator, events: []assistant_presentation.Event) !void {
+        assistant_presentation.freeEventSlice(alloc, events);
+    }
+
     fn semanticPresentationSink(self: *@This()) SemanticPresentationSink {
         return .{
             .ctx = self,
             .table = captureTable,
             .code_block = captureCodeBlock,
             .thematic_rule = captureThematicRule,
+            .assistant_tail = captureAssistantTail,
         };
     }
 
-    fn noopAppendRuntimeContext(_: *anyopaque, _: Allocator, _: *std.ArrayList(ChatMessage)) !void {}
+    fn noopAppendRuntimeContext(_: *anyopaque, _: Allocator, _: []const u8, _: *std.ArrayList(ChatMessage)) !void {}
     fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: PermissionMode, _: []const PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8, _: ?[]const u8) !command_admission.PermissionOutcome {
         return .{ .decision = .once, .execution_authority = .ordinary };
     }
@@ -2251,13 +2434,10 @@ test "emitProviderLengthNotice emits exact length notice" {
     defer capture.deinit(alloc);
     const hooks = capture.hooks();
 
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-
-    try emitProviderLengthNotice(&hooks, arena_state.allocator(), .length_limited);
+    try emitProviderLengthNotice(&hooks, .length_limited);
 
     try std.testing.expectEqual(@as(usize, 1), capture.notices.items.len);
-    try std.testing.expectEqualStrings("response hit provider length limit; output may be incomplete", capture.notices.items[0]);
+    try std.testing.expectEqualStrings("The response hit the provider's length limit and may be incomplete.", capture.notices.items[0]);
 }
 
 test "emitProviderLengthNotice ignores non-length finish reasons" {
@@ -2266,10 +2446,7 @@ test "emitProviderLengthNotice ignores non-length finish reasons" {
     defer capture.deinit(alloc);
     const hooks = capture.hooks();
 
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-
-    try emitProviderLengthNotice(&hooks, arena_state.allocator(), .completed);
+    try emitProviderLengthNotice(&hooks, .completed);
 
     try std.testing.expectEqual(@as(usize, 0), capture.notices.items.len);
 }

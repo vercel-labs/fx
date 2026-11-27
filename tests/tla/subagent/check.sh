@@ -123,6 +123,19 @@
 # against it (MainMailTrace.tla) where turns commit as they finish, as in
 # fx ask and ACP.
 #
+# main-mail-handoff.cfg is the design where the host hands a subagent's mail
+# to its main loop before the worker's queue, as the app does
+# (postDelivery and deliverReports in src/core/app/app_agents_runtime.zig).
+# A reply that ends empty is followed by a check that first waits, at most a
+# bound, for mail in that hand-off (wait_for_handoff_mail), so the mail takes
+# the nudge's place, and it ends at once when older work keeps mail out of the
+# turn. Three more planted defects:
+#
+#   nudge-blind          an empty reply's check ignores the hand-off        NoNudgeWithMail
+#   unbounded-wait       the worker waits for the hand-off with no bound    WaitBounded
+#   wait-behind          the worker keeps waiting for mail that older work    NoPointlessWait
+#                        keeps out of the turn
+#
 # The WaitNudge configs:
 #
 # WaitNudge models main's wait against subagent works that end with nothing
@@ -136,6 +149,39 @@
 # trace driver runs fx along it: the inline tests in tool_host.zig and
 # "a wait that starts as a subagent's work ends with nothing to report still
 # returns" in tests/e2e/gateway-stream-lifecycle.test.ts hold fx in the gap.
+#
+# The ParentApproval configs:
+#
+# ParentApproval models a subagent's approval request reaching main and main
+# answering it (requestChildPermission and registerApproval in
+# src/core/subagent/execution.zig, noteChildApproval and answerApproval in
+# tool_host.zig, the registry in approval_registry.zig, awaitMailOrQuiet and
+# the fx ask loop in src/core/cli/cli_ask.zig). The request is registered
+# before its note is posted, and the mark that counts it noted runs only after
+# the post returned; a failed post refuses it at once. `PostNote` and
+# `MarkNoted` are separate because the ask loop can block between them
+# (`Block`), and only the mark's wake (or the loop's 50 ms re-check, `Wake`)
+# lets it look at the fallback again. approve runs the exact call through
+# main's own check, and fx ask's fallback refuses the waiting requests once
+# main is idle with no mail and the loop is not blocked. parent-approval.cfg
+# is the design and must pass. parent-approval-today.cfg is fx before this
+# change: no note and no approve, so a waiting request is never answered,
+# which TLC reports as a deadlock. Each parent-approval-mutation-*.cfg plants
+# one defect, and the rule or deadlock named for it must catch it:
+#
+#   final-answer  approve resolves allowed without main's check      Authority
+#   note-first    the note is posted before the request is
+#                 registered                                         NoLostApprove
+#   early-stall   the fallback counts a request that is not yet
+#                 noted                                              FallbackOnlyAfterSeen
+#   no-fallback   no fallback: a waiting request stays unanswered    deadlock
+#   note-lost     a failed note leaves the request registered
+#                 and waiting                                        deadlock
+#   no-nudge      the mark does not wake the blocked loop, so a
+#                 request noted after the loop looked is never
+#                 answered                                           deadlock
+#
+# No trace driver runs fx along it yet.
 
 set -eu
 
@@ -191,6 +237,10 @@ MainMail main-mail-commit -
 MainMail main-mail-mutation-no-gate CommitBeforeNextTurn
 MainMail main-mail-mutation-stuck-gate GateNeverStuck
 MainMail main-mail-mutation-drop-unacknowledged GateNeverStuck
+MainMail main-mail-handoff -
+MainMail main-mail-mutation-nudge-blind NoNudgeWithMail
+MainMail main-mail-mutation-unbounded-wait WaitBounded
+MainMail main-mail-mutation-wait-behind NoPointlessWait
 QuietRelay quiet-relay -
 QuietRelay quiet-relay-deep -
 QuietRelay quiet-relay-mutation-relay-late-notice OnePerSpell
@@ -201,4 +251,93 @@ QuietRelay quiet-relay-mutation-check-first NoSleepOnMail
 WaitNudge wait-nudge -
 WaitNudge wait-nudge-today deadlock
 WaitNudge wait-nudge-mutation-check-first deadlock
+ParentApproval parent-approval -
+ParentApproval parent-approval-today deadlock
+ParentApproval parent-approval-mutation-final-answer Authority
+ParentApproval parent-approval-mutation-note-first NoLostApprove
+ParentApproval parent-approval-mutation-early-stall FallbackOnlyAfterSeen
+ParentApproval parent-approval-mutation-no-fallback deadlock
+ParentApproval parent-approval-mutation-note-lost deadlock
+ParentApproval parent-approval-mutation-no-nudge deadlock
+# The TuiParentApproval configs:
+# The trial (step 3b) and a must break: the trial breaks NoStaleLent (a lent
+# copy outliving its wait), a breaks NoStalePrompt (the call frees its review).
+# a2, b and c must pass; c is the code in this change (the prompt owns its
+# copy, so NoStalePrompt holds by construction).
+# lend_routed, free_anyway and note_typed each break the rule named on its row.
+# Two defects have no config because they cannot fail: no_withdraw (one request
+# per kid) and b_note_keeps_prompt (b's free guard waits on the prompt).
+# The simulate pair runs under ideal and non-ideal conditions.
+#
+TuiParentApproval tui-approval-current-trial NoStaleLent
+TuiParentApproval tui-approval-design-a NoStalePrompt
+TuiParentApproval tui-approval-design-a-person NoStalePrompt
+TuiParentApproval tui-approval-design-a2 -
+TuiParentApproval tui-approval-design-a2-person -
+TuiParentApproval tui-approval-design-b -
+TuiParentApproval tui-approval-design-c -
+TuiParentApproval tui-approval-design-b-person -
+TuiParentApproval tui-approval-mutant-lend-routed NoPersonPromptForParentRouted
+TuiParentApproval tui-approval-mutant-free-anyway NoStalePrompt
+TuiParentApproval tui-approval-mutant-note-typed TypedStaysWithPerson
+TuiParentApproval tui-approval-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
+TuiParentApproval tui-approval-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
+# The ViewWaits configs:
+# ViewWaits models what a view shows for the person-only items in its tree
+# (lendPrompt, settleLentQuestion and waitingNote in app_agents_runtime.zig;
+# attach and stopSet; a child's question prompt and status row). It models
+# approvals only as far as the one-item order needs them; their routing and
+# their review memory stay in TuiParentApproval.tla.
+#   design-a and design-b are the two designs and must pass every rule. A
+#   copies the item into the view and settles a pass later; b projects it
+#   from the child's live state and stores nothing.
+#   current-e, current-b and current-model are today: kind E shows nothing,
+#   kind B says "needs you" while its picker is shown, and its "Switch to
+#   another model" reaches the screen's agent.
+#   Each mutant plants one defect, and the rule named for it must catch it:
+#     footer-blind      the footer counts every wait, shown or not
+#                                                    FooterQuietForShown
+#     route-screen      an action from a view goes to the screen's agent
+#                                                    ActionReachesOwner
+#     a-no-settle       design A never discards a stale copy  NoStaleShown
+#     lend-under-alt    a lend while the alternate screen is owned
+#                                                    HeldUnderAltScreen
+#     two-shown         a view adds a second item instead of replacing
+#                                                    OneAtATime
+#     cross-tree        a view shows another tree's item   InstanceScope
+#     note-content      the note carries the question text  NoSecretToModel
+#     main-answers      main answers the item           MainOnlyTellsOrStops
+#     view-only         the child's own screen cannot act  OwnScreenActable
+#     row-as-wait       the view shows a status row that outlived its wait
+#                                                   ShownOnlyWhileWaiting
+#     lend-under-picker a view lends the card under the picker it opened
+#                                                    CardYieldsToPicker
+#     stale-pick        a continue keeps its pick       OnceForTheWait
+#     own-model-keeps-pick  the own-screen model does not beat an older pick
+#                                                    LatestChoiceWins
+#   The simulate pair runs under ideal and non-ideal conditions.
+#
+#   view-waits-chart is the same design with one child in each tree, small enough
+#   to draw every state as a chart.
+ViewWaits view-waits-chart -
+ViewWaits view-waits-design-a -
+ViewWaits view-waits-design-b -
+ViewWaits view-waits-current-e ShownWhenFree
+ViewWaits view-waits-current-b FooterQuietForShown
+ViewWaits view-waits-current-model ActionReachesOwner
+ViewWaits view-waits-mutant-footer-blind FooterQuietForShown
+ViewWaits view-waits-mutant-route-screen ActionReachesOwner
+ViewWaits view-waits-mutant-a-no-settle NoStaleShown
+ViewWaits view-waits-mutant-lend-under-alt HeldUnderAltScreen
+ViewWaits view-waits-mutant-two-shown OneAtATime
+ViewWaits view-waits-mutant-cross-tree InstanceScope
+ViewWaits view-waits-mutant-note-content NoSecretToModel
+ViewWaits view-waits-mutant-main-answers MainOnlyTellsOrStops
+ViewWaits view-waits-mutant-view-only OwnScreenActable
+ViewWaits view-waits-mutant-row-as-wait ShownOnlyWhileWaiting
+ViewWaits view-waits-mutant-lend-under-picker CardYieldsToPicker
+ViewWaits view-waits-mutant-stale-pick OnceForTheWait
+ViewWaits view-waits-mutant-own-model-keeps-pick LatestChoiceWins
+ViewWaits view-waits-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
+ViewWaits view-waits-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
 VERDICTS

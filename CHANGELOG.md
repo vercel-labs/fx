@@ -1,8 +1,100 @@
 # fx
 
-## 0.0.17
+## 0.0.18
 
 <!-- release:start -->
+
+**Subagents are more reliable. The tool view is refreshed, with one short row per call. Your model's provider can compact long conversations, and replies show each word formatted as it arrives. Shell commands run 3.1× to 4.8× faster.**
+
+### Improvements
+
+- Subagents show what they are for, and whether they failed, stopped, or wait for you, in the agent list and `status`.
+- The main agent ends its turn after it sends work to a subagent, and the subagent's report starts its next turn.
+- Refused subagent calls tell the model what to try next.
+- Tool rows show file names instead of full paths, and a failed call fits on one line.
+- Related tool calls share one row, and a row of several commands names the newest ones.
+- A toolbox call's row names its tool while its arguments stream in.
+- The compaction row shows how much of the summary is written and counts its own time.
+- Ctrl+O opens at once after a compaction.
+- Streamed replies show each word formatted as it arrives, with the first word in a median 18.4 ms instead of 287.3 ms.
+- Shell commands run 3.1× to 4.8× faster with an MCP server configured.
+- `shell` can wait up to 5 minutes for a command when the model asks.
+- Long command output keeps its newest lines.
+- Captured shell commands return as soon as they end, and a model step no longer waits for the request watcher's 10 ms tick.
+- A shell result tells the model when its command's `fx mcp call` calls will stop working.
+- Shell results send the model an output handle only when the output was cut, so later requests carry less.
+- `fx doctor` finishes in about 7 s on a large profile where it ran for more than 14 minutes, and `--deep` keeps the full check.
+- fx resends a reply the content filter blocked up to three times before it asks you.
+- Retry reports in `fx ask --json` and ACP say why fx retried, and the session log keeps each retry.
+- `fx ask` shows a short header and a Thinking line, keeps scrollback on resize, and starts faster.
+- An MCP tool error gives the model the details the server sent, up to 8 KiB.
+- `$${VAR}` in an MCP config reaches the server as `${VAR}`.
+- MCP sign-outs that the server did not confirm keep the login and try again later.
+- fx says when it refuses an MCP server's tool list or login.
+- `read_file` reads a line field of 0 as unset.
+- A read skipped because of new folder rules tells the model to send it again.
+- The model picker leaves out a fast variant when Fast mode runs it.
+- `/trace` includes auto mode reviews, git state, settings, and skills.
+- Codex and custom `openai-responses` connections send the system prompt as the first input item, so later turns keep it in the prompt cache.
+
+### New Features
+
+- On models whose provider can compact a conversation, the provider writes the compaction, and fx keeps the newest 4 turns unchanged.
+- fx sessions in one profile share each stdio MCP server, so several terminals run one copy of it.
+- A stdio MCP server with no call for 10 minutes stops, and the next call starts it again.
+- `"shared": false` in a server's config keeps one copy per session.
+- fx saves a crash report to `~/.fx/diagnostics/last-crash.jsonl` when it stops on an error, a panic, or a segfault.
+- `fx ask --json` lists each subagent's usage in a `subagents` field.
+- `fx sessions --live --json` gives the process ID that holds each session.
+- `fx sessions ls` and `fx models ls` name the list commands, and the old forms still work.
+- `fx session fork <last|id>` copies a session into a new one and leaves the original running.
+- With `experimental.workspace_capture` on, fx saves the state of each turn's repositories at the turn's start and end.
+
+### Bug Fixes
+
+- Subagents keep working through ACP session switches, loads, and resumes, and keep their profile settings and approvals.
+- A stop or close right after a subagent finishes acts on the right work, and the main agent learns what it dropped.
+- Waits on subagents no longer hang when a subagent ends with nothing to report or cannot start.
+- Tool calls run and show when a model reuses a call ID or sends none.
+- A prompt sent right after a turn ends includes that turn.
+- fx no longer waits after every shell command, and `printf` with data that starts with `--` runs through the shell.
+- Closing the terminal while fx draws a frame saves the request for the next fx.
+- `fx ask` and ACP count usage over every main turn.
+- A waiting request continues with a login that another fx session saved.
+- Vercel login says when your team's Token Pass is active, instead of offering to buy it.
+- A content filter block that a provider sends as a stream error counts as a content filter block.
+- Tables break long words instead of widening a column, and recolor when the theme changes.
+- Rows stay in scrollback when a resumed agent opens, and cancelled calls keep their rows after a resume.
+- fx keeps running when the footer shrinks during a long turn.
+- MCP servers whose fields use JSON escapes, or send replies fx can't read, no longer stall or crash a call.
+- An MCP HTTP link that loses several calls in a row restarts.
+- `web_fetch` handles 204 and 304 responses.
+- Max effort goes to AI Gateway unchanged, and fx says when the Gateway leaves out an effort.
+- Tool calls after an answered question show in a new row below it.
+- The agent list shows how long a subagent's turn has run, not its current call.
+- `wait` no longer says no report will arrive while one is on its way.
+- A subagent status call no longer shows `Managing` for a moment.
+- A message from a subagent you typed on keeps who started its turn.
+- ACP sessions read the profile's MCP servers as the terminal app does: a bad entry is skipped and the others load.
+- `fx status` and `fx doctor` show a profile's good MCP servers when one entry is bad.
+- `fx mcp call list` and `search` say a server needs its variable, not a login.
+
+### Security
+
+- `/trace` masks secrets that a cut or a screen wrap splits.
+- fx refuses to load v1 session folders that other users can write.
+
+### Breaking Changes
+
+- `fx setup` and `/setup` are removed; use `fx login vercel --api-key` and `/provider`.
+- `fx mcp --profile` and `/allowlist user` and `local` are removed; use `--global`, `global`, and `workspace`.
+- fx no longer reads the `statusLine` and `notifications` settings; rename them to `status_line` and `sound`.
+- `"*": "deny"`, `"web_fetch": "deny"`, and `"web_fetch": "ask"` now apply to every `web_fetch` call.
+- ACP ends a prompt that the content filter blocks with `stopReason: "refused"` and a message, instead of a `ModelError` JSON-RPC error.
+
+<!-- release:end -->
+
+## 0.0.17
 
 **Subagents now work alongside you: switch between agents and run several fx instances in one window. Vercel Token Pass is now first-class in fx. Tool definitions 48.0% smaller, and 82.0% of later input from the prompt cache, up from 61.3%.**
 
@@ -164,8 +256,6 @@
 - Esc during a retry ends the turn, and the separate Esc-to-pause is gone.
 - `fx ask --json` and ACP report recovery as `state`, `attempt`, `need`, and `message`.
 - A libfx host tool now receives an argument whose `inputSchema` type is number, boolean, array, or object as that type, not as JSON text, so it must not `JSON.parse` it.
-
-<!-- release:end -->
 
 ## 0.0.16
 

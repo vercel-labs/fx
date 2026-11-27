@@ -376,6 +376,7 @@ pub const TranscriptEntry = union(enum) {
         body: []const u8,
         visibility: types.NoticeVisibility,
         detail: []const u8 = "",
+        detail_visibility: types.NoticeVisibility = .compact_and_full,
         // The producer will replace this entry in place; its bytes are not
         // final and must not be released into terminal history.
         pending_replacement: bool = false,
@@ -393,6 +394,10 @@ pub const TranscriptEntry = union(enum) {
         id: u32,
         created_at_ms: i64 = 0,
         inline_hidden: bool = false,
+        /// Holds a line fx wrote between steps, such as the empty-reply
+        /// nudge. It draws as any other text; the main screen draws the
+        /// turn's later calls below it (`breaksPresentationGroup`).
+        operational: bool = false,
         segments: AssistantTurnSegments,
     };
 
@@ -1867,13 +1872,137 @@ fn updateNoticeHyperlinkState(fragment: []const u8, active: *?[]const u8) void {
     }
 }
 
+/// A bare URL up to this wide shows whole in the compact view; a longer one shows its host.
+const max_full_url_cells: usize = 40;
+
+/// Host of a notice URL, or the URL itself when it has no host. Userinfo is
+/// dropped, so the shown host is the one the link opens.
+fn urlHost(url: []const u8) []const u8 {
+    const authority = text_utils.urlAuthority(url) orelse return url;
+    const host = url[authority.host_start..authority.end];
+    return if (host.len == 0) url else host;
+}
+
+/// URL an fx OSC 8 opener carries: the payload after its first ';'.
+fn noticeOpenerUrl(opener: []const u8) []const u8 {
+    const terminator_len: usize = if (opener[opener.len - 1] == 0x07) 1 else 2;
+    const payload = opener[notice_osc8_prefix.len .. opener.len - terminator_len];
+    const separator = std.mem.findScalar(u8, payload, ';') orelse return "";
+    return payload[separator + 1 ..];
+}
+
+/// One OSC 8 link on a bare URL. The compact view shows the URL when it fits
+/// `max_full_url_cells` and its host when it does not; the full view always
+/// shows the whole URL. A link target is printable ASCII, so its bytes are its cells.
+fn appendBareUrlLink(out: *std.ArrayList(u8), alloc: Allocator, url: []const u8, presentation: TranscriptPresentation) !void {
+    try out.appendSlice(alloc, "\x1b]8;;");
+    try out.appendSlice(alloc, url);
+    try out.appendSlice(alloc, "\x1b\\");
+    const shows_whole_url = presentation == .full or url.len <= max_full_url_cells;
+    try out.appendSlice(alloc, if (shows_whole_url) url else urlHost(url));
+    try out.appendSlice(alloc, notice_osc8_close);
+}
+
+/// Copies notice text and turns each bare http(s) URL outside an fx link into
+/// an OSC 8 link, labeled as appendBareUrlLink describes. In the full view, a
+/// link whose label is not its URL gets the URL after it, so the full
+/// transcript shows where the link goes.
+fn appendLinkedNoticeText(out: *std.ArrayList(u8), alloc: Allocator, text: []const u8, presentation: TranscriptPresentation) !void {
+    var link: ?[]const u8 = null;
+    var label_start: usize = 0;
+    var copied: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == 0x1b) {
+            const sequence_end = display_width.ansiSequenceEnd(text, index);
+            if (sequence_end <= index or sequence_end > text.len) {
+                index += 1;
+                continue;
+            }
+            const opener = link;
+            updateNoticeHyperlinkState(text[index..sequence_end], &link);
+            if (opener == null and link != null) label_start = sequence_end;
+            if (opener != null and link == null and presentation == .full) {
+                const url = noticeOpenerUrl(opener.?);
+                if (!std.mem.eql(u8, text[label_start..index], url)) {
+                    try out.appendSlice(alloc, text[copied..sequence_end]);
+                    try out.appendSlice(alloc, " (");
+                    try out.appendSlice(alloc, url);
+                    try out.append(alloc, ')');
+                    copied = sequence_end;
+                }
+            }
+            index = sequence_end;
+            continue;
+        }
+        if (link == null) {
+            if (assistant_presentation.bareUrlEnd(text, index)) |bare_end| {
+                // An escaped outside byte shows as `\xNN` text, so it must not join a link.
+                const url_end = if (std.mem.findScalar(u8, text[index..bare_end], '\\')) |backslash| index + backslash else bare_end;
+                const url = text[index..url_end];
+                if (text_utils.isLinkTarget(url)) {
+                    try out.appendSlice(alloc, text[copied..index]);
+                    try appendBareUrlLink(out, alloc, url, presentation);
+                    index = url_end;
+                    copied = url_end;
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    try out.appendSlice(alloc, text[copied..]);
+}
+
+/// Notice text with each fx OSC 8 link written as "label (url)", for plain-text views. The caller owns the result.
+pub fn noticeLinksAsText(alloc: Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var link: ?[]const u8 = null;
+    var label_start: usize = 0;
+    var copied: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] != 0x1b) {
+            index += 1;
+            continue;
+        }
+        const sequence_end = display_width.ansiSequenceEnd(text, index);
+        if (sequence_end <= index or sequence_end > text.len) {
+            index += 1;
+            continue;
+        }
+        if (!std.mem.startsWith(u8, text[index..sequence_end], notice_osc8_prefix)) {
+            index = sequence_end;
+            continue;
+        }
+        const opener = link;
+        updateNoticeHyperlinkState(text[index..sequence_end], &link);
+        try out.appendSlice(alloc, text[copied..index]);
+        copied = sequence_end;
+        if (opener == null and link != null) label_start = sequence_end;
+        if (opener != null and link == null) {
+            const url = noticeOpenerUrl(opener.?);
+            if (!std.mem.eql(u8, text[label_start..index], url)) {
+                try out.appendSlice(alloc, " (");
+                try out.appendSlice(alloc, url);
+                try out.append(alloc, ')');
+            }
+        }
+        index = sequence_end;
+    }
+    try out.appendSlice(alloc, text[copied..]);
+    return out.toOwnedSlice(alloc);
+}
+
 fn skipNoticeWhitespace(text: []const u8, start: usize) usize {
     var index = start;
     while (index < text.len and (text[index] == ' ' or text[index] == '\t')) : (index += 1) {}
     return index;
 }
 
-fn scanNoticeLine(text: []const u8, start: usize, max_width: usize) NoticeLine {
+/// `linked`: the row starts inside an fx link, so its `/` is not a break point.
+fn scanNoticeLine(text: []const u8, start: usize, max_width: usize, linked: bool) NoticeLine {
     std.debug.assert(max_width > 0);
     if (start >= text.len) return .{ .end = start, .next = start };
 
@@ -1881,11 +2010,13 @@ fn scanNoticeLine(text: []const u8, start: usize, max_width: usize) NoticeLine {
     var width: usize = 0;
     var last_wrap_end: ?usize = null;
     var last_wrap_next: usize = start;
+    var link: ?[]const u8 = if (linked) "" else null;
     while (index < text.len) {
         const byte = text[index];
         if (byte == 0x1b) {
             const sequence_end = display_width.ansiSequenceEnd(text, index);
             if (sequence_end <= index) return .{ .end = index, .next = index + 1 };
+            updateNoticeHyperlinkState(text[index..sequence_end], &link);
             index = sequence_end;
             continue;
         }
@@ -1921,7 +2052,7 @@ fn scanNoticeLine(text: []const u8, start: usize, max_width: usize) NoticeLine {
         }
         width += cell_width;
         index += unit.byte_len;
-        if (byte == '/' or byte == '\\') {
+        if ((byte == '/' or byte == '\\') and link == null) {
             last_wrap_end = index;
             last_wrap_next = index;
         }
@@ -1988,6 +2119,17 @@ pub fn renderSemanticNotice(
     styles: Styles,
     cols: u16,
 ) ![]u8 {
+    return renderSemanticNoticeForPresentation(alloc, notice, styles, cols, .compact);
+}
+
+/// Returns an owned semantic notice block for `presentation`, without surrounding blank rows.
+pub fn renderSemanticNoticeForPresentation(
+    alloc: Allocator,
+    notice: types.SemanticNotice,
+    styles: Styles,
+    cols: u16,
+    presentation: TranscriptPresentation,
+) ![]u8 {
     var logical: std.ArrayList(u8) = .empty;
     defer logical.deinit(alloc);
     try logical.appendSlice(alloc, types.noticeGlyph(notice.tone));
@@ -2001,14 +2143,17 @@ pub fn renderSemanticNotice(
     const body = std.mem.trimEnd(u8, notice.body, "\r\n");
     if (body.len > 0) {
         if (notice.topic.len > 0) try logical.append(alloc, ' ');
-        try logical.appendSlice(alloc, body);
+        try appendLinkedNoticeText(&logical, alloc, body, presentation);
     }
     // The detail starts on its own row; rows from here on render dim.
-    const detail = std.mem.trim(u8, notice.detail, "\r\n");
+    const detail = if (notice.detail_visibility == .compact_and_full or presentation == .full)
+        std.mem.trim(u8, notice.detail, "\r\n")
+    else
+        "";
     const detail_start = if (detail.len > 0) blk: {
         try logical.append(alloc, '\n');
         const start = logical.items.len;
-        try logical.appendSlice(alloc, detail);
+        try appendLinkedNoticeText(&logical, alloc, detail, presentation);
         break :blk start;
     } else logical.items.len;
 
@@ -2021,7 +2166,7 @@ pub fn renderSemanticNotice(
         if (row > 0) try out.append(alloc, '\n');
         const indent: usize = if (row > 0) noticeContinuationIndent(logical.items, cursor, cols) else 0;
         const available: usize = @max(@as(usize, cols) -| indent, 1);
-        const line = scanNoticeLine(logical.items, cursor, available);
+        const line = scanNoticeLine(logical.items, cursor, available, active_hyperlink != null);
         var row_styles = styles;
         if (cursor >= detail_start) row_styles.system_notice_text_style = styles.dim_style;
         try appendNoticeRow(
@@ -2104,7 +2249,7 @@ fn renderEntryToBlockForPresentationInterruptible(
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, compact);
         } else try normalizeRenderedBlockTail(alloc, kind, e.bytes),
         .semantic_notice => |e| blk: {
-            const rendered = try renderSemanticNotice(
+            const rendered = try renderSemanticNoticeForPresentation(
                 alloc,
                 .{
                     .topic = e.topic,
@@ -2112,9 +2257,11 @@ fn renderEntryToBlockForPresentationInterruptible(
                     .body = e.body,
                     .visibility = e.visibility,
                     .detail = e.detail,
+                    .detail_visibility = e.detail_visibility,
                 },
                 styles,
                 cols,
+                presentation,
             );
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, rendered);
         },
@@ -2429,6 +2576,7 @@ const RenderedEntries = struct {
     bytes: []u8,
     target_entry_start_line: ?usize,
     target_entry_start_byte: ?usize,
+    tail_start_byte: ?usize = null,
 };
 
 const BlockSequenceState = struct {
@@ -2451,6 +2599,14 @@ const BlockSequenceState = struct {
     fn attachedNewlineCountBefore(self: BlockSequenceState) u16 {
         if (!self.emitted_any) return 0;
         return 1 -| @intFromBool(self.previous_ends_with_newline);
+    }
+
+    /// The newlines that continue the previous block's text: the newlines its
+    /// text ended with, which the block drops, so the blank rows they make stay
+    /// as they will when the next text commits into the same block.
+    fn continuedTextNewlineCountBefore(self: BlockSequenceState) usize {
+        if (!self.emitted_any) return 0;
+        return @max(1, self.final_tail_newlines) -| @intFromBool(self.previous_ends_with_newline);
     }
 
     fn observe(
@@ -2482,6 +2638,8 @@ const RenderEntriesOptions = struct {
     summary_transcript_indices: []usize = &.{},
     line_provenance: ?*std.ArrayList(LineProvenance) = null,
     entry_overrides: []const EntryRenderOverride = &.{},
+    /// Rendered after the committed entries, and never captured in a prefix.
+    tail: []const TranscriptEntry = &.{},
     /// Continue after this prefix instead of rendering from the first entry.
     resume_from: ?*const PreparationResume = null,
     /// Save the renderer's state before the entry at this index (or after the
@@ -2573,6 +2731,7 @@ const RenderEntriesBuilder = struct {
     target_entry_start_byte: ?usize = null,
     record_marks: bool = false,
     marks: std.ArrayList(PreparationMark) = .empty,
+    tail_start_byte: ?usize = null,
 
     fn deinit(self: *RenderEntriesBuilder, alloc: Allocator) void {
         self.out.deinit(alloc);
@@ -2696,7 +2855,39 @@ const RenderEntriesBuilder = struct {
         checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !void {
         try self.appendSeparatorBefore(alloc, block.kind, options.line_provenance);
+        try self.appendBlockAfterSeparator(alloc, entry, block, options, block_provenance, checkpoint);
+    }
 
+    /// Starts an assistant text block where the previous block's text would
+    /// continue, after the blank rows that text ended with, as the text of one
+    /// turn continues in the same block.
+    fn appendContinuedBlock(
+        self: *RenderEntriesBuilder,
+        alloc: Allocator,
+        entry: TranscriptEntry,
+        block: RenderedBlock,
+        options: RenderEntriesOptions,
+        block_provenance: []const LineProvenance,
+        checkpoint: ?*build_checkpoint.BuildCheckpoint,
+    ) !void {
+        const newlines = self.sequence.continuedTextNewlineCountBefore();
+        try self.out.appendNTimes(alloc, '\n', newlines);
+        self.line_index += newlines;
+        if (options.line_provenance) |lines| {
+            try lines.appendNTimes(alloc, .block_separator, newlines -| 1);
+        }
+        try self.appendBlockAfterSeparator(alloc, entry, block, options, block_provenance, checkpoint);
+    }
+
+    fn appendBlockAfterSeparator(
+        self: *RenderEntriesBuilder,
+        alloc: Allocator,
+        entry: TranscriptEntry,
+        block: RenderedBlock,
+        options: RenderEntriesOptions,
+        block_provenance: []const LineProvenance,
+        checkpoint: ?*build_checkpoint.BuildCheckpoint,
+    ) !void {
         const entry_id = entry.id();
         if (self.record_marks) try self.marks.append(alloc, .{
             .entry_id = entry_id,
@@ -2740,6 +2931,7 @@ const RenderEntriesBuilder = struct {
             .bytes = try self.out.toOwnedSlice(alloc),
             .target_entry_start_line = self.target_entry_start_line,
             .target_entry_start_byte = self.target_entry_start_byte,
+            .tail_start_byte = self.tail_start_byte,
         };
     }
 };
@@ -2810,8 +3002,43 @@ fn renderEntriesInterruptible(
         try builder.appendBlock(alloc, entry, block, options, &.{}, checkpoint);
     }
     if (options.capture_at == entries.len) try builder.capture(alloc, options, entries.len);
+    try appendTailEntries(&builder, alloc, options.tail, cols, styles, options, checkpoint);
 
     return builder.finish(alloc);
+}
+
+/// Draws the provisional tail with the same per-entry renderer as committed
+/// entries. Its first rendered byte is the tail start, which the caller uses
+/// as a finality floor, so tail rows never enter native history.
+fn appendTailEntries(
+    builder: *RenderEntriesBuilder,
+    alloc: Allocator,
+    tail: []const TranscriptEntry,
+    cols: u16,
+    styles: Styles,
+    options: RenderEntriesOptions,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !void {
+    for (tail) |entry| {
+        try build_checkpoint.tick(checkpoint);
+        if (!isEntryVisibleInCompactPresentation(entry)) continue;
+        const block = try renderEntryToBlockForPresentationInterruptible(
+            alloc,
+            entry,
+            cols,
+            styles,
+            .compact,
+            checkpoint,
+        );
+        defer block.deinit(alloc);
+        if (!renderedBlockHasContent(block)) continue;
+        if (builder.tail_start_byte == null) builder.tail_start_byte = builder.out.items.len;
+        if (block.kind == .assistant_turn and builder.sequence.previous_kind == .assistant_turn) {
+            try builder.appendContinuedBlock(alloc, entry, block, options, &.{}, checkpoint);
+        } else {
+            try builder.appendBlock(alloc, entry, block, options, &.{}, checkpoint);
+        }
+    }
 }
 
 /// `renderEntriesToBytes` that continues after `resume_from` and saves the
@@ -2953,6 +3180,7 @@ pub const TranscriptPreparationBytes = struct {
     trailing_boundary_blank_rows: u16,
     target_entry_start_line: ?usize = null,
     target_entry_start_byte: ?usize = null,
+    tail_start_byte: ?usize = null,
     folded_summary_indices: []usize,
     line_provenance: []const LineProvenance = &.{},
 
@@ -2976,6 +3204,7 @@ pub const TranscriptPreparationOptions = struct {
     folded_summary_entry_ids: []const ?u32 = &.{},
     capture_provenance: bool = false,
     entry_overrides: []const EntryRenderOverride = &.{},
+    tail: []const TranscriptEntry = &.{},
     resume_from: ?*const PreparationResume = null,
     capture_at: ?usize = null,
     captured: ?*?PreparationResume = null,
@@ -3029,6 +3258,7 @@ pub fn renderEntriesForPreparationInterruptible(
             .summary_transcript_indices = summary_indices,
             .line_provenance = if (options.capture_provenance) &line_provenance else null,
             .entry_overrides = options.entry_overrides,
+            .tail = options.tail,
             .resume_from = options.resume_from,
             .capture_at = options.capture_at,
             .captured = options.captured,
@@ -3054,6 +3284,7 @@ pub fn renderEntriesForPreparationInterruptible(
             .trailing_boundary_blank_rows = boundary.blank_rows,
             .target_entry_start_line = rendered.target_entry_start_line,
             .target_entry_start_byte = rendered.target_entry_start_byte,
+            .tail_start_byte = rendered.tail_start_byte,
             .folded_summary_indices = summary_indices,
             .line_provenance = owned_provenance,
         };
@@ -3066,6 +3297,7 @@ pub fn renderEntriesForPreparationInterruptible(
         .trailing_boundary_blank_rows = boundary.blank_rows,
         .target_entry_start_line = rendered.target_entry_start_line,
         .target_entry_start_byte = rendered.target_entry_start_byte,
+        .tail_start_byte = rendered.tail_start_byte,
         .folded_summary_indices = summary_indices,
         .line_provenance = owned_provenance,
     };
@@ -3231,6 +3463,18 @@ pub fn compactTailVisibleBlockKindForProjection(
         entry_actions,
         .compact,
     );
+}
+
+/// The last visible block kind on screen: the provisional tail when it shows
+/// anything, otherwise the committed entries. The footer gap follows it.
+pub fn compactTailVisibleBlockKindWithTail(
+    entries: []const TranscriptEntry,
+    tail: []const TranscriptEntry,
+    omitted_entry_id: ?u32,
+    entry_actions: []const EntryRenderAction,
+) ?TranscriptBlockKind {
+    return tailVisibleBlockKindOmittingEntries(tail, null, &.{}, .compact) orelse
+        compactTailVisibleBlockKindForProjection(entries, omitted_entry_id, entry_actions);
 }
 
 fn tailVisibleBlockKindOmittingEntries(
@@ -3401,6 +3645,7 @@ fn appendSemanticNoticeTestEntry(
         .body = owned.body,
         .visibility = owned.visibility,
         .detail = owned.detail,
+        .detail_visibility = owned.detail_visibility,
     } });
 }
 
@@ -3424,7 +3669,7 @@ test "semantic notice renders every tone and resets before following content" {
     };
     const tones = [_]types.NoticeTone{ .information, .success, .warning, .@"error", .cancelled };
     const label_styles = [_][]const u8{ "\x1b[36m", "\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[90m" };
-    const glyphs = [_][]const u8{ "i", "✓", "!", "✗", "⊘" };
+    const glyphs = [_][]const u8{ "i", "✓", "⚠", "✗", "⊘" };
 
     for (tones, label_styles, glyphs) |tone, label_style, glyph| {
         const rendered = try renderSemanticNotice(alloc, .{
@@ -3478,7 +3723,7 @@ test "semantic notice glyph grid regression locks tone markers and lowercase top
         .{ .tone = .neutral, .topic = "session", .body = "renamed to \"custom models\"", .row_text = "* session: renamed to \"custom models\"", .label_fg = 7 },
         .{ .tone = .information, .topic = "background", .body = "command #7 started", .row_text = "i background: command #7 started", .label_fg = 6 },
         .{ .tone = .success, .topic = "upgrade", .body = "fx has been updated to v9.9.9", .row_text = "✓ upgrade: fx has been updated to v9.9.9", .label_fg = 2 },
-        .{ .tone = .warning, .topic = "skills", .body = "1 discovery issue", .row_text = "! skills: 1 discovery issue", .label_fg = 3 },
+        .{ .tone = .warning, .topic = "skills", .body = "1 discovery issue", .row_text = "⚠ skills: 1 discovery issue", .label_fg = 3 },
         .{ .tone = .@"error", .topic = "session", .body = "usage: /rename <title>", .row_text = "✗ session: usage: /rename <title>", .label_fg = 1 },
         .{ .tone = .cancelled, .topic = "system", .body = "cancelled", .row_text = "⊘ system: cancelled", .label_fg = 8 },
     };
@@ -3544,6 +3789,39 @@ test "semantic notice detail renders dim on its own indented rows" {
     defer alloc.free(plain);
     try std.testing.expect(std.mem.find(u8, plain, "<D>") == null);
     try std.testing.expect(std.mem.find(u8, plain, "\n") == null);
+}
+
+test "a full-only notice detail shows only in the full transcript" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendSemanticNoticeTestEntry(&entries, alloc, 1, .{
+        .topic = "",
+        .tone = .warning,
+        .body = "Gemini request failed.",
+        .detail = "HTTP 400",
+        .detail_visibility = .full_only,
+    });
+    const entry = entries.items[0];
+
+    const compact = try renderEntryToBlockForPresentation(alloc, entry, 80, .{}, .compact);
+    defer compact.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "HTTP 400") == null);
+
+    const full = try renderEntryToBlockForPresentation(alloc, entry, 80, .{}, .full);
+    defer full.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, full.bytes, "HTTP 400") != null);
+}
+
+test "a warning notice leads with the status line's warning sign" {
+    const alloc = std.testing.allocator;
+    const rendered = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .warning,
+        .body = "x",
+    }, .{}, 80);
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.startsWith(u8, rendered, "⚠ "));
 }
 
 test "semantic notice topics never render the tool-activity bullet or forced capitalization" {
@@ -3617,6 +3895,248 @@ test "semantic notice keeps an OSC 8 target hidden, clickable, and underlined" {
     // Each row a link wraps onto is underlined too, and nothing after it.
     try expectUnderlinedExactlyWhereLinked(&narrow_grid);
     try std.testing.expect(!narrow_grid.current_style.flags.underline);
+}
+
+const bare_notice_url = "https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway%2Fbudgets%3Fdimension%3Duser&title=AI+Gateway+Budgets+%26+Spend";
+const bare_notice_body = "To keep sending requests, raise the budget in AI Gateway Budgets & Spend (" ++ bare_notice_url ++ ").";
+
+fn noticeGridText(alloc: Allocator, grid: *const vt_emulator.Grid) ![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(alloc);
+    for (1..grid.rows + 1) |row_index| {
+        var row: std.ArrayList(u8) = .empty;
+        defer row.deinit(alloc);
+        try grid.rowTextTrimmed(@intCast(row_index), &row);
+        try text.appendSlice(alloc, row.items);
+        try text.append(alloc, '\n');
+    }
+    return text.toOwnedSlice(alloc);
+}
+
+/// Expects the linked cells to read `text`, with every linked cell pointing at `url`.
+fn expectLinkedText(alloc: Allocator, grid: *const vt_emulator.Grid, text: []const u8, url: []const u8) !void {
+    var linked: std.ArrayList(u8) = .empty;
+    defer linked.deinit(alloc);
+    for (1..grid.rows + 1) |row_index| {
+        for (1..grid.cols + 1) |col_index| {
+            const cell = grid.cellAt(@intCast(row_index), @intCast(col_index)).?;
+            if (cell.style.hyperlink_id == 0) continue;
+            try std.testing.expectEqualStrings(url, grid.hyperlinkUrl(cell.style.hyperlink_id).?);
+            try linked.append(alloc, @intCast(cell.codepoint));
+        }
+    }
+    try std.testing.expectEqualStrings(text, linked.items);
+}
+
+fn gridFirstRowText(alloc: Allocator, grid: *const vt_emulator.Grid) ![]u8 {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    try grid.rowTextTrimmed(1, &row);
+    return row.toOwnedSlice(alloc);
+}
+
+test "a notice links a bare URL under its host and never breaks it" {
+    const alloc = std.testing.allocator;
+    for ([_]u16{ 60, 80, 120 }) |cols| {
+        const rendered = try renderSemanticNotice(alloc, .{
+            .topic = "",
+            .tone = .warning,
+            .body = bare_notice_body,
+        }, .{}, cols);
+        defer alloc.free(rendered);
+
+        var grid = try vt_emulator.Grid.init(alloc, cols, 8);
+        defer grid.deinit();
+        try grid.feed(rendered);
+        const text = try noticeGridText(alloc, &grid);
+        defer alloc.free(text);
+        try std.testing.expect(std.mem.find(u8, text, "(vercel.com).") != null);
+        try std.testing.expect(std.mem.find(u8, text, "https://") == null);
+        try expectLinkedText(alloc, &grid, "vercel.com", bare_notice_url);
+        try expectUnderlinedExactlyWhereLinked(&grid);
+    }
+}
+
+test "the full transcript shows a notice link's whole URL" {
+    const alloc = std.testing.allocator;
+    const wide = try renderSemanticNoticeForPresentation(alloc, .{
+        .topic = "",
+        .tone = .warning,
+        .body = bare_notice_body,
+    }, .{}, 200, .full);
+    defer alloc.free(wide);
+    var wide_grid = try vt_emulator.Grid.init(alloc, 200, 4);
+    defer wide_grid.deinit();
+    try wide_grid.feed(wide);
+    const wide_text = try noticeGridText(alloc, &wide_grid);
+    defer alloc.free(wide_text);
+    try std.testing.expect(std.mem.find(u8, wide_text, bare_notice_url) != null);
+
+    const narrow = try renderSemanticNoticeForPresentation(alloc, .{
+        .topic = "",
+        .tone = .warning,
+        .body = bare_notice_body,
+    }, .{}, 60, .full);
+    defer alloc.free(narrow);
+    var narrow_grid = try vt_emulator.Grid.init(alloc, 60, 12);
+    defer narrow_grid.deinit();
+    try narrow_grid.feed(narrow);
+    const narrow_text = try noticeGridText(alloc, &narrow_grid);
+    defer alloc.free(narrow_text);
+    var found_url_row = false;
+    var lines = std.mem.splitScalar(u8, narrow_text, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(!std.mem.endsWith(u8, line, "vercel.com/"));
+        if (std.mem.find(u8, line, "https://") == null) continue;
+        found_url_row = true;
+        try std.testing.expect(std.mem.startsWith(u8, line, "  (https://vercel.com/d?to="));
+    }
+    try std.testing.expect(found_url_row);
+}
+
+test "a labeled notice link shows its URL only in the full transcript" {
+    const alloc = std.testing.allocator;
+    const body = "\x1b]8;;https://fx.sh/token-pass\x1b\\Subscribe to Token Pass\x1b]8;;\x1b\\";
+
+    const compact = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .warning,
+        .body = body,
+    }, .{}, 120);
+    defer alloc.free(compact);
+    var compact_grid = try vt_emulator.Grid.init(alloc, 120, 2);
+    defer compact_grid.deinit();
+    try compact_grid.feed(compact);
+    const compact_row = try gridFirstRowText(alloc, &compact_grid);
+    defer alloc.free(compact_row);
+    try std.testing.expectEqualStrings("⚠ Subscribe to Token Pass", compact_row);
+    try expectLinkedText(alloc, &compact_grid, "Subscribe to Token Pass", "https://fx.sh/token-pass");
+
+    const full = try renderSemanticNoticeForPresentation(alloc, .{
+        .topic = "",
+        .tone = .warning,
+        .body = body,
+    }, .{}, 120, .full);
+    defer alloc.free(full);
+    var full_grid = try vt_emulator.Grid.init(alloc, 120, 2);
+    defer full_grid.deinit();
+    try full_grid.feed(full);
+    const full_row = try gridFirstRowText(alloc, &full_grid);
+    defer alloc.free(full_row);
+    try std.testing.expectEqualStrings("⚠ Subscribe to Token Pass (https://fx.sh/token-pass)", full_row);
+}
+
+test "a notice keeps a short bare URL whole and still links it" {
+    const alloc = std.testing.allocator;
+    const url = "https://fx.sh/feedback";
+    const rendered = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .warning,
+        .body = "Could not open " ++ url ++ ". Open it manually.",
+    }, .{}, 80);
+    defer alloc.free(rendered);
+    var grid = try vt_emulator.Grid.init(alloc, 80, 2);
+    defer grid.deinit();
+    try grid.feed(rendered);
+    const row = try gridFirstRowText(alloc, &grid);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("⚠ Could not open https://fx.sh/feedback. Open it manually.", row);
+    try expectLinkedText(alloc, &grid, url, url);
+    try expectUnderlinedExactlyWhereLinked(&grid);
+}
+
+test "a notice link shows the real host after userinfo" {
+    const alloc = std.testing.allocator;
+    const url = "https://vercel.com@evil.example/login/session";
+    try std.testing.expect(url.len > max_full_url_cells);
+    const rendered = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .warning,
+        .body = "Open " ++ url ++ " now",
+    }, .{}, 80);
+    defer alloc.free(rendered);
+    var grid = try vt_emulator.Grid.init(alloc, 80, 2);
+    defer grid.deinit();
+    try grid.feed(rendered);
+    const row = try gridFirstRowText(alloc, &grid);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("⚠ Open evil.example now", row);
+    try expectLinkedText(alloc, &grid, "evil.example", url);
+}
+
+test "a notice URL that cannot be a link stays plain text" {
+    const alloc = std.testing.allocator;
+    const rendered = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .warning,
+        .body = "See https://h.example/caf\xc3\xa9 now",
+    }, .{}, 80);
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.find(u8, rendered, "\x1b]8;") == null);
+
+    var grid = try vt_emulator.Grid.init(alloc, 80, 2);
+    defer grid.deinit();
+    try grid.feed(rendered);
+    const row = try gridFirstRowText(alloc, &grid);
+    defer alloc.free(row);
+    try std.testing.expect(std.mem.find(u8, row, "https://h.example/café") != null);
+}
+
+test "a notice does not link a URL inside an fx link again" {
+    const alloc = std.testing.allocator;
+    const rendered = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .warning,
+        .body = "\x1b]8;;https://fx.sh/a\x1b\\https://fx.sh/a\x1b]8;;\x1b\\",
+    }, .{}, 80);
+    defer alloc.free(rendered);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "\x1b]8;;https://fx.sh/a"));
+}
+
+test "a notice link stops before escaped outside bytes" {
+    const alloc = std.testing.allocator;
+    const rendered = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .neutral,
+        .body = "Open https://evil.example\\x07fake now",
+    }, .{}, 100);
+    defer alloc.free(rendered);
+
+    var grid = try vt_emulator.Grid.init(alloc, 100, 2);
+    defer grid.deinit();
+    try grid.feed(rendered);
+    const row = try gridFirstRowText(alloc, &grid);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("* Open https://evil.example\\x07fake now", row);
+    try std.testing.expectEqual(@as(u21, 'h'), grid.cellAt(1, 8).?.codepoint);
+    try std.testing.expectEqualStrings("https://evil.example", grid.hyperlinkUrl(grid.cellAt(1, 8).?.style.hyperlink_id).?);
+    try std.testing.expectEqual(@as(u21, 'f'), grid.cellAt(1, 32).?.codepoint);
+    try std.testing.expectEqual(@as(u32, 0), grid.cellAt(1, 32).?.style.hyperlink_id);
+    try expectLinkedText(alloc, &grid, "https://evil.example", "https://evil.example");
+    try expectUnderlinedExactlyWhereLinked(&grid);
+}
+
+test "noticeLinksAsText writes a link as its label and URL" {
+    const alloc = std.testing.allocator;
+    const labeled = try noticeLinksAsText(alloc, "Pay \x1b]8;;https://a.example/pay\x1b\\here\x1b]8;;\x1b\\ now");
+    defer alloc.free(labeled);
+    try std.testing.expectEqualStrings("Pay here (https://a.example/pay) now", labeled);
+
+    const same = try noticeLinksAsText(alloc, "\x1b]8;;https://a.example/x\x1b\\https://a.example/x\x1b]8;;\x1b\\");
+    defer alloc.free(same);
+    try std.testing.expectEqualStrings("https://a.example/x", same);
+
+    const plain = try noticeLinksAsText(alloc, "No link here.");
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("No link here.", plain);
+}
+
+test "urlHost keeps only the host and port of a notice URL" {
+    try std.testing.expectEqualStrings("a.example", urlHost("https://a.example/x"));
+    try std.testing.expectEqualStrings("a.example:8080", urlHost("http://a.example:8080?q"));
+    try std.testing.expectEqualStrings("b.example", urlHost("https://u:p@b.example#f"));
+    try std.testing.expectEqualStrings("https://", urlHost("https://"));
+    try std.testing.expectEqualStrings("c.example", urlHost("https://c.example"));
 }
 
 fn expectUnderlinedExactlyWhereLinked(grid: *vt_emulator.Grid) !void {
@@ -4485,8 +5005,8 @@ test "compact presentation hides context notices while full presentation retains
     defer first_full.deinit(alloc);
     const second_full = try renderEntryToBlockForPresentation(alloc, entries.items[2], 80, .{}, .full);
     defer second_full.deinit(alloc);
-    try std.testing.expectEqualStrings("! context: first warning", first_full.bytes);
-    try std.testing.expectEqualStrings("! context: second warning", second_full.bytes);
+    try std.testing.expectEqualStrings("⚠ context: first warning", first_full.bytes);
+    try std.testing.expectEqualStrings("⚠ context: second warning", second_full.bytes);
     try std.testing.expectEqual(TranscriptEntryClass.context_notice, entryClassForEntry(entries.items[0]));
 }
 

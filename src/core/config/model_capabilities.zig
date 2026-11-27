@@ -7,6 +7,10 @@ const image_route = @import("../images/image_route.zig");
 /// `ChatMessage.cache_breakpoint`.
 pub const CacheMarkers = enum { none, anthropic, openai, bedrock };
 
+/// The provider whose own on-demand compaction writes a model's compaction
+/// block (`vercel_model_policy.providerCompaction`).
+pub const ProviderCompaction = enum { anthropic, openai };
+
 pub const ResolvedProviderOptions = struct {
     reasoning: ?types.ReasoningEffort = null,
     fast: bool = false,
@@ -24,6 +28,10 @@ pub const ResolvedProviderOptions = struct {
     /// The model takes one system message, at the start of the conversation,
     /// so the Gateway request joins the leading system messages into one.
     single_system_message: bool = false,
+    /// Asks the provider's own on-demand compaction for this request: its
+    /// reply is the provider's compaction block over the conversation sent,
+    /// not an answer. Only a compaction request sets it.
+    compaction: ?ProviderCompaction = null,
     /// Borrowed gateway provider slugs in preference order. Empty leaves
     /// provider selection to the gateway. The backing memory must outlive
     /// request-body serialization.
@@ -172,6 +180,40 @@ test "empty length retry limit stays inside a known context window" {
     try std.testing.expectEqual(@as(?u32, 32_768), emptyLengthRetryOutputTokens(.{ .context_window = 1_000_000 }));
     try std.testing.expectEqual(@as(?u32, 8_192), emptyLengthRetryOutputTokens(.{ .context_window = 65_536 }));
     try std.testing.expectEqual(@as(?u32, null), emptyLengthRetryOutputTokens(.{ .context_window = 7 }));
+}
+
+// The raised limit after a reply was cut while calling tools, when fx chose
+// the first limit itself. Twice the full-window bound, so a reply that needed
+// a little more room fits, and well inside every provider limit fx has seen.
+const cut_reply_output_tokens: u32 = 65_536;
+
+/// The output limit for the rest of a turn after a reply was cut off while
+/// calling tools, or null to keep the limit the request had. Only a limit fx
+/// chose itself goes up: no limit, when the provider's own default ran out,
+/// or its bound on a catalog limit that fills the whole context window. A
+/// catalog limit below the window is the model's own and stays.
+pub fn cutReplyOutputTokens(capabilities: Capabilities) ?u32 {
+    const advertised = capabilities.max_output_tokens orelse return emptyLengthRetryOutputTokens(capabilities);
+    const window = capabilities.context_window orelse return null;
+    if (advertised < window) return null;
+    const bound = @min(full_window_output_tokens, window / full_window_output_divisor);
+    const raised = @min(@min(cut_reply_output_tokens, window / full_window_output_divisor), advertised);
+    return if (raised > bound) raised else null;
+}
+
+test "a cut reply raises only a limit fx chose itself" {
+    const cases = [_]struct { capabilities: Capabilities, expected: ?u32 }{
+        .{ .capabilities = .{}, .expected = 32_768 },
+        .{ .capabilities = .{ .context_window = 1_000_000 }, .expected = 32_768 },
+        .{ .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 1_000_000 }, .expected = 65_536 },
+        .{ .capabilities = .{ .context_window = 400_000, .max_output_tokens = 400_000 }, .expected = 50_000 },
+        .{ .capabilities = .{ .context_window = 131_072, .max_output_tokens = 131_072 }, .expected = null },
+        .{ .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 64_000 }, .expected = null },
+        .{ .capabilities = .{ .max_output_tokens = 8_192 }, .expected = null },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, cutReplyOutputTokens(case.capabilities));
+    }
 }
 
 /// The effort for the one resend of a reply that spent its whole output limit

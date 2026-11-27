@@ -297,6 +297,8 @@ fn writeLines(w: *std.Io.Writer, fx_version: []const u8, git_commit: []const u8,
     try writeJsonStr(fx_version, w);
     try w.writeAll(",\"git_commit\":");
     try writeJsonStr(git_commit, w);
+    try w.writeAll(",\"update_channel\":");
+    try writeJsonStr(build_options.update_channel, w);
     if (utc) |text| try writeTime(w, "written_at", text, now_ms);
     try w.writeAll(",\"notice\":");
     try writeJsonStr(trace_report.notice_text, w);
@@ -347,6 +349,7 @@ test "crash panic record is two JSON lines the reader takes" {
     try std.testing.expectEqual(@as(i64, 1), header.get("format_version").?.integer);
     try std.testing.expectEqualStrings("0.0.17", header.get("fx_version").?.string);
     try std.testing.expectEqualStrings("abc1234", header.get("git_commit").?.string);
+    try std.testing.expectEqualStrings(build_options.update_channel, header.get("update_channel").?.string);
     try std.testing.expectEqualStrings("2023-11-14T22:13:20.123Z", header.get("written_at").?.string);
     try std.testing.expectEqual(@as(i64, 1_700_000_000_123), header.get("written_at_ms").?.integer);
     try std.testing.expectEqualStrings(trace_report.notice_text, header.get("notice").?.string);
@@ -517,7 +520,7 @@ test "crash panic segfault message names the program counter when the handler ha
     var buf: [segfault_msg_bytes]u8 = undefined;
     const message = segfaultMessage(&buf, 0x1234, "Segmentation fault", &ctx);
     var expected_buf: [segfault_msg_bytes]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
         "Segmentation fault at address 0x1234 (pc 0x0, handleSegfault-0x{x})",
         .{@intFromPtr(&handleSegfault)},
@@ -546,7 +549,7 @@ test "crash panic segfault message fits the longest name and two full addresses"
     var buf: [segfault_msg_bytes]u8 = undefined;
     const message = try formatSegfault(&buf, std.math.maxInt(usize), "General protection exception", std.math.maxInt(usize));
     try std.testing.expect(std.mem.startsWith(u8, message, "General protection exception at address 0xffffffffffffffff"));
-    try std.testing.expect(std.mem.indexOf(u8, message, "(pc 0xffffffffffffffff, handleSegfault+0x") != null);
+    try std.testing.expect(std.mem.find(u8, message, "(pc 0xffffffffffffffff, handleSegfault+0x") != null);
 }
 
 test "crash panic saves the record when a FIFO sits at the temporary path" {

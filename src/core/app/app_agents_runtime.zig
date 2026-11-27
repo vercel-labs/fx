@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const agents = @import("../agents/agents.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
+const wait_card = @import("../agent/wait_card.zig");
 const composer_stash = @import("../input/composer_stash.zig");
 const input_action = @import("../input/input_action.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
@@ -29,6 +30,7 @@ const subagent_execution = @import("../subagent/execution.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_reports = @import("../subagent/reports.zig");
+const subagent_delivery_test_controls = @import("../subagent/delivery_test_controls.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
@@ -107,6 +109,10 @@ pub const ChildAgent = struct {
     /// Main loop only.
     approval_asked: u64 = 0,
     question_asked: u64 = 0,
+    /// Where the wait only the person can continue comes in that same order
+    /// (`App.prompt_order`), stamped once when the wait begins, so a view's
+    /// copy of it can tell the wait it holds from a newer one. Main loop only.
+    wait_asked: u64 = 0,
     /// How its last turn ended, which its row and its footer name once none
     /// is going (`LastEnd`). Main loop only.
     last_end: LastEnd = .done,
@@ -140,7 +146,7 @@ pub const ChildAgent = struct {
     /// pace out in `pacer`, the pacer that holds its text: its own slot's
     /// while it is hidden, the app's while it is on screen (`pacerOf`).
     fn hasUnapplied(self: *ChildAgent, pacer: *AssistantPacer) bool {
-        return self.agent.worker.hasPendingEvents() or pacer.hasPending();
+        return self.agent.worker.hasPendingEvents() or pacer.hasPending() or pacer.hasTail();
     }
 };
 
@@ -241,7 +247,7 @@ pub const AgentsMenu = struct {
     rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
     /// Backs the instance names in `rows`, such as "fx 12". Owned.
     names: std.ArrayList(u8) = .empty,
-    /// Backs each subagent row's state with its current call's time, such
+    /// Backs each subagent row's state with the time its turn has run, such
     /// as "working 12s". Owned.
     activities: std.ArrayList(u8) = .empty,
 
@@ -266,8 +272,8 @@ pub const AgentsMenu = struct {
 
 /// Room for an instance's name in the agent list, such as "fx 12".
 const instance_name_bytes = 24;
-/// Room for a subagent row's state with its call's time, such as
-/// "working 59m59s".
+/// Room for a subagent row's state with the time its turn has run, such
+/// as "working 59m59s".
 const activity_bytes = 32;
 
 /// What an instance is doing, as the instance list shows it, most urgent
@@ -277,6 +283,10 @@ const InstanceState = enum {
     has_question,
     /// A request only the user can continue, such as one out of credits.
     needs_you,
+    /// A wait the view on screen shows in its card, so the person acts on it
+    /// there. It still needs the person, so it sorts with the waiting rows,
+    /// and `busyAs` keeps `busiest` and herdr quiet for it.
+    waiting,
     working,
     finished,
     idle,
@@ -291,6 +301,7 @@ const InstanceState = enum {
             .needs_approval => "needs approval",
             .has_question => "has a question",
             .needs_you => "needs you",
+            .waiting => "waiting",
             .working => "working",
             .finished => "finished",
             .idle => "idle",
@@ -299,9 +310,12 @@ const InstanceState = enum {
         };
     }
 
+    /// Where the row sorts: a wait the view shows still needs the person, so
+    /// it sorts first with the other rows that do, even though the footer
+    /// and herdr stay quiet for it (`busyAs`).
     fn urgency(self: InstanceState) Urgency {
         return switch (self) {
-            .needs_approval, .has_question, .needs_you => .attention,
+            .needs_approval, .has_question, .needs_you, .waiting => .attention,
             .working => .working,
             .finished, .idle, .failed, .stopped => .idle,
         };
@@ -311,7 +325,7 @@ const InstanceState = enum {
     fn tone(self: InstanceState) render_input.AgentStateTone {
         return switch (self) {
             .needs_approval, .has_question, .needs_you => .needs_user,
-            .working, .finished => .active,
+            .waiting, .working, .finished => .active,
             .idle, .failed, .stopped => .idle,
         };
     }
@@ -334,8 +348,9 @@ const Urgency = enum(u2) {
 /// first. A finished turn counts as idle.
 pub const Busiest = enum { needs_approval, has_question, needs_you, working, idle };
 
-/// An agent that restarting fx, as an upgrade does, would stop, and what it
-/// is doing (`Runtime.busyAgentElsewhere`). `doing` is never `.idle`.
+/// An agent that restarting fx, as an upgrade does, would stop while it
+/// waits for the user, and what it waits for (`Runtime.needsUserElsewhere`).
+/// `doing` is never `.working` or `.idle`.
 pub const BusyAgent = struct { name: []const u8, doing: Busiest };
 
 /// One subagent as `/trace` shows it (`Runtime.traceRows`): what the agent
@@ -367,9 +382,19 @@ fn busyAs(state: InstanceState) ?Busiest {
         .needs_approval => .needs_approval,
         .has_question => .has_question,
         .needs_you => .needs_you,
+        // The person is acting on it in the view they are on, so a pane that
+        // stands for the whole process is not blocked by it.
+        .waiting => .working,
         .working => .working,
         .finished, .idle, .failed, .stopped => null,
     };
+}
+
+/// What `state` waits for the user for, or null when it does not: what
+/// `busyAs` says, without its working case.
+fn waitsForUserAs(state: InstanceState) ?Busiest {
+    const busy = busyAs(state) orelse return null;
+    return if (busy == .working) null else busy;
 }
 
 /// The more urgent of `a` and `b`; `InstanceState` lists the most urgent
@@ -516,6 +541,36 @@ test "a subagent's footer name says how its last turn ended once no turn is goin
     try std.testing.expectEqualStrings("writer-id", child.footerLabel());
 }
 
+test "wait card: the note reason names the kind and never the item" {
+    // Only the sources main cannot answer are noted; a plain agent question is
+    // not, because it is the subagent's own business (rule R3.8).
+    try std.testing.expect(questionNoteReason(.agent_question, false) == null);
+    try std.testing.expectEqualStrings("Out of credits", questionNoteReason(.route_recovery, false).?);
+    try std.testing.expectEqualStrings("an MCP server asks for input", questionNoteReason(.mcp_elicitation, false).?);
+    try std.testing.expectEqualStrings("an MCP server asks to sign in", questionNoteReason(.mcp_elicitation, true).?);
+    // Each reason is a fixed sentence: no URL, field name or value can ride it.
+    for ([_]worker_runtime.QuestionPromptSource{ .route_recovery, .mcp_elicitation }) |source| {
+        for ([_]bool{ false, true }) |sign_in| {
+            const reason = questionNoteReason(source, sign_in) orelse continue;
+            for ([_][]const u8{ "http", "://", "=", "?" }) |carried| {
+                try std.testing.expect(std.mem.find(u8, reason, carried) == null);
+            }
+        }
+    }
+}
+
+test "wait card: a shown wait sorts first and leaves the busy state alone" {
+    // The row of a wait the view shows still needs the person, so it sorts in
+    // the attention group.
+    try std.testing.expectEqual(Urgency.attention, InstanceState.waiting.urgency());
+    try std.testing.expectEqual(InstanceState.needs_you, moreUrgent(.needs_you, .waiting));
+    try std.testing.expectEqual(InstanceState.waiting, moreUrgent(.waiting, .working));
+    try std.testing.expectEqualStrings("waiting", InstanceState.waiting.label());
+    // But the person is acting on it in the view they are on, so a pane that
+    // stands for the whole process is not blocked by it.
+    try std.testing.expectEqual(Busiest.working, busyAs(.waiting).?);
+}
+
 /// Slot threads and the main loop both use the hand-off list.
 const handoff_alloc = std.heap.c_allocator;
 
@@ -562,8 +617,11 @@ pub const ReportPost = struct {
     idle: bool = false,
     /// A message's lines the user typed in the turn that sent it.
     typed_lines: [][]u8 = &.{},
+    /// Who started the turn that sent a message, read while that turn ran
+    /// (`messageStartedBy`).
+    started_by: ?subagent_reports.StartedBy = null,
 
-    fn create(host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) !*ReportPost {
+    fn create(host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery, started_by: ?subagent_reports.StartedBy) !*ReportPost {
         const post = try handoff_alloc.create(ReportPost);
         errdefer handoff_alloc.destroy(post);
         const agent, const child_id, const work_id, const text = switch (delivery) {
@@ -588,6 +646,7 @@ pub const ReportPost = struct {
             .dropped = if (delivery == .report) delivery.report.dropped else 0,
             .end = if (delivery == .report) delivery.report.end else .{},
             .idle = delivery == .report and delivery.report.idle,
+            .started_by = if (delivery == .message) started_by else null,
         };
         if (delivery == .message) {
             // The others are freed by their own errdefers above.
@@ -619,12 +678,12 @@ pub const ReportPost = struct {
     }
 };
 
-test "a message's hand-off keeps its own copy of what the user typed" {
+test "a message's hand-off keeps its own copy of what the user typed, and who started its turn" {
     var host: subagent_tool_host.Runtime = undefined;
     var first = "tell main hi".*;
     var second = "and bye".*;
     const lines = [_][]const u8{ &first, &second };
-    const post = try ReportPost.create(&host, .{ .message = .{ .to = .owner, .agent = "reviewer", .child_id = "c1", .text = "hi", .user_typed = &lines } });
+    const post = try ReportPost.create(&host, .{ .message = .{ .to = .owner, .agent = "reviewer", .child_id = "c1", .text = "hi", .user_typed = &lines } }, .user);
     defer post.destroy();
     // The sender's buffers change once the post is made.
     @memset(&first, 'x');
@@ -632,27 +691,32 @@ test "a message's hand-off keeps its own copy of what the user typed" {
     try std.testing.expectEqual(@as(usize, 2), post.typed_lines.len);
     try std.testing.expectEqualStrings("tell main hi", post.typed_lines[0]);
     try std.testing.expectEqualStrings("and bye", post.typed_lines[1]);
+    try std.testing.expectEqual(@as(?subagent_reports.StartedBy, .user), post.started_by);
 }
 
 test "a report's hand-off keeps the count a user's stop dropped, and who started and stopped its work" {
     // Only the host's address is kept, so any will do.
     var host: subagent_tool_host.Runtime = undefined;
     const end: subagent_child_state.EndFacts = .{ .started_by = .user, .cause = .user_stop };
-    const post = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .cancelled, .output = "", .dropped = 2, .end = end } });
+    const post = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .cancelled, .output = "", .dropped = 2, .end = end } }, .user);
     defer post.destroy();
     try std.testing.expectEqual(@as(usize, 2), post.dropped);
     try std.testing.expectEqual(subagent_child_state.Outcome.cancelled, post.outcome);
     try std.testing.expectEqual(end, post.end);
     try std.testing.expect(!post.idle);
-    const idle = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w2", .outcome = .completed, .output = "done", .idle = true } });
+    // Only a message carries who started its turn; a report has `end` for that.
+    try std.testing.expect(post.started_by == null);
+    const idle = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w2", .outcome = .completed, .output = "done", .idle = true } }, null);
     defer idle.destroy();
     try std.testing.expect(idle.idle);
 }
 
 /// Queues a host's delivery for the main loop, without waiting.
-/// `AgentGone` once the app is shutting down; a report then stays owed.
-pub fn postDelivery(handoffs: *Handoffs, host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) subagent_tool_host.PostReportError!void {
-    const post = try ReportPost.create(host, delivery);
+/// `started_by` is who started the turn that sends a message, from
+/// `messageStartedBy`; a report ignores it. `AgentGone` once the app is
+/// shutting down; a report then stays owed.
+pub fn postDelivery(handoffs: *Handoffs, host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery, started_by: ?subagent_reports.StartedBy) subagent_tool_host.PostReportError!void {
+    const post = try ReportPost.create(host, delivery, started_by);
     handoffs.mutex.lockUncancelable(io_mod.getIo());
     defer handoffs.mutex.unlock(io_mod.getIo());
     if (handoffs.closed) {
@@ -958,6 +1022,17 @@ fn matchesSearchText(name: []const u8, title: []const u8, purpose: []const u8, s
         ascii_case.containsIgnoreCase(purpose, search);
 }
 
+/// The fixed reason a subagent's question prompt gives its parent, or null for
+/// a plain agent question, which main must not hear of. The reason names the
+/// kind only: never the question, a field value or a URL (`R4.8`).
+pub fn questionNoteReason(source: worker_runtime.QuestionPromptSource, sign_in: bool) ?[]const u8 {
+    return switch (source) {
+        .agent_question => null,
+        .route_recovery => "Out of credits",
+        .mcp_elicitation => if (sign_in) "an MCP server asks to sign in" else "an MCP server asks for input",
+    };
+}
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
@@ -1018,7 +1093,7 @@ pub fn Runtime(comptime App: type) type {
             var deferred: usize = 0;
             if (app.agent_on_screen != null and
                 (app.main_agent.worker.hasPendingEvents() or app.main_screen.pacer.hasPending() or
-                    approvalOutOfDate(&app.main_agent, false)))
+                    app.main_screen.pacer.hasTail() or approvalOutOfDate(&app.main_agent, false)))
             {
                 if (handoff_pending) deferred += 1 else try visitScreen(app, &app.main_agent, &app.main_screen, context, body);
             }
@@ -1173,7 +1248,7 @@ pub fn Runtime(comptime App: type) type {
             return if (on_screen.agent.role == .instance) &on_screen.agent else null;
         }
 
-        pub const PromptKind = enum { approval, question };
+        pub const PromptKind = enum { approval, question, wait };
 
         /// Notes that subagent `agent`'s approval or question just showed,
         /// so its tree's prompts reach the instance's screen in the order
@@ -1186,34 +1261,43 @@ pub fn Runtime(comptime App: type) type {
             switch (kind) {
                 .approval => child.approval_asked = app.prompt_order,
                 .question => child.question_asked = app.prompt_order,
+                .wait => child.wait_asked = app.prompt_order,
             }
         }
 
-        /// While an instance is on screen with no approval or question
-        /// showing, the oldest one waiting in its tree, approval or
-        /// question, is lent to the instance's prompt, so it shows on the
-        /// instance's screen too. One is lent at a time, so the next shows
-        /// once that one is answered or goes back. A rule a subagent's
-        /// `/permissions remember` would save is its own, so it isn't lent.
+        /// While an instance is on screen with nothing of its own showing,
+        /// the oldest item waiting in its tree, an approval, a question or a
+        /// wait only the person can continue, is lent to that view, so it
+        /// shows on the instance's screen too. One is lent at a time, so the
+        /// next shows once that one is answered or goes back
+        /// (`tests/tla/subagent/ViewWaits.tla` OldestFirst, OneAtATime). A
+        /// rule a subagent's `/permissions remember` would save is its own,
+        /// so it isn't lent, and nothing is lent behind the alternate screen.
         pub fn lendPrompt(app: *App) void {
-            if (app.approval_lender != null or app.question_lender != null) return;
+            if (app.approval_lender != null or app.question_lender != null or app.wait_card_lender != null) return;
+            if (alternateScreenOwned(app)) return;
             const borrower = instanceOnScreen(app) orelse return;
-            if (borrower.approval_prompt.isActive() or borrower.question_prompt.isActive()) return;
+            if (viewPickerHoldsItem(app)) return;
+            if (borrower.approval_prompt.isActive() or borrower.question_prompt.isActive() or borrower.wait_card_prompt.isActive()) return;
             var oldest: ?struct { child: *ChildAgent, kind: PromptKind, asked: u64 } = null;
             for (app.child_agents.items) |child| {
                 if (!lendsTo(app, child, borrower)) continue;
                 const approval = &child.agent.approval_prompt;
-                if (approval.isActive() and approval.rule_management == null) {
+                if (approval.isActive() and approval.rule_management == null and !parentRoutedApproval(child)) {
                     if (oldest == null or child.approval_asked < oldest.?.asked) oldest = .{ .child = child, .kind = .approval, .asked = child.approval_asked };
                 }
                 if (child.agent.question_prompt.isActive()) {
                     if (oldest == null or child.question_asked < oldest.?.asked) oldest = .{ .child = child, .kind = .question, .asked = child.question_asked };
+                }
+                if (childWaitsForCard(app, child)) {
+                    if (oldest == null or child.wait_asked < oldest.?.asked) oldest = .{ .child = child, .kind = .wait, .asked = child.wait_asked };
                 }
             }
             const lent = oldest orelse return;
             switch (lent.kind) {
                 .approval => lendApproval(app, borrower, lent.child),
                 .question => lendQuestion(app, borrower, lent.child),
+                .wait => lendWaitCard(app, borrower, lent.child),
             }
             app.shell.render_requests.request(.modal);
         }
@@ -1264,11 +1348,246 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// The view's name for `agent`: a subagent's own, else the id it was
+        /// started with. Empty for an agent the app does not host.
+        pub fn agentNameOf(app: *App, agent: *const AppAgent) []const u8 {
+            const child = hostedOf(app, agent) orelse return "";
+            return child.displayName();
+        }
+
+        /// Whether `child` waits on something only the person can continue,
+        /// with no prompt of its own to show for it, so its tree's view shows
+        /// a card (`WaitCardPrompt`). A wait that shows a prompt, such as the
+        /// out-of-credits picker or an MCP question, is the prompt's to show,
+        /// and the model picker the view opens for the wait stands in the
+        /// footer the same way, so the card waits behind it. The row alone
+        /// outlives a cancelled turn, so the wait also needs the worker still
+        /// in its turn (`tests/tla/subagent/ViewWaits.tla` NoStaleShown).
+        fn childWaitsForCard(app: *App, child: *ChildAgent) bool {
+            if (app.approval_lender == child or app.question_lender == child) return false;
+            if (child.agent.question_prompt.isActive()) return false;
+            if (!child.agent.worker.isProcessing()) return false;
+            if (modelPickerOpenFor(app, child)) return false;
+            // The picker the wait's own answer opened waits for the main loop:
+            // the card is not lent in the pass before it, so it never flashes.
+            if (child.agent.worker.hasPendingModelPicker()) return false;
+            return requestWaitsForUser(app, child);
+        }
+
+        /// Whether the composer holds the `/model` picker.
+        fn modelPickerHolds(app: *App) bool {
+            if (comptime !@hasField(App, "input_runtime")) return false;
+            const input = &app.input_runtime;
+            return input.picker.activeModelPickerQuery(&input.edit_state) != null;
+        }
+
+        /// Whether the view holds the `/model` picker for a subagent's wait.
+        /// The picker is the view's one modal until it closes, so nothing else
+        /// is lent beside it and the item it stands for stays the view's own
+        /// (`tests/tla/subagent/ViewWaits.tla` OneAtATime, OldestFirst).
+        fn viewPickerHoldsItem(app: *App) bool {
+            if (comptime !@hasField(App, "model_choice_target")) return false;
+            if (app.model_choice_target == null) return false;
+            return modelPickerHolds(app);
+        }
+
+        /// Whether the `/model` picker the view opened for `child`'s wait is
+        /// still open. It stands where the card would, so the card is not
+        /// lent over it, and the view keeps its wait as it does a card.
+        fn modelPickerOpenFor(app: *App, child: *const ChildAgent) bool {
+            if (comptime !@hasField(App, "model_choice_target")) return false;
+            if (app.model_choice_target != &child.agent) return false;
+            return modelPickerHolds(app);
+        }
+
+        /// The wait `child`'s own status row shows, while it is one the
+        /// person must continue.
+        fn waitStatusOf(app: *App, child: *ChildAgent) ?types.RouteRecoveryStatus {
+            return switch (screenOf(app, child).transcript.notebook.worker_status) {
+                .route_recovery => |status| if (status.status.kind == .need_user) status.status else null,
+                else => null,
+            };
+        }
+
+        /// Copies `child`'s wait into `borrower`'s card, named for the
+        /// subagent. The copy takes the wait's stamp, so the view returns it
+        /// when the subagent raises a newer wait.
+        fn lendWaitCard(app: *App, borrower: *AppAgent, child: *ChildAgent) void {
+            if (child.wait_asked == 0) return;
+            const status = waitStatusOf(app, child) orelse return;
+            _ = borrower.wait_card_prompt.sync(child.wait_asked, status, child.displayName());
+            app.wait_card_lender = child;
+            debug_trace.eventf("host", "wait_card_lent", .{}, "agent={s}", .{child.id});
+        }
+
+        /// Gives the card back to the view that holds it, and returns the
+        /// subagent that waits.
+        pub fn returnWaitCard(app: *App) ?*ChildAgent {
+            const child = app.wait_card_lender orelse return null;
+            rootInstance(app, child).wait_card_prompt.clear();
+            app.wait_card_lender = null;
+            app.shell.render_requests.request(.modal);
+            return child;
+        }
+
+        /// Returns the card unless it still copies the subagent's current
+        /// wait, and otherwise re-syncs the copy so the countdown moves. The
+        /// copy goes back when the wait ended, the subagent raised a newer
+        /// one, its wait now shows a prompt, the view has a prompt of its
+        /// own, the person left the view, or the alternate screen took the
+        /// terminal (`FooterQuietForShown`, `HeldUnderAltScreen`). A caller
+        /// runs it in the same pass as `lendPrompt`, so nothing waits for the
+        /// next frame.
+        pub fn settleLentWaitCard(app: *App) void {
+            const child = app.wait_card_lender orelse return;
+            if (!viewKeepsWaitCard(app, child)) {
+                _ = returnWaitCard(app);
+                return;
+            }
+            const borrower = rootInstance(app, child);
+            const status = waitStatusOf(app, child) orelse {
+                _ = returnWaitCard(app);
+                return;
+            };
+            if (borrower.wait_card_prompt.sync(child.wait_asked, status, child.displayName())) {
+                app.shell.render_requests.request(.modal);
+            }
+        }
+
+        fn viewKeepsWaitCard(app: *App, child: *ChildAgent) bool {
+            if (alternateScreenOwned(app)) return false;
+            // The picker takes the footer, and the card comes back after it
+            // closes, oldest item first.
+            if (viewPickerHoldsItem(app)) return false;
+            const borrower = rootInstance(app, child);
+            if (instanceOnScreen(app) != borrower) return false;
+            if (borrower.approval_prompt.isActive() or borrower.question_prompt.isActive()) return false;
+            if (borrower.wait_card_prompt.asked != child.wait_asked) return false;
+            return childWaitsForCard(app, child);
+        }
+
+        /// Clears the picker target once the view has left that picker,
+        /// whether the choice applied or not, so its wait comes back as the
+        /// card and the next `/model` starts from the agent on screen again.
+        pub fn settleModelChoiceTarget(app: *App) void {
+            if (comptime !@hasField(App, "model_choice_target")) return;
+            if (app.model_choice_target == null) return;
+            if (modelPickerHolds(app)) return;
+            app.model_choice_target = null;
+            // The person left the picker without a choice: the card comes
+            // back, and so does the draft the picker borrowed the composer for.
+            if (comptime @hasField(App, "input_runtime")) _ = app.input_runtime.restoreModelPickerDraft(app.alloc);
+            debug_trace.eventf("host", "model_picker_target_cleared", .{}, "", .{});
+        }
+
+        /// Whether one view holds a subagent's item, so the footer, the agent
+        /// list, `busiest` and herdr ask for it no more. Only a lent item
+        /// counts, and the picker a view opened for a wait, since it stands
+        /// where that wait's card would: a subagent's row on its own screen
+        /// is that screen's.
+        pub fn viewShows(app: *App, child: *const ChildAgent) bool {
+            if (app.approval_lender == child or app.question_lender == child or app.wait_card_lender == child) return true;
+            return modelPickerOpenFor(app, child);
+        }
+
+        /// The card `agent` draws, when it holds one and nothing else owns the
+        /// footer. The alternate screen does, so the card waits for it to
+        /// close (`tests/tla/subagent/ViewWaits.tla` HeldUnderAltScreen).
+        pub fn waitCardFor(app: *const App, agent: *const AppAgent) ?*const wait_card.WaitCardPrompt {
+            if (comptime @hasField(AppAgent, "wait_card_prompt")) {
+                if (alternateScreenOwned(app)) return null;
+                if (!agent.wait_card_prompt.isActive()) return null;
+                return &agent.wait_card_prompt;
+            }
+            return null;
+        }
+
+        /// Whether `agent`'s own status row waits for a sign-in: the screen's
+        /// row for the agent on it, the slot's row for a hidden one. A view
+        /// signs in for the subagent that waits, never for what the screen
+        /// waits for.
+        pub fn agentWaitsForSignIn(app: *App, agent: *AppAgent) bool {
+            if (agent == agents.screenAgentOf(app)) {
+                if (comptime !@hasDecl(@TypeOf(app.shell), "worker_status_state")) return false;
+                return app.shell.worker_status_state().waitsForSignIn();
+            }
+            const child = hostedOf(app, agent) orelse return false;
+            return screenOf(app, child).transcript.notebook.worker_status.waitsForSignIn();
+        }
+
+        /// `agent`'s fast mode: the app's for the agent in context, else the
+        /// one its slot keeps while it is hidden.
+        pub fn fastModeOf(app: *App, agent: *const AppAgent) bool {
+            if (comptime !@hasField(App, "fast_mode")) return false;
+            if (agent == agents.screenAgentOf(app)) return app.fast_mode;
+            const child = hostedOf(app, agent) orelse return app.fast_mode;
+            return child.screen.fast_mode;
+        }
+
+        pub fn setFastModeFor(app: *App, agent: *AppAgent, enabled: bool) void {
+            if (comptime !@hasField(App, "fast_mode")) return;
+            if (agent == agents.screenAgentOf(app)) {
+                app.fast_mode = enabled;
+                return;
+            }
+            if (hostedOf(app, agent)) |child| child.screen.fast_mode = enabled;
+        }
+
+        /// Runs the choice the person pressed on a view's card in the context
+        /// of the subagent that waits, as that subagent's own screen would.
+        /// The answer arms the Enter guard, because the card hid the view's
+        /// draft and the Enter beside it must not submit that draft. False
+        /// when no card shows.
+        pub fn answerWaitCard(app: *App, choice: wait_card.Choice) !bool {
+            const child = returnWaitCard(app) orelse return false;
+            if (comptime @hasField(App, "wait_card_enter_guard")) app.wait_card_enter_guard.arm();
+            debug_trace.eventf("host", "wait_card_answered", .{}, "agent={s} choice={t}", .{ child.id, choice });
+            switch (choice) {
+                .retry => try visit(app, child, {}, continueInContext),
+                .cancel => try visit(app, child, {}, cancelInContext),
+                .sign_in => {
+                    if (comptime @hasDecl(App, "beginRecoverySignIn")) try app.beginRecoverySignIn(&child.agent);
+                },
+                .change_model => {
+                    if (comptime @hasDecl(App, "openModelPickerFor")) try app.openModelPickerFor(&child.agent);
+                },
+                .open_screen => try show(app, child),
+                .stop => try closeSubagent(app, child),
+            }
+            app.shell.render_requests.request(.modal);
+            return true;
+        }
+
+        fn continueInContext(_: void, _: *App, agent: *AppAgent) anyerror!void {
+            if (comptime @hasDecl(@TypeOf(agent.worker), "requestRecoveryContinue")) agent.worker.requestRecoveryContinue();
+        }
+
+        /// Cancels the waiting subagent's turn with the steps its own screen
+        /// takes and none of the app-level ones: `cancelActiveOperation` also
+        /// clears the screen's tool rows and its provider preparation, which
+        /// belong to the view's agent (`R2.4`).
+        fn cancelInContext(_: void, app: *App, agent: *AppAgent) anyerror!void {
+            noteUserStop(app, agent);
+            agent.worker.requestInteractiveCancel();
+            app_worker_runtime.Runtime(App).clearPacer(app, agent, "wait_card_cancel");
+        }
+
+        /// Whether the alternate screen holds the terminal, as the file
+        /// approval review, the full transcript or a catalog menu does.
+        fn alternateScreenOwned(app: anytype) bool {
+            const State = @TypeOf(app.*);
+            if (comptime !@hasField(State, "terminal")) return false;
+            if (comptime !@hasField(@TypeOf(app.terminal), "alternate_screen_owner")) return false;
+            return app.terminal.alternate_screen_owner != .none;
+        }
+
         /// Lends `child`'s approval to `borrower`'s prompt. Its request comes
         /// from the subagent's own worker and stays labeled with its name.
         /// It goes back when the subagent is shown, the instance gets its
-        /// own, or the subagent stops waiting (`keepLentApproval`).
+        /// own, or the subagent stops waiting (`keepLentApproval`). A request
+        /// main answers is never lent: main's screen does not show it.
         fn lendApproval(app: *App, borrower: *AppAgent, child: *ChildAgent) void {
+            if (parentRoutedApproval(child)) return;
             std.mem.swap(@TypeOf(child.agent.approval_prompt), &borrower.approval_prompt, &child.agent.approval_prompt);
             app.approval_lender = child;
             debug_trace.eventf("host", "approval_lent", .{}, "agent={s}", .{child.id});
@@ -1591,7 +1910,11 @@ pub fn Runtime(comptime App: type) type {
             }
             for (app.child_agents.items) |child| {
                 if (child == app.agent_on_screen) continue;
-                const approval = child.agent.approval_prompt.isActive();
+                // What this view shows is not asked for again here.
+                if (viewShows(app, child)) continue;
+                // A request main answers is not a wait for the person: the
+                // screen shows no prompt for it and the footer stays quiet.
+                const approval = child.agent.approval_prompt.isActive() and !parentRoutedApproval(child);
                 const asks = child.agent.question_prompt.isActive();
                 if (!approval and !asks and !requestWaitsForUser(app, child)) continue;
                 if (!found) {
@@ -1651,24 +1974,170 @@ pub fn Runtime(comptime App: type) type {
             return busyAs(most) orelse .idle;
         }
 
-        /// The first open agent other than the one on screen that is busy:
-        /// a turn going or queued, an approval or a question open, or a
-        /// request only the user can continue. Restarting fx would stop it.
-        /// Null when every other agent is idle. Its name may use `buf`.
-        /// Main loop only: it reads every agent's prompts.
-        pub fn busyAgentElsewhere(app: *App, buf: []u8) ?BusyAgent {
+        /// Whether a turn of any agent `busiest` reads began or went on since
+        /// the last call, which clears each (`WorkerRuntime.takeBeganWork`).
+        /// Main loop only.
+        pub fn takeBeganWork(app: *App) bool {
+            var began = false;
+            if (firstOpen(app)) began = app.main_agent.worker.takeBeganWork() or began;
+            for (app.child_agents.items) |child| {
+                began = child.agent.worker.takeBeganWork() or began;
+            }
+            return began;
+        }
+
+        /// The first open agent other than the one on screen that waits for
+        /// the user: an approval or a question open, or a request only the
+        /// user can continue. An upgrade's restart waits for a working agent
+        /// to stop between steps, but not for the user. Null when none
+        /// waits. Its name may use `buf`. Main loop only: it reads every
+        /// agent's prompts.
+        pub fn needsUserElsewhere(app: *App, buf: []u8) ?BusyAgent {
             if (app.agent_on_screen != null and firstOpen(app)) {
-                if (busyAs(stateOf(app, null))) |doing| {
+                if (waitsForUserAs(stateOf(app, null))) |doing| {
                     return .{ .name = noteName(app, null, buf), .doing = doing };
                 }
             }
             for (app.child_agents.items) |child| {
                 if (child == app.agent_on_screen) continue;
-                if (busyAs(stateOf(app, child))) |doing| {
+                if (waitsForUserAs(stateOf(app, child))) |doing| {
                     return .{ .name = noteName(app, child, buf), .doing = doing };
                 }
             }
             return null;
+        }
+
+        /// The first open agent other than the one on screen whose queued
+        /// work an upgrade's restart would drop: main or another instance,
+        /// which hold their queues while they yield (`requestYields`). A
+        /// subagent's queue runs, and the restart waits for it
+        /// (`anyTurnRunning`). Null when none holds any. Its name may use
+        /// `buf`. Main loop only.
+        pub fn queuedWorkElsewhere(app: *App, buf: []u8) ?[]const u8 {
+            if (app.agent_on_screen != null and firstOpen(app) and app.main_agent.worker.queuedPromptCount() > 0) {
+                return noteName(app, null, buf);
+            }
+            for (app.child_agents.items) |child| {
+                if (child == app.agent_on_screen or child.agent.role != .instance) continue;
+                if (child.agent.worker.queuedPromptCount() > 0) return noteName(app, child, buf);
+            }
+            return null;
+        }
+
+        /// Asks the running turns of the main agent and of other instances
+        /// to stop at their next step boundary, and holds their queued work,
+        /// for an upgrade's restart (`WorkerRuntime.requestYield`). Subagents
+        /// keep working: the restart waits until they finish
+        /// (`anyTurnRunning`), so an upgrade loses none of their work.
+        pub fn requestYields(app: *App) void {
+            yieldStepOnRestartAgents(app, .request);
+        }
+
+        /// Lets the turns held for the restart return (`WorkerRuntime.releaseYield`),
+        /// on the agents `requestYields` asked.
+        pub fn releaseYields(app: *App) void {
+            yieldStepOnRestartAgents(app, .release);
+        }
+
+        /// Takes back `requestYields` when the restart is cancelled
+        /// (`WorkerRuntime.cancelYield`).
+        pub fn cancelYields(app: *App) void {
+            yieldStepOnRestartAgents(app, .cancel);
+        }
+
+        const YieldStep = enum { request, release, cancel };
+
+        /// Takes `step` on the workers an upgrade's restart stops between
+        /// steps: main's and the other instances'.
+        fn yieldStepOnRestartAgents(app: *App, comptime step: YieldStep) void {
+            yieldStep(&app.main_agent.worker, step);
+            for (app.child_agents.items) |child| {
+                if (child.agent.role == .instance) yieldStep(&child.agent.worker, step);
+            }
+        }
+
+        fn yieldStep(worker: anytype, comptime step: YieldStep) void {
+            switch (step) {
+                .request => worker.requestYield(),
+                .release => worker.releaseYield(),
+                .cancel => worker.cancelYield(),
+            }
+        }
+
+        /// Whether any agent's worker runs work now or holds events the main
+        /// loop has not applied, such as a finished turn's history, a
+        /// subagent has work queued, or a child's report or hand-off waits
+        /// for the main loop to deliver it. An upgrade's restart waits until
+        /// none does.
+        pub fn anyTurnRunning(app: *App) bool {
+            return anyTurnBusy(app, false);
+        }
+
+        /// As `anyTurnRunning`, with a turn held at its step boundary for the
+        /// restart counted as stopped: the restart lets the held turns return
+        /// once this is false (`tests/tla/recovery/RestartWait.tla` Release).
+        pub fn anyTurnUnheld(app: *App) bool {
+            return anyTurnBusy(app, true);
+        }
+
+        fn anyTurnBusy(app: *App, comptime held_counts_as_stopped: bool) bool {
+            if (workerBusy(&app.main_agent.worker, held_counts_as_stopped)) return true;
+            for (app.child_agents.items) |child| {
+                const worker = &child.agent.worker;
+                if (workerBusy(worker, held_counts_as_stopped)) return true;
+                // Only instances hold their queued work, so a subagent's runs.
+                if (child.agent.role == .subagent and worker.queuedPromptCount() > 0) return true;
+            }
+            return deliveriesPending(app, null);
+        }
+
+        fn workerBusy(worker: anytype, comptime held_counts_as_stopped: bool) bool {
+            const runs = if (held_counts_as_stopped) worker.turnActivity() == .running else worker.isProcessing();
+            return runs or worker.hasPendingEvents();
+        }
+
+        /// Whether a subagent runs work, has work queued, or holds events
+        /// the main loop has not applied. Main loop only.
+        pub fn anySubagentWorking(app: *App) bool {
+            for (app.child_agents.items) |child| {
+                if (child.agent.role != .subagent) continue;
+                const worker = &child.agent.worker;
+                if (worker.isProcessing() or worker.hasPendingEvents() or worker.queuedPromptCount() > 0) return true;
+            }
+            return false;
+        }
+
+        /// Whether a child's report or a hand-off waits for the main loop to
+        /// deliver it (`takePosts`): any report, or only `host`'s when given.
+        /// A hand-off does not name its host, so every one counts.
+        fn deliveriesPending(app: *App, host: ?*subagent_tool_host.Runtime) bool {
+            app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+            defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+            if (app.child_handoffs.posts.items.len > 0) return true;
+            const wanted = host orelse return app.child_handoffs.reports.items.len > 0;
+            for (app.child_handoffs.reports.items) |report| {
+                if (report.host == wanted) return true;
+            }
+            return false;
+        }
+
+        /// Logs the work each agent still holds as fx exits for an upgrade's
+        /// restart. After Ctrl+G's checks only reports can be here: queued
+        /// work refuses Ctrl+G (`queuedWorkElsewhere`), a prompt sent during
+        /// the wait stays in the composer, and a message is refused
+        /// (`reserveMessagePlace`, `WorkerRuntime.postMailWith`). Each report
+        /// stays owed in its child's log and comes again after the restart.
+        pub fn logHeldWork(app: *App) void {
+            var name_buf: [32]u8 = undefined;
+            const main_queued = app.main_agent.worker.queuedPromptCount();
+            if (firstOpen(app) and main_queued > 0) {
+                debug_trace.logf("upgrade", "event=held_work_dropped agent={s} prompts={d} reason=upgrade_restart", .{ noteName(app, null, &name_buf), main_queued });
+            }
+            for (app.child_agents.items) |child| {
+                const queued = child.agent.worker.queuedPromptCount();
+                if (queued == 0) continue;
+                debug_trace.logf("upgrade", "event=held_work_dropped agent={s} prompts={d} reason=upgrade_restart", .{ noteName(app, child, &name_buf), queued });
+            }
         }
 
         fn targetAgent(app: *App, target: ?*ChildAgent) *AppAgent {
@@ -1721,11 +2190,33 @@ pub fn Runtime(comptime App: type) type {
             if (turnInFlight(screen)) return 0;
             var count: usize = 0;
             for (app.child_agents.items) |child| {
-                if (child.agent.role != .subagent) continue;
-                if (ownerOf(app, hostOf(app, child)) != screen) continue;
-                if (turnInFlight(&child.agent) or resultPending(app, child)) count += 1;
+                if (ownSubagentWorking(app, screen, child)) count += 1;
             }
             return count;
+        }
+
+        fn ownSubagentWorking(app: *App, owner: @TypeOf(agents.screenAgentOf(app)), child: *ChildAgent) bool {
+            return child.agent.role == .subagent and
+                ownerOf(app, hostOf(app, child)) == owner and
+                (turnInFlight(&child.agent) or resultPending(app, child));
+        }
+
+        /// Whether the agent on screen waits on its subagents: one works or
+        /// holds an unapplied result, its host stays busy until the report is
+        /// posted, or the report is not handed over yet. Main loop only.
+        pub fn screenSubagentsWorking(app: *App) bool {
+            const screen = agents.screenAgentOf(app);
+            for (app.child_agents.items) |child| {
+                if (ownSubagentWorking(app, screen, child)) return true;
+            }
+            const host: ?*subagent_tool_host.Runtime = if (comptime agents.hasAgentField(App, "session_persistence")) screen.session_persistence.subagent_host else null;
+            const own_host = host orelse return false;
+            return !own_host.quiet() or deliveriesPending(app, own_host);
+        }
+
+        /// Main loop only.
+        pub fn screenWorkGoing(app: *App) bool {
+            return turnInFlight(agents.screenAgentOf(app)) or screenSubagentsWorking(app);
         }
 
         /// The activity row for an agent on screen whose turn ended while its
@@ -1974,7 +2465,7 @@ pub fn Runtime(comptime App: type) type {
                 const model = provider_runtime.modelOf(app, agent);
                 const state = stateOf(app, target);
                 const name = noteName(app, target, menu.names.addManyAsArrayAssumeCapacity(instance_name_bytes));
-                const activity_state = rowActivityState(app, subagent, state, now_ms, menu.activities.addManyAsArrayAssumeCapacity(activity_bytes));
+                const activity_state = rowActivityState(subagent, state, now_ms, menu.activities.addManyAsArrayAssumeCapacity(activity_bytes));
                 menu.rows.appendAssumeCapacity(.{
                     .name = name,
                     .subagent = subagent != null,
@@ -2254,6 +2745,20 @@ pub fn Runtime(comptime App: type) type {
             };
             if (inBranch(set, app.approval_lender)) _ = returnApproval(app);
             if (inBranch(set, app.question_lender)) _ = returnQuestion(app);
+            if (inBranch(set, app.wait_card_lender)) _ = returnWaitCard(app);
+            // A view's picker for one of these agents must not keep pointing at
+            // it after `dropSet` frees it (`tests/tla/subagent/ViewWaits.tla`
+            // ActionReachesOwner).
+            if (comptime @hasField(App, "model_choice_target")) {
+                if (app.model_choice_target) |target| {
+                    for (set) |entry| {
+                        if (target != &entry.agent) continue;
+                        app.model_choice_target = null;
+                        if (comptime @hasField(App, "input_runtime")) _ = app.input_runtime.restoreModelPickerDraft(app.alloc);
+                        break;
+                    }
+                }
+            }
             if (comptime agents.hasAgentField(App, "session_persistence")) {
                 if (first_host) |host| host.closeTree();
                 for (set) |entry| if (entry.agent.session_persistence.subagent_host) |host| host.closeTree();
@@ -2401,9 +2906,27 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
+        /// The person answered a subagent's request on its own screen, so the
+        /// registry binding goes with it. An agent that is not a hosted child
+        /// does nothing.
+        pub fn withdrawAnsweredApproval(app: *App, agent: *AppAgent) void {
+            const child = hostedOf(app, agent) orelse return;
+            const host = hostOf(app, child) orelse return;
+            _ = host.withdrawAnsweredApproval(child.id);
+        }
+
         fn hostedOf(app: *App, agent: *const AppAgent) ?*ChildAgent {
             for (app.child_agents.items) |child| if (&child.agent == agent) return child;
             return null;
+        }
+
+        /// Whether `child`'s waiting approval came from a run main started. Main
+        /// answers those, so no instance's screen lends one and the footer and
+        /// the agent list never say the child needs the person
+        /// (`tests/tla/subagent/TuiParentApproval.tla` NoPersonPromptForParentRouted).
+        fn parentRoutedApproval(child: *const ChildAgent) bool {
+            const run = if (child.agent.child_run) |*value| value else return false;
+            return run.turn != null and run.startedByParent();
         }
 
         /// A subagent's approval or question is lent to an instance's screen
@@ -2480,10 +3003,11 @@ pub fn Runtime(comptime App: type) type {
         /// text back to the agent leaving, takes the arriving agent's out of
         /// its slot, and makes it the loop's agent in context. Paints nothing.
         fn attach(app: *App, target: ?*ChildAgent) void {
-            // A question or approval lent to main goes back first, to show on
-            // its own subagent's screen.
+            // A question, approval or wait card lent to a view goes back
+            // first, to show on its own subagent's screen.
             _ = returnQuestion(app);
             _ = returnApproval(app);
+            _ = returnWaitCard(app);
             const leaving = screenOf(app, app.agent_on_screen);
             const arriving = screenOf(app, target);
             if (leaving == arriving) return;
@@ -2571,17 +3095,17 @@ pub fn Runtime(comptime App: type) type {
             return if (child) |value| &value.screen else &app.main_screen;
         }
 
-        /// A working subagent's state with its current call's time, such as
-        /// "working 12s", from its host, written into `buf`; null for any
-        /// other row.
-        fn rowActivityState(app: *App, subagent: ?*ChildAgent, state: InstanceState, now_ms: i64, buf: *[activity_bytes]u8) ?[]const u8 {
+        /// A working subagent's state with the time its turn has run, such as
+        /// "working 12m3s", written into `buf`. It reads the clock the
+        /// subagent's own status row shows, which holds while the turn waits
+        /// on the user. Null for any other row, and for a turn not timed yet.
+        fn rowActivityState(subagent: ?*ChildAgent, state: InstanceState, now_ms: i64, buf: *[activity_bytes]u8) ?[]const u8 {
             if (state != .working) return null;
             const child = subagent orelse return null;
-            const host = hostOf(app, child) orelse return null;
-            const call = host.childCall(child.id) orelse return null;
+            const seconds = activity_status.turnSeconds(child.agent.stream, now_ms) orelse return null;
             var writer = std.Io.Writer.fixed(buf);
             writer.print("{s} ", .{state.label()}) catch return null;
-            activity_status.writeElapsed(&writer, @intCast(call.runningMs(now_ms) / std.time.ms_per_s)) catch return null;
+            activity_status.writeElapsed(&writer, seconds) catch return null;
             return writer.buffered();
         }
 
@@ -2606,6 +3130,13 @@ pub fn Runtime(comptime App: type) type {
             if (target) |child| {
                 if (app.approval_lender == child) return .needs_approval;
                 if (app.question_lender == child) return .has_question;
+                // The view shows this wait in its card, so the row says it
+                // waits and does not ask the person again
+                // (`tests/tla/subagent/ViewWaits.tla` FooterQuietForShown).
+                if (viewShows(app, child)) return .waiting;
+                // A request main answers is main's work, not a wait for the
+                // person, so the list says working, not "needs approval".
+                if (parentRoutedApproval(child) and child.agent.approval_prompt.isActive()) return .working;
             }
             const last_end: LastEnd = if (target) |child| (if (child.agent.role == .subagent) child.last_end else .done) else .done;
             const state = instanceState(targetAgent(app, target), requestWaitsForUser(app, target), last_end);
@@ -2613,7 +3144,7 @@ pub fn Runtime(comptime App: type) type {
             if (child.agent.role != .subagent) return state;
             return switch (state) {
                 .idle, .finished, .failed, .stopped => if (resultPending(app, child)) .working else state,
-                .working, .needs_approval, .has_question, .needs_you => state,
+                .working, .waiting, .needs_approval, .has_question, .needs_you => state,
             };
         }
 
@@ -2626,6 +3157,14 @@ pub fn Runtime(comptime App: type) type {
                 return app.shell.worker_status_state().waitsForUser();
             }
             return screenOf(app, target).transcript.notebook.worker_status.waitsForUser();
+        }
+
+        /// Whether `agent`'s request waits for the person right now, which is
+        /// when a view's picker choice continues it (`tests/tla/subagent/
+        /// ViewWaits.tla` ActionReachesOwner).
+        pub fn agentRequestWaitsForUser(app: *App, agent: *AppAgent) bool {
+            const child = hostedOf(app, agent) orelse return false;
+            return requestWaitsForUser(app, child);
         }
 
         fn nameOf(child: ?*ChildAgent) []const u8 {
@@ -2727,23 +3266,76 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Gives each posted delivery to its agent, in the order they were
-        /// posted (`App.postAgentMessage`). One whose agent is gone is
-        /// dropped; a report stays owed in the log.
+        /// posted (`App.postAgentMessage`). A delivery stays in the list until
+        /// its agent's worker has it, so mail is always in the list or in the
+        /// worker's queue, and `handoffMailWaiting` never misses it. One whose
+        /// agent is gone is dropped; a report stays owed in the log.
         fn deliverReports(app: *App) void {
-            var posted: std.ArrayList(*ReportPost) = .empty;
-            {
-                app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
-                defer app.child_handoffs.mutex.unlock(io_mod.getIo());
-                if (app.child_handoffs.closed) return;
-                std.mem.swap(std.ArrayList(*ReportPost), &posted, &app.child_handoffs.reports);
-            }
-            defer posted.deinit(handoff_alloc);
-            for (posted.items) |post| {
-                defer post.destroy();
+            while (oldestReport(app)) |post| {
+                if (subagent_delivery_test_controls.deferred(post.child_id)) return;
                 deliverReport(app, post) catch |err| {
                     debug_trace.eventf("host", "child_delivery_dropped", .{}, "child={s} work_id={s} kind={s} reason={s}", .{ post.child_id, post.work_id, @tagName(post.kind), @errorName(err) });
                 };
+                removeDelivered(app, post);
             }
+        }
+
+        /// The oldest delivery in the hand-off, which stays in the list. Only the
+        /// main loop removes one, so it stays valid until `removeDelivered`.
+        fn oldestReport(app: *App) ?*ReportPost {
+            app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+            defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+            if (app.child_handoffs.closed or app.child_handoffs.reports.items.len == 0) return null;
+            return app.child_handoffs.reports.items[0];
+        }
+
+        /// Takes `post`, the oldest delivery, out of the list once its agent's
+        /// worker has it or it was dropped, and frees it.
+        fn removeDelivered(app: *App, post: *ReportPost) void {
+            app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+            defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+            std.debug.assert(app.child_handoffs.reports.items[0] == post);
+            _ = app.child_handoffs.reports.orderedRemove(0);
+            post.destroy();
+        }
+
+        /// Whether the hand-off holds a report or message that `deliverReport`
+        /// will give `agent`, which its worker's queue does not have yet. Runs
+        /// on the agent's worker thread with no lock held. It takes
+        /// `child_handoffs.mutex` to copy what it needs, releases it, and only
+        /// then takes `authority_mutex` to find the receivers, the way
+        /// `reserveMessagePlace` does, so no lock is held while another is taken.
+        pub fn handoffMailWaiting(app: *App, agent: *AppAgent) bool {
+            const Waiting = struct { host: *subagent_tool_host.Runtime, from_owner: bool };
+            var waiting: std.ArrayList(Waiting) = .empty;
+            defer waiting.deinit(handoff_alloc);
+            {
+                app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+                defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+                if (app.child_handoffs.closed) return false;
+                for (app.child_handoffs.reports.items) |post| {
+                    waiting.append(handoff_alloc, .{ .host = post.host, .from_owner = post.from_owner }) catch return false;
+                }
+            }
+            if (waiting.items.len == 0) return false;
+            app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            for (waiting.items) |entry| {
+                if (receiverOf(app, entry.host, entry.from_owner) == agent) return true;
+            }
+            return false;
+        }
+
+        /// Whether the hand-off holds mail for the agent that owns `host`
+        /// (`handoffMailWaiting`), so that agent's `wait` waits for it: the
+        /// host's `ReportSink.mail_waiting_fn`, on that agent's thread.
+        pub fn hostMailWaiting(app: *App, host: *subagent_tool_host.Runtime) bool {
+            const owner = blk: {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                break :blk ownerOf(app, host) orelse return false;
+            };
+            return handoffMailWaiting(app, owner);
         }
 
         /// The agent a subagent's delivery from `host` goes to: the host's
@@ -2766,6 +3358,10 @@ pub fn Runtime(comptime App: type) type {
                 defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
                 break :blk receiverOf(app, host, from_owner) orelse return error.AgentGone;
             };
+            // An agent that stops its turn for fx's restart takes no message
+            // before fx exits, and nothing saves one across it, so the
+            // sender hears at once and puts it in its report, which is kept.
+            if (receiver.worker.yield_requested.load(.seq_cst)) return error.ReceiverRestarting;
             // The receiver outlives the sender's call: a tree closes its
             // subagents' threads before the agents that started them.
             if (!receiver.worker.reserveAgentMessage()) return error.QueueFull;
@@ -2780,6 +3376,29 @@ pub fn Runtime(comptime App: type) type {
             receiver.worker.releaseAgentMessage();
         }
 
+        /// Who started the turn that sends a message from child `child_id`
+        /// of `host`, or from `host`'s owner when `from_owner`, as the host
+        /// that runs the sender knows it. Read on the sender's thread while
+        /// that turn runs: once the main loop takes the post, the turn may
+        /// have ended. A post made after a pass took its posts waits for the
+        /// next pass, and the same pass can handle the turn's end first
+        /// (`tests/e2e/tui-host-switch.test.ts` "a subagent's message says
+        /// the user started its turn when that turn ends before the main loop
+        /// delivers the message").
+        pub fn messageStartedBy(app: *App, host: *subagent_tool_host.Runtime, from_owner: bool, child_id: []const u8) ?subagent_reports.StartedBy {
+            if (!from_owner) return host.turnStartedBy(child_id);
+            const sender_host, const sender = blk: {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                const owner = ownerOf(app, host) orelse return null;
+                const child = hostedOf(app, owner) orelse return null;
+                break :blk .{ hostOf(app, child) orelse return null, child };
+            };
+            // The sender is mid-call, so its agent and the host that runs it
+            // outlive this read.
+            return sender_host.turnStartedBy(sender.id);
+        }
+
         fn deliverReport(app: *App, post: *ReportPost) !void {
             const message = post.kind == .message;
             const target = receiverOf(app, post.host, message and post.from_owner) orelse return error.AgentGone;
@@ -2789,15 +3408,6 @@ pub fn Runtime(comptime App: type) type {
                 break :blk hostedOf(app, owner) orelse return error.AgentGone;
             } else null;
             const sender = if (owner_child) |child| (if (child.name.len > 0) child.name else child.id) else post.agent;
-            // Who started the turn that sent a message, from the host that
-            // runs the sender. That turn is still going: posts are taken
-            // each pass before the children's events, its end among them.
-            const started_by: ?subagent_reports.StartedBy = if (!message)
-                null
-            else if (owner_child) |child|
-                if (hostOf(app, child)) |host| host.turnStartedBy(child.id) else null
-            else
-                post.host.turnStartedBy(post.child_id);
             const limit = target.worker.effectiveAgentTurnSettings().max_tool_result_bytes;
             const text = switch (post.kind) {
                 .report => try subagent_reports.message(app.alloc, .{
@@ -2810,14 +3420,30 @@ pub fn Runtime(comptime App: type) type {
                     .end = post.end,
                     .idle = post.idle,
                 }, limit),
-                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, started_by, post.typed_lines) catch |err| {
+                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, post.started_by, post.typed_lines) catch |err| {
                     target.worker.releaseAgentMessage();
                     return err;
                 },
             };
             defer app.alloc.free(text);
-            try app.postAgentMessage(target, text, .child, if (message) .message else .report);
+            app.postAgentMessage(target, text, .child, if (message) .message else .report) catch |err| {
+                // A message that came after its receiver began to stop for
+                // fx's restart is not kept across it.
+                if (err == error.ReceiverRestarting) try noteMessageDroppedForRestart(app, sender, text.len);
+                return err;
+            };
             debug_trace.eventf("host", "child_delivery_posted", .{}, "child={s} work_id={s} kind={s}", .{ post.child_id, post.work_id, @tagName(post.kind) });
+        }
+
+        /// Tells the user that a subagent's message came while fx waits to
+        /// restart and that fx restarts without it. The trace names its
+        /// size, never its text.
+        fn noteMessageDroppedForRestart(app: *App, sender: []const u8, bytes: usize) !void {
+            debug_trace.logf("upgrade", "event=held_work_dropped kind=message bytes={d} reason=upgrade_restart", .{bytes});
+            if (comptime !@hasDecl(App, "writeDomainNotice")) return;
+            const body = try app.alloc.print("a message from {s} came while fx waits to restart, so fx restarts without it", .{sender});
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "upgrade", .tone = .neutral, .body = body }, true);
         }
 
         /// Takes every waiting hand-off. Runs on the main loop each pass,
@@ -3313,6 +3939,10 @@ pub fn Runtime(comptime App: type) type {
             noteLastEnd(app, agent, finished);
             const run = runInFlight(app, agent) orelse userWorkRun(app, agent) orelse return;
             run.ended_as = finished.outcome;
+            // The parent hears why, such as a reply cut off at the output
+            // limit, in place of `agent_turn_failed`. A provider's own error
+            // the worker kept stays first.
+            if (run.failure == null) run.failure = types.turnFailureFor(finished);
             if (finished.outcome == .interrupted and agent.worker.handedOff(finished.turn_id)) {
                 run.handed_off = true;
                 debug_trace.eventf("host", "child_turn_handed_off", .{}, "agent={s} work_id={s} turn_id={d}", .{ run.child_id, run.work_id, finished.turn_id });
@@ -3389,6 +4019,9 @@ pub fn Runtime(comptime App: type) type {
         pub fn noteChildWaiting(app: *App, agent: *AppAgent, status: types.RouteRecoveryStatus) void {
             if (agent.role != .subagent) return;
             const child = hostedOf(app, agent) orelse return;
+            // The view's copy is ordered by this stamp, so a newer wait can
+            // never take an older one's place.
+            notePromptAsked(app, agent, .wait);
             const host = hostOf(app, child) orelse return;
             const first = if (agent.child_run) |*run| first: {
                 run.waits +|= 1;
@@ -3401,10 +4034,21 @@ pub fn Runtime(comptime App: type) type {
             host.noteChildWaiting(child.id, child.displayName(), if (std.mem.find(u8, text, " \u{b7} ")) |at| text[0..at] else text, resend);
         }
 
+        /// Posts one note for a subagent's question prompt that only the
+        /// person can answer, so main hears of it and can tell the person
+        /// (`R3.8`).
+        pub fn noteChildQuestionPrompt(app: *App, agent: *AppAgent, source: worker_runtime.QuestionPromptSource) void {
+            if (agent.role != .subagent) return;
+            const child = hostedOf(app, agent) orelse return;
+            const host = hostOf(app, child) orelse return;
+            const reason = questionNoteReason(source, agentWaitsForSignIn(app, agent)) orelse return;
+            host.noteChildNeedsUser(child.id, child.displayName(), reason);
+        }
+
         /// A hosted subagent's tool events reach the app instead of its
-        /// turn: its current call goes to its host, for status and the agent
-        /// list, and a shell command that crossed the quiet limit is relayed
-        /// to its parent (`noteChildQuiet`, `tests/tla/subagent/QuietRelay.tla`).
+        /// turn: its current call goes to its host, for status, and a shell
+        /// command that crossed the quiet limit is relayed to its parent
+        /// (`noteChildQuiet`, `tests/tla/subagent/QuietRelay.tla`).
         pub fn noteChildToolLifecycle(app: *App, agent: *AppAgent, lifecycle: types.ToolLifecycleEvent) void {
             if (agent.role != .subagent) return;
             const child = hostedOf(app, agent) orelse return;
@@ -3552,6 +4196,12 @@ pub fn Runtime(comptime App: type) type {
         /// first. A child whose slot thread still holds its worker stays
         /// allocated, as `shutdownChildren` kept it.
         pub fn deinitChildren(app: *App) void {
+            // A lent prompt is swapped into the view that shows it, so it
+            // must be back with the child that owns its bytes before that
+            // child's screen is freed.
+            _ = returnWaitCard(app);
+            _ = returnQuestion(app);
+            _ = returnApproval(app);
             for (app.child_agents.items) |child| {
                 if (child.bound.held()) {
                     debug_trace.logf("host", "child_kept child={s} at=deinit reason=slot_thread_holds_worker", .{child.id});

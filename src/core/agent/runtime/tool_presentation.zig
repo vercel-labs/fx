@@ -588,6 +588,31 @@ pub const ProvisionalToolStatuses = struct {
         turn_id: u64,
         recovered_calls: []const ToolCall,
     ) !void {
+        try self.finishUnmatchedStarts(hooks, alloc, arena, turn_id, recovered_calls, "Connection interrupted before {s} ran");
+    }
+
+    /// Settles the row of each streamed start that none of `calls` finished:
+    /// the reply was cut off at its output limit, so the call never runs.
+    pub fn finishCutStarts(
+        self: *ProvisionalToolStatuses,
+        hooks: *const AgentRuntimeDeps,
+        alloc: Allocator,
+        arena: Allocator,
+        turn_id: u64,
+        complete_calls: []const ToolCall,
+    ) !void {
+        try self.finishUnmatchedStarts(hooks, alloc, arena, turn_id, complete_calls, "Cut off at the output limit before {s} ran");
+    }
+
+    fn finishUnmatchedStarts(
+        self: *ProvisionalToolStatuses,
+        hooks: *const AgentRuntimeDeps,
+        alloc: Allocator,
+        arena: Allocator,
+        turn_id: u64,
+        recovered_calls: []const ToolCall,
+        comptime summary_format: []const u8,
+    ) !void {
         var index = self.tracked.items.len;
         while (index > 0) {
             index -= 1;
@@ -615,10 +640,7 @@ pub const ProvisionalToolStatuses = struct {
                 detail,
                 diff.max_encoded_label_bytes,
             );
-            const summary = try arena.print(
-                "Connection interrupted before {s} ran",
-                .{encoded.bytes},
-            );
+            const summary = try arena.print(summary_format, .{encoded.bytes});
             try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
                 .id = .{ .turn_id = turn_id, .call_id = status.id },
                 .outcome = .{ .kind = .failed, .summary = summary },
@@ -777,6 +799,9 @@ pub const ToolPresentationGroupObservation = struct {
     has_visible_text: bool,
     saw_tool_start: bool,
     saw_visible_text_after_tool_start: bool,
+    /// The step called `ask_user_question`. Its answered question draws
+    /// below the open group, so calls after the answer start a new group.
+    asked_question: bool,
 };
 
 pub const ToolPresentationGroupTransition = struct {
@@ -817,7 +842,8 @@ pub fn transitionPresentationGroup(
     if (observation.has_visible_tool_calls) {
         next_active_group_id = resolved_tool_group_id;
     }
-    if (observation.saw_visible_text_after_tool_start or
+    if (observation.asked_question or
+        observation.saw_visible_text_after_tool_start or
         (observation.has_visible_text and !observation.has_visible_tool_calls))
     {
         next_active_group_id = null;
@@ -833,13 +859,44 @@ pub fn activityKind(registry: tool_dispatch.Registry, tool_name: []const u8) typ
     return tool_dispatch.toolActivityKind(registry, tool_name);
 }
 
+/// What a call does, as its rows show it. A toolbox run of a built-in tool
+/// does what the call fx runs for it does (`toolbox.shownBuiltinRun`), so a
+/// question asked through toolbox is a question, as a direct one is.
 pub fn activityKindForCall(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
     call: ToolCall,
 ) types.ToolActivityKind {
     if (tooling_presentation.isProviderSearchAlias(call.name)) return .read;
-    return tool_dispatch.toolActivityKindForCall(alloc, registry, call);
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const shown = toolbox.shownBuiltinRun(scratch_state.allocator(), registry, call) catch |err| blk: {
+        // Out of memory keeps the toolbox call's own kind, as a call whose
+        // arguments don't parse keeps its tool's static kind.
+        debug_trace.logf("tool", "toolbox run kind not resolved call={s} err={s}", .{ call.id, @errorName(err) });
+        break :blk null;
+    };
+    return tool_dispatch.toolActivityKindForCall(alloc, registry, shown orelse call);
+}
+
+test "a toolbox run of a built-in tool does what that tool does" {
+    const registry = test_builtin_tools.advertisement_set.registry;
+    const cases = [_]struct { arguments: []const u8, kind: types.ToolActivityKind }{
+        .{ .arguments = "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}", .kind = .ask },
+        .{ .arguments = "{\"run\":\"ask_user_question\",\"arguments\":\"{\\\"questions\\\":[]}\"}", .kind = .ask },
+        .{ .arguments = "{\"run\":\"read_file\",\"arguments\":{\"path\":\"a\"}}", .kind = .read },
+        // Toolbox's own kinds: a run of an MCP tool, a search, and a run that
+        // also opens, which toolbox refuses.
+        .{ .arguments = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .kind = .mcp },
+        .{ .arguments = "{\"search\":\"files\"}", .kind = .read },
+        .{ .arguments = "{\"run\":\"ask_user_question\",\"open\":\"skill\"}", .kind = .write },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "t", .name = toolbox.tool_name, .arguments_json = case.arguments };
+        try std.testing.expectEqual(case.kind, activityKindForCall(std.testing.allocator, registry, call));
+    }
+    const carried: ToolCall = .{ .id = "t", .name = "ask_user_question", .arguments_json = "{\"questions\":[]}", .carried_by = toolbox.tool_name };
+    try std.testing.expectEqual(types.ToolActivityKind.ask, activityKindForCall(std.testing.allocator, registry, carried));
 }
 
 /// How a streaming toolbox call's row reads when it runs a built-in tool.
@@ -2136,7 +2193,7 @@ const ProvisionalStatusTestCapture = struct {
         };
     }
 
-    fn noopAppendRuntimeContext(_: *anyopaque, _: Allocator, _: *std.ArrayList(types.ChatMessage)) !void {}
+    fn noopAppendRuntimeContext(_: *anyopaque, _: Allocator, _: []const u8, _: *std.ArrayList(types.ChatMessage)) !void {}
     fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: types.PermissionMode, _: []const types.PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8, _: ?[]const u8) !command_admission.PermissionOutcome {
         return .{ .decision = .once, .execution_authority = .ordinary };
     }
@@ -2340,6 +2397,7 @@ test "presentation grouping spans silent tool steps and splits on visible prose"
             .has_visible_text = false,
             .saw_tool_start = false,
             .saw_visible_text_after_tool_start = false,
+            .asked_question = false,
         },
     );
     const inherited = presentationGroupForStep(first_transition.active_group_id, 7, 12);
@@ -2355,6 +2413,7 @@ test "presentation grouping spans silent tool steps and splits on visible prose"
             .has_visible_text = true,
             .saw_tool_start = false,
             .saw_visible_text_after_tool_start = false,
+            .asked_question = false,
         },
     );
     try std.testing.expectEqual(
@@ -2382,10 +2441,54 @@ test "visible prose after streamed tools closes the group for the next step" {
             .has_visible_text = true,
             .saw_tool_start = true,
             .saw_visible_text_after_tool_start = true,
+            .asked_question = false,
         },
     );
 
     try std.testing.expectEqual(current, transition.tool_group_id.?);
+    try std.testing.expect(transition.active_group_id == null);
+}
+
+test "a step that only asks a question closes the group for the calls after the answer" {
+    const open = types.ToolPresentationGroupId{ .turn_id = 7, .anchor_step_id = 11 };
+    const asked = transitionPresentationGroup(
+        open,
+        open,
+        7,
+        12,
+        .{
+            .has_visible_tool_calls = false,
+            .has_visible_text = false,
+            .saw_tool_start = true,
+            .saw_visible_text_after_tool_start = false,
+            .asked_question = true,
+        },
+    );
+    try std.testing.expect(asked.active_group_id == null);
+
+    const after_answer = presentationGroupForStep(asked.active_group_id, 7, 13);
+    try std.testing.expectEqual(
+        types.ToolPresentationGroupId{ .turn_id = 7, .anchor_step_id = 13 },
+        after_answer,
+    );
+}
+
+test "calls in the step that asks keep the open group, and the group closes after it" {
+    const open = types.ToolPresentationGroupId{ .turn_id = 7, .anchor_step_id = 11 };
+    const transition = transitionPresentationGroup(
+        open,
+        open,
+        7,
+        12,
+        .{
+            .has_visible_tool_calls = true,
+            .has_visible_text = false,
+            .saw_tool_start = false,
+            .saw_visible_text_after_tool_start = false,
+            .asked_question = true,
+        },
+    );
+    try std.testing.expectEqual(open, transition.tool_group_id.?);
     try std.testing.expect(transition.active_group_id == null);
 }
 

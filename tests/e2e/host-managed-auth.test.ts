@@ -160,13 +160,17 @@ describe("host-managed authentication", () => {
     expect(status.stderr).toBe("");
     expect(JSON.parse(status.stdout).auth).toBe("host managed");
 
-    for (const command of [["login"], ["login", "--api-key"], ["logout"], ["setup"], ["teams"]]) {
+    for (const command of [["login"], ["login", "--api-key"], ["logout"], ["teams"]]) {
       const result = await runFx(command, { cwd: workspace, env: childEnv });
       expect(result.code).toBe(0);
-      // `fx setup` is deprecated and says so even when the host manages authentication.
-      expect(result.stderr).toBe(command[0] === "setup" ? "fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n" : "");
+      expect(result.stderr).toBe("");
       expect(result.stdout).toBe("Authentication is managed by the host.\n");
     }
+    // `fx setup` is removed: the host does not answer for it, and fx names its replacement.
+    const setup = await runFx(["setup"], { cwd: workspace, env: childEnv });
+    expect(setup.code).toBe(2);
+    expect(setup.stdout).toBe("");
+    expect(setup.stderr).toBe("fx: fx setup was removed; use fx login vercel --api-key\n");
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
 
     for (const [provider, marker] of [
@@ -253,7 +257,7 @@ describe("host-managed authentication", () => {
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
   }, TIMEOUT);
 
-  test("an empty reply cut short is asked again with fx's limit through Grok and at low effort through Codex", async () => {
+  test("an empty reply cut short gets a note with fx's limit through Grok and at low effort through Codex", async () => {
     const childEnv = env();
     const turnBodies = (path: string) => responseBodies
       .filter((entry) => entry.path === path && !entry.body.includes("Generate a short title"))
@@ -278,19 +282,22 @@ describe("host-managed authentication", () => {
       expect(asked.code).toBe(0);
       expect(sent[0]!.max_output_tokens).toBeUndefined();
       if (provider === "codex") {
-        // The Codex endpoint ignores fx's limit, so the resend asks for less
-        // reasoning instead, which the selected model offers.
+        // The Codex endpoint ignores fx's limit, so the request after the
+        // note asks for less reasoning instead, which the selected model
+        // offers.
         expect(sent).toHaveLength(2);
         expect(sent[1]!.max_output_tokens).toBeUndefined();
         expect(sent[0]!.reasoning?.effort).toBeUndefined();
         expect(sent[1]!.reasoning?.effort).toBe("low");
-        expect(asked.stderr).toContain("Retrying with low effort.");
-        expect(asked.stderr).not.toContain("Retrying with a higher limit");
+        expect(JSON.stringify(sent[1])).toContain("before any text or tool call, likely while thinking.");
+        expect(asked.stderr).toContain("Asking the model to take a smaller step, at low effort.");
+        expect(asked.stderr).not.toContain("The next requests allow");
         expect(asked.stdout).toContain("CODEX_HOST_MANAGED_OK");
       } else {
         expect(sent).toHaveLength(2);
         expect(sent[1]!.max_output_tokens).toBe(32_768);
-        expect(asked.stderr).toContain("Retrying with a higher limit.");
+        expect(JSON.stringify(sent[1])).toContain("before any text or tool call, likely while thinking.");
+        expect(asked.stderr).toContain("Asking the model to take a smaller step. The next requests allow 32768 output tokens.");
         expect(asked.stdout).toContain("GROK_HOST_MANAGED_OK");
       }
     }

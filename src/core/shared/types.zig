@@ -3,6 +3,7 @@ const testing_allocator = @import("testing_allocator.zig");
 const text_utils = @import("text_utils.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const recovery = @import("../recovery/recovery.zig");
+const json_decode = @import("json_decode.zig");
 
 pub const Layout = struct {
     rows: u16,
@@ -45,17 +46,17 @@ pub const SemanticNotice = struct {
     /// An optional dim line under the body, indented like a wrapped body row
     /// and without its own glyph.
     detail: []const u8 = "",
+    /// Where the detail row shows; `.full_only` keeps it to the full transcript.
+    detail_visibility: NoticeVisibility = .compact_and_full,
 };
 
-/// Status glyph leading every semantic notice, keyed by tone. Tool activity
-/// owns "●"; notices deliberately use distinct git-style status glyphs so the
-/// two channels never read as the same raw marker. The neutral marker "*"
-/// avoids the middot, which the footer already uses as a separator.
+/// Status glyph leading every semantic notice, keyed by tone. Tool activity owns "●",
+/// so notices use other marks; "⚠" matches the status line's warning sign, and "*" avoids the footer's middot.
 pub fn noticeGlyph(tone: NoticeTone) []const u8 {
     return switch (tone) {
         .information => "i",
         .success => "✓",
-        .warning => "!",
+        .warning => "⚠",
         .@"error" => "✗",
         .cancelled => "⊘",
         .neutral => "*",
@@ -75,6 +76,7 @@ pub fn dupeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) std.
         .body = body,
         .visibility = notice.visibility,
         .detail = try alloc.dupe(u8, notice.detail),
+        .detail_visibility = notice.detail_visibility,
     };
 }
 
@@ -214,7 +216,35 @@ pub const TurnPresentationOutcome = enum {
 pub const TurnFinished = struct {
     turn_id: u64,
     outcome: TurnPresentationOutcome,
+    /// How the turn's last model reply ended, when one did. A subagent's
+    /// parent reads it to say why a failed turn failed.
+    disposition: ?ProviderCompletionDisposition = null,
 };
+
+/// Why a turn failed when its reply was cut off at the output limit, in the
+/// failure a subagent's parent sees in place of `agent_turn_failed`.
+const output_limit_failure = "output_limit: the reply was cut off at its output-token limit";
+
+/// The failure a turn that ended this way reports, when its own reason says
+/// more than that it failed.
+pub fn turnFailureFor(finished: TurnFinished) ?ModelFailureDiagnostic {
+    if (finished.outcome != .failed) return null;
+    const disposition = finished.disposition orelse return null;
+    return switch (disposition) {
+        .length_limited => ModelFailureDiagnostic.init(output_limit_failure),
+        else => null,
+    };
+}
+
+test "a turn that a cut reply failed reports the output limit" {
+    try std.testing.expectEqualStrings(
+        "output_limit: the reply was cut off at its output-token limit",
+        turnFailureFor(.{ .turn_id = 1, .outcome = .failed, .disposition = .length_limited }).?.view(),
+    );
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .completed, .disposition = .length_limited }) == null);
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .failed }) == null);
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .failed, .disposition = .completed }) == null);
+}
 
 pub const ToolLifecycleId = struct {
     turn_id: u64,
@@ -1452,9 +1482,9 @@ pub const ToolResultMemory = struct {
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
     terminal_action_presentation: ?TerminalActionPresentation = null,
-    /// Set on a running shell result whose wait ended when its command
-    /// crossed the quiet limit (`src/core/execution/quiet_notice.zig`), for
-    /// the note fx relays to a subagent's parent. Only the tool's end event
+    /// Set on a running shell result whose wait ended past the quiet limit
+    /// after seeing the command under it (`src/core/execution/quiet_notice.zig`),
+    /// for the note fx relays to a subagent's parent. Only the tool's end event
     /// reads it; the session never saves it.
     quiet_crossing: ?QuietCrossing = null,
     /// A `subagent` message that made a new subagent, so its row reads
@@ -1481,6 +1511,9 @@ pub const PersistedSteering = struct {
     text: []u8,
     assistant_prefix: ?[]u8 = null,
     after_tool_step_count: usize,
+    /// In-memory only: links to `input_accepted` so `Session.writePieces`
+    /// appends `input_delivered` in the same batch; never written into item JSON.
+    input_id: ?u64 = null,
 };
 
 /// An instruction file a context note delivered: its absolute path and a
@@ -1967,6 +2000,9 @@ pub const UserTurn = struct {
     /// line holding it says; 0 when unknown. For display only: nothing saves
     /// it, and the model never sees it.
     sent_at_ms: i64 = 0,
+    /// In-memory only: links to `input_accepted` so `Session.writePieces`
+    /// appends `input_delivered` in the same batch; never written into item JSON.
+    input_id: ?u64 = null,
 };
 
 /// Borrows both strings; use dupeProviderReplay/freeProviderReplay for ownership.
@@ -1975,6 +2011,9 @@ pub const ProviderReplay = struct {
     /// Joins distinct provider messages in assistant content. Replayed text
     /// spans exclude it, so each message returns to its provider unchanged.
     pub const message_separator = "\n\n";
+    /// The `custom` part kind of OpenAI's compaction item, which later
+    /// requests send back whole.
+    pub const openai_compaction_kind = "openai.compaction";
     source: @import("../config/model_provider.zig").ProviderSelection,
     parts_json: []const u8,
 
@@ -2036,7 +2075,68 @@ pub const ChatMessage = struct {
     /// prompt caching and the model honors such markers, and ignores it
     /// otherwise.
     cache_breakpoint: bool = false,
+    /// In-memory only: links steering to `input_accepted` until persisted into
+    /// `PersistedSteering.input_id`. Never sent to providers or written to JSON.
+    input_id: ?u64 = null,
+    /// What a request to any model but the replay's own sends in place of
+    /// this message, as a user message: fx's exact text of the turns a
+    /// provider's compaction block stands for, which only the model that
+    /// wrote it can read (`tests/tla/compaction/ProviderCompaction.tla` Wire).
+    replay_fallback: ?[]const u8 = null,
+    /// The user's own answer to a question fx asked, which the security
+    /// review and compaction take as the user's words. Set from the call
+    /// that ran and its result (`isUserAnswer`), where the result is made and
+    /// where a saved turn is rebuilt, so a question asked through toolbox
+    /// counts too and fx's note for a cancelled question never does. Never
+    /// saved or sent to a provider.
+    user_answer: bool = false,
 };
+
+/// The tool that asks the user questions.
+pub const user_question_tool_name = "ask_user_question";
+
+/// The user's answers in a question tool's result, which lists each answered
+/// question. Null for any other text, such as fx's note that the user
+/// cancelled the question or that no one could answer it. The answers borrow
+/// `arena`.
+pub fn questionAnswers(arena: std.mem.Allocator, output: []const u8) std.mem.Allocator.Error!?[]const []const u8 {
+    const Answered = struct { answer: []const u8 };
+    const answered = json_decode.parseFromSliceLeaky([]const Answered, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const answers = try arena.alloc([]const u8, answered.len);
+    for (answers, answered) |*answer, item| answer.* = item.answer;
+    return answers;
+}
+
+/// Whether a result with `status` and `output` is the user's own answer to a
+/// question fx asked: one that lists the user's answers (`questionAnswers`).
+/// `ran_tool` is the tool that ran: for a toolbox run, the one it carries,
+/// not `toolbox`, the name its result goes back under.
+pub fn isUserAnswer(alloc: std.mem.Allocator, ran_tool: []const u8, status: ?PersistedToolStatus, output: []const u8) std.mem.Allocator.Error!bool {
+    if (!std.mem.eql(u8, ran_tool, user_question_tool_name) or status == .failure) return false;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    return try questionAnswers(scratch.allocator(), output) != null;
+}
+
+test "only a question's listed answers are the user's answer" {
+    const alloc = std.testing.allocator;
+    const answered = "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"}]";
+    try std.testing.expect(try isUserAnswer(alloc, "ask_user_question", .success, answered));
+    try std.testing.expect(try isUserAnswer(alloc, "ask_user_question", null, answered));
+    try std.testing.expect(!try isUserAnswer(alloc, "ask_user_question", .failure, answered));
+    try std.testing.expect(!try isUserAnswer(alloc, "toolbox", .success, answered));
+    try std.testing.expect(!try isUserAnswer(alloc, "shell", .success, answered));
+    // fx's own notes, which the question tool returns as a success.
+    for ([_][]const u8{
+        "(user cancelled the question)",
+        "(ask_user_question is only available in the interactive shell; ask the user freeform instead)",
+        "(ask_user_question: invalid arguments; provide {questions})",
+        "[{\"question\":\"Choose next step?\"}]",
+    }) |note| try std.testing.expect(!try isUserAnswer(alloc, "ask_user_question", .success, note));
+}
 
 /// Returns a caller-owned shallow projection only when incompatible replay exists.
 pub fn projectProviderReplay(
@@ -2051,8 +2151,25 @@ pub fn projectProviderReplay(
         if (replay.matches(source)) continue;
         if (projected == null) projected = try alloc.dupe(ChatMessage, messages);
         projected.?[index].provider_replay = null;
+        if (message.replay_fallback) |text| projected.?[index] = .{ .role = .user, .content = text, .context_origin = message.context_origin };
     }
     return projected;
+}
+
+test "a compaction block another model cannot read goes as fx's text of the same turns" {
+    const alloc = std.testing.allocator;
+    const writer = @import("../config/model_provider.zig").ProviderSelection{ .provider = .gateway, .model = "anthropic/claude-fable-5.2" };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .content = "block summary", .provider_replay = .{ .source = writer, .parts_json = "[]" }, .replay_fallback = "fx's exact text", .context_origin = .handoff },
+        .{ .role = .user, .content = "next" },
+    };
+    try std.testing.expect(try projectProviderReplay(alloc, &messages, writer) == null);
+    const projected = (try projectProviderReplay(alloc, &messages, .{ .provider = .gateway, .model = "openai/gpt-6.1-sol" })).?;
+    defer alloc.free(projected);
+    try std.testing.expectEqual(ChatRole.user, projected[0].role);
+    try std.testing.expectEqualStrings("fx's exact text", projected[0].content.?);
+    try std.testing.expect(projected[0].provider_replay == null);
+    try std.testing.expectEqualStrings("next", projected[1].content.?);
 }
 
 test "provider replay projection preserves matching origin and excludes other routes" {
@@ -2800,6 +2917,10 @@ pub const AssistantHistoryTurn = struct {
     assistant: []u8,
     execution: ExecutionMemory = .{},
     provider_replay: ?ProviderReplay = null,
+    /// The whole turn, when a compaction inside it cut steps out of
+    /// `execution`: the session log saves it, and resume leaves the cut steps
+    /// out again (D87). fx's history never keeps it (`dropSavedExecution`).
+    saved_execution: ?ExecutionMemory = null,
 };
 
 /// What a turn write does with the recovery module's record for the model
@@ -2811,6 +2932,9 @@ pub const AssistantHistoryTurn = struct {
 pub const RecoveryResume = struct {
     record: ?[32]u8 = null,
     stale: bool = false,
+    /// The request continues a turn that stopped between steps for the
+    /// host's restart (`recovery.zig` `Start.continues`).
+    continues: bool = false,
 };
 
 pub const RecoveryRecordWrite = union(enum) {
@@ -2844,6 +2968,12 @@ pub const InterruptedHistoryTurn = struct {
     /// rather than the turn failing or being cancelled. Only a session's
     /// replay sets it, and nothing saves it.
     stopped_by_exit: bool = false,
+    /// fx stopped the turn between steps for an upgrade's restart
+    /// (`turn_yielded`), and a later turn goes on from it. Only a session's
+    /// replay sets it, and nothing saves it.
+    yielded: bool = false,
+    /// As `AssistantHistoryTurn.saved_execution`.
+    saved_execution: ?ExecutionMemory = null,
 };
 
 pub const CompactedSummaryHistoryTurn = struct {
@@ -2870,8 +3000,14 @@ pub const HistoryTurn = union(enum) {
 
 pub fn setHistoryTurnSummary(turn: *HistoryTurn, summary: TurnSummary) void {
     switch (turn.*) {
-        .assistant => |*entry| entry.execution.turn_summary = summary,
-        .interrupted => |*entry| entry.execution.turn_summary = summary,
+        .assistant => |*entry| {
+            entry.execution.turn_summary = summary;
+            if (entry.saved_execution) |*whole| whole.turn_summary = summary;
+        },
+        .interrupted => |*entry| {
+            entry.execution.turn_summary = summary;
+            if (entry.saved_execution) |*whole| whole.turn_summary = summary;
+        },
         .compacted_summary => {},
     }
 }
@@ -3175,6 +3311,7 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
             alloc.free(entry.assistant);
             if (entry.provider_replay) |replay| freeProviderReplay(alloc, replay);
             freeExecutionMemory(alloc, entry.execution);
+            if (entry.saved_execution) |saved| freeExecutionMemory(alloc, saved);
         },
         .interrupted => |entry| {
             freeUserTurn(alloc, entry.user);
@@ -3182,12 +3319,44 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
             if (entry.tool_call) |tool_call| freeToolCall(alloc, tool_call);
             freeCompletedToolNames(alloc, entry.completed_tool_names);
             freeExecutionMemory(alloc, entry.execution);
+            if (entry.saved_execution) |saved| freeExecutionMemory(alloc, saved);
             if (entry.cancelled_command) |presentation| {
                 freeCancelledCommandPresentation(alloc, presentation);
             }
             if (entry.cancelled_wait) |presentation| freeCancelledWaitPresentation(alloc, presentation);
         },
     }
+}
+
+/// `turn` as the session log saves it: its whole execution in place of the
+/// part fx's history keeps, when a compaction inside it cut steps (D87).
+/// Borrows `turn`.
+pub fn savedHistoryTurn(turn: HistoryTurn) HistoryTurn {
+    var saved = turn;
+    switch (saved) {
+        .assistant => |*entry| if (entry.saved_execution) |whole| {
+            entry.execution = whole;
+            entry.saved_execution = null;
+        },
+        .interrupted => |*entry| if (entry.saved_execution) |whole| {
+            entry.execution = whole;
+            entry.saved_execution = null;
+        },
+        .compacted_summary => {},
+    }
+    return saved;
+}
+
+/// Frees `turn`'s whole execution, which only the session log saves, so fx's
+/// history keeps what the model is sent and nothing more.
+pub fn dropSavedExecution(alloc: std.mem.Allocator, turn: *HistoryTurn) void {
+    const saved = switch (turn.*) {
+        .assistant => |*entry| &entry.saved_execution,
+        .interrupted => |*entry| &entry.saved_execution,
+        .compacted_summary => return,
+    };
+    if (saved.*) |whole| freeExecutionMemory(alloc, whole);
+    saved.* = null;
 }
 
 pub fn freeHistoryTurnSlice(alloc: std.mem.Allocator, turns: []HistoryTurn) void {
@@ -3236,12 +3405,15 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
 
             const execution = try dupeExecutionMemory(alloc, entry.execution);
             errdefer freeExecutionMemory(alloc, execution);
+            const saved_execution = if (entry.saved_execution) |saved| try dupeExecutionMemory(alloc, saved) else null;
+            errdefer if (saved_execution) |saved| freeExecutionMemory(alloc, saved);
             const replay = if (entry.provider_replay) |value| try dupeProviderReplay(alloc, value) else null;
             break :blk .{ .assistant = .{
                 .user = user,
                 .assistant = assistant,
                 .execution = execution,
                 .provider_replay = replay,
+                .saved_execution = saved_execution,
             } };
         },
         .interrupted => |entry| blk: {
@@ -3272,6 +3444,8 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
             errdefer if (cancelled_wait) |presentation| freeCancelledWaitPresentation(alloc, presentation);
 
             const execution = try dupeExecutionMemory(alloc, entry.execution);
+            errdefer freeExecutionMemory(alloc, execution);
+            const saved_execution = if (entry.saved_execution) |saved| try dupeExecutionMemory(alloc, saved) else null;
 
             break :blk .{ .interrupted = .{
                 .user = user,
@@ -3284,6 +3458,8 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .terminal_reason = entry.terminal_reason,
                 .cancellation_origin = entry.cancellation_origin,
                 .stopped_by_exit = entry.stopped_by_exit,
+                .yielded = entry.yielded,
+                .saved_execution = saved_execution,
             } };
         },
     };
@@ -3503,6 +3679,7 @@ pub fn dupePersistedSteering(
             .text = text,
             .assistant_prefix = assistant_prefix,
             .after_tool_step_count = item.after_tool_step_count,
+            .input_id = item.input_id,
         };
         copied += 1;
     }
@@ -3908,10 +4085,12 @@ test "dupeHistoryTurn keeps a turn fx stopped as stopped" {
         .user = .{ .text = @constCast("go") },
         .terminal_reason = .failed,
         .stopped_by_exit = true,
+        .yielded = true,
     } };
     const copy = try dupeHistoryTurn(alloc, source);
     defer freeHistoryTurn(alloc, copy);
     try std.testing.expect(copy.interrupted.stopped_by_exit);
+    try std.testing.expect(copy.interrupted.yielded);
     try std.testing.expectEqual(InterruptedTerminalReason.failed, copy.interrupted.terminal_reason);
 }
 
@@ -4102,6 +4281,7 @@ pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
         .work_id = work_id,
         .author = user.author,
         .sent_at_ms = user.sent_at_ms,
+        .input_id = user.input_id,
     };
 }
 

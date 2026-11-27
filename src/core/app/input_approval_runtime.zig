@@ -267,6 +267,12 @@ pub fn ApprovalRuntime(comptime App: type) type {
                         if (asker) |id| debug_trace.eventf("host", "approval_answered", .{}, "agent={s} screen={s}", .{ id, app.screenAgentId() });
                     }
                     clearApprovalPromptAfterSubmission(app, agent);
+                    // A subagent's request answered on its own screen leaves no
+                    // binding behind, so main's later answer says it no longer
+                    // waits instead of answering it a second time.
+                    if (comptime @hasDecl(App, "withdrawAnsweredApproval")) {
+                        app.withdrawAnsweredApproval(agent);
+                    }
                     app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
                     requestActiveSurfaceFrame(app);
                 },
@@ -372,6 +378,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
 
             if (!already_cancelled and agent.stream.active) {
+                try app.shell.freezeAssistantTail(app.alloc, "cancel_approval");
                 app_worker_runtime.Runtime(App).clearPacer(app, agent, "cancel_approval");
                 app.stopStream(agent);
             }
@@ -458,7 +465,7 @@ test "approval wheel keeps scrolling a committed command review after review syn
         .document_scrollable = true,
     });
 
-    try std.testing.expect(!app.agent().approval_prompt.syncReview(null));
+    try std.testing.expect(!app.agent().approval_prompt.adoptReview(alloc, null, null, null));
     try ApprovalRuntime(WheelApp).handleApprovalWheel(&app, (&app).agent(), .up);
     try std.testing.expectEqual(@as(usize, 3), app.approval_screen.document_scroll_rows);
     try std.testing.expect(app.shell.render_requests.hasReason(.modal));

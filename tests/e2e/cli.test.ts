@@ -21,8 +21,8 @@ import { join, sep } from "node:path";
 import {
   cleanupIsolatedTestHome,
   createIsolatedTestHome,
-  envWithoutFxHome,
   FX_BIN,
+  fxChildEnv,
   HAS_API_KEY,
   REPO_ROOT,
   runFx,
@@ -31,6 +31,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySse,
+  startDynamicFakeGateway,
   startFakeGateway,
   tokenPassCatalog,
 } from "./tmux-helpers";
@@ -365,7 +366,7 @@ describe("cli: help", () => {
       expect(stdout).toContain("Sign in to a model provider");
       expect(stdout).toContain("Sign out of a model provider");
       expect(stdout).toContain("Choose the active model provider");
-      // `fx setup` is deprecated and hidden; `fx login --api-key` replaces it.
+      // `fx login --api-key` replaced the removed `fx setup`.
       expect(stdout).not.toContain("Configure a Vercel AI Gateway API key");
       expect(stdout).toContain("login [vercel|codex|grok] [--api-key]");
       expect(stdout).toContain("Choose a Vercel AI Gateway team");
@@ -796,6 +797,472 @@ describe("cli: closed output pipe", () => {
   }
 });
 
+describe("cli: closed terminal", () => {
+  const PTY_HELPER = [
+    "import fcntl, json, os, pty, select, struct, subprocess, sys, termios, time",
+    "ctty = sys.argv[1].endswith('+ctty')",
+    "mode = sys.argv[1].split('+')[0]",
+    "fx_bin = sys.argv[2]",
+    "cwd = sys.argv[3]",
+    "stderr_path = sys.argv[4]",
+    "needle = sys.argv[5].encode('latin1')",
+    "argv = sys.argv[6:]",
+    "master, slave = pty.openpty()",
+    "fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))",
+    "err_master = err_slave = None",
+    "if mode == 'separate_err':",
+    "    err_master, err_slave = pty.openpty()",
+    "def preexec():",
+    "    # New session. Without TIOCSCTTY closing master sends no SIGHUP; with ctty it does, as a closed window does.",
+    "    os.setsid()",
+    "    if ctty: fcntl.ioctl(slave, termios.TIOCSCTTY, 0)",
+    "    os.dup2(slave, 0)",
+    "    os.dup2(slave, 1)",
+    "    if err_slave is not None:",
+    "        os.dup2(err_slave, 2)",
+    "    else:",
+    "        err_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)",
+    "        os.dup2(err_fd, 2)",
+    "        if err_fd > 2: os.close(err_fd)",
+    "    if slave > 2: os.close(slave)",
+    "    if mode != 'immediate': os.close(master)",
+    "    if err_slave is not None and err_slave > 2: os.close(err_slave)",
+    "    if err_master is not None: os.close(err_master)",
+    "if mode == 'immediate':",
+    "    os.close(master)",
+    "proc = subprocess.Popen([fx_bin] + argv, cwd=cwd, preexec_fn=preexec, close_fds=False)",
+    "os.close(slave)",
+    "if err_slave is not None: os.close(err_slave)",
+    "def drain(fd):",
+    "    chunks = []",
+    "    while True:",
+    "        r, _, _ = select.select([fd], [], [], 0.05)",
+    "        if not r: break",
+    "        try:",
+    "            d = os.read(fd, 4096)",
+    "            if not d: break",
+    "            chunks.append(d)",
+    "        except OSError: break",
+    "    return b''.join(chunks)",
+    "if mode == 'immediate':",
+    "    pass",
+    "elif mode == 'open':",
+    "    out = bytearray()",
+    "    while proc.poll() is None:",
+    "        r, _, _ = select.select([master], [], [], 0.05)",
+    "        if r:",
+    "            try: out.extend(os.read(master, 4096))",
+    "            except OSError: break",
+    "    out.extend(drain(master))",
+    "    os.close(master)",
+    "else:",
+    "    watch_fd = err_master if err_master is not None else master",
+    "    buf = bytearray()",
+    "    sent_11 = False",
+    "    sent_6n = False",
+    "    deadline = time.monotonic() + 8.0",
+    "    while time.monotonic() < deadline:",
+    "        r, _, _ = select.select([watch_fd], [], [], 0.1)",
+    "        if r:",
+    "            try: chunk = os.read(watch_fd, 4096)",
+    "            except OSError: break",
+    "            if not chunk: break",
+    "            buf.extend(chunk)",
+    "            if mode == 'ask_stream':",
+    "                if not sent_11 and b'\\x1b]11;?' in buf:",
+    "                    sent_11 = True",
+    "                    os.write(master, b'\\x1b]11;rgb:0000/0000/0000\\x1b\\\\\\x1b[?1;2c')",
+    "                if not sent_6n and b'\\x1b[6n' in buf:",
+    "                    sent_6n = True",
+    "                    os.write(master, b'\\x1b[1;1R')",
+    "            if needle:",
+    "                if needle in buf:",
+    "                    os.close(master)",
+    "                    if mode == 'ask_stream':",
+    "                        sys.stdout.write('PTY_CLOSED\\n')",
+    "                        sys.stdout.flush()",
+    "                    break",
+    "            elif len(buf) > 0:",
+    "                os.close(master)",
+    "                break",
+    "    else:",
+    "        os.close(master)",
+    "try:",
+    "    rc = proc.wait(timeout=2.0)",
+    "except subprocess.TimeoutExpired:",
+    "    proc.kill()",
+    "    rc = proc.wait(timeout=2.0)",
+    "if err_master is not None:",
+    "    stderr_txt = drain(err_master).decode('utf-8', 'replace')",
+    "    os.close(err_master)",
+    "else:",
+    "    stderr_txt = open(stderr_path, encoding='utf-8', errors='replace').read()",
+    "if ctty and rc < 0: rc = 128 - rc  # killed by a signal: the shell's 128 + signal",
+    "print(json.dumps({'status': rc, 'stderr': stderr_txt}))",
+  ].join("\n");
+
+  async function runInPty(opts: {
+    mode: "immediate" | "open" | "ask_stream" | "wait_needle" | "separate_err";
+    argv: string[];
+    cwd: string;
+    env: Record<string, string | undefined>;
+    needle?: string;
+    onPtyClosed?: () => void;
+    controllingTerminal?: boolean;
+  }): Promise<{ status: number; stderr: string }> {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-pty-")));
+    const stderrPath = join(root, "stderr.log");
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries({ ...process.env, ...opts.env })) {
+      if (v !== undefined) env[k] = v;
+    }
+    const proc = Bun.spawn(
+      [
+        "python3",
+        "-c",
+        PTY_HELPER,
+        opts.controllingTerminal ? `${opts.mode}+ctty` : opts.mode,
+        FX_BIN,
+        opts.cwd,
+        stderrPath,
+        opts.needle ?? "",
+        ...opts.argv,
+      ],
+      { cwd: opts.cwd, env, stdout: "pipe", stderr: "pipe" },
+    );
+    const lines: string[] = [];
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (line === "PTY_CLOSED") opts.onPtyClosed?.();
+          else if (line) lines.push(line);
+        }
+      }
+      if (buf.trim()) lines.push(buf.trim());
+      const exitCode = await proc.exited;
+      const helperErr = await new Response(proc.stderr).text();
+      if (exitCode !== 0) throw new Error(`pty helper failed (${exitCode}): ${helperErr}`);
+      return JSON.parse(lines[lines.length - 1]!);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  function writeSampleReplayTape(path: string) {
+    const magic = Buffer.from("FXTP\x01", "latin1");
+    const ver = Buffer.from("0.0.1", "latin1");
+    const line = Buffer.from("HELLO_REPLAY_FRAME_" + "X".repeat(80) + "\r\n", "latin1");
+    const header = Buffer.alloc(13);
+    header.writeUInt16LE(80, 0);
+    header.writeUInt16LE(24, 2);
+    header.writeBigInt64LE(123456789n, 4);
+    header.writeUInt8(ver.length, 12);
+    const frameHeader = Buffer.alloc(9);
+    frameHeader.writeInt32LE(1, 0);
+    frameHeader.writeUInt8(1, 4);
+    frameHeader.writeUInt32LE(line.length, 5);
+    const frames = Buffer.concat(Array.from({ length: 1200 }, () => Buffer.concat([frameHeader, line])));
+    writeFileSync(path, Buffer.concat([magic, header, ver, frames]));
+  }
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx ask in a terminal closing mid-stream exits 129 with empty stderr",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-ask-pty-stream-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const workspaceFile = join(workspace, "note.txt");
+      writeFileSync(workspaceFile, "hello\n");
+      let releaseTurn2!: () => void;
+      const turn2Gate = new Promise<void>((resolve) => {
+        releaseTurn2 = resolve;
+      });
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes("pty_call_1")) {
+          return fakeGatewaySse([
+            { type: "text-delta", id: "answer_1", delta: "First chunk paragraph." },
+            {
+              type: "tool-call",
+              toolCallId: "pty_call_1",
+              toolName: "read_file",
+              input: { path: "note.txt" },
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: { inputTokens: { total: 2 }, outputTokens: { total: 10 } },
+            },
+          ]);
+        }
+        await turn2Gate;
+        return fakeGatewayFinalText("Second chunk after terminal closed.");
+      });
+      try {
+        const result = await runInPty({
+          mode: "ask_stream",
+          argv: ["ask", "--auto", "Read note.txt and reply."],
+          cwd: workspace,
+          needle: "First chunk paragraph.",
+          onPtyClosed: () => releaseTurn2(),
+          env: {
+            HOME: home,
+            TERM: "xterm-256color",
+            AI_GATEWAY_API_KEY: "pty-hangup-key",
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_SOUND: "0",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+        });
+        expect(result).toEqual({ status: 129, stderr: "" });
+      } finally {
+        releaseTurn2();
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx ask in a terminal closing during the startup probe exits 129 with empty stderr",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-ask-pty-startup-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      try {
+        const result = await runInPty({
+          mode: "wait_needle",
+          argv: ["ask", "--auto", "Say hi."],
+          cwd: workspace,
+          needle: "\x1b[6n",
+          env: {
+            HOME: home,
+            TERM: "xterm-256color",
+            AI_GATEWAY_API_KEY: "pty-startup-key",
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_SOUND: "0",
+            FX_TEST_SKIP_ONBOARDING: "1",
+          },
+        });
+        expect(result).toEqual({ status: 129, stderr: "" });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx replay in a terminal closing mid-write exits 129 with empty stderr",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-replay-pty-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tapePath = join(root, "sample.fxtape");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeSampleReplayTape(tapePath);
+      try {
+        const result = await runInPty({
+          mode: "wait_needle",
+          argv: ["replay", tapePath, "--frames"],
+          cwd: workspace,
+          env: { HOME: home, TERM: "xterm-256color", FX_SOUND: "0", FX_AUTO_UPGRADE: "0" },
+        });
+        expect(result).toEqual({ status: 129, stderr: "" });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx status in a terminal closing at once exits 129 with empty stderr",
+    async () => {
+      const home = createIsolatedTestHome();
+      try {
+        const result = await runInPty({
+          mode: "immediate",
+          argv: ["status"],
+          cwd: home,
+          env: { HOME: home, TERM: "xterm-256color", FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1" },
+        });
+        expect(result).toEqual({ status: 129, stderr: "" });
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx login --api-key with stdin closed exits 129 with empty stderr",
+    async () => {
+      const home = createIsolatedTestHome();
+      try {
+        for (const argv of [["login", "--api-key"]]) {
+          const result = await runInPty({
+            mode: "separate_err",
+            argv,
+            cwd: home,
+            needle: "input hidden",
+            // macOS gives the pty a controlling terminal, as a real window does, so the Keychain prompt stays on it; FXC-451 tracks the hang-up without SIGHUP.
+            controllingTerminal: process.platform === "darwin",
+            env: { HOME: home, TERM: "xterm-256color", FX_SOUND: "0", FX_AUTO_UPGRADE: "0" },
+          });
+          const afterPrompt = result.stderr.split("input hidden): ").slice(1).join("");
+          expect({ status: result.status, afterPrompt }, argv.join(" ")).toEqual({ status: 129, afterPrompt: "" });
+        }
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx login grok with stdin closed exits 129 with empty stderr without hanging",
+    async () => {
+      const home = createIsolatedTestHome();
+      const grokIssuer = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch() {
+          return Response.json({
+            authorization_endpoint: `http://127.0.0.1:${grokIssuer.port}/authorize`,
+            token_endpoint: `http://127.0.0.1:${grokIssuer.port}/token`,
+          });
+        },
+      });
+      try {
+        const result = await runInPty({
+          mode: "wait_needle",
+          argv: ["login", "grok"],
+          cwd: home,
+          needle: "Paste the code",
+          env: {
+            HOME: home,
+            TERM: "xterm-256color",
+            FX_SOUND: "0",
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_NO_OPEN_BROWSER: "1",
+            FX_TEST_GROK_ISSUER_URL: `http://127.0.0.1:${grokIssuer.port}`,
+          },
+        });
+        expect(result).toEqual({ status: 129, stderr: "" });
+      } finally {
+        grokIssuer.stop(true);
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx teams with stdin closed exits 129 with empty stderr and does not pick a team",
+    async () => {
+      const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-teams-pty-hangup-")));
+      const issuer = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch(request) {
+          const url = new URL(request.url);
+          if (url.pathname === "/v2/teams") {
+            return Response.json({
+              teams: [
+                { id: "team_one", slug: "team-one", name: "Team One" },
+                { id: "team_two", slug: "team-two", name: "Team Two" },
+              ],
+            });
+          }
+          return new Response("not found", { status: 404 });
+        },
+      });
+      try {
+        writeSeededFxAuth(home, "team_old", `http://127.0.0.1:${issuer.port}`);
+        const result = await runInPty({
+          mode: "wait_needle",
+          argv: ["teams"],
+          cwd: home,
+          needle: "Select a Vercel team",
+          env: {
+            HOME: home,
+            TERM: "xterm-256color",
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_SOUND: "0",
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_OAUTH_ISSUER_URL: `http://127.0.0.1:${issuer.port}`,
+          },
+        });
+        expect(result).toEqual({ status: 129, stderr: "" });
+        const persisted = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as { team_id?: string };
+        expect(persisted.team_id).toBe("team_old");
+      } finally {
+        issuer.stop(true);
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test("fx replay with a missing tape still reports its file error and exits 1", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-replay-missing-guard-"));
+    try {
+      const r = await runFx(["replay", join(root, "does-not-exist.fxtape")], { cwd: root });
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain("cannot open");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test.skipIf(!Bun.which("python3"))(
+    "fx status on an open terminal still exits 0 with empty stderr",
+    async () => {
+      const home = createIsolatedTestHome();
+      try {
+        const result = await runInPty({
+          mode: "open",
+          argv: ["status"],
+          cwd: home,
+          env: { HOME: home, TERM: "xterm-256color", FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1" },
+        });
+        expect(result).toEqual({ status: 0, stderr: "" });
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+});
+
 describe("cli: status", () => {
   test(
     "status and doctor expose the MCP profile error that blocks ask startup",
@@ -979,6 +1446,82 @@ describe("cli: status", () => {
   );
 
   test(
+    "status and doctor skip one bad entry of ~/.fx/mcp.json with a note, and still show its good entry and the project's server",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-mcp-profile-entry-")));
+      const gateway = startFakeGateway([]);
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        // Disabled, so doctor makes no connection: both still show, as configured.
+        writeFileSync(
+          join(home, ".fx", "mcp.json"),
+          JSON.stringify({
+            mcp: {
+              bad: { type: "http", url: "http://example.com/mcp" },
+              good: { type: "http", url: "http://127.0.0.1:1/mcp", enabled: false },
+            },
+          }) + "\n",
+          { mode: 0o600 },
+        );
+        writeFileSync(join(workspace, ".mcp.json"), JSON.stringify({ mcpServers: { project: { type: "http", url: "http://127.0.0.1:2/mcp", enabled: false } } }) + "\n");
+        const env = {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "mcp-profile-entry-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const statusText = await runFx(["status"], { cwd: workspace, env });
+        const statusJson = await runFx(["status", "--json"], { cwd: workspace, env });
+        const doctorText = await runFx(["doctor"], { cwd: workspace, env });
+        const doctorJson = await runFx(["doctor", "--json"], { cwd: workspace, env });
+
+        const note = "~/.fx/mcp.json server 'bad' was skipped: fx uses plain http only for localhost, 127.0.0.1 and [::1]; use https.";
+        const fix = "fix ~/.fx/mcp.json, then run fx doctor again";
+        const named = (stdout: string) =>
+          (JSON.parse(stdout).mcp.servers as { name: string; source: string }[]).map((server) => `${server.source}:${server.name}`).sort();
+
+        expect(statusText.code, statusText.stderr).toBe(0);
+        expect(statusText.stderr).toBe("");
+        expect(statusText.stdout).not.toContain("mcp_config_error");
+        expect(statusText.stdout).toContain(`[status] mcp_configuration_issue=${note}\n`);
+        expect(statusText.stdout).toContain("[status] mcp_servers=2 mcp_configuration_issues=1\n");
+
+        expect(statusJson.code, statusJson.stderr).toBe(0);
+        const status = JSON.parse(statusJson.stdout);
+        expect(status).not.toHaveProperty("mcp_config_error");
+        expect(status.mcp.servers.map((server: { source: string }) => server.source).sort()).toEqual(["profile", "workspace"]);
+        expect(named(statusJson.stdout)).toEqual(["profile:good", "workspace:project"]);
+        expect(status.mcp.configuration_issues).toEqual([note]);
+        expect(status.mcp.inspection_error).toBeNull();
+        expect(status.mcp.connection_check).toBe("not_checked");
+
+        const doctor = JSON.parse(doctorJson.stdout);
+        expect(doctor.mcp.connection_check).toBe("checked");
+        expect(named(doctorJson.stdout)).toEqual(["profile:good", "workspace:project"]);
+        expect(doctor.mcp.configuration_issues).toEqual([note]);
+        expect(doctor.mcp.inspection_error).toBeNull();
+        const configChecks = doctor.checks.filter((check: { name: string }) => check.name === "mcp_config");
+        expect(configChecks).toEqual([{ name: "mcp_config", status: "fail", detail: note, fix }]);
+        expect(doctorJson.code, doctorJson.stderr).toBe(1);
+        expect(doctorText.stdout).toContain(`  \u2717 mcp_config ${note}\n               fix: ${fix}\n`);
+        expect(doctorText.stdout).not.toContain("failed to load");
+        expect(gateway.requestCount()).toBe(0);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "doctor names unknown settings keys while status stays quiet",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-unknown-settings-")));
@@ -1007,11 +1550,12 @@ describe("cli: status", () => {
         const warnings = JSON.parse(doctor.stdout)
           .checks.filter((check: { name: string; status: string }) => check.name === "config" && check.status === "warn")
           .map((check: { detail: string }) => check.detail);
+        // The old `statusLine` group is an unknown key now, so doctor names its
+        // current key. Its children are not checked, since the group is ignored.
         expect(warnings).toEqual([
           "unknown setting fast_mdoe in ~/.fx/settings.json (did you mean fast_mode?)",
-          "unknown setting statusLine.contxt in ~/.fx/settings.json (did you mean statusLine.context?)",
+          "unknown setting statusLine in ~/.fx/settings.json (did you mean status_line?)",
           `unknown setting efort in ~/.fx/settings.json for workspace ${cwd} (did you mean effort?)`,
-          "statusLine and status_line are both set in ~/.fx/settings.json; fx uses status_line where they differ, so remove statusLine",
           "unknown setting max_agent_step in .fx.json (did you mean max_agent_steps?)",
         ]);
 
@@ -1040,7 +1584,8 @@ describe("cli: status", () => {
         expect(schema.properties.fast_mode).toEqual({ description: "Use faster inference when the model supports it", type: "boolean" });
         expect(schema.properties.permission_mode.enum).toEqual(["ask", "auto", "full-access", "yolo"]);
         expect(schema.properties.auto_compact_percent).toMatchObject({ type: "integer", minimum: 10, maximum: 80 });
-        expect(schema.properties.statusLine.deprecated).toBe(true);
+        expect(schema.properties.statusLine).toBeUndefined();
+        expect(schema.properties.status_line).toMatchObject({ description: "What the footer shows" });
         expect(schema.properties.workspaces.additionalProperties).toEqual({ $ref: "#/$defs/workspace" });
         expect(schema.properties.additional_directories).toBeUndefined();
         expect(schema.$defs.workspace.properties.additional_directories.type).toBe("array");
@@ -1085,7 +1630,7 @@ describe("cli: status", () => {
           JSON.stringify({
             fast_mode: true,
             fast_mdoe: 1,
-            statusLine: { context: true },
+            status_line: { context: true },
             models: { codex: "gpt-5.5" },
             provider_order: ["a", "b"],
             workspaces: { [cwd]: { fast_mode: false } },
@@ -1170,7 +1715,7 @@ describe("cli: status", () => {
         mkdirSync(join(home, ".fx"), { recursive: true });
         mkdirSync(cwd);
         const settingsPath = join(home, ".fx", "settings.json");
-        writeFileSync(settingsPath, JSON.stringify({ statusLine: { session: true } }) + "\n", { mode: 0o600 });
+        writeFileSync(settingsPath, JSON.stringify({ status_line: { session: true } }) + "\n", { mode: 0o600 });
         const env = { ...NO_GATEWAY_AUTH, ...NO_SETTING_ENV, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
         const settings = () => JSON.parse(readFileSync(settingsPath, "utf8"));
 
@@ -1188,7 +1733,7 @@ describe("cli: status", () => {
           changed: true,
           file: "~/.fx/settings.json",
         });
-        const unset = await runFx(["config", "unset", "statusLine.session"], { cwd, env });
+        const unset = await runFx(["config", "unset", "status_line.session"], { cwd, env });
         expect([unset.code, unset.stdout]).toEqual([0, "status_line.session removed from ~/.fx/settings.json.\n"]);
         expect(settings()).toEqual({ fast_mode: true, max_agent_steps: 40 });
         const get = await runFx(["config", "get", "max_agent_steps"], { cwd, env });
@@ -1962,7 +2507,7 @@ describe("cli: status", () => {
             model: 123,
             permission_mode: "danger",
             permission: { bash: true },
-            statusLine: 7,
+            status_line: 7,
             max_agent_steps: 7,
           }) + "\n",
         );
@@ -1987,7 +2532,7 @@ describe("cli: status", () => {
           "fx: config project: ignored_project_user_only_setting; key=permission",
         );
         expect(status.stderr).toContain(
-          "fx: config project: ignored_project_user_only_setting; key=statusLine",
+          "fx: config project: ignored_project_user_only_setting; key=status_line",
         );
         expect(status.stderr).not.toContain("danger");
 
@@ -2928,23 +3473,20 @@ describe("cli: logout", () => {
 
 describe("cli: setup", () => {
   test(
-    "fx setup is a top-level command and fails cleanly when Keychain is disabled",
+    "fx setup is removed: it exits 2 and names fx login vercel --api-key",
     async () => {
-      const r = await runFx(["setup"], {
+      const r = await runFx(["setup", "--anything"], {
         env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" },
       });
-      expect(r.code).toBe(1);
+      expect(r.code).toBe(2);
       expect(r.stdout).toBe("");
-      expect(r.stderr).toBe(
-        "fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n" +
-          "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
-      );
+      expect(r.stderr).toBe("fx: fx setup was removed; use fx login vercel --api-key\n");
     },
     TIMEOUT,
   );
 
   test(
-    "fx login --api-key replaces fx setup and is only for vercel",
+    "fx login --api-key pastes a key and is only for vercel",
     async () => {
       for (const args of [["login", "--api-key"], ["login", "vercel", "--api-key"]]) {
         const disabled = await runFx(args, { env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" } });
@@ -3000,10 +3542,9 @@ exit 99
           },
           timeoutMs: TIMEOUT,
         });
-        expect(r.code).toBe(1);
+        expect(r.code).toBe(2);
         expect(r.stdout).toBe("");
-        expect(r.stderr).toContain("fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n");
-        expect(r.stderr).toContain("interactive terminal is required");
+        expect(r.stderr).toBe("fx: fx setup was removed; use fx login vercel --api-key\n");
         expect(existsSync(invocationLog)).toBe(false);
       } finally {
         rmSync(fakeDir, { recursive: true, force: true });
@@ -3721,6 +4262,58 @@ describe("cli: sessions", () => {
   );
 
   test(
+    "session lists return every session for small and large stores",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-sizes-"));
+      try {
+        // 40 sessions is past sessions_before_helper_threads in
+        // src/core/session/session_catalog_cache.zig, so it takes the helper threads.
+        for (const sessions of [8, 40]) {
+          const home = join(root, `home-${sessions}`);
+          const workspace = join(root, `workspace-${sessions}`);
+          mkdirSync(home);
+          mkdirSync(workspace);
+          const workspaceRoot = realpathSync(workspace);
+          const fixture = spawnSync(
+            "python3",
+            [
+              join(REPO_ROOT, "benchmarks", "session_list_fixture.py"),
+              "--home",
+              home,
+              "--workspace",
+              workspaceRoot,
+              "--sessions",
+              String(sessions),
+              "--log-size",
+              "4096",
+            ],
+            { encoding: "utf8" },
+          );
+          expect(fixture.status).toBe(0);
+
+          const listed = await runFx(["sessions", "--json"], {
+            cwd: workspaceRoot,
+            env: { HOME: home },
+            timeoutMs: TIMEOUT,
+          });
+          expect(listed.code).toBe(0);
+          const page = JSON.parse(listed.stdout);
+          expect(page.count).toBe(sessions);
+          expect(page.sessions.map((session: { id: string }) => session.id)).toEqual(
+            Array.from(
+              { length: sessions },
+              (_, index) => `benchmark-session-${String(sessions - 1 - index).padStart(2, "0")}`,
+            ),
+          );
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "workspace-scoped session discovery filters list and last by cwd",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-workspace-sessions-"));
@@ -4392,10 +4985,7 @@ describe("cli: models", () => {
       });
       const proc = Bun.spawn([FX_BIN, "models", "--json"], {
         cwd: REPO_ROOT,
-        env: {
-          ...envWithoutFxHome(),
-          ...modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
-        },
+        env: fxChildEnv(modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`)),
         stdout: "pipe",
         stderr: "pipe",
       });
@@ -4929,6 +5519,65 @@ describe("cli: replay failures", () => {
         expect(JSON.parse(malformed.stdout.trim())).toMatchObject({
           kind: "replay",
         });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
+/// A tape, as `FX_RECORD` writes one, whose frames are the given stdout reads.
+function stdoutTape(cols: number, rows: number, reads: string[]): Buffer {
+  const version = Buffer.from("test");
+  const header = Buffer.alloc(18);
+  header.write("FXTP\x01", 0, "binary");
+  header.writeUInt16LE(cols, 5);
+  header.writeUInt16LE(rows, 7);
+  header.writeBigInt64LE(0n, 9);
+  header.writeUInt8(version.length, 17);
+  const parts = [header, version];
+  for (const read of reads) {
+    const payload = Buffer.from(read, "binary");
+    const frame = Buffer.alloc(9);
+    frame.writeInt32LE(0, 0);
+    frame.writeUInt8(1, 4);
+    frame.writeUInt32LE(payload.length, 5);
+    parts.push(frame, payload);
+  }
+  return Buffer.concat(parts);
+}
+
+describe("cli: replay", () => {
+  test(
+    "fx replay drops charset designations, also when a read splits one",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-replay-charset-"));
+      try {
+        const tapePath = join(root, "charset.fxtape");
+        writeFileSync(tapePath, stdoutTape(40, 6, [
+          // What `tput sgr0` sends on xterm terminfo.
+          "1 sgr0: A\x1b(B\x1b[mC\r\n",
+          "2 split: A\x1b(",
+          "BC\r\n",
+          // ncurses line drawing; the designation is ignored, not applied.
+          "3 lines: \x1b(0lqqk\x1b(B end\r\n",
+          "4 ESC SP F: A\x1b F C\r\n",
+        ]));
+        const goldenPath = join(root, "golden.txt");
+        const replay = await runFx(["replay", tapePath, "--golden", goldenPath]);
+        expect(replay.code).toBe(0);
+        expect(replay.stderr).toBe("");
+        const rows = readFileSync(goldenPath, "utf8")
+          .split("\n")
+          .slice(0, 4)
+          .map((line) => line.slice(1, -1).trimEnd());
+        expect(rows).toEqual([
+          "1 sgr0: AC",
+          "2 split: AC",
+          "3 lines: lqqk end",
+          "4 ESC SP F: A C",
+        ]);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -5475,6 +6124,60 @@ describe("cli: ask success", () => {
     },
     TIMEOUT,
   );
+
+  // `fx ask` shows no question, so the reply after one starts a new paragraph,
+  // as it does after any other tool.
+  const ASK_QUESTION = { questions: [{ question: "Choose next step?", options: [{ label: "Run tests" }, { label: "Stop" }] }] };
+  for (const [placement, settings, call] of [
+    ["direct", {}, { name: "ask_user_question", input: ASK_QUESTION }],
+    ["toolbox", { tool_placement: { ask_user_question: "toolbox" } }, { name: "toolbox", input: { run: "ask_user_question", arguments: ASK_QUESTION } }],
+  ] as const) {
+    for (const [label, flags] of [["text", []], ["--json", ["--json"]]] as const) {
+      test(
+        `fx ask ${label} starts a new paragraph after a ${placement} question`,
+        async () => {
+          const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-question-break-"));
+          const home = join(root, "home");
+          const workspace = join(root, "workspace");
+          const gateway = startFakeGateway([
+            fakeGatewaySse([
+              { type: "text-delta", id: "prose_1", delta: "One question first." },
+              { type: "tool-call", toolCallId: "ask_1", toolName: call.name, input: call.input },
+              { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+            ]),
+            fakeGatewayFinalText("Done after the question."),
+          ]);
+          try {
+            mkdirSync(join(home, ".fx"), { recursive: true });
+            mkdirSync(workspace);
+            writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify(settings));
+
+            const result = await runFx(["ask", ...flags, "--auto", "--no-save", "Ask me, then finish."], {
+              cwd: realpathSync(workspace),
+              env: {
+                HOME: realpathSync(home),
+                AI_GATEWAY_API_KEY: "fake-question-break-key",
+                VERCEL_OIDC_TOKEN: undefined,
+                FX_GATEWAY_BASE_URL: gateway.baseUrl,
+                FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+                FX_MODEL: FAKE_GATEWAY_MODEL,
+                FX_AUTO_UPGRADE: "0",
+              },
+              timeoutMs: TIMEOUT,
+            });
+
+            expect(result.code, result.stderr).toBe(0);
+            const output = label === "--json" ? JSON.parse(result.stdout).output : result.stdout;
+            expect(output).toBe("One question first.\n\nDone after the question.");
+          } finally {
+            gateway.stop();
+            rmSync(root, { recursive: true, force: true });
+          }
+        },
+        TIMEOUT,
+      );
+    }
+  }
 
   test(
     "fx ask stdin prompts above the old 1 MiB limit reach Gateway byte-for-byte",
@@ -7392,4 +8095,84 @@ describe("fx login Token Pass status", () => {
       rmSync(home, { recursive: true, force: true });
     }
   }, TIMEOUT);
+
+  test(
+    "fx ask --model names the requested model in turn context and keeps the stable prefix unchanged",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace);
+      const modelA = "openai/gpt-5.5";
+      const modelB = "anthropic/claude-opus-4.6";
+      const modelC = "anthropic/claude-sonnet-4.6";
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("ASK_MODEL_A_OK"),
+        fakeGatewayFinalText("ASK_MODEL_B_OK"),
+        fakeGatewayFinalText("ASK_MODEL_C_OK"),
+      ], {
+        models: [
+          { id: modelA, type: "language", tags: ["tool-use"] },
+          { id: modelB, type: "language", tags: ["tool-use"] },
+          { id: modelC, type: "language", tags: ["tool-use"] },
+        ],
+      });
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "fake-ask-model-id-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const askA = await runFx(["ask", "--json", "--no-save", "--model", modelA, "Which model are you?"], {
+          cwd: workspace,
+          env,
+          timeoutMs: TIMEOUT,
+        });
+        expect(askA.code, askA.stderr).toBe(0);
+        const askB = await runFx(["ask", "--json", "--no-save", "--model", modelB, "Which model are you?"], {
+          cwd: workspace,
+          env,
+          timeoutMs: TIMEOUT,
+        });
+        expect(askB.code, askB.stderr).toBe(0);
+        const askC = await runFx(["ask", "--json", "--no-save", "--model", modelC, "Which model are you?"], {
+          cwd: workspace,
+          env,
+          timeoutMs: TIMEOUT,
+        });
+        expect(askC.code, askC.stderr).toBe(0);
+        expect(gateway.requests).toHaveLength(3);
+
+        const reqA = JSON.parse(gateway.requests[0]!.body) as { prompt: Array<{ role: string; content: unknown; providerOptions?: unknown }> };
+        const reqB = JSON.parse(gateway.requests[1]!.body) as { prompt: Array<{ role: string; content: unknown; providerOptions?: unknown }> };
+        const reqC = JSON.parse(gateway.requests[2]!.body) as { prompt: Array<{ role: string; content: unknown; providerOptions?: unknown }> };
+        const sysText = (content: unknown) => typeof content === "string" ? content : JSON.stringify(content);
+        const turnIdxA = reqA.prompt.findIndex((m) => m.role === "system" && sysText(m.content).includes("<fx-turn-context>"));
+        const turnIdxB = reqB.prompt.findIndex((m) => m.role === "system" && sysText(m.content).includes("<fx-turn-context>"));
+        const turnIdxC = reqC.prompt.findIndex((m) => m.role === "system" && sysText(m.content).includes("<fx-turn-context>"));
+        expect(turnIdxA).toBeGreaterThan(0);
+        expect(turnIdxB).toBe(turnIdxA);
+        expect(turnIdxC).toBe(turnIdxA);
+
+        const turnA = sysText(reqA.prompt[turnIdxA]!.content);
+        const turnB = sysText(reqB.prompt[turnIdxB]!.content);
+        const turnC = sysText(reqC.prompt[turnIdxC]!.content);
+        expect(turnA).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelA}\\n`));
+        expect(turnB).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelB}\\n`));
+        expect(turnC).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelC}\\n`));
+        // The stable prefix text before <fx-turn-context> stays identical across model families,
+        // and within the same caching family even the cache breakpoints stay byte-for-byte identical.
+        expect(reqB.prompt.slice(0, turnIdxB).map((m) => m.content)).toEqual(reqA.prompt.slice(0, turnIdxA).map((m) => m.content));
+        expect(JSON.stringify(reqC.prompt.slice(0, turnIdxC))).toBe(JSON.stringify(reqB.prompt.slice(0, turnIdxB)));
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
 });

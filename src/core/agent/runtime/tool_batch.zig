@@ -96,15 +96,18 @@ pub fn appendToolResultContent(
             }
         }
     }
+    const status: types.PersistedToolStatus = accounting.status orelse
+        if (accounting.increment_error) .failure else .success;
     try within_turn_suffix.append(arena, .{
         .role = .tool,
         .content = content,
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.calledName(),
-        .tool_result_status = accounting.status orelse
-            if (accounting.increment_error) .failure else .success,
+        .tool_result_status = status,
         .tool_result_memory = memory,
         .tool_result_created_at_ms = io_mod.milliTimestamp(),
+        // `tool_call` is the call that ran, which a toolbox run carries.
+        .user_answer = try types.isUserAnswer(arena, tool_call.name, status, content),
     });
     if (accounting.record_completion) {
         try runtime_interruption.recordCompletedToolName(arena, completed_tool_names, tool_call.name);
@@ -112,7 +115,7 @@ pub fn appendToolResultContent(
     if (batch.observer) |observer| observer.emit(.{ .tool_result = .{
         .call = tool_call,
         .output = content,
-        .status = accounting.status orelse if (accounting.increment_error) .failure else .success,
+        .status = status,
     } });
 }
 
@@ -497,10 +500,7 @@ pub fn processCommittedFileResult(
         }
     }
     if (reporting_degraded) {
-        hooks.push_system_notice(
-            hooks.ctx,
-            "File change committed, but some secondary reporting failed.",
-        ) catch |err| {
+        hooks.pushWarningNotice("fx saved the file change, but could not report all of it.") catch |err| {
             debug_trace.eventf(
                 "tool",
                 "committed_reporting_warning_failed",

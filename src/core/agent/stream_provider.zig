@@ -145,6 +145,11 @@ pub const NetworkFailureCause = enum {
     /// damaged on the way. Resent a few times; a server that keeps sending
     /// one ends the turn.
     unreadable_reply,
+    /// The OS returned an error code that Zig has no name for, which it
+    /// reports as `error.Unexpected`; `/trace` names the code
+    /// (`src/core/shared/os_errors.zig`). Its cause is not known, so it is
+    /// resent a few times, and a request that keeps getting one ends the turn.
+    unnamed_os_error,
 };
 
 /// Stable native transport evidence consumed by model recovery policy.
@@ -752,6 +757,21 @@ pub const Provider = struct {
     /// The largest request body this provider's transport can carry, when it
     /// has its own limit below any provider's.
     max_request_bytes: ?usize = null,
+    /// Whose own on-demand compaction writes `model`'s compaction block
+    /// through this provider; null when none does.
+    provider_compaction_fn: ?*const fn (model: []const u8) ?model_capabilities.ProviderCompaction = null,
+    /// A reply's provider replay parts hold one compaction block.
+    holds_compaction_block_fn: ?*const fn (alloc: Allocator, parts_json: []const u8) bool = null,
+
+    pub fn providerCompaction(self: Provider, model: []const u8) ?model_capabilities.ProviderCompaction {
+        const find = self.provider_compaction_fn orelse return null;
+        return find(model);
+    }
+
+    pub fn holdsCompactionBlock(self: Provider, alloc: Allocator, parts_json: []const u8) bool {
+        const holds = self.holds_compaction_block_fn orelse return false;
+        return holds(alloc, parts_json);
+    }
     /// Borrows unchanged payloads; projected payloads live in the caller's arena.
     pub fn projectReplay(self: Provider, arena: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
         if (replay == null) return null;

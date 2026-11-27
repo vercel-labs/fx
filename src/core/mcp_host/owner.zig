@@ -1127,6 +1127,7 @@ fn broadcastMessage(owner: *Owner, engine_value: *engine.Engine, a: Allocator, k
                 // The engine lends the words until its next refusal; the frame
                 // copies them, as it copies the list.
                 .list_refusal = refusalMessage(owner, engine_value, a, key),
+                .dropped = droppedMessage(owner, engine_value, key),
                 .tools = toolsJson(owner, engine_value, a, key),
             },
         },
@@ -1174,6 +1175,12 @@ fn refusalMessage(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key
     const index = liveSlotOf(owner, engine_value, key) orelse return null;
     const words = engine_value.status(index).list_refusal orelse return null;
     return a.dupe(u8, words) catch null;
+}
+
+/// How many tools of this server's list its engine left out, by reason, for the frame that carries the list.
+fn droppedMessage(owner: *Owner, engine_value: *engine.Engine, key: core.Key) mcp.tools.Dropped {
+    const index = liveSlotOf(owner, engine_value, key) orelse return .{};
+    return engine_value.status(index).dropped;
 }
 
 fn toolsJson(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key: core.Key) []const u8 {
@@ -1536,7 +1543,7 @@ fn testSocketPair(tag: []const u8) !struct { server: std.Io.net.Stream, peer: st
     const io = testing.io;
     const n = socket_count.fetchAdd(1, .monotonic);
     var buffer: [129]u8 = undefined;
-    const path = try std.fmt.bufPrint(buffer[0..128], "/tmp/fx-owner-{s}-{d}-{d}.sock", .{ tag, std.c.getpid(), n });
+    const path = try std.mem.print(buffer[0..128], "/tmp/fx-owner-{s}-{d}-{d}.sock", .{ tag, std.c.getpid(), n });
     buffer[path.len] = 0;
     const path_z = buffer[0..path.len :0];
     // A file an earlier run left; there need not be one.

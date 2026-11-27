@@ -70,7 +70,7 @@ pub const Refusal = union(enum) {
             .invalid_json => try writer.writeAll("The arguments are not valid JSON. Send one JSON object with \"action\" and the fields that action takes."),
             .invalid_agent => |fault| try writer.writeAll(switch (fault) {
                 .name => agent_name_rule,
-                .parent_target => "stop and close take the name of a subagent you started. \"parent\" is the agent that started you and works only with message.",
+                .parent_target => "stop, close, approve, and deny take the name of a subagent you started. \"parent\" is the agent that started you and works only with message.",
             }),
             .invalid_message => try writer.writeAll(message_rule),
             .invalid_instructions => try writer.writeAll(instructions_rule),
@@ -103,6 +103,7 @@ pub const Refusal = union(enum) {
             .no_parent => |fault| try writer.writeAll(switch (fault) {
                 .none => "You have no parent agent, because you are the main agent. Say it in your reply to the user.",
                 .unreachable_now => "Your parent cannot take a message now. Put it in your final reply instead.",
+                .restarting => "Your parent is restarting for an upgrade and cannot take a message now. Put it in your final reply instead.",
             }),
             .host_failure => |fault| try writer.writeAll(switch (fault) {
                 .subagent_limit => subagent_limit,
@@ -164,6 +165,9 @@ const ParentFault = enum {
     none,
     /// The caller has a parent that cannot take a message now.
     unreachable_now,
+    /// The caller's parent stops its turn while fx restarts for an
+    /// upgrade, and takes no message before fx exits.
+    restarting,
 };
 
 const HostFault = enum {
@@ -281,6 +285,7 @@ const samples = [_]Refusal{
     .{ .queue_full = .parent },
     .{ .no_parent = .none },
     .{ .no_parent = .unreachable_now },
+    .{ .no_parent = .restarting },
     .{ .host_failure = .subagent_limit },
     .{ .host_failure = .internal },
 };
@@ -330,6 +335,7 @@ test "the host, the decoder and the provider name no code outside Refusal unless
         "child_cancelled",
         "child_interrupted",
         "child_lost",
+        "approval_not_answered",
     };
     const needle = "error_code" ++ " = \"";
     var found: usize = 0;

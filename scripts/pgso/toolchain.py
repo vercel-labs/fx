@@ -69,6 +69,8 @@ class Toolchain:
     llvm_profdata: pathlib.Path
     llvm_ar: pathlib.Path
     llvm_nm: pathlib.Path
+    llvm_link: pathlib.Path
+    llvm_split: pathlib.Path
     clang: pathlib.Path
     libllvm: pathlib.Path
     ir_size: pathlib.Path
@@ -114,6 +116,8 @@ class Toolchain:
             "llvm-profdata",
             "llvm-ar",
             "llvm-nm",
+            "llvm-link",
+            "llvm-split",
             "clang",
         ):
             candidate = llvm_root / name
@@ -148,6 +152,8 @@ class Toolchain:
             llvm_profdata=llvm_tools["llvm-profdata"],
             llvm_ar=llvm_tools["llvm-ar"],
             llvm_nm=llvm_tools["llvm-nm"],
+            llvm_link=llvm_tools["llvm-link"],
+            llvm_split=llvm_tools["llvm-split"],
             clang=llvm_tools["clang"],
             libllvm=libllvm,
             ir_size=IR_SIZE_SCRIPT,

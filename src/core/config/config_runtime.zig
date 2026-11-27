@@ -547,6 +547,33 @@ pub fn loadProjectMcpChoicesFromHome(
     return result;
 }
 
+/// Reads whether the profile trusts the folder; the caller passes its real path.
+pub fn loadWorkspaceTrustFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    workspace_root: []const u8,
+) !bool {
+    var store = try settings_store.Store.initFromHome(alloc, home, .read_only);
+    defer store.deinit(alloc);
+    var primary = try store.loadPrimary(alloc);
+    defer primary.deinit(alloc);
+    const bytes = switch (primary) {
+        .absent => return false,
+        .valid => |value| value,
+        .invalid => return error.InvalidSettingsFormat,
+        .oversized => return error.SettingsPrimaryTooLarge,
+    };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSettingsFormat;
+    const workspaces = parsed.value.object.get("workspaces") orelse return false;
+    if (workspaces != .object) return error.InvalidSettingsFormat;
+    const workspace = workspaces.object.get(normalizeWorkspaceRoot(workspace_root)) orelse return false;
+    if (workspace != .object) return false;
+    const trusted = workspace.object.get(settings_keys.workspace_trusted_key) orelse return false;
+    return trusted == .bool and trusted.bool;
+}
+
 pub fn loadMergedSettingsFromHome(alloc: Allocator, home_dir: []const u8, workspace_root: []const u8) !Settings {
     var paths = try discoverPathsFromHome(alloc, home_dir, workspace_root);
     defer paths.deinit(alloc);
@@ -684,7 +711,6 @@ fn loadMergedSettingsDetailedWithOptionalHome(
                     &detailed_merge_state,
                     parsed.value,
                     .project,
-                    false,
                     .project,
                     .project,
                     .none,
@@ -715,7 +741,6 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             &detailed_merge_state,
             parsed.value,
             .profile,
-            false,
             .user,
             .user_global,
             .user,
@@ -755,7 +780,6 @@ fn loadMergedSettingsDetailedWithOptionalHome(
                         &detailed_merge_state,
                         workspace_value,
                         .profile,
-                        true,
                         .user,
                         .user_workspace,
                         .local,
@@ -925,14 +949,12 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
         if (workspace.get("prompt_history")) |value| {
             if (value == .object and value.object.contains("enabled")) return true;
         }
-        for ([_]?std.json.Value{ workspace.get("statusLine"), workspace.get("status_line") }) |group| {
-            if (group) |value| {
-                if (value == .object and
-                    (value.object.contains("context") or
-                        value.object.contains("session")))
-                {
-                    return true;
-                }
+        if (workspace.get("status_line")) |value| {
+            if (value == .object and
+                (value.object.contains("context") or
+                    value.object.contains("session")))
+            {
+                return true;
             }
         }
     }
@@ -973,7 +995,7 @@ fn salvageProviderRouting(alloc: Allocator, settings: *Settings, sources: *Confi
         routing_only.put(alloc, key, field) catch return error.OutOfMemory;
     }
     if (routing_only.count() == 0) return false;
-    var salvaged = parseSettingsValueForLayer(alloc, .{ .object = routing_only }, layer, false, false) catch |err| switch (err) {
+    var salvaged = parseSettingsValueForLayer(alloc, .{ .object = routing_only }, layer, false) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidProviderRouting,
     };
@@ -1039,7 +1061,6 @@ fn mergeDetailedSettingsLayer(
     state: *const DetailedSettingsMergeState,
     value: std.json.Value,
     settings_layer: SettingsLayer,
-    tolerate_non_object_user_containers: bool,
     diagnostic_layer: ConfigLayer,
     source: ConfigSource,
     permission_source: DetailedPermissionSource,
@@ -1048,7 +1069,6 @@ fn mergeDetailedSettingsLayer(
         alloc,
         value,
         if (source == .user_workspace) .profile_workspace else settings_layer,
-        tolerate_non_object_user_containers,
         source != .user_workspace,
     )) |layer_settings| {
         var incoming = layer_settings;
@@ -1246,6 +1266,25 @@ pub fn attemptProjectMcpMutation(
     return .{ .outcome = outcome };
 }
 
+/// Saves that the profile trusts the folder; the caller passes its real path.
+pub fn attemptWorkspaceTrustInHome(
+    alloc: Allocator,
+    home: []const u8,
+    workspace_root: []const u8,
+) CommitAttempt {
+    var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
+        return .{ .failure = .{ .err = err } };
+    };
+    defer store.deinit(alloc);
+    const outcome = store.applyWorkspaceTrustMutation(alloc, .{
+        .workspace_root = workspace_root,
+    }) catch |err| return .{ .failure = .{
+        .err = err,
+        .cleanup = store.takeFailureCleanup(),
+    } };
+    return .{ .outcome = outcome };
+}
+
 pub fn setUserPreferences(
     alloc: Allocator,
     patch: UserSettingsPatch,
@@ -1369,7 +1408,7 @@ pub fn loadMergedSettingsFromPaths(alloc: Allocator, paths: Paths) !Settings {
 
         try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
 
-        var user_settings = try parseSettingsValueForLayer(alloc, parsed.value, .profile, false, true);
+        var user_settings = try parseSettingsValueForLayer(alloc, parsed.value, .profile, true);
         defer user_settings.deinit(alloc);
         user_settings.context_limits.retag(.user_global);
         try mergeSettings(&settings, &user_settings, alloc);
@@ -1471,7 +1510,7 @@ fn mergeWorkspaceOverridesFromValue(target: *Settings, alloc: Allocator, root_va
     const override_val = workspaces_val.object.get(workspace_root) orelse return;
     if (override_val != .object) return;
 
-    var override_settings = try parseSettingsValueForLayer(alloc, override_val, .profile_workspace, true, false);
+    var override_settings = try parseSettingsValueForLayer(alloc, override_val, .profile_workspace, false);
     defer override_settings.deinit(alloc);
     override_settings.update_channel = null;
     override_settings.context_limits.retag(.user_workspace);
@@ -1504,7 +1543,7 @@ fn readOptionalFile(alloc: Allocator, path: []const u8) !?[]u8 {
 }
 
 /// One `--config key=value` for a single run, with the value already checked
-/// and in settings-file form. The key is dotted, such as `statusLine.context`.
+/// and in settings-file form. The key is dotted, such as `status_line.context`.
 pub const SettingOverride = struct {
     key: []const u8,
     value: std.json.Value,
@@ -1571,7 +1610,7 @@ pub fn applySettingOverrides(alloc: Allocator, settings: *Settings, overrides: [
         try parent.value_ptr.object.put(scratch, override.key[dot + 1 ..], override.value);
     }
 
-    var incoming = try parseSettingsValueForLayer(alloc, .{ .object = root }, .profile, false, true);
+    var incoming = try parseSettingsValueForLayer(alloc, .{ .object = root }, .profile, true);
     defer incoming.deinit(alloc);
     try mergeSettings(settings, &incoming, alloc);
     // Like git's GIT_* variables over -c, an FX_* override still wins.
@@ -1594,7 +1633,7 @@ fn parseSettingsJson(alloc: Allocator, json_text: []const u8) !Settings {
 fn parseSettingsJsonForLayer(alloc: Allocator, json_text: []const u8, layer: SettingsLayer) !Settings {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_text, .{});
     defer parsed.deinit();
-    return parseSettingsValueForLayer(alloc, parsed.value, layer, false, true);
+    return parseSettingsValueForLayer(alloc, parsed.value, layer, true);
 }
 
 const JsonStringToken = struct {
@@ -1771,7 +1810,6 @@ fn parseSettingsValueForLayer(
     alloc: Allocator,
     root: std.json.Value,
     layer: SettingsLayer,
-    tolerate_non_object_user_containers: bool,
     parse_workspace_statusline: bool,
 ) !Settings {
     if (root != .object) return error.InvalidSettingsShape;
@@ -1786,7 +1824,6 @@ fn parseSettingsValueForLayer(
         &settings,
         alloc,
         root,
-        tolerate_non_object_user_containers,
         parse_workspace_statusline,
     );
     try parseProjectSafeFields(&settings, alloc, root);
@@ -1798,7 +1835,6 @@ fn parseProfileOnlyFields(
     settings: *Settings,
     alloc: Allocator,
     root: std.json.Value,
-    tolerate_non_object_user_containers: bool,
     parse_workspace_statusline: bool,
 ) !void {
     if (root.object.contains("skill_match_fuzzy")) return error.RetiredSkillMatchFuzzy;
@@ -1981,44 +2017,33 @@ fn parseProfileOnlyFields(
         }
     }
 
-    // `status_line` and `sound` were `statusLine` and `notifications`. The
-    // older name is read first, so the current one wins any value both set.
-    // The current names were unknown keys before, which startup ignores, so a
-    // value under one that isn't an object is still ignored.
-    for ([_]?std.json.Value{ root.object.get("statusLine"), root.object.get("status_line") }, 0..) |group, index| {
-        if (group) |value| {
-            if (value != .object) {
-                if (index == 1) {
-                    debug_trace.logf("config", "ignoring status_line: not an object", .{});
-                    continue;
-                }
-                if (!tolerate_non_object_user_containers) return error.InvalidStatusLineType;
-            } else {
-                if (value.object.get("context")) |v| {
-                    if (v != .bool) return error.InvalidStatusLineContextType;
-                    settings.statusline_context = v.bool;
-                }
-                if (value.object.get("session")) |v| {
-                    if (v != .bool) return error.InvalidStatusLineSessionType;
-                    settings.statusline_session = v.bool;
-                }
-                if (parse_workspace_statusline) {
-                    if (value.object.get("workspace")) |v| {
-                        if (v != .bool) return error.InvalidStatusLineWorkspaceType;
-                        settings.statusline_workspace = v.bool;
-                    }
+    // `status_line` and `sound` are read as they are saved. A value that isn't
+    // an object is ignored, as fx ignores any key it doesn't use.
+    if (root.object.get("status_line")) |value| {
+        if (value != .object) {
+            debug_trace.logf("config", "ignoring status_line: not an object", .{});
+        } else {
+            if (value.object.get("context")) |v| {
+                if (v != .bool) return error.InvalidStatusLineContextType;
+                settings.statusline_context = v.bool;
+            }
+            if (value.object.get("session")) |v| {
+                if (v != .bool) return error.InvalidStatusLineSessionType;
+                settings.statusline_session = v.bool;
+            }
+            if (parse_workspace_statusline) {
+                if (value.object.get("workspace")) |v| {
+                    if (v != .bool) return error.InvalidStatusLineWorkspaceType;
+                    settings.statusline_workspace = v.bool;
                 }
             }
         }
     }
 
-    for ([_]?std.json.Value{ root.object.get("notifications"), root.object.get("sound") }, 0..) |group, index| {
-        if (group) |sound_value| {
-            if (sound_value != .object) {
-                if (index == 0) return error.InvalidNotificationsType;
-                debug_trace.logf("config", "ignoring sound: not an object", .{});
-                continue;
-            }
+    if (root.object.get("sound")) |sound_value| {
+        if (sound_value != .object) {
+            debug_trace.logf("config", "ignoring sound: not an object", .{});
+        } else {
             if (sound_value.object.get("turn_end")) |value| {
                 if (value != .bool) return error.InvalidNotificationTurnEndType;
                 settings.notification_turn_end = value.bool;
@@ -3143,28 +3168,23 @@ test "review_model parses, merges, and yields to FX_REVIEW_MODEL" {
     try std.testing.expectEqualStrings("process/review", result.settings.review_model.?);
 }
 
-test "renamed groups read either spelling and the current one wins" {
+test "old renamed groups are not read; status_line and sound are" {
     const alloc = std.testing.allocator;
     var both = try parseSettingsJson(alloc,
         \\{"status_line":{"context":true},"statusLine":{"context":false,"session":true},
         \\ "sound":{"max":true},"notifications":{"max":false,"turn_end":true}}
     );
     defer both.deinit(alloc);
-    try std.testing.expect(both.statusline_context.? and both.statusline_session.?);
-    try std.testing.expect(both.notification_max.? and both.notification_turn_end.?);
+    try std.testing.expect(both.statusline_context.?);
+    try std.testing.expect(both.statusline_session == null);
+    try std.testing.expect(both.notification_max.?);
+    try std.testing.expect(both.notification_turn_end == null);
 
-    var older = try parseSettingsJson(alloc, "{\"statusLine\":{\"session\":true},\"notifications\":{\"attention_required\":false}}");
-    defer older.deinit(alloc);
-    try std.testing.expect(older.statusline_session.?);
-    try std.testing.expect(!older.notification_attention_required.?);
-
-    // The current names were unknown keys before the rename, so a stray value
-    // of another type under one is ignored, not a startup failure.
+    // A current group that isn't an object is ignored, as any unused value is.
     var stray = try parseSettingsJson(alloc, "{\"sound\":false,\"status_line\":7,\"notifications\":{\"max\":true}}");
     defer stray.deinit(alloc);
-    try std.testing.expect(stray.notification_max.?);
+    try std.testing.expect(stray.notification_max == null);
     try std.testing.expect(stray.statusline_context == null);
-    try std.testing.expectError(error.InvalidNotificationsType, parseSettingsJson(alloc, "{\"notifications\":\"on\"}"));
 }
 
 test "an FX_* override beats a setting override for one run" {
@@ -3181,15 +3201,15 @@ test "an FX_* override beats a setting override for one run" {
 
 test "setting overrides sit above the files, nest dotted keys, and keep the last value" {
     const alloc = std.testing.allocator;
-    var settings = try parseSettingsJson(alloc, "{\"fast_mode\":false,\"effort\":\"low\",\"theme\":\"dark\",\"statusLine\":{\"session\":true}}");
+    var settings = try parseSettingsJson(alloc, "{\"fast_mode\":false,\"effort\":\"low\",\"theme\":\"dark\",\"status_line\":{\"session\":true}}");
     defer settings.deinit(alloc);
 
     try applySettingOverrides(alloc, &settings, &.{
         .{ .key = "fast_mode", .value = .{ .bool = true } },
         .{ .key = "effort", .value = .{ .string = "medium" } },
         .{ .key = "effort", .value = .{ .string = "high" } },
-        .{ .key = "statusLine.context", .value = .{ .bool = true } },
-        .{ .key = "statusLine.workspace", .value = .{ .bool = true } },
+        .{ .key = "status_line.context", .value = .{ .bool = true } },
+        .{ .key = "status_line.workspace", .value = .{ .bool = true } },
         .{ .key = "theme", .value = .{ .string = "light" } },
     });
     try std.testing.expect(settings.fast_mode.?);
@@ -3840,6 +3860,44 @@ test "user effort preference preserves unrelated workspace override keys" {
     try std.testing.expect((try workspaceOverrideObject(&parsed.value, workspace_root)).get("effort") == null);
 }
 
+test "workspace trust counts only a true boolean for the exact folder" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "empty-home");
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"workspaces\":{\"/r\":{\"trusted\":true},\"/s\":{\"trusted\":\"yes\"},\"/t\":{}}}",
+    );
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const empty_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "empty-home");
+    defer alloc.free(empty_home);
+
+    try std.testing.expect(try loadWorkspaceTrustFromHome(alloc, home, "/r"));
+    try std.testing.expect(try loadWorkspaceTrustFromHome(alloc, home, "/r/"));
+    try std.testing.expect(!try loadWorkspaceTrustFromHome(alloc, home, "/s"));
+    try std.testing.expect(!try loadWorkspaceTrustFromHome(alloc, home, "/t"));
+    try std.testing.expect(!try loadWorkspaceTrustFromHome(alloc, home, "/u"));
+    try std.testing.expect(!try loadWorkspaceTrustFromHome(alloc, empty_home, "/r"));
+}
+
+test "a saved workspace trust grant is read back" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    var attempt = attemptWorkspaceTrustInHome(alloc, home, "/r");
+    defer attempt.deinit(alloc);
+    try std.testing.expect(attempt == .outcome);
+    try std.testing.expect(try loadWorkspaceTrustFromHome(alloc, home, "/r"));
+}
+
 test "user fast mode preference writes bool and preserves unrelated keys" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3930,12 +3988,12 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try writeFixtureFile(
         tmp.dir,
         "home/.fx/settings.json",
-        "{\"model\":\"profile/model\",\"permission_mode\":\"auto\",\"permission\":{\"bash\":{\"profile *\":\"allow\"}},\"prompt_history\":{\"enabled\":true},\"statusLine\":{\"sandbox\":true,\"context\":false},\"first_call_tool_choice\":\"none\",\"review_model\":\"profile/review\",\"auto_upgrade\":false,\"update_channel\":\"dev\",\"fast_mode\":false,\"input_appearance\":\"tint\",\"maxxing_mode\":\"minimal\",\"slash_menu_categories\":false,\"effort\":\"high\",\"output_level\":\"quiet\",\"startup_scrollback\":false}\n",
+        "{\"model\":\"profile/model\",\"permission_mode\":\"auto\",\"permission\":{\"bash\":{\"profile *\":\"allow\"}},\"prompt_history\":{\"enabled\":true},\"status_line\":{\"sandbox\":true,\"context\":false},\"first_call_tool_choice\":\"none\",\"review_model\":\"profile/review\",\"auto_upgrade\":false,\"update_channel\":\"dev\",\"fast_mode\":false,\"input_appearance\":\"tint\",\"maxxing_mode\":\"minimal\",\"slash_menu_categories\":false,\"effort\":\"high\",\"output_level\":\"quiet\",\"startup_scrollback\":false}\n",
     );
     try writeFixtureFile(
         tmp.dir,
         "workspace/.fx.json",
-        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"statusLine\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"review_model\":\"project/review\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"max_agent_steps\":17}\n",
+        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"status_line\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"review_model\":\"project/review\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"max_agent_steps\":17}\n",
     );
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -3968,7 +4026,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
         "permission_mode",
         "permission",
         "prompt_history",
-        "statusLine",
+        "status_line",
         "skill_match_fuzzy",
         "first_call_tool_choice",
         "review_model",
@@ -4017,7 +4075,7 @@ test "malformed project profile-only settings are ignored before value parsing" 
     try writeFixtureFile(
         tmp.dir,
         "workspace/.fx.json",
-        "{\"model\":123,\"permission_mode\":\"danger\",\"permission\":{\"bash\":true},\"statusLine\":7,\"fast_mode\":\"yes\",\"max_agent_steps\":12}\n",
+        "{\"model\":123,\"permission_mode\":\"danger\",\"permission\":{\"bash\":true},\"status_line\":7,\"fast_mode\":\"yes\",\"max_agent_steps\":12}\n",
     );
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -4032,7 +4090,7 @@ test "malformed project profile-only settings are ignored before value parsing" 
     try std.testing.expectEqual(false, result.settings.fast_mode.?);
     try std.testing.expectEqual(@as(usize, 12), result.settings.max_agent_steps.?);
     try std.testing.expectEqual(@as(usize, 5), result.diagnostics.len);
-    inline for (&.{ "model", "permission_mode", "permission", "statusLine", "fast_mode" }) |key| {
+    inline for (&.{ "model", "permission_mode", "permission", "status_line", "fast_mode" }) |key| {
         try expectIgnoredProjectKey(result.diagnostics, key);
     }
 
@@ -4050,12 +4108,12 @@ test "malformed project profile-only settings are ignored before value parsing" 
 test "global statusline fields parse and merge independently" {
     var target = try parseSettingsJson(
         std.testing.allocator,
-        "{\"statusLine\":{\"sandbox\":false,\"context\":true,\"session\":false,\"workspace\":false}}",
+        "{\"status_line\":{\"sandbox\":false,\"context\":true,\"session\":false,\"workspace\":false}}",
     );
     defer target.deinit(std.testing.allocator);
     var incoming = try parseSettingsJson(
         std.testing.allocator,
-        "{\"statusLine\":{\"session\":true,\"workspace\":true}}",
+        "{\"status_line\":{\"session\":true,\"workspace\":true}}",
     );
     defer incoming.deinit(std.testing.allocator);
 
@@ -4066,35 +4124,34 @@ test "global statusline fields parse and merge independently" {
     try std.testing.expectEqual(true, target.statusline_workspace.?);
 }
 
-test "global statusline rejects malformed containers and fields" {
-    try std.testing.expectError(
-        error.InvalidStatusLineType,
-        parseSettingsJson(std.testing.allocator, "{\"statusLine\":7}"),
-    );
+test "global statusline rejects malformed fields and ignores a non-object group" {
+    var ignored = try parseSettingsJson(std.testing.allocator, "{\"status_line\":7}");
+    defer ignored.deinit(std.testing.allocator);
+    try std.testing.expect(ignored.statusline_context == null);
     var legacy = try parseSettingsJson(
         std.testing.allocator,
-        "{\"statusLine\":{\"sandbox\":\"yes\"}}",
+        "{\"status_line\":{\"sandbox\":\"yes\"}}",
     );
     legacy.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.InvalidStatusLineContextType,
         parseSettingsJson(
             std.testing.allocator,
-            "{\"statusLine\":{\"context\":1}}",
+            "{\"status_line\":{\"context\":1}}",
         ),
     );
     try std.testing.expectError(
         error.InvalidStatusLineSessionType,
         parseSettingsJson(
             std.testing.allocator,
-            "{\"statusLine\":{\"session\":1}}",
+            "{\"status_line\":{\"session\":1}}",
         ),
     );
     try std.testing.expectError(
         error.InvalidStatusLineWorkspaceType,
         parseSettingsJson(
             std.testing.allocator,
-            "{\"statusLine\":{\"workspace\":1}}",
+            "{\"status_line\":{\"workspace\":1}}",
         ),
     );
 }
@@ -4102,7 +4159,7 @@ test "global statusline rejects malformed containers and fields" {
 test "legacy sandbox keys are inert unknown data" {
     var settings = try parseSettingsJson(
         std.testing.allocator,
-        "{\"sandbox\":{\"legacy\":true},\"statusLine\":{\"sandbox\":\"legacy\",\"context\":true}}",
+        "{\"sandbox\":{\"legacy\":true},\"status_line\":{\"sandbox\":\"legacy\",\"context\":true}}",
     );
     defer settings.deinit(std.testing.allocator);
     try std.testing.expectEqual(true, settings.statusline_context.?);
@@ -4120,7 +4177,7 @@ test "workspace statusline is global only in ordinary and detailed loads" {
     defer std.testing.allocator.free(workspace_root);
 
     const user_settings = try std.testing.allocator.print(
-        "{{\"statusLine\":{{\"workspace\":true}},\"workspaces\":{{\"{s}\":{{\"statusLine\":{{\"workspace\":\"ignored\"}}}}}}}}\n",
+        "{{\"status_line\":{{\"workspace\":true}},\"workspaces\":{{\"{s}\":{{\"status_line\":{{\"workspace\":\"ignored\"}}}}}}}}\n",
         .{workspace_root},
     );
     defer std.testing.allocator.free(user_settings);
@@ -4148,7 +4205,7 @@ test "ordinary and detailed loads agree on workspace overrides with legacy statu
     defer std.testing.allocator.free(workspace_root);
 
     const user_settings = try std.testing.allocator.print(
-        "{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"statusLine\":7,\"startup_scrollback\":false}}}}}}\n",
+        "{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"status_line\":7,\"startup_scrollback\":false}}}}}}\n",
         .{workspace_root},
     );
     defer std.testing.allocator.free(user_settings);
@@ -4182,12 +4239,12 @@ test "notification settings default off parse and merge by field" {
 
     var global = try parseSettingsJson(
         std.testing.allocator,
-        "{\"notifications\":{\"turn_end\":true,\"attention_required\":false}}",
+        "{\"sound\":{\"turn_end\":true,\"attention_required\":false}}",
     );
     defer global.deinit(std.testing.allocator);
     var workspace = try parseSettingsJson(
         std.testing.allocator,
-        "{\"notifications\":{\"attention_required\":true,\"max\":true}}",
+        "{\"sound\":{\"attention_required\":true,\"max\":true}}",
     );
     defer workspace.deinit(std.testing.allocator);
     try mergeSettings(&global, &workspace, std.testing.allocator);
@@ -4197,19 +4254,15 @@ test "notification settings default off parse and merge by field" {
     try std.testing.expectEqual(true, global.notification_max.?);
     try std.testing.expectError(
         error.InvalidNotificationTurnEndType,
-        parseSettingsJson(std.testing.allocator, "{\"notifications\":{\"turn_end\":1}}"),
-    );
-    try std.testing.expectError(
-        error.InvalidNotificationsType,
-        parseSettingsJson(std.testing.allocator, "{\"notifications\":true}"),
+        parseSettingsJson(std.testing.allocator, "{\"sound\":{\"turn_end\":1}}"),
     );
     try std.testing.expectError(
         error.InvalidNotificationAttentionRequiredType,
-        parseSettingsJson(std.testing.allocator, "{\"notifications\":{\"attention_required\":\"yes\"}}"),
+        parseSettingsJson(std.testing.allocator, "{\"sound\":{\"attention_required\":\"yes\"}}"),
     );
     try std.testing.expectError(
         error.InvalidNotificationMaxType,
-        parseSettingsJson(std.testing.allocator, "{\"notifications\":{\"max\":\"yes\"}}"),
+        parseSettingsJson(std.testing.allocator, "{\"sound\":{\"max\":\"yes\"}}"),
     );
 }
 
@@ -4224,7 +4277,7 @@ test "notification settings merge global and workspace while project values are 
     defer std.testing.allocator.free(workspace_root);
 
     const user_settings = try std.testing.allocator.print(
-        "{{\"notifications\":{{\"turn_end\":true,\"attention_required\":false}},\"workspaces\":{{\"{s}\":{{\"notifications\":{{\"attention_required\":true}}}}}}}}",
+        "{{\"sound\":{{\"turn_end\":true,\"attention_required\":false}},\"workspaces\":{{\"{s}\":{{\"sound\":{{\"attention_required\":true}}}}}}}}",
         .{workspace_root},
     );
     defer std.testing.allocator.free(user_settings);
@@ -4232,7 +4285,7 @@ test "notification settings merge global and workspace while project values are 
     try writeFixtureFile(
         tmp.dir,
         "workspace/.fx.json",
-        "{\"notifications\":{\"turn_end\":false,\"attention_required\":false}}",
+        "{\"sound\":{\"turn_end\":false,\"attention_required\":false}}",
     );
 
     var ordinary = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
@@ -4246,7 +4299,7 @@ test "notification settings merge global and workspace while project values are 
     try std.testing.expectEqual(true, detailed.settings.notification_attention_required.?);
     try std.testing.expectEqual(ConfigSource.user_global, detailed.sources.notification_turn_end);
     try std.testing.expectEqual(ConfigSource.user_workspace, detailed.sources.notification_attention_required);
-    try expectIgnoredProjectKey(detailed.diagnostics, "notifications");
+    try expectIgnoredProjectKey(detailed.diagnostics, "sound");
 }
 
 test "detailed settings diagnose legacy workspace preferences" {
@@ -4267,7 +4320,7 @@ test "detailed settings diagnose legacy workspace preferences" {
     );
     defer std.testing.allocator.free(workspace_root);
     const fixture = try std.testing.allocator.print(
-        "{{\"model\":\"user/model\",\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/model\",\"statusLine\":{{\"session\":true}}}}}}}}\n",
+        "{{\"model\":\"user/model\",\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/model\",\"status_line\":{{\"session\":true}}}}}}}}\n",
         .{workspace_root},
     );
     defer std.testing.allocator.free(fixture);
@@ -4325,7 +4378,7 @@ test "detailed settings expose target sources and permission views" {
 
     const user_settings = try std.testing.allocator.print(
         "{{\"model\":\"user/model\",\"permission_mode\":\"ask\",\"fast_mode\":true,\"input_appearance\":\"tint\",\"startup_scrollback\":false," ++
-            "\"prompt_history\":{{\"enabled\":false}},\"statusLine\":{{\"sandbox\":true,\"context\":false,\"session\":true}}," ++
+            "\"prompt_history\":{{\"enabled\":false}},\"status_line\":{{\"sandbox\":true,\"context\":false,\"session\":true}}," ++
             "\"permission\":{{\"bash\":{{\"user *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{" ++
             "\"model\":\"workspace/model\",\"permission_mode\":\"auto\",\"input_appearance\":\"lines\",\"sandbox\":\"none\",\"permission\":{{\"bash\":{{\"local *\":\"allow\"}}}}" ++
             "}}}}}}\n",
@@ -5008,7 +5061,7 @@ fn settingsTextAcceptedForTest(layer: SettingsLayer, json: []const u8) !bool {
     const alloc = std.testing.allocator;
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
-    var settings = parseSettingsValueForLayer(alloc, parsed.value, layer, false, false) catch |err| {
+    var settings = parseSettingsValueForLayer(alloc, parsed.value, layer, false) catch |err| {
         if (err == error.OutOfMemory) return err;
         return false;
     };

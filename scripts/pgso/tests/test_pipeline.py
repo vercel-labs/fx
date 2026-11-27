@@ -260,6 +260,8 @@ class PgsoPipelineTests(unittest.TestCase):
             "llvm_profdata": tool_root / "llvm-profdata",
             "llvm_ar": tool_root / "llvm-ar",
             "llvm_nm": tool_root / "llvm-nm",
+            "llvm_link": tool_root / "llvm-link",
+            "llvm_split": tool_root / "llvm-split",
             "clang": tool_root / "clang",
             "libllvm": self.root / "libLLVM.dylib",
             "ir_size": tool_root / "ir_size.py",
@@ -321,11 +323,13 @@ print('{{}}')""",
         actions: pathlib.Path,
         *,
         rerun_output: bytes = b"BC\xc0\xdezig",
+        stdout_before: str = "",
         stderr_before: str = "",
     ) -> pathlib.Path:
         """`zig build pgso-ir --verbose` installs an optimized, wrapped module
-        and prints `stderr_before`, then its compile; that compile run again
-        writes `rerun_output` to its `--verbose-llvm-bc` path."""
+        and prints `stdout_before` and `stderr_before`, then its compile; that
+        compile run again writes `rerun_output` to its `--verbose-llvm-bc`
+        path."""
         return self.write_executable(
             "bitcode-zig",
             f"""import pathlib,sys
@@ -335,6 +339,7 @@ if sys.argv[1] == 'build':
     prefix = pathlib.Path(sys.argv[sys.argv.index('--prefix') + 1])
     (prefix / 'pgso').mkdir(parents=True, exist_ok=True)
     (prefix / 'pgso' / 'fx.bc').write_bytes(b'\\xde\\xc0\\x17\\x0boptimized')
+    sys.stdout.write({stdout_before!r})
     sys.stderr.write({stderr_before!r})
     sys.stderr.write('info(verbose): ' + sys.argv[0] + ' build-exe -Osafe -Mroot=src/main.zig -femit-llvm-bc --name fx --listen=-\\n')
 else:
@@ -425,27 +430,30 @@ if sys.argv[1] == 'build':
 
     def test_emitted_bitcode_rejects_pgso_ir_output_it_only_saw_the_end_of(self) -> None:
         # pgso-ir must print exactly one compile that emits bitcode. When the
-        # capture keeps only the tail, an earlier one can be cut off, and the
-        # one left would pass that check.
-        actions = self.root / "emit-truncated"
+        # capture keeps only the tail of either stream, an earlier one can be
+        # cut off, and the one left would pass that check.
         earlier_compile = "info(verbose): zig build-exe -Mroot=src/other.zig -femit-llvm-bc --listen=-\n"
-        toolchain = dataclasses.replace(
-            self.toolchain,
-            zig=self.write_bitcode_zig(actions, stderr_before=earlier_compile + "x" * 2048 + "\n"),
-            ir_size=self.write_ir_size(actions),
-        )
         self.spec.repo_root.mkdir(parents=True)
+        for stream in ("stdout", "stderr"):
+            with self.subTest(stream=stream):
+                actions = self.root / f"emit-truncated-{stream}"
+                cut_off = {f"{stream}_before": earlier_compile + "x" * 2048 + "\n"}
+                toolchain = dataclasses.replace(
+                    self.toolchain,
+                    zig=self.write_bitcode_zig(actions, **cut_off),
+                    ir_size=self.write_ir_size(actions),
+                )
 
-        with self.assertRaisesRegex(PgsoError, "found 2"):
-            emit_bitcode(toolchain, self.spec, self.paths)
-        actions.unlink()
-        with mock.patch.object(runner, "MAX_CAPTURED_OUTPUT_CHARS", 1024):
-            with self.assertRaisesRegex(PgsoError, "pgso-ir output was truncated"):
-                emit_bitcode(toolchain, self.spec, self.paths)
+                with self.assertRaisesRegex(PgsoError, "found 2"):
+                    emit_bitcode(toolchain, self.spec, self.paths)
+                actions.unlink()
+                with mock.patch.object(runner, "MAX_CAPTURED_OUTPUT_CHARS", 1024):
+                    with self.assertRaisesRegex(PgsoError, "pgso-ir output was truncated"):
+                        emit_bitcode(toolchain, self.spec, self.paths)
 
-        lines = actions.read_text().splitlines()
-        self.assertEqual(1, len(lines))
-        self.assertTrue(lines[0].startswith("zig build pgso-ir "))
+                lines = actions.read_text().splitlines()
+                self.assertEqual(1, len(lines))
+                self.assertTrue(lines[0].startswith("zig build pgso-ir "))
 
     def write_unreproducible_zig(self, actions: pathlib.Path, *, new_result_each_build: bool = False) -> pathlib.Path:
         """Like Zig 0.17.1: the printed compile writes different bytes on every

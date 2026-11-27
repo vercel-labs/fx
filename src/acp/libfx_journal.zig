@@ -10,6 +10,7 @@ const session_runtime = @import("../core/session/session.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const types = @import("../core/shared/types.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const quiesce = @import("../core/quiesce/quiesce.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
 const checkpoint_codec = @import("../core/agent/runtime/checkpoint.zig");
 const execution_memory = @import("../core/agent/execution_memory.zig");
@@ -20,6 +21,8 @@ const Allocator = std.mem.Allocator;
 
 pub const Event = journal.Event;
 pub const max_load_bytes = journal.max_load_bytes;
+/// What a save of the running turn is for (`Journal.yieldsAt`).
+pub const QuiesceKind = quiesce.Boundary.Kind;
 /// What the model is told when libfx continues a turn a crash left open.
 const resume_notice = runtime_execution_memory.resume_notice;
 
@@ -87,12 +90,9 @@ pub const Journal = struct {
     next_turn_id: TurnId = .{},
     open_turn_id: TurnId = .{},
     last_turn_id: TurnId = .{},
-    /// When the running turn stops, in milliseconds since the epoch, if the
-    /// host gave a time: its first progress at or after it yields.
-    yield_at_ms: ?i64 = null,
-    /// Set once the running turn has sent a model request in this prompt. A
-    /// turn yields only after one, so every prompt makes progress.
-    yield_armed: bool = false,
+    /// When the running turn stops: the host's time, if it gave one, and
+    /// whether the prompt has sent a model request yet (`src/core/quiesce/`).
+    quiesce: quiesce.State = .{},
     /// The host stores every input before it hands it in, so a progress that
     /// places one, or a turn's first, need not wait for the host.
     inputs_durable: bool = false,
@@ -194,20 +194,20 @@ pub const Journal = struct {
 
     /// Starts a turn's time limit: `yield_at_ms` is when it stops, or null.
     pub fn startYieldClock(self: *Journal, yield_at_ms: ?i64) void {
-        self.yield_at_ms = yield_at_ms;
-        self.yield_armed = false;
+        _ = quiesce.step(&self.quiesce, .{ .start = .{ .stop_at_ms = yield_at_ms } });
     }
 
-    /// Whether the progress just sent, before a model request at `now_ms`,
-    /// is where the turn yields. The first request of a prompt always goes
-    /// out, so each prompt makes progress however late it starts.
-    pub fn yieldsAt(self: *Journal, now_ms: i64) bool {
-        const deadline = self.yield_at_ms orelse return false;
-        if (!self.yield_armed) {
-            self.yield_armed = true;
-            return false;
-        }
-        return now_ms >= deadline;
+    /// Whether the progress just sent at `now_ms`, a save of kind `kind`, is
+    /// where the turn yields: its time limit has passed, or its host asked it
+    /// to stop (`stop_requested`, from `libfx/yield`). Only the save right
+    /// before a model request can be, and the first request of a prompt always
+    /// goes out, so each prompt makes progress however late it starts.
+    pub fn yieldsAt(self: *Journal, now_ms: i64, kind: QuiesceKind, stop_requested: bool) bool {
+        return quiesce.step(&self.quiesce, .{ .boundary = .{
+            .now_ms = now_ms,
+            .stop_requested = stop_requested,
+            .kind = kind,
+        } }) == .yield;
     }
 
     /// Keeps `checkpoint`, the progress a yield stopped at, as the pending
@@ -218,7 +218,7 @@ pub const Journal = struct {
         self.dropPendingResume(session_alloc);
         self.pending_resume = owned;
         self.pending_resume_yielded = true;
-        self.yield_at_ms = null;
+        self.quiesce.stop_at_ms = null;
     }
 
     fn clearPlaced(self: *Journal, alloc: Allocator) void {
@@ -994,6 +994,24 @@ test "a progress places the follow-up its turn runs" {
     // Nothing is left to settle when the turn ends.
     try session.endUnplaced(alloc, alloc, "session");
     try std.testing.expect(std.mem.find(u8, capture.frames.items, "input_withdrawn") == null);
+}
+
+test "a host's stop request yields the turn at the request save after its first" {
+    const alloc = std.testing.allocator;
+    var capture: TestCapture = .{};
+    defer capture.frames.deinit(alloc);
+    var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
+    var session: Journal = .{ .writer = &writer };
+    defer session.deinit(alloc);
+
+    session.startYieldClock(null);
+    // The prompt's first request goes out, and a compaction or another save
+    // never stops the turn.
+    try std.testing.expect(!session.yieldsAt(0, .request, true));
+    try std.testing.expect(!session.yieldsAt(0, .compaction, true));
+    try std.testing.expect(!session.yieldsAt(0, .other, true));
+    try std.testing.expect(!session.yieldsAt(0, .request, false));
+    try std.testing.expect(session.yieldsAt(0, .request, true));
 }
 
 test "a follow-up whose turn ended before its request is withdrawn, so it never runs again" {

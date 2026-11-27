@@ -21,6 +21,7 @@ const pending_revocation = @import("../auth/pending_revocation.zig");
 const slack = @import("slack.zig");
 const login_words = @import("login_words.zig");
 const runtime_mod = @import("runtime.zig");
+const mcp = @import("../../mcp/mcp.zig");
 const mcp_call_client = @import("mcp_call_client.zig");
 const Host = @import("host.zig").Host;
 
@@ -67,9 +68,8 @@ pub const Command = union(enum) {
     list: struct { json: bool = false },
     show: struct { name: []const u8, json: bool = false },
     /// `login`: sign in to a new HTTP server that needs a login.
-    /// `old_profile`: the older `--profile` named the file, so fx warns.
-    add: struct { name: []const u8, file: config_file.File, entry: config_file.Entry, login: bool = true, old_profile: bool = false },
-    remove: struct { name: []const u8, file: ?config_file.File, old_profile: bool = false },
+    add: struct { name: []const u8, file: config_file.File, entry: config_file.Entry, login: bool = true },
+    remove: struct { name: []const u8, file: ?config_file.File },
     login: struct { name: []const u8, browser: bool },
     logout: []const u8,
     /// Null approves every project server.
@@ -123,7 +123,6 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
     var json = false;
     var project = false;
     var profile = false;
-    var old_profile = false;
     var all = false;
     var no_browser = false;
     var no_login = false;
@@ -145,10 +144,8 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             .json => json = true,
             .project => project = true,
             .global => profile = true,
-            .profile => {
-                profile = true;
-                old_profile = true;
-            },
+            // The flag parser refuses a removed `--profile` before it gets here.
+            .profile => return usage(arena, verb, "{s} {s}: --profile was removed; use --global", .{ p, @tagName(verb) }),
             .all => all = true,
             .no_browser => no_browser = true,
             .no_login => no_login = true,
@@ -182,7 +179,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
                 const command = rest[dash + 1 ..];
                 if (command.len == 0) return usage(arena, verb, "{s} add needs a command after --.", .{p});
                 if (pair_flag == .header) return usage(arena, verb, "--header is for HTTP servers; use --env for a command.", .{});
-                return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .stdio = .{ .command = command[0], .args = command[1..], .env = pairs.items } }, .old_profile = old_profile } } };
+                return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .stdio = .{ .command = command[0], .args = command[1..], .env = pairs.items } } } } };
             }
             // fx knows Slack's address, as `add slack` did before.
             const url = if (n.len == 1 and std.mem.eql(u8, name, "slack")) slack.server_url else url: {
@@ -192,7 +189,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             if (!std.mem.startsWith(u8, url, "https://") and !std.mem.startsWith(u8, url, "http://"))
                 return usage(arena, verb, "'{s}' isn't a URL. A stdio server's command goes after --.", .{url});
             if (pair_flag == .env) return usage(arena, verb, "--env is for stdio servers; use --header for HTTP.", .{});
-            return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } }, .login = !no_login, .old_profile = old_profile } } };
+            return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } }, .login = !no_login } } };
         },
         .call => {
             if (surface == .shell) return usage(arena, verb, "/mcp call runs only in a command that fx's shell tool runs: fx mcp call TOOL [JSON].", .{});
@@ -225,7 +222,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         .show => .{ .show = .{ .name = name, .json = json } },
         .remove => blk: {
             if (project and profile) return usage(arena, verb, "Use --project or --global, not both.", .{});
-            break :blk .{ .remove = .{ .name = name, .file = if (project) .project else if (profile) .profile else null, .old_profile = old_profile } };
+            break :blk .{ .remove = .{ .name = name, .file = if (project) .project else if (profile) .profile else null } };
         },
         .login => .{ .login = .{ .name = name, .browser = !no_browser } },
         .logout => .{ .logout = name },
@@ -242,7 +239,7 @@ fn isHelp(a: []const u8) bool {
 const Flag = enum { json, connect, global, profile, project, env, header, no_browser, no_login, all };
 
 // Each verb's flags, from the lists `fx mcp --help` and shell completion
-// show. `--global` picks ~/.fx/mcp.json; the older `--profile` still works.
+// show. `--global` picks ~/.fx/mcp.json.
 const scope_options = builtin_commands.mcp_scope_options;
 const list_cli_options = builtin_commands.mcp_list_options;
 const list_shell_options = builtin_commands.mcp_list_shell_options;
@@ -348,9 +345,11 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
             \\  list prints every tool of SERVER and search the tools that best
             \\  match QUERY, one per line: the name, a tab, and the description.
             \\  help prints the arguments TOOL takes and what it does.
-            \\  Works only in a command that fx's shell tool runs, while it runs, and
-            \\  asks permission as a direct call of TOOL would; list, search, and
-            \\  help need none and show only the tools that agent may use.
+            \\  Works only in a command that fx's shell tool runs, while that shell
+            \\  call runs, so check a slow job with one short shell call per check,
+            \\  not one long loop. Asks permission as a direct call of TOOL would;
+            \\  list, search, and help need none and show only the tools that agent
+            \\  may use.
             \\  Exits 0 on success, 1 when the call fails, 2 for a usage mistake,
             \\  3 outside a running fx shell call, 4 when too many calls are
             \\  running, 5 when permission is not granted, and 6 when the tool
@@ -485,12 +484,6 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
         .help, .call => {},
         else => if (!std.Io.Dir.path.isAbsolute(c.home)) return error.HomeNotSet,
     }
-    const old_profile = switch (command) {
-        .add => |a| a.old_profile,
-        .remove => |r| r.old_profile,
-        else => false,
-    };
-    if (old_profile) try c.err.print("{s} {s}: --profile " ++ command_specs.deprecated_until ++ "; use --global\n", .{ c.surface.prog(), @tagName(command) });
     return switch (command) {
         .help => |verb| {
             try writeUsage(c.out, c.surface, verb);
@@ -632,7 +625,8 @@ fn list(c: Context, arena: Allocator, json: bool) !u8 {
     return 0;
 }
 
-/// The status in words, as `list`, `show`, and the menu say it.
+/// The status in words, as `list` and `show` say it. An idle server that holds a saved login says "saved login":
+/// nothing has asked its server to take that login, so it is not "signed in".
 pub fn statusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
     return switch (s.state) {
         .disabled => "disabled",
@@ -645,34 +639,92 @@ pub fn statusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
             .ready => if (s.tools_error == null)
                 try arena.print("ready, {d} tool{s}", .{ s.tools, if (s.tools == 1) "" else "s" })
             else if (s.tools == 0)
-                "ready, " ++ tool_list_refused
+                try arena.print("ready, {s}", .{faultText(s, .tool_list, .whole)})
             else
-                try arena.print("ready, {d} tool{s}, " ++ newer_list_refused, .{ s.tools, if (s.tools == 1) "" else "s" }),
+                try arena.print("ready, {d} tool{s}, {s}", .{ s.tools, if (s.tools == 1) "" else "s", faultText(s, .newer_list, .whole) }),
             .connecting => "connecting",
             .retrying => "retrying",
             .failed => "failed",
-            .idle => if (s.signed_in) "signed in" else "not started",
+            .idle => if (s.signed_in) "saved login" else "not started",
             else => unreachable,
         },
     };
 }
 
-/// What a server's status says when fx refused its tool list and has none, and when it refused its newest one
-/// and still serves an older one it accepted.
-const tool_list_refused = "tool list refused";
-const newer_list_refused = "newer list refused";
+/// The status as the `/mcp` menu and its completions say it: how a server runs. A saved login is no part of that,
+/// so an idle server says "not started" whether or not it holds one. `statusText` is what `list` and `show` say.
+pub fn runStatusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
+    var running = s;
+    running.signed_in = false;
+    return statusText(arena, running);
+}
 
-/// The same two facts without the rest of the status, for a place too narrow for it.
-pub fn refusedShort(s: Status) []const u8 {
-    return if (s.tools == 0) tool_list_refused else newer_list_refused;
+/// What a refused tool list is called, by the kind of answer, behind `subject`: "refused", or, for a status that says
+/// the server can't answer now (`mcp.tools.temporary_statuses`), "unavailable (HTTP n)", or in fewer words
+/// "unavailable (n)" and "unavailable". The words of every place that says a list's refusal come from here, spelled
+/// out at compile time.
+fn faultText(s: Status, comptime subject: enum { none, tool_list, newer_list }, comptime form: enum { whole, number, bare }) []const u8 {
+    const lead = switch (subject) {
+        .none => "",
+        .tool_list => "tool list ",
+        .newer_list => "newer list ",
+    };
+    if (s.tools_unavailable == 0) return lead ++ "refused";
+    inline for (mcp.tools.temporary_statuses) |status| {
+        if (s.tools_unavailable == status) return lead ++ switch (form) {
+            .whole => std.fmt.comptimePrint("unavailable (HTTP {d})", .{status}),
+            .number => std.fmt.comptimePrint("unavailable ({d})", .{status}),
+            .bare => "unavailable",
+        };
+    }
+    return lead ++ "unavailable";
+}
+
+/// The status of a refused-list row for a place `width` columns wide: all of it, else the longest of the same facts
+/// in fewer words that fits (`tool list refused`, `list refused`, `refused`; `unavailable (HTTP 503)`, `unavailable`),
+/// so a cut never takes the word that says it. The shortest is returned when none fits.
+pub fn statusThatFits(arena: Allocator, s: Status, width: usize) Allocator.Error![]const u8 {
+    const whole = try runStatusText(arena, s);
+    if (s.tools_error == null or whole.len <= width) return whole;
+    var forms: [4][]const u8 = undefined;
+    var n: usize = 0;
+    forms[n] = if (s.tools == 0) faultText(s, .tool_list, .whole) else faultText(s, .newer_list, .whole);
+    n += 1;
+    if (s.tools_unavailable == 0) {
+        forms[n] = "list refused";
+        forms[n + 1] = "refused";
+        n += 2;
+    } else {
+        forms[n] = faultText(s, .none, .whole);
+        forms[n + 1] = faultText(s, .none, .number);
+        forms[n + 2] = faultText(s, .none, .bare);
+        n += 3;
+    }
+    for (forms[0..n]) |form| if (form.len <= width) return form;
+    return forms[n - 1];
+}
+
+/// Why fx left tools out of a server's list, in words: the one reason they share, or that there is more than one.
+/// `show`, its JSON and the `/mcp` screen all say it this way.
+fn droppedWhy(d: @FieldType(Status, "dropped")) []const u8 {
+    return if (d.single()) |why| why.words() else "more than one reason";
+}
+
+/// How many tools fx left out of the server's list and why, as `show` and the `/mcp` screen say it after "left
+/// out": `1 tool: a field is written twice`. Null when fx kept every tool.
+pub fn droppedText(arena: Allocator, s: Status) Allocator.Error!?[]const u8 {
+    const n = s.dropped.total();
+    if (n == 0) return null;
+    return try arena.print("{d} tool{s}: {s}", .{ n, if (n == 1) "" else "s", droppedWhy(s.dropped) });
 }
 
 /// The line `show` adds after the status when fx refused the server's tool list: the fixed reason, and, when
 /// an older accepted list is still served, that it is. Nothing for a list fx accepted.
 fn writeListRefusal(w: *Writer, s: Status) !void {
     const why = s.tools_error orelse return;
-    if (s.tools == 0) return w.print("  tool list  refused: {s}\n", .{why});
-    try w.print("  tool list  " ++ newer_list_refused ++ ": {s}. fx still uses the older list of {d} tool{s}.\n", .{ why, s.tools, if (s.tools == 1) "" else "s" });
+    const kind = if (s.tools_unavailable == 0) "refused" else "unavailable";
+    if (s.tools == 0) return w.print("  tool list  {s}: {s}\n", .{ kind, why });
+    try w.print("  tool list  newer list {s}: {s}. fx still uses the older list of {d} tool{s}.\n", .{ kind, why, s.tools, if (s.tools == 1) "" else "s" });
 }
 
 fn statusToken(s: Status) []const u8 {
@@ -688,7 +740,7 @@ fn statusToken(s: Status) []const u8 {
             .connecting => "connecting",
             .retrying => "retrying",
             .failed => "failed",
-            .idle => if (s.signed_in) "signed_in" else "not_started",
+            .idle => if (s.signed_in) "saved_login" else "not_started",
             else => unreachable,
         },
     };
@@ -747,6 +799,19 @@ fn writeStatusFields(jw: *std.json.Stringify, s: Status, p: Paths) !void {
     try jw.write(s.last_error);
     try jw.objectField("tools_error");
     try jw.write(s.tools_error);
+    // Null when fx kept every tool of the list; else how many it left out and the one reason they share, or that
+    // there is more than one.
+    try jw.objectField("tools_left_out");
+    if (s.dropped.total() == 0) {
+        try jw.write(null);
+    } else {
+        try jw.beginObject();
+        try jw.objectField("count");
+        try jw.write(s.dropped.total());
+        try jw.objectField("reason");
+        try jw.write(droppedWhy(s.dropped));
+        try jw.endObject();
+    }
 }
 
 /// What loading the config skipped, so a server never vanishes without a reason.
@@ -820,6 +885,7 @@ fn show(c: Context, arena: Allocator, name: []const u8, json: bool) !u8 {
         try w.print("{s}\n", .{try safe(arena, name)});
         try w.print("  status     {s}\n", .{try statusText(arena, status)});
         try writeListRefusal(w, status);
+        if (try droppedText(arena, status)) |left_out| try w.print("  left out   {s}\n", .{left_out});
         if (status.version) |v| try w.print("  version    {s}\n", .{try safe(arena, v)});
         try w.print("  transport  {s}\n", .{@tagName(status.transport)});
         if (server.url) |u| try w.print("  url        {s}\n", .{try safe(arena, u)});
@@ -1370,9 +1436,12 @@ test "parse reads every verb, with flags before --" {
     try testing.expectEqualStrings("1=2", stdio.entry.stdio.env[0].value);
 
     try testing.expectEqual(@as(?config_file.File, .project), (try parseCli(a, &.{ "remove", "--project", "x" })).command.remove.file);
-    // `--global` names the profile file; the older `--profile` still works.
+    // `--global` names the profile file. `--profile` is a removed spelling.
     try testing.expectEqual(@as(?config_file.File, .profile), (try parseCli(a, &.{ "remove", "--global", "x" })).command.remove.file);
-    try testing.expectEqual(@as(?config_file.File, .profile), (try parseCli(a, &.{ "remove", "--profile", "x" })).command.remove.file);
+    switch (try parseCli(a, &.{ "remove", "--profile", "x" })) {
+        .usage => |u| try testing.expect(std.mem.find(u8, u.message, "--profile was removed; use --global") != null),
+        else => return error.TestExpectedUsage,
+    }
     try testing.expectEqual(config_file.File.profile, (try parseCli(a, &.{ "add", "--global", "web", "https://w/mcp" })).command.add.file);
     try testing.expectEqual(@as(?config_file.File, null), (try parseCli(a, &.{ "remove", "x" })).command.remove.file);
     try testing.expect(!(try parseCli(a, &.{ "login", "--no-browser", "x" })).command.login.browser);
@@ -1441,7 +1510,7 @@ test "parse turns mistakes into usage, and old verbs into pointers" {
         .{ .args = &.{ "add", "--env", "A=1", "web", "https://w" }, .message = "--env is for stdio servers; use --header for HTTP." },
         .{ .args = &.{ "add", "--header", "A=1", "web", "--", "node" }, .message = "--header is for HTTP servers; use --env for a command." },
         .{ .args = &.{ "add", "--env", "noequals", "web", "--", "node" }, .message = "--env needs KEY=VALUE." },
-        .{ .args = &.{ "remove", "--project", "--profile", "x" }, .message = "Use --project or --global, not both." },
+        .{ .args = &.{ "remove", "--project", "--global", "x" }, .message = "Use --project or --global, not both." },
         .{ .args = &.{ "add", "--global", "--project", "web", "https://w/mcp" }, .message = "Use --project or --global, not both." },
         .{ .args = &.{ "approve", "--all", "x" }, .message = "fx mcp approve takes a NAME or --all, not both." },
         .{ .args = &.{ "logout", "--json", "x" }, .message = "fx mcp logout: unknown flag --json" },
@@ -1457,7 +1526,7 @@ test "parse turns mistakes into usage, and old verbs into pointers" {
     try testing.expectEqualStrings("'nope' isn't a /mcp command.", (try parse(a, .shell, &.{"nope"})).usage.message);
 }
 
-test "status words follow commands.md, held states first" {
+test "status words: an idle server says a saved login only when it holds one, held states first" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1465,7 +1534,7 @@ test "status words follow commands.md, held states first" {
     var s = base;
     try testing.expectEqualStrings("not started", try statusText(a, s));
     s.signed_in = true;
-    try testing.expectEqualStrings("signed in", try statusText(a, s));
+    try testing.expectEqualStrings("saved login", try statusText(a, s));
     s = base;
     s.state = .ready;
     s.tools = 1;
@@ -1542,7 +1611,7 @@ test "list lines up its columns and keeps hostile names inert" {
     var json: Writer.Allocating = .init(a);
     try writeListJson(&json.writer, statuses[0..1], .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
     try testing.expectEqualStrings(
-        \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools_error":null,"tools":2}]}
+        \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools_error":null,"tools_left_out":null,"tools":2}]}
         \\
     , json.written());
 }
@@ -1571,7 +1640,7 @@ test "a refused tool list shows in the status, the JSON and a line of show, and 
     var json: Writer.Allocating = .init(a);
     try writeListJson(&json.writer, statuses[0..2], .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
     try testing.expectEqualStrings(
-        \\{"servers":[{"name":"none","source":"profile","file":"/h/.fx/mcp.json","transport":"stdio","status":"ready","error":null,"tools_error":"\"tools\" is not a list","tools":0},{"name":"older","source":"profile","file":"/h/.fx/mcp.json","transport":"stdio","status":"ready","error":null,"tools_error":"\"tools\" is not a list","tools":3}]}
+        \\{"servers":[{"name":"none","source":"profile","file":"/h/.fx/mcp.json","transport":"stdio","status":"ready","error":null,"tools_error":"\"tools\" is not a list","tools_left_out":null,"tools":0},{"name":"older","source":"profile","file":"/h/.fx/mcp.json","transport":"stdio","status":"ready","error":null,"tools_error":"\"tools\" is not a list","tools_left_out":null,"tools":3}]}
         \\
     , json.written());
 
@@ -1582,6 +1651,52 @@ test "a refused tool list shows in the status, the JSON and a line of show, and 
         \\  tool list  newer list refused: "tools" is not a list. fx still uses the older list of 3 tools.
         \\
     , lines.written());
+}
+
+test "a tool list answered with a temporary status is unavailable, in the status, the show line and every narrower form" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const words = "the server answered the list with HTTP 503, which is temporary";
+    const none: Status = .{ .name = "web", .source = .profile, .transport = .http, .state = .ready, .tools_error = words, .tools_unavailable = 503 };
+    var older = none;
+    older.tools = 3;
+    var refused = none;
+    refused.tools_error = "the server answered the list with HTTP 403";
+    refused.tools_unavailable = 0;
+    var older_refused = refused;
+    older_refused.tools = 3;
+
+    try testing.expectEqualStrings("ready, tool list unavailable (HTTP 503)", try statusText(a, none));
+    try testing.expectEqualStrings("ready, 3 tools, newer list unavailable (HTTP 503)", try statusText(a, older));
+    try testing.expectEqualStrings("ready, tool list refused", try statusText(a, refused));
+    try testing.expectEqualStrings("ready", statusToken(none));
+
+    var lines: Writer.Allocating = .init(a);
+    for ([_]Status{ none, older, refused }) |s| try writeListRefusal(&lines.writer, s);
+    try testing.expectEqualStrings(
+        \\  tool list  unavailable: the server answered the list with HTTP 503, which is temporary
+        \\  tool list  newer list unavailable: the server answered the list with HTTP 503, which is temporary. fx still uses the older list of 3 tools.
+        \\  tool list  refused: the server answered the list with HTTP 403
+        \\
+    , lines.written());
+
+    // The status in a place `width` columns wide: all of it, else the longest fewer words that fit.
+    const cases = [_]struct { s: Status, width: usize, want: []const u8 }{
+        .{ .s = none, .width = 80, .want = "ready, tool list unavailable (HTTP 503)" },
+        .{ .s = none, .width = 38, .want = "tool list unavailable (HTTP 503)" },
+        .{ .s = none, .width = 31, .want = "unavailable (HTTP 503)" },
+        .{ .s = none, .width = 21, .want = "unavailable (503)" },
+        .{ .s = none, .width = 16, .want = "unavailable" },
+        .{ .s = none, .width = 5, .want = "unavailable" },
+        .{ .s = older, .width = 40, .want = "newer list unavailable (HTTP 503)" },
+        .{ .s = refused, .width = 24, .want = "ready, tool list refused" },
+        .{ .s = refused, .width = 23, .want = "tool list refused" },
+        .{ .s = refused, .width = 16, .want = "list refused" },
+        .{ .s = refused, .width = 11, .want = "refused" },
+        .{ .s = older_refused, .width = 20, .want = "newer list refused" },
+    };
+    for (cases) |case| try testing.expectEqualStrings(case.want, try statusThatFits(a, case.s, case.width));
 }
 
 test "a name that only a misspelled key holds gets a line with the key and the fix, and no other name does" {
@@ -1657,4 +1772,98 @@ test "an MCP file fx can't read gets fx's words, and only mcp.json's own errors 
     try testing.expectEqualStrings("an MCP config file is over 1 MB, the most fx reads; make it smaller", describe(error.StreamTooLong));
     try testing.expectEqualStrings("it is a link that loops or passes through too many links; replace it with a plain file", try whyNot(a, error.SymLinkLoop, "/example/.mcp.json"));
     try testing.expectEqualStrings("it is over 1 MB, the most fx reads; make it smaller", try whyNot(a, error.StreamTooLong, "/example/.mcp.json"));
+}
+
+test "a saved login is said by an idle server only, in words and in JSON, and a connected one says it is ready" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const base: Status = .{ .name = "x", .source = .profile, .transport = .http, .state = .idle };
+    try testing.expectEqualStrings("not started", try statusText(a, base));
+    try testing.expectEqualStrings("not_started", statusToken(base));
+    var saved = base;
+    saved.signed_in = true;
+    try testing.expectEqualStrings("saved login", try statusText(a, saved));
+    try testing.expectEqualStrings("saved_login", statusToken(saved));
+    // A server fx connected and that accepted the login is ready; it is not "saved login".
+    var connected = saved;
+    connected.state = .ready;
+    connected.tools = 2;
+    try testing.expectEqualStrings("ready, 2 tools", try statusText(a, connected));
+    try testing.expectEqualStrings("ready", statusToken(connected));
+    // Every other state keeps its own words with a login kept.
+    const others = [_]struct { state: runtime_mod.State, text: []const u8, token: []const u8 }{
+        .{ .state = .connecting, .text = "connecting", .token = "connecting" },
+        .{ .state = .retrying, .text = "retrying", .token = "retrying" },
+        .{ .state = .failed, .text = "failed", .token = "failed" },
+    };
+    for (others) |o| {
+        var s = saved;
+        s.state = o.state;
+        try testing.expectEqualStrings(o.text, try statusText(a, s));
+        try testing.expectEqualStrings(o.token, statusToken(s));
+    }
+    // A login the server refused is not a saved one, whatever the flag says.
+    var refused = saved;
+    refused.needs_login = true;
+    try testing.expectEqualStrings("needs login", try statusText(a, refused));
+    try testing.expectEqualStrings("needs_login", statusToken(refused));
+}
+
+test "the menu's words for a status are the list's, except that an idle server never says it holds a login" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var s: Status = .{ .name = "x", .source = .profile, .transport = .http, .state = .idle, .signed_in = true };
+    try testing.expectEqualStrings("saved login", try statusText(a, s));
+    try testing.expectEqualStrings("not started", try runStatusText(a, s));
+    const states = [_]runtime_mod.State{ .idle, .connecting, .ready, .retrying, .failed, .disabled, .waiting_for_approval, .rejected, .unsupported };
+    for (states) |state| {
+        for ([_]bool{ false, true }) |held| {
+            s.state = state;
+            s.signed_in = held;
+            s.tools = 2;
+            const menu_words = try runStatusText(a, s);
+            if (state == .idle) {
+                try testing.expectEqualStrings("not started", menu_words);
+            } else {
+                try testing.expectEqualStrings(try statusText(a, s), menu_words);
+            }
+        }
+    }
+}
+
+test "tools fx left out are said once, in the same words, by show's line and the JSON, and kept tools say nothing" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const kept: Status = .{ .name = "kept", .source = .profile, .transport = .stdio, .state = .ready, .tools = 3 };
+    try testing.expect((try droppedText(a, kept)) == null);
+
+    var one = kept;
+    one.dropped.add(.repeated_field, 1);
+    try testing.expectEqualStrings("1 tool: a field is written twice", (try droppedText(a, one)).?);
+    var two = kept;
+    two.dropped.add(.over_limit, 2);
+    try testing.expectEqualStrings("2 tools: a limit on size or nesting is passed", (try droppedText(a, two)).?);
+    var mixed = kept;
+    mixed.dropped.add(.unnamed, 1);
+    mixed.dropped.add(.unusable, 2);
+    try testing.expectEqualStrings("3 tools: more than one reason", (try droppedText(a, mixed)).?);
+
+    // The JSON names the same count and reason, and is null for a list that kept every tool.
+    one.name = "one";
+    mixed.name = "mixed";
+    const statuses = [_]Status{ kept, one, mixed };
+    var json: Writer.Allocating = .init(a);
+    try writeListJson(&json.writer, &statuses, .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, json.written(), .{});
+    const servers = parsed.object.get("servers").?.array.items;
+    try testing.expect(servers[0].object.get("tools_left_out").? == .null);
+    const left_one = servers[1].object.get("tools_left_out").?.object;
+    try testing.expectEqual(@as(i64, 1), left_one.get("count").?.integer);
+    try testing.expectEqualStrings("a field is written twice", left_one.get("reason").?.string);
+    const left_mixed = servers[2].object.get("tools_left_out").?.object;
+    try testing.expectEqual(@as(i64, 3), left_mixed.get("count").?.integer);
+    try testing.expectEqualStrings("more than one reason", left_mixed.get("reason").?.string);
 }

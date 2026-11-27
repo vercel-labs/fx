@@ -21,6 +21,7 @@ const storage = @import("storage.zig");
 const log_mod = @import("log.zig");
 const fold = @import("fold.zig");
 const diag = @import("diag.zig");
+const lock_wait = @import("lock_wait.zig");
 const trace = if (storage.hooks) @import("trace.zig") else struct {};
 
 const hooks = storage.hooks;
@@ -30,6 +31,9 @@ const Log = log_mod.Log;
 /// 256 KB and 0.4 ms at 64 KB. Smaller distances gain little and cost more
 /// log bytes when the folded state (settings, children) is large.
 pub const default_snapshot_every_bytes: u64 = 64 << 10;
+
+/// How long `openResume` sleeps between tries of a held flock.
+const session_lock_retry_ms: u64 = 10;
 
 pub const Options = struct {
     /// How long `openResume` retries a held flock before Busy.
@@ -414,9 +418,12 @@ pub const Session = struct {
     }
 
     /// Before the first turn, a batch without `turn_started` may only hold
-    /// settings; they wait in memory, already framed (seq 2 onward).
+    /// settings or input records; they wait in memory, already framed (seq 2 onward).
     fn hold(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
-        for (bodies) |body| if (body != .set) return error.InvalidTransition;
+        for (bodies) |body| switch (body) {
+            .set, .input_accepted, .input_delivered, .input_withdrawn => {},
+            else => return error.InvalidTransition,
+        };
         const gpa = session.env.gpa;
         const start = session.held.items.len;
         errdefer session.held.shrinkRetainingCapacity(start);
@@ -1120,6 +1127,8 @@ fn needsSync(bodies: []const schema.Body) bool {
             .permissions, .usage, .moved_files => return true,
             .prefs, .title, .workspace, .language, .client_prompt, .tool_identities, .compaction_records, .v1_source => {},
         },
+        // Accepted input records stay unsynced on the input path; a process crash keeps written bytes.
+        .input_accepted, .input_delivered, .input_withdrawn => {},
         else => {},
     };
     return false;
@@ -1295,13 +1304,17 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
 
 fn acquireLock(env: *const Env, lock: storage.File, wait_ms: u64) OpenError!void {
     const io = env.s.io;
-    const step_ms: u64 = 10;
-    var waited: u64 = 0;
-    while (true) {
+    const wait: lock_wait.Wait = .{ .budget_ms = wait_ms, .retry_ms = session_lock_retry_ms };
+    const started = std.Io.Timestamp.now(io, .awake);
+    var sleeps: u64 = 0;
+    // flock has no timed wait, so the wait polls a non-blocking try between short sleeps.
+    while (true) : (sleeps += 1) {
         if (env.s.tryLock(lock) catch |io_err| return storage.ioFault(io_err)) return;
-        if (waited >= wait_ms) return error.Busy;
-        io.sleep(.fromMilliseconds(@intCast(step_ms)), .awake) catch return error.Busy;
-        waited += step_ms;
+        const elapsed_ms = lock_wait.elapsedMs(started, std.Io.Timestamp.now(io, .awake));
+        switch (lock_wait.afterFailedTry(wait, elapsed_ms, sleeps)) {
+            .give_up => return error.Busy,
+            .sleep_ms => |ms| io.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch return error.Busy,
+        }
     }
 }
 
@@ -1852,9 +1865,9 @@ pub fn openForkWithChildren(env: *const Env, options: ForkOptions, children: []c
     const copied = try gpa.alloc(u8, @intCast(point.end - point.line1_end));
     defer gpa.free(copied);
     if ((s.readAt(src, copied, point.line1_end) catch |io_err| return storage.ioFault(io_err)) != copied.len) return error.Io;
-    copyFolded(session, copied, point.seq) catch |err| return forkError(err);
-    // Then one finished work item per copy, after S, so the fork owns them.
     var seq = point.seq;
+    copyFolded(session, copied, point.seq, &seq, created) catch |err| return forkError(err);
+    // Then one finished work item per copy, after S, so the fork owns them.
     for (children, copies) |child, copy| {
         const ids: schema.Body.WorkItem = .{ .child = copy.identity.id, .work_id = child.work_id, .data = child.spawn_data };
         seq += 1;
@@ -1939,8 +1952,8 @@ fn openChildCopy(env: *const Env, options: ChildCopyOptions) ForkError!*Session 
     const copied = try gpa.alloc(u8, @intCast(cut.end - cut.line1_end));
     defer gpa.free(copied);
     if ((s.readAt(src, copied, cut.line1_end) catch |io_err| return storage.ioFault(io_err)) != copied.len) return error.Io;
-    copyFolded(session, copied, cut.seq) catch |err| return forkError(err);
     var seq = cut.seq;
+    copyFolded(session, copied, cut.seq, &seq, cut.ts_ms) catch |err| return forkError(err);
     if (session.state.open_turn) |turn| {
         // At the last copied line's time, which is at or before the cut.
         seq += 1;
@@ -2185,12 +2198,24 @@ fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u6
 /// crc holds, except snapshots: a snapshot records byte offsets, and the
 /// fork's line 1 has a different length, so each snapshot is encoded again
 /// from the fork's own fold at that point, with the same seq and time.
-fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!void {
+/// Any `input_accepted` pending at S is withdrawn right after S so the fork
+/// does not inherit the source's queued prompts.
+fn copyFolded(
+    session: *Session,
+    copied: []const u8,
+    fork_seq: u64,
+    seq: *u64,
+    withdraw_ts_ms: u64,
+) AppendError!void {
     const gpa = session.env.gpa;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var encoded: std.ArrayList(u8) = .empty;
     defer encoded.deinit(gpa);
+    var accepted_ids: std.ArrayList(u64) = .empty;
+    defer accepted_ids.deinit(gpa);
+    var settled_ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer settled_ids.deinit(gpa);
     var at: usize = 0;
     while (std.mem.findScalarPos(u8, copied, at, '\n')) |nl| : (at = nl + 1) {
         _ = arena.reset(.retain_capacity);
@@ -2208,11 +2233,22 @@ fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!
         const header = log_mod.checkLine(line) catch |io_err| return storage.ioFault(io_err);
         if (header.kind) |kind| {
             const body = schema.parseBody(arena.allocator(), kind, log_mod.lineBody(line, header)) catch |io_err| return storage.ioFault(io_err);
+            switch (body) {
+                .input_accepted => |a| try accepted_ids.append(gpa, a.id),
+                .input_delivered, .input_withdrawn => |r| try settled_ids.put(gpa, r.id, {}),
+                else => {},
+            }
             try fold.apply(gpa, &session.state, fork_seq, .{ .seq = header.seq, .offset = start, .body = body });
             if (kind == .snapshot) session.snapshot_base = session.batch.items.len;
         } else {
             session.state.last_seq = header.seq;
         }
+    }
+    for (accepted_ids.items) |input_id| {
+        const entry = try settled_ids.getOrPut(gpa, input_id);
+        if (entry.found_existing) continue;
+        seq.* += 1;
+        try session.frameFolded(seq.*, withdraw_ts_ms, .{ .input_withdrawn = .{ .id = input_id } }, fork_seq);
     }
     // The fork owns no children spawned before its fork point.
     std.debug.assert(session.state.children.items.len == 0);
@@ -3895,6 +3931,95 @@ const session_tests = struct {
         crash(&t, again);
         try expectLockStatus(&t.env, id, .free);
         try testing.expect(try lockFileLength(&t, id) > 0);
+    }
+
+    test "raw log with input_accepted, input_delivered, and input_withdrawn lines reads as known kinds" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+
+        const id = "rawinputtest";
+        const dir = try t.env.s.ensureDir(t.env.root, id);
+        defer t.env.s.closeDir(dir);
+        const blobs = try t.env.s.ensureDir(dir, "blobs");
+        t.env.s.closeDir(blobs);
+
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        const payloads = [_][]const u8{
+            "{\"v\":1,\"seq\":1,\"ts\":1,\"kind\":\"session_created\",\"id\":\"rawinputtest\",\"workspace\":\"/w\",\"role\":\"root\",\"host\":\"app\"",
+            "{\"v\":1,\"seq\":2,\"ts\":2,\"kind\":\"input_accepted\",\"id\":1,\"text\":\"queued\"",
+            "{\"v\":1,\"seq\":3,\"ts\":3,\"kind\":\"turn_started\",\"turn\":1",
+            "{\"v\":1,\"seq\":4,\"ts\":4,\"kind\":\"item\",\"turn\":1,\"type\":\"user\",\"data\":{\"text\":\"hi\"}",
+            "{\"v\":1,\"seq\":5,\"ts\":5,\"kind\":\"input_delivered\",\"id\":1",
+            "{\"v\":1,\"seq\":6,\"ts\":6,\"kind\":\"input_withdrawn\",\"id\":2",
+            "{\"v\":1,\"seq\":7,\"ts\":7,\"kind\":\"turn_committed\",\"turn\":1",
+            "{\"v\":1,\"seq\":8,\"ts\":8,\"kind\":\"closed\"",
+        };
+        for (payloads) |p| try log_mod.appendFramed(gpa, &bytes, p);
+
+        const log_file = try t.env.s.createFile(dir, "log.jsonl");
+        try t.env.s.writeAt(log_file, bytes.items, 0);
+        try t.env.s.sync(log_file);
+        t.env.s.closeFile(log_file);
+        const lock_file = try t.env.s.createFile(dir, "lock");
+        t.env.s.closeFile(lock_file);
+
+        const s = try resumeRoot(&t, id);
+        try closeAndDestroy(s);
+        var page = try session_mod.readPage(&t.env, gpa, id, .start, .forward, 20);
+        defer page.deinit();
+        try testing.expectEqual(@as(usize, 9), page.entries.len);
+        for (page.entries) |entry| {
+            try testing.expect(entry.kind != null);
+            try testing.expect(entry.body != null);
+        }
+    }
+
+    test "input records are held before turn 1, published on turn 1, and do not sync" {
+        try testing.expect(!session_mod.needsSync(&.{.{ .input_accepted = .{ .id = 1, .text = "hi" } }}));
+        try testing.expect(!session_mod.needsSync(&.{.{ .input_delivered = .{ .id = 1 } }}));
+        try testing.expect(!session_mod.needsSync(&.{.{ .input_withdrawn = .{ .id = 2 } }}));
+
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{
+            .{ .input_accepted = .{ .id = 1, .text = "before turn 1" } },
+            .{ .input_withdrawn = .{ .id = 1 } },
+            .{ .input_accepted = .{ .id = 2, .text = "for turn 1" } },
+        });
+        try testing.expectError(error.InvalidTransition, s.append(&.{item}));
+        _ = try s.append(&.{ .turn_started, item, .{ .input_delivered = .{ .id = 2 } }, .turn_committed });
+
+        const accepted_seq = try s.append(&.{.{ .input_accepted = .{ .id = 3, .text = "after turn 1" } }});
+        const delivered_seq = try s.append(&.{.{ .input_delivered = .{ .id = 3 } }});
+        const withdrawn_seq = try s.append(&.{.{ .input_withdrawn = .{ .id = 4 } }});
+        s.sync_mutex.lockUncancelable(io);
+        const synced = s.synced_seq;
+        s.sync_mutex.unlock(io);
+        try testing.expect(synced < accepted_seq);
+        try testing.expect(synced < delivered_seq);
+        try testing.expect(synced < withdrawn_seq);
+
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+        try expectKinds(&t, id, &.{
+            .session_created,
+            .input_accepted,
+            .input_withdrawn,
+            .input_accepted,
+            .turn_started,
+            .item,
+            .input_delivered,
+            .turn_committed,
+            .input_accepted,
+            .input_delivered,
+            .input_withdrawn,
+            .closed,
+        });
     }
 };
 

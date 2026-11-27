@@ -459,10 +459,6 @@ pub fn executeToolCallAuthorized(
         execution_ctx.session_grants = authority.grants;
         execution_ctx.permission_rules = authority.rules;
         execution_ctx.advertised_dynamic_tool_names = authority.integrations;
-        execution_ctx.mcp_access = rebindMcpAuthorityGeneration(
-            execution_ctx.mcp_access,
-            authority.generation,
-        );
     } else {
         execution_ctx.session_grants = request.session_grants;
         execution_ctx.advertised_dynamic_tool_names =
@@ -725,21 +721,6 @@ pub fn executeHostToolCallAuthorized(
         request.call,
     );
     return toolExecutionResultFromDispatch(dispatched, .{});
-}
-
-fn rebindMcpAuthorityGeneration(
-    access: tool_mcp_runtime.Access,
-    authority_generation: u64,
-) tool_mcp_runtime.Access {
-    return switch (access) {
-        .scoped => |scope| .{ .scoped = .{
-            .captured = scope.captured,
-            .admission_authority_generation = scope.admission_authority_generation,
-            .live = scope.live,
-            .action_authority_generation = authority_generation,
-        } },
-        else => access,
-    };
 }
 
 fn containsName(values: []const []const u8, needle: []const u8) bool {
@@ -1066,14 +1047,43 @@ fn authorizeBridgeCall(
     if (ctx.tool_registry.lookup(tool) != null) {
         return .{ .deny = try arena.print("{f} is a built-in tool; fx mcp call runs MCP tools only.", .{text_utils.terminalSafe(tool)}) };
     }
-    const resolved = (try resolveUnselectedMcpTool(ctx, arena, tool)) orelse {
-        return .{ .deny = try arena.print("No MCP tool named {f} is available to this agent. Find tool names with toolbox search.", .{text_utils.terminalSafe(tool)}) };
+    const resolved = switch (try resolveBridgeTool(ctx, arena, tool)) {
+        .found => |found| found,
+        .refused => |why| return .{ .deny = why },
     };
     const call: ToolCall = .{ .id = request_id, .name = tool, .arguments_json = arguments_json };
     return switch (try checkNestedCall(ctx, arena, call, resolved)) {
         .allow => .{ .allow = .{ .binding = resolved.mcp_binding } },
         .deny => |why| .{ .deny = why },
     };
+}
+
+/// What `fx mcp call` and `fx mcp call help` hear for an MCP tool: the tool, or why the agent may not use it.
+const BridgeTool = union(enum) {
+    found: tool_mcp_runtime.SelectedTool,
+    /// Terminal-safe words for the command's output.
+    refused: []const u8,
+};
+
+/// Resolves the tool a command names, as `toolbox {open}` does, so the reason a tool that exists can't be used
+/// now, such as its server needing a login or being down, reaches the command in the same words. A tool fx has
+/// none of for this agent, one outside its view or denied in its mode included, is the same answer on every path.
+fn resolveBridgeTool(ctx: Context, arena: Allocator, tool: []const u8) !BridgeTool {
+    return switch (try lookupToolboxMcpTool(ctx, arena, tool)) {
+        .found => |found| .{ .found = found.tool },
+        .rejected => |why| .{ .refused = try arena.print("{f}", .{text_utils.terminalSafe(why)}) },
+        // As `toolbox {open}` says it: a subagent whose view the servers changed under hears why, not that the tool is gone.
+        .missing => .{ .refused = if (types.isMcpToolName(tool) and mcpAccessChanged(ctx))
+            try arena.print("{f}", .{text_utils.terminalSafe(try staleViewRefusal(arena, tool))})
+        else
+            try noMcpToolText(arena, tool) },
+    };
+}
+
+/// What a command hears when fx has no MCP tool by that name for this agent; `fx mcp call` and `fx mcp call
+/// help` both say it, and the way on is the command's own search, which a command can run.
+fn noMcpToolText(arena: Allocator, tool: []const u8) Allocator.Error![]const u8 {
+    return arena.print("No MCP tool named {f} is available to this agent. Find tool names with fx mcp call search.", .{text_utils.terminalSafe(tool)});
 }
 
 const NestedCheck = union(enum) {
@@ -1416,8 +1426,9 @@ fn lookupBridge(
             if (ctx.tool_registry.lookup(tool) != null) {
                 return .{ .status = .failed, .bytes = try arena.print("{f} is a built-in tool; fx mcp call runs MCP tools only.", .{text_utils.terminalSafe(tool)}) };
             }
-            const resolved = (try resolveUnselectedMcpTool(ctx, arena, tool)) orelse {
-                return .{ .status = .failed, .bytes = try arena.print("No MCP tool named {f} is available to this agent. Find tool names with fx mcp call search.", .{text_utils.terminalSafe(tool)}) };
+            const resolved = switch (try resolveBridgeTool(ctx, arena, tool)) {
+                .found => |found| found,
+                .refused => |why| return .{ .status = .failed, .bytes = why },
             };
             mcp_tool_lookup.writeHelp(arena, &out.writer, resolved.schema_json) catch |err| switch (err) {
                 error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
@@ -1441,6 +1452,7 @@ fn lookupBridge(
                     .server = if (question == .list) text else null,
                     .limit = capability_retrieval.max_limit,
                     .cursor = cursor,
+                    .login_sentence = true,
                 };
                 request.validate() catch |err| {
                     return .{ .status = .failed, .bytes = try arena.print("fx can't search for that: {s}.", .{@errorName(err)}) };
@@ -1865,6 +1877,61 @@ test "a toolbox run whose MCP definition changed before it ran says to open it a
 
 fn accessAlwaysChanged(_: *anyopaque, _: tool_mcp_runtime.Access) bool {
     return true;
+}
+
+const login_reason = "MCP server 'fixture' needs a login. Ask the user to run fx mcp login fixture in a terminal, then try again.";
+
+fn needsLoginSchema(_: *anyopaque, arena: Allocator, _: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    return .{ .rejected = .{ .model_output = try arena.dupe(u8, login_reason) } };
+}
+
+fn escapeReasonSchema(_: *anyopaque, arena: Allocator, _: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    return .{ .rejected = .{ .model_output = try arena.dupe(u8, "MCP server 'fixture' is unavailable: it said \x1b[31mno") } };
+}
+
+test "a command's fx mcp call and help hear why a tool can't be used, as toolbox open does, and one sentence when fx has none" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var host: u8 = 0;
+    var rt = TestRuntime{ .mcp_ctx = &host, .mcp_tool_schema = needsLoginSchema };
+    defer rt.deinit(std.testing.allocator);
+    var state: McpCallBridgeState = .{ .runtime = rt.context() };
+    var cancel = std.atomic.Value(bool).init(false);
+
+    // The tool exists but its server needs a login: the reason, not "no such tool", from both.
+    const denied = try authorizeBridgeCall(&state, arena, "1", "mcp_fixture_echo", "{}");
+    try std.testing.expectEqualStrings(login_reason, denied.deny);
+    const help = try lookupBridge(&state, arena, .{ .help = "mcp_fixture_echo" }, &cancel);
+    try std.testing.expect(help.status == .failed);
+    try std.testing.expectEqualStrings(login_reason, help.bytes);
+    // It is the very text `toolbox {open}` gives.
+    const opened = try executeToolCall(rt.context(), arena, .{ .id = "2", .name = "toolbox", .arguments_json = "{\"open\":\"mcp_fixture_echo\",\"kind\":\"tool\"}" });
+    try std.testing.expectEqualStrings(login_reason, opened.model_output);
+
+    // A server's words never reach the terminal as control bytes.
+    rt.mcp_tool_schema = escapeReasonSchema;
+    state.runtime = rt.context();
+    const escaped = try authorizeBridgeCall(&state, arena, "3", "mcp_fixture_echo", "{}");
+    try std.testing.expectEqualStrings("MCP server 'fixture' is unavailable: it said \\x1b[31mno", escaped.deny);
+
+    // A tool fx has none of says one sentence from both, and the command can run the search it names.
+    rt.mcp_tool_schema = goneMcpSchema;
+    state.runtime = rt.context();
+    const none = "No MCP tool named mcp_fixture_echo is available to this agent. Find tool names with fx mcp call search.";
+    const gone = try authorizeBridgeCall(&state, arena, "4", "mcp_fixture_echo", "{}");
+    try std.testing.expectEqualStrings(none, gone.deny);
+    const gone_help = try lookupBridge(&state, arena, .{ .help = "mcp_fixture_echo" }, &cancel);
+    try std.testing.expectEqualStrings(none, gone_help.bytes);
+
+    // A subagent whose view the servers changed under hears why, as toolbox open says it.
+    rt.mcp_access_changed = accessAlwaysChanged;
+    state.runtime = rt.context();
+    const stale = "mcp_fixture_echo is not available to this work: " ++ tool_mcp_runtime.servers_changed_reason;
+    const stale_call = try authorizeBridgeCall(&state, arena, "5", "mcp_fixture_echo", "{}");
+    try std.testing.expectEqualStrings(stale, stale_call.deny);
+    const stale_help = try lookupBridge(&state, arena, .{ .help = "mcp_fixture_echo" }, &cancel);
+    try std.testing.expectEqualStrings(stale, stale_help.bytes);
 }
 
 test "a subagent whose MCP view the servers changed under hears why for toolbox open of a tool" {
@@ -2932,6 +2999,48 @@ fn subagentProviderRefusal(
     return .{ .status = .failure, .body = try why.body(alloc) };
 }
 
+/// Checks a subagent's waiting call as main's own, for `answerApproval`
+/// (`Runtime.ApprovalCheck`). It borrows the caller's tool context, which
+/// this provider call keeps alive while `executeManaged` runs.
+const SubagentApprovalCheck = struct {
+    runtime: Context,
+    /// The subagent whose request this check answers, for the card ACP shows
+    /// in main's session. Empty when the answer is not for a named subagent.
+    agent: []const u8 = "",
+
+    fn check(raw: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 {
+        const self: *SubagentApprovalCheck = @ptrCast(@alignCast(raw));
+        const ctx = self.runtime;
+        // A name this context cannot resolve is refused, not allowed:
+        // `requestPermissionOutcome` allows a name it has no contract for as
+        // its not-registered default, and the child's own admission runs the
+        // action, so allowing it would grant what main never saw (RULES.md
+        // R4.3). An MCP tool main does not advertise is such a name, since
+        // the child's profile may select servers main never did.
+        if (ctx.tool_registry.lookup(call.name) == null and
+            !containsName(ctx.advertised_dynamic_tool_names, call.name))
+        {
+            return try arena.dupe(u8, "your parent's permissions cannot check this action");
+        }
+        // The check answers another agent's call, not one of main's, so its
+        // card gets an id of its own: main's session must not reuse a card of
+        // its own with the child's id, and ACP names the agent on the card
+        // from this prefix (`subagentCardAgent`).
+        const check_call = types.ToolCall{
+            .id = try arena.print("subagent:{s}:{s}", .{ self.agent, call.id }),
+            .name = call.name,
+            .arguments_json = call.arguments_json,
+        };
+        // No selected MCP view is passed: a dynamic tool is checked as an
+        // advertised name of main's, and one it does not advertise is refused
+        // above, so nothing is checked through a view this path cannot supply.
+        return switch (try checkNestedCall(ctx, arena, check_call, null)) {
+            .allow => null,
+            .deny => |message| message,
+        };
+    }
+};
+
 fn executeSubagentProvider(
     raw_context: ?*anyopaque,
     arena: Allocator,
@@ -2946,6 +3055,15 @@ fn executeSubagentProvider(
         return subagentProviderRefusal(arena, .{ .caller_unavailable = .unidentified });
     const identity_epoch = host.issueOperationIdentity(invocation_id);
     var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
+    // The parent's answer checks the subagent's waiting call as main's own,
+    // with the permission context this call runs under.
+    var approval_check = SubagentApprovalCheck{
+        .runtime = ctx,
+        .agent = switch (request.*) {
+            .approve => |value| value.agent,
+            else => "",
+        },
+    };
     const output = host.executeManaged(arena, request, .{
         .observer = ctx.observer,
         .caller_id = caller_id,
@@ -2968,6 +3086,7 @@ fn executeSubagentProvider(
         .cancel_flag = runtimeCancelFlag(ctx),
         .caller_worker = ctx.worker,
         .turn_messages = ctx.current_turn_messages,
+        .approval_check = .{ .context = &approval_check, .check_fn = SubagentApprovalCheck.check },
         .progress = if (progress_bridge) |*bridge| bridge.sink() else null,
         .model_capability_resolver = ctx.model_capability_resolver,
         .model_override_resolver = ctx.model_override_resolver,
@@ -7257,10 +7376,9 @@ const McpFixture = struct {
         snapshot_rule_count: usize = 0,
     };
 
-    const AuthorityContext = struct {
+    const ScopedCallContext = struct {
         calls: usize = 0,
-        admission_generation: u64 = 0,
-        action_generation: u64 = 0,
+        captured: ?*const mcp_access_policy.View = null,
         expected_runtime_generation: ?u64 = null,
     };
 
@@ -7290,15 +7408,14 @@ const McpFixture = struct {
         return .{ .model_output = try arena.dupe(u8, "mcp ok") };
     }
 
-    fn callRecordingAuthority(raw_ctx: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
-        const ctx: *AuthorityContext = @ptrCast(@alignCast(raw_ctx));
+    fn callRecordingScope(raw_ctx: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
+        const ctx: *ScopedCallContext = @ptrCast(@alignCast(raw_ctx));
         const scope = switch (options.access) {
             .scoped => |value| value,
             else => return error.McpScopedAccessExpected,
         };
         ctx.calls += 1;
-        ctx.admission_generation = scope.admission_authority_generation;
-        ctx.action_generation = scope.action_authority_generation;
+        ctx.captured = scope.captured;
         ctx.expected_runtime_generation = options.expected_runtime_generation;
         return .{ .model_output = try arena.dupe(u8, "mcp ok") };
     }
@@ -7535,9 +7652,50 @@ test "MCP dynamic tool executes after its schema was advertised" {
 
     try expectToolOutput(rt.context(), "mcp_fs_read", "{}", "mcp ok");
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
+
+    // A name the request did not advertise is refused and reaches no server.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const refused = try executeToolCall(rt.context(), arena_state.allocator(), .{
+        .id = "other",
+        .name = "mcp_other",
+        .arguments_json = "{}",
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, refused.status);
+    try expectContains(refused.model_output, "is not one of the tools in this request");
+    try std.testing.expectEqual(@as(usize, 1), counting.calls);
 }
 
-test "MCP execution binds the last live action generation before transport" {
+test "an MCP call that finishes after a cancel is not a cancelled command" {
+    const CancelDuringCall = struct {
+        fn call(raw: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, _: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
+            const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+            flag.store(true, .seq_cst);
+            return .{ .model_output = try arena.dupe(u8, "mcp ok") };
+        }
+    };
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const advertised = [_][]const u8{"mcp_fs_read"};
+    var rt = TestRuntime{
+        .mcp_ctx = @ptrCast(&cancel_flag),
+        .mcp_has_tool = McpFixture.hasTrue,
+        .mcp_call_tool = CancelDuringCall.call,
+        .advertised_dynamic_tool_names = &advertised,
+        .cancel_flag = &cancel_flag,
+    };
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const result = try executeToolCall(rt.context(), arena_state.allocator(), .{
+        .id = "dynamic",
+        .name = "mcp_fs_read",
+        .arguments_json = "{}",
+    });
+    try std.testing.expectEqualStrings("mcp ok", result.model_output);
+    try std.testing.expectEqual(false, result.cancelled);
+}
+
+test "MCP execution gives the transport the child's view and the expected generation, once" {
     const alloc = std.testing.allocator;
     var captured = mcp_access_policy.View{
         .runtime_generation = 1,
@@ -7547,27 +7705,14 @@ test "MCP execution binds the last live action generation before transport" {
         .tools = try alloc.alloc(mcp_access_policy.ToolIdentity, 0),
     };
     defer captured.deinit(alloc);
-    const UnusedLiveProvider = struct {
-        fn resolve(_: *anyopaque, _: Allocator) !tool_mcp_runtime.ResolvedLiveView {
-            return error.TestUnexpectedResult;
-        }
-    };
-    var marker: u8 = 0;
-    var authority = McpFixture.AuthorityContext{};
+    var recorded = McpFixture.ScopedCallContext{};
     var rt = TestRuntime{
-        .mcp_ctx = @ptrCast(&authority),
-        .mcp_call_tool = McpFixture.callRecordingAuthority,
+        .mcp_ctx = @ptrCast(&recorded),
+        .mcp_call_tool = McpFixture.callRecordingScope,
     };
     defer rt.deinit(alloc);
     var tool_ctx = rt.context();
-    tool_ctx.mcp_access = .{ .scoped = .{
-        .captured = &captured,
-        .admission_authority_generation = 17,
-        .live = .{
-            .context = @ptrCast(&marker),
-            .resolve_fn = UnusedLiveProvider.resolve,
-        },
-    } };
+    tool_ctx.mcp_access = .{ .scoped = .{ .captured = &captured } };
     const integrations = [_][]const u8{"mcp_fs_read"};
     const result = try executeToolCallAuthorized(tool_ctx, .{
         .call_allocator = alloc,
@@ -7596,16 +7741,9 @@ test "MCP execution binds the last live action generation before transport" {
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
     try std.testing.expectEqualStrings("mcp ok", result.model_output);
-    try std.testing.expectEqual(@as(usize, 1), authority.calls);
-    try std.testing.expectEqual(@as(u64, 17), authority.admission_generation);
-    try std.testing.expectEqual(@as(u64, 41), authority.action_generation);
-    try std.testing.expectEqual(@as(?u64, 73), authority.expected_runtime_generation);
-    const original_scope = switch (tool_ctx.mcp_access) {
-        .scoped => |scope| scope,
-        else => return error.McpScopedAccessExpected,
-    };
-    try std.testing.expectEqual(@as(u64, 17), original_scope.admission_authority_generation);
-    try std.testing.expectEqual(@as(u64, 0), original_scope.action_authority_generation);
+    try std.testing.expectEqual(@as(usize, 1), recorded.calls);
+    try std.testing.expectEqual(@as(?*const mcp_access_policy.View, &captured), recorded.captured);
+    try std.testing.expectEqual(@as(?u64, 73), recorded.expected_runtime_generation);
 }
 
 test "MCP dynamic tool preserves provider errors without leaking dispatch output" {
@@ -9154,4 +9292,19 @@ test "in auto mode a command's fx mcp call skips the safety check for the approv
     try std.testing.expectEqual(@as(usize, 1), reviewer.calls);
     try std.testing.expect(try nestedBridgeStatus(&rt, &.{}, "mcp_fixture_echo") != .denied);
     try std.testing.expectEqual(@as(usize, 2), reviewer.calls);
+}
+
+test "the approve check refuses a name main cannot resolve" {
+    var rt = TestRuntime{ .interactive = false };
+    defer rt.deinit(std.testing.allocator);
+    var check = SubagentApprovalCheck{ .runtime = rt.context() };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const refused = try SubagentApprovalCheck.check(
+        &check,
+        arena.allocator(),
+        .{ .id = "call-1", .name = "not_a_main_tool", .arguments_json = "{}" },
+    );
+    try std.testing.expect(refused != null);
+    try expectContains(refused.?, "your parent's permissions cannot check this action");
 }

@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const types = @import("../../shared/types.zig");
+const compactor = @import("../../compactor/compactor.zig");
 const model_context_encoding = @import("../../shared/model_context_encoding.zig");
 
 const Allocator = std.mem.Allocator;
@@ -58,7 +59,14 @@ pub const State = struct {
         while (index > 0) {
             index -= 1;
             const execution = switch (history[index]) {
-                .compacted_summary => break,
+                // A provider's compaction block keeps the copy the turns after
+                // it were sent with, so nothing before them changes; fx's own
+                // summary starts a new one.
+                .compacted_summary => |entry| {
+                    const block = (try compactor.providerBlock(arena, entry.summary)) orelse break;
+                    if (block.runtime_context.len == 0) break;
+                    return .{ .frozen = try messagesFrom(arena, block.runtime_context), .known_update = known_update };
+                },
                 .assistant => |entry| entry.execution,
                 .interrupted => |entry| entry.execution,
             };
@@ -274,4 +282,52 @@ test "an empty runtime context is sent as nothing and not saved" {
     try std.testing.expect(try state.refresh(arena, arena, &.{}) == null);
     try std.testing.expect(state.captured == null);
     try std.testing.expectEqual(@as(usize, 0), state.messages().len);
+}
+
+test "when only the model changes between two turns, refresh keeps frozen text and produces one update" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var saved = [_][]u8{
+        @constCast("<fx-turn-context>\ndate_utc: 2026-11-27\nmodel: openai/gpt-5.4\n</fx-turn-context>"),
+        @constCast("Runtime context: permission mode is ask."),
+    };
+    const history = [_]types.HistoryTurn{assistantTurn(.{ .runtime_context = &saved })};
+    const next = systemMessages(&.{
+        "<fx-turn-context>\ndate_utc: 2026-11-27\nmodel: anthropic/claude-opus-4.6\n</fx-turn-context>",
+        "Runtime context: permission mode is ask.",
+    });
+
+    var state = try State.init(arena, &history, null);
+    try std.testing.expectEqualStrings(saved[0], state.messages()[0].content.?);
+
+    const note = (try state.refresh(arena, arena, &next)).?;
+    try std.testing.expectEqualStrings(
+        "<fx-context-update>\nThe runtime context changed during this session. These blocks replace the turn context and runtime notes in the instructions above, and any earlier update:\n" ++
+            "\n<fx-turn-context>\ndate_utc: 2026-11-27\nmodel: anthropic/claude-opus-4.6\n</fx-turn-context>\n\nRuntime context: permission mode is ask.\n</fx-context-update>",
+        note,
+    );
+    try std.testing.expectEqualStrings(saved[0], state.messages()[0].content.?);
+    try std.testing.expect(try state.refresh(arena, arena, &next) == null);
+}
+
+test "a pre-change saved turn without a model line emits one update on first resume and none on the next" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var saved = [_][]u8{
+        @constCast("<fx-turn-context>\ndate_utc: 2026-11-27\n</fx-turn-context>"),
+        @constCast("Runtime context: permission mode is ask."),
+    };
+    const history = [_]types.HistoryTurn{assistantTurn(.{ .runtime_context = &saved })};
+    const current = systemMessages(&.{
+        "<fx-turn-context>\ndate_utc: 2026-11-27\nmodel: openai/gpt-5.4\n</fx-turn-context>",
+        "Runtime context: permission mode is ask.",
+    });
+
+    var state = try State.init(arena, &history, null);
+    const note = (try state.refresh(arena, arena, &current)).?;
+    try std.testing.expect(std.mem.find(u8, note, "model: openai/gpt-5.4\n") != null);
+    try std.testing.expectEqualStrings(saved[0], state.messages()[0].content.?);
+    try std.testing.expect(try state.refresh(arena, arena, &current) == null);
 }

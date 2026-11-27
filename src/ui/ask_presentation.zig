@@ -36,7 +36,11 @@ pub const Runtime = struct {
         header: ui_render.AskHeader,
         no_color: bool,
     ) !Runtime {
-        const layout = zeroFooterLayout(try ui_terminal.queryLayout(std.posix.STDOUT_FILENO, 0));
+        const raw_layout = ui_terminal.queryLayout(std.posix.STDOUT_FILENO, 0) catch |err| {
+            if (ui_terminal.terminalInputGone(std.posix.STDOUT_FILENO)) return error.TerminalHungUp;
+            return err;
+        };
+        const layout = zeroFooterLayout(raw_layout);
         var terminal = shell_runtime.TerminalState{};
         const cursor = probeTerminal(&terminal, layout, no_color);
         return initConfigured(
@@ -120,6 +124,7 @@ pub const Runtime = struct {
             .table = pushTable,
             .code_block = pushCodeBlock,
             .thematic_rule = pushThematicRule,
+            .assistant_tail = pushAssistantTail,
         };
     }
 
@@ -129,6 +134,18 @@ pub const Runtime = struct {
         if (self.thinking == active) return;
         self.thinking = active;
         self.render() catch |err| return self.failWith(err);
+    }
+
+    /// The open tail is applied at once: `fx ask` writes committed text without a pacer.
+    fn pushAssistantTail(raw: *anyopaque, alloc: std.mem.Allocator, events: []assistant_presentation.Event) !void {
+        const self: *Runtime = @ptrCast(@alignCast(raw));
+        self.checkPendingError() catch |err| {
+            assistant_presentation.freeEventSlice(alloc, events);
+            return err;
+        };
+        const id = self.shell.stageAssistantTail(alloc, events);
+        self.shell.applyStagedAssistantTail(self.alloc, id);
+        self.render() catch |err| self.rememberFailure(err);
     }
 
     pub fn pushText(self: *Runtime, text: []const u8) !void {
@@ -336,7 +353,10 @@ pub const Runtime = struct {
     }
 
     fn writeTerminalBytes(self: *Runtime, bytes: []const u8) !void {
-        try self.shell.stdout_file.writeStreamingAll(io_mod.getIo(), bytes);
+        self.shell.stdout_file.writeStreamingAll(io_mod.getIo(), bytes) catch |err| {
+            if (ui_terminal.terminalGone(self.shell.stdout_file.handle, err)) return error.TerminalHungUp;
+            return err;
+        };
         self.metrics.ansi_bytes += bytes.len;
         if (self.shell.shadow_vt) |shadow| try shadow.feed(bytes);
     }
@@ -612,6 +632,57 @@ test "ask presentation carries the light theme into semantic code blocks" {
     try std.testing.expect(runtime.shell.retainedTranscriptStyles().code_highlight_theme == .light);
 }
 
+fn askGridRowsContaining(runtime: *Runtime, needle: []const u8) !usize {
+    var count: usize = 0;
+    var row: u16 = 1;
+    while (row <= runtime.shell.layout.rows) : (row += 1) {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(std.testing.allocator);
+        try runtime.shell.shadow_vt.?.rowText(row, &buf);
+        if (std.mem.find(u8, buf.items, needle) != null) count += 1;
+    }
+    return count;
+}
+
+test "ask presentation draws a provisional tail and drops it when committed text arrives" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output = try tmp.dir.createFile(std.testing.io, "ask-tail.log", .{ .read = true });
+    defer output.close(io_mod.getIo());
+
+    var runtime = try Runtime.initConfigured(
+        alloc,
+        .{ .model = "openai/gpt-5" },
+        false,
+        output,
+        zeroFooterLayout(.{
+            .rows = 12,
+            .cols = 48,
+            .content_bottom = 12,
+            .divider_top_row = 12,
+            .input_row = 12,
+            .divider_bottom_row = 12,
+            .hint_row = 12,
+        }),
+        .{ .row = 1, .col = 1 },
+        true,
+    );
+    defer runtime.deinit();
+
+    const events = try alloc.alloc(assistant_presentation.Event, 1);
+    events[0] = .{ .text = try alloc.dupe(u8, "Streaming bold") };
+    const sink = runtime.semanticSink();
+    try sink.assistant_tail.?(sink.ctx, alloc, events);
+    try std.testing.expectEqual(@as(usize, 1), runtime.shell.assistant_tail.items.len);
+    try std.testing.expectEqual(@as(usize, 1), try askGridRowsContaining(&runtime, "Streaming bold"));
+
+    try runtime.pushText("Streaming bold\n");
+    try std.testing.expectEqual(@as(usize, 0), runtime.shell.assistant_tail.items.len);
+    try std.testing.expectEqual(@as(usize, 1), try askGridRowsContaining(&runtime, "Streaming bold"));
+    try runtime.finish();
+}
+
 test "ask presentation retains a streaming write failure until finish" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -802,4 +873,43 @@ test "ask presentation neutralizes thinking row styling under no_color" {
     try std.testing.expect(std.mem.find(u8, bytes, "\x1b[2J") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\x1b[3J") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\x1bc") == null);
+}
+
+test "ask presentation maps closed TestPty EIO to TerminalHungUp and keeps open-file errors" {
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |file| file.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+
+    var runtime = Runtime{
+        .alloc = alloc,
+        .shell = .{
+            .stdout_file = slave,
+            .sync_updates_enabled = false,
+            .history_reset_uses_ris = false,
+            .layout = zeroFooterLayout(.{
+                .rows = 12,
+                .cols = 64,
+                .content_bottom = 12,
+                .divider_top_row = 12,
+                .input_row = 12,
+                .divider_bottom_row = 12,
+                .hint_row = 12,
+            }),
+            .notebook = .{ .transcript_release = .{ .policy = .append_only } },
+        },
+        .no_color = true,
+    };
+    master.?.close(io_mod.getIo());
+    master = null;
+    try std.testing.expectError(error.TerminalHungUp, runtime.writeTerminalBytes("abc"));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "readonly.txt", .{ .read = true });
+    defer file.close(io_mod.getIo());
+    try std.testing.expect(!ui_terminal.terminalGone(file.handle, error.InputOutput));
 }

@@ -9,6 +9,7 @@ const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
+const ui_terminal = @import("../../ui/terminal/terminal.zig");
 const cli_flags = @import("cli_flags.zig");
 const completion = @import("completion.zig");
 const agent_run_flags = @import("agent_run_flags.zig");
@@ -90,7 +91,6 @@ pub const Command = union(enum) {
     issue: []const [:0]const u8,
     login: []const [:0]const u8,
     logout: []const [:0]const u8,
-    setup: []const [:0]const u8,
     status: []const [:0]const u8,
     permissions: []const [:0]const u8,
     mcp: []const [:0]const u8,
@@ -823,7 +823,6 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .replay)) return .{ .replay = args[1..] };
         },
         's' => {
-            if (command_specs.matchesTopLevel(command_catalog, command, .setup)) return .{ .setup = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .status)) return .{ .status = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .sessions)) return .{ .sessions = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .session)) {
@@ -932,7 +931,7 @@ pub fn parseInteractiveLaunch(
                         if (parseResumeArgs(alloc, resume_line, invocation.top_level_alias)) |parsed_target| {
                             var unused = parsed_target;
                             unused.deinit(alloc);
-                        } else |resume_err| if (removedResumeHint(resume_err) != null) return resume_err;
+                        } else |resume_err| if (removedSpellingHint(resume_err) != null) return resume_err;
                     }
                     return err;
                 };
@@ -971,6 +970,7 @@ pub fn parseInteractiveLaunch(
             .print_flag => return error.PrintFlagUseAsk,
             .unknown_flag => return error.UnknownLaunchFlag,
             .command_typo => return error.UnknownCommandTypo,
+            .removed_setup => return error.RemovedSetupCommand,
             .prompt => {
                 // Read the whole line again so launch flags may also follow
                 // the prompt, as in `fx "fix the bug" --model x`.
@@ -1031,13 +1031,18 @@ const LaunchWord = enum {
     /// A near miss for a command name, such as `stauts`, or a flag name
     /// typed without its dashes, such as `version`.
     command_typo,
+    /// `fx setup`, a removed spelling that names its replacement.
+    removed_setup,
     prompt,
 };
 
 /// Decides what plain `fx` does with a first argument that isn't a command.
+const removed_setup_word = "setup";
+
 fn classifyLaunchWord(command_catalog: CommandCatalog, word: []const u8) LaunchWord {
     // `fx -- "-x"` lets a prompt start with a dash.
     if (std.mem.eql(u8, word, "--")) return .prompt;
+    if (std.mem.eql(u8, word, removed_setup_word)) return .removed_setup;
     if (word.len > 0 and word[0] == '-') {
         if (isVersionFlag(word)) return .command_line;
         if (isPrintFlag(word)) return .print_flag;
@@ -1151,6 +1156,42 @@ test "a command whose output reader went away reports that, however the write fa
     try std.testing.expectEqual(@as(anyerror, error.OutputReaderGone), output.commandError(error.WriteFailed));
     try std.testing.expectEqual(@as(anyerror, error.OutputReaderGone), output.commandError(error.BrokenPipe));
     try std.testing.expectEqual(@as(anyerror, error.NoSpaceLeft), output.commandError(error.NoSpaceLeft));
+}
+
+test "writeFdAll reports WriteFailed rather than BrokenPipe on a non-tty unwritable fd" {
+    const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer _ = std.c.close(fds[0]);
+    _ = std.c.close(fds[1]);
+    var output: OwnOutput = .{};
+    const err = writeFdAll(fds[0], "x");
+    try std.testing.expectError(error.WriteFailed, err);
+    OwnOutput.noteFailure(&output, error.WriteFailed);
+    try std.testing.expectEqual(@as(anyerror, error.OutputWriteFailed), output.commandError(error.WriteFailed));
+}
+
+test "writeFdAll preserves InputOutput on a closed TestPty while open files keep OutputWriteFailed" {
+    const shell_runtime = @import("../../ui/shell_runtime.zig");
+    var output: OwnOutput = .{};
+    try std.testing.expectEqual(@as(anyerror, error.TerminalHungUp), output.commandError(error.TerminalHungUp));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "out.txt", .{ .read = true });
+    defer file.close(io_mod.getIo());
+    try std.testing.expect(!ui_terminal.terminalGone(file.handle, error.InputOutput));
+    OwnOutput.noteFailure(&output, error.InputOutput);
+    try std.testing.expectEqual(@as(anyerror, error.OutputWriteFailed), output.commandError(error.WriteFailed));
+
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |f| f.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+    master.?.close(io_mod.getIo());
+    master = null;
+    try std.testing.expectError(error.InputOutput, writeFdAll(slave.handle, "x"));
+    try std.testing.expect(ui_terminal.terminalGone(slave.handle, error.InputOutput));
 }
 
 fn runNoConfigIfRequestedWithDeps(
@@ -1421,6 +1462,7 @@ fn activateProviderSelectionFallible(
     var performed_login: ?model_provider.ProviderId = null;
     if (cfg.auth_mode == .local and prepared_credential == null and provider_catalog.find(target).subscription and caller == .provider_command) {
         runProviderLogin(alloc, cfg, target) catch |err| {
+            if (isTerminalOrOutputGone(err)) return err;
             try writeProviderLoginFailure(alloc, deps, target, caller, err);
             return false;
         };
@@ -1609,7 +1651,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
             try writeTopLevelUsage(cfg.command_catalog, deps, .@"resume");
             return usage_failure;
         }
-        if (removedResumeHint(err)) |hint| {
+        if (removedSpellingHint(err)) |hint| {
             try writeStderr(deps, hint);
             return usage_failure;
         }
@@ -1803,6 +1845,7 @@ fn runNonInteractiveWithDeps(
             // Preserve the original `fx login` behavior for scripts and users.
             const login_provider = login_args.provider orelse .gateway;
             runProviderLogin(alloc, cfg, login_provider) catch |err| {
+                if (isTerminalOrOutputGone(err)) return err;
                 try writeProviderLoginFailure(alloc, deps, login_provider, .provider_login, err);
                 return .handled_failure;
             };
@@ -1966,6 +2009,7 @@ fn runNonInteractiveWithDeps(
                     .validate_fn = validateCliTeamCredential,
                 },
             ) catch |err| {
+                if (isTerminalOrOutputGone(err)) return err;
                 const message = switch (err) {
                     error.NoSession => "fx teams: run fx login first\n",
                     error.SessionChanged => "fx teams: authentication changed; try again\n",
@@ -2009,21 +2053,6 @@ fn runNonInteractiveWithDeps(
                 else => return err,
             };
             return if (activated) .handled_success else .handled_failure;
-        },
-        .setup => |rest| {
-            if (try command_specs.deprecationWarning(alloc, cfg.command_catalog, .setup)) |warning| {
-                defer alloc.free(warning);
-                try writeStderr(deps, warning);
-            }
-            if (rest.len != 0) {
-                try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
-                return usage_failure;
-            }
-            if (cfg.auth_mode == .host_managed) {
-                try writeHostManagedAuthResult(deps);
-                return .handled_success;
-            }
-            return if (try runPasteSetup(alloc, cfg.secret_store, deps, "fx setup")) .handled_success else .handled_failure;
         },
         .status => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
@@ -2686,8 +2715,7 @@ fn writeStderr(deps: RunDeps, text: []const u8) !void {
 }
 
 /// Reads and stores an AI Gateway API key. `command` names the command in
-/// failure messages: `fx login` for `fx login --api-key`, `fx setup` for the
-/// deprecated spelling.
+/// failure messages, such as `fx login`.
 fn runPasteSetup(
     alloc: Allocator,
     secret_store: host.SecretStore,
@@ -2704,7 +2732,8 @@ fn runPasteSetup(
     }
 
     try writeStderr(deps, "Paste AI Gateway API key (input hidden): ");
-    const stored_interactively = secret_store.storeInteractive() catch {
+    const stored_interactively = secret_store.storeInteractive() catch |err| {
+        if (isTerminalOrOutputGone(err)) return err;
         try writeStderr(deps, "\n");
         try writePasteFailure(alloc, deps, command, "API key was not saved");
         return false;
@@ -2715,14 +2744,16 @@ fn runPasteSetup(
             alloc,
             deps.write_stderr,
             deps.stderr_ctx,
-        ) catch {
+        ) catch |err| {
+            if (isTerminalOrOutputGone(err)) return err;
             try writeStderr(deps, "\n");
             try writePasteFailure(alloc, deps, command, "API key was not saved");
             return false;
         };
         defer secret.zeroAndFree(alloc, key);
         try writeStderr(deps, "\n");
-        secret_store.store(alloc, key) catch {
+        secret_store.store(alloc, key) catch |err| {
+            if (isTerminalOrOutputGone(err)) return err;
             try writePasteFailure(alloc, deps, command, "API key was not saved");
             return false;
         };
@@ -2764,7 +2795,14 @@ fn readMaskedKeyDefault(
 
     while (input.items.len < 8 * 1024) {
         var byte: [1]u8 = undefined;
-        if (try std.posix.read(std.posix.STDIN_FILENO, &byte) == 0) return error.SetupCancelled;
+        const n = std.posix.read(std.posix.STDIN_FILENO, &byte) catch |err| {
+            if (ui_terminal.terminalGone(std.posix.STDIN_FILENO, err)) return error.TerminalHungUp;
+            return err;
+        };
+        if (n == 0) {
+            if (ui_terminal.terminalInputGone(std.posix.STDIN_FILENO)) return error.TerminalHungUp;
+            return error.SetupCancelled;
+        }
         switch (byte[0]) {
             '\r', '\n' => {
                 if (input.items.len == 0) continue;
@@ -2803,7 +2841,10 @@ const MaskedKeyRawMode = struct {
         }
 
         var self: MaskedKeyRawMode = .{};
-        self.original = try io_mod.tcgetattr(std.posix.STDIN_FILENO);
+        self.original = io_mod.tcgetattr(std.posix.STDIN_FILENO) catch |err| {
+            if (ui_terminal.terminalInputGone(std.posix.STDIN_FILENO)) return error.TerminalHungUp;
+            return err;
+        };
         var raw = self.original;
         raw.iflag.BRKINT = false;
         raw.iflag.ICRNL = false;
@@ -2973,12 +3014,21 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
     };
 }
 
+fn isTerminalOrOutputGone(err: anyerror) bool {
+    return err == error.TerminalHungUp or
+        err == error.TerminalInputClosed or
+        err == error.OutputReaderGone;
+}
+
 fn writeRealStdout(ctx: ?*anyopaque, text: []const u8) !void {
     const written = if (comptime builtin.target.os.tag != .windows)
         writeFdAll(std.posix.STDOUT_FILENO, text)
     else
         std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
     written catch |err| {
+        if (comptime builtin.target.os.tag != .windows) {
+            if (ui_terminal.terminalGone(std.posix.STDOUT_FILENO, err)) return error.TerminalHungUp;
+        }
         OwnOutput.noteFailure(ctx, err);
         return err;
     };
@@ -2990,6 +3040,9 @@ fn writeRealStderr(ctx: ?*anyopaque, text: []const u8) !void {
     else
         std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
     written catch |err| {
+        if (comptime builtin.target.os.tag != .windows) {
+            if (ui_terminal.terminalGone(std.posix.STDERR_FILENO, err)) return error.TerminalHungUp;
+        }
         OwnOutput.noteFailure(ctx, err);
         return err;
     };
@@ -3001,8 +3054,12 @@ fn writeFdAll(fd: std.posix.fd_t, text: []const u8) !void {
     while (remaining.len > 0) {
         const written = std.c.write(fd, remaining.ptr, remaining.len);
         if (written <= 0) {
-            // A reader that went away, as `head` does, is told apart.
-            if (written < 0 and std.posix.errno(written) == .PIPE) return error.BrokenPipe;
+            // Preserve PIPE and IO so callers separate pipe closes and terminal hang-ups from generic write errors.
+            if (written < 0) switch (std.posix.errno(written)) {
+                .PIPE => return error.BrokenPipe,
+                .IO => return error.InputOutput,
+                else => {},
+            };
             return error.WriteFailed;
         }
         remaining = remaining[@intCast(written)..];
@@ -5364,14 +5421,15 @@ fn resumeFlagTarget(alloc: Allocator, value: []const u8) !ResumeTarget {
     return .{ .id = try alloc.dupe(u8, id) };
 }
 
-/// The hint for a removed resume spelling, or null for any other error.
-fn removedResumeHint(err: anyerror) ?[]const u8 {
+/// The hint for a removed spelling, such as `fx resume`, or null for any other error.
+fn removedSpellingHint(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.RemovedResumeLast => "fx: --resume-last was removed; use fx --resume last\n",
         error.RemovedResumeIdAlias => "fx: --resume-<id> was removed; use fx --resume <id>\n",
         error.RemovedResumeCommand => "fx: fx resume was removed; use fx --resume [last|<id>] or fx session resume [last|<id>]\n",
         error.RemovedResumeIdFlag => "fx session resume: --id was removed; use fx session resume <id>\n",
         error.RemovedResumeLastFlag => "fx session resume: --resume --last was removed; use fx session resume last\n",
+        error.RemovedSetupCommand => "fx: fx setup was removed; use fx login vercel --api-key\n",
         else => null,
     };
 }
@@ -5496,10 +5554,6 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{ @constCast("issue"), @constCast("flaky") })) {
         .issue => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{@constCast("setup")})) {
-        .setup => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{ @constCast("status"), @constCast("--json") })) {
@@ -6293,8 +6347,30 @@ test "removed resume spellings fail with a hint" {
     };
     for (cases) |case| {
         try std.testing.expectError(case.err, parseResumeArgs(std.testing.allocator, case.args, case.top_level_alias));
-        try std.testing.expect(removedResumeHint(case.err) != null);
+        try std.testing.expect(removedSpellingHint(case.err) != null);
     }
+}
+
+test "removed setup exits 2 with a hint that names its replacement, without a terminal" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    var cfg = testConfig();
+    cfg.secret_store = capture.secretStore();
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("setup"), @constCast("extra") },
+        cfg,
+        capture.deps(),
+    );
+
+    switch (result) {
+        .handled_exit => |code| try std.testing.expectEqual(output_contracts.usage_exit_code, code),
+        else => return error.TestExpectedEqual,
+    }
+    try std.testing.expectEqualStrings("fx: fx setup was removed; use fx login vercel --api-key\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+    try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
 }
 
 test "parse resume args accepts an operand on the top-level resume flag" {
@@ -6678,7 +6754,7 @@ test "runIfRequested version flags reject extra args" {
     }
 }
 
-test "setup is a paste-only stored-key adapter" {
+test "login --api-key is a paste-only stored-key adapter" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
     var cfg = testConfig();
@@ -6686,7 +6762,7 @@ test "setup is a paste-only stored-key adapter" {
 
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
-        &.{@constCast("setup")},
+        &.{ @constCast("login"), @constCast("--api-key") },
         cfg,
         capture.deps(),
     );
@@ -6700,7 +6776,7 @@ test "setup is a paste-only stored-key adapter" {
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), cfg.secret_store.backend_label) != null);
 }
 
-test "setup delegates secure input to an interactive host store" {
+test "login --api-key delegates secure input to an interactive host store" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
     capture.setup_interactive_store = true;
@@ -6709,7 +6785,7 @@ test "setup delegates secure input to an interactive host store" {
 
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
-        &.{@constCast("setup")},
+        &.{ @constCast("login"), @constCast("--api-key") },
         cfg,
         capture.deps(),
     );
@@ -6720,31 +6796,7 @@ test "setup delegates secure input to an interactive host store" {
     try std.testing.expect(!capture.setup_value_matched);
 }
 
-test "setup preserves the disabled secret-store failure" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    capture.setup_store_disabled = true;
-    var cfg = testConfig();
-    cfg.secret_store = capture.secretStore();
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{@constCast("setup")},
-        cfg,
-        capture.deps(),
-    );
-
-    try std.testing.expectEqual(RunResult.handled_failure, result);
-    try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
-    try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
-    try std.testing.expectEqualStrings(
-        "fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n" ++
-            "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
-        capture.stderr.written(),
-    );
-}
-
-test "login --api-key stores a pasted key like setup, without the deprecation warning" {
+test "login --api-key stores a pasted key without a warning" {
     for ([_][]const [:0]const u8{
         &.{"--api-key"},
         &.{ "vercel", "--api-key" },
@@ -6909,15 +6961,15 @@ test "CLI surface uses the supplied command catalog for parsing usage and help" 
             .summary = "Show injected help",
         },
         .{
-            .kind = .setup,
+            .kind = .status,
             .token = "start",
             .usage = "start",
-            .summary = "Run injected setup",
+            .summary = "Run injected start",
         },
     };
     const help_groups = [_]command_specs.TopLevelHelpGroup{
         .{ .entries = &.{
-            .{ .kind = .setup, .usage = "start" },
+            .{ .kind = .status, .usage = "start" },
             .{ .kind = .help, .usage = "guide" },
         } },
     };
@@ -6930,7 +6982,7 @@ test "CLI surface uses the supplied command catalog for parsing usage and help" 
 
     try std.testing.expectEqual(Command.help, parse(command_catalog, &.{@constCast("-?")}));
     switch (parse(command_catalog, &.{@constCast("start")})) {
-        .setup => {},
+        .status => {},
         else => return error.TestExpectedEqual,
     }
 

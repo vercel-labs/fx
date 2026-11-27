@@ -242,18 +242,20 @@ pub fn Runtime(comptime App: type) type {
             ctx.permission_state_override = &run.admission.permission_state;
             ctx.advertised_dynamic_tool_names = run.admission.integration_names;
             ctx.mcp_access = if (run.admission.mcp_view) |*view|
-                .{ .scoped = .{
-                    .captured = view,
-                    .admission_authority_generation = run.admission.authority_generation,
-                    .live = .{ .context = run, .resolve_fn = resolveChildLiveMcpView },
-                } }
+                .{ .scoped = .{ .captured = view } }
             else
                 .disabled;
             // A child's `subagent` calls go to its own host, which the tool
             // context already holds, as main's go to main's.
-            // A child's approvals and questions go to its own worker, as
-            // main's do, for main's runs and the user's alike; main's screen
-            // borrows them while the child is hidden.
+            // A run main started asks through its turn, so the request is
+            // registered and main is told; it still waits on this child's own
+            // worker, whose screen shows it too. A turn the person typed has no
+            // turn of main's, so it keeps the worker's prompter and stays with
+            // the person (`tests/tla/subagent/TuiParentApproval.tla`
+            // TypedStaysWithPerson).
+            if (run.turn) |turn| {
+                if (run.startedByParent()) ctx.permission_prompter = turn.permissionPrompter();
+            }
             ctx.interactive = false;
             ctx.ask_user_questions = true;
             ctx.provider = run.admission.provider;
@@ -289,15 +291,6 @@ pub fn Runtime(comptime App: type) type {
         /// through the child's profile, which gives the same mode again.
         fn userPermissionMode(run: *const agents.ChildRun) ?types.PermissionMode {
             return if (run.inFlight()) null else run.admission.permission_mode;
-        }
-
-        fn resolveChildLiveMcpView(raw: *anyopaque, alloc: Allocator) !tool_mcp_runtime.ResolvedLiveView {
-            const run: *agents.ChildRun = @ptrCast(@alignCast(raw));
-            var authority = if (userPermissionMode(run)) |mode|
-                try run.authority_resolver.resolveForUser(alloc, run.child_id, mode)
-            else
-                try run.authority_resolver.resolve(alloc, run.child_id);
-            return subagent_execution.liveMcpViewFrom(alloc, &authority);
         }
 
         fn resolveChildLiveToolAction(
@@ -531,6 +524,7 @@ pub fn Runtime(comptime App: type) type {
                     .capabilities = .{ .form = true, .url = true },
                     .legacy_url_manual_completion = true,
                     .callback = respondToMcpInput,
+                    .declined_notice = if (comptime @hasDecl(App, "addMcpHostNotice")) tellMcpDeclined else null,
                 };
             }
             ctx.model_capability_resolver = app_callbacks.Bindings(App).modelCapabilityResolver(agent);
@@ -565,6 +559,12 @@ pub fn Runtime(comptime App: type) type {
         fn profileAllowsMcpServer(raw: *const anyopaque, server: []const u8) bool {
             const profile: *const profiles.Profile = @ptrCast(@alignCast(raw));
             return profiles.allowsMcpServer(profile, server);
+        }
+
+        /// A question fx declined, in the notice row the host's other warnings use.
+        fn tellMcpDeclined(raw_ctx: *anyopaque, text: []const u8) void {
+            const agent: *AppAgent = @ptrCast(@alignCast(raw_ctx));
+            app_agents_runtime.appOf(App, agent).addMcpHostNotice(text);
         }
 
         fn respondToMcpInput(
@@ -1131,6 +1131,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             agent: *AppAgent,
             arena: Allocator,
+            model: []const u8,
             messages: *std.ArrayList(ChatMessage),
             ignored_list_entries: []const []const u8,
             max_list_entries: usize,
@@ -1167,6 +1168,7 @@ pub fn Runtime(comptime App: type) type {
                 .access_scope = workspace.access_scope,
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
+                .model = model,
                 .subagents = subagents,
             }, arena, messages);
         }
@@ -1206,6 +1208,31 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
             }
+        }
+
+        /// Gathers the project context only when the agent has none yet,
+        /// as for a subagent's report that starts the first turn after a
+        /// relaunch or a resume. In a running session the turn keeps the
+        /// instructions of the last user turn, so a report never changes
+        /// the prompt before earlier signed thinking blocks.
+        pub fn ensureProjectContext(app: *App, agent: *AppAgent) context_contract.ProviderError!void {
+            if (agent.context_snapshot.contribution != null) return;
+            try refreshProjectContext(app, agent);
+        }
+
+        /// `ensureProjectContext` for a turn fx starts for an agent's mail,
+        /// such as a subagent's report. A failed read does not hold the
+        /// mail back: the turn goes out without the instructions, and a
+        /// notice names the error and what the person can do.
+        pub fn ensureProjectContextForMail(app: *App, agent: *AppAgent) void {
+            ensureProjectContext(app, agent) catch |err| {
+                debug_trace.logf("context", "message turn has no project instructions err={s}", .{@errorName(err)});
+                if (comptime !@hasDecl(App, "writeDomainNotice")) return;
+                var buffer: [256]u8 = undefined;
+                const body = std.mem.print(&buffer, "fx could not read the project instructions ({s}); this turn goes out without them. Check the workspace instruction files, then send a message to go on.", .{@errorName(err)}) catch "fx could not read the project instructions; this turn goes out without them. Check the workspace instruction files, then send a message to go on.";
+                app.writeDomainNotice(.{ .topic = "context", .tone = .neutral, .body = body }, true) catch |write_err|
+                    debug_trace.logf("context", "event=missing_instructions_notice_failed err={s}", .{@errorName(write_err)});
+            };
         }
 
         pub fn fetchModelIds(
@@ -1374,6 +1401,14 @@ pub fn Runtime(comptime App: type) type {
                 deps.agent_stream_provider = bundle.agent_stream_or_unavailable();
                 break :blk bundle.capabilities;
             } else .{};
+            // A model whose provider writes the compaction block compacts
+            // right before the next message is sent: only that request can
+            // go to the provider exactly as the conversation went before.
+            if (job.provider == .gateway and deps.agent_stream_provider.providerCompaction(job.model) != null) {
+                agent.session.agent.compaction_requested = true;
+                agent.worker.settleCompactionActivity(operation_id, .{ .outcome = .no_op, .scheduled = true });
+                return;
+            }
             const capabilities = deps.available_model_capabilities(deps.ctx, job.model);
             const settings = agent.worker.effectiveAgentTurnSettings();
             var provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, settings.effort, settings.fast_mode);
@@ -1733,6 +1768,7 @@ pub fn Runtime(comptime App: type) type {
                 .cancel_flag = &agent.worker.worker_cancel_requested,
                 .recovery_continue_flag = &agent.worker.recovery_continue_requested,
                 .recovery_sign_in_closed_flag = &agent.worker.recovery_sign_in_closed,
+                .yield_flag = &agent.worker.yield_requested,
                 .review_enabled = false,
                 .fast_mode = job.agent_settings.fast_mode,
                 .ultrafast_mode = job.agent_settings.ultrafast_mode,
@@ -2268,9 +2304,9 @@ const FakeApp = struct {
         };
     }
 
-    pub fn appendRuntimeContextMessage(self: *FakeApp, _: anytype, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+    pub fn appendRuntimeContextMessage(self: *FakeApp, _: anytype, arena: Allocator, model: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
         self.append_context_count += 1;
-        try Runtime(FakeApp).appendTransientRuntimeContextMessage(self, self.agent(), arena, messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        try Runtime(FakeApp).appendTransientRuntimeContextMessage(self, self.agent(), arena, model, messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
     pub fn requestToolPermissionSync(self: *FakeApp, arena: Allocator, call: ToolCall, permission_mode: PermissionMode, local_grants: []const PermissionGrant) !command_admission.PermissionOutcome {
@@ -2754,7 +2790,7 @@ test "app prompt projection configures web search then blocks native execution" 
     var messages: std.ArrayList(ChatMessage) = .empty;
     defer messages.deinit(arena);
     try Runtime(FakeApp).appendStaticContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-    try app.appendRuntimeContextMessage(app.agent(), arena, &messages);
+    try app.appendRuntimeContextMessage(app.agent(), arena, app.selected_model.items, &messages);
 
     try std.testing.expectEqualStrings("stale-key", app.web_search_runtime.api_key);
 
@@ -3141,6 +3177,31 @@ test "app agent runtime refreshes enabled project context through registry" {
     try std.testing.expectEqual(types.NoticeVisibility.full_only, app.context_notice_visibility.?);
 }
 
+test "app agent runtime gathers project context for a report turn only when it has none" {
+    const alloc = std.testing.allocator;
+    refresh_gather_calls = 0;
+    var app = RefreshContextApp{
+        .alloc = alloc,
+        .context_enabled = true,
+        .context_registry = fresh_context_registry,
+        .main_agent = .{ .context_snapshot = try makeTestContextSnapshot(alloc, "test.kept_context", "kept context") },
+    };
+    defer app.deinit();
+
+    // A running session keeps the instructions of its last user turn.
+    try Runtime(RefreshContextApp).ensureProjectContext(&app, (&app).agent());
+    try std.testing.expectEqual(@as(usize, 0), refresh_gather_calls);
+    const kept = app.agent().context_snapshot.contribution orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("kept context", kept.content);
+
+    // A new process has none yet, so the turn gathers them.
+    app.agent().context_snapshot.deinit(alloc);
+    try Runtime(RefreshContextApp).ensureProjectContext(&app, (&app).agent());
+    try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
+    const gathered = app.agent().context_snapshot.contribution orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("fresh:/tmp/workspace", gathered.content);
+}
+
 const TestHostWorkspace = struct {
     pub fn workspaceAvailable() i32 {
         return 1;
@@ -3242,6 +3303,27 @@ test "app agent runtime propagates project context gathering failures" {
     }
 }
 
+test "a mail turn whose project instructions cannot be read goes on with a notice that names the error" {
+    const alloc = std.testing.allocator;
+    refresh_gather_calls = 0;
+    refresh_gather_error = error.NoSpaceLeft;
+    var app = RefreshContextApp{
+        .alloc = alloc,
+        .context_enabled = true,
+        .context_registry = failing_context_registry,
+        .main_agent = .{ .context_snapshot = .{} },
+    };
+    defer app.deinit();
+
+    Runtime(RefreshContextApp).ensureProjectContextForMail(&app, (&app).agent());
+
+    try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
+    try std.testing.expect(app.agent().context_snapshot.contribution == null);
+    try std.testing.expectEqual(@as(?types.NoticeTone, .neutral), app.context_notice_tone);
+    try std.testing.expect(std.mem.find(u8, app.context_notices.items, "could not read the project instructions") != null);
+    try std.testing.expect(std.mem.find(u8, app.context_notices.items, "NoSpaceLeft") != null);
+}
+
 test "app agent runtime appends static and transient context through configured registry" {
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc);
@@ -3255,7 +3337,7 @@ test "app agent runtime appends static and transient context through configured 
     app.permission_engine.mode = .auto;
 
     try Runtime(FakeApp).appendStaticContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-    try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, (&app).agent(), arena, app.selected_model.items, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);
     try std.testing.expectEqual(types.ChatRole.system, messages.items[0].role);
@@ -3535,7 +3617,7 @@ test "app direct ask delivers semantic presentation through the runtime sink" {
                 semantic_events[semantic_event_count] = .thematic_rule;
                 semantic_event_count += 1;
             },
-            .text, .attempt_start, .attempt_restart => {},
+            .text, .attempt_start, .operational_text_shown, .attempt_restart, .assistant_tail => {},
         },
         else => {},
     };

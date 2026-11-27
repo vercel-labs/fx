@@ -150,10 +150,10 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     return result;
 }
 
-// Only `tests/e2e/tui-interrupt-recovery.test.ts` sets
-// `FX_TEST_GREP_RELEASE`: a finished search then waits until the file it
-// names exists, so the test can cancel the turn while the tool is still
-// running. The libfx artifacts leave it out.
+// Only tests set `FX_TEST_GREP_RELEASE`, such as
+// `tests/e2e/tui-interrupt-recovery.test.ts`: a finished search then waits
+// until the file it names exists, so the test can cancel the turn while the
+// tool is still running. The libfx artifacts leave it out.
 fn holdForTest() void {
     if (comptime build_options.libfx) return;
     const release_path = io_mod.getenvAbsolutePath("FX_TEST_GREP_RELEASE") orelse return;
@@ -328,14 +328,14 @@ fn formatMatches(
     defer out.deinit();
 
     if (matches.len == 0) {
-        out.writer.print("[grep] no matches for {s}\n", .{pattern}) catch return error.OutOfMemory;
+        out.writer.print("[grep] no matches for {f}\n", .{text_utils.terminalSafe(pattern)}) catch return error.OutOfMemory;
     } else if (emitted == 0) {
-        out.writer.print("[grep] no matches for {s} at offset {d} ({d} total matches)\n", .{ pattern, offset, matches.len }) catch return error.OutOfMemory;
+        out.writer.print("[grep] no matches for {f} at offset {d} ({d} total matches)\n", .{ text_utils.terminalSafe(pattern), offset, matches.len }) catch return error.OutOfMemory;
     } else {
         if (start == 0 and end == matches.len) {
-            out.writer.print("[grep] {d} matches for {s}\n", .{ emitted, pattern }) catch return error.OutOfMemory;
+            out.writer.print("[grep] {d} matches for {f}\n", .{ emitted, text_utils.terminalSafe(pattern) }) catch return error.OutOfMemory;
         } else {
-            out.writer.print("[grep] {d} matches for {s} (showing {d}-{d} of {d})\n", .{ emitted, pattern, start + 1, end, matches.len }) catch return error.OutOfMemory;
+            out.writer.print("[grep] {d} matches for {f} (showing {d}-{d} of {d})\n", .{ emitted, text_utils.terminalSafe(pattern), start + 1, end, matches.len }) catch return error.OutOfMemory;
         }
         for (matches[start..end]) |match| {
             const display_path = displayPath(arena, workspace_root, match.absolute_path) catch |err| fallback: {
@@ -365,11 +365,11 @@ fn writeMatchWithContext(
     const content = if (context_lines > 0) try readContextContent(arena, match.absolute_path) else null;
     if (content) |text| {
         const first_line = if (match.line_number > context_lines) match.line_number - context_lines else 1;
-        try writeContextRange(writer, display_path, text, first_line, match.line_number, max_read_file_line_len);
+        try writeContextRange(arena, writer, display_path, text, first_line, match.line_number, max_read_file_line_len);
     }
-    try writeMatchLine(writer, display_path, match, max_read_file_line_len);
+    try writeMatchLine(arena, writer, display_path, match, max_read_file_line_len);
     if (content) |text| {
-        try writeContextRange(writer, display_path, text, match.line_number + 1, match.line_number + context_lines + 1, max_read_file_line_len);
+        try writeContextRange(arena, writer, display_path, text, match.line_number + 1, match.line_number + context_lines + 1, max_read_file_line_len);
     }
 }
 
@@ -383,6 +383,7 @@ fn readContextContent(arena: Allocator, absolute_path: []const u8) !?[]const u8 
 }
 
 fn writeContextRange(
+    arena: Allocator,
     writer: *std.Io.Writer,
     display_path: []const u8,
     content: []const u8,
@@ -395,8 +396,8 @@ fn writeContextRange(
     while (nextRealLine(content, &cursor)) |line| : (line_number += 1) {
         if (line_number < start_line) continue;
         if (line_number >= end_line_exclusive) break;
-        try writer.print("   {s}:{d}- ", .{ display_path, line_number });
-        try writeClippedLine(writer, line, max_read_file_line_len);
+        try writer.print("   {f}:{d}- ", .{ text_utils.terminalSafe(display_path), line_number });
+        try writeClippedLine(arena, writer, line, max_read_file_line_len);
     }
 }
 
@@ -415,18 +416,22 @@ fn nextRealLine(content: []const u8, cursor: *usize) ?[]const u8 {
 }
 
 fn writeMatchLine(
+    arena: Allocator,
     writer: *std.Io.Writer,
     display_path: []const u8,
     match: grep_search.Match,
     max_read_file_line_len: usize,
 ) !void {
-    try writer.print(" - {s}:{d}: ", .{ display_path, match.line_number });
-    try writeClippedLine(writer, match.line, max_read_file_line_len);
+    try writer.print(" - {f}:{d}: ", .{ text_utils.terminalSafe(display_path), match.line_number });
+    try writeClippedLine(arena, writer, match.line, max_read_file_line_len);
 }
 
-fn writeClippedLine(writer: *std.Io.Writer, line: []const u8, max_read_file_line_len: usize) !void {
-    const clipped_len = @min(line.len, max_read_file_line_len);
-    try writer.writeAll(line[0..clipped_len]);
+// File text can hold escape sequences that the terminal would act on (RULES.md R4.6).
+fn writeClippedLine(arena: Allocator, writer: *std.Io.Writer, line: []const u8, max_read_file_line_len: usize) !void {
+    const clipped_len = text_utils.utf8BackwardBoundary(line, max_read_file_line_len);
+    var safe_line: std.ArrayList(u8) = .empty;
+    try text_utils.appendTerminalSafeLine(arena, &safe_line, line[0..clipped_len]);
+    try writer.writeAll(safe_line.items);
     if (line.len > max_read_file_line_len) {
         try writer.writeAll("...");
     }
@@ -467,17 +472,17 @@ fn formatFilesWithMatches(
     defer out.deinit();
 
     if (files.items.len == 0) {
-        out.writer.print("[grep] no files with matches for {s}\n", .{pattern}) catch return error.OutOfMemory;
+        out.writer.print("[grep] no files with matches for {f}\n", .{text_utils.terminalSafe(pattern)}) catch return error.OutOfMemory;
     } else if (emitted == 0) {
-        out.writer.print("[grep] no files with matches for {s} at offset {d} ({d} total files)\n", .{ pattern, offset, files.items.len }) catch return error.OutOfMemory;
+        out.writer.print("[grep] no files with matches for {f} at offset {d} ({d} total files)\n", .{ text_utils.terminalSafe(pattern), offset, files.items.len }) catch return error.OutOfMemory;
     } else {
         if (start == 0 and end == files.items.len) {
-            out.writer.print("[grep] {d} files with matches for {s}\n", .{ emitted, pattern }) catch return error.OutOfMemory;
+            out.writer.print("[grep] {d} files with matches for {f}\n", .{ emitted, text_utils.terminalSafe(pattern) }) catch return error.OutOfMemory;
         } else {
-            out.writer.print("[grep] {d} files with matches for {s} (showing {d}-{d} of {d})\n", .{ emitted, pattern, start + 1, end, files.items.len }) catch return error.OutOfMemory;
+            out.writer.print("[grep] {d} files with matches for {f} (showing {d}-{d} of {d})\n", .{ emitted, text_utils.terminalSafe(pattern), start + 1, end, files.items.len }) catch return error.OutOfMemory;
         }
         for (files.items[start..end]) |path| {
-            out.writer.print(" - {s}\n", .{path}) catch return error.OutOfMemory;
+            out.writer.print(" - {f}\n", .{text_utils.terminalSafe(path)}) catch return error.OutOfMemory;
         }
     }
     if (end < files.items.len) {
@@ -518,7 +523,7 @@ fn formatCount(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    out.writer.print("[grep] count {d} matching lines in {d} files for {s}\n", .{ result.matching_lines, result.matching_files, pattern }) catch return error.OutOfMemory;
+    out.writer.print("[grep] count {d} matching lines in {d} files for {f}\n", .{ result.matching_lines, result.matching_files, text_utils.terminalSafe(pattern) }) catch return error.OutOfMemory;
     try candidateCompleteness(result).writeNotes(&out.writer);
     return try out.toOwnedSlice();
 }
@@ -708,6 +713,136 @@ test "grep_files keeps only its result in the turn's allocator" {
         // Searching 2,050 files takes far more than this; the result does not.
         try std.testing.expect(turn_state.queryCapacity() - before < 64 * 1024);
     }
+}
+
+fn expectNoRawEscapeBytes(body: []const u8) !void {
+    try std.testing.expect(std.mem.findScalar(u8, body, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, body, 0x07) == null);
+    try std.testing.expect(std.mem.findScalar(u8, body, '\r') == null);
+}
+
+fn expectEscapedText(alloc: Allocator, body: []const u8, raw: []const u8) !void {
+    var escaped = try text_utils.encodeTerminalSafe(alloc, raw, std.math.maxInt(usize));
+    defer escaped.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, body, escaped.bytes) != null);
+}
+
+test "grep_files writes escape bytes in a match line as visible escapes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "a.txt", "needle \x1b[31mred\x07\tend\r\n");
+    defer alloc.free(path);
+
+    var result = try dispatchGrepFiles(alloc, workspace, "needle", null, null, null, null, null);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try expectNoRawEscapeBytes(result.body);
+    try std.testing.expect(std.mem.find(u8, result.body, "\tend\n") != null);
+    try expectEscapedText(alloc, result.body, "\x1b[31mred\x07");
+}
+
+test "grep_files writes escape bytes in context lines as visible escapes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "context.txt", "\x1b]0;title\x07\nneedle\n");
+    defer alloc.free(path);
+
+    var result = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"needle\",\"path\":\"context.txt\",\"context_lines\":1}");
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try expectNoRawEscapeBytes(result.body);
+    try expectEscapedText(alloc, result.body, "\x1b]0;title\x07");
+}
+
+test "grep_files writes escape bytes in file names as visible escapes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const name = "esc\x1b[1mname.txt";
+    const path = try writeTempFile(alloc, &tmp, name, "needle\n");
+    defer alloc.free(path);
+
+    var files_result = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"needle\",\"mode\":\"files_with_matches\"}");
+    defer files_result.deinit(alloc);
+    try std.testing.expectEqual(.success, files_result.status);
+    try expectNoRawEscapeBytes(files_result.body);
+    try expectEscapedText(alloc, files_result.body, name);
+
+    var matches_result = try dispatchGrepFiles(alloc, workspace, "needle", null, null, null, null, null);
+    defer matches_result.deinit(alloc);
+    try std.testing.expectEqual(.success, matches_result.status);
+    try expectNoRawEscapeBytes(matches_result.body);
+    try expectEscapedText(alloc, matches_result.body, name);
+}
+
+test "grep_files writes escape bytes in the pattern as visible escapes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "a.txt", "needle\n");
+    defer alloc.free(path);
+
+    var result = try dispatchGrepFiles(alloc, workspace, "\x1b[2Jabsent", null, null, null, null, null);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try expectNoRawEscapeBytes(result.body);
+    try expectEscapedText(alloc, result.body, "\x1b[2Jabsent");
+}
+
+test "grep_files keeps tabs and plain text unchanged" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "a.txt", "needle\there\n");
+    defer alloc.free(path);
+
+    var result = try dispatchGrepFiles(alloc, workspace, "needle", null, null, null, null, null);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - a.txt:1: needle\there\n", result.body);
+}
+
+test "grep_files clips a long match line at a whole UTF-8 character" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const path = try writeTempFile(alloc, &tmp, "a.txt", "needle éééé\n");
+    defer alloc.free(path);
+    const args = try grepArgsJson(alloc, "needle", null, null, null, null, null);
+    defer alloc.free(args);
+
+    const registry = tool_dispatch.Registry{ .tools = &.{grep_files_dispatch_tool} };
+    // "needle " is 7 bytes and each "é" is 2, so byte 12 splits the third "é".
+    var result = try tool_dispatch.dispatchToolCall(.{
+        .allocator = alloc,
+        .scratch_allocator = alloc,
+        .permission_mode = .auto,
+        .workspace_root = workspace,
+        .max_read_file_line_len = 12,
+    }, registry, .{ .id = "call_1", .name = "grep_files", .arguments_json = args });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - a.txt:1: needle éé...\n", result.body);
+    try std.testing.expect(std.mem.find(u8, result.body, "\\x") == null);
 }
 
 fn writeTempFile(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) ![]u8 {
@@ -1369,10 +1504,12 @@ test "grep_files files_with_matches mode returns unique paginated paths" {
 
 test "grep_files formatter uses active pagination cap" {
     const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
     const matches = try matchingLines(alloc, 3);
     defer alloc.free(matches);
 
-    const body = try formatMatches(alloc, alloc, "", "needle", .{ .matches = matches }, 2, 0, 0, 2, 2000);
+    const body = try formatMatches(alloc, arena_state.allocator(), "", "needle", .{ .matches = matches }, 2, 0, 0, 2, 2000);
     defer alloc.free(body);
 
     try std.testing.expectEqualStrings(
@@ -1386,10 +1523,12 @@ test "grep_files formatter uses active pagination cap" {
 
 test "grep_files formatter does not report output truncation for exactly active cap" {
     const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
     const matches = try matchingLines(alloc, tool_dispatch.default_max_list_entries);
     defer alloc.free(matches);
 
-    const body = try formatMatches(alloc, alloc, "", "needle", .{ .matches = matches }, output_cap, 0, 0, tool_dispatch.default_max_list_entries, 2000);
+    const body = try formatMatches(alloc, arena_state.allocator(), "", "needle", .{ .matches = matches }, output_cap, 0, 0, tool_dispatch.default_max_list_entries, 2000);
     defer alloc.free(body);
 
     try std.testing.expect(std.mem.startsWith(u8, body, "[grep] 100 matches for needle\n"));
@@ -1399,10 +1538,12 @@ test "grep_files formatter does not report output truncation for exactly active 
 
 test "grep_files formatter reports active truncation when cap hides matches" {
     const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
     const matches = try matchingLines(alloc, tool_dispatch.default_max_list_entries + 1);
     defer alloc.free(matches);
 
-    const body = try formatMatches(alloc, alloc, "", "needle", .{ .matches = matches }, output_cap, 0, 0, tool_dispatch.default_max_list_entries, 2000);
+    const body = try formatMatches(alloc, arena_state.allocator(), "", "needle", .{ .matches = matches }, output_cap, 0, 0, tool_dispatch.default_max_list_entries, 2000);
     defer alloc.free(body);
 
     try std.testing.expect(std.mem.startsWith(u8, body, "[grep] 100 matches for needle (showing 1-100 of 101)\n"));
@@ -1412,10 +1553,12 @@ test "grep_files formatter reports active truncation when cap hides matches" {
 
 test "grep_files formatter reports collection cap separately from output truncation" {
     const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
     const matches = try matchingLines(alloc, grep_search.collection_cap);
     defer alloc.free(matches);
 
-    const body = try formatMatches(alloc, alloc, "", "needle", .{
+    const body = try formatMatches(alloc, arena_state.allocator(), "", "needle", .{
         .matches = matches,
         .truncated_reason = .collection_cap,
     }, output_cap, 0, 0, tool_dispatch.default_max_list_entries, 2000);

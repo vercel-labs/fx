@@ -20,7 +20,7 @@ import {
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
 import { LineQueue } from "./line-queue";
 import { commandReplays, onlySessionId, savedSessionIds, savedText, storeRoot } from "./saved-sessions";
 import { latestTraceReportPath, readTraceReport, traceReportNames, waitForNewTraceReport } from "./trace-report";
@@ -37,6 +37,7 @@ import {
   TITLE_GENERATION_MARKER,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -302,6 +303,18 @@ function currentUserText(body: string): string {
   return contentText(
     request.prompt?.findLast((message) => message.role === "user")?.content,
   );
+}
+
+// Every user message at the end of the prompt, in order. Joined subagent
+// reports arrive as several consecutive user messages.
+function trailingUserTexts(body: string): string[] {
+  const request = JSON.parse(body) as {
+    prompt?: Array<{ role?: string; content?: unknown }>;
+  };
+  const prompt = request.prompt ?? [];
+  let first = prompt.length;
+  while (first > 0 && prompt[first - 1].role === "user") first -= 1;
+  return prompt.slice(first).map((message) => contentText(message.content));
 }
 
 function occurrenceCount(text: string, needle: string): number {
@@ -844,7 +857,7 @@ describe("effect-aware command permissions", () => {
         10_000,
       );
       await activeSession.sendKeys("1");
-      await activeSession.waitForText("history feedback live complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("history feedback live complete") && turnSettled(pane), TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
       // The two commands share one row by their steps, which is the group's
@@ -904,7 +917,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("/resume");
       await activeSession.waitForText("Run the prepared two-command history fixture.", TIMEOUT);
       await activeSession.sendKeys("Enter");
-      await activeSession.waitForText("history feedback cli resume complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("history feedback cli resume complete") && turnSettled(pane), TIMEOUT);
       const pickerScrollback = await activeSession.captureFullScrollback();
       const pickerCommandsRow = pickerScrollback.indexOf("Ran touch, printf");
       expect(pickerCommandsRow).toBeGreaterThanOrEqual(0);
@@ -1092,7 +1105,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run pwd once in auto mode.");
-      await activeSession.waitForText("direct auto complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("direct auto complete") && turnSettled(pane), TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
       // The group's only call is its header.
@@ -1379,7 +1392,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run the prepared command.");
-      await activeSession.waitForText("COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("COMMAND_SUMMARY_WIDTH_COMPLETE") && turnSettled(pane), TIMEOUT);
 
       const narrow = await activeSession.captureFullScrollback();
       // The command is long, so its row shows its steps in short form at every
@@ -1395,7 +1408,7 @@ describe("effect-aware command permissions", () => {
       expect(wideRow).toBe("● Ran printf ✓");
 
       await activeSession.sendText("Run the next prepared command.");
-      await activeSession.waitForText("WORKSPACE_COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("WORKSPACE_COMMAND_SUMMARY_WIDTH_COMPLETE") && turnSettled(pane), TIMEOUT);
       const workspaceWide = await activeSession.captureFullScrollback();
       // The second command is long too, and its row never shows the
       // workspace path.
@@ -1479,7 +1492,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("Run the lossless direct printf fixture.");
       await activeSession.waitForText("DIRECT_LOSSLESS_DONE", TIMEOUT);
       await activeSession.waitForPane(
-        (pane) => pane.includes("DIRECT_LOSSLESS_DONE") && !pane.includes("Streaming ("),
+        (pane) => pane.includes("DIRECT_LOSSLESS_DONE") && turnSettled(pane),
         TIMEOUT,
       );
 
@@ -1509,7 +1522,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("Run the lossy direct printf fixture.");
       await activeSession.waitForText("DIRECT_LOSSY_DONE", TIMEOUT);
       await activeSession.waitForPane(
-        (pane) => pane.includes("DIRECT_LOSSY_DONE") && !pane.includes("Streaming ("),
+        (pane) => pane.includes("DIRECT_LOSSY_DONE") && turnSettled(pane),
         TIMEOUT,
       );
       const lossyCompact = await activeSession.captureFullScrollback();
@@ -1654,7 +1667,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("/output quiet");
-      await activeSession.waitForText(responseRows.at(-1)!, TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes(responseRows.at(-1)!) && turnSettled(pane), TIMEOUT);
       expect(promptText(gateway.requests[0]!.body)).toContain("/output quiet");
       expect(gateway.requests).toHaveLength(2);
       const compact = await activeSession.captureFullScrollback();
@@ -1814,7 +1827,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("diagnostic fixture complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("diagnostic fixture complete") && turnSettled(pane), TIMEOUT);
       expect(readFileSync(fixturePath, "utf8")).toBe("same twice same\n");
 
       await activeSession.sendText("/trace");
@@ -1905,12 +1918,14 @@ describe("effect-aware command permissions", () => {
         }
         return finalText("unexpected request");
       }
-      // A failed ship tells main that its request waits; that message stays
-      // in main's history, so only the report itself names who reported.
-      const current = currentUserText(body);
-      if (current.startsWith("Subagent report")) {
-        for (const name of ["cards", "ship"]) {
-          if (current.includes(`"agent":"${name}"`)) reported.add(name);
+      // A failed ship tells main that its request waits. That message can
+      // trail a report in the same request, so only report texts name who reported.
+      const reports = trailingUserTexts(body).filter((text) => text.startsWith("Subagent report"));
+      if (reports.length > 0) {
+        for (const text of reports) {
+          for (const name of ["cards", "ship"]) {
+            if (text.includes(`"agent":"${name}"`)) reported.add(name);
+          }
         }
         return finalText(`report noted ${reported.size}`);
       }
@@ -1941,10 +1956,18 @@ describe("effect-aware command permissions", () => {
     await activeSession.waitForComposer(TIMEOUT);
     await activeSession.sendText(rootPrompt);
     if (shipFails) {
-      await activeSession.waitForText("report noted 1", TIMEOUT * 2);
-      await activeSession.waitForText("ship needs you", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("report noted 1") && turnSettled(pane), TIMEOUT * 2);
+      // Ship's request failed while main's turn was still taking in reports,
+      // so the view shows the card for it instead of the footer's note.
+      const card = await activeSession.waitForText("Open ship's screen", TIMEOUT);
+      expect(card).toContain("ship: The provider rejected this request");
+      expect(card).not.toContain("ship needs you");
+      // The card holds the keys, so the person opens ship's screen to go on
+      // from there; ship's wait and its running turn stay as they were.
+      await activeSession.sendKeys("4");
+      await activeSession.waitForPane((pane) => !pane.includes("Open ship's screen"), TIMEOUT);
     } else {
-      await activeSession.waitForText("report noted 2", TIMEOUT * 2);
+      await activeSession.waitForPane((pane) => pane.includes("report noted 2") && turnSettled(pane), TIMEOUT * 2);
     }
     await activeSession.waitForComposer(TIMEOUT);
 
@@ -2051,7 +2074,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Say hello.");
-      await activeSession.waitForText("nothing to delegate", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("nothing to delegate") && turnSettled(pane), TIMEOUT);
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
         process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
@@ -2130,7 +2153,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("window filled", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("window filled") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2251,7 +2274,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("cuts done", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("cuts done") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2347,7 +2370,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("wrapped secrets done", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("wrapped secrets done") && turnSettled(pane), 120_000);
       // The prose and the table are on screen in pieces: no row holds a whole
       // secret. The command output is folded once the turn ends, and its
       // entries keep the rows it was wrapped into.
@@ -2431,7 +2454,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("many secrets done", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("many secrets done") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2501,7 +2524,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("AAAAAA", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("AAAAAA") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2581,7 +2604,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("probe done", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("probe done") && turnSettled(pane), TIMEOUT);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2639,7 +2662,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Trigger the gateway schema diagnostic.");
-      await activeSession.waitForText("HTTP 400", TIMEOUT);
+      await activeSession.waitForText("The provider rejected this request", TIMEOUT);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2733,9 +2756,9 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(failPrompt);
-      await activeSession.waitForText("HTTP 400", TIMEOUT);
+      await activeSession.waitForText("The provider rejected this request", TIMEOUT);
       await activeSession.sendText(fillPrompt);
-      await activeSession.waitForText("network window filled", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("network window filled") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2755,6 +2778,9 @@ describe("effect-aware command permissions", () => {
       const networkFailures = report.all("failed_network_call");
       expect(networkFailures).toHaveLength(1);
       expect(network.kept_failures).toBe(1);
+      // An HTTP rejection is not an OS error that Zig has no name for.
+      expect(network.os_errors).toBe(0);
+      expect(report.all("os_error")).toEqual([]);
       expect(networkFailures[0]).toMatchObject({
         source: "parent",
         status: 400,
@@ -2813,7 +2839,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Render the trace fixture.");
-      await activeSession.waitForText("TRACE_RENDER_DONE", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("TRACE_RENDER_DONE") && turnSettled(pane), TIMEOUT);
       await activeSession.waitForStableComposer(TIMEOUT);
       await activeSession.resizeWindow(100, 32);
       await activeSession.waitForStableComposer(TIMEOUT);
@@ -2902,7 +2928,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Say ready.");
-      await activeSession.waitForText("TRACE_FAULT_READY", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("TRACE_FAULT_READY") && turnSettled(pane), TIMEOUT);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText("Could not create trace.", TIMEOUT);
@@ -2934,6 +2960,80 @@ describe("effect-aware command permissions", () => {
       expect(await activeSession.waitForSessionEnd()).toBe(true);
       await activeSession.kill();
       activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace records the gateway generation, served-by, and effort the request sent",
+    async () => {
+      // An ID in the AI Gateway's form (types.validGatewayGenerationId): gen_ and 26 Crockford characters.
+      const GENERATION_ID = "gen_01JC7P5XQ2M8VZ000000000001";
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "trace-effort-stderr.log");
+      writeFileSync(stderrPath, "");
+      const gateway = startDynamicFakeGateway(
+        () =>
+          sse([
+            { type: "text-delta", id: "answer_1", delta: "EFFORT_TRACE_OK" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: { inputTokens: { total: 3 }, outputTokens: { total: 5 } },
+              providerMetadata: {
+                gateway: { generationId: GENERATION_ID, routing: { finalProvider: "bedrock" } },
+              },
+            },
+          ]),
+        {
+          models: [{
+            id: MODEL,
+            type: "language",
+            tags: ["tool-use", "reasoning"],
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          }],
+        },
+      );
+      gateways.push(gateway);
+      activeSession = await TmuxSession.create({
+        cmd: `${FX_BIN} --effort high`,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          TMPDIR: root.root,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Say the effort is high.");
+      await activeSession.waitForPane((pane) => pane.includes("EFFORT_TRACE_OK") && turnSettled(pane), TIMEOUT);
+      await activeSession.waitForComposer(TIMEOUT);
+
+      await activeSession.sendText("/trace");
+      const report = await waitForNewTraceReport(root.root);
+
+      const prompt = gateway.requests.find((request) => request.body.includes("Say the effort is high."));
+      expect(prompt).toBeDefined();
+      expect(JSON.parse(prompt!.body)).toMatchObject({ reasoning: "high" });
+      expect(report.records[0]).toMatchObject({ type: "fx_trace", update_channel: "stable" });
+      const turnCalls = report.all("network_call").filter((call) => call.generation_id === GENERATION_ID);
+      expect(turnCalls).toHaveLength(1);
+      expect(turnCalls[0]).toMatchObject({
+        kind: "gateway",
+        model: MODEL,
+        generation_id: GENERATION_ID,
+        served_by: "bedrock",
+        effort: "high",
+      });
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
   );
@@ -3167,7 +3267,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForPane(
         (pane) =>
           pane.includes("classifier approved complete") &&
-          !pane.includes("Streaming ("),
+          turnSettled(pane),
         TIMEOUT,
       );
 
@@ -4020,6 +4120,58 @@ describe("effect-aware command permissions", () => {
     60_000,
   );
 
+const LIST_HINT = "enter switch";
+
+// A promise the fake resolves when it records a value, so a test waits on the
+// record itself instead of sampling for it.
+function heldValue<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => (resolve = res));
+  return { promise, resolve };
+}
+
+// Awaits `promise`, failing with `what` when it is not settled within `ms`. The
+// race only bounds the wait: what the test waits on is the signal the fake sends.
+async function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  const expired = new Promise<never>((_, reject) => {
+    AbortSignal.timeout(ms).addEventListener("abort", () => reject(new Error(`timed out waiting for ${what}`)), { once: true });
+  });
+  return await Promise.race([promise, expired]);
+}
+
+// Shows `agent`, "main" or a subagent's name, through the agent list: Ctrl+X
+// opens it whatever the composer holds, each arrow shows the next row's agent,
+// and Enter keeps it. Main's row comes first, then its working subagents, then
+// the rest by their latest reply. Those rows can move while the list is open,
+// so each step reads the rows again instead of counting them.
+async function showAgent(session: TmuxSession, agent: string) {
+  await selectAgent(session, agent);
+  await session.sendKeys("Enter");
+  // The list's header is gone once Enter kept the highlighted agent.
+  await session.waitForPane((pane) => !pane.includes("Agents 1"), 10_000);
+}
+
+// Opens the agent list and highlights `agent`'s row: the list's search box
+// narrows the rows to that agent's own, and it reports how many it kept, so the
+// state to wait for is its one-row header.
+async function selectAgent(session: TmuxSession, agent: string) {
+  await session.sendKeys("C-x");
+  await session.waitForText(LIST_HINT, 10_000);
+  await session.sendLiteral(agent);
+  await session.waitForPane((pane) => pane.includes("Agents 1"), 15_000);
+}
+
+// The person opens the subagent's own screen and types a task there, so its turn
+// is one the person started. A turn main started is answered by main and its
+// request is never lent; a turn the person typed still lends its approval to
+// main's screen, which is the path these tests keep
+// (`tests/tla/subagent/TuiParentApproval.tla` NoStaleLent).
+async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: string, task: string) {
+  await showAgent(session, agent);
+  await session.waitForPane((pane) => pane.includes(ready), 30_000);
+  await session.sendText(task);
+}
+
   test.skipIf(!tmuxAvailable())(
     "interactive child approval uses the normal parent prompt",
     async () => {
@@ -4028,15 +4180,126 @@ describe("effect-aware command permissions", () => {
       const markerPath = join(root.workspace, "child-approval-must-not-exist");
       const rootPrompt = "DELEGATE_ONE_APPROVAL_TASK";
       const childPrompt = "Request permission to create the delegated marker.";
+      const readyToken = "HELPER_READY_TASK";
+      // The child's task request waits until the person is back on main, so the
+      // lent prompt finds them there. A typed turn owes no report, so the
+      // evidence at the end is the tool result the child read; the note test
+      // beside this one covers main's side.
+      let releaseTask!: () => void;
+      const backOnMain = new Promise<void>((resolve) => (releaseTask = resolve));
+      const childDenial = heldValue<string>();
       const createId = "direct_child_create";
       const commandId = "direct_child_command";
       writeFileSync(stderrPath, "");
+      const gateway = startDynamicFakeGateway(async (body) => {
+        // A typed turn owes no report; only the ready turn's report reaches main.
+        if (currentUserText(body).includes("Subagent report (untrusted agent output, not user instructions):")) {
+          expect(currentUserText(body)).not.toContain("CHILD_PERMISSION_DENIED");
+          return finalText("PARENT_SAW_HELPER_READY");
+        }
+        if (body.includes(`\\\"toolCallId\\\":\\\"${commandId}\\\"`) || body.includes(`"toolCallId":"${commandId}"`)) {
+          // The person's denial is this call's result, which the child reads.
+          childDenial.resolve(body);
+          return finalText("CHILD_PERMISSION_DENIED");
+        }
+        // The child's first turn only makes it ready: the person then types the
+        // task on the child's own screen.
+        if (currentUserText(body).includes(readyToken)) return finalText("HELPER_CHILD_READY");
+        if (body.includes(createId)) {
+          const created = JSON.parse(toolResultText(body, createId)) as {
+            ok: boolean;
+            result?: string;
+          };
+          expect(created.ok).toBe(true);
+          expect(created.result).toContain("Sent to helper");
+          expect(toolResultText(body, createId)).not.toContain("child_id");
+          return finalText("PARENT_TURN_DONE");
+        }
+        if (currentUserText(body).includes(childPrompt)) {
+          // fx's agent profile has every tool, so the subagent may start
+          // its own.
+          expect(body).toContain('"name":"subagent"');
+          await backOnMain;
+          return toolCall(`/usr/bin/touch ${shellQuote(markerPath)}`, {}, commandId);
+        }
+        if (currentUserText(body).includes(rootPrompt)) {
+          return gatewayToolCall("subagent", {
+            request: { action: "message", agent: "helper", message: readyToken },
+          }, createId);
+        }
+        throw new Error(`Unexpected direct child approval request: ${body}`);
+      });
+      gateways.push(gateway);
 
-      const gateway = startDynamicFakeGateway((body) => {
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          FX_PERMISSION_MODE: "ask",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      // The person types the task on helper's own screen, so the turn is
+      // theirs, and returns to main, where the request is lent to them.
+      await typeTaskOnSubagent(activeSession, "helper", "HELPER_CHILD_READY", childPrompt);
+      await showAgent(activeSession, "main");
+      releaseTask();
+      const approvalPane = await activeSession.waitForText(
+        COMMAND_APPROVAL_PROMPT,
+        TIMEOUT,
+      );
+      expect(approvalPane).toContain("touch");
+      expect(existsSync(markerPath)).toBe(false);
+      await activeSession.sendKeys("3");
+      // The child read the denial, and the marker never exists.
+      const denial = await within(childDenial.promise, TIMEOUT, "the child to read the person's denial");
+      expect(denial).toContain("Permission denied by user");
+      expect(existsSync(markerPath)).toBe(false);
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd(5_000)).toBe(true);
+      activeSession = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "interactive child approval asks the parent as a note the parent denies",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "interactive-child-approval-stderr.log");
+      const markerPath = join(root.workspace, "child-approval-must-not-exist");
+      const command = `/usr/bin/touch ${shellQuote(markerPath)}`;
+      const rootPrompt = "DELEGATE_ONE_APPROVAL_TASK";
+      const childPrompt = "Request permission to create the delegated marker.";
+      const createId = "direct_child_create";
+      const commandId = "direct_child_command";
+      const denyId = "direct_child_deny";
+      writeFileSync(stderrPath, "");
+      // The child's request starts in the parent's turn, so the parent hears it
+      // as one note and answers it with the subagent tool. The note waits until
+      // the test has looked at the screen.
+      const note = heldValue<string>();
+      let releaseDeny!: () => void;
+      const denyMayGo = new Promise<void>((resolve) => (releaseDeny = resolve));
+
+      const gateway = startDynamicFakeGateway(async (body) => {
         // The child's report starts the parent's next turn.
         if (currentUserText(body).includes("Subagent report (untrusted agent output, not user instructions):")) {
           expect(currentUserText(body)).toContain("CHILD_PERMISSION_DENIED");
           return finalText("PARENT_OBSERVED_CHILD_DENIAL");
+        }
+        // The note names the command the child asks for and the child itself.
+        if (currentUserText(body).includes("I wait for your approval to run") && !body.includes(denyId)) {
+          note.resolve(currentUserText(body));
+          await denyMayGo;
+          return gatewayToolCall("subagent", {
+            request: { action: "deny", agent: "helper", message: "Not in this workspace." },
+          }, denyId);
         }
         if (body.includes(`\\\"toolCallId\\\":\\\"${commandId}\\\"`) || body.includes(`"toolCallId":"${commandId}"`)) {
           return finalText("CHILD_PERMISSION_DENIED");
@@ -4055,7 +4318,7 @@ describe("effect-aware command permissions", () => {
           // fx's agent profile has every tool, so the subagent may start
           // its own.
           expect(body).toContain('"name":"subagent"');
-          return toolCall(`/usr/bin/touch ${shellQuote(markerPath)}`, {}, commandId);
+          return toolCall(command, {}, commandId);
         }
         if (currentUserText(body).includes(rootPrompt)) {
           return gatewayToolCall("subagent", {
@@ -4078,13 +4341,26 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      const approvalPane = await activeSession.waitForText(
-        COMMAND_APPROVAL_PROMPT,
-        TIMEOUT,
-      );
-      expect(approvalPane).toContain("touch");
+      // The note names the command and the child that asks, and no screen offers
+      // the request to the person. Its action is one terminal-safe line
+      // (`live_metrics.storeLabel`'s 160 bytes around the cut command), so a long
+      // workspace path, as macOS makes, hides the marker's tail.
+      const noteText = await within(note.promise, TIMEOUT, "the note to reach the parent");
+      expect(noteText).toContain("/usr/bin/touch");
+      expect(noteText).toContain("helper");
+      const label = `shell.run ${command}`;
+      const after = "I wait for your approval to run: ";
+      const action = noteText.slice(noteText.indexOf(after) + after.length).split(". Answer with the subagent tool")[0]!;
+      // The action is the label itself, or the label's own head cut for one line
+      // with a cut marker; a long workspace path, as macOS makes, cuts before the
+      // marker's name, so only the label held whole shows that name.
+      expect(label.startsWith(action.replace(/(?:\.\.\.|…)+$/, ""))).toBe(true);
+      if (action === label) expect(noteText).toContain("child-approval-must-not-exist");
+      else expect(action).toMatch(/(?:\.\.\.|…)+$/);
+      const waiting = await activeSession.capturePane();
+      expect(waiting).not.toContain(COMMAND_APPROVAL_PROMPT);
       expect(existsSync(markerPath)).toBe(false);
-      await activeSession.sendKeys("3");
+      releaseDeny();
       const reported = await activeSession.waitForText("PARENT_OBSERVED_CHILD_DENIAL", TIMEOUT);
       // The report shows as a finished subagent row, not as the user's prompt.
       expect(reported).toContain("helper finished");
@@ -4107,7 +4383,7 @@ describe("effect-aware command permissions", () => {
 
       await harness.initialSession.waitForText("auto · gpt-5", TIMEOUT);
       await harness.initialSession.sendText("Save a turn before changing permission mode.");
-      await harness.initialSession.waitForText("permission resume seed complete", TIMEOUT);
+      await harness.initialSession.waitForPane((pane) => pane.includes("permission resume seed complete") && turnSettled(pane), TIMEOUT);
       expect(harness.initialGateway.requests).toHaveLength(1);
 
       await harness.initialSession.sendText("/permissions ask");
@@ -4318,12 +4594,12 @@ describe("effect-aware command permissions", () => {
 
       await activeSession.sendKeys("2");
       await activeSession.sendKeys("Enter");
-      await activeSession.waitForText("first always approval complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("first always approval complete") && turnSettled(pane), TIMEOUT);
       expect(existsSync(marker)).toBe(true);
 
       rmSync(marker);
       await activeSession.sendText("Create the reusable marker again.");
-      const finalPane = await activeSession.waitForText("second always approval complete", TIMEOUT);
+      const finalPane = await activeSession.waitForPane((pane) => pane.includes("second always approval complete") && turnSettled(pane), TIMEOUT);
 
       expect(finalPane).toContain("second always approval complete");
       expect(existsSync(marker)).toBe(true);
@@ -5267,7 +5543,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Say hello.");
-      await activeSession.waitForText("setup traced", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("setup traced") && turnSettled(pane), TIMEOUT);
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
         process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
@@ -5521,7 +5797,7 @@ class AcpClient {
   static create(cwd: string, env: Record<string, string | undefined>) {
     return new AcpClient(nodeSpawn(FX_BIN, ["acp"], {
       cwd,
-      env: definedEnv({ ...process.env, ...env, NO_COLOR: "1" }),
+      env: definedEnv(fxChildEnv({ ...env, NO_COLOR: "1" })),
       stdio: ["pipe", "pipe", "pipe"],
     }));
   }
