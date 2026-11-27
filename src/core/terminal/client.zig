@@ -1981,15 +1981,22 @@ const LauncherWatch = struct {
         }
     }
 
-    /// Blocks until `event` is set, for at most `timeout_ms`.
+    /// Blocks until `event` is set, for at most `timeout_ms`. A wait that ends
+    /// early without the event is not a timeout: `Event.waitTimeout` reports a
+    /// spurious wake-up as one.
     fn waitFor(event: *std.Io.Event, timeout_ms: i64) !void {
-        event.waitTimeout(io_mod.getIo(), .{ .duration = .{
-            .clock = .awake,
-            .raw = .fromMilliseconds(timeout_ms),
-        } }) catch |err| switch (err) {
-            error.Timeout => return error.TestLauncherEventTimedOut,
-            error.Canceled => return err,
-        };
+        const deadline = io_mod.milliTimestamp() + timeout_ms;
+        while (!event.isSet()) {
+            const left_ms = deadline - io_mod.milliTimestamp();
+            if (left_ms <= 0) return error.TestLauncherEventTimedOut;
+            event.waitTimeout(io_mod.getIo(), .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(left_ms),
+            } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return err,
+            };
+        }
     }
 };
 
@@ -2133,15 +2140,17 @@ fn expectExitEndsLateChild(output: OutputEnds) !void {
 
     fixture.runtime.closeOwnedTerminals();
     // The hook ran after the shell's tree was recorded and waited for the child.
-    try std.testing.expect(!ExitGate.failed);
+    if (ExitGate.failed) return error.TestExitGateFailed;
     const late = TestProcess.init(try readPid(&fixture, "late.pid"));
     // Past the failed assertions, so the test never leaves its child behind.
     defer late.end();
-    try std.testing.expect(fixture.runtime.backend_drained);
+    if (!fixture.runtime.backend_drained) return error.TestBackendNotDrained;
     try alive.waitGone(2_000);
     // The host collected the launcher once, after the close ended its session.
     try std.testing.expectEqual(@as(usize, 1), LauncherWatch.collected.load(.acquire));
-    try std.testing.expect(!process_tree.exitedChildIsUncollected(LauncherWatch.pid.load(.acquire)));
+    if (process_tree.exitedChildIsUncollected(LauncherWatch.pid.load(.acquire))) {
+        return error.TestLauncherNotCollected;
+    }
 }
 
 test "a launcher is collected as soon as its terminal ends with nothing left in its session" {
