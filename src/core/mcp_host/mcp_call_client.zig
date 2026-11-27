@@ -173,10 +173,6 @@ fn printReply(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, operatio
             return exit.denied;
         },
         .refused => {
-            if (reply.header.reason == .not_followed) {
-                try err.writeAll("fx mcp call: this call did not run, because no fx shell call checked on its command for 2 minutes. Check on the command with shell interact, then run the call again.\n");
-                return exit.unavailable;
-            }
             try err.writeAll("fx mcp call: ");
             try writeTerminalSafeLine(arena, err, reply.bytes);
             return if (reply.header.reason == .busy) exit.busy else if (reply.header.reason == .malformed or reply.header.reason == .too_large) exit.usage else exit.unavailable;
@@ -582,23 +578,4 @@ test "a shape summary stays bounded on deep, wide, and odd input" {
         \\wrote 55 bytes of JSON: [2 × {"a\u001bb": "x", "c,d": "y"}]
     , odd_summary);
     try std.testing.expect(std.mem.findScalar(u8, odd_summary, 0x1b) == null);
-}
-
-test "a not_followed refusal exits 3 and tells the model to use shell interact" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const asked: wire.Operation = .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } };
-    var out: std.Io.Writer.Allocating = .init(arena);
-    var err: std.Io.Writer.Allocating = .init(arena);
-    const code = try printReply(arena, std.testing.io, &out.writer, &err.writer, asked, .{
-        .header = .{ .status = .refused, .reason = .not_followed, .bytes = 0 },
-        .bytes = "",
-    });
-    try std.testing.expectEqual(exit.unavailable, code);
-    try std.testing.expectEqual(@as(usize, 0), out.written().len);
-    try std.testing.expectEqualStrings(
-        "fx mcp call: this call did not run, because no fx shell call checked on its command for 2 minutes. Check on the command with shell interact, then run the call again.\n",
-        err.written(),
-    );
 }

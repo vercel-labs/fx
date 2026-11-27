@@ -759,7 +759,7 @@ fn callRun(
             break :registration null;
         };
     } else null;
-    defer if (comptime mcp_call_bridge.supported) if (bridge_registration) |registration| mcp_call_bridge.unfollow(registration, isCancelled(ctx));
+    defer if (comptime mcp_call_bridge.supported) if (bridge_registration) |registration| mcp_call_bridge.unfollow(registration, if (isCancelled(ctx)) .cancelled else .returned);
     var prepared = runtime.startCaptured(ctx.allocator, .{
         .execution_id = execution_id,
         .command = command,
@@ -1475,7 +1475,7 @@ fn callInteract(
         const id = runtime.endNoticeId(session_id) orelse break :follow null;
         break :follow mcp_call_bridge.follow(id, capability);
     } else null;
-    defer if (comptime mcp_call_bridge.supported) if (follower) |registration| mcp_call_bridge.unfollow(registration, isCancelled(ctx));
+    defer if (comptime mcp_call_bridge.supported) if (follower) |registration| mcp_call_bridge.unfollow(registration, if (isCancelled(ctx)) .cancelled else .returned);
     var prepared = runtime.waitOrYield(
         ctx.allocator,
         session_id,

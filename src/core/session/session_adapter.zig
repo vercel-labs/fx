@@ -3071,9 +3071,9 @@ pub const Session = struct {
     }
 
     /// Saves a call a command made through `fx mcp call` in the open turn,
-    /// as it ends (`bridge_call_type`). The shell call that ran the command
-    /// is still running, so the turn is open; with none open, nothing is
-    /// written and the caller logs the row as dropped.
+    /// as it ends (`bridge_call_type`). The shell call that follows the
+    /// command is still running, so the turn is open; with none open,
+    /// nothing is written and the caller logs the row as dropped.
     pub fn saveBridgeCall(self: *Session, record: types.BridgeCallRecord) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());

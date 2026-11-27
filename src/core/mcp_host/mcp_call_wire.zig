@@ -24,7 +24,7 @@ const Allocator = std.mem.Allocator;
 
 /// The bridge's socket, for commands the session's shell tool runs.
 pub const socket_env = "FX_MCP_CALL_SOCKET";
-/// The token of the shell call that ran the command.
+/// The token of the command that runs `fx mcp call`, valid until that command ends.
 pub const token_env = "FX_MCP_CALL_TOKEN";
 
 /// The longest request line the bridge reads.
@@ -148,12 +148,13 @@ fn writeField(writer: *std.Io.Writer, comptime key: []const u8, text: []const u8
 pub const Status = enum { ok, tool_error, failed, denied, refused };
 
 /// Why the bridge refused a request: the core's refusals, and the two the
-/// shell decides before the core sees a request.
+/// shell decides before the core sees a request. The core's `not_followed`
+/// goes out as `unauthorized` with its own words, because fx v0.0.18's client
+/// knows only these reasons and reads any other as a lost connection.
 pub const Reason = enum {
     closed,
     unauthorized,
     unsupported_version,
-    not_followed,
     busy,
     /// The request line was not a request.
     malformed,
@@ -165,7 +166,7 @@ pub const Reason = enum {
             .closed => .closed,
             .unauthorized => .unauthorized,
             .unsupported_version => .unsupported_version,
-            .not_followed => .not_followed,
+            .not_followed => .unauthorized,
             .busy => .busy,
         };
     }
@@ -281,7 +282,7 @@ test "a reply header round-trips and rejects another version" {
     try std.testing.expectEqual(Status.refused, header.status);
     try std.testing.expectEqual(Reason.busy, header.reason.?);
     try std.testing.expectEqual(@as(u64, 12), header.bytes);
-    try std.testing.expectEqual(Reason.not_followed, Reason.fromRefusal(.not_followed));
+    try std.testing.expectEqual(Reason.unauthorized, Reason.fromRefusal(.not_followed));
     try std.testing.expectError(error.UnsupportedReply, parseHeader(arena, "{\"v\":2,\"status\":\"ok\",\"bytes\":0}"));
     try std.testing.expectError(error.MalformedReply, parseHeader(arena, "{\"v\":1,\"status\":\"maybe\",\"bytes\":0}"));
 }

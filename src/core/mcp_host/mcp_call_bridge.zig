@@ -47,11 +47,17 @@ const wake_safety_poll_ms = 1000;
 /// How long a client may take to send its request line.
 const request_deadline_ms: i64 = 10_000;
 
-var test_follow_wait_ms: if (builtin.is_test) ?u32 else void = if (builtin.is_test) null else {};
+/// A test's follow-wait limit in milliseconds, or 0 for none. Atomic, because
+/// serving tasks read it while the test sets it.
+var test_follow_wait_ms: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {};
+/// While set, a waiting request that wakes holds before it checks again, so a
+/// test can make a follower return first, as a zero-wait `interact` can.
+var test_hold_recheck: if (builtin.is_test) std.atomic.Value(bool) else void = if (builtin.is_test) .init(false) else {};
 
-pub fn followWaitMs() u32 {
+fn followWaitMs() u32 {
     if (builtin.is_test) {
-        if (test_follow_wait_ms) |ms| return ms;
+        const ms = test_follow_wait_ms.load(.acquire);
+        if (ms > 0) return ms;
     }
     return parseFollowWaitMs(io_mod.getenv("FX_TEST_MCP_CALL_FOLLOW_WAIT_MS"));
 }
@@ -88,6 +94,15 @@ pub const Registration = struct {
     /// The command sent a request that the bridge admitted. Guarded by the
     /// bridge mutex.
     called: bool = false,
+    /// The owner's requests in the follow wait (`admit`). The registration
+    /// stays until they leave it. Guarded by the bridge mutex.
+    waiters: u32 = 0,
+    /// How many times a shell call has followed the command. Guarded by the
+    /// bridge mutex.
+    follows: u64 = 0,
+    /// Waiting requests the latest `follow` woke that have not checked again.
+    /// That follower's `unfollow` waits for them. Guarded by the bridge mutex.
+    rechecks_due: u32 = 0,
     token_hex: [wire.token_hex_len]u8,
     variables: [2]command_runner.EnvironmentVariable = undefined,
 
@@ -166,8 +181,8 @@ pub fn register(capability: capability_mod.Capability) !*Registration {
         .{ .name = wire.token_env, .value = &registration.token_hex },
     };
     bridge.registrations.appendAssumeCapacity(registration);
-    applyLocked(mcp_call.step(bridge.state, .{ .owner_added = .{ .owner = registration.owner, .token = token } }));
-    applyLocked(mcp_call.step(bridge.state, .{ .owner_followed = registration.owner }));
+    _ = step(.{ .owner_added = .{ .owner = registration.owner, .token = token } });
+    _ = step(.{ .owner_followed = registration.owner });
     return registration;
 }
 
@@ -194,18 +209,40 @@ pub fn follow(id: u64, capability: capability_mod.Capability) ?*Registration {
     std.debug.assert(registration.in_use == 0);
     registration.followed = true;
     registration.capability = capability;
-    applyLocked(mcp_call.step(bridge.state, .{ .owner_followed = registration.owner }));
+    registration.follows +%= 1;
+    registration.rechecks_due = registration.waiters;
+    _ = step(.{ .owner_followed = registration.owner });
     bridge.changed.broadcast(io);
     return registration;
 }
 
-/// Ends a shell call's following of its command. When the command still runs,
-/// its token stays valid and this returns once no request borrows the call's
-/// capability. When the command has ended, this finishes the registration.
-pub fn unfollow(registration: *Registration, cancelled: bool) void {
+/// How a shell call that follows a command ends.
+pub const FollowEnd = enum {
+    /// It returned: its wait ended, or the command ended.
+    returned,
+    /// Its turn was cancelled, so the call it lends stops too.
+    cancelled,
+};
+
+/// Ends a shell call's following of its command. A follower that returns
+/// first lets the requests its `follow` woke check again, so a zero-wait
+/// `interact` still runs them. When the command still runs, its token stays
+/// valid and this returns once no request borrows the call's capability. When
+/// the command has ended, this finishes the registration.
+pub fn unfollow(registration: *Registration, end: FollowEnd) void {
     const io = io_mod.getIo();
     bridge.mutex.lockUncancelable(io);
-    applyLocked(mcp_call.step(bridge.state, .{ .owner_unfollowed = .{ .owner = registration.owner, .cancel = cancelled } }));
+    switch (end) {
+        .returned => while (registration.rechecks_due > 0) {
+            if (builtin.is_test) {
+                test_hold_recheck.store(false, .release);
+                bridge.changed.broadcast(io);
+            }
+            bridge.changed.waitUncancelable(io, &bridge.mutex);
+        },
+        .cancelled => registration.rechecks_due = 0,
+    }
+    _ = step(.{ .owner_unfollowed = .{ .owner = registration.owner, .cancel = end == .cancelled } });
     while (registration.in_use > 0) bridge.changed.waitUncancelable(io, &bridge.mutex);
     registration.capability = null;
     registration.followed = false;
@@ -231,7 +268,7 @@ pub fn commandEnded(id: u64) void {
         return;
     }
     registration.command_running = false;
-    applyLocked(mcp_call.step(bridge.state, .{ .owner_removed = registration.owner }));
+    _ = step(.{ .owner_removed = registration.owner });
     bridge.changed.broadcast(io);
     if (registration.followed) {
         // A follower's `unfollow` drains any borrowed work and calls `finishLocked`.
@@ -249,9 +286,10 @@ fn findLocked(id: u64) ?*Registration {
 }
 
 /// Ends a registration once its command has ended and no shell call follows it.
+/// Its waiting requests leave first: the core now refuses them as unauthorized.
 /// Called with `bridge.mutex` held, which it releases.
 fn finishLocked(io: std.Io, registration: *Registration) void {
-    while (registration.in_use > 0) bridge.changed.waitUncancelable(io, &bridge.mutex);
+    while (registration.in_use > 0 or registration.waiters > 0) bridge.changed.waitUncancelable(io, &bridge.mutex);
     for (bridge.registrations.items, 0..) |item, index| {
         if (item == registration) {
             _ = bridge.registrations.swapRemove(index);
@@ -261,7 +299,7 @@ fn finishLocked(io: std.Io, registration: *Registration) void {
     const last = bridge.registrations.items.len == 0;
     var accept_task: ?std.Io.Future(void) = null;
     if (last) {
-        applyLocked(mcp_call.step(bridge.state, .stopped));
+        _ = step(.stopped);
         bridge.phase = .stopping;
         bridge.stop.store(true, .release);
         if (bridge.wake) |wake| writeWakeByte(wake[1]);
@@ -344,7 +382,7 @@ fn startLocked(io: std.Io) !void {
     var main_token: mcp_call.Token = undefined;
     io.random(&main_token);
     // The bridge's own registration: no command ever receives this token.
-    applyLocked(mcp_call.step(bridge.state, .{ .started = main_token }));
+    _ = step(.{ .started = main_token });
     bridge.phase = .running;
     debug_trace.logf("mcp-call", "bridge listening socket={s}", .{socket_path});
 }
@@ -384,14 +422,18 @@ fn closeListenerLocked(io: std.Io) void {
 }
 
 /// Takes the core's new state and runs the effects that are not the
-/// serving task's own: cancels, withdrawals, and logs.
-fn applyLocked(out: mcp_call.Output) void {
+/// serving task's own: cancels, withdrawals, and logs. `event` names the core
+/// event that led to them.
+fn applyLocked(out: mcp_call.Output, event: []const u8) void {
     bridge.state = out.state;
     for (out.effects()) |effect| switch (effect) {
         .cancel => |id| {
+            debug_trace.logf("mcp-call", "request={d} running call cancelled after {s}; its result is dropped", .{ @backingInt(id), event });
             for (bridge.live.items) |live| {
                 if (live.id == id) live.cancel.store(true, .release);
             }
+            // Wakes what waits on the bridge for a cancel, such as the test fake's long call.
+            bridge.changed.broadcast(io_mod.getIo());
         },
         .withdraw => |id| debug_trace.logf("mcp-call", "request={d} client or owner gone; its permission prompt stays until answered, and nothing runs", .{@backingInt(id)}),
         .log => |log| debug_trace.logf("mcp-call", "request={d} dropped={s}", .{ @backingInt(log.id), @tagName(log.drop) }),
@@ -401,7 +443,7 @@ fn applyLocked(out: mcp_call.Output) void {
 
 fn step(event: mcp_call.Event) mcp_call.Output {
     const out = mcp_call.step(bridge.state, event);
-    applyLocked(out);
+    applyLocked(out, @tagName(event));
     return out;
 }
 
@@ -514,27 +556,68 @@ fn refusalMessage(reason: wire.Reason) []const u8 {
         .closed => "The fx session that started this command has ended.",
         .unauthorized => "This command was not started by fx's shell tool, or it has ended.",
         .unsupported_version => "This fx mcp call is from another fx version than the running session. Run the fx that started the session, or restart the session with this one.",
-        .not_followed => "No fx shell call checked on this command for 2 minutes, so this call did not run. Check on the command with shell interact, then run the call again.",
         .busy => "Too many fx mcp call requests are running in this session. Nothing ran; try again when one finishes.",
         .malformed => "The request was not an fx mcp call request. Send requests with the fx that started the session.",
         .too_large => "The request is over 1 MiB. Pass smaller arguments.",
     };
 }
 
-fn clientDisconnected(fd: posix.socket_t) bool {
-    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    const ready = posix.poll(&fds, 0) catch return true;
-    if (ready == 0) return false;
-    if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) return true;
-    if ((fds[0].revents & posix.POLL.IN) == 0) return false;
+/// What a client the core refused is told. A request that no shell call
+/// followed in time goes out as `unauthorized` (`wire.Reason.fromRefusal`),
+/// so its words come from here.
+fn refusalText(refusal: mcp_call.Refusal) []const u8 {
+    return switch (refusal) {
+        .not_followed => "This call did not run, because no fx shell call checked on its command for 2 minutes. Check on the command with shell interact, then run the call again.",
+        else => refusalMessage(wire.Reason.fromRefusal(refusal)),
+    };
+}
+
+/// What a client socket shows after a poll.
+const Peek = union(enum) {
+    /// The client closed or reset its end.
+    gone,
+    /// Nothing to read.
+    quiet,
+    /// The client sent bytes after its request line.
+    bytes,
+    /// The peek itself failed.
+    failed: posix.E,
+};
+
+/// Peeks at client socket `fd`, given the events a poll reported on it.
+fn peekClient(fd: posix.socket_t, revents: i16) Peek {
+    if ((revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL)) != 0) return .gone;
+    if ((revents & posix.POLL.IN) == 0) return .quiet;
     var probe: [1]u8 = undefined;
     const rc = std.c.recv(fd, &probe, 1, posix.MSG.PEEK | posix.MSG.DONTWAIT);
-    if (rc == 0) return true;
+    if (rc == 0) return .gone;
     if (rc < 0) {
         const err = posix.errno(rc);
-        return err != .AGAIN and err != .INTR;
+        return if (err == .AGAIN or err == .INTR) .quiet else .{ .failed = err };
     }
-    return false;
+    return .bytes;
+}
+
+/// Whether a waiting request's client has left, so the request ends without
+/// a reply. A poll or peek that fails ends it too. Logs which happened.
+fn waitingClientGone(fd: posix.socket_t) bool {
+    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    const ready = posix.poll(&fds, 0) catch |err| {
+        debug_trace.logf("mcp-call", "waiting request dropped: its client could not be polled err={s}", .{@errorName(err)});
+        return true;
+    };
+    if (ready == 0) return false;
+    switch (peekClient(fd, fds[0].revents)) {
+        .quiet, .bytes => return false,
+        .gone => {
+            debug_trace.logf("mcp-call", "waiting request dropped: its client disconnected before a shell call followed", .{});
+            return true;
+        },
+        .failed => |err| {
+            debug_trace.logf("mcp-call", "waiting request dropped: its client could not be peeked err={s}", .{@tagName(err)});
+            return true;
+        },
+    }
 }
 
 fn ownerIdForTokenLocked(token: mcp_call.Token) u32 {
@@ -568,10 +651,8 @@ const Watch = struct {
             };
             if (fds[1].revents != 0) return;
             if (ready == 0) continue;
-            var probe: [1]u8 = undefined;
-            const rc = std.c.recv(self.fd, &probe, 1, posix.MSG.PEEK | posix.MSG.DONTWAIT);
-            const hung_up = (fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0;
-            if (rc == 0 or hung_up) {
+            const seen = peekClient(self.fd, fds[0].revents);
+            if (seen == .gone) {
                 bridge.mutex.lockUncancelable(io);
                 _ = step(.{ .client_gone = self.id });
                 bridge.mutex.unlock(io);
@@ -579,12 +660,11 @@ const Watch = struct {
             }
             // The client sent more than its one line: not ours to read. Log it once,
             // then wait on the wake byte alone, so the unread bytes do not spin this loop.
-            if (!self.extra_logged) {
+            if (!self.extra_logged and seen != .quiet) {
                 self.extra_logged = true;
-                if (rc < 0) {
-                    debug_trace.logf("mcp-call", "request={d} disconnect watch could not peek the client err={s}; it checks again every 100 ms", .{ @backingInt(self.id), @tagName(posix.errno(rc)) });
-                } else {
-                    debug_trace.logf("mcp-call", "request={d} client sent bytes after its request line; the watch leaves them unread", .{@backingInt(self.id)});
+                switch (seen) {
+                    .failed => |err| debug_trace.logf("mcp-call", "request={d} disconnect watch could not peek the client err={s}; it checks again every 100 ms", .{ @backingInt(self.id), @tagName(err) }),
+                    else => debug_trace.logf("mcp-call", "request={d} client sent bytes after its request line; the watch leaves them unread", .{@backingInt(self.id)}),
                 }
             }
             var wake_only = [_]posix.pollfd{.{ .fd = self.wake[0], .events = posix.POLL.IN, .revents = 0 }};
@@ -596,6 +676,154 @@ const Watch = struct {
         }
     }
 };
+
+/// A request the core admitted. `admit` returns it with `bridge.mutex` held
+/// and room for its entry in `bridge.live`.
+const Admitted = struct {
+    work: mcp_call.Work,
+    registration: *Registration,
+};
+
+/// A request in the follow wait, counted on its command's registration, so a
+/// follower that returns at once still lets it check again (`unfollow`).
+const Waiting = struct {
+    registration: ?*Registration,
+    started_ms: i64,
+    /// The registration's `follows` when this request last checked.
+    seen_follows: u64,
+};
+
+/// Admits `request`, and while no shell call follows its command, waits before
+/// admission up to the follow-wait limit. Returns with `bridge.mutex` held when
+/// the core admits the request. Otherwise it answers the client when one is
+/// owed, releases the mutex, and returns null.
+fn admit(io: std.Io, stream: std.Io.net.Stream, request: wire.Request) ?Admitted {
+    const token: mcp_call.Token = request.token orelse @splat(0);
+    const limit_ms = followWaitMs();
+    var waiting: ?Waiting = null;
+    bridge.mutex.lockUncancelable(io);
+    while (true) {
+        // Room for the request's entry, taken in the same lock hold as its
+        // admission, so a request served while this one waited cannot take it.
+        bridge.live.ensureUnusedCapacity(gpa, 1) catch {
+            leaveWaitLocked(io, &waiting);
+            bridge.mutex.unlock(io);
+            debug_trace.logf("mcp-call", "bridge request dropped op={s}: no memory for its entry", .{@tagName(request.operation)});
+            _ = writeReply(stream, .failed, null, "fx could not take this request: out of memory.");
+            return null;
+        };
+        if (waiting) |*current| {
+            if (waitingClientGone(stream.socket.handle)) {
+                leaveWaitLocked(io, &waiting);
+                bridge.mutex.unlock(io);
+                return null;
+            }
+            noteRecheckLocked(io, current);
+        }
+        const out = step(.{ .request = .{ .token = token, .version = request.version } });
+        const outcome: union(enum) { authorized: mcp_call.Work, refused: mcp_call.Refusal, none } = for (out.effects()) |effect| switch (effect) {
+            .authorize => |value| break .{ .authorized = value },
+            .refuse => |refusal| break .{ .refused = refusal },
+            else => {},
+        } else .none;
+        switch (outcome) {
+            .authorized => |work| {
+                leaveWaitLocked(io, &waiting);
+                const registration = for (bridge.registrations.items) |item| {
+                    if (item.owner == work.owner) break item;
+                } else unreachable; // the core admits only registered owners
+                return .{ .work = work, .registration = registration };
+            },
+            .refused => |refusal| {
+                if (refusal != .not_followed) {
+                    leaveWaitLocked(io, &waiting);
+                    bridge.mutex.unlock(io);
+                    refuse(stream, request.operation, refusal);
+                    return null;
+                }
+                if (waiting == null) {
+                    waiting = startWaitLocked(io, token);
+                    if (waitingClientGone(stream.socket.handle)) {
+                        leaveWaitLocked(io, &waiting);
+                        bridge.mutex.unlock(io);
+                        return null;
+                    }
+                }
+                const elapsed_ms = io_mod.awakeMilliTimestamp() - waiting.?.started_ms;
+                if (mcp_call.followWaitOver(elapsed_ms, limit_ms)) {
+                    leaveWaitLocked(io, &waiting);
+                    bridge.mutex.unlock(io);
+                    refuse(stream, request.operation, .not_followed);
+                    return null;
+                }
+                const slice_ms: i64 = @max(1, @min(@as(i64, limit_ms) - elapsed_ms, poll_ms));
+                bridge.changed.waitTimeout(io, &bridge.mutex, .{ .duration = .{ .raw = .fromMilliseconds(slice_ms), .clock = .awake } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => {
+                        leaveWaitLocked(io, &waiting);
+                        bridge.mutex.unlock(io);
+                        debug_trace.logf("mcp-call", "waiting request dropped op={s}: the bridge stopped", .{@tagName(request.operation)});
+                        return null;
+                    },
+                };
+                if (builtin.is_test) {
+                    while (test_hold_recheck.load(.acquire)) {
+                        bridge.changed.waitTimeout(io, &bridge.mutex, .{ .duration = .{ .raw = .fromMilliseconds(poll_ms), .clock = .awake } }) catch break;
+                    }
+                }
+            },
+            .none => {
+                leaveWaitLocked(io, &waiting);
+                bridge.mutex.unlock(io);
+                debug_trace.logf("mcp-call", "bridge request dropped op={s}: the core neither admitted nor refused it", .{@tagName(request.operation)});
+                return null;
+            },
+        }
+    }
+}
+
+/// Starts a request's follow wait. Called with `bridge.mutex` held.
+fn startWaitLocked(io: std.Io, token: mcp_call.Token) Waiting {
+    const owner_id = ownerIdForTokenLocked(token);
+    const registration = for (bridge.registrations.items) |item| {
+        if (@backingInt(item.owner) == owner_id) break item;
+    } else null;
+    if (registration) |item| item.waiters += 1;
+    debug_trace.logf("mcp-call", "request waits for a shell call to follow its command owner={d}", .{owner_id});
+    bridge.waiting_follows += 1;
+    bridge.changed.broadcast(io);
+    return .{
+        .registration = registration,
+        .started_ms = io_mod.awakeMilliTimestamp(),
+        .seen_follows = if (registration) |item| item.follows else 0,
+    };
+}
+
+/// Records that a waiting request checks again after a follow woke it, so the
+/// follower's `unfollow` can go on. Called with `bridge.mutex` held.
+fn noteRecheckLocked(io: std.Io, current: *Waiting) void {
+    const registration = current.registration orelse return;
+    if (registration.follows == current.seen_follows) return;
+    current.seen_follows = registration.follows;
+    registration.rechecks_due -|= 1;
+    bridge.changed.broadcast(io);
+}
+
+/// Ends a request's follow wait, if it has one. Called with `bridge.mutex` held.
+fn leaveWaitLocked(io: std.Io, waiting: *?Waiting) void {
+    if (waiting.*) |*current| {
+        noteRecheckLocked(io, current);
+        if (current.registration) |registration| registration.waiters -= 1;
+        bridge.changed.broadcast(io);
+    }
+    waiting.* = null;
+}
+
+/// Answers a request the core refused, and logs why.
+fn refuse(stream: std.Io.net.Stream, operation: wire.Operation, refusal: mcp_call.Refusal) void {
+    debug_trace.logf("mcp-call", "bridge refused op={s} reason={s}", .{ @tagName(operation), @tagName(refusal) });
+    _ = writeReply(stream, .refused, wire.Reason.fromRefusal(refusal), refusalText(refusal));
+}
 
 // finishLocked awaits this task before closeListenerLocked closes wake_read.
 fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
@@ -617,86 +845,11 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
         return;
     };
 
-    // Admission, waiting before admission while no shell call follows the command.
-    var live: Live = undefined;
-    var registration: *Registration = undefined;
-    var work: mcp_call.Work = undefined;
-    bridge.mutex.lockUncancelable(io);
-    bridge.live.ensureUnusedCapacity(gpa, 1) catch {
-        bridge.mutex.unlock(io);
-        _ = writeReply(stream, .failed, null, "fx could not take this request: out of memory.");
-        return;
-    };
-    const token: mcp_call.Token = request.token orelse @splat(0);
-    var wait_started_ms: ?i64 = null;
-    const limit_ms = followWaitMs();
-    while (true) {
-        const admitted = step(.{ .request = .{ .token = token, .version = request.version } });
-        const outcome: union(enum) { authorized: mcp_call.Work, refused: mcp_call.Refusal, none } = for (admitted.effects()) |effect| switch (effect) {
-            .authorize => |value| break .{ .authorized = value },
-            .refuse => |refusal| break .{ .refused = refusal },
-            else => {},
-        } else .none;
-        switch (outcome) {
-            .authorized => |value| {
-                work = value;
-                registration = for (bridge.registrations.items) |item| {
-                    if (item.owner == work.owner) break item;
-                } else unreachable; // the core admits only registered owners
-                break;
-            },
-            .refused => |refusal| {
-                if (refusal != .not_followed) {
-                    bridge.mutex.unlock(io);
-                    const reason = wire.Reason.fromRefusal(refusal);
-                    debug_trace.logf("mcp-call", "bridge refused op={s} reason={s}", .{ @tagName(request.operation), @tagName(reason) });
-                    _ = writeReply(stream, .refused, reason, refusalMessage(reason));
-                    return;
-                }
-                const started_ms = wait_started_ms orelse blk: {
-                    const now = io_mod.milliTimestamp();
-                    wait_started_ms = now;
-                    const owner_id = ownerIdForTokenLocked(token);
-                    debug_trace.logf("mcp-call", "request waits for a shell call to follow its command owner={d}", .{owner_id});
-                    bridge.waiting_follows += 1;
-                    bridge.changed.broadcast(io);
-                    break :blk now;
-                };
-                if (clientDisconnected(stream.socket.handle)) {
-                    bridge.mutex.unlock(io);
-                    debug_trace.logf("mcp-call", "waiting request client disconnected before follow", .{});
-                    return;
-                }
-                const elapsed_ms = io_mod.milliTimestamp() - started_ms;
-                if (mcp_call.followWaitOver(elapsed_ms, limit_ms)) {
-                    bridge.mutex.unlock(io);
-                    debug_trace.logf("mcp-call", "bridge refused op={s} reason={s}", .{ @tagName(request.operation), @tagName(wire.Reason.not_followed) });
-                    _ = writeReply(stream, .refused, .not_followed, refusalMessage(.not_followed));
-                    return;
-                }
-                const remaining_ms = @as(i64, limit_ms) - elapsed_ms;
-                const slice_ms: i64 = @max(1, @min(remaining_ms, poll_ms));
-                bridge.changed.waitTimeout(io, &bridge.mutex, .{ .duration = .{ .raw = .fromMilliseconds(slice_ms), .clock = .awake } }) catch |err| switch (err) {
-                    error.Timeout => {},
-                    error.Canceled => {
-                        bridge.mutex.unlock(io);
-                        return;
-                    },
-                };
-                if (clientDisconnected(stream.socket.handle)) {
-                    bridge.mutex.unlock(io);
-                    debug_trace.logf("mcp-call", "waiting request client disconnected before follow", .{});
-                    return;
-                }
-            },
-            .none => {
-                bridge.mutex.unlock(io);
-                return;
-            },
-        }
-    }
+    const admitted = admit(io, stream, request) orelse return;
+    const registration = admitted.registration;
+    const work = admitted.work;
     const capability = registration.capability.?;
-    live = .{ .id = work.id };
+    var live: Live = .{ .id = work.id };
     bridge.live.appendAssumeCapacity(&live);
     registration.in_use += 1;
     registration.called = true;
@@ -772,6 +925,9 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
                 }, .bytes = outcome.bytes },
                 else => {},
             };
+            // The core logs a dropped result unless the call failed, as a
+            // cancelled call does, so that drop is logged here.
+            if (reply == null and outcome.status == .failed) debug_trace.logf("mcp-call", "request={d} failed result dropped: its client, command, follower, or session ended first", .{@backingInt(work.id)});
         },
         .reply => reply = .{ .status = .denied, .bytes = authorization.deny },
         else => {},
@@ -835,7 +991,18 @@ const FakeTool = struct {
         const self: *FakeTool = @ptrCast(@alignCast(raw));
         _ = self.calls.fetchAdd(1, .acq_rel);
         self.calling.store(true, .release);
-        while (self.long_call.load(.acquire) and !cancel.load(.acquire)) io_mod.sleep(5 * std.time.ns_per_ms);
+        if (self.long_call.load(.acquire)) {
+            const io = io_mod.getIo();
+            bridge.mutex.lockUncancelable(io);
+            defer bridge.mutex.unlock(io);
+            // A cancel sets the flag under the bridge mutex and wakes this wait (`applyLocked`).
+            while (!cancel.load(.acquire)) {
+                bridge.changed.waitTimeout(io, &bridge.mutex, .{ .duration = .{ .raw = .fromMilliseconds(wake_safety_poll_ms), .clock = .awake } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => return err,
+                };
+            }
+        }
         if (cancel.load(.acquire)) return .{ .status = .failed, .bytes = "Cancelled by the test." };
         return .{ .status = .ok, .bytes = try arena.print("{s} {s}\n", .{ tool, arguments_json }) };
     }
@@ -853,7 +1020,7 @@ const client = @import("mcp_call_client.zig");
 
 fn endCommandAndUnfollow(registration: *Registration) void {
     commandEnded(commandId(registration));
-    unfollow(registration, false);
+    unfollow(registration, .returned);
 }
 
 test "a shell call's command reaches its MCP tool, and a forged token reaches nothing" {
@@ -969,16 +1136,16 @@ test "a call after its command ended says why" {
 }
 
 test "refusals explain why the call did not run without short-checks advice" {
-    const reasons = [_]wire.Reason{ .closed, .unauthorized, .not_followed };
-    for (reasons) |reason| {
-        const text = refusalMessage(reason);
+    const refusals = [_]mcp_call.Refusal{ .closed, .unauthorized, .not_followed };
+    for (refusals) |refusal| {
+        const text = refusalText(refusal);
         try std.testing.expect(std.mem.find(u8, text, "each check as its own shell call") == null);
     }
-    try std.testing.expectEqualStrings("The fx session that started this command has ended.", refusalMessage(.closed));
-    try std.testing.expectEqualStrings("This command was not started by fx's shell tool, or it has ended.", refusalMessage(.unauthorized));
+    try std.testing.expectEqualStrings("The fx session that started this command has ended.", refusalText(.closed));
+    try std.testing.expectEqualStrings("This command was not started by fx's shell tool, or it has ended.", refusalText(.unauthorized));
     try std.testing.expectEqualStrings(
-        "No fx shell call checked on this command for 2 minutes, so this call did not run. Check on the command with shell interact, then run the call again.",
-        refusalMessage(.not_followed),
+        "This call did not run, because no fx shell call checked on its command for 2 minutes. Check on the command with shell interact, then run the call again.",
+        refusalText(.not_followed),
     );
 }
 
@@ -1003,7 +1170,7 @@ test "a command that leaves while its call waits for permission runs nothing, an
     io_mod.sleep(4 * poll_ms * std.time.ns_per_ms);
     tool.gate.store(false, .release);
     commandEnded(id);
-    unfollow(registration, false);
+    unfollow(registration, .returned);
     try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
 }
 
@@ -1019,8 +1186,8 @@ test "the bridge removes its socket after the last command ends" {
     const id2 = commandId(second);
     const socket_path = try arena_state.allocator().dupe(u8, first.environment()[0].value);
     try std.testing.expectEqualStrings(socket_path, second.environment()[0].value);
-    unfollow(first, false);
-    unfollow(second, false);
+    unfollow(first, .returned);
+    unfollow(second, .returned);
     try std.Io.Dir.cwd().access(io, socket_path, .{});
     commandEnded(id1);
     try std.Io.Dir.cwd().access(io, socket_path, .{});
@@ -1162,11 +1329,11 @@ test "a command's token stays valid after its shell call returns" {
     errdefer commandEnded(id);
     const socket_path = try arena.dupe(u8, registration.environment()[0].value);
     const token = wire.parseToken(registration.environment()[1].value).?;
-    unfollow(registration, false);
+    unfollow(registration, .returned);
 
     const followed = follow(id, later.capability()) orelse return error.TestUnexpectedResult;
     {
-        defer unfollow(followed, false);
+        defer unfollow(followed, .returned);
         const reply = try client.call(arena, std.testing.io, socket_path, token, .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } });
         try std.testing.expectEqual(wire.Status.ok, reply.header.status);
         try std.testing.expectEqualStrings("mcp_s_t {}\n", reply.bytes);
@@ -1189,7 +1356,7 @@ test "a request that comes while no shell call follows waits and the next follow
         .token = wire.parseToken(registration.environment()[1].value).?,
     };
     defer pending.arena_state.deinit();
-    unfollow(registration, false);
+    unfollow(registration, .returned);
     const thread = try std.Thread.spawn(.{}, PendingCall.run, .{&pending});
     defer thread.join();
     errdefer commandEnded(id);
@@ -1199,7 +1366,7 @@ test "a request that comes while no shell call follows waits and the next follow
     try std.testing.expect(!later.authorizing.load(.acquire));
 
     const followed = follow(id, later.capability()) orelse return error.TestUnexpectedResult;
-    errdefer unfollow(followed, false);
+    errdefer unfollow(followed, .returned);
     try std.testing.expectEqual(registration, followed);
     try waitFor(&pending.done);
     try std.testing.expectEqual(@as(?anyerror, null), pending.err);
@@ -1210,7 +1377,7 @@ test "a request that comes while no shell call follows waits and the next follow
     try std.testing.expect(commandCalled(followed));
     try std.testing.expectEqual(@as(?*Registration, null), follow(id, started.capability()));
     commandEnded(id);
-    unfollow(followed, false);
+    unfollow(followed, .returned);
 }
 
 test "a waiting request never runs after the command ends" {
@@ -1222,7 +1389,7 @@ test "a waiting request never runs after the command ends" {
     const other = try register(tool.capability());
     defer {
         commandEnded(commandId(other));
-        unfollow(other, false);
+        unfollow(other, .returned);
     }
     const registration = try register(tool.capability());
     const id = commandId(registration);
@@ -1233,7 +1400,7 @@ test "a waiting request never runs after the command ends" {
         .token = token,
     };
     defer pending.arena_state.deinit();
-    unfollow(registration, false);
+    unfollow(registration, .returned);
     const thread = try std.Thread.spawn(.{}, PendingCall.run, .{&pending});
     {
         errdefer {
@@ -1271,19 +1438,19 @@ test "a follower's cancel cancels the call it runs and keeps the token" {
     {
         errdefer {
             commandEnded(id);
-            unfollow(registration, true);
+            unfollow(registration, .cancelled);
         }
         try waitFor(&tool.calling);
     }
 
-    unfollow(registration, true);
+    unfollow(registration, .cancelled);
     errdefer commandEnded(id);
     try waitFor(&pending.done);
     try std.testing.expectEqual(@as(?anyerror, error.ConnectionLost), pending.err);
     var later: FakeTool = .{};
     const followed = follow(id, later.capability()) orelse return error.TestUnexpectedResult;
     {
-        defer unfollow(followed, false);
+        defer unfollow(followed, .returned);
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena_state.deinit();
         const reply = try client.call(arena_state.allocator(), std.testing.io, followed.environment()[0].value, wire.parseToken(followed.environment()[1].value).?, .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } });
@@ -1303,7 +1470,7 @@ test "a waiting request whose client leaves never runs" {
     const variables = registration.environment();
     const socket_path = variables[0].value;
     const token = wire.parseToken(variables[1].value).?;
-    unfollow(registration, false);
+    unfollow(registration, .returned);
 
     const address = try std.Io.net.UnixAddress.init(socket_path);
     const stream = try address.connect(io);
@@ -1317,29 +1484,41 @@ test "a waiting request whose client leaves never runs" {
 
     const followed = follow(id, tool.capability()) orelse return error.TestUnexpectedResult;
     commandEnded(id);
-    unfollow(followed, false);
+    unfollow(followed, .returned);
     try std.testing.expect(!tool.authorizing.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
 }
 
-test "a request that waits past the limit is refused not_followed" {
+/// The refusal reasons that `fx mcp call` in fx v0.0.18 knows. That client
+/// reads a reply with any other reason as a lost connection that may have run
+/// the call, and exits 1.
+const v0_0_18_reasons = [_][]const u8{ "closed", "unauthorized", "unsupported_version", "busy", "malformed", "too_large" };
+
+test "a request that waits past the limit gets a refusal fx v0.0.18 clients can read" {
     if (!supported) return error.SkipZigTest;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const prev_limit = test_follow_wait_ms;
-    test_follow_wait_ms = 20;
-    defer test_follow_wait_ms = prev_limit;
+    const prev_limit = test_follow_wait_ms.load(.acquire);
+    test_follow_wait_ms.store(20, .release);
+    defer test_follow_wait_ms.store(prev_limit, .release);
     var tool: FakeTool = .{};
     const registration = try register(tool.capability());
     const id = commandId(registration);
     defer commandEnded(id);
     const socket_path = try arena_state.allocator().dupe(u8, registration.environment()[0].value);
     const token = wire.parseToken(registration.environment()[1].value).?;
-    unfollow(registration, false);
+    unfollow(registration, .returned);
 
     const reply = try client.call(arena_state.allocator(), std.testing.io, socket_path, token, .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } });
     try std.testing.expectEqual(wire.Status.refused, reply.header.status);
-    try std.testing.expectEqual(wire.Reason.not_followed, reply.header.reason.?);
+    const reason = @tagName(reply.header.reason.?);
+    for (v0_0_18_reasons) |known| {
+        if (std.mem.eql(u8, known, reason)) break;
+    } else {
+        std.debug.print("reason {s} is not one fx v0.0.18 knows\n", .{reason});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(std.mem.find(u8, reply.bytes, "2 minutes") != null);
     try std.testing.expect(std.mem.find(u8, reply.bytes, "shell interact") != null);
     try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
 }
@@ -1367,14 +1546,14 @@ test "a shell call of another agent does not follow a command, so its calls keep
         .token = wire.parseToken(registration.environment()[1].value).?,
     };
     defer pending.arena_state.deinit();
-    unfollow(registration, false);
+    unfollow(registration, .returned);
     const thread = try std.Thread.spawn(.{}, PendingCall.run, .{&pending});
     defer thread.join();
     errdefer commandEnded(id);
     try waitForCount(io, &bridge.waiting_follows);
 
     if (follow(id, parent.capability())) |wrong| {
-        unfollow(wrong, false);
+        unfollow(wrong, .returned);
         return error.TestExpectedEqual;
     }
     try std.testing.expect(!pending.done.load(.acquire));
@@ -1383,12 +1562,98 @@ test "a shell call of another agent does not follow a command, so its calls keep
     try std.testing.expectEqual(@as(u32, 0), subagent.calls.load(.acquire));
 
     const followed = follow(id, subagent.capability()) orelse return error.TestUnexpectedResult;
-    errdefer unfollow(followed, false);
+    errdefer unfollow(followed, .returned);
     try waitFor(&pending.done);
     try std.testing.expectEqual(@as(?anyerror, null), pending.err);
     try std.testing.expectEqual(wire.Status.ok, pending.reply.?.header.status);
     try std.testing.expectEqual(@as(u32, 1), subagent.calls.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), parent.calls.load(.acquire));
     commandEnded(id);
-    unfollow(followed, false);
+    unfollow(followed, .returned);
+}
+
+test "a waiting request admitted after the live list filled meanwhile still runs" {
+    if (!supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var started: FakeTool = .{};
+    var later: FakeTool = .{};
+    const registration = try register(started.capability());
+    const id = commandId(registration);
+    var pending: PendingCall = .{
+        .arena_state = .init(std.testing.allocator),
+        .socket_path = registration.environment()[0].value,
+        .token = wire.parseToken(registration.environment()[1].value).?,
+    };
+    defer pending.arena_state.deinit();
+    unfollow(registration, .returned);
+    const thread = try std.Thread.spawn(.{}, PendingCall.run, .{&pending});
+    defer thread.join();
+    defer commandEnded(id);
+    try waitForCount(io, &bridge.waiting_follows);
+
+    // Other requests take every free entry of the live list while this one
+    // waits, as served requests of other commands can.
+    bridge.mutex.lockUncancelable(io);
+    const fillers = std.testing.allocator.alloc(Live, bridge.live.capacity - bridge.live.items.len) catch |err| {
+        bridge.mutex.unlock(io);
+        return err;
+    };
+    for (fillers, 0..) |*filler, index| {
+        filler.* = .{ .id = @fromBackingInt(std.math.maxInt(u64) - index) };
+        bridge.live.appendAssumeCapacity(filler);
+    }
+    bridge.mutex.unlock(io);
+    defer {
+        bridge.mutex.lockUncancelable(io);
+        for (fillers) |*filler| {
+            for (bridge.live.items, 0..) |item, index| {
+                if (item == filler) {
+                    _ = bridge.live.swapRemove(index);
+                    break;
+                }
+            }
+        }
+        bridge.mutex.unlock(io);
+        std.testing.allocator.free(fillers);
+    }
+
+    const followed = follow(id, later.capability()) orelse return error.TestUnexpectedResult;
+    defer unfollow(followed, .returned);
+    try waitFor(&pending.done);
+    try std.testing.expectEqual(@as(?anyerror, null), pending.err);
+    try std.testing.expectEqual(wire.Status.ok, pending.reply.?.header.status);
+    try std.testing.expectEqual(@as(u32, 1), later.calls.load(.acquire));
+}
+
+test "a follower that returns at once still runs the request that waited for it" {
+    if (!supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var started: FakeTool = .{};
+    var later: FakeTool = .{};
+    const registration = try register(started.capability());
+    const id = commandId(registration);
+    var pending: PendingCall = .{
+        .arena_state = .init(std.testing.allocator),
+        .socket_path = registration.environment()[0].value,
+        .token = wire.parseToken(registration.environment()[1].value).?,
+    };
+    defer pending.arena_state.deinit();
+    unfollow(registration, .returned);
+    const thread = try std.Thread.spawn(.{}, PendingCall.run, .{&pending});
+    defer thread.join();
+    defer commandEnded(id);
+    try waitForCount(io, &bridge.waiting_follows);
+
+    // The waiting request wakes at the follow but holds before it checks
+    // again, so the follower returns first, as a zero-wait interact can.
+    test_hold_recheck.store(true, .release);
+    defer test_hold_recheck.store(false, .release);
+    const followed = follow(id, later.capability()) orelse return error.TestUnexpectedResult;
+    unfollow(followed, .returned);
+    test_hold_recheck.store(false, .release);
+    commandEnded(id);
+    try waitFor(&pending.done);
+    try std.testing.expectEqual(@as(?anyerror, null), pending.err);
+    try std.testing.expectEqual(wire.Status.ok, pending.reply.?.header.status);
+    try std.testing.expectEqual(@as(u32, 1), later.calls.load(.acquire));
 }
