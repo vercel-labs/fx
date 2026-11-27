@@ -762,6 +762,7 @@ test("fxChildEnv drops every name on the unset list and keeps the caller's own",
     PATH: "/usr/bin",
     AI_GATEWAY_API_KEY: "stale-ai_gateway_api_key",
     VERCEL_OIDC_TOKEN: "stale-vercel_oidc_token",
+    VERCEL_TOKEN: "stale-vercel_token",
   });
   expect(inherited.FX_TEST_SHELL_YIELD_HELD).toBe("stale-fx_test_shell_yield_held");
 });
