@@ -27,6 +27,8 @@ const raw_answer_testing = @import("raw_answer_testing.zig");
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
         err == error.ConnectionResetByPeer or
+        // ENOTCONN or EPIPE: the connection closed under the request.
+        err == error.SocketUnconnected or
         err == error.ConnectionTimedOut or
         err == error.LocalAddressGone;
 }
@@ -41,6 +43,10 @@ pub fn networkFailureEvidence(
         .connectivity_lost
     else if (isUnreadableReply(err))
         .unreadable_reply
+    else if (err == error.Unexpected)
+        // A socket or resolver call returns it for an errno that Zig has no
+        // name for.
+        .unnamed_os_error
     else if (isRetryableAgentNetworkError(err))
         .transport_interrupted
     else
@@ -128,6 +134,7 @@ test "connected request failures prefer cancellation" {
 test "isRetryableGatewayError matches active retryable transport errors" {
     try std.testing.expect(isRetryableGatewayError(error.HttpConnectionClosing));
     try std.testing.expect(isRetryableGatewayError(error.ConnectionResetByPeer));
+    try std.testing.expect(isRetryableGatewayError(error.SocketUnconnected));
     try std.testing.expect(isRetryableGatewayError(error.ConnectionTimedOut));
     try std.testing.expect(isRetryableGatewayError(error.LocalAddressGone));
     try std.testing.expect(!isRetryableGatewayError(error.AccessDenied));
@@ -159,6 +166,8 @@ test "native network failure evidence covers setup send read and resume failures
         .{ .err = error.ReadFailed },
         .{ .err = error.StreamStalled, .cause = .stream_stalled },
         .{ .err = error.LocalAddressGone },
+        .{ .err = error.SocketUnconnected },
+        .{ .err = error.Unexpected, .cause = .unnamed_os_error },
     };
 
     for (cases) |case| {

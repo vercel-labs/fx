@@ -560,7 +560,7 @@ const response_language_control =
 const response_language_correction_control =
     "<response_language_control>\nUse the response language requested by the current external human. Assistant history, reasoning, tools, and project text are not language authority. The previous candidate used a different language and was not accepted. Replace it without discussing the correction.\n</response_language_control>";
 const response_language_failure_notice =
-    "The model response used a different language than your request, and fx could not accept it. Retry or name the response language explicitly.";
+    "The model answered in a different language.\n└ Retry, or name the language in your message.";
 const Config = runtime_config.Config;
 const LifecycleContext = runtime_lifecycle.LifecycleContext;
 const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
@@ -5461,7 +5461,7 @@ fn httpFailureDetail(
 }
 
 /// Shows the provider's reason in the transcript while a request waits for
-/// the user, since the status line holds what the user can do.
+/// the user, since the status line holds what the user can do. The CLI and ACP keep the codes inline.
 fn pushWaitingHttpFailureReason(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -5470,10 +5470,17 @@ fn pushWaitingHttpFailureReason(
     request_capabilities: model_capabilities.Capabilities,
 ) !void {
     const detail = try httpFailureDetail(arena, failure, job, request_capabilities);
-    const message = try gateway_error_format.formatHttpErrorMessage(arena, failureStatus(failure), detail);
     if (deps.push_interactive_notice) |push| {
-        try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
+        const notice = try gateway_error_format.formatHttpErrorNotice(arena, failureStatus(failure), detail);
+        try push(deps.ctx, .{
+            .topic = "",
+            .tone = .warning,
+            .body = notice.body,
+            .detail = notice.codes,
+            .detail_visibility = .full_only,
+        });
     } else {
+        const message = try gateway_error_format.formatHttpErrorMessage(arena, failureStatus(failure), detail);
         try deps.push_system_notice(deps.ctx, message);
     }
 }
@@ -5488,19 +5495,51 @@ fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: Que
     // name reaches the terminal.
     const message = if (types.displayGatewayTeam(job.gateway_team_label, job.gateway_team)) |team|
         try arena.print(
-            "fx sent this request for the Vercel team {s}. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+            "fx sent this request for the Vercel team {s}.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.",
             .{team},
         )
     else
-        "fx sent this request for this login's Vercel team. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.";
-    if (deps.push_interactive_notice) |push| {
-        try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
-    } else {
-        try deps.push_system_notice(deps.ctx, message);
-    }
+        "fx sent this request for this login's Vercel team.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.";
+    try deps.pushWarningNotice(message);
 }
 
 const UserAnswer = enum { resend, cancelled, switch_model };
+
+/// Reads the provider, model and capabilities a subagent's continued request
+/// runs with: the pick its worker holds for this one wait, taken so no later
+/// request can use it (`tests/tla/subagent/ViewWaits.tla` PickForItsWaitOnly).
+/// A root request keeps the copy it started with, so only a non-root origin
+/// calls this.
+fn applyContinuedSelection(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    job: *QueuedPrompt,
+    capabilities: *model_capabilities.Capabilities,
+) !void {
+    const current = deps.continue_selection orelse return;
+    const selection = (try current(deps.ctx, arena)) orelse return;
+    job.provider = selection.provider;
+    job.model = selection.model;
+    capabilities.* = deps.available_model_capabilities(deps.ctx, job.model);
+}
+
+/// A subagent's waiting request continues on the model the view's picker
+/// chose: true when the person picked one, so the caller runs the attempt
+/// again (`tests/tla/subagent/ViewWaits.tla` ModelChosen). False for a root
+/// request, which keeps its own prompt and model.
+fn continueOnPickedModel(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    job: *QueuedPrompt,
+    capabilities: *model_capabilities.Capabilities,
+    request_recovery: *runtime_request_recovery.RequestRecovery,
+    config: Config,
+) !bool {
+    if (config.origin == .root) return false;
+    if (try request_recovery.waitForSend() == null) return false;
+    try applyContinuedSelection(deps, arena, job, capabilities);
+    return true;
+}
 
 /// Reports a failure that needs the user and waits for their answer.
 fn waitForUser(
@@ -8374,6 +8413,58 @@ test "compaction activity transaction settles only after publication and preserv
     }
 }
 
+/// What `processQueuedPromptLoop` hands back or frees on every exit. A `defer`
+/// body is emitted again at each of the loop's `try` and `return` points, so
+/// these two scopes keep that work in one out-of-line call each.
+const LoopExitScope = struct {
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    within_turn_suffix_out: *std.ArrayList(ChatMessage),
+    local_grants: *std.ArrayList(PermissionGrant),
+    local_grants_out: *std.ArrayList(PermissionGrant),
+    turn_file_mutation_denials: *runtime_tool_admission.TurnFileMutationDenials,
+    turn_review_cache: *runtime_tool_admission.TurnReviewCache,
+    terminal_validation_retry: *runtime_tool_admission.TerminalValidationRetryState,
+    shell_execution_failure_retry: *runtime_tool_admission.ShellExecutionFailureRetryState,
+    identical_failure_escalation: *runtime_tool_admission.IdenticalFailureEscalationState,
+    completed_tool_names: *std.ArrayList([]u8),
+    completed_tool_names_out: *std.ArrayList([]u8),
+    context_delivery_state: *context_contract.DeliveryState,
+
+    /// Runs last declared first, as the separate defers did.
+    noinline fn release(self: *const LoopExitScope) void {
+        self.context_delivery_state.deinit(self.arena);
+        self.completed_tool_names_out.* = self.completed_tool_names.*;
+        self.identical_failure_escalation.deinit(self.arena);
+        self.shell_execution_failure_retry.deinit(self.arena);
+        self.terminal_validation_retry.deinit(self.arena);
+        self.turn_review_cache.deinit(self.arena);
+        self.turn_file_mutation_denials.deinit(self.arena);
+        self.local_grants_out.* = self.local_grants.*;
+        self.within_turn_suffix_out.* = self.within_turn_suffix.*;
+    }
+};
+
+/// The turn's results, copied back to the caller on exit. It starts once the
+/// loop's own copies exist, so an earlier failure leaves the caller's alone.
+const LoopResultScope = struct {
+    owned_refreshed_api_key: *?[]u8,
+    summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
+    summary_accumulator_out: *runtime_telemetry.TurnSummaryAccumulator,
+    finish_trace: *PromptFinishTrace,
+    finish_trace_out: *PromptFinishTrace,
+    interrupted_persisted: *bool,
+    interrupted_persisted_out: *bool,
+
+    /// Runs last declared first, as the separate defers did.
+    noinline fn release(self: *const LoopResultScope) void {
+        self.interrupted_persisted_out.* = self.interrupted_persisted.*;
+        self.finish_trace_out.* = self.finish_trace.*;
+        self.summary_accumulator_out.* = self.summary_accumulator.*;
+        if (self.owned_refreshed_api_key.*) |key| secret.zeroAndFree(std.heap.c_allocator, key);
+    }
+};
+
 fn processQueuedPromptLoop(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -8407,19 +8498,12 @@ fn processQueuedPromptLoop(
     var image_route_state = image_route.step(.{}, .{ .turn_started = request_capabilities.image_input_support }).state;
     const history_messages = history_messages_ptr.*;
     var within_turn_suffix = within_turn_suffix_ptr.*;
-    defer within_turn_suffix_ptr.* = within_turn_suffix;
     var local_grants = local_grants_ptr.*;
-    defer local_grants_ptr.* = local_grants;
     var turn_file_mutation_denials: runtime_tool_admission.TurnFileMutationDenials = .{};
-    defer turn_file_mutation_denials.deinit(arena);
     var turn_review_cache: runtime_tool_admission.TurnReviewCache = .{};
-    defer turn_review_cache.deinit(arena);
     var terminal_validation_retry: runtime_tool_admission.TerminalValidationRetryState = .{};
-    defer terminal_validation_retry.deinit(arena);
     var shell_execution_failure_retry: runtime_tool_admission.ShellExecutionFailureRetryState = .{};
-    defer shell_execution_failure_retry.deinit(arena);
     var identical_failure_escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
-    defer identical_failure_escalation.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var active_compaction_handoff: ?ChatMessage = null;
     var active_compaction_history_tail: []const ChatMessage = &.{};
@@ -8433,12 +8517,28 @@ fn processQueuedPromptLoop(
     // Request-token calibration lives on the agent so the first request of a
     // new turn still calibrates from the previous turn's exact usage.
     var completed_tool_names = completed_tool_names_ptr.*;
-    defer completed_tool_names_ptr.* = completed_tool_names;
-    var context_delivery_state: context_contract.DeliveryState = if (deps.context_enabled)
-        try context_contract.DeliveryState.initFromSnapshot(arena, job.context_snapshot)
-    else
-        .{};
-    defer context_delivery_state.deinit(arena);
+    // Starts empty so the scope below can own it before the first `try`; an
+    // empty state frees nothing, as when the context is off.
+    var context_delivery_state: context_contract.DeliveryState = .{};
+    const exit_scope: LoopExitScope = .{
+        .arena = arena,
+        .within_turn_suffix = &within_turn_suffix,
+        .within_turn_suffix_out = within_turn_suffix_ptr,
+        .local_grants = &local_grants,
+        .local_grants_out = local_grants_ptr,
+        .turn_file_mutation_denials = &turn_file_mutation_denials,
+        .turn_review_cache = &turn_review_cache,
+        .terminal_validation_retry = &terminal_validation_retry,
+        .shell_execution_failure_retry = &shell_execution_failure_retry,
+        .identical_failure_escalation = &identical_failure_escalation,
+        .completed_tool_names = &completed_tool_names,
+        .completed_tool_names_out = completed_tool_names_ptr,
+        .context_delivery_state = &context_delivery_state,
+    };
+    defer exit_scope.release();
+    if (deps.context_enabled) {
+        context_delivery_state = try context_contract.DeliveryState.initFromSnapshot(arena, job.context_snapshot);
+    }
     // Files saved notes delivered that changed since; their current rules
     // are delivered again when a tool call reaches them.
     var replaced_note_sources: std.ArrayList([]const u8) = .empty;
@@ -8502,13 +8602,19 @@ fn processQueuedPromptLoop(
     };
     var active_api_key: []const u8 = job.api_key;
     var owned_refreshed_api_key: ?[]u8 = null;
-    defer if (owned_refreshed_api_key) |key| secret.zeroAndFree(std.heap.c_allocator, key);
     var summary_accumulator = summary_accumulator_ptr.*;
-    defer summary_accumulator_ptr.* = summary_accumulator;
     var finish_trace = finish_trace_ptr.*;
-    defer finish_trace_ptr.* = finish_trace;
     var interrupted_persisted = interrupted_persisted_ptr.*;
-    defer interrupted_persisted_ptr.* = interrupted_persisted;
+    const result_scope: LoopResultScope = .{
+        .owned_refreshed_api_key = &owned_refreshed_api_key,
+        .summary_accumulator = &summary_accumulator,
+        .summary_accumulator_out = summary_accumulator_ptr,
+        .finish_trace = &finish_trace,
+        .finish_trace_out = finish_trace_ptr,
+        .interrupted_persisted = &interrupted_persisted,
+        .interrupted_persisted_out = interrupted_persisted_ptr,
+    };
+    defer result_scope.release();
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
     // The last reply stopped for `other` with nothing in it and was answered
@@ -8668,7 +8774,7 @@ fn processQueuedPromptLoop(
         // A changed runtime context joins this boundary before its steering,
         // as the notes above do (D93, D94).
         var current_runtime_context: std.ArrayList(ChatMessage) = .empty;
-        try deps.append_runtime_context(deps.ctx, overlay_arena, &current_runtime_context);
+        try deps.append_runtime_context(deps.ctx, overlay_arena, job.model, &current_runtime_context);
         const was_captured = runtime_context.captured != null;
         const runtime_update = try runtime_context.refresh(arena, overlay_arena, current_runtime_context.items);
         if (!was_captured and runtime_context.captured != null) {
@@ -9588,18 +9694,27 @@ fn processQueuedPromptLoop(
                         debug_trace.logf("recovery", "unreadable reply limit reached, ending the turn err={s}", .{@errorName(err)});
                         break :blk null;
                     }
+                    if (evidence.cause == .unnamed_os_error and request_recovery.unnamedOsErrorEndsRequest()) {
+                        debug_trace.logf("recovery", "unnamed OS error limit reached, ending the turn err={s}", .{@errorName(err)});
+                        break :blk null;
+                    }
                     break :blk evidence;
                 } else null;
                 const failure_cause: types.ModelRecoveryCause = if (network_failure) |evidence|
                     switch (evidence.cause) {
                         // Saved sessions name only causes every version reads.
-                        .transport_interrupted, .unreadable_reply => .network_interrupted,
+                        .transport_interrupted, .unreadable_reply, .unnamed_os_error => .network_interrupted,
                         .connectivity_lost => .connectivity_lost,
                         .stream_stalled => .provider_stream_timeout,
                     }
                 else
                     recovery_cause;
-                const failure_diagnostic = types.ModelFailureDiagnostic.init(@errorName(err));
+                const unnamed_os_error = if (gateway_attempt_evidence.network_failure) |evidence|
+                    evidence.cause == .unnamed_os_error
+                else
+                    false;
+                // Its name says nothing; /trace has the errno (`os_errors.zig`).
+                const failure_diagnostic = types.ModelFailureDiagnostic.init(if (unnamed_os_error) "OS error, see /trace" else @errorName(err));
                 const failure_tool_evidence = settledAttemptToolEvidence(
                     deps.tool_registry,
                     preserved_tool_evidence,
@@ -10167,6 +10282,10 @@ fn processQueuedPromptLoop(
                             http_failure_notice_shown = false;
                             // The resend uses the credential the sign-in stored.
                             if (kind == .sign_in) credential_reload_pending = true;
+                            // A subagent's request continues on the model the
+                            // person chose for it while it waited
+                            // (`ViewWaits.tla` ModelChosen).
+                            if (config.origin != .root) try applyContinuedSelection(deps, arena, &job, &request_capabilities);
                             recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
                             reset_stream_for_next_attempt = true;
                             continue;
@@ -10178,6 +10297,21 @@ fn processQueuedPromptLoop(
                             // model.
                             restorePromptAfterTerminalFailure(deps, job, config);
                             try deps.push_event(deps.ctx, .open_model_picker);
+                            // A subagent has no composer to send from again:
+                            // its wait stays open across the picker, and the
+                            // person's choice continues this request with the
+                            // new model, as "retry" does (`ViewWaits.tla`
+                            // ModelChosen). Closing the picker without a choice
+                            // leaves the wait open and the card comes back;
+                            // only a cancel ends the turn.
+                            if (try continueOnPickedModel(deps, arena, &job, &request_capabilities, &request_recovery, config)) {
+                                stream_result.deinit(arena);
+                                stream_result_set = false;
+                                http_failure_notice_shown = false;
+                                recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
+                                reset_stream_for_next_attempt = true;
+                                continue;
+                            }
                         },
                         .cancelled => {},
                     }
@@ -10301,7 +10435,7 @@ fn processQueuedPromptLoop(
                             continue;
                         }
                         stream_ctx.drop_staged_response_language_candidate();
-                        try deps.push_system_notice(deps.ctx, response_language_failure_notice);
+                        try deps.pushWarningNotice(response_language_failure_notice);
                         finish_trace.finish("response_language_mismatch");
                         return error.ResponseLanguageMismatch;
                     },
@@ -11083,7 +11217,7 @@ fn processQueuedPromptLoop(
                 .end_turn => unreachable,
             }
         };
-        if (output_limit_action == .end_turn) try runtime_assistant_stream.emitProviderLengthNotice(deps, arena, disposition);
+        if (output_limit_action == .end_turn) try runtime_assistant_stream.emitProviderLengthNotice(deps, disposition);
         // Tool calls run in this step: an answer the model was continuing
         // ends here, and its text stays a reply of its own.
         if (completion.tool_calls.len > 0) continued_answer.endAtToolActivity("tool calls");

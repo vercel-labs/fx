@@ -837,6 +837,7 @@ export class TmuxSession {
     const defaultArgs = [
       ["FX_DISABLE_KEYCHAIN", "1"],
       ["FX_TEST_SKIP_ONBOARDING", "1"],
+      ["FX_TEST_SKIP_WORKSPACE_TRUST", "1"],
       ["FX_SOUND", "0"],
       // fx panics if it makes a network request on the input loop.
       ["FX_TEST_INPUT_LOOP_NETWORK_GUARD", "1"],
