@@ -64,33 +64,25 @@ pub const OpenedSkillCandidate = struct {
         var segment = segments.next() orelse return error.InvalidSkillResourcePath;
         if (invalidResourceSegment(segment)) return error.InvalidSkillResourcePath;
 
-        const child_segment = segments.next() orelse {
-            return self.dir.openFile(io_mod.getIo(), segment, .{
-                .allow_directory = false,
-                .follow_symlinks = false,
-            });
-        };
-        if (invalidResourceSegment(child_segment)) return error.InvalidSkillResourcePath;
-
-        var current_dir = try self.dir.openDir(io_mod.getIo(), segment, .{
-            .follow_symlinks = false,
-        });
-        defer current_dir.close(io_mod.getIo());
-        segment = child_segment;
+        var current_dir: ?std.Io.Dir = null;
+        defer if (current_dir) |*dir| dir.close(io_mod.getIo());
 
         while (segments.next()) |next_segment| {
             if (invalidResourceSegment(next_segment)) return error.InvalidSkillResourcePath;
-            const next_dir = try current_dir.openDir(io_mod.getIo(), segment, .{
+            const parent = current_dir orelse self.dir;
+            const next_dir = try parent.openDir(io_mod.getIo(), segment, .{
                 .follow_symlinks = false,
             });
-            current_dir.close(io_mod.getIo());
+            if (current_dir) |*dir| dir.close(io_mod.getIo());
             current_dir = next_dir;
             segment = next_segment;
         }
-        return current_dir.openFile(io_mod.getIo(), segment, .{
-            .allow_directory = false,
-            .follow_symlinks = false,
-        });
+
+        const target_dir = current_dir orelse self.dir;
+        return io_mod.openExistingReadOnlyRegularFile(target_dir, segment, .no_follow) catch |err| switch (err) {
+            error.DurablePathUnsafe => error.SkillResourceNotRegularFile,
+            else => err,
+        };
     }
 };
 
@@ -5542,6 +5534,57 @@ test "linked metadata FIFO is rejected before descriptor open" {
     try std.testing.expect(!mark.called);
     try std.testing.expect(!writer.finished.load(.seq_cst));
     try std.testing.expect(!writer.failed.load(.seq_cst));
+}
+
+test "loadVisibleSkills and openValidatedSkillCandidate refuse FIFO entries without blocking" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try createTempFifoOrSkip(alloc, &tmp, "home/workspace/.codex/skills/direct-fifo/SKILL.md");
+    try createTempFifoOrSkip(alloc, &tmp, "home/workspace/.codex/skills/fifo-entry");
+    try createTempFifoOrSkip(alloc, &tmp, "home/workspace/fifo-target");
+    try createTempSymlinkOrSkip(
+        &tmp,
+        "../../fifo-target",
+        "home/workspace/.codex/skills/linked-fifo-dir",
+    );
+    try createTempFifoOrSkip(alloc, &tmp, "home/.fx/skills/managed-fifo/SKILL.md");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+
+    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+    defer discovery.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), discovery.skills.len);
+    try std.testing.expectEqual(@as(usize, 3), discovery.diagnostics.len);
+
+    const direct_fifo_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/direct-fifo" });
+    defer alloc.free(direct_fifo_path);
+    const open_res = try openValidatedSkillCandidate(alloc, .{
+        .name = "direct-fifo",
+        .description = "",
+        .path = direct_fifo_path,
+        .source = .workspace_codex,
+        .read_authority = workspace_root,
+    });
+    try std.testing.expect(open_res == .skipped and open_res.skipped == .unreadable);
+
+    const fifo_target_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, "fifo-target" });
+    defer alloc.free(fifo_target_path);
+    try std.testing.expectError(
+        error.NotDir,
+        openSkillRoot(alloc, .{ .path = fifo_target_path, .source = .workspace_codex, .read_authority = workspace_root }, .{}),
+    );
+    try std.testing.expectError(
+        error.NotDir,
+        openSkillRoot(alloc, .{ .path = fifo_target_path, .source = .global_fx, .read_authority = null }, .{}),
+    );
 }
 
 test "loadVisibleSkills discovers and reopens a contained linked workspace candidate" {

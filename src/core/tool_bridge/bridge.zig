@@ -552,10 +552,11 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
     // are denied as the core's deny, and the client is told why.
     const file_refused = switch (request.operation) {
         .edit, .write => registration.capability.authorize_file_fn == null,
+        .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => registration.capability.authorize_bash_tool_fn == null,
         .call, .list, .search, .help => false,
     };
     const authorization: capability_mod.Authorization = if (file_refused) .{ .deny = refusalMessage(.file_tool_unavailable) } else switch (request.operation) {
-        .call, .edit, .write => authorizeGated(io, registration, work.id, arena, request_id, request.operation),
+        .call, .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => authorizeGated(io, registration, work.id, arena, request_id, request.operation),
         .list, .search, .help => .{ .allow = .{} },
     };
     bridge.mutex.lockUncancelable(io);
@@ -623,6 +624,13 @@ fn authorizeGated(
         .call => |value| registration.capability.authorize(arena, request_id, value.tool, value.arguments_json),
         .edit => |value| registration.capability.authorizeFile(arena, request_id, .{ .edit = value }),
         .write => |value| registration.capability.authorizeFile(arena, request_id, .{ .write = value }),
+        .skill_list => registration.capability.authorizeBashTool(arena, request_id, .skill_list),
+        .skill_open => |value| registration.capability.authorizeBashTool(arena, request_id, .{ .skill_open = value }),
+        .agent_message => |value| registration.capability.authorizeBashTool(arena, request_id, .{ .agent_message = value }),
+        .agent_wait => registration.capability.authorizeBashTool(arena, request_id, .agent_wait),
+        .agent_status => |agent| registration.capability.authorizeBashTool(arena, request_id, .{ .agent_status = agent }),
+        .agent_stop => |agent| registration.capability.authorizeBashTool(arena, request_id, .{ .agent_stop = agent }),
+        .agent_close => |agent| registration.capability.authorizeBashTool(arena, request_id, .{ .agent_close = agent }),
         .list, .search, .help => unreachable, // lookups have no permission check
     };
     return checked catch |err| .{ .deny = arena.print("The permission check for {f} failed: {s}", .{ text_utils.terminalSafe(operation.subject()), @errorName(err) }) catch "The permission check failed." };
@@ -640,8 +648,8 @@ fn runOperation(
     if (operation.lookup()) |question| return capability.lookup(arena, question, cancel);
     return switch (operation) {
         .call => |value| capability.call(arena, request_id, value.tool, value.arguments_json, allowed, cancel),
-        // A file change's authority holds its call, so the tool and arguments are empty.
-        .edit, .write => capability.call(arena, request_id, operation.subject(), "", allowed, cancel),
+        // A gated bash-tool operation's authority holds its call, so tool and arguments are empty.
+        .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => capability.call(arena, request_id, operation.subject(), "", allowed, cancel),
         .list, .search, .help => unreachable, // answered by the lookup above
     };
 }
@@ -658,14 +666,36 @@ const FakeTool = struct {
     authorize_calls: u32 = 0,
     /// File permission checks begun. Guarded by the bridge mutex, like `authorize_calls`.
     file_authorize_calls: u32 = 0,
+    bash_tool_authorize_calls: u32 = 0,
     calls: std.atomic.Value(u32) = .init(0),
     /// File changes run. The fake changes nothing.
     file_calls: std.atomic.Value(u32) = .init(0),
-    /// The registration offers no file handler, as a shell command's does.
+    /// The registration offers no file/bash-tool handler, as a shell command's does.
     no_files: bool = false,
 
     fn capability(self: *FakeTool) capability_mod.Capability {
-        return .{ .context = @ptrCast(self), .authorize_fn = authorize, .authorize_file_fn = if (self.no_files) null else authorizeFile, .call_fn = run, .lookup_fn = lookup };
+        return .{
+            .context = @ptrCast(self),
+            .authorize_fn = authorize,
+            .authorize_file_fn = if (self.no_files) null else authorizeFile,
+            .authorize_bash_tool_fn = if (self.no_files) null else authorizeBashTool,
+            .call_fn = run,
+            .lookup_fn = lookup,
+        };
+    }
+
+    fn authorizeBashTool(raw: *anyopaque, arena: Allocator, request_id: []const u8, operation: capability_mod.BashToolRequest) anyerror!capability_mod.Authorization {
+        _ = .{ arena, request_id, operation };
+        const self: *FakeTool = @ptrCast(@alignCast(raw));
+        self.authorizing.store(true, .release);
+        const io = io_mod.getIo();
+        bridge.mutex.lockUncancelable(io);
+        self.bash_tool_authorize_calls += 1;
+        bridge.changed.broadcast(io);
+        bridge.mutex.unlock(io);
+        while (self.gate.load(.acquire)) io_mod.sleep(5 * std.time.ns_per_ms);
+        if (self.fail) return error.PermissionCheckFailed;
+        return if (self.allow) .{ .allow = .{ .prepared = @ptrCast(self) } } else .{ .deny = "Denied by the test." };
     }
 
     fn authorizeFile(raw: *anyopaque, arena: Allocator, request_id: []const u8, file: capability_mod.FileRequest) anyerror!capability_mod.Authorization {
@@ -1090,8 +1120,82 @@ test "a client that stays connected after its lookup does not hold the bridge's 
     const started = io_mod.milliTimestamp();
     stopped = true;
     unregister(registration);
-    // unregister waits for this request's watch to end, which needs the watch's
-    // wake byte. Without it the watch would wait out wake_safety_poll_ms (1000 ms).
+    // The wake byte lets unregister end without waiting for wake_safety_poll_ms (1000 ms).
     try std.testing.expect(io_mod.milliTimestamp() - started < 500);
     try std.testing.expectEqual(@as(u32, 0), bridge.connections);
+}
+
+fn bashToolAuthorizeCount(io: std.Io, tool: *const FakeTool) u32 {
+    bridge.mutex.lockUncancelable(io);
+    defer bridge.mutex.unlock(io);
+    return tool.bash_tool_authorize_calls;
+}
+
+test "new skill and agent operations go through authorizeGated and never run when denied or unavailable" {
+    if (!supported) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ops = [_]wire.Operation{
+        .skill_list,
+        .{ .skill_open = .{ .name = "zig", .resource = "SKILL.md" } },
+        .{ .agent_message = .{ .agent = "worker", .message = "hi" } },
+        .agent_wait,
+        .{ .agent_status = null },
+        .{ .agent_stop = "worker" },
+        .{ .agent_close = "worker" },
+    };
+
+    // Allowed: goes through authorizeBashTool (not lookup) and reaches run.
+    {
+        var tool: FakeTool = .{};
+        const registration = try register(tool.capability());
+        defer unregister(registration);
+        const variables = registration.environment();
+        const socket_path = variables[0].value;
+        const token = wire.parseToken(variables[1].value).?;
+        for (ops) |op| {
+            const reply = try client.call(arena, std.testing.io, socket_path, token, op);
+            try std.testing.expectEqual(wire.Status.ok, reply.header.status);
+        }
+        try std.testing.expectEqual(@as(u32, ops.len), bashToolAuthorizeCount(std.testing.io, &tool));
+        try std.testing.expectEqual(@as(u32, ops.len), tool.file_calls.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
+    }
+
+    // Denied: authorization refuses it and call_fn never runs.
+    {
+        var tool: FakeTool = .{ .allow = false };
+        const registration = try register(tool.capability());
+        defer unregister(registration);
+        const variables = registration.environment();
+        const socket_path = variables[0].value;
+        const token = wire.parseToken(variables[1].value).?;
+        for (ops) |op| {
+            const reply = try client.call(arena, std.testing.io, socket_path, token, op);
+            try std.testing.expectEqual(wire.Status.denied, reply.header.status);
+            try std.testing.expectEqualStrings("Denied by the test.", reply.bytes);
+        }
+        try std.testing.expectEqual(@as(u32, ops.len), bashToolAuthorizeCount(std.testing.io, &tool));
+        try std.testing.expectEqual(@as(u32, 0), tool.file_calls.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
+    }
+
+    // No bash-tool handler (e.g. shell tool): refused as file_tool_unavailable before authorization.
+    {
+        var tool: FakeTool = .{ .no_files = true };
+        const registration = try register(tool.capability());
+        defer unregister(registration);
+        const variables = registration.environment();
+        const socket_path = variables[0].value;
+        const token = wire.parseToken(variables[1].value).?;
+        for (ops) |op| {
+            const reply = try client.call(arena, std.testing.io, socket_path, token, op);
+            try std.testing.expectEqual(wire.Status.refused, reply.header.status);
+            try std.testing.expectEqual(wire.Reason.file_tool_unavailable, reply.header.reason.?);
+        }
+        try std.testing.expectEqual(@as(u32, 0), bashToolAuthorizeCount(std.testing.io, &tool));
+        try std.testing.expectEqual(@as(u32, 0), tool.file_calls.load(.acquire));
+    }
 }

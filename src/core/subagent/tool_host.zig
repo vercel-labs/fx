@@ -1249,6 +1249,17 @@ pub const Runtime = struct {
         }
     }
 
+    /// `waitForPostOrNudge`, which a set `cancel` ends too. Without a flag it is
+    /// that wait. With one, the flag is rechecked every `cancel_poll`, as
+    /// `awaitMailOrQuiet` does, so a flag set without any wake still ends it.
+    fn waitForWake(worker: *worker_runtime.WorkerRuntime, cancel: ?*std.atomic.Value(bool)) worker_runtime.WorkerRuntime.PostWake {
+        const flag = cancel orelse return worker.waitForPostOrNudge();
+        while (true) {
+            if (flag.load(.seq_cst)) return .stopped;
+            if (worker.waitForPostOrNudgeTimeout(cancel_poll)) |wake| return wake;
+        }
+    }
+
     /// How trace lines name this host's owner: `main` for a root host, as the
     /// mailbox trace contract reads it, or the owner's own id.
     fn ownerName(self: *const Runtime) []const u8 {
@@ -2244,7 +2255,8 @@ pub const Runtime = struct {
         defer roster_arena.deinit();
         const waited_for = try self.roster(roster_arena.allocator(), true);
         debug_trace.eventf("mailbox", "wait_begin", .{}, "agent={s}", .{self.ownerName()});
-        const wake = worker.waitForPostOrNudge();
+        const wake = waitForWake(worker, options.cancel_flag);
+        const canceled = if (options.cancel_flag) |flag| wake == .stopped and flag.load(.seq_cst) else false;
         // Mail joins the owner's running turn only where the host marks its
         // turns; elsewhere, as in ACP, it starts the next one, and the owner
         // must end this turn to read it (`tests/tla/subagent/MainMail.tla`
@@ -2253,7 +2265,7 @@ pub const Runtime = struct {
         const senders: MailSenders = if (wake == .posted) worker.queuedAuthors() else .empty;
         debug_trace.eventf("mailbox", "wait_end", .{}, "agent={s} reason={s} said={s} user={} parent={} child={}", .{
             self.ownerName(),
-            @tagName(wake),
+            if (canceled) "canceled" else @tagName(wake),
             if (read == .this_turn) "follows" else "next",
             senders.contains(.user),
             senders.contains(.parent),
@@ -6946,6 +6958,109 @@ test "wait returns at once when nothing works, and when a report arrives" {
     // It names the subagent that was working when it began.
     try std.testing.expect(std.mem.find(u8, woken, "\"subagents\":[\"reviewer\"]") != null);
     try std.testing.expect(std.mem.find(u8, woken, "shell") == null);
+    try std.testing.expectEqual(@as(usize, 1), worker.queuedPromptCount());
+    const queued = worker.takeQueuedPrompt(alloc).?;
+    defer worker_runtime.freeQueuedPrompt(alloc, queued);
+    try std.testing.expectEqual(types.MessageAuthor.child, queued.author);
+}
+
+test "a wait with a cancel flag ends with error.Cancelled once the flag is set, while a child still works" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .hold = true, .worker = &worker };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    defer fixture.release.set(io_mod.getIo());
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", &worker);
+    try waitForRuns(&fixture, 1);
+    const Canceler = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            io_mod.sleep(20 * std.time.ns_per_ms);
+            flag.store(true, .seq_cst);
+        }
+    };
+    var cancel = std.atomic.Value(bool).init(false);
+    const canceler = try std.Thread.spawn(.{}, Canceler.run, .{&cancel});
+    defer canceler.join();
+    // Without the flag, the wait blocks until a nudge. The watchdog nudges after
+    // 5 s, so a regression fails the elapsed check below instead of hanging.
+    const Watchdog = struct {
+        fn run(target: *worker_runtime.WorkerRuntime, done: *std.Io.Event) void {
+            done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } }) catch {
+                target.nudgeWaiter();
+            };
+        }
+    };
+    var done: std.Io.Event = .unset;
+    const watchdog = try std.Thread.spawn(.{}, Watchdog.run, .{ &worker, &done });
+    defer watchdog.join();
+    defer done.set(io_mod.getIo());
+
+    var request = try model_contract.validateRequest(alloc, .wait);
+    defer request.deinit(alloc);
+    const started_ms = io_mod.milliTimestamp();
+    const outcome = runtime.executeManaged(arena, &request, .{
+        .caller_id = runtime.root_id,
+        .invocation_id = "call-2",
+        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .caller_worker = &worker,
+        .cancel_flag = &cancel,
+    });
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+    try std.testing.expectError(error.Cancelled, outcome);
+    try std.testing.expectEqual(@as(usize, 0), worker.queuedPromptCount());
+}
+
+test "a wait with a cancel flag leaves the mail it returns for, in the queue" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .hold = true, .worker = &worker };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", &worker);
+    try waitForRuns(&fixture, 1);
+    const Releaser = struct {
+        fn run(target: *MailboxFixture) void {
+            io_mod.sleep(20 * std.time.ns_per_ms);
+            target.release.set(io_mod.getIo());
+        }
+    };
+    const releaser = try std.Thread.spawn(.{}, Releaser.run, .{&fixture});
+    defer releaser.join();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var request = try model_contract.validateRequest(alloc, .wait);
+    defer request.deinit(alloc);
+    const woken = try runtime.executeManaged(arena, &request, .{
+        .caller_id = runtime.root_id,
+        .invocation_id = "call-2",
+        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .caller_worker = &worker,
+        .cancel_flag = &cancel,
+    });
+    try std.testing.expect(std.mem.find(u8, woken.body, "A report or message arrived") != null);
     try std.testing.expectEqual(@as(usize, 1), worker.queuedPromptCount());
     const queued = worker.takeQueuedPrompt(alloc).?;
     defer worker_runtime.freeQueuedPrompt(alloc, queued);

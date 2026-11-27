@@ -791,6 +791,7 @@ pub const Runtime = struct {
         var quiet_wait = quiet_notice.beginWait(started_ms, entry.last_output_ms, input.yield_time_ms, limit_ms);
         entry.mutex.unlock(zio);
         var quiet_crossed = false;
+        var hold_seen_ms: ?i64 = null;
         while (true) {
             entry.mutex.lockUncancelable(zio);
             const terminal = entry.isTerminal();
@@ -811,7 +812,12 @@ pub const Runtime = struct {
             }
             const now_ms = io_mod.milliTimestamp();
             const elapsed = now_ms - started_ms;
-            const held = if (input.yield_hold) |hold| hold.load(.acquire) > 0 else false;
+            if (input.yield_hold) |hold| {
+                if (hold.load(.acquire) > 0) hold_seen_ms = now_ms;
+            }
+            // A bridge call holds the wait while it runs, and for the grace after
+            // the last poll that saw it held.
+            const held = if (hold_seen_ms) |seen| now_ms - seen < contract.bridge_yield_grace_ms else false;
             if (elapsed >= input.yield_time_ms and !held) break;
             if (!held and steerYieldDue(input.tool_yield_flag, started_ms, now_ms, yield_grace_ms)) {
                 debug_trace.logf("managed-execution", "run yielded for steering execution={s} elapsed_ms={d}", .{ entry.execution_id, elapsed });
@@ -2351,6 +2357,122 @@ test "a command that ends inside the steering grace returns its result" {
     }
     try std.testing.expect(std.mem.find(u8, started.snapshot.output_delta, "quick") != null);
     try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+}
+
+test "a bridge hold dropped past the yield ceiling and taken again 100 ms later does not yield in the gap" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var hold = std.atomic.Value(u32).init(1);
+    var input = StartCapturedInput{
+        .execution_id = "managed-hold-gap",
+        .command = "sleep 3; printf done",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 200,
+        .yield_hold = &hold,
+    };
+    input.authority = testAuthority(input);
+    const Steps = struct {
+        fn run(target: *std.atomic.Value(u32)) void {
+            io_mod.sleep(250 * std.time.ns_per_ms);
+            target.store(0, .release);
+            io_mod.sleep(100 * std.time.ns_per_ms);
+            target.store(1, .release);
+            io_mod.sleep(50 * std.time.ns_per_ms);
+            target.store(0, .release);
+        }
+    };
+    const steps = try std.Thread.spawn(.{}, Steps.run, .{&hold});
+    defer steps.join();
+    const started_ms = io_mod.milliTimestamp();
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    // The hold came back at 350 ms, so the first wait may not yield before it.
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms >= 350);
+    try std.testing.expectEqual(SnapshotState.running, started.snapshot.state);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+    var stopped = try runtime.stop(alloc, input.execution_id, true);
+    defer stopped.deinit(alloc);
+    try runtime.commitDelivery(stopped.snapshot.execution_id, stopped.reservation_id);
+}
+
+test "a bridge hold that drops and stays down yields within the grace after it was last seen" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var hold = std.atomic.Value(u32).init(1);
+    var input = StartCapturedInput{
+        .execution_id = "managed-hold-down",
+        .command = "sleep 3; printf done",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 200,
+        .yield_hold = &hold,
+    };
+    input.authority = testAuthority(input);
+    var dropped_at_ms = std.atomic.Value(i64).init(0);
+    const Drop = struct {
+        fn run(target: *std.atomic.Value(u32), at: *std.atomic.Value(i64)) void {
+            io_mod.sleep(300 * std.time.ns_per_ms);
+            at.store(io_mod.milliTimestamp(), .seq_cst);
+            target.store(0, .release);
+        }
+    };
+    const drop = try std.Thread.spawn(.{}, Drop.run, .{ &hold, &dropped_at_ms });
+    defer drop.join();
+    const started_ms = io_mod.milliTimestamp();
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    const returned_after_ms = io_mod.milliTimestamp() - started_ms;
+    const dropped_after_ms = dropped_at_ms.load(.seq_cst) - started_ms;
+    try std.testing.expect(returned_after_ms >= dropped_after_ms + contract.bridge_yield_grace_ms - 100);
+    try std.testing.expect(returned_after_ms <= dropped_after_ms + contract.bridge_yield_grace_ms + 500);
+    try std.testing.expectEqual(SnapshotState.running, started.snapshot.state);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+    var stopped = try runtime.stop(alloc, input.execution_id, true);
+    defer stopped.deinit(alloc);
+    try runtime.commitDelivery(stopped.snapshot.execution_id, stopped.reservation_id);
+}
+
+test "a first wait with no bridge hold yields at its ceiling and not after the grace" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var input = StartCapturedInput{
+        .execution_id = "managed-no-hold",
+        .command = "sleep 3; printf done",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 200,
+    };
+    input.authority = testAuthority(input);
+    const started_ms = io_mod.milliTimestamp();
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    const returned_after_ms = io_mod.milliTimestamp() - started_ms;
+    try std.testing.expect(returned_after_ms >= 200);
+    try std.testing.expect(returned_after_ms < contract.bridge_yield_grace_ms);
+    try std.testing.expectEqual(SnapshotState.running, started.snapshot.state);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+    var stopped = try runtime.stop(alloc, input.execution_id, true);
+    defer stopped.deinit(alloc);
+    try runtime.commitDelivery(stopped.snapshot.execution_id, stopped.reservation_id);
 }
 
 test "a cancel takes only the running commands steering detached in its turn" {

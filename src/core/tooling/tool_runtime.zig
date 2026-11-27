@@ -3,6 +3,9 @@ const toolbox = @import("toolbox.zig");
 const observation = @import("../agent/runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
+const skill_invocation = @import("../skills/skill_invocation.zig");
+const builtin_skills = @import("../../builtins/skills.zig");
+const subagent_impl = @import("../../tools/agent/subagent.zig");
 const builtin = @import("builtin");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -62,6 +65,7 @@ const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_bridge = @import("../tool_bridge/tool_bridge.zig");
 const mcp_call_capability = tool_bridge.capability;
+const bash_tool_requests = @import("bash_tool_requests.zig");
 const model_tool_schema = @import("model_tool_schema.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const capability_retrieval = @import("capability_retrieval.zig");
@@ -87,6 +91,22 @@ else
     struct {};
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
+else
+    struct {};
+const test_subagent_authority = if (builtin.is_test)
+    @import("../subagent/authority.zig")
+else
+    struct {};
+const test_subagent_child_state = if (builtin.is_test)
+    @import("../subagent/child_state.zig")
+else
+    struct {};
+const test_subagent_domain = if (builtin.is_test)
+    @import("../subagent/domain.zig")
+else
+    struct {};
+const test_subagent_execution = if (builtin.is_test)
+    @import("../subagent/execution.zig")
 else
     struct {};
 const test_browser_workspace_tools = if (builtin.is_test)
@@ -1080,8 +1100,60 @@ const McpCallBridgeState = struct {
     file_ops: bool = false,
 
     fn capability(self: *McpCallBridgeState) mcp_call_capability.Capability {
-        return .{ .context = @ptrCast(self), .authorize_fn = authorizeBridgeCall, .authorize_file_fn = if (comptime tool_bridge.supported) (if (self.file_ops) authorizeBridgeFile else null) else null, .call_fn = runBridgeCall, .lookup_fn = lookupBridge };
+        return .{
+            .context = @ptrCast(self),
+            .authorize_fn = authorizeBridgeCall,
+            .authorize_file_fn = if (comptime tool_bridge.supported) (if (self.file_ops) authorizeBridgeFile else null) else null,
+            .authorize_bash_tool_fn = if (comptime tool_bridge.supported) (if (self.file_ops) authorizeBridgeBashTool else null) else null,
+            .call_fn = runBridgeCall,
+            .lookup_fn = lookupBridge,
+        };
     }
+};
+
+fn authorizeBridgeBashTool(
+    raw: *anyopaque,
+    arena: Allocator,
+    request_id: []const u8,
+    operation: mcp_call_capability.BashToolRequest,
+) anyerror!mcp_call_capability.Authorization {
+    const state: *McpCallBridgeState = @ptrCast(@alignCast(raw));
+    const ctx = state.runtime;
+    const call = try bridgeBashToolCall(ctx, arena, request_id, operation);
+    const checked_ctx = switch (try checkNestedCall(ctx, arena, call, null)) {
+        .allow => |allowed_ctx| allowed_ctx,
+        .deny => |why| return .{ .deny = why },
+    };
+    const authority = try arena.create(BridgeAuthority);
+    authority.* = .{ .bash_tool = .{
+        .ctx = checked_ctx,
+        .operation = operation,
+        .tool_call = call,
+    } };
+    return .{ .allow = .{ .prepared = authority } };
+}
+
+fn bridgeBashToolCall(
+    ctx: Context,
+    arena: Allocator,
+    request_id: []const u8,
+    operation: mcp_call_capability.BashToolRequest,
+) !ToolCall {
+    // Only a skill open needs the session's skill locations, so the lookup happens here.
+    const skill_target = switch (operation) {
+        .skill_open => |req| (try toolbox.skillNamed(arena, ctx.skill_locations, req.name)) orelse req.name,
+        else => "",
+    };
+    return bash_tool_requests.toolCall(arena, request_id, operation, skill_target);
+}
+
+const BridgeAuthority = union(enum) {
+    file: BridgeFileAuthority,
+    bash_tool: struct {
+        ctx: Context,
+        operation: mcp_call_capability.BashToolRequest,
+        tool_call: ToolCall,
+    },
 };
 
 /// Checks a bridge call as the agent's own call of an MCP tool it never
@@ -1201,20 +1273,20 @@ fn authorizeBridgeFile(
         .file_mutation => |value| value,
         else => return .{ .deny = "fx tool edit and write did not get file authority." },
     };
-    const authority = try arena.create(BridgeFileAuthority);
-    authority.* = .{ .allowed = .{ .call = call, .execution = execution, .block_count = block_count } };
+    const authority = try arena.create(BridgeAuthority);
+    authority.* = .{ .file = .{ .allowed = .{ .call = call, .execution = execution, .block_count = block_count } } };
     return .{ .allow = .{ .prepared = authority } };
 }
 
 /// The authorization of a change that failed before its check. A multi-block
 /// failure says that nothing was applied.
 fn failedBridgeFile(arena: Allocator, tool: []const u8, path: []const u8, reason: []const u8, block_count: usize) !mcp_call_capability.Authorization {
-    const authority = try arena.create(BridgeFileAuthority);
-    authority.* = .{ .failed = .{
+    const authority = try arena.create(BridgeAuthority);
+    authority.* = .{ .file = .{ .failed = .{
         .tool = tool,
         .path = path,
         .text = try failureWithBlockNote(arena, reason, block_count),
-    } };
+    } } };
     return .{ .allow = .{ .prepared = authority } };
 }
 
@@ -1364,6 +1436,240 @@ fn runBridgeFileCall(
         prepared.preview.additions,
         prepared.preview.deletions,
     ) };
+}
+
+fn runBridgeBashToolCall(
+    ctx: Context,
+    arena: Allocator,
+    request_id: []const u8,
+    operation: mcp_call_capability.BashToolRequest,
+    tool_call: ToolCall,
+    cancel: *std.atomic.Value(bool),
+) anyerror!mcp_call_capability.CallOutcome {
+    const info = try bashToolRowInfo(arena, operation);
+    const row = BridgeCallRow.startAction(ctx, arena, request_id, info.tool, tool_call.arguments_json, info.action);
+    if (cancel.load(.acquire)) {
+        if (row) |value| value.finishAction(arena, .cancelled);
+        debug_trace.logf("mcp-call", "request={s} dropped {s} before it started: canceled", .{ request_id, @tagName(operation) });
+        return .{ .status = .failed, .bytes = "Cancelled before starting." };
+    }
+    const outcome = executeBridgeBashToolOperation(ctx, arena, operation, tool_call, cancel) catch |err| {
+        if (row) |value| value.finishAction(arena, if (err == error.Cancelled or cancel.load(.acquire)) .cancelled else .failed);
+        if (err == error.Cancelled) {
+            debug_trace.logf("mcp-call", "request={s} dropped {s} while it ran: canceled", .{ request_id, @tagName(operation) });
+            return .{ .status = .failed, .bytes = "Cancelled." };
+        }
+        return err;
+    };
+    if (row) |value| value.finishAction(arena, if (cancel.load(.acquire)) .cancelled else switch (outcome.status) {
+        .ok => .completed,
+        .tool_error, .failed => .failed,
+    });
+    return outcome;
+}
+
+fn bashToolRowInfo(arena: Allocator, operation: mcp_call_capability.BashToolRequest) !struct {
+    tool: []const u8,
+    action: BridgeCallRow.ActionRow,
+} {
+    return switch (operation) {
+        .skill_list => .{
+            .tool = "skill",
+            .action = .{
+                .activity_kind = .list,
+                .running_label = "Listing skills",
+                .done_label = "Listed skills",
+                .failed_label = "Failed skill list",
+                .target = "",
+            },
+        },
+        .skill_open => |req| .{
+            .tool = "skill",
+            .action = .{
+                .activity_kind = .read,
+                .running_label = "Reading skill",
+                .done_label = "Read skill",
+                .failed_label = "Failed skill",
+                .target = try rowPath(arena, req.name),
+            },
+        },
+        .agent_message => |req| .{
+            .tool = "subagent",
+            .action = .{
+                .activity_kind = .subagent,
+                .running_label = "Messaging subagent",
+                .done_label = "Messaged subagent",
+                .failed_label = "Failed subagent",
+                .target = try rowPath(arena, req.agent),
+            },
+        },
+        .agent_wait => .{
+            .tool = "subagent",
+            .action = .{
+                .activity_kind = .subagent,
+                .running_label = "Waiting for subagents",
+                .done_label = "Waited for subagents",
+                .failed_label = "Failed subagent wait",
+                .target = "",
+            },
+        },
+        .agent_status => |agent| .{
+            .tool = "subagent",
+            .action = .{
+                .activity_kind = .subagent,
+                .running_label = "Checking subagent",
+                .done_label = "Checked subagent",
+                .failed_label = "Failed subagent status",
+                .target = if (agent) |name| try rowPath(arena, name) else "",
+            },
+        },
+        .agent_stop => |agent| .{
+            .tool = "subagent",
+            .action = .{
+                .activity_kind = .subagent,
+                .running_label = "Stopping subagent",
+                .done_label = "Stopped subagent",
+                .failed_label = "Failed stopping subagent",
+                .target = try rowPath(arena, agent),
+            },
+        },
+        .agent_close => |agent| .{
+            .tool = "subagent",
+            .action = .{
+                .activity_kind = .subagent,
+                .running_label = "Closing subagent",
+                .done_label = "Closed subagent",
+                .failed_label = "Failed closing subagent",
+                .target = try rowPath(arena, agent),
+            },
+        },
+    };
+}
+
+fn executeBridgeBashToolOperation(
+    ctx: Context,
+    arena: Allocator,
+    operation: mcp_call_capability.BashToolRequest,
+    tool_call: ToolCall,
+    cancel: *std.atomic.Value(bool),
+) anyerror!mcp_call_capability.CallOutcome {
+    return switch (operation) {
+        .skill_list => runBridgeSkillList(ctx, arena),
+        .skill_open => |req| runBridgeSkillOpen(ctx, arena, req, cancel),
+        .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => runBridgeAgentCall(ctx, arena, tool_call, cancel),
+    };
+}
+
+fn runBridgeSkillList(ctx: Context, arena: Allocator) anyerror!mcp_call_capability.CallOutcome {
+    const skills: []const skill_contract.Skill = if (ctx.skill_locations) |locations|
+        locations.skills
+    else blk: {
+        const discovery = try builtin_skills.loadVisibleSkillsForTool(arena, ctx.workspace_root, ctx.skills_dir);
+        skill_runtime.traceDiagnostics("skill_list", discovery.diagnostics);
+        break :blk discovery.skills;
+    };
+    const description_bytes = ctx.context_limits.skill_description_bytes.effectiveBytes();
+    return .{ .status = .ok, .bytes = try bash_tool_requests.skillListText(arena, skills, toolbox.max_menu_bytes, description_bytes) };
+}
+
+fn runBridgeSkillOpen(
+    ctx: Context,
+    arena: Allocator,
+    req: mcp_call_capability.SkillOpenRequest,
+    cancel: *std.atomic.Value(bool),
+) anyerror!mcp_call_capability.CallOutcome {
+    if (cancel.load(.acquire)) return error.Cancelled;
+    var catalog: skill_invocation.Catalog = .{ .skills = &.{}, .diagnostics = &.{} };
+    var by_location = false;
+    var resolved_location: ?[]const u8 = null;
+
+    if (ctx.skill_locations) |locations| {
+        const maybe_path = locations.resolve(arena, req.name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .status = .tool_error, .bytes = try bash_tool_requests.skillOpenFailureText(arena, req.name, req.resource, err) },
+        };
+        if (std.mem.startsWith(u8, req.name, "skill:") or !std.mem.eql(u8, maybe_path, req.name)) {
+            by_location = true;
+            resolved_location = maybe_path;
+            catalog = .{ .skills = locations.skills, .diagnostics = locations.diagnostics };
+        }
+    }
+    if (!by_location) {
+        const discovery = try builtin_skills.loadVisibleSkillsForTool(arena, ctx.workspace_root, ctx.skills_dir);
+        skill_runtime.traceDiagnostics("skill_tool", discovery.diagnostics);
+        catalog = .{ .skills = discovery.skills, .diagnostics = discovery.diagnostics };
+    }
+
+    const preparation = try skill_invocation.prepareIdentity(
+        arena,
+        catalog,
+        if (by_location) null else req.name,
+        resolved_location,
+        ctx.max_tool_result_bytes,
+    );
+    switch (preparation) {
+        .failure => |failed| return .{ .status = .tool_error, .bytes = failed.model_output },
+        .selected => |prepared| {
+            const selected_catalog: skill_invocation.Catalog = .{
+                .skills = &.{prepared.skill},
+                .diagnostics = prepared.diagnostics,
+            };
+            const result = skill_invocation.loadWholeRawByLocation(
+                arena,
+                selected_catalog,
+                prepared.skill.path,
+                req.resource,
+                ctx.context_limits,
+                cancel,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Cancelled => return error.Cancelled,
+                else => return .{ .status = .tool_error, .bytes = try bash_tool_requests.skillOpenFailureText(arena, req.name, req.resource, err) },
+            };
+            return switch (result) {
+                .loaded => |loaded| .{ .status = .ok, .bytes = loaded.model_output },
+                .failure => |failed| .{ .status = .tool_error, .bytes = failed.model_output },
+            };
+        },
+    }
+}
+
+/// The text for a skill read that failed after the skill was chosen. Each named
+/// error says what is wrong and what to do next. The last arm names an
+/// unexpected error, so no failure is shown as a bare error name. The text has
+/// no command name: `fx tool` writes `fx tool skill open:` before it.
+fn runBridgeAgentCall(
+    ctx: Context,
+    arena: Allocator,
+    tool_call: ToolCall,
+    cancel: *std.atomic.Value(bool),
+) anyerror!mcp_call_capability.CallOutcome {
+    var completion_sink: ?types.SubagentStatus = null;
+    var subagent_provider = SubagentProviderState{
+        .runtime = ctx,
+        .call = tool_call,
+        .completion_sink = &completion_sink,
+        .cancel_flag = cancel,
+        .emit_progress = false,
+    };
+    var dispatch_ctx = typedDispatchContextForCall(ctx, arena, tool_call);
+    dispatch_ctx.cancel_flag = cancel;
+    dispatch_ctx.subagent_provider = .{
+        .context = @ptrCast(&subagent_provider),
+        .execute_fn = executeSubagentProvider,
+    };
+    const decoded = try subagent_impl.decode(dispatch_ctx, tool_call.arguments_json);
+    const tool_input = switch (decoded) {
+        .failure => |reason| return .{ .status = .tool_error, .bytes = reason },
+        .input => |value| value,
+    };
+    defer tool_input.deinit(arena);
+    const result = try subagent_impl.call(dispatch_ctx, tool_input);
+    return switch (result) {
+        .success => |body| .{ .status = .ok, .bytes = body },
+        .failure => |body| .{ .status = .tool_error, .bytes = body },
+        .rich => |rich| .{ .status = if (rich.is_error) .tool_error else .ok, .bytes = rich.text },
+    };
 }
 
 /// Publishes a bridged change through the surface's publisher, once. A surface
@@ -1603,11 +1909,14 @@ fn runBridgeCall(
     cancel: *std.atomic.Value(bool),
 ) anyerror!mcp_call_capability.CallOutcome {
     const state: *McpCallBridgeState = @ptrCast(@alignCast(raw));
-    // A file change exists only where the bridge does (`tool_bridge.supported`).
+    // A bash-tool operation exists only where the bridge does (`tool_bridge.supported`).
     if (comptime tool_bridge.supported) {
         if (allowed.prepared) |prepared| {
-            const authority: *BridgeFileAuthority = @ptrCast(@alignCast(prepared));
-            return runBridgeFileCall(state.runtime, arena, request_id, authority, cancel);
+            const authority: *BridgeAuthority = @ptrCast(@alignCast(prepared));
+            return switch (authority.*) {
+                .file => |*file_auth| runBridgeFileCall(state.runtime, arena, request_id, file_auth, cancel),
+                .bash_tool => |*tool_auth| runBridgeBashToolCall(tool_auth.ctx, arena, request_id, tool_auth.operation, tool_auth.tool_call, cancel),
+            };
         }
     }
     const row = BridgeCallRow.start(state.runtime, arena, request_id, tool, arguments_json);
@@ -1636,6 +1945,8 @@ const BridgeCallRow = struct {
     /// A file change's row: it names the file and what the change does, and it is
     /// saved with the row's text. Null for an MCP call's row.
     file: ?FileRow = null,
+    /// A bridged bash-tool row (`skill` or `subagent`).
+    action: ?ActionRow = null,
 
     /// What a file change's row shows: its action while it runs, and its file.
     const FileRow = struct {
@@ -1643,6 +1954,14 @@ const BridgeCallRow = struct {
         action: []const u8,
         /// The file as the transcript names it.
         path: []const u8,
+    };
+
+    const ActionRow = struct {
+        activity_kind: types.ToolActivityKind,
+        running_label: []const u8,
+        done_label: []const u8,
+        failed_label: []const u8,
+        target: []const u8,
     };
 
     /// Arguments larger than this stay out of the row's details.
@@ -1656,6 +1975,30 @@ const BridgeCallRow = struct {
             .id = .{ .turn_id = parent.turn_id, .call_id = request_id },
             .shell_call_id = parent.call_id,
             .tool = tool,
+        };
+        row.begin(ctx, arena, arguments_json) catch |err| {
+            debug_trace.logf("mcp-call", "request={s} row not shown err={s}", .{ request_id, @errorName(err) });
+            return null;
+        };
+        return row;
+    }
+
+    fn startAction(
+        ctx: Context,
+        arena: Allocator,
+        request_id: []const u8,
+        tool: []const u8,
+        arguments_json: []const u8,
+        action: ActionRow,
+    ) ?BridgeCallRow {
+        const publisher = ctx.nested_tool_lifecycle orelse return null;
+        const parent = ctx.output_chunk_lifecycle_id orelse return null;
+        const row: BridgeCallRow = .{
+            .publisher = publisher,
+            .id = .{ .turn_id = parent.turn_id, .call_id = request_id },
+            .shell_call_id = parent.call_id,
+            .tool = tool,
+            .action = action,
         };
         row.begin(ctx, arena, arguments_json) catch |err| {
             debug_trace.logf("mcp-call", "request={s} row not shown err={s}", .{ request_id, @errorName(err) });
@@ -1699,6 +2042,22 @@ const BridgeCallRow = struct {
             } });
             return;
         }
+        if (self.action) |action| {
+            try self.publisher.push(.{ .authoritative_started = .{
+                .id = self.id,
+                .presentation_group_id = ctx.output_chunk_presentation_group_id,
+                .reconciles_provisional_call_id = null,
+                .tool_name = self.tool,
+                .activity_kind = action.activity_kind,
+                .arguments_json = if (arguments_json.len <= max_argument_bytes) try text_utils.maskSecrets(arena, arguments_json) else null,
+                .resolved_display_target = if (action.target.len > 0) action.target else null,
+            } });
+            try self.publisher.push(.{ .progress = .{
+                .id = self.id,
+                .text = try tool_presentation.formatToolActionValue(arena, action.running_label, action.target),
+            } });
+            return;
+        }
         try self.publisher.push(.{ .authoritative_started = .{
             .id = self.id,
             .presentation_group_id = ctx.output_chunk_presentation_group_id,
@@ -1722,6 +2081,21 @@ const BridgeCallRow = struct {
     /// Ends a file change's row with its texts (`FileRowTexts`).
     fn finishFile(self: BridgeCallRow, outcome: types.BridgeCallOutcome, texts: FileRowTexts) void {
         self.end(outcome, texts.live, texts.saved);
+    }
+
+    fn finishAction(self: BridgeCallRow, arena: Allocator, outcome: types.BridgeCallOutcome) void {
+        const action = self.action orelse return self.finish(arena, outcome);
+        const label = switch (outcome) {
+            .completed => action.done_label,
+            .cancelled => "Cancelled",
+            .failed => action.failed_label,
+        };
+        const live = tool_presentation.formatToolActionValue(arena, label, action.target) catch label;
+        const saved = (if (action.target.len > 0)
+            arena.print("{s} {s}", .{ label, action.target })
+        else
+            arena.dupe(u8, label)) catch label;
+        self.end(outcome, live, saved);
     }
 
     /// `saved` is the row's text without colors, kept with the record; null for an
@@ -1757,12 +2131,11 @@ fn fileToolActivityKind(tool: []const u8) types.ToolActivityKind {
     return if (std.mem.eql(u8, tool, "write_file")) .write else .edit;
 }
 
-/// A file's name in a row: the path, shortened at a character boundary when long.
+/// A file's or a program's name in a row: terminal-safe and on one line, and
+/// shortened at a token boundary when long. It is escaped here, once, so a row
+/// shows the name as the program wrote it.
 fn rowPath(arena: Allocator, path: []const u8) Allocator.Error![]const u8 {
-    if (path.len <= max_row_path_bytes) return path;
-    var end: usize = max_row_path_bytes - "...".len;
-    while (end > 0 and !std.unicode.utf8ValidateSlice(path[0..end])) end -= 1;
-    return arena.print("{s}...", .{path[0..end]});
+    return (try text_utils.encodeTerminalSafeInline(arena, path, max_row_path_bytes)).bytes;
 }
 
 /// The arguments a file row carries: the path alone, never the change's content.
@@ -2732,6 +3105,477 @@ test "an automatic review of a bridged edit holds a caution and applies a clear,
     const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-32", ".bashrc", "", allowed, &cancel);
     try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
     try std.testing.expectEqualStrings("export A=3\n", try readBridgeTestFile(arena, tmp, "workspace/.bashrc"));
+}
+
+const BridgeSubagentTestFixture = struct {
+    mutex: std.Io.Mutex = .init,
+    runs: std.atomic.Value(usize) = .init(0),
+    hold: bool = false,
+    release: std.Io.Event = .unset,
+    last_message: ?[]u8 = null,
+    last_model: ?[]u8 = null,
+    last_effort: ?types.ReasoningEffort = null,
+    last_cancel_ptr: ?*std.atomic.Value(bool) = null,
+
+    fn deinit(self: *BridgeSubagentTestFixture) void {
+        if (self.last_message) |v| std.testing.allocator.free(v);
+        if (self.last_model) |v| std.testing.allocator.free(v);
+    }
+
+    fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) test_subagent_authority.HostResolveError!test_subagent_authority.HostAuthority {
+        return test_subagent_authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
+    }
+
+    fn run(
+        raw: ?*anyopaque,
+        turn: *test_subagent_execution.TurnContext,
+        message: test_subagent_domain.QueuedMessage,
+        snapshot: test_subagent_domain.AdmissionSnapshot,
+        cancel: *std.atomic.Value(bool),
+    ) test_subagent_execution.ServiceError!test_subagent_execution.RunOutcome {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.mutex.lockUncancelable(io_mod.getIo());
+        if (self.last_message) |old| std.testing.allocator.free(old);
+        self.last_message = std.testing.allocator.dupe(u8, message.content) catch null;
+        if (self.last_model) |old| std.testing.allocator.free(old);
+        self.last_model = std.testing.allocator.dupe(u8, snapshot.model) catch null;
+        self.last_effort = snapshot.effort;
+        self.last_cancel_ptr = cancel;
+        self.mutex.unlock(io_mod.getIo());
+        _ = self.runs.fetchAdd(1, .seq_cst);
+        if (self.hold) self.release.waitUncancelable(io_mod.getIo());
+        const reply = std.testing.allocator.dupe(u8, "DONE") catch return error.ProviderFailed;
+        defer std.testing.allocator.free(reply);
+        turn.commit(turn.active_work_id.?, .{ .assistant = .{
+            .user = .{ .text = message.content },
+            .assistant = reply,
+        } }) catch return error.ProviderFailed;
+        return .completed;
+    }
+
+    fn post(_: ?*anyopaque, _: *subagent_tool_host.Runtime, _: subagent_tool_host.Delivery) subagent_tool_host.PostReportError!void {}
+};
+
+test "bridged agent message reaches the host with the right request, and a child program gets the non-root refusal" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var parent: test_subagent_child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture: BridgeSubagentTestFixture = .{};
+    defer fixture.deinit();
+    const host = try subagent_tool_host.Runtime.create(
+        alloc,
+        &parent.children,
+        .{ .resolve_fn = BridgeSubagentTestFixture.resolve },
+        .{ .context = &fixture, .run_fn = BridgeSubagentTestFixture.run },
+    );
+    defer host.deinit();
+    host.report_sink = .{ .context = &fixture, .post_fn = BridgeSubagentTestFixture.post };
+
+    var runtime_cancel: std.atomic.Value(bool) = .init(false);
+    var bridge_cancel: std.atomic.Value(bool) = .init(false);
+    var rows = RowRecorder{ .alloc = alloc };
+    defer rows.deinit();
+    var rt = TestRuntime{
+        .workspace_root = parent.children.workspace,
+        .permission_mode = .yolo,
+        .subagent_host = host,
+        .subagent_caller_id = parent.parent.id(),
+        .cancel_flag = &runtime_cancel,
+    };
+    defer rt.deinit(alloc);
+    var ctx = rt.context();
+    ctx.nested_tool_lifecycle = .{ .context = @ptrCast(&rows), .push_fn = RowRecorder.push, .save_bridge_call_fn = RowRecorder.save };
+    ctx.output_chunk_lifecycle_id = .{ .turn_id = 1, .call_id = "bash-call-1" };
+    var state = McpCallBridgeState{ .runtime = ctx, .file_ops = true };
+
+    const msg_op: mcp_call_capability.BashToolRequest = .{ .agent_message = .{
+        .agent = "helper",
+        .message = "check files",
+        .instructions = "be concise",
+        .model = "custom-model",
+        .effort = "high",
+        .report = .every_turn,
+    } };
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-40", msg_op)) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-40", "helper", "", allowed, &bridge_cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "\"ok\":true") != null);
+    // Wait until the child finishes its single turn so cleanup is clean and fields are populated.
+    for (0..5000) |_| {
+        if (fixture.runs.load(.seq_cst) >= 1) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    var reg = try parent.stateStore().load(arena);
+    const child = reg.findPersistent("helper") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("be concise", child.instructions());
+    try std.testing.expectEqual(@import("../subagent/reports.zig").Rule.every_turn, child.report_rule);
+    try std.testing.expectEqualStrings("check files", fixture.last_message orelse "");
+    try std.testing.expectEqualStrings("custom-model", fixture.last_model orelse "");
+    try std.testing.expectEqualStrings("high", fixture.last_effort.?.label());
+    try std.testing.expectEqual(@as(usize, 1), rows.saved.items.len);
+
+    // A child's program cannot manage sibling subagents: it gets the non-root refusal.
+    var child_rt = TestRuntime{
+        .workspace_root = parent.children.workspace,
+        .permission_mode = .yolo,
+        .subagent_host = host,
+        .subagent_caller_id = child.id,
+        .lifecycle_scope_kind = .subagent,
+    };
+    defer child_rt.deinit(alloc);
+    var child_state = McpCallBridgeState{ .runtime = child_rt.context(), .file_ops = true };
+    const child_allowed = switch (try authorizeBridgeBashTool(@ptrCast(&child_state), arena, "fx-mcp-call-41", .{ .agent_status = null })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const child_outcome = try runBridgeCall(@ptrCast(&child_state), arena, "fx-mcp-call-41", "agent status", "", child_allowed, &bridge_cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, child_outcome.status);
+    try std.testing.expect(std.mem.find(u8, child_outcome.bytes, "caller_unavailable") != null);
+    try std.testing.expect(std.mem.find(u8, child_outcome.bytes, "Only the agent that started the subagents") != null);
+}
+
+test "bridged agent wait ends when the bridge request cancel flag is set while a child still works" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var parent: test_subagent_child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture: BridgeSubagentTestFixture = .{ .hold = true };
+    defer fixture.deinit();
+    var runtime_cancel: std.atomic.Value(bool) = .init(false);
+    var bridge_cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{
+        .workspace_root = parent.children.workspace,
+        .permission_mode = .yolo,
+        .subagent_caller_id = parent.parent.id(),
+        .cancel_flag = &runtime_cancel,
+    };
+    defer rt.deinit(alloc);
+    const host = try subagent_tool_host.Runtime.create(
+        alloc,
+        &parent.children,
+        .{ .resolve_fn = BridgeSubagentTestFixture.resolve },
+        .{ .context = &fixture, .run_fn = BridgeSubagentTestFixture.run },
+    );
+    defer host.deinit();
+    host.report_sink = .{ .context = &fixture, .post_fn = BridgeSubagentTestFixture.post };
+    defer fixture.release.set(io_mod.getIo());
+    rt.subagent_host = host;
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+
+    const msg_allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-47", .{ .agent_message = .{
+        .agent = "helper",
+        .message = "work",
+        .model = "custom-model",
+    } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    var msg_cancel: std.atomic.Value(bool) = .init(false);
+    const msg_outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-47", "helper", "", msg_allowed, &msg_cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, msg_outcome.status);
+    try std.testing.expect(std.mem.find(u8, msg_outcome.bytes, "\"ok\":true") != null);
+    for (0..5000) |_| {
+        if (fixture.runs.load(.seq_cst) >= 1) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), rt.worker.queuedPromptCount());
+
+    const Canceler = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            io_mod.sleep(20 * std.time.ns_per_ms);
+            flag.store(true, .seq_cst);
+        }
+    };
+    // Without the flag, the wait blocks until a nudge. The watchdog nudges after
+    // 5 s, so a regression fails the elapsed check below instead of hanging.
+    const Watchdog = struct {
+        fn run(target: *worker_runtime.WorkerRuntime, done: *std.Io.Event) void {
+            done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } }) catch {
+                target.nudgeWaiter();
+            };
+        }
+    };
+    var done: std.Io.Event = .unset;
+    const canceler = try std.Thread.spawn(.{}, Canceler.run, .{&bridge_cancel});
+    defer canceler.join();
+    const watchdog = try std.Thread.spawn(.{}, Watchdog.run, .{ &rt.worker, &done });
+    defer watchdog.join();
+    defer done.set(io_mod.getIo());
+
+    const wait_allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-48", .agent_wait)) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const started_ms = io_mod.milliTimestamp();
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-48", "agent wait", "", wait_allowed, &bridge_cancel);
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, outcome.status);
+    try std.testing.expectEqualStrings("Cancelled.", outcome.bytes);
+    try std.testing.expectEqual(@as(usize, 0), rt.worker.queuedPromptCount());
+}
+
+test "bridged skill list formats one NAME<TAB>DESCRIPTION line per skill within the 32 KiB cap" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var skills_buf: [260]skill_contract.Skill = undefined;
+    const pad_buf = try arena.alloc(u8, 140);
+    @memset(pad_buf, 'x');
+    const desc_long = try arena.print("desc\twith\ttabs\nand\rnewlines \x1b[31m\x00\x7f {s}", .{pad_buf});
+    for (&skills_buf, 0..) |*s, idx| {
+        s.* = .{
+            .name = try arena.print("skill-{d:0>3}", .{idx}),
+            .description = desc_long,
+            .path = try arena.print("{s}/.fx/skills/skill-{d:0>3}/SKILL.md", .{ workspace, idx }),
+            .source = .workspace_fx,
+        };
+    }
+
+    // Small list: exact NAME<TAB>DESCRIPTION lines with sanitized fields.
+    {
+        const locations = skill_contract.Locations{ .skills = skills_buf[0..2] };
+        var cancel: std.atomic.Value(bool) = .init(false);
+        var rt = TestRuntime{ .workspace_root = workspace, .permission_mode = .yolo, .skill_locations = &locations };
+        defer rt.deinit(alloc);
+        var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+        const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-42", .skill_list)) {
+            .allow => |value| value,
+            .deny => return error.TestExpectedAllow,
+        };
+        const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-42", "skill list", "", allowed, &cancel);
+        try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, outcome.bytes, "\n"), '\n');
+        const first = lines.next() orelse return error.TestUnexpectedResult;
+        const tab = std.mem.findScalar(u8, first, '\t') orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("skill-000", first[0..tab]);
+        try std.testing.expect(std.mem.findScalar(u8, first[tab + 1 ..], '\t') == null);
+        try std.testing.expect(std.mem.findScalar(u8, first, '\x1b') == null);
+        try std.testing.expect(std.mem.findScalar(u8, first, 0) == null);
+        try std.testing.expect(std.mem.findScalar(u8, first, 0x7f) == null);
+        try std.testing.expect(std.mem.find(u8, first[tab + 1 ..], "desc with tabs and newlines") != null);
+    }
+
+    // Over 32 KiB: capped at toolbox.max_menu_bytes with a truncation notice.
+    {
+        const locations = skill_contract.Locations{ .skills = &skills_buf };
+        var cancel: std.atomic.Value(bool) = .init(false);
+        var rt = TestRuntime{ .workspace_root = workspace, .permission_mode = .yolo, .skill_locations = &locations };
+        defer rt.deinit(alloc);
+        var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+        const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-43", .skill_list)) {
+            .allow => |value| value,
+            .deny => return error.TestExpectedAllow,
+        };
+        const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-43", "skill list", "", allowed, &cancel);
+        try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
+        try std.testing.expect(outcome.bytes.len <= toolbox.max_menu_bytes);
+        try std.testing.expect(std.mem.find(u8, outcome.bytes, "truncated") != null or std.mem.find(u8, outcome.bytes, "omitted") != null);
+    }
+}
+
+test "bridged skill open reads whole files, enforces skill_file_bytes, and reports missing skills" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace/.fx/skills/alpha");
+    try writeBridgeTestFile(tmp, "home/workspace/.fx/skills/alpha/SKILL.md", "---\nname: alpha\ndescription: alpha skill\n---\n\nALPHA BODY\n");
+    const big_buf = try arena.alloc(u8, 4096);
+    @memset(big_buf, 'Z');
+    try writeBridgeTestFile(tmp, "home/workspace/.fx/skills/alpha/big.txt", big_buf);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace);
+    const skills_dir = try std.Io.Dir.path.join(arena, &.{ workspace, ".fx", "skills" });
+    try setTestHome(null);
+    defer io_mod.resetEnvironForTest();
+
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{
+        .workspace_root = workspace,
+        .skills_dir = skills_dir,
+        .permission_mode = .yolo,
+    };
+    rt.context_limits.skill_file_bytes = .{ .value = .{ .bytes = 2048 }, .source = .command_line };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+
+    // Missing skill -> tool_error (exit 6) with clear text.
+    {
+        const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-44", .{ .skill_open = .{ .name = "missing-skill" } })) {
+            .allow => |value| value,
+            .deny => return error.TestExpectedAllow,
+        };
+        const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-44", "missing-skill", "", allowed, &cancel);
+        try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+        try std.testing.expect(std.mem.find(u8, outcome.bytes, "missing-skill") != null);
+    }
+
+    // Valid skill -> ok and prints the raw file text without <skill_content> tags.
+    {
+        const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-45", .{ .skill_open = .{ .name = "alpha" } })) {
+            .allow => |value| value,
+            .deny => return error.TestExpectedAllow,
+        };
+        const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-45", "alpha", "", allowed, &cancel);
+        try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
+        try std.testing.expect(std.mem.find(u8, outcome.bytes, "<skill_content") == null);
+        try std.testing.expect(std.mem.find(u8, outcome.bytes, "</skill_content>") == null);
+        try std.testing.expectEqualStrings("---\nname: alpha\ndescription: alpha skill\n---\n\nALPHA BODY\n", outcome.bytes);
+    }
+
+    // Over skill_file_bytes limit -> tool_error (exit 6) naming the limit.
+    {
+        const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-46", .{ .skill_open = .{ .name = "alpha", .resource = "big.txt" } })) {
+            .allow => |value| value,
+            .deny => return error.TestExpectedAllow,
+        };
+        const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-46", "alpha", "", allowed, &cancel);
+        try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+        try std.testing.expect(std.mem.find(u8, outcome.bytes, "skill_file_bytes") != null);
+    }
+}
+
+test "bridged skill open target lookup propagates OutOfMemory from a location's resolve" {
+    var name_buf: [16 * 1024]u8 = undefined;
+    @memset(&name_buf, 'a');
+    name_buf[0] = '/';
+    const locations = skill_contract.Locations{};
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo, .skill_locations = &locations };
+    defer rt.deinit(std.testing.allocator);
+    const ctx = rt.context();
+    const operation: mcp_call_capability.BashToolRequest = .{ .skill_open = .{ .name = &name_buf } };
+
+    var saw_out_of_memory = false;
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = fail_index });
+        var arena_state = std.heap.ArenaAllocator.init(failing.allocator());
+        defer arena_state.deinit();
+        const result = bridgeBashToolCall(ctx, arena_state.allocator(), "fx-mcp-call-47", operation);
+        if (!failing.has_induced_failure) {
+            _ = try result;
+            try std.testing.expect(saw_out_of_memory);
+            return;
+        }
+        if (result) |_| {
+            return error.TestInducedFailureWasSwallowed;
+        } else |err| {
+            const name = @errorName(err);
+            if (std.mem.eql(u8, name, "OutOfMemory")) {
+                saw_out_of_memory = true;
+            } else if (!std.mem.eql(u8, name, "WriteFailed")) {
+                // The arguments writer reports its own allocation failure as WriteFailed.
+                return err;
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "bridged skill open names a bad resource path, a missing resource, and a folder, with the next step" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace/.fx/skills/alpha/nested");
+    try writeBridgeTestFile(tmp, "home/workspace/.fx/skills/alpha/SKILL.md", "---\nname: alpha\ndescription: alpha skill\n---\n\nALPHA BODY\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace);
+    const skills_dir = try std.Io.Dir.path.join(arena, &.{ workspace, ".fx", "skills" });
+    try setTestHome(null);
+    defer io_mod.resetEnvironForTest();
+
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = workspace, .skills_dir = skills_dir, .permission_mode = .yolo };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    const cases = [_]struct { resource: []const u8, expected: []const u8 }{
+        .{ .resource = "../outside.txt", .expected = "resource ../outside.txt is not a valid path in skill alpha; use a relative path inside the skill folder with no .. parts." },
+        .{ .resource = "missing.md", .expected = "resource missing.md was not found in skill alpha; check the path, which is relative to the skill folder." },
+        .{ .resource = "nested", .expected = "resource nested in skill alpha is not a regular file (a folder, a link, a pipe, or a device); name a regular file inside the skill folder." },
+    };
+    for (cases) |case| {
+        const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-47", .{ .skill_open = .{ .name = "alpha", .resource = case.resource } })) {
+            .allow => |value| value,
+            .deny => return error.TestExpectedAllow,
+        };
+        const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-47", "alpha", "", allowed, &cancel);
+        try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+        try std.testing.expectEqualStrings(case.expected, outcome.bytes);
+    }
+}
+
+test "a row path shows a program's escapes once, and a clean path is unchanged" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("a\\x1b[31m b.txt", try rowPath(arena, "a\x1b[31m\nb.txt"));
+    try std.testing.expectEqualStrings("src/main.zig", try rowPath(arena, "src/main.zig"));
+}
+
+test "a bridged skill row shows a program's name escaped once, never raw" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace/.fx/skills");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace);
+    const skills_dir = try std.Io.Dir.path.join(arena, &.{ workspace, ".fx", "skills" });
+    try setTestHome(null);
+    defer io_mod.resetEnvironForTest();
+
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = workspace, .skills_dir = skills_dir, .permission_mode = .yolo, .cancel_flag = &cancel };
+    defer rt.deinit(alloc);
+    var rows = RowRecorder{ .alloc = alloc };
+    defer rows.deinit();
+    var ctx = rt.context();
+    ctx.nested_tool_lifecycle = .{ .context = @ptrCast(&rows), .push_fn = RowRecorder.push, .save_bridge_call_fn = RowRecorder.save };
+    ctx.output_chunk_lifecycle_id = .{ .turn_id = 4, .call_id = "shell-call-1" };
+    var state = McpCallBridgeState{ .runtime = ctx, .file_ops = true };
+
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-48", .{ .skill_open = .{ .name = "bad\x1b[31m\nname" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    _ = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-48", "skill open", "", allowed, &cancel);
+
+    var shown_once = false;
+    // The row's own styling escapes are fine; the program's raw escape must not appear.
+    for (rows.lines.items) |line| {
+        try std.testing.expect(std.mem.find(u8, line, "bad\x1b") == null);
+        try std.testing.expect(std.mem.find(u8, line, "\\\\x1b") == null);
+        if (std.mem.find(u8, line, "bad\\x1b[31m name") != null) shown_once = true;
+    }
+    try std.testing.expect(shown_once);
 }
 
 const RunCommandBackendState = struct {
@@ -3951,6 +4795,8 @@ const SubagentProviderState = struct {
     runtime: Context,
     call: ToolCall,
     completion_sink: *?types.SubagentStatus,
+    cancel_flag: ?*std.atomic.Value(bool) = null,
+    emit_progress: bool = true,
 };
 
 fn requestDerivedSubagentSessionTitle(alloc: Allocator, call: ToolCall) Allocator.Error!?[]u8 {
@@ -4075,7 +4921,7 @@ fn executeSubagentProvider(
     const caller_id = ctx.subagent_caller_id orelse
         return subagentProviderRefusal(arena, .{ .caller_unavailable = .unidentified });
     const identity_epoch = host.issueOperationIdentity(invocation_id);
-    var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
+    var progress_bridge = if (state.emit_progress) SubagentProgressBridge.init(arena, ctx, state.call) else null;
     const output = host.executeManaged(arena, request, .{
         .observer = ctx.observer,
         .caller_id = caller_id,
@@ -4095,7 +4941,7 @@ fn executeSubagentProvider(
         .max_result_bytes = ctx.max_tool_result_bytes,
         .timestamp_ms = io_mod.milliTimestamp(),
         .identity_epoch = identity_epoch,
-        .cancel_flag = runtimeCancelFlag(ctx),
+        .cancel_flag = state.cancel_flag orelse runtimeCancelFlag(ctx),
         .caller_worker = ctx.worker,
         .turn_messages = ctx.current_turn_messages,
         .progress = if (progress_bridge) |*bridge| bridge.sink() else null,
@@ -4361,6 +5207,8 @@ const TestRuntime = struct {
     workspace_root: []const u8 = "/tmp",
     ignored_list_entries: []const []const u8 = &.{},
     skills_dir: []const u8 = "",
+    skill_locations: ?*const skill_contract.Locations = null,
+    lifecycle_scope_kind: hooks.ScopeKind = .ask,
     tracker: ?*change_tracker.ChangeTracker = null,
     permission_rules: types.PermissionRuleSet = .{},
     permission_grants: []const PermissionGrant = &.{},
@@ -4449,6 +5297,8 @@ const TestRuntime = struct {
             .session = &self.session,
             .session_allocator = self.session_allocator,
             .skills_dir = self.skills_dir,
+            .skill_locations = self.skill_locations,
+            .lifecycle_scope = .{ .kind = self.lifecycle_scope_kind, .workspace_root = self.workspace_root },
             .context_registry = test_context_registry,
             .context_limits = self.context_limits,
             .output_chunk_ctx = undefined,

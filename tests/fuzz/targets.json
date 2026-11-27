@@ -104,6 +104,7 @@
     {"name": "bash_call_text", "module": "fx", "test": "bash calls sent as JSON text decode or are refused on arbitrary bytes", "iterations": 250000},
     {"name": "gateway_json_decode", "module": "fx", "test": "gateway JSON body decode stays bounded and round-trips gzip on fuzzed bytes", "iterations": 20000},
     {"name": "edit_blocks", "module": "fx", "test": "edit blocks are refused or decode, and decode back the same, on fuzzed text", "iterations": 500000},
+    {"name": "tool_bridge_wire", "module": "fx", "test": "tool bridge wire requests parse or are refused, and parsed requests round-trip, on fuzzed bytes", "iterations": 175000},
     {"name": "bash_results", "module": "fx", "test": "the bash results keep their laws on fuzzed output, split however it arrives", "iterations": 120000}
   ]
 }

@@ -22,39 +22,234 @@ pub const max_input_bytes: usize = wire.max_request_bytes;
 pub const Command = union(enum) {
     edit: []const u8,
     write: []const u8,
+    skill_list,
+    skill_open: capability.SkillOpenRequest,
+    agent_message: capability.AgentMessageRequest,
+    agent_wait,
+    agent_status: ?[]const u8,
+    agent_stop: []const u8,
+    agent_close: []const u8,
 
     pub fn verb(self: Command) []const u8 {
         return switch (self) {
             .edit => "edit",
             .write => "write",
+            .skill_list => "skill list",
+            .skill_open => "skill open",
+            .agent_message => "agent message",
+            .agent_wait => "agent wait",
+            .agent_status => "agent status",
+            .agent_stop => "agent stop",
+            .agent_close => "agent close",
+        };
+    }
+
+    fn readsStdin(self: Command) bool {
+        return switch (self) {
+            .edit, .write => true,
+            .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => false,
         };
     }
 };
 
-pub const ParseError = error{ MissingPath, TooManyArguments, UnknownCommand, PathIsOption };
+pub const ParseError = error{
+    MissingPath,
+    MissingArgument,
+    MissingOptionValue,
+    UnknownOption,
+    InvalidReport,
+    TooManyArguments,
+    UnknownCommand,
+    PathIsOption,
+};
 
-/// Reads `args`, the words after `fx tool`: one verb and one path.
+/// Reads `args`, the words after `fx tool`.
 pub fn parse(args: []const []const u8) ParseError!Command {
     if (args.len == 0) return error.UnknownCommand;
     const verb = args[0];
-    const is_edit = std.mem.eql(u8, verb, "edit");
-    if (!is_edit and !std.mem.eql(u8, verb, "write")) return error.UnknownCommand;
-    if (args.len < 2 or args[1].len == 0) return error.MissingPath;
-    if (args.len > 2) return error.TooManyArguments;
-    const path = args[1];
-    if (path[0] == '-') return error.PathIsOption;
-    if (is_edit) return .{ .edit = path };
-    return .{ .write = path };
+    if (std.mem.eql(u8, verb, "edit") or std.mem.eql(u8, verb, "write")) {
+        if (args.len < 2 or args[1].len == 0) return error.MissingPath;
+        if (args.len > 2) return error.TooManyArguments;
+        const path = args[1];
+        if (path[0] == '-') return error.PathIsOption;
+        return if (std.mem.eql(u8, verb, "edit")) .{ .edit = path } else .{ .write = path };
+    }
+    if (std.mem.eql(u8, verb, "skill")) {
+        if (args.len < 2) return error.UnknownCommand;
+        const sub = args[1];
+        if (std.mem.eql(u8, sub, "list")) {
+            if (args.len > 2) return error.TooManyArguments;
+            return .skill_list;
+        }
+        if (std.mem.eql(u8, sub, "open")) {
+            if (args.len < 3 or args[2].len == 0) return error.MissingArgument;
+            if (args[2][0] == '-') return error.UnknownOption;
+            if (args.len == 3) return .{ .skill_open = .{ .name = args[2] } };
+            if (args.len == 4) {
+                if (args[3].len == 0) return error.MissingArgument;
+                if (args[3][0] == '-') return error.UnknownOption;
+                return .{ .skill_open = .{ .name = args[2], .resource = args[3] } };
+            }
+            return error.TooManyArguments;
+        }
+        return error.UnknownCommand;
+    }
+    if (std.mem.eql(u8, verb, "agent")) {
+        if (args.len < 2) return error.UnknownCommand;
+        const sub = args[1];
+        if (std.mem.eql(u8, sub, "wait")) {
+            if (args.len > 2) return error.TooManyArguments;
+            return .agent_wait;
+        }
+        if (std.mem.eql(u8, sub, "status")) {
+            if (args.len == 2) return .{ .agent_status = null };
+            if (args.len == 3) {
+                if (args[2].len == 0) return error.MissingArgument;
+                if (args[2][0] == '-') return error.UnknownOption;
+                return .{ .agent_status = args[2] };
+            }
+            return error.TooManyArguments;
+        }
+        if (std.mem.eql(u8, sub, "stop")) {
+            if (args.len < 3 or args[2].len == 0) return error.MissingArgument;
+            if (args[2][0] == '-') return error.UnknownOption;
+            if (args.len > 3) return error.TooManyArguments;
+            return .{ .agent_stop = args[2] };
+        }
+        if (std.mem.eql(u8, sub, "close")) {
+            if (args.len < 3 or args[2].len == 0) return error.MissingArgument;
+            if (args[2][0] == '-') return error.UnknownOption;
+            if (args.len > 3) return error.TooManyArguments;
+            return .{ .agent_close = args[2] };
+        }
+        if (std.mem.eql(u8, sub, "message")) {
+            return parseAgentMessage(args[2..]);
+        }
+        return error.UnknownCommand;
+    }
+    return error.UnknownCommand;
+}
+
+fn parseAgentMessage(args: []const []const u8) ParseError!Command {
+    var agent: ?[]const u8 = null;
+    var message: ?[]const u8 = null;
+    var instructions: ?[]const u8 = null;
+    var model: ?[]const u8 = null;
+    var effort: ?[]const u8 = null;
+    var profile: ?[]const u8 = null;
+    var report: ?capability.AgentReport = null;
+    var positional_only = false;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (!positional_only and std.mem.eql(u8, arg, "--")) {
+            positional_only = true;
+            continue;
+        }
+        if (!positional_only and arg.len > 0 and arg[0] == '-') {
+            if (try matchOptionValue(args, &index, "--instructions")) |val| {
+                instructions = val;
+            } else if (try matchOptionValue(args, &index, "--model")) |val| {
+                model = val;
+            } else if (try matchOptionValue(args, &index, "--effort")) |val| {
+                effort = val;
+            } else if (try matchOptionValue(args, &index, "--profile")) |val| {
+                profile = val;
+            } else if (try matchOptionValue(args, &index, "--report")) |val| {
+                report = capability.AgentReport.parse(val) orelse return error.InvalidReport;
+            } else {
+                return error.UnknownOption;
+            }
+            continue;
+        }
+        if (agent == null) {
+            agent = arg;
+        } else if (message == null) {
+            message = arg;
+        } else {
+            return error.TooManyArguments;
+        }
+    }
+    const name = agent orelse return error.MissingArgument;
+    const text = message orelse return error.MissingArgument;
+    if (name.len == 0 or text.len == 0) return error.MissingArgument;
+    return .{ .agent_message = .{
+        .agent = name,
+        .message = text,
+        .instructions = instructions,
+        .model = model,
+        .effort = effort,
+        .profile = profile,
+        .report = report,
+    } };
+}
+
+fn matchOptionValue(args: []const []const u8, index: *usize, comptime flag: []const u8) ParseError!?[]const u8 {
+    const arg = args[index.*];
+    if (std.mem.eql(u8, arg, flag)) {
+        if (index.* + 1 >= args.len) return error.MissingOptionValue;
+        const val = args[index.* + 1];
+        if (val.len == 0) return error.MissingOptionValue;
+        index.* += 1;
+        return val;
+    }
+    const prefix = flag ++ "=";
+    if (std.mem.startsWith(u8, arg, prefix)) {
+        const val = arg[prefix.len..];
+        if (val.len == 0) return error.MissingOptionValue;
+        return val;
+    }
+    return null;
 }
 
 /// Writes why `err` refused `args`, in the words of the command line.
 pub fn writeUsage(w: *Writer, err: ParseError, args: []const []const u8) Writer.Error!void {
     const verb = if (args.len > 0) args[0] else "";
+    const sub = if (args.len > 1) args[1] else "";
+    if (std.mem.eql(u8, verb, "skill")) {
+        const usage_line = if (std.mem.eql(u8, sub, "list"))
+            "Usage: fx tool skill list\n"
+        else if (std.mem.eql(u8, sub, "open"))
+            "Usage: fx tool skill open NAME [FILE]\n"
+        else
+            "Usage: fx tool skill list | fx tool skill open NAME [FILE]\n";
+        switch (err) {
+            error.MissingArgument, error.MissingPath => try w.print("fx tool skill {s}: missing required argument.\n{s}", .{ sub, usage_line }),
+            error.TooManyArguments => try w.print("fx tool skill {s}: too many arguments.\n{s}", .{ sub, usage_line }),
+            error.UnknownOption, error.PathIsOption => try w.print("fx tool skill {s}: unexpected option.\n{s}", .{ sub, usage_line }),
+            else => try w.print("fx tool skill: unknown subcommand {f}.\n{s}", .{ text_utils.terminalSafe(sub), usage_line }),
+        }
+        return;
+    }
+    if (std.mem.eql(u8, verb, "agent")) {
+        const usage_line = if (std.mem.eql(u8, sub, "message"))
+            "Usage: fx tool agent message NAME TEXT [--instructions T] [--model M] [--effort E] [--profile P] [--report final|every_turn|never]\n"
+        else if (std.mem.eql(u8, sub, "wait"))
+            "Usage: fx tool agent wait\n"
+        else if (std.mem.eql(u8, sub, "status"))
+            "Usage: fx tool agent status [NAME]\n"
+        else if (std.mem.eql(u8, sub, "stop"))
+            "Usage: fx tool agent stop NAME\n"
+        else if (std.mem.eql(u8, sub, "close"))
+            "Usage: fx tool agent close NAME\n"
+        else
+            "Usage: fx tool agent <message|wait|status|stop|close> ...\n";
+        switch (err) {
+            error.MissingArgument, error.MissingPath => try w.print("fx tool agent {s}: missing required argument.\n{s}", .{ sub, usage_line }),
+            error.MissingOptionValue => try w.print("fx tool agent {s}: option requires a non-empty value.\n{s}", .{ sub, usage_line }),
+            error.UnknownOption, error.PathIsOption => try w.print("fx tool agent {s}: unknown or misplaced option.\n{s}", .{ sub, usage_line }),
+            error.InvalidReport => try w.print("fx tool agent message: --report must be final, every_turn, or never.\n{s}", .{usage_line}),
+            error.TooManyArguments => try w.print("fx tool agent {s}: too many arguments.\n{s}", .{ sub, usage_line }),
+            error.UnknownCommand => try w.print("fx tool agent: unknown subcommand {f}.\n{s}", .{ text_utils.terminalSafe(sub), usage_line }),
+        }
+        return;
+    }
     switch (err) {
-        error.MissingPath => try w.print("fx tool {s}: give the file to change, as in fx tool {s} PATH.\n", .{ verb, verb }),
+        error.MissingPath, error.MissingArgument => try w.print("fx tool {s}: give the file to change, as in fx tool {s} PATH.\n", .{ verb, verb }),
         error.TooManyArguments => try w.print("fx tool {s}: give one file, as in fx tool {s} PATH.\n", .{ verb, verb }),
-        error.PathIsOption => try w.print("fx tool {s}: the file must be a path, not an option.\n", .{verb}),
-        error.UnknownCommand => try w.print("fx tool: unknown command {f}. Use fx tool edit PATH or fx tool write PATH.\n", .{text_utils.terminalSafe(verb)}),
+        error.PathIsOption, error.UnknownOption => try w.print("fx tool {s}: the file must be a path, not an option.\n", .{verb}),
+        error.UnknownCommand => try w.print("fx tool: unknown command {f}. Use edit, write, skill, or agent.\n", .{text_utils.terminalSafe(verb)}),
+        error.MissingOptionValue, error.InvalidReport => try w.print("fx tool {s}: invalid usage.\n", .{verb}),
     }
 }
 
@@ -93,22 +288,25 @@ fn resolveCommandPath(arena: Allocator, cwd: []const u8, path: []const u8) Alloc
 }
 
 /// Runs `fx tool` in the program that runs it, and returns the exit code. It
-/// reads the change from stdin only when a bridge is there to receive it.
+/// reads stdin only for `edit` and `write`, and only when a bridge is there.
 pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Command) !u8 {
     const bridge = bridgeFromEnv() orelse return writeUnavailable(err);
-    var stdin_buffer: [4096]u8 = undefined;
-    var stdin = std.Io.File.stdin().reader(io, &stdin_buffer);
-    const input = readLimited(arena, &stdin.interface, max_input_bytes) catch |read_err| switch (read_err) {
-        error.InputTooLarge => {
-            try writeTooLarge(err, command);
-            return client.exit.usage;
-        },
-        else => return read_err,
-    };
+    const input: []const u8 = if (command.readsStdin()) blk: {
+        var stdin_buffer: [4096]u8 = undefined;
+        var stdin = std.Io.File.stdin().reader(io, &stdin_buffer);
+        break :blk readLimited(arena, &stdin.interface, max_input_bytes) catch |read_err| switch (read_err) {
+            error.InputTooLarge => {
+                try writeTooLarge(err, command);
+                return client.exit.usage;
+            },
+            else => return read_err,
+        };
+    } else "";
     const cwd = try std.process.currentPathAlloc(io, arena);
     const resolved_command: Command = switch (command) {
         .edit => |path| .{ .edit = try resolveCommandPath(arena, cwd, path) },
         .write => |path| .{ .write = try resolveCommandPath(arena, cwd, path) },
+        .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => command,
     };
     return send(arena, io, out, err, resolved_command, input, bridge, socket_caller);
 }
@@ -192,6 +390,13 @@ pub fn send(
             }
             break :blk .{ .write = .{ .path = path, .content = input } };
         },
+        .skill_list => .skill_list,
+        .skill_open => |req| .{ .skill_open = req },
+        .agent_message => |req| .{ .agent_message = req },
+        .agent_wait => .agent_wait,
+        .agent_status => |agent| .{ .agent_status = agent },
+        .agent_stop => |agent| .{ .agent_stop = agent },
+        .agent_close => |agent| .{ .agent_close = agent },
     };
     _ = client.encodeRequest(arena, bridge.token, operation) catch |encode_err| switch (encode_err) {
         error.RequestTooLarge => {
@@ -213,9 +418,13 @@ fn callFailure(err: *Writer, command: Command, call_err: anyerror) !u8 {
         },
         error.UnsupportedReply => return writeOtherVersion(err, command),
         // The bridge's socket is removed once its last call has returned.
-        error.FileNotFound, error.ConnectionRefused => return writeUnreviewable(err),
+        error.FileNotFound, error.ConnectionRefused => return if (command.readsStdin()) writeUnreviewable(err) else writeUnavailable(err),
         error.ConnectionLost, error.MalformedReply => {
-            try err.print("fx tool {s}: the connection to fx was lost ({s}). The change may have run; check the file before you run it again.\n", .{ command.verb(), @errorName(call_err) });
+            if (command.readsStdin()) {
+                try err.print("fx tool {s}: the connection to fx was lost ({s}). The change may have run; check the file before you run it again.\n", .{ command.verb(), @errorName(call_err) });
+            } else {
+                try err.print("fx tool {s}: the connection to fx was lost ({s}).\n", .{ command.verb(), @errorName(call_err) });
+            }
             return client.exit.failed;
         },
         else => return writeUnavailable(err),
@@ -228,7 +437,12 @@ fn printReply(arena: Allocator, out: *Writer, err: *Writer, command: Command, re
     switch (reply.header.status) {
         .ok => {
             try out.writeAll(reply.bytes);
-            try out.writeByte('\n');
+            // edit and write always end with a newline, as they did before the
+            // skill and agent words; those words add one only when it is missing.
+            switch (command) {
+                .edit, .write => try out.writeByte('\n'),
+                else => if (reply.bytes.len > 0 and reply.bytes[reply.bytes.len - 1] != '\n') try out.writeByte('\n'),
+            }
             return client.exit.ok;
         },
         .tool_error => return refusal(arena, err, command, reply.bytes, client.exit.tool_error),
@@ -239,7 +453,7 @@ fn printReply(arena: Allocator, out: *Writer, err: *Writer, command: Command, re
             // the bridge does not hold, cannot be reviewed; a command that is not a bash
             // tool program gets the experimental text.
             if (reply.header.reason) |reason| switch (reason) {
-                .closed, .unauthorized => return writeUnreviewable(err),
+                .closed, .unauthorized => return if (command.readsStdin()) writeUnreviewable(err) else writeUnavailable(err),
                 .file_tool_unavailable => return writeUnavailable(err),
                 .busy => return writeBusy(err, command),
                 .unsupported_version => return writeOtherVersion(err, command),
@@ -276,7 +490,7 @@ const FakeBridge = struct {
         switch (operation) {
             .edit => |edit| self.edit_blocks = edit.blocks.len,
             .write => |write| self.written = write.content,
-            .call, .list, .search, .help => {},
+            .call, .list, .search, .help, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => {},
         }
         return self.reply;
     }
@@ -320,7 +534,7 @@ test "outside a program fx started, the command says so and exits 3" {
     var err: std.Io.Writer.Allocating = .init(arena_state.allocator());
     try std.testing.expectEqual(client.exit.unavailable, try writeUnavailable(&err.writer));
     try std.testing.expectEqualStrings(
-        "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.\n",
+        "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, before that bash call returns.\n",
         err.written(),
     );
 }
@@ -336,7 +550,7 @@ test "a file change refused because the command is not a bash tool program exits
     const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .edit = "app.py" }, "<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n", test_bridge, fake.caller());
     try std.testing.expectEqual(client.exit.unavailable, code);
     try std.testing.expectEqualStrings(
-        "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.\n",
+        "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, before that bash call returns.\n",
         err.written(),
     );
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
@@ -511,5 +725,160 @@ test "a multi-block edit is one request, and each reply status gives its exit co
         try std.testing.expectEqualStrings(case.stderr, err.written());
         try std.testing.expectEqual(@as(usize, 1), fake.calls);
         try std.testing.expectEqual(@as(usize, 2), fake.edit_blocks);
+    }
+}
+
+test "fx tool edit ends its reply with a newline, even when the reply already has one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const input = "<<<<<<< SEARCH\none\n=======\ntwo\n>>>>>>> REPLACE\n";
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .ok, .bytes = 14 }, .bytes = "edited app.py\n" } };
+
+    const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .edit = "app.py" }, input, test_bridge, fake.caller());
+    try std.testing.expectEqual(client.exit.ok, code);
+    try std.testing.expectEqualStrings("edited app.py\n\n", out.written());
+    try std.testing.expectEqualStrings("", err.written());
+}
+
+test "fx tool write ends its reply with a newline, even when the reply already has one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .ok, .bytes = 14 }, .bytes = "wrote new.txt\n" } };
+
+    const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .write = "new.txt" }, "hello\n", test_bridge, fake.caller());
+    try std.testing.expectEqual(client.exit.ok, code);
+    try std.testing.expectEqualStrings("wrote new.txt\n\n", out.written());
+    try std.testing.expectEqualStrings("", err.written());
+}
+
+test "skill and agent replies end with one newline, and add none when the reply has one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var err: std.Io.Writer.Allocating = .init(arena);
+        var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .ok, .bytes = 13 }, .bytes = "zig\tZig help\n" } };
+        _ = try send(arena, std.testing.io, &out.writer, &err.writer, .skill_list, "", test_bridge, fake.caller());
+        try std.testing.expectEqualStrings("zig\tZig help\n", out.written());
+    }
+    {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var err: std.Io.Writer.Allocating = .init(arena);
+        var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .ok, .bytes = 4 }, .bytes = "done" } };
+        _ = try send(arena, std.testing.io, &out.writer, &err.writer, .agent_wait, "", test_bridge, fake.caller());
+        try std.testing.expectEqualStrings("done\n", out.written());
+    }
+}
+
+test "parse reads skill and agent verbs with options, and rejects bad usage" {
+    try std.testing.expectEqual(Command.skill_list, try parse(&.{ "skill", "list" }));
+    try std.testing.expectEqualDeep(
+        Command{ .skill_open = .{ .name = "zig" } },
+        try parse(&.{ "skill", "open", "zig" }),
+    );
+    try std.testing.expectEqualDeep(
+        Command{ .skill_open = .{ .name = "zig", .resource = "refs/notes.md" } },
+        try parse(&.{ "skill", "open", "zig", "refs/notes.md" }),
+    );
+    try std.testing.expectEqualDeep(
+        Command{ .agent_message = .{
+            .agent = "worker",
+            .message = "check tests",
+            .instructions = "be concise",
+            .model = "claude-sonnet",
+            .effort = "high",
+            .profile = "reviewer",
+            .report = .every_turn,
+        } },
+        try parse(&.{
+            "agent",
+            "message",
+            "worker",
+            "check tests",
+            "--instructions",
+            "be concise",
+            "--model=claude-sonnet",
+            "--effort",
+            "high",
+            "--profile=reviewer",
+            "--report",
+            "every_turn",
+        }),
+    );
+    try std.testing.expectEqual(Command.agent_wait, try parse(&.{ "agent", "wait" }));
+    try std.testing.expectEqualDeep(Command{ .agent_status = null }, try parse(&.{ "agent", "status" }));
+    try std.testing.expectEqualDeep(Command{ .agent_status = "worker" }, try parse(&.{ "agent", "status", "worker" }));
+    try std.testing.expectEqualDeep(Command{ .agent_stop = "worker" }, try parse(&.{ "agent", "stop", "worker" }));
+    try std.testing.expectEqualDeep(Command{ .agent_close = "worker" }, try parse(&.{ "agent", "close", "worker" }));
+
+    try std.testing.expectError(error.UnknownCommand, parse(&.{"skill"}));
+    try std.testing.expectError(error.UnknownCommand, parse(&.{ "skill", "delete", "zig" }));
+    try std.testing.expectError(error.TooManyArguments, parse(&.{ "skill", "list", "extra" }));
+    try std.testing.expectError(error.MissingArgument, parse(&.{ "skill", "open" }));
+    try std.testing.expectError(error.TooManyArguments, parse(&.{ "skill", "open", "zig", "a", "b" }));
+    try std.testing.expectError(error.UnknownCommand, parse(&.{"agent"}));
+    try std.testing.expectError(error.UnknownCommand, parse(&.{ "agent", "ping" }));
+    try std.testing.expectError(error.MissingArgument, parse(&.{ "agent", "message", "worker" }));
+    try std.testing.expectError(error.MissingOptionValue, parse(&.{ "agent", "message", "worker", "hi", "--model" }));
+    try std.testing.expectError(error.UnknownOption, parse(&.{ "agent", "message", "worker", "hi", "--bogus", "1" }));
+    try std.testing.expectError(error.InvalidReport, parse(&.{ "agent", "message", "worker", "hi", "--report", "always" }));
+    try std.testing.expectError(error.TooManyArguments, parse(&.{ "agent", "wait", "worker" }));
+    try std.testing.expectError(error.TooManyArguments, parse(&.{ "agent", "status", "a", "b" }));
+    try std.testing.expectError(error.MissingArgument, parse(&.{ "agent", "stop" }));
+    try std.testing.expectError(error.MissingArgument, parse(&.{ "agent", "close" }));
+}
+
+test "skill and agent commands never read stdin, while edit and write do" {
+    try std.testing.expect((Command{ .edit = "a" }).readsStdin());
+    try std.testing.expect((Command{ .write = "a" }).readsStdin());
+    const list_cmd: Command = .skill_list;
+    const wait_cmd: Command = .agent_wait;
+    try std.testing.expect(!list_cmd.readsStdin());
+    try std.testing.expect(!(Command{ .skill_open = .{ .name = "zig" } }).readsStdin());
+    try std.testing.expect(!(Command{ .agent_message = .{ .agent = "w", .message = "hi" } }).readsStdin());
+    try std.testing.expect(!wait_cmd.readsStdin());
+    try std.testing.expect(!(Command{ .agent_status = null }).readsStdin());
+    try std.testing.expect(!(Command{ .agent_stop = "w" }).readsStdin());
+    try std.testing.expect(!(Command{ .agent_close = "w" }).readsStdin());
+}
+
+test "skill and agent send prints stdout on ok and exits 5 or 6 on denial or tool error" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var err: std.Io.Writer.Allocating = .init(arena);
+        var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .ok, .bytes = 12 }, .bytes = "zig\tZig help\n" } };
+        const code = try send(arena, std.testing.io, &out.writer, &err.writer, .skill_list, "", test_bridge, fake.caller());
+        try std.testing.expectEqual(client.exit.ok, code);
+        try std.testing.expectEqualStrings("zig\tZig help\n", out.written());
+        try std.testing.expectEqualStrings("", err.written());
+    }
+    {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var err: std.Io.Writer.Allocating = .init(arena);
+        var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .denied, .bytes = 6 }, .bytes = "denied" } };
+        const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .agent_stop = "w" }, "", test_bridge, fake.caller());
+        try std.testing.expectEqual(client.exit.denied, code);
+        try std.testing.expectEqualStrings("", out.written());
+        try std.testing.expectEqualStrings("fx tool agent stop: denied\n", err.written());
+    }
+    {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var err: std.Io.Writer.Allocating = .init(arena);
+        var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .tool_error, .bytes = 9 }, .bytes = "not found" } };
+        const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .skill_open = .{ .name = "missing" } }, "", test_bridge, fake.caller());
+        try std.testing.expectEqual(client.exit.tool_error, code);
+        try std.testing.expectEqualStrings("", out.written());
+        try std.testing.expectEqualStrings("fx tool skill open: not found\n", err.written());
     }
 }

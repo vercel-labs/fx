@@ -1,5 +1,6 @@
 const std = @import("std");
 const command_specs = @import("../core/slash_commands/command_specs.zig");
+const tool_bridge = @import("../core/tool_bridge/tool_bridge.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -140,11 +141,44 @@ pub const replay_options = [_]command_specs.OptionDoc{
     json_option,
 };
 
-/// `fx mcp list` options; `fx mcp --help` shows them in its usage line.
-const tool_subcommands = [_]command_specs.SubcommandDoc{
+const tool_agent_message_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--instructions <text>", .description = "System instructions when starting a new subagent" },
+    .{ .flag = "--model <id>", .description = "Override the subagent's model" },
+    .{ .flag = "--effort <level>", .description = "Override the subagent's reasoning effort" },
+    .{ .flag = "--profile <name>", .description = "Start the subagent in an agent profile" },
+    .{ .flag = "--report <final|every_turn|never>", .description = "When the subagent reports back" },
+};
+
+const tool_skill_subcommands = [_]command_specs.SubcommandDoc{
+    .{ .usage = "list", .description = "List visible skills as NAME<TAB>DESCRIPTION" },
+    .{ .usage = "open NAME [FILE]", .description = "Print a skill or one of its files" },
+};
+
+const tool_agent_subcommands = [_]command_specs.SubcommandDoc{
+    .{ .usage = "message NAME TEXT", .description = "Message or start a subagent; options take a value after a space or as --flag=value", .options = &tool_agent_message_options },
+    .{ .usage = "wait", .description = "Wait for a subagent report or until none work" },
+    .{ .usage = "status [NAME]", .description = "Show subagent state" },
+    .{ .usage = "stop NAME", .description = "Stop a subagent's running turn" },
+    .{ .usage = "close NAME", .description = "Close a subagent for good" },
+};
+
+/// The `tool` command's one-line summary. A build without the bash tool bridge
+/// still names the command, so its help never shows an empty summary.
+fn toolSummary(comptime bridge_supported: bool) []const u8 {
+    return if (bridge_supported) "Run bash-tool file, skill, and subagent commands" else "Bash tool commands (not available in this host)";
+}
+
+/// The `tool` command's usage, shared by its help entry and the top-level list.
+fn toolUsage(comptime bridge_supported: bool) []const u8 {
+    return if (bridge_supported) "tool <edit|write|skill|agent> ..." else "tool";
+}
+
+const tool_subcommands: []const command_specs.SubcommandDoc = if (tool_bridge.supported) &.{
     .{ .usage = "edit PATH", .description = "Change a file with SEARCH/REPLACE blocks on stdin" },
     .{ .usage = "write PATH", .description = "Write a whole file from stdin" },
-};
+    .{ .usage = "skill <list|open>", .description = "List or read visible skills", .subcommands = &tool_skill_subcommands },
+    .{ .usage = "agent <message|wait|status|stop|close>", .description = "Message, wait for, check, stop, or close subagents", .subcommands = &tool_agent_subcommands },
+} else &.{};
 
 const mcp_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "list", .description = "List configured servers; never connects", .options = &mcp_list_options },
@@ -348,14 +382,14 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .tool,
         .token = "tool",
-        .usage = "tool edit PATH | tool write PATH",
-        .summary = "Change a file from a program that the experimental bash tool runs",
-        .subcommands = &tool_subcommands,
-        .details = &.{
-            "The change goes through fx's permission rules and review, as an edit the agent makes itself. Send the change on stdin.",
-            "Experimental: it works only in programs that the bash tool runs, with experimental.bash_tool on.",
-            "Exit codes: 0 changed; 1 failed; 2 the change or the command line is wrong; 3 no running fx program to reach; 4 busy; 5 denied; 6 the change did not apply.",
-        },
+        .usage = toolUsage(tool_bridge.supported),
+        .summary = toolSummary(tool_bridge.supported),
+        .subcommands = tool_subcommands,
+        .details = if (tool_bridge.supported) &.{
+            "Each command runs through fx's permission rules and review, as the agent's own call does. Only edit and write read stdin.",
+            "Experimental: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, before that bash call returns.",
+            "Exit codes: 0 ok; 1 failed; 2 bad input or usage; 3 unavailable (no running bash call to reach); 4 busy; 5 denied; 6 tool error.",
+        } else &.{},
     },
     .{
         .kind = .models,
@@ -538,7 +572,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
         .{ .kind = .mcp, .usage = "mcp <command> ..." },
-        .{ .kind = .tool, .usage = "tool edit|write PATH" },
+        .{ .kind = .tool, .usage = toolUsage(tool_bridge.supported) },
         .{ .kind = .slack, .usage = "slack <install|status|refresh>" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
@@ -988,4 +1022,32 @@ test "the launch usage line pairs each --no- spelling with its flag" {
     try std.testing.expect(std.mem.startsWith(u8, launch_usage, "usage: fx [--context-limit <spec>] [--add-dir <path>] [--no-additional-dirs] "));
     try std.testing.expect(std.mem.find(u8, launch_usage, " [--fast|--no-fast] ") != null);
     try std.testing.expect(std.mem.endsWith(u8, launch_usage, " <command>\n"));
+}
+
+test "fx tool help matches tool_bridge.supported" {
+    const spec = for (top_level_specs) |entry| {
+        if (entry.kind == .tool) break entry;
+    } else unreachable;
+    if (tool_bridge.supported) {
+        try std.testing.expectEqual(@as(usize, 4), spec.subcommands.len);
+        try std.testing.expect(spec.details.len > 0);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), spec.subcommands.len);
+        try std.testing.expectEqual(@as(usize, 0), spec.details.len);
+    }
+    try std.testing.expectEqualStrings(toolSummary(tool_bridge.supported), spec.summary);
+    try std.testing.expect(toolSummary(false).len > 0);
+}
+
+test "fx tool help group line shows the same usage as the tool spec" {
+    const spec = for (top_level_specs) |entry| {
+        if (entry.kind == .tool) break entry;
+    } else unreachable;
+    var group_usage: ?[]const u8 = null;
+    for (top_level_help_groups) |group| {
+        for (group.entries) |entry| {
+            if (entry.kind == .tool) group_usage = entry.usage;
+        }
+    }
+    try std.testing.expectEqualStrings(spec.usage, group_usage orelse return error.TestUnexpectedResult);
 }

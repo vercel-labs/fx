@@ -18,6 +18,17 @@
 # random behaviors; SIM_RUNS sets how many (default 20000). The witness-*
 # configs show that an edit is applied, prompted, and refused as stale.
 #
+# AgentWait models `fx tool agent wait`: the subagent's wait reads its cancel
+# flag, and the bridge's agent operations call it with each request's flag.
+# agent-design must pass. agent-mutant-ignore-cancel and
+# agent-mutant-ignore-cancel-hang plant a wait that ignores its cancel flag, so
+# a wait whose program is gone never ends and its bash call never returns.
+# agent-mutant-yield-while-held plants a yield that ignores the bridge's hold,
+# and agent-mutant-takes-mail plants a wait that takes the mail it saw, so the
+# mail reaches no one. The agent-witness-* configs show a canceled wait, a
+# quiet wait, a wait that ended on mail, and a wait refused after the first
+# call yielded.
+#
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 set -eu
 
@@ -45,11 +56,23 @@ ToolEdit witness-prompted NeverPrompted
 ToolEdit witness-stale NeverStale
 ToolEdit simulate-ideal simulate $sim
 ToolEdit simulate-nonideal simulate $sim
+AgentWait agent-design -
+AgentWait agent-mutant-yield-while-held NoYieldWhileHeld
+AgentWait agent-mutant-ignore-cancel temporal
+AgentWait agent-mutant-ignore-cancel-hang temporal
+AgentWait agent-mutant-takes-mail NoMailLost
+AgentWait agent-witness-canceled NeverCanceled
+AgentWait agent-witness-quiet NeverQuiet
+AgentWait agent-witness-mail NeverMailAfterWait
+AgentWait agent-witness-unavailable NeverUnavailable
 EOT
 
 # The driver: the design-bridge state graph walked on the real harness,
 # code traces checked by TraceToolEdit.tla, and each planted bug in
-# mutations.json caught. FX_TLA_TOOL_BRIDGE_QUICK=1 runs the quick settings.
+# mutations.json caught. The AgentWait graph is walked on the real subagent
+# wait, its traces are checked by TraceAgentWait.tla, the bridge grace is timed,
+# and each planted bug in agent-mutations.json is caught.
+# FX_TLA_TOOL_BRIDGE_QUICK=1 runs the quick settings.
 # FX_TLA_TOOL_BRIDGE_TLC_ONLY=1 skips the driver and keeps the TLC verdicts,
 # which every pull request checks in ci.yml.
 if [ "${FX_TLA_TOOL_BRIDGE_TLC_ONLY:-0}" != "1" ]; then
