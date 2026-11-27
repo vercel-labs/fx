@@ -30,6 +30,7 @@ const effort_menu_presentation = @import("effort_menu_presentation.zig");
 const fork_menu_presentation = @import("fork_menu_presentation.zig");
 const agents_menu_presentation = @import("agents_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
+const wait_card_ui = @import("wait_card_ui.zig");
 const trust_prompt_ui = @import("trust_prompt_ui.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
@@ -648,7 +649,9 @@ pub fn composeFooterFrame(
     const approval_active = !trust_active and input.approval != null;
     const question_projection = if (!trust_active and !approval_active) ctx.question else null;
     const question_active = question_projection != null;
-    const compact_command_menu = if (!trust_active and !approval_active and !question_active)
+    const wait_card = if (!trust_active and !approval_active and !question_active) ctx.wait_card else null;
+    const wait_card_active = wait_card != null;
+    const compact_command_menu = if (!trust_active and !approval_active and !question_active and !wait_card_active)
         render_input.activeCompactCommandMenu(ctx)
     else
         null;
@@ -698,7 +701,7 @@ pub fn composeFooterFrame(
         cursor_col = cursor.col;
     }
 
-    if (trust_active or approval_active or question_active or compact_command_active or input.show_picker) {
+    if (trust_active or approval_active or question_active or wait_card_active or compact_command_active or input.show_picker) {
         if (input.input_visible) {
             var picker_divider = try row_text.composeDividerRow(alloc, shell.layout.cols);
             try pushFooterBandRow(alloc, &frame, plan, rows.picker_divider, &picker_divider);
@@ -720,6 +723,12 @@ pub fn composeFooterFrame(
             }
         } else if (question_projection) |projection| {
             try pushQuestionPanelRows(alloc, &frame, plan, rows.picker_start, input.picker_rows, projection, shell.layout.cols);
+        } else if (wait_card) |card| {
+            var card_row_index: u16 = 0;
+            while (card_row_index < input.picker_rows) : (card_row_index += 1) {
+                var card_row = try wait_card_ui.composeRow(alloc, card, card_row_index, shell.layout.cols);
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + card_row_index, &card_row);
+            }
         } else if (compact_command_menu) |menu| {
             var menu_row_index: u16 = 0;
             while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
@@ -979,7 +988,7 @@ pub fn composeFooterFrame(
         }
     }
 
-    const needs_bottom_divider = !input.input_visible or trust_active or approval_active or question_active or compact_command_active or input.show_picker;
+    const needs_bottom_divider = !input.input_visible or trust_active or approval_active or question_active or wait_card_active or compact_command_active or input.show_picker;
     var bottom_row: std.ArrayList(u8) = if (needs_bottom_divider)
         try row_text.composeDividerRow(alloc, shell.layout.cols)
     else
