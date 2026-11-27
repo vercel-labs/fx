@@ -58,7 +58,7 @@ export const scenarios: Scenario[] = [
     description: "Two pages joined in order, an empty-string cursor followed, malformed tools and duplicates dropped, then served from the cache (CAT-01, CAT-04)",
     rules: [
       discover,
-      { method: "tools/list", cursor: null, result: { tools: [tool("a"), { name: "bad" }], nextCursor: "", ttlMs: 60000 } },
+      { method: "tools/list", cursor: null, result: { tools: [tool("a"), { inputSchema: { type: "object" } }], nextCursor: "", ttlMs: 60000 } },
       { method: "tools/list", cursor: "", result: { tools: [tool("b"), tool("a")], ttlMs: 30000 } },
     ],
     script: [...START, "tools", "expect catalog-fresh", "tools", ...STOP],
