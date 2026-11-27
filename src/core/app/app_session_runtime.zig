@@ -3712,6 +3712,12 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.resume_handoff_intent = .upgrade_requested;
         }
 
+        /// Takes back `requestUpgradeResumeHandoff` when the restart is cancelled.
+        pub fn cancelUpgradeResumeHandoff(agent: *AppAgent) void {
+            if (agent.session_persistence.resume_handoff_intent != .upgrade_requested) return;
+            agent.session_persistence.resume_handoff_intent = .none;
+        }
+
         pub fn prepareResumeHandoff(agent: *AppAgent) !void {
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
