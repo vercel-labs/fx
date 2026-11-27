@@ -360,6 +360,16 @@ pub const HostWorkspaceContext = struct {
     home: []const u8,
 };
 
+/// How this turn's requests run, beside the model that the turn context already
+/// names. Names and switches only: a provider's name, never its binding,
+/// endpoint, or credential.
+pub const TurnSelectionNames = struct {
+    provider: []const u8,
+    effort: []const u8,
+    fast_mode: bool,
+    ultrafast_mode: bool,
+};
+
 pub const TransientContextInput = struct {
     workspace_root: []const u8,
     host_workspace: ?HostWorkspaceContext = null,
@@ -371,6 +381,9 @@ pub const TransientContextInput = struct {
     /// host (`Runtime.teamNote` in src/core/subagent/tool_host.zig); null
     /// when it has none.
     subagents: ?[]const u8 = null,
+    /// Provider, effort, and speed for the turn context's `model:` line. Null
+    /// when the host does not track them, and then only the model is written.
+    turn_selection: ?TurnSelectionNames = null,
 };
 
 pub const Provider = struct {

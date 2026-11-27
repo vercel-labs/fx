@@ -1158,6 +1158,10 @@ pub fn Runtime(comptime App: type) type {
                 if (app_session_runtime.Runtime(App).ownSubagentHost(agent)) |team_host| try team_host.teamNote(arena, agent.worker.activeTurnId()) else null
             else
                 null;
+            // The turn's own provider, effort, and speed, copied from its queued
+            // prompt when the turn started, so the turn context names what its
+            // requests use. Null between turns.
+            const turn_selection = agent.worker.activeTurnSelection();
             try app.contextRegistry().appendDefaultTransient(.{
                 .workspace_root = workspace.root,
                 .host_workspace = if (host_workspace) |info| .{
@@ -1170,6 +1174,12 @@ pub fn Runtime(comptime App: type) type {
                 .permission_mode = permission_snapshot.mode,
                 .model = model,
                 .subagents = subagents,
+                .turn_selection = if (turn_selection) |*selection| .{
+                    .provider = selection.provider.label(),
+                    .effort = selection.effort.label(),
+                    .fast_mode = selection.fast_mode,
+                    .ultrafast_mode = selection.ultrafast_mode,
+                } else null,
             }, arena, messages);
         }
 
@@ -1269,6 +1279,8 @@ pub fn Runtime(comptime App: type) type {
             defer agent.worker.active_context_snapshot = null;
             agent.worker.setActiveAgentTurnSettings(job.agent_settings);
             defer agent.worker.clearActiveAgentTurnSettings();
+            agent.worker.setActiveTurnSelection(worker_runtime.ActiveTurnSelection.init(job.provider, job.agent_settings));
+            defer agent.worker.clearActiveTurnSelection();
             var preflight_context_notices: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
             defer preflight_context_notices.deinit();
             for (job.context_snapshot.notices) |notice| {
