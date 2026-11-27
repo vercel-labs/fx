@@ -84,6 +84,7 @@ VERIFICATION_E2E_TESTS = (
     "tui-mcp-http-many-servers.test.ts",
     "tui-render-replay.test.ts",
     "tui-resume.test.ts",
+    "tui-program-resume.test.ts",
     "tui-slash-commands.test.ts",
     "tui-slash-extra.test.ts",
     "tui-slash-menu.test.ts",
