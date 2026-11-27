@@ -1733,6 +1733,83 @@ describe("remote setup in a terminal (AC-25)", () => {
     });
   }, TIMEOUT * 3);
 
+  test.skipIf(!tmuxAvailable())("AC-25: width 120 keeps both Reason lines and the remote command output intact without garbling", async () => {
+    const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
+    await withSetup({ teams: [fakeTeam, fakeSecondTeam] }, async (setup) => {
+      await withSandboxFixture(
+        [
+          fakeGatewayToolCall("call-1", "shell", { command: "printf 'remote-out-%s\\n' ok-42" }),
+          (body: string) => {
+            const raw = toolResultsIn(body).at(-1) ?? "{}";
+            const output = (JSON.parse(raw) as { output_delta?: string }).output_delta ?? "";
+            return fakeGatewayFinalText(output);
+          },
+        ],
+        async (fixture) => {
+          const script = `${shellQuote(FX_BIN)} ask --permission-mode full-access ${shellQuote("Run it.")}; code=$?; printf '\\n__FX_EXIT_%s__\\n' "$code"; exit "$code"`;
+          const cmd = `/bin/sh -c ${shellQuote(script)}`;
+          const session = await TmuxSession.create({
+            cmd,
+            cwd: fixture.workspace,
+            width: 120,
+            remainOnExit: true,
+            env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
+          });
+          sessions.push(session);
+          await session.waitForText("Which Vercel team should remote commands use?", TIMEOUT);
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          await session.waitForText("Pick a project in fx-test-team", TIMEOUT);
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          await session.waitForText("Another project (optional)", TIMEOUT);
+          await session.sendLiteral("2");
+          await session.sendKeys("Enter");
+          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+
+          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
+          const started = events(fixture).find((event) => event.ev === "start" && JSON.stringify(event.argv).includes("ok-42"));
+          expect(started).toBeDefined();
+          expect(events(fixture).some((event) => event.ev === "exit" && event.id === started!.id && event.code === 0)).toBe(true);
+
+          const scrollback = await session.captureFullScrollback();
+          const lines = scrollback.split("\n").map((line) => line.trimEnd());
+          const teamReason = "Reason: Which Vercel team should remote commands use?";
+          const projectReason = `Reason: Pick a project in ${fakeTeam.slug}. fx will copy this repository's files to a sandbox in the project you pick, for remote commands.`;
+          const outputText = "remote-out-ok-42";
+
+          expect(lines).toContain(teamReason);
+
+          const projectReasonStart = lines.findIndex((line) => line.startsWith("Reason: Pick a project in "));
+          expect(projectReasonStart).toBeGreaterThanOrEqual(0);
+          const firstLine = lines[projectReasonStart] ?? "";
+          const secondLine = lines[projectReasonStart + 1] ?? "";
+          const joinedProjectReason = firstLine.length === 120 || `${firstLine}${secondLine}` === projectReason
+            ? `${firstLine}${secondLine}`
+            : `${firstLine} ${secondLine}`;
+          expect(joinedProjectReason).toBe(projectReason);
+
+          expect(lines.some((line) => line.trim() === outputText)).toBe(true);
+
+          const formPattern = /fx asks|Reason:|Which Vercel team|Pick a project|Another project|Choose a number|Submit, Edit, Decline|Current values/;
+          const commandOutputPattern = /remote-out-ok-42|Running printf/;
+          for (const line of lines) {
+            expect(formPattern.test(line) && commandOutputPattern.test(line)).toBe(false);
+          }
+        },
+        () => ({ remote: undefined, rules: [{ command: "printf*", runner: "remote" }] }),
+        true,
+        setup,
+      );
+    });
+  }, TIMEOUT * 3);
+
   test.skipIf(!tmuxAvailable())("fx ask --no-save: a decline holds for the second remote call in the same process (U4)", async () => {
     await withSetup({}, async (setup) => {
       await withSandboxFixture(
