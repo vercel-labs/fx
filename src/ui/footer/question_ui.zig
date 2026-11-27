@@ -73,6 +73,16 @@ const OptionRows = struct {
         alloc.free(self.text);
         alloc.free(self.starts);
     }
+
+    /// The option whose rows include option row `row`.
+    fn optionOfRow(self: OptionRows, row: usize) usize {
+        var option: usize = 0;
+        for (self.starts, 0..) |start, index| {
+            if (start > row) break;
+            option = index;
+        }
+        return option;
+    }
 };
 
 pub fn nextPanelLine(text: []const u8, start: *usize) []const u8 {
@@ -93,6 +103,55 @@ pub fn composeQuestionPanelText(
     cols: u16,
     max_rows: u16,
 ) ![]u8 {
+    return composeQuestionPanel(alloc, projection, cols, max_rows, .{ .alloc = alloc });
+}
+
+/// The option drawn on panel row `row` (0 is the panel's first row) of the
+/// panel `composeQuestionPanelText` draws with the same arguments, or null
+/// when that row shows the question, a gap, or a scroll marker. A click or
+/// tap on an option row picks that option.
+pub fn optionAtPanelRow(
+    alloc: Allocator,
+    projection: question_prompt.Projection,
+    cols: u16,
+    max_rows: u16,
+    row: usize,
+) !?usize {
+    var row_options: std.ArrayList(?usize) = .empty;
+    defer row_options.deinit(alloc);
+    const text = try composeQuestionPanel(alloc, projection, cols, max_rows, .{
+        .alloc = alloc,
+        .list = &row_options,
+    });
+    alloc.free(text);
+    return if (row < row_options.items.len) row_options.items[row] else null;
+}
+
+/// Records which option each panel row draws, so pointer hit tests read the
+/// same layout the panel is drawn from. A null `list` records nothing.
+const RowOptions = struct {
+    alloc: Allocator,
+    list: ?*std.ArrayList(?usize) = null,
+
+    fn note(self: RowOptions, option: ?usize, rows: usize) !void {
+        const list = self.list orelse return;
+        try list.appendNTimes(self.alloc, option, rows);
+    }
+
+    /// Notes option rows `first..end` of `options`.
+    fn noteOptionRows(self: RowOptions, options: OptionRows, first: usize, end: usize) !void {
+        if (self.list == null) return;
+        for (first..end) |row| try self.note(options.optionOfRow(row), 1);
+    }
+};
+
+fn composeQuestionPanel(
+    alloc: Allocator,
+    projection: question_prompt.Projection,
+    cols: u16,
+    max_rows: u16,
+    row_options: RowOptions,
+) ![]u8 {
     const row_budget: usize = cols;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -100,6 +159,7 @@ pub fn composeQuestionPanelText(
 
     const entry = projection.current_entry orelse {
         try out.writer.writeByte('\n');
+        try row_options.note(null, 1);
         return out.toOwnedSlice();
     };
 
@@ -110,7 +170,7 @@ pub fn composeQuestionPanelText(
     defer options.deinit(alloc);
 
     if (questionPanelRowCount(question_rows, options.total) > max_rows) {
-        try writeWindowedQuestionPanel(alloc, &out.writer, entry, question, options, row_budget, max_rows);
+        try writeWindowedQuestionPanel(alloc, &out.writer, entry, question, options, row_budget, max_rows, row_options);
         return out.toOwnedSlice();
     }
 
@@ -119,6 +179,9 @@ pub fn composeQuestionPanelText(
     try out.writer.writeByte('\n');
     try out.writer.writeAll(options.text);
     try out.writer.writeByte('\n');
+    try row_options.note(null, question_rows + 1);
+    try row_options.noteOptionRows(options, 0, options.total);
+    try row_options.note(null, 1);
 
     return out.toOwnedSlice();
 }
@@ -355,6 +418,7 @@ fn writeWindowedQuestionPanel(
     options: OptionRows,
     row_budget: usize,
     max_rows: usize,
+    row_options: RowOptions,
 ) !void {
     const option_starts = options.starts;
     const total = options.total;
@@ -377,12 +441,15 @@ fn writeWindowedQuestionPanel(
 
     try writeQuestionRows(writer, question, question_shown, row_budget);
     if (gap > 0) try writer.writeByte('\n');
+    try row_options.note(null, question_shown + gap);
 
     if (total <= body_rows or body_rows < 3) {
-        for (lines.items[0..@min(total, body_rows)]) |line| {
+        const shown = @min(total, body_rows);
+        for (lines.items[0..shown]) |line| {
             try writer.writeAll(line);
             try writer.writeByte('\n');
         }
+        try row_options.noteOptionRows(options, 0, shown);
         return;
     }
 
@@ -409,12 +476,19 @@ fn writeWindowedQuestionPanel(
         above += @intFromBool(start < window.top);
         below += @intFromBool(start >= window_end);
     }
-    if (window.top > 0) try writeScrollMarker(writer, "↑", above);
+    if (window.top > 0) {
+        try writeScrollMarker(writer, "↑", above);
+        try row_options.note(null, 1);
+    }
     for (lines.items[window.top..window_end]) |line| {
         try writer.writeAll(line);
         try writer.writeByte('\n');
     }
-    if (window_end < total) try writeScrollMarker(writer, "↓", below);
+    try row_options.noteOptionRows(options, window.top, window_end);
+    if (window_end < total) {
+        try writeScrollMarker(writer, "↓", below);
+        try row_options.note(null, 1);
+    }
 }
 
 /// A dim row that stands for the option rows scrolled out of the window.
@@ -920,6 +994,97 @@ test "question footer composes prompt inside decision panel" {
     _ = lines.next();
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(lines.next().?) == 0);
     try std.testing.expect(std.mem.find(u8, text, question_hint) == null);
+}
+
+test "question panel rows map to the options they draw" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Yes", .description = "go ahead" },
+        .{ .label = "No", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Should we proceed?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+    const projection = prompt.projection().?;
+
+    // The question, a gap, Yes, No, the freeform Other slot, and a gap.
+    const expected = [_]?usize{ null, null, 0, 1, 2, null, null };
+    for (expected, 0..) |option, row| {
+        try std.testing.expectEqual(
+            option,
+            try optionAtPanelRow(std.testing.allocator, projection, 80, unbounded_rows, row),
+        );
+    }
+    try expectPanelRowOptionsMatchOrdinals(&prompt, 80, unbounded_rows);
+}
+
+test "windowed question panel rows map to the options in the window" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+    try syncTallTestQuestion(&prompt, "Which pane should the relay follow?");
+    for (0..5) |_| prompt.moveChoice(1);
+
+    const width: u16 = 60;
+    const max_rows: u16 = 9;
+    const total = try questionPanelRowsForLayout(std.testing.allocator, prompt.projection().?, width, unbounded_rows);
+    try std.testing.expect(total > max_rows);
+    try expectPanelRowOptionsMatchOrdinals(&prompt, width, max_rows);
+
+    // The selected option is drawn, so a click can still reach it.
+    var found_selected = false;
+    for (0..max_rows) |row| {
+        const option = try optionAtPanelRow(std.testing.allocator, prompt.projection().?, width, max_rows, row);
+        if (option == 5) found_selected = true;
+    }
+    try std.testing.expect(found_selected);
+}
+
+/// Checks every row of the panel against `optionAtPanelRow`: a row that
+/// starts with an option's ordinal maps to that option, a scroll marker
+/// maps to none, and every other row maps to the option above it or none.
+fn expectPanelRowOptionsMatchOrdinals(
+    prompt: *const question_prompt.QuestionPrompt,
+    width: u16,
+    max_rows: u16,
+) !void {
+    const alloc = std.testing.allocator;
+    const projection = prompt.projection().?;
+    const text = try composeQuestionPanelText(alloc, projection, width, max_rows);
+    defer alloc.free(text);
+
+    var line_start: usize = 0;
+    var row: usize = 0;
+    var labelled_rows: usize = 0;
+    var last_option: ?usize = null;
+    while (line_start < text.len) : (row += 1) {
+        const line = nextPanelLine(text, &line_start);
+        var plain: std.ArrayList(u8) = .empty;
+        defer plain.deinit(alloc);
+        try appendWithoutAnsi(&plain, line);
+        const trimmed = std.mem.trimStart(u8, plain.items, " ");
+        const option = try optionAtPanelRow(alloc, projection, width, max_rows, row);
+
+        const ordinal_end = std.mem.findScalar(u8, trimmed, ')') orelse 0;
+        const ordinal: ?usize = if (ordinal_end > 0)
+            std.fmt.parseInt(usize, trimmed[0..ordinal_end], 10) catch null
+        else
+            null;
+        if (ordinal) |number| {
+            try std.testing.expectEqual(@as(?usize, number - 1), option);
+            labelled_rows += 1;
+        } else if (std.mem.startsWith(u8, trimmed, "↑") or std.mem.startsWith(u8, trimmed, "↓")) {
+            try std.testing.expectEqual(@as(?usize, null), option);
+        } else if (option) |continued| {
+            // A window can open on the rest of an option whose label row
+            // scrolled out above it.
+            if (last_option) |previous| try std.testing.expectEqual(previous, continued);
+        }
+        if (option != null) last_option = option;
+    }
+    try std.testing.expect(labelled_rows > 0);
 }
 
 test "long question text wraps into measured continuation rows" {

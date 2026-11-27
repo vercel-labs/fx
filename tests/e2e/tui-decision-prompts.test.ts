@@ -807,6 +807,13 @@ async function resolveApprovalWithDeny(activeSession: TmuxSession) {
   await activeSession.sendLiteralText("3");
 }
 
+// The SGR mouse press and release of a left click at a 1-based `row` and
+// `column`, as tmux `send-keys -H` bytes.
+function sgrClickHex(row: number, column: number): string[] {
+  const report = `\x1b[<0;${column};${row}M\x1b[<0;${column};${row}m`;
+  return Array.from(Buffer.from(report, "utf8"), (byte) => byte.toString(16).padStart(2, "0"));
+}
+
 async function resolveQuestionWithSecondOption(activeSession: TmuxSession) {
   await activeSession.sendKeys("Down");
   await activeSession.sendKeys("Enter");
@@ -2838,6 +2845,31 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(ctx.gateway.requests.some((request) =>
         requestContainsExactString(request.body, QUESTION_TYPING)
       )).toBe(false);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a click or tap on a question option answers with that option",
+    async () => {
+      const ctx = await openQuestionPrompt("question click");
+
+      // A click on the question itself picks nothing.
+      const grid = await ctx.session.capturePaneGrid();
+      const questionRow = grid.findIndex((row) => row.includes(QUESTION_PROMPT));
+      const optionRow = grid.findIndex((row) => row.includes("2) Run tests"));
+      expect(questionRow).toBeGreaterThanOrEqual(0);
+      expect(optionRow).toBeGreaterThan(questionRow);
+      await ctx.session.sendHexBytes(sgrClickHex(questionRow + 1, 8));
+      await expectQuestionSelection(ctx.session, 1, "Inspect repo state");
+      expect(ctx.gateway.requests).toHaveLength(1);
+
+      // The press and release a web terminal sends for one tap.
+      await ctx.session.sendHexBytes(sgrClickHex(optionRow + 1, 8));
+      await ctx.session.waitForText("question click handled", TIMEOUT);
+      expect(requestContainsExactString(ctx.gateway.requests[1]?.body ?? "", "Run tests")).toBe(true);
+      expect(ctx.gateway.requests).toHaveLength(2);
       await assertProcessAliveAndClean(ctx);
     },
     TIMEOUT,

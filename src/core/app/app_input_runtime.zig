@@ -12281,6 +12281,105 @@ test "primary composer pointer press places the caret without starting a drag se
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
+fn installRoutingQuestionPanel(app: *RoutingFakeApp, entries: []const types.QuestionBatchEntry) !void {
+    try app.agent().question_prompt.syncFrom(app.alloc, entries);
+    app.shell.layout.cols = 80;
+    app.shell.footer_viewport.has_frame = true;
+    app.shell.footer_viewport.geometry = .{
+        .top = 10,
+        .top_divider = 10,
+        .input_base = 10,
+        .bottom_divider = 19,
+        .hint = 20,
+        // The question, a gap, the options, the freeform slot, and a gap.
+        .question_panel = .{ .first = 11, .count = 8 },
+    };
+}
+
+fn feedRoutingClick(app: *RoutingFakeApp, row: u16) !void {
+    var report: [48]u8 = undefined;
+    const click = try std.mem.print(&report, "\x1b[<0;8;{d}M\x1b[<0;8;{d}m", .{ row, row });
+    try feedRoutingBytes(app, click);
+}
+
+test "question option click answers with that option" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const opts = [_]types.QuestionOption{
+        .{ .label = "Alpha", .description = null },
+        .{ .label = "Beta", .description = null },
+        .{ .label = "Gamma", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Continue?", .options = &opts },
+    };
+    try installRoutingQuestionPanel(&app, &entries);
+
+    // The question row and the gap under it pick nothing.
+    try feedRoutingClick(&app, 11);
+    try feedRoutingClick(&app, 12);
+    try std.testing.expect(app.agent().question_prompt.isActive());
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.submitted_question_count);
+
+    try feedRoutingClick(&app, 14);
+
+    try std.testing.expect(!app.agent().question_prompt.isActive());
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.submitted_question_count);
+    try std.testing.expectEqualStrings(
+        "Beta",
+        app.agent().worker.submitted_question_answer[0..app.agent().worker.submitted_question_answer_len],
+    );
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+}
+
+test "question freeform slot click selects it for typing" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const opts = [_]types.QuestionOption{
+        .{ .label = "Alpha", .description = null },
+        .{ .label = "Beta", .description = null },
+        .{ .label = "Gamma", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Continue?", .options = &opts },
+    };
+    try installRoutingQuestionPanel(&app, &entries);
+
+    try feedRoutingClick(&app, 16);
+
+    try std.testing.expect(app.agent().question_prompt.isActive());
+    try std.testing.expect(app.agent().question_prompt.isFreeformSelected());
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.submitted_question_count);
+    try std.testing.expect(app.shell.render_requests.hasReason(.modal));
+}
+
+test "question click outside the drawn panel picks nothing" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const opts = [_]types.QuestionOption{
+        .{ .label = "Alpha", .description = null },
+        .{ .label = "Beta", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Continue?", .options = &opts },
+    };
+    try installRoutingQuestionPanel(&app, &entries);
+
+    try feedRoutingClick(&app, 5);
+    try feedRoutingClick(&app, 20);
+
+    // A frame that drew no question panel takes no clicks.
+    app.shell.footer_viewport.geometry.question_panel = null;
+    try feedRoutingClick(&app, 13);
+
+    try std.testing.expect(app.agent().question_prompt.isActive());
+    try std.testing.expectEqual(@as(u8, 0), currentQuestionChoiceForRoutingTest(&app.agent().question_prompt));
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.submitted_question_count);
+}
+
 test "file approval enter waits for the matching committed modal frame" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);

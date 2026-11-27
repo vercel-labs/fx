@@ -1296,6 +1296,12 @@ pub fn commitSurfaceFooterFrame(
             geometry.input_window_first = measured.input_window.first_row;
         }
     }
+    if (frame.composed.question_panel_rows > 0) {
+        geometry.question_panel = .{
+            .first = frame.paint.footer.picker_start,
+            .count = frame.composed.question_panel_rows,
+        };
+    }
     shell.footer_viewport.installComposedFrame(
         alloc,
         geometry,

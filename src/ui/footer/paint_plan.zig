@@ -723,6 +723,7 @@ pub fn composeFooterFrame(
             }
         } else if (question_projection) |projection| {
             try pushQuestionPanelRows(alloc, &frame, plan, rows.picker_start, input.picker_rows, projection, shell.layout.cols);
+            frame.question_panel_rows = input.picker_rows;
         } else if (wait_card) |card| {
             var card_row_index: u16 = 0;
             while (card_row_index < input.picker_rows) : (card_row_index += 1) {
