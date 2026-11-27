@@ -11,6 +11,7 @@ pub const ParsedCommand = union(enum) {
     launch_instance: []const u8,
     close_instance,
     show_agents,
+    stop_subagents,
     reset_session,
     resume_session,
     rename_session: []const u8,
@@ -57,7 +58,7 @@ pub const ChordCommandRoute = enum { run_now, open_catalog, preview, refuse };
 
 pub fn chordCommandRoute(parsed: ParsedCommand) ChordCommandRoute {
     return switch (parsed) {
-        .fast, .version, .status, .stats, .usage, .help => .run_now,
+        .fast, .version, .status, .stats, .usage, .help, .stop_subagents => .run_now,
         .effort => |level| if (blankArgs(level)) .preview else .run_now,
         .ultrafast => |rest| if (ultrafastReadOrToggle(rest)) .run_now else .preview,
         .model => |query| if (blankArgs(query)) .open_catalog else .preview,
@@ -118,6 +119,7 @@ pub const CommandHandlers = struct {
     launch_instance: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     close_instance: *const fn (ctx: *anyopaque) anyerror!void,
     show_agents: *const fn (ctx: *anyopaque) anyerror!void,
+    stop_subagents: *const fn (ctx: *anyopaque) anyerror!void,
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
     resume_session: *const fn (ctx: *anyopaque) anyerror!void,
     fork_session: *const fn (ctx: *anyopaque) anyerror!void,
@@ -167,6 +169,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .launch_instance => .{ .launch_instance = payload },
         .close_instance => .close_instance,
         .show_agents => .show_agents,
+        .stop_subagents => .stop_subagents,
         .reset_session => .reset_session,
         .resume_session => .resume_session,
         .rename_session => .{ .rename_session = payload },
@@ -233,6 +236,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .launch_instance => |rest| try handlers.launch_instance(handlers.ctx, rest),
         .close_instance => try handlers.close_instance(handlers.ctx),
         .show_agents => try handlers.show_agents(handlers.ctx),
+        .stop_subagents => try handlers.stop_subagents(handlers.ctx),
         .reset_session => try handlers.reset_session(handlers.ctx),
         .resume_session => try handlers.resume_session(handlers.ctx),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
@@ -520,6 +524,10 @@ fn recordShell(ctx: *anyopaque, value: []const u8) anyerror!void {
     testContext(ctx).payload = value;
 }
 
+fn recordStopSubagents(ctx: *anyopaque) anyerror!void {
+    testContext(ctx).called = "stop_subagents";
+}
+
 fn recordCopy(ctx: *anyopaque) anyerror!void {
     testContext(ctx).called = "copy";
 }
@@ -576,6 +584,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .launch_instance = unexpectedPayload,
         .close_instance = unexpectedNoPayload,
         .show_agents = unexpectedNoPayload,
+        .stop_subagents = unexpectedNoPayload,
         .reset_session = unexpectedNoPayload,
         .resume_session = unexpectedNoPayload,
         .fork_session = unexpectedNoPayload,
@@ -731,4 +740,16 @@ test "route propagates callback errors" {
     handlers.show_status = failStatus;
 
     try std.testing.expectError(error.TestRouteFailure, route(testSlashRegistry(), &handlers, "/status"));
+}
+
+test "route dispatches /stop and shortcuts allow running it without touching draft" {
+    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.stop_subagents));
+    const parsed = parse(testSlashRegistry(), "/stop");
+    try std.testing.expectEqual(ParsedCommand.stop_subagents, parsed);
+
+    var ctx: TestContext = .{};
+    var handlers = testHandlers(&ctx);
+    handlers.stop_subagents = recordStopSubagents;
+    try route(testSlashRegistry(), &handlers, "/stop");
+    try std.testing.expectEqualStrings("stop_subagents", ctx.called);
 }

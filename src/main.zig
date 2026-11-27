@@ -3758,6 +3758,11 @@ const App = struct {
         try AgentsAppRuntime.openMenu(self);
     }
 
+    /// `/stop`: stops every working subagent in the current session's tree.
+    pub fn stopWorkingSubagents(self: *App) !usize {
+        return AgentsAppRuntime.stopWorkingSubagents(self);
+    }
+
     pub fn closeAgentsMenu(self: *App) void {
         _ = AgentsAppRuntime.closeMenu(self);
     }

@@ -22,6 +22,7 @@ const agents_menu_presentation = @import("../../ui/footer/agents_menu_presentati
 const session_mod = @import("../session/session.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_process_runtime = @import("app_process_runtime.zig");
+const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const profiles = @import("../profiles/profiles.zig");
@@ -3899,6 +3900,83 @@ pub fn Runtime(comptime App: type) type {
             endRun(run, outcome);
         }
 
+        /// Stops every working subagent in the current session's tree using the
+        /// per-child user-stop path (`noteUserStop` and per-child cancel),
+        /// leaving idle subagents, other instances' subagents, the main turn,
+        /// and the composer draft untouched. Returns how many were stopped.
+        pub fn stopWorkingSubagents(app: *App) !usize {
+            const screen = agents.screenAgentOf(app);
+            const session_root: *AppAgent = if (hostedOf(app, screen)) |child|
+                if (child.agent.role == .subagent) rootInstance(app, child) else screen
+            else
+                screen;
+            var stopped: usize = 0;
+            for (app.child_agents.items) |child| {
+                if (child.agent.role != .subagent or rootInstance(app, child) != session_root) continue;
+                if (!subagentWorking(child)) continue;
+                if (app.approval_lender == child) _ = returnApproval(app);
+                if (app.question_lender == child) _ = returnQuestion(app);
+                if (app.wait_card_lender == child) _ = returnWaitCard(app);
+                if (child == app.agent_on_screen) {
+                    try stopChildAgentInContext({}, app, &child.agent);
+                } else {
+                    try visit(app, child, {}, stopChildAgentInContext);
+                }
+                stopped += 1;
+            }
+            if (stopped > 0) {
+                if (comptime @hasDecl(App, "playCancelSound")) app.playCancelSound();
+                app.shell.render_requests.request(.footer);
+            }
+            return stopped;
+        }
+
+        fn subagentWorking(child: *ChildAgent) bool {
+            if (child.agent.worker.isTurnCancelRequested()) return false;
+            if (turnInFlight(&child.agent)) return true;
+            if (child.agent.child_run) |*run| {
+                if (run.inFlight() and run.ended_as == null) return true;
+            }
+            return false;
+        }
+
+        fn stopChildAgentInContext(_: void, app: *App, agent: *AppAgent) anyerror!void {
+            if (agent.approval_prompt.isActive()) {
+                noteUserStop(app, agent);
+                agent.worker.cancelApprovalTurn();
+                agent.approval_prompt.clearWithReason(app.alloc, "cancelled");
+                if (comptime @hasField(App, "approval_screen")) app.approval_screen.clear();
+                if (agent.stream.active) {
+                    try app.shell.freezeAssistantTail(app.alloc, "cancel_approval");
+                    app_worker_runtime.Runtime(App).clearPacer(app, agent, "cancel_approval");
+                    app.stopStream(agent);
+                }
+                return;
+            }
+            if (agent.question_prompt.isActive()) {
+                const route_recovery = agent.worker.pendingQuestionBatchSource() == worker_runtime.QuestionPromptSource.route_recovery;
+                if (!route_recovery) {
+                    noteUserStop(app, agent);
+                    agent.worker.requestInteractiveCancel();
+                }
+                app_worker_runtime.Runtime(App).clearPacer(app, agent, "cancel_question");
+                try agent.worker.submitQuestionBatchAnswer(std.heap.c_allocator, null, null);
+                agent.question_prompt.discard(app.alloc, "cancelled");
+                app.stopStream(agent);
+                return;
+            }
+            if (agent.stream.active) {
+                try input_interrupt_runtime.InterruptRuntime(App).cancelActiveStream(app, agent, false);
+                return;
+            }
+            noteUserStop(app, agent);
+            agent.worker.requestInteractiveCancel();
+            app_worker_runtime.Runtime(App).clearPacer(app, agent, "stop_subagents");
+            if (agent.worker.contextCompactionStatus() != .idle) {
+                _ = agent.worker.cancelContextCompaction(std.heap.c_allocator);
+            }
+        }
+
         /// The user stops a subagent's turn on its own screen (Esc, or
         /// cancelling its approval or question) while it works for its
         /// parent: the other agents' messages waiting in its queue are
@@ -4661,4 +4739,136 @@ test "only a subagent has a purpose to show, and the list's search reads it with
     try std.testing.expect(matchesSearchText("auditor", "Review the parser", text, "parser"));
     try std.testing.expect(!matchesSearchText("auditor", "Review the parser", text, "giraffe"));
     try std.testing.expect(!matchesSearchText("auditor", "", "", "zebra"));
+}
+
+test "stopWorkingSubagents stops only working subagents in the active session tree without touching main or idle children" {
+    const alloc = std.testing.allocator;
+    const composer_edit = @import("../input/editor_state.zig");
+    const FakeStopTreeApp = struct {
+        alloc: Allocator,
+        main_agent: agents.Agent = .{},
+        main_screen: ScreenSlot = .{},
+        screen_owner: ?*agents.Agent = null,
+        agent_on_screen: ?*ChildAgent = null,
+        child_agents: std.ArrayList(*ChildAgent) = .empty,
+        approval_lender: ?*ChildAgent = null,
+        question_lender: ?*ChildAgent = null,
+        wait_card_lender: ?*ChildAgent = null,
+        pacer: AssistantPacer = .{},
+        fast_mode: bool = false,
+        permission_state: struct { authority_mutex: std.Io.Mutex = .init } = .{},
+        instances: struct {
+            first_open: bool = true,
+            agents_menu: struct { open: bool = false } = .{},
+        } = .{},
+        input_runtime: struct {
+            edit_state: composer_edit.State = .{},
+        } = .{},
+        shell: struct {
+            render_requests: @import("../../ui/render_request.zig").RenderRequestState = .{},
+            transcript_slot: transcript_runtime.TranscriptSlot = .{},
+
+            pub fn swapSlot(self: *@This(), other: *transcript_runtime.TranscriptSlot) void {
+                std.mem.swap(transcript_runtime.TranscriptSlot, &self.transcript_slot, other);
+            }
+
+            pub fn freezeAssistantTail(_: *@This(), _: Allocator, _: []const u8) !void {}
+            pub fn resetCommandOutputDisplay(_: *@This(), _: Allocator, _: []const u8) void {}
+        } = .{},
+        metrics: types.Metrics = .{},
+
+        pub fn stopStream(_: *@This(), agent: *agents.Agent) void {
+            agent.stream = .{};
+        }
+    };
+
+    var app = FakeStopTreeApp{ .alloc = alloc };
+    defer {
+        app.main_agent.worker.deinit(alloc);
+        app.main_screen.deinit(alloc);
+        app.pacer.deinit(alloc);
+        app.input_runtime.edit_state.deinit(alloc);
+        transcript_runtime.TranscriptRuntime.deinitSlot(&app.shell.transcript_slot, alloc);
+    }
+    try app.input_runtime.edit_state.setText(alloc, "keep this draft");
+
+    // Only the hosts' addresses are compared by `rootInstance` when no `child_run` is attached.
+    var main_host: subagent_tool_host.Runtime = undefined;
+    var other_host: subagent_tool_host.Runtime = undefined;
+    app.main_agent.session_persistence.subagent_host = &main_host;
+
+    var other_instance: ChildAgent = .{
+        .id = try alloc.dupe(u8, "inst-2"),
+        .agent = .{ .role = .instance },
+    };
+    defer {
+        other_instance.agent.worker.deinit(alloc);
+        other_instance.screen.deinit(alloc);
+        alloc.free(other_instance.id);
+    }
+    other_instance.agent.session_persistence.subagent_host = &other_host;
+
+    var work_a: ChildAgent = .{
+        .id = try alloc.dupe(u8, "work-a"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer {
+        work_a.agent.worker.deinit(alloc);
+        work_a.screen.deinit(alloc);
+        alloc.free(work_a.id);
+    }
+    var work_b: ChildAgent = .{
+        .id = try alloc.dupe(u8, "work-b"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer {
+        work_b.agent.worker.deinit(alloc);
+        work_b.screen.deinit(alloc);
+        alloc.free(work_b.id);
+    }
+    var idle_child: ChildAgent = .{
+        .id = try alloc.dupe(u8, "idle-c"),
+        .agent = .{ .role = .subagent, .root_instance = &app.main_agent },
+        .parent_host = &main_host,
+    };
+    defer {
+        idle_child.agent.worker.deinit(alloc);
+        idle_child.screen.deinit(alloc);
+        alloc.free(idle_child.id);
+    }
+    var other_child: ChildAgent = .{
+        .id = try alloc.dupe(u8, "other-d"),
+        .agent = .{ .role = .subagent, .root_instance = &other_instance.agent },
+        .parent_host = &other_host,
+    };
+    defer {
+        other_child.agent.worker.deinit(alloc);
+        other_child.screen.deinit(alloc);
+        alloc.free(other_child.id);
+    }
+
+    try app.child_agents.appendSlice(alloc, &.{ &other_instance, &work_a, &work_b, &idle_child, &other_child });
+    defer app.child_agents.deinit(alloc);
+
+    try std.testing.expect(app.main_agent.worker.beginDirectProcessing(1));
+    defer app.main_agent.worker.finishProcessing();
+    try std.testing.expect(work_a.agent.worker.beginDirectProcessing(2));
+    defer work_a.agent.worker.finishProcessing();
+    try std.testing.expect(work_b.agent.worker.beginDirectProcessing(3));
+    defer work_b.agent.worker.finishProcessing();
+    try std.testing.expect(other_child.agent.worker.beginDirectProcessing(4));
+    defer other_child.agent.worker.finishProcessing();
+
+    const stopped = try Runtime(FakeStopTreeApp).stopWorkingSubagents(&app);
+    try std.testing.expectEqual(@as(usize, 2), stopped);
+    try std.testing.expect(work_a.agent.worker.isTurnCancelRequested());
+    try std.testing.expect(work_b.agent.worker.isTurnCancelRequested());
+    try std.testing.expect(!idle_child.agent.worker.isTurnCancelRequested());
+    try std.testing.expect(!other_child.agent.worker.isTurnCancelRequested());
+    try std.testing.expect(!app.main_agent.worker.isTurnCancelRequested());
+    try std.testing.expectEqualStrings("keep this draft", app.input_runtime.edit_state.input.items);
+    // Calling again when none remain uncancelled stops 0.
+    try std.testing.expectEqual(@as(usize, 0), try Runtime(FakeStopTreeApp).stopWorkingSubagents(&app));
 }

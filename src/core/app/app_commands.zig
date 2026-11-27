@@ -296,6 +296,7 @@ pub fn Handlers(comptime App: type) type {
                 .launch_instance = commandLaunchInstance,
                 .close_instance = commandCloseInstance,
                 .show_agents = commandShowAgents,
+                .stop_subagents = commandStopSubagents,
                 .reset_session = commandResetSession,
                 .resume_session = commandResumeSession,
                 .fork_session = commandForkSession,
@@ -474,6 +475,24 @@ pub fn Handlers(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !@hasDecl(App, "openAgentsMenu")) return;
             try app.openAgentsMenu();
+        }
+
+        /// `/stop` stops every working subagent in the current session's tree
+        /// and reports how many were stopped without cancelling main's turn.
+        fn commandStopSubagents(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !@hasDecl(App, "stopWorkingSubagents")) return;
+            const stopped = try app.stopWorkingSubagents();
+            var body_buf: [64]u8 = undefined;
+            const body = if (stopped == 0)
+                "No subagent is working."
+            else
+                try std.mem.print(&body_buf, "Stopped {d} subagent{s}.", .{ stopped, if (stopped == 1) "" else "s" });
+            try app.writeDomainNotice(.{
+                .topic = "subagent",
+                .tone = .neutral,
+                .body = body,
+            }, true);
         }
 
         fn commandResumeSession(ctx: *anyopaque) !void {
@@ -2893,4 +2912,48 @@ test "/version command writes dev build label and omits unresolved revision" {
     try expectVersionCommandBody(.dev, "f1862c5061f5", "0.0.17-f1862c5 (dev)");
     try expectVersionCommandBody(.dev, "unknown", "0.0.17 (dev)");
     try expectVersionCommandBody(.dev, "", "0.0.17 (dev)");
+}
+
+test "/stop command writes stopped count or idle notice" {
+    const FakeStopApp = struct {
+        alloc: std.mem.Allocator,
+        stop_result: usize = 0,
+        calls: usize = 0,
+        notice_topic: ?[]const u8 = null,
+        notice_tone: ?types.NoticeTone = null,
+        notice_body: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.notice_body.deinit(self.alloc);
+        }
+
+        pub fn stopWorkingSubagents(self: *@This()) !usize {
+            self.calls += 1;
+            return self.stop_result;
+        }
+
+        noinline fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
+            self.notice_topic = notice.topic;
+            self.notice_tone = notice.tone;
+            self.notice_body.clearRetainingCapacity();
+            try self.notice_body.appendSlice(self.alloc, notice.body);
+        }
+    };
+
+    var app = FakeStopApp{ .alloc = std.testing.allocator, .stop_result = 0 };
+    defer app.deinit();
+
+    try Handlers(FakeStopApp).commandStopSubagents(@ptrCast(&app));
+    try std.testing.expectEqual(@as(usize, 1), app.calls);
+    try std.testing.expectEqualStrings("subagent", app.notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone.?);
+    try std.testing.expectEqualStrings("No subagent is working.", app.notice_body.items);
+
+    app.stop_result = 1;
+    try Handlers(FakeStopApp).commandStopSubagents(@ptrCast(&app));
+    try std.testing.expectEqualStrings("Stopped 1 subagent.", app.notice_body.items);
+
+    app.stop_result = 3;
+    try Handlers(FakeStopApp).commandStopSubagents(@ptrCast(&app));
+    try std.testing.expectEqualStrings("Stopped 3 subagents.", app.notice_body.items);
 }

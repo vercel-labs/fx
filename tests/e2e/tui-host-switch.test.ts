@@ -6389,4 +6389,196 @@ describe("a subagent's wait shows in the view the person is on", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "/stop stops every working subagent while main streams, leaves idle subagents and main alone, and shows the notice",
+    async () => {
+      const alphaHeld = held();
+      const betaHeld = held();
+      const mainHeld = held();
+      let alphaCalls = 0;
+      let betaCalls = 0;
+      let idlerCalls = 0;
+      let mainCalls = 0;
+      const reports = new Map<string, { agent: string; outcome: string; cause?: string }>();
+      const collectReports = (body: string) => {
+        const walk = (value: unknown) => {
+          if (typeof value === "string") {
+            const idx = value.indexOf(REPORT_HEADER);
+            if (idx < 0) return;
+            for (const line of value.slice(idx).split("\n")) {
+              if (!line.startsWith("{")) continue;
+              const parsed = JSON.parse(line);
+              if (parsed.agent) {
+                reports.set(parsed.agent, { agent: parsed.agent, outcome: parsed.outcome, cause: parsed.cause });
+              }
+            }
+          } else if (Array.isArray(value)) value.forEach(walk);
+          else if (value && typeof value === "object") Object.values(value).forEach(walk);
+        };
+        walk(JSON.parse(body));
+      };
+      try {
+        await withFx(async (body) => {
+          const latest = latestUserText(body);
+          if (!isMainRequest(body)) {
+            if (latest.includes("STOP_IDLE_TASK")) {
+              idlerCalls += 1;
+              return text("idler_done", "STOP_IDLER_DONE");
+            }
+            if (latest.includes("STOP_ALPHA_TASK")) {
+              alphaCalls += 1;
+              await alphaHeld.promise;
+              return text("alpha_done", "STOP_ALPHA_DONE");
+            }
+            if (latest.includes("STOP_BETA_TASK")) {
+              betaCalls += 1;
+              await betaHeld.promise;
+              return text("beta_done", "STOP_BETA_DONE");
+            }
+            return text("other_done", "STOP_OTHER_DONE");
+          }
+          collectReports(body);
+          if (latest.startsWith(REPORT_HEADER)) {
+            if (reports.has("idler") && !body.includes('"STOP_PHASE_2"')) {
+              return text("main_idle_ready", "STOP_IDLE_READY");
+            }
+            return text(`main_report_${reports.size}`, "STOP_MAIN_SAW_REPORT");
+          }
+          mainCalls += 1;
+          if (latest.includes("STOP_PHASE_1")) {
+            return toolCall("main_idler", "subagent", {
+              request: { action: "message", agent: "idler", message: "STOP_IDLE_TASK look" },
+            });
+          }
+          if (body.includes('"main_idler"') && !body.includes('"STOP_IDLE_READY"') && !body.includes('"STOP_PHASE_2"')) {
+            return toolCall("main_wait_idler", "subagent", { request: { action: "wait" } });
+          }
+          if (latest.includes("STOP_PHASE_2")) {
+            if (!body.includes('"main_alpha"')) {
+              return toolCall("main_alpha", "subagent", {
+                request: { action: "message", agent: "alpha", message: "STOP_ALPHA_TASK work" },
+              });
+            }
+            if (!body.includes('"main_beta"')) {
+              return toolCall("main_beta", "subagent", {
+                request: { action: "message", agent: "beta", message: "STOP_BETA_TASK work" },
+              });
+            }
+            await until("both subagents to start", () => alphaCalls >= 1 && betaCalls >= 1);
+            await mainHeld.promise;
+            return text("main_phase2_done", "STOP_MAIN_FINISHED");
+          }
+          return text("main_fallback", "STOP_MAIN_FALLBACK");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER STOP_PHASE_1");
+          await session.waitForPane((pane) => pane.includes("STOP_IDLE_READY") && turnSettled(pane), 30_000);
+
+          await session.sendText("SWITCH_USER STOP_PHASE_2");
+          await until("alpha and beta working while main streams", () => alphaCalls === 1 && betaCalls === 1);
+
+          await session.sendText("/stop");
+          await session.waitForText("Stopped 2 subagents.", 15_000);
+
+          mainHeld.release();
+          await session.waitForText("STOP_MAIN_FINISHED", 30_000);
+          await until("both user-stop reports", () => reports.has("alpha") && reports.has("beta"), 30_000);
+
+          expect(reports.get("alpha")).toEqual({
+            agent: "alpha",
+            outcome: "cancelled",
+            cause: "user_stop",
+          });
+          expect(reports.get("beta")).toEqual({
+            agent: "beta",
+            outcome: "cancelled",
+            cause: "user_stop",
+          });
+          expect(idlerCalls).toBe(1);
+
+          await session.sendKeys("C-x");
+          const list = await session.waitForPane((pane) =>
+            pane.includes(LIST_HINT)
+            && subagentRow("alpha", "stopped").test(pane)
+            && subagentRow("beta", "stopped").test(pane)
+            && subagentRow("idler", "idle").test(pane), 10_000);
+          expect(list).toMatch(subagentRow("idler", "idle"));
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes(LIST_HINT), 5_000);
+
+          await session.sendText("/stop");
+          await session.waitForText("No subagent is working.", 10_000);
+          expect(mainCalls).toBeGreaterThanOrEqual(3);
+        });
+      } finally {
+        alphaHeld.release();
+        betaHeld.release();
+        mainHeld.release();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/stop bound to a shortcut runs while main streams and keeps the composer draft",
+    async () => {
+      const alphaHeld = held();
+      const mainHeld = held();
+      let alphaCalls = 0;
+      const reports: Array<{ agent: string; outcome: string; cause?: string }> = [];
+      try {
+        await withFx(
+          async (body) => {
+            const latest = latestUserText(body);
+            if (!isMainRequest(body)) {
+              alphaCalls += 1;
+              await alphaHeld.promise;
+              return text("alpha_done", "SHORTCUT_ALPHA_DONE");
+            }
+            if (latest.startsWith(REPORT_HEADER)) {
+              const parsed = JSON.parse(latest.slice(REPORT_HEADER.length));
+              reports.push({ agent: parsed.agent, outcome: parsed.outcome, cause: parsed.cause });
+              return text("main_report", "SHORTCUT_MAIN_SAW_REPORT");
+            }
+            if (!body.includes('"main_alpha_sc"')) {
+              return toolCall("main_alpha_sc", "subagent", {
+                request: { action: "message", agent: "alpha", message: "SHORTCUT_ALPHA_TASK work" },
+              });
+            }
+            await until("alpha working", () => alphaCalls >= 1);
+            await mainHeld.promise;
+            return text("main_done", "SHORTCUT_MAIN_FINISHED");
+          },
+          async (session) => {
+            await session.sendText("SWITCH_USER start alpha");
+            await until("alpha working while main streams", () => alphaCalls === 1);
+
+            await session.sendLiteral("KEEP_MY_DRAFT");
+            await session.waitForPane((pane) => composerContains(pane, "KEEP_MY_DRAFT"), 10_000);
+
+            // Alt+K bound to `/stop`
+            await session.sendHexBytes(["1b", "6b"]);
+            const stopped = await session.waitForPane((pane) => pane.includes("Stopped 1 subagent."), 15_000);
+            expect(composerContains(stopped, "KEEP_MY_DRAFT")).toBe(true);
+
+            mainHeld.release();
+            await session.waitForPane((pane) => pane.includes("SHORTCUT_MAIN_FINISHED") && turnSettled(pane), 30_000);
+            expect(composerContains(await session.capturePane(), "KEEP_MY_DRAFT")).toBe(true);
+            await until("alpha user-stop report", () => reports.some((report) => report.agent === "alpha"), 30_000);
+            expect(reports[0]).toEqual({ agent: "alpha", outcome: "cancelled", cause: "user_stop" });
+          },
+          (home) => {
+            writeFileSync(
+              join(home, ".fx", "settings.json"),
+              JSON.stringify({ sandbox: "none", shortcuts: { "alt+k": "/stop" } }),
+            );
+          },
+        );
+      } finally {
+        alphaHeld.release();
+        mainHeld.release();
+      }
+    },
+    TIMEOUT,
+  );
 });
