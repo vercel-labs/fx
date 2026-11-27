@@ -7608,7 +7608,8 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
       const result = await runFx(["ask", "--json", "--auto", "Report the supplied answer without using tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(result.signal).toBeNull();
       expect(result.code, result.stdout + result.stderr).toBe(rejected ? 1 : 0);
-      expect(direct ? direct.bodies.length : gateway.requests.length).toBe(rejected || limited ? 1 : 2);
+      // A cut answer goes on in a second request, as a failed one is retried.
+      expect(direct ? direct.bodies.length : gateway.requests.length).toBe(rejected ? 1 : 2);
       const output = JSON.parse(result.stdout);
       expect(output.tool_calls).toEqual([]);
       if (rejected) {
@@ -7633,15 +7634,21 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
           expect(input.filter((item: { type?: string }) => item.type === "function_call")).toEqual([]);
         }
       } else {
-        expect(output.output).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
-        if (limited) expect(result.stderr).toContain("[notice] The response hit the provider's length limit and may be incomplete.");
+        // The reply that finishes a cut answer joins it, so the answer is whole.
+        const answer = limited ? "LIMITED_ANSWERRECOVERED_OK" : "RECOVERED_OK";
+        expect(output.final_output).toBe(answer);
+        if (limited) {
+          expect(result.stderr).toContain("Asking the model to continue from where it stopped.");
+          expect(direct!.bodies[1]).toContain("LIMITED_ANSWER");
+          expect(direct!.bodies[1]).toContain("Continue exactly where it stopped, without repeating it.");
+        }
         // A retry shows the recovery module's wording, never the provider's detail.
         else expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
         const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
         const history = JSON.parse(detail.stdout).history;
         expect(history).toHaveLength(1);
-        expect(history[0].assistant).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
+        expect(history[0].assistant).toBe(answer);
         expect(history[0].execution.tool_steps).toEqual([]);
         if (mode === "partial") expect(direct!.bodies[1]).not.toContain("DISCARDED_PREVIEW");
       }
