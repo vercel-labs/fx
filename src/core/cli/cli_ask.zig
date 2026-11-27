@@ -10133,7 +10133,7 @@ test "AskEventSink appends JSONL lines, bounds long text, and latches write erro
     {
         var sink = try AskEventSink.open(path, &stderr_capture, TestCapture.write);
         defer sink.close();
-        sink.emitRunStarted("openai/gpt-5", 1);
+        sink.emitRunStarted("provider/model-a", 1);
         var long_msg: [700]u8 = undefined;
         @memset(&long_msg, 'x');
         sink.emit(.{ .event = "notice", .message = &long_msg });
