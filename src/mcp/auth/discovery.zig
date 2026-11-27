@@ -270,7 +270,9 @@ fn isInternal(host: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(std.mem.trimEnd(u8, host, "."), name)) return true;
     }
     var v4 = ipv4(host);
-    if (std.ascii.startsWithIgnoreCase(host, "::ffff:")) v4 = ipv4(host[7..]);
+    if (std.ascii.startsWithIgnoreCase(host, "::ffff:")) {
+        v4 = ipv4(host[7..]) orelse ipv4FromHexPair(host[7..]);
+    }
     if (v4) |ip| return ip[0] == 0 or ip[0] == 10 or ip[0] == 127 or (ip[0] == 100 and ip[1] >= 64 and ip[1] <= 127) or
         (ip[0] == 169 and ip[1] == 254) or (ip[0] == 172 and ip[1] >= 16 and ip[1] <= 31) or
         (ip[0] == 192 and ip[1] == 168) or (ip[0] == 198 and (ip[1] == 18 or ip[1] == 19)) or ip[0] >= 224;
@@ -281,16 +283,41 @@ fn isInternal(host: []const u8) bool {
     return host.len >= 3 and std.ascii.startsWithIgnoreCase(host, "fe") and std.mem.findScalar(u8, "89abAB", host[2]) != null;
 }
 
+fn ipv4FromHexPair(rest: []const u8) ?[4]u8 {
+    const colon = std.mem.findScalar(u8, rest, ':') orelse return null;
+    const hi = std.fmt.parseInt(u16, rest[0..colon], 16) catch return null;
+    const lo = std.fmt.parseInt(u16, rest[colon + 1 ..], 16) catch return null;
+    return .{ @intCast(hi >> 8), @intCast(hi & 0xff), @intCast(lo >> 8), @intCast(lo & 0xff) };
+}
+
+fn parseIpv4Part(part: []const u8) ?u32 {
+    if (part.len == 0) return null;
+    if (part.len >= 2 and part[0] == '0' and (part[1] == 'x' or part[1] == 'X')) {
+        return std.fmt.parseInt(u32, part[2..], 16) catch null;
+    }
+    if (part.len > 1 and part[0] == '0') {
+        return std.fmt.parseInt(u32, part[1..], 8) catch null;
+    }
+    return std.fmt.parseInt(u32, part, 10) catch null;
+}
+
 fn ipv4(host: []const u8) ?[4]u8 {
-    var out: [4]u8 = undefined;
+    if (host.len == 0) return null;
+    var parts: [4]u32 = undefined;
     var it = std.mem.splitScalar(u8, host, '.');
     var n: usize = 0;
     while (it.next()) |part| : (n += 1) {
-        if (n == 4 or part.len == 0 or part.len > 3) return null;
-        for (part) |c| if (!std.ascii.isDigit(c)) return null;
-        out[n] = std.fmt.parseInt(u8, part, 10) catch return null;
+        if (n == 4) return null;
+        parts[n] = parseIpv4Part(part) orelse return null;
     }
-    return if (n == 4) out else null;
+    const addr: u32 = switch (n) {
+        1 => parts[0],
+        2 => if (parts[0] > 0xff or parts[1] > 0xffffff) return null else (parts[0] << 24) | parts[1],
+        3 => if (parts[0] > 0xff or parts[1] > 0xff or parts[2] > 0xffff) return null else (parts[0] << 24) | (parts[1] << 16) | parts[2],
+        4 => if (parts[0] > 0xff or parts[1] > 0xff or parts[2] > 0xff or parts[3] > 0xff) return null else (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3],
+        else => return null,
+    };
+    return .{ @intCast((addr >> 24) & 0xff), @intCast((addr >> 16) & 0xff), @intCast((addr >> 8) & 0xff), @intCast(addr & 0xff) };
 }
 
 // ---- Documents ----
@@ -526,6 +553,22 @@ test "which URLs may be used or fetched" {
     try testing.expectEqual(@as(?Refusal, null), refusal("https://auth.example.com/x", "https://mcp.example.com/mcp"));
     try testing.expectEqual(@as(?Refusal, .insecure), refusal("http://auth.example.com/x", "https://mcp.example.com/mcp"));
     try testing.expectEqual(@as(?Refusal, .internal), refusal("https://10.0.0.1/x", "https://mcp.example.com/mcp"));
+}
+
+test "integer, short, octal, hex IPv4 and hex-mapped IPv6 internal hosts are refused" {
+    for ([_][]const u8{
+        "https://2130706433/x",
+        "https://2852039166/x",
+        "https://127.1/x",
+        "https://169.254.43518/x",
+        "https://0177.0.0.1/x",
+        "https://0x7f000001/x",
+        "https://[::ffff:a9fe:a9fe]/x",
+        "https://[::ffff:7f00:1]/x",
+    }) |url| {
+        try testing.expectEqual(@as(?Refusal, .internal), refusal(url, "https://mcp.example.com/mcp"));
+    }
+    try testing.expectEqual(@as(?Refusal, null), refusal("https://134744072/x", "https://mcp.example.com/mcp"));
 }
 
 test "reads and checks both metadata documents" {
