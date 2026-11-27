@@ -268,7 +268,7 @@ pub const Refusal = enum {
 /// (unavailable). `fx mcp show` names each in the words it has for them (`verbs.zig`).
 pub const temporary_statuses = [_]u16{ 429, 503 };
 
-pub fn temporaryStatus(status: u16) bool {
+fn temporaryStatus(status: u16) bool {
     return std.mem.findScalar(u16, &temporary_statuses, status) != null;
 }
 
