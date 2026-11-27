@@ -11759,6 +11759,54 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP bash runs skill list and agent status, and the result holds the skill line and the agent status",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-bash-skill-agent-");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { bash_tool: true } }));
+      mkdirSync(join(root.workspace, ".fx", "skills", "demo"), { recursive: true });
+      writeFileSync(
+        join(root.workspace, ".fx", "skills", "demo", "SKILL.md"),
+        "---\nname: demo\ndescription: Demo skill description\n---\n\nDEMO_INSTRUCTIONS\n",
+      );
+      const gateway = startDynamicFakeGateway((body) => {
+        if (body.includes('"toolCallId":"acp_skill_agent"')) return finalText("ACP_SKILL_AGENT_DONE");
+        if (body.includes("List skills and agent status.")) {
+          return fakeGatewayToolCall("acp_skill_agent", "bash", { command: "skill list; agent status" });
+        }
+        return finalText("ACP_OTHER");
+      });
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine(); // consume session/update notification
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const run = await runPrompt(client, "List skills and agent status.", 60_000);
+        expect(run.promptResult.result.stopReason).toBe("end_turn");
+
+        const request = gateway.requests.find((entry) => entry.body.includes('"toolCallId":"acp_skill_agent"'));
+        expect(request).toBeDefined();
+        const output = acpToolResultText(request!.body, "acp_skill_agent");
+        expect(output).toContain("demo\tDemo skill description");
+        expect(output).toContain("No subagents yet.");
+
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  test(
     "ACP sessions start with a fresh bash state: a new session does not see the last one's variables",
     async () => {
       const root = createIsolatedRoot("fx-acp-bash-fresh-");

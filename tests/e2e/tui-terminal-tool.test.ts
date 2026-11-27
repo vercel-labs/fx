@@ -1631,6 +1631,38 @@ test(
   60_000,
 );
 
+test.skipIf(!tmuxAvailable())(
+  "TUI bash skill list shows its row in the call and the model reads the skill line",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-skill-", { experimental: { bash_tool: true } });
+    mkdirSync(join(fixture.workspace, ".fx", "skills", "demo"), { recursive: true });
+    writeFileSync(
+      join(fixture.workspace, ".fx", "skills", "demo", "SKILL.md"),
+      "---\nname: demo\ndescription: Demo skill description\n---\n\nDEMO_INSTRUCTIONS\n",
+    );
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash_skill_list", "bash", { command: "skill list" }),
+      fakeGatewayFinalText("BASH_SKILL_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("List skills.");
+    await active.sendKeys("Enter");
+    await active.waitForText("BASH_SKILL_DONE", TIMEOUT);
+    expect(await active.capturePane()).toContain("Ran skill list");
+
+    expect(gateway.requests).toHaveLength(2);
+    const output = JSON.parse(toolResultText(gateway.requests[1]!.body, "bash_skill_list")) as { value: string };
+    expect(output.value).toContain("demo\tDemo skill description");
+
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
 async function waitForEditApproval(
   session: TmuxSession,
   required: string[] = [],
