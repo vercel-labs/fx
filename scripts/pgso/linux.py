@@ -715,8 +715,8 @@ ARM64 = Platform(
     DISPLAY_NAME="Linux arm64",
     HOST_ARCH="aarch64",
     PROFILE_RUNTIME_TRIPLE="aarch64-unknown-linux-gnu",
-    # Linux arm64 candidates have measured up to 7.357 MiB, so the 0.250 MiB preferred headroom
-    # needs a ceiling of at least 7.607 MiB.
+    # Linux arm64 candidates have measured up to 7.382 MiB, so the 0.250 MiB preferred headroom
+    # needs a ceiling of at least 7.632 MiB.
     SIZE_CEILING_MIB=7.750,
 )
 X86_64 = Platform(
