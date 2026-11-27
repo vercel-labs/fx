@@ -155,12 +155,23 @@ const tool_skill_subcommands = [_]command_specs.SubcommandDoc{
 };
 
 const tool_agent_subcommands = [_]command_specs.SubcommandDoc{
-    .{ .usage = "message NAME TEXT", .description = "Message or start a subagent", .options = &tool_agent_message_options },
+    .{ .usage = "message NAME TEXT", .description = "Message or start a subagent; options take a value after a space or as --flag=value", .options = &tool_agent_message_options },
     .{ .usage = "wait", .description = "Wait for a subagent report or until none work" },
     .{ .usage = "status [NAME]", .description = "Show subagent state" },
     .{ .usage = "stop NAME", .description = "Stop a subagent's running turn" },
     .{ .usage = "close NAME", .description = "Close a subagent for good" },
 };
+
+/// The `tool` command's one-line summary. A build without the bash tool bridge
+/// still names the command, so its help never shows an empty summary.
+fn toolSummary(comptime bridge_supported: bool) []const u8 {
+    return if (bridge_supported) "Run bash-tool file, skill, and subagent commands" else "Bash tool commands (not available in this host)";
+}
+
+/// The `tool` command's usage, shared by its help entry and the top-level list.
+fn toolUsage(comptime bridge_supported: bool) []const u8 {
+    return if (bridge_supported) "tool <edit|write|skill|agent> ..." else "tool";
+}
 
 const tool_subcommands: []const command_specs.SubcommandDoc = if (tool_bridge.supported) &.{
     .{ .usage = "edit PATH", .description = "Change a file with SEARCH/REPLACE blocks on stdin" },
@@ -371,8 +382,8 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .tool,
         .token = "tool",
-        .usage = if (tool_bridge.supported) "tool <edit|write|skill|agent> ..." else "tool",
-        .summary = if (tool_bridge.supported) "Run bash-tool file, skill, and subagent commands" else "",
+        .usage = toolUsage(tool_bridge.supported),
+        .summary = toolSummary(tool_bridge.supported),
         .subcommands = tool_subcommands,
         .details = if (tool_bridge.supported) &.{
             "Each command runs through fx's permission rules and review, as the agent's own call does. Only edit and write read stdin.",
@@ -561,7 +572,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
         .{ .kind = .mcp, .usage = "mcp <command> ..." },
-        .{ .kind = .tool, .usage = "tool edit|write PATH" },
+        .{ .kind = .tool, .usage = toolUsage(tool_bridge.supported) },
         .{ .kind = .slack, .usage = "slack <install|status|refresh>" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
@@ -1024,4 +1035,19 @@ test "fx tool help matches tool_bridge.supported" {
         try std.testing.expectEqual(@as(usize, 0), spec.subcommands.len);
         try std.testing.expectEqual(@as(usize, 0), spec.details.len);
     }
+    try std.testing.expectEqualStrings(toolSummary(tool_bridge.supported), spec.summary);
+    try std.testing.expect(toolSummary(false).len > 0);
+}
+
+test "fx tool help group line shows the same usage as the tool spec" {
+    const spec = for (top_level_specs) |entry| {
+        if (entry.kind == .tool) break entry;
+    } else unreachable;
+    var group_usage: ?[]const u8 = null;
+    for (top_level_help_groups) |group| {
+        for (group.entries) |entry| {
+            if (entry.kind == .tool) group_usage = entry.usage;
+        }
+    }
+    try std.testing.expectEqualStrings(spec.usage, group_usage orelse return error.TestUnexpectedResult);
 }

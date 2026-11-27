@@ -437,8 +437,11 @@ fn printReply(arena: Allocator, out: *Writer, err: *Writer, command: Command, re
     switch (reply.header.status) {
         .ok => {
             try out.writeAll(reply.bytes);
-            if (reply.bytes.len > 0 and reply.bytes[reply.bytes.len - 1] != '\n') {
-                try out.writeByte('\n');
+            // edit and write always end with a newline, as they did before the
+            // skill and agent words; those words add one only when it is missing.
+            switch (command) {
+                .edit, .write => try out.writeByte('\n'),
+                else => if (reply.bytes.len > 0 and reply.bytes[reply.bytes.len - 1] != '\n') try out.writeByte('\n'),
             }
             return client.exit.ok;
         },
@@ -722,6 +725,55 @@ test "a multi-block edit is one request, and each reply status gives its exit co
         try std.testing.expectEqualStrings(case.stderr, err.written());
         try std.testing.expectEqual(@as(usize, 1), fake.calls);
         try std.testing.expectEqual(@as(usize, 2), fake.edit_blocks);
+    }
+}
+
+test "fx tool edit ends its reply with a newline, even when the reply already has one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const input = "<<<<<<< SEARCH\none\n=======\ntwo\n>>>>>>> REPLACE\n";
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .ok, .bytes = 14 }, .bytes = "edited app.py\n" } };
+
+    const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .edit = "app.py" }, input, test_bridge, fake.caller());
+    try std.testing.expectEqual(client.exit.ok, code);
+    try std.testing.expectEqualStrings("edited app.py\n\n", out.written());
+    try std.testing.expectEqualStrings("", err.written());
+}
+
+test "fx tool write ends its reply with a newline, even when the reply already has one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .ok, .bytes = 14 }, .bytes = "wrote new.txt\n" } };
+
+    const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .write = "new.txt" }, "hello\n", test_bridge, fake.caller());
+    try std.testing.expectEqual(client.exit.ok, code);
+    try std.testing.expectEqualStrings("wrote new.txt\n\n", out.written());
+    try std.testing.expectEqualStrings("", err.written());
+}
+
+test "skill and agent replies end with one newline, and add none when the reply has one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var err: std.Io.Writer.Allocating = .init(arena);
+        var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .ok, .bytes = 13 }, .bytes = "zig\tZig help\n" } };
+        _ = try send(arena, std.testing.io, &out.writer, &err.writer, .skill_list, "", test_bridge, fake.caller());
+        try std.testing.expectEqualStrings("zig\tZig help\n", out.written());
+    }
+    {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var err: std.Io.Writer.Allocating = .init(arena);
+        var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .ok, .bytes = 4 }, .bytes = "done" } };
+        _ = try send(arena, std.testing.io, &out.writer, &err.writer, .agent_wait, "", test_bridge, fake.caller());
+        try std.testing.expectEqualStrings("done\n", out.written());
     }
 }
 

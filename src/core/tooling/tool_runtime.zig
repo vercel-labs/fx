@@ -1737,7 +1737,19 @@ fn runBridgeSkillOpen(
 /// The model-facing text for a skill read that failed after the skill was
 /// chosen. Each named error says what is wrong and what to do next. The last
 /// arm names an unexpected error, so no failure is shown as a bare error name.
-fn skillOpenFailureText(arena: Allocator, name: []const u8, resource: ?[]const u8, err: anyerror) Allocator.Error![]const u8 {
+/// The longest encoded skill name or resource that a failure text shows. A
+/// longer one is cut on a token boundary and ends with "...".
+const skill_open_field_bytes: usize = 200;
+
+/// A skill name or resource from a program, as text fit to draw and to send
+/// to the model: terminal-safe, and at most `skill_open_field_bytes` bytes.
+fn skillOpenField(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
+    return (try text_utils.encodeTerminalSafe(arena, raw, skill_open_field_bytes)).bytes;
+}
+
+fn skillOpenFailureText(arena: Allocator, raw_name: []const u8, raw_resource: ?[]const u8, err: anyerror) Allocator.Error![]const u8 {
+    const name = try skillOpenField(arena, raw_name);
+    const resource = if (raw_resource) |raw| try skillOpenField(arena, raw) else null;
     const shown = resource orelse "SKILL.md";
     return switch (err) {
         error.FileNotFound => if (resource) |path|
@@ -3683,6 +3695,35 @@ test "bridged skill open read failures name the file, what is wrong, and the nex
         const text = try skillOpenFailureText(arena, "alpha", case.resource, case.err);
         try std.testing.expectEqualStrings(case.expected, text);
     }
+}
+
+test "bridged skill open shows a program's name and resource terminal-safe and cut to 200 bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var hostile_buf: [5 + 300]u8 = undefined;
+    @memcpy(hostile_buf[0..5], "\x1b[31m");
+    @memset(hostile_buf[5..], 'a');
+    const hostile: []const u8 = &hostile_buf;
+
+    const missing = try skillOpenFailureText(arena, hostile, null, error.FileNotFound);
+    const missing_prefix = "fx tool skill open: no skill named ";
+    const missing_suffix = "; run skill list to see the names.";
+    try std.testing.expect(std.mem.startsWith(u8, missing, missing_prefix));
+    try std.testing.expect(std.mem.endsWith(u8, missing, missing_suffix));
+    const shown_name = missing[missing_prefix.len .. missing.len - missing_suffix.len];
+    try std.testing.expect(shown_name.len <= 200);
+    try std.testing.expect(std.mem.endsWith(u8, shown_name, "..."));
+    try std.testing.expect(std.mem.findScalar(u8, shown_name, 0x1b) == null);
+
+    const resource_text = try skillOpenFailureText(arena, "alpha", hostile, error.FileNotFound);
+    const resource_prefix = "fx tool skill open: resource ";
+    const resource_end = " was not found in skill alpha";
+    try std.testing.expect(std.mem.startsWith(u8, resource_text, resource_prefix));
+    const end = std.mem.find(u8, resource_text, resource_end) orelse return error.TestUnexpectedResult;
+    const shown_resource = resource_text[resource_prefix.len..end];
+    try std.testing.expect(shown_resource.len <= 200);
+    try std.testing.expect(std.mem.findScalar(u8, shown_resource, 0x1b) == null);
 }
 
 const RunCommandBackendState = struct {
