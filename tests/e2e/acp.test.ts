@@ -10314,6 +10314,34 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "unknown method returns error -32601",
+    async () => {
+      // Its own profile and fake gateway, as the other tests here use: the
+      // developer's profile can select a provider that refuses initialize.
+      const root = createIsolatedRoot("fx-acp-unknown-method-");
+      const gateway = startFakeGateway([]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const init = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+        expect(init.error).toBeUndefined();
+        expect(init.result.protocolVersion).toBe(1);
+        const resp = await client.request("nonexistent/method", {}, 2) as any;
+        expect(resp.error).toBeDefined();
+        expect(resp.error.code).toBe(-32601);
+        expect(resp.error.message).toContain("Method not found");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session/list leaves an empty home unchanged",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-acp-no-create-"));
@@ -15092,19 +15120,6 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
       expect(resp.error).toBeDefined();
       expect(resp.error.code).toBe(-32600);
       expect(resp.error.message).toContain("Not initialized");
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "unknown method returns error -32601",
-    async () => {
-      client = await AcpClient.create();
-      await client.request("initialize", { protocolVersion: 1 }, 1);
-      const resp = await client.request("nonexistent/method", {}, 2) as any;
-      expect(resp.error).toBeDefined();
-      expect(resp.error.code).toBe(-32601);
-      expect(resp.error.message).toContain("Method not found");
     },
     TIMEOUT,
   );

@@ -108,6 +108,13 @@ fn approvalActionFromRawByte(byte: u8) ?approval_decision.Action {
     return approvalActionFromByte(byte);
 }
 
+fn withTerminalInputEnrichment(
+    ingress: input_action.TerminalInputIngress,
+    context: input_action.TerminalDecodeContext,
+) input_action.TerminalInputIngress {
+    return withQuestionInput(withApprovalInput(ingress), context.question_freeform_selected);
+}
+
 fn withApprovalInput(
     ingress: input_action.TerminalInputIngress,
 ) input_action.TerminalInputIngress {
@@ -672,10 +679,19 @@ pub const Runtime = struct {
         context: input_action.TerminalDecodeContext,
     ) input_action.TerminalInputIngress {
         if (context.paste_active) return terminal_action_decoder.pasteByteIngress(byte);
-        return withQuestionInput(
-            withApprovalInput(self.terminal_action_decoder.feed(byte, context)),
-            context.question_freeform_selected,
-        );
+        return withTerminalInputEnrichment(self.terminal_action_decoder.feed(byte, context), context);
+    }
+
+    /// Decodes a byte that core replays after routing a `remapped_byte`. It takes
+    /// the same approval and question enrichment as `decodeTerminalByte`, and it
+    /// names no chord, because the report that produced the byte already did.
+    pub fn decodeReplayedTerminalByte(
+        self: *Runtime,
+        byte: u8,
+        context: input_action.TerminalDecodeContext,
+    ) input_action.TerminalInputIngress {
+        if (context.paste_active) return terminal_action_decoder.pasteByteIngress(byte);
+        return withTerminalInputEnrichment(self.terminal_action_decoder.feedReplay(byte, context), context);
     }
 
     pub fn flushTerminalAction(
@@ -720,6 +736,57 @@ pub const Runtime = struct {
         };
     }
 };
+
+fn feedRuntimeSequence(
+    runtime: *Runtime,
+    bytes: []const u8,
+    context: input_action.TerminalDecodeContext,
+) input_action.TerminalInputIngress {
+    var ingress = input_action.TerminalInputIngress{};
+    for (bytes) |byte| ingress = runtime.decodeTerminalByte(byte, context);
+    return ingress;
+}
+
+test "replayed bytes keep live enrichment and event, and name no chord" {
+    var runtime: Runtime = .{};
+    defer runtime.deinit(std.testing.allocator);
+    const context: input_action.TerminalDecodeContext = .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = false,
+        .question_freeform_selected = true,
+    };
+
+    // Fallback: bytes with no chord, and printable bytes in a freeform answer.
+    for ([_]u8{ '\r', 0x7f, 'x', '1' }) |byte| {
+        const live = runtime.decodeTerminalByte(byte, context);
+        const replay = runtime.decodeReplayedTerminalByte(byte, context);
+        try std.testing.expectEqualDeep(live.event, replay.event);
+        try std.testing.expect(replay.chord == null);
+    }
+
+    // Fallback: control bytes name their chord live, and the replay keeps the same event.
+    for ([_]u8{ 3, 6, 11 }) |byte| {
+        const live = runtime.decodeTerminalByte(byte, context);
+        const replay = runtime.decodeReplayedTerminalByte(byte, context);
+        try std.testing.expectEqualDeep(live.event, replay.event);
+        try std.testing.expect(live.chord != null);
+        try std.testing.expect(replay.chord == null);
+    }
+
+    // Near miss: Ctrl+Super+F reports remapped_byte 6. Core replays that byte as
+    // a plain byte 6, which keeps the cursor motion and names no chord.
+    const near_miss = feedRuntimeSequence(&runtime, "\x1b[102;13u", context);
+    try std.testing.expectEqual(input_action.Action{ .remapped_byte = 6 }, near_miss.event.?.action.action);
+    const near_chord = near_miss.chord.?;
+    try std.testing.expect(near_chord.ctrl and near_chord.super);
+    try std.testing.expectEqual(@as(u8, 'f'), near_chord.key.char);
+    const direct = runtime.decodeTerminalByte(6, context);
+    const replayed = runtime.decodeReplayedTerminalByte(6, context);
+    try std.testing.expectEqualDeep(direct.event, replayed.event);
+    try std.testing.expect(direct.chord != null);
+    try std.testing.expect(replayed.chord == null);
+}
 
 test "deferred session input preserves delivery epochs and enforces a byte limit" {
     var runtime: Runtime = .{};
@@ -2309,6 +2376,31 @@ test "input escape parser handles alt+d as delete_word_right" {
     try expectEscapeAction("d", .{ .composer_shortcut = .delete_word_right });
     try expectEscapeAction("[100;3u", .delete_word_right);
     try expectEscapeAction("[27;3;100~", .delete_word_right);
+}
+
+test "input escape parser keeps Alt+m and Ctrl+digit events unchanged; their chords are named by the decoder" {
+    try expectEscapeAction("m", .ignore);
+    try expectEscapeAction("[109;3u", .ignore);
+    try expectEscapeAction("[27;3;109~", .ignore);
+    inline for (1..10) |slot| {
+        const digit = '0' + slot;
+        try expectEscapeAction(std.fmt.comptimePrint("[{d};5u", .{digit}), .ignore);
+        try expectEscapeAction(std.fmt.comptimePrint("[27;5;{d}~", .{digit}), .ignore);
+    }
+    try expectEscapeAction("[57400;5u", .ignore);
+}
+
+test "input escape parser keeps near-miss and ambiguous Alt+m and Ctrl+digit unassigned" {
+    try expectEscapeAction("\x1bm", .ignore);
+    try expectEscapeAction("[109;4u", .ignore);
+    try expectEscapeAction("[109;7u", .{ .remapped_byte = 13 });
+    try expectEscapeAction("[48;5u", .ignore);
+    try expectEscapeAction("[49;6u", .ignore);
+    try expectEscapeAction("[109;3:3u", .ignore);
+    try expectEscapeAction("[49;5:3u", .ignore);
+    try expectEscapeAction("\x1b[49;5u", .ignore);
+    try expectEscapeAction("\x1b[27;5;49~", .ignore);
+    try expectEscapeAction("\x1b[109;3u", .ignore);
 }
 
 test "input escape parser handles kitty alt+b and alt+f as word navigation" {

@@ -472,13 +472,6 @@ pub fn Runtime(comptime App: type) type {
                 } else .none,
                 .permission_reviewer_provider = if (comptime @hasDecl(App, "permissionReviewerProvider")) app.permissionReviewerProvider() else null,
                 .tracker = &agent.change_tracker,
-                .mcp_ctx = @ptrCast(app),
-                .mcp_has_tool = if (comptime runtime_profile.allows(App, .mcp)) mcpHasTool else null,
-                .mcp_validate_tool = if (comptime runtime_profile.allows(App, .mcp)) validateMcpTool else null,
-                .mcp_call_tool = if (comptime runtime_profile.allows(App, .mcp)) callMcpTool else null,
-                .mcp_search_tools = if (comptime runtime_profile.allows(App, .mcp)) searchMcpTools else null,
-                .mcp_tool_schema = if (comptime runtime_profile.allows(App, .mcp)) mcpToolSchemaJson else null,
-                .mcp_snapshot_tool = if (comptime runtime_profile.allows(App, .mcp)) mcpSnapshotTool else null,
                 .mcp_progress_ctx = @ptrCast(agent),
                 .on_mcp_progress = app_callbacks.Bindings(App).onMcpProgress,
                 .tool_progress_ctx = @ptrCast(agent),
@@ -515,6 +508,7 @@ pub fn Runtime(comptime App: type) type {
                 ctx.web_search_progress_ctx = @ptrCast(agent);
                 ctx.on_web_search_progress = app_callbacks.Bindings(App).onWebSearchProgress;
             }
+            if (comptime runtime_profile.allows(App, .mcp)) app.wireMcp(&ctx);
             if (comptime runtime_profile.allows(App, .mcp) and
                 @hasDecl(@TypeOf(agent.worker), "requestMcpElicitationAnswerBlocking") and
                 @hasDecl(App, "urlOpener"))
@@ -665,48 +659,6 @@ pub fn Runtime(comptime App: type) type {
                 std.math.minInt(i64)
             else
                 std.math.maxInt(i64);
-        }
-
-        fn mcpHasTool(raw_ctx: *anyopaque, name: []const u8, access: tool_mcp_runtime.Access) bool {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            return app.hasMcpTool(name, access);
-        }
-
-        fn validateMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (comptime @hasDecl(App, "validateMcpTool")) {
-                return app.validateMcpTool(arena, name, arguments_json, access);
-            }
-            return .not_available;
-        }
-
-        fn callMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, max_tool_result_bytes: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            return app.callMcpTool(arena, name, arguments_json, max_tool_result_bytes, options);
-        }
-
-        fn searchMcpTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, _: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (comptime @hasDecl(App, "searchMcpTools")) {
-                return app.searchMcpTools(arena, request, permission_rules, access, cancel_flag);
-            }
-            return .{ .model_output = try arena.dupe(u8, "{\"tools\":[],\"count\":0}") };
-        }
-
-        fn mcpSnapshotTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (comptime @hasField(App, "mcp")) {
-                return app.mcp.snapshotToolDefinition(arena, name, known, permission_rules, limits, access);
-            }
-            return .unavailable;
-        }
-
-        fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, _: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (comptime @hasDecl(App, "mcpToolSchemaJson")) {
-                return app.mcpToolSchemaJson(arena, name, permission_rules, access, cancel_flag);
-            }
-            return null;
         }
 
         pub fn resolveToolActionDisplayTarget(
@@ -1001,6 +953,26 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) !?tool_mcp_runtime.SelectedTool {
             return tool_runtime.resolveUnselectedMcpTool(toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), arena, name);
+        }
+
+        /// Whether the tool `name` the model was shown is still the one `known`
+        /// describes, as the agent's own tool context sees MCP.
+        pub fn snapshotMcpDefinition(
+            app: *App,
+            agent: *AppAgent,
+            arena: Allocator,
+            name: []const u8,
+            known: tool_mcp_runtime.Binding,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) !tool_mcp_runtime.DefinitionSnapshot {
+            return tool_runtime.snapshotMcpDefinition(toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), arena, name, known);
         }
 
         pub fn checkToolAvailability(
@@ -2223,14 +2195,21 @@ const FakeApp = struct {
         self.lifecycle_runtime.deinit();
     }
 
-    fn hasMcpTool(self: *FakeApp, name: []const u8, _: tool_mcp_runtime.Access) bool {
+    fn wireMcp(self: *FakeApp, tc: *tool_runtime.Context) void {
+        tc.mcp_ctx = @ptrCast(self);
+        tc.mcp_has_tool = fakeHasTool;
+        tc.mcp_call_tool = fakeCallTool;
+    }
+
+    fn fakeHasTool(raw: *anyopaque, name: []const u8, _: tool_mcp_runtime.Access) bool {
+        const self: *FakeApp = @ptrCast(@alignCast(raw));
         self.mcp_has_tool_calls += 1;
         return std.mem.eql(u8, name, self.mcp_name);
     }
 
-    fn callMcpTool(self: *FakeApp, arena: Allocator, name: []const u8, arguments_json: []const u8, _: usize, _: tool_mcp_runtime.CallOptions) !?tool_mcp_runtime.CallResult {
-        _ = arguments_json;
-        if (!self.hasMcpTool(name, .unrestricted)) return null;
+    fn fakeCallTool(raw: *anyopaque, arena: Allocator, name: []const u8, _: []const u8, _: usize, _: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
+        const self: *FakeApp = @ptrCast(@alignCast(raw));
+        if (!fakeHasTool(raw, name, .unrestricted)) return null;
         return .{ .model_output = try arena.dupe(u8, self.mcp_result) };
     }
 
