@@ -2238,6 +2238,9 @@ pub const SessionUsage = struct {
     output_tokens: u64 = 0,
     cache_read_tokens: u64 = 0,
     cache_write_tokens: u64 = 0,
+    reasoning_tokens: u64 = 0,
+    cache_write_seen: bool = false,
+    reasoning_seen: bool = false,
     step_count: u64 = 0,
     cost_status: SessionCostStatus = .none,
     cost_usd: f64 = 0,
@@ -2260,7 +2263,14 @@ pub const SessionUsage = struct {
         self.input_tokens +|= step.tokens.input_tokens orelse 0;
         self.output_tokens +|= step.tokens.output_tokens orelse 0;
         self.cache_read_tokens +|= step.tokens.cache_read_tokens orelse 0;
-        self.cache_write_tokens +|= step.tokens.cache_write_tokens orelse 0;
+        if (step.tokens.cache_write_tokens) |v| {
+            self.cache_write_tokens +|= v;
+            self.cache_write_seen = true;
+        }
+        if (step.tokens.reasoning_tokens) |v| {
+            self.reasoning_tokens +|= v;
+            self.reasoning_seen = true;
+        }
         self.step_count +|= 1;
         if (step.gateway_cost_usd) |cost| {
             if (std.math.isFinite(cost) and cost >= 0) {

@@ -4150,7 +4150,7 @@ pub const Session = struct {
         const text = raw orelse return .{};
         const decoded = json_decode.parseFromSliceLeaky(SavedUsage, sa, text, .{ .ignore_unknown_fields = true }) catch |err| {
             debug_trace.logf("session", "event=sessions_v2_usage_reset session={s} reason={s} dropped=saved_usage", .{ session_id, @errorName(err) });
-            return .{};
+            return .{ .cost_status = .unknown };
         };
         const has_tokens = decoded.input_tokens != null or
             decoded.output_tokens != null or
@@ -4163,6 +4163,9 @@ pub const Session = struct {
             .output_tokens = decoded.output_tokens orelse 0,
             .cache_read_tokens = decoded.cache_read_tokens orelse 0,
             .cache_write_tokens = decoded.cache_write_tokens orelse 0,
+            .reasoning_tokens = decoded.reasoning_tokens orelse 0,
+            .cache_write_seen = decoded.cache_write_tokens != null,
+            .reasoning_seen = decoded.reasoning_tokens != null,
             .step_count = step_count,
         };
         if (decoded.cost_unknown == true) {
@@ -4202,7 +4205,8 @@ pub const Session = struct {
             .input_tokens = total.input_tokens,
             .output_tokens = total.output_tokens,
             .cache_read_tokens = total.cache_read_tokens,
-            .cache_write_tokens = total.cache_write_tokens,
+            .cache_write_tokens = if (total.cache_write_seen) total.cache_write_tokens else null,
+            .reasoning_tokens = if (total.reasoning_seen) total.reasoning_tokens else null,
             .step_count = total.step_count,
             .cost_usd = if (total.cost_status == .known) total.cost_usd else null,
             .cost_unknown = switch (total.cost_status) {
@@ -17364,4 +17368,17 @@ test "Session.recordUsage persists summed tokens and gateway cost across resume,
     const legacy = Session.decodeSavedUsage(testing.allocator, "legacy", "{\"input_tokens\":500,\"output_tokens\":25}");
     try testing.expectEqual(@as(u64, 500), legacy.input_tokens);
     try testing.expectEqual(types.SessionCostStatus.unknown, legacy.cost_status);
+}
+
+test "corrupt saved usage decodes with unknown cost status so the next step cannot claim the session total" {
+    const corrupt = Session.decodeSavedUsage(testing.allocator, "corrupt", "{not valid json");
+    try testing.expectEqual(types.SessionCostStatus.unknown, corrupt.cost_status);
+
+    var next = corrupt;
+    next.observe(.{ .tokens = .{ .input_tokens = 10, .output_tokens = 5 }, .gateway_cost_usd = 0.0025 });
+    try testing.expectEqual(types.SessionCostStatus.unknown, next.cost_status);
+
+    // Absent saved usage still starts at .none so the first step becomes .known.
+    const absent = Session.decodeSavedUsage(testing.allocator, "absent", null);
+    try testing.expectEqual(types.SessionCostStatus.none, absent.cost_status);
 }

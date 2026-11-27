@@ -7701,6 +7701,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         cache_read_tokens: 80,
         cache_write_tokens: null,
         reasoning_tokens: 2,
+        step_count: 1,
+        cost_usd: null,
+        cost_unknown: true,
       });
 
       const resumed = await runFx(["ask", "--yolo", "--json", "--resume", id!, "--", "Finish up."], {
@@ -7717,6 +7720,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         cache_read_tokens: 120,
         cache_write_tokens: null,
         reasoning_tokens: 2,
+        step_count: 2,
+        cost_usd: null,
+        cost_unknown: true,
       });
     } finally {
       if (proc.exitCode === null) proc.kill("SIGKILL");
@@ -7770,8 +7776,26 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const [parent] = rootSessionIds(root.home);
       const children = savedSessionIds(root.home).filter((id) => id !== parent);
       expect(children.length).toBe(1);
-      expect(savedUsage(parent!)).toEqual({ input_tokens: 300, output_tokens: 3, cache_read_tokens: 30, cache_write_tokens: null, reasoning_tokens: null });
-      expect(savedUsage(children[0]!)).toEqual({ input_tokens: 7000, output_tokens: 70, cache_read_tokens: 700, cache_write_tokens: null, reasoning_tokens: null });
+      expect(savedUsage(parent!)).toEqual({
+        input_tokens: 300,
+        output_tokens: 3,
+        cache_read_tokens: 30,
+        cache_write_tokens: null,
+        reasoning_tokens: null,
+        step_count: 3,
+        cost_usd: null,
+        cost_unknown: true,
+      });
+      expect(savedUsage(children[0]!)).toEqual({
+        input_tokens: 7000,
+        output_tokens: 70,
+        cache_read_tokens: 700,
+        cache_write_tokens: null,
+        reasoning_tokens: null,
+        step_count: 1,
+        cost_usd: null,
+        cost_unknown: true,
+      });
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
