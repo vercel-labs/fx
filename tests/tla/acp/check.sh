@@ -51,6 +51,7 @@ MCAcpPromptDelivery AcpPromptDeliveryToday-interrupt NoSteerWaitsOnReply
 MCAcpPromptDelivery AcpPromptDeliveryToday-lost NothingLost
 MCAcpPromptDelivery AcpPromptDeliveryToday-dropped DeliveryValues
 MCAcpPromptDelivery AcpPromptDeliveryToday-late LateRunTogether
+MCAcpPromptDelivery AcpPromptDeliveryToday-withdraw PendingRefused
 MCAcpFollow MCAcpFollow -
 MCAcpFollow AcpFollowToday-busy JoinWorks
 MCAcpFollow AcpFollowToday-ids StableIds

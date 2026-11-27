@@ -25,7 +25,7 @@ const TIMEOUT = 30_000;
 const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
 
 function createNotificationRoot(
-  notifications = { turn_end: true, attention_required: true },
+  sound = { turn_end: true, attention_required: true },
 ) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-notifications-")));
   const home = join(root, "home");
@@ -39,7 +39,7 @@ function createNotificationRoot(
     settingsPath,
     JSON.stringify({
       permission_mode: "ask",
-      notifications,
+      sound,
     }),
     { mode: 0o600 },
   );
@@ -110,18 +110,6 @@ function handlerStartCount(trace: string, lifecycleEvent: string) {
     .length;
 }
 
-function handlerTurnId(trace: string, lifecycleEvent: string) {
-  const line = trace
-    .split("\n")
-    .find((candidate) =>
-      candidate.includes("[hooks] event=handler_start") &&
-      candidate.includes(`lifecycle_event=${lifecycleEvent}`)
-    );
-  const match = line?.match(/\bturn_id=(\d+)\b/);
-  if (!match) throw new Error(`Missing ${lifecycleEvent} turn ID.\n${trace}`);
-  return Number(match[1]);
-}
-
 test.skipIf(!tmuxAvailable())(
   "/sound toggles both events immediately and persists the profile",
   async () => {
@@ -152,8 +140,6 @@ test.skipIf(!tmuxAvailable())(
       );
 
       let settings = JSON.parse(readFileSync(settingsPath, "utf8"));
-      // Saving moves the older `notifications` group to `sound`.
-      expect(settings).not.toHaveProperty("notifications");
       expect(settings.sound).toEqual({
         turn_end: true,
         attention_required: true,
@@ -239,7 +225,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test(
-  "fx ask keeps redirected stdout JSON and stderr byte-clean with notifications enabled",
+  "fx ask keeps redirected stdout JSON, stderr, and notifications silent when sound is enabled",
   async () => {
     const fixture = createNotificationRoot();
     const gateway = startFakeGateway([
@@ -251,7 +237,10 @@ test(
         ["ask", "--json", "--no-save", "Finish the ask notification fixture."],
         {
           cwd: fixture.workspace,
-          env: notificationEnv(fixture.home, gateway, tracePath),
+          env: {
+            ...notificationEnv(fixture.home, gateway, tracePath),
+            FX_TRACE_SCOPES: "hooks,notifications,agent",
+          },
           timeoutMs: TIMEOUT,
         },
       );
@@ -259,11 +248,12 @@ test(
       expect(result.code).toBe(0);
       expect(JSON.parse(result.stdout).output.trim()).toBe("NOTIFICATION_ASK_COMPLETE");
       expect(result.stderr).toBe("");
-      const trace = await waitForTrace(
-        tracePath,
-        (value) => handlerStartCount(value, "PostTurnEnd") === 1,
-      );
-      expect(trace).toContain("scope=ask");
+      expect(existsSync(tracePath)).toBe(true);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("[agent]");
+      expect(trace).not.toContain("sound play");
+      expect(trace).not.toContain("fx.sound.");
+      expect(handlerStartCount(trace, "PostTurnEnd")).toBe(0);
     } finally {
       gateway.stop();
       rmSync(fixture.root, { recursive: true, force: true });
@@ -273,7 +263,7 @@ test(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "fx ask correlates permission attention and turn-end notifications",
+  "fx ask stays silent on permission prompts and turn end even when sound is enabled",
   async () => {
     const fixture = createNotificationRoot();
     const marker = join(fixture.workspace, "ask-permission-marker.txt");
@@ -284,30 +274,36 @@ test.skipIf(!tmuxAvailable())(
       fakeGatewayFinalText("NOTIFICATION_ASK_PERMISSION_COMPLETE"),
     ]);
     const tracePath = join(fixture.root, "trace.log");
+    const paneOutputPath = join(fixture.root, "pane-output.bin");
+    writeFileSync(paneOutputPath, "");
     let session: TmuxSession | null = null;
     try {
+      const fxCmd = `${FX_BIN} ask --no-save "Try the prepared command."`;
+      const script = `${fxCmd}; code=$?; printf '\\n__FX_EXIT_%s__\\n' "$code"; exit "$code"`;
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} ask --no-save "Try the prepared command."`,
+        cmd: `/bin/sh -c '${script.replace(/'/g, "'\\''")}'`,
         cwd: fixture.workspace,
-        env: notificationEnv(fixture.home, gateway, tracePath),
+        env: {
+          ...notificationEnv(fixture.home, gateway, tracePath),
+          FX_TRACE_SCOPES: "hooks,notifications,agent",
+        },
         remainOnExit: true,
       });
+      session.startPaneOutputCapture(paneOutputPath);
       await session.waitForText("Approve? [y/N]", TIMEOUT);
       expect(existsSync(marker)).toBe(false);
       await session.sendText("n");
       await session.waitForText("NOTIFICATION_ASK_PERMISSION_COMPLETE", TIMEOUT);
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
 
-      const trace = await waitForTrace(
-        tracePath,
-        (value) =>
-          handlerStartCount(value, "AttentionRequired") === 1 &&
-          handlerStartCount(value, "PostTurnEnd") === 1,
-      );
-      const attentionTurnId = handlerTurnId(trace, "AttentionRequired");
-      expect(attentionTurnId).toBeGreaterThan(0);
-      expect(handlerTurnId(trace, "PostTurnEnd")).toBe(attentionTurnId);
-      expect(trace).toContain("sound play kind=attention_required");
-      expect(trace).toContain("sound play kind=turn_end");
+      expect(existsSync(tracePath)).toBe(true);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("[agent]");
+      expect(trace).not.toContain("sound play");
+      expect(trace).not.toContain("fx.sound.");
+      expect(handlerStartCount(trace, "AttentionRequired")).toBe(0);
+      expect(handlerStartCount(trace, "PostTurnEnd")).toBe(0);
+      expect(bellCount(paneOutputPath)).toBe(0);
       expect(existsSync(marker)).toBe(false);
     } finally {
       if (session) await session.kill();

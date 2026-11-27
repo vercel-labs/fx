@@ -7,8 +7,17 @@
 \*     and every step matches the whole projection instead.
 \*   - `expired` is Expired; a timer that no longer applies is no step, and
 \*     the core writes no record for it.
+\*   - `page_refused` is PageRefused, a page the server answered and fx could
+\*     not use, or PageUnreadable, a page whose line fx could not read and
+\*     whose grace ran out: the core writes one record for both, and they
+\*     differ only in the ghost `lastAnswer`. `page_failed` is PageFailed, a
+\*     page it never answered, or PageSharedGrace, a page whose grace ran out
+\*     on a line that another request could have written; they differ only
+\*     in the ghost `graceLine`. `refused` is matched in every step.
 \*   - `page_received` carries `lapse`, which the core works out from the
 \*     pages' arrival times; the model takes it as given.
+\*   - The count of tools a page leaves out (`gatherDrop`, `dropped` and their ghosts) is not in the core's trace: `Server`
+\*     keeps it. A page may leave tools out or not (`d`), and TrackDrops is FALSE, so it never does here.
 \*   - MaxPages comes from the scenario (ObsMaxPages). MaxGen and
 \*     MaxProcesses are the highest values in the trace.
 EXTENDS Catalog, TraceObs, Integers, Sequences
@@ -23,9 +32,10 @@ ObsMaxProcesses == Highest({r.data.process : r \in Recs} \cup {1})
 Step(r) ==
     CASE r.event = "process_started" -> ProcessStarted(r.data.arg_era)
       [] r.event = "need" -> Need
-      [] r.event = "page_received" -> PageReceived(r.data.more, r.data.ttl_zero, r.data.lapse)
+      [] r.event = "page_received" -> \E d \in BOOLEAN : PageReceived(r.data.more, r.data.ttl_zero, r.data.lapse, d)
       [] r.event = "invalid_cursor" -> InvalidCursor
-      [] r.event = "page_failed" -> PageFailed
+      [] r.event = "page_refused" -> PageRefused
+      [] r.event = "page_failed" -> PageFailed \/ PageSharedGrace
       [] r.event = "invalidated" -> Invalidate
       [] r.event = "expired" -> Expired
       [] OTHER -> FALSE
@@ -47,6 +57,7 @@ Matches(r) ==
     /\ pending' = r.data.pending
     /\ waiting' = r.data.waiting
     /\ answer' = r.data.answer
+    /\ refused' = r.data.refused
 
 TraceInit ==
     /\ Init

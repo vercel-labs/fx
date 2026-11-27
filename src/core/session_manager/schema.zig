@@ -26,6 +26,9 @@ pub const Kind = enum {
     child_finished,
     snapshot,
     closed,
+    input_accepted,
+    input_delivered,
+    input_withdrawn,
 };
 
 pub const Header = struct {
@@ -101,8 +104,9 @@ pub const Reason = enum { cancel, failed, closed, crash };
 pub const Outcome = enum { ok, failed, cancelled, interrupted, lost };
 /// `language` is the conversation language fx keeps per session, a JSON
 /// string such as `"es"` or `"und-Latn"` (D18); the index lists it.
-/// `client_prompt` (a JSON string) and `tool_identities` are an ACP
-/// client's settings (D46). `moved_files` records a session moved off fx's
+/// `client_prompt` (a JSON string) is an ACP client's setting, and
+/// `tool_identities` the MCP tools a session called, which ACP and the
+/// terminal both write (D46). `moved_files` records a session moved off fx's
 /// side folder: its value names the blob that maps old handles to blobs,
 /// and its line lists every moved blob (D47). `compaction_records` names
 /// the blob that maps fx's compactor record names to blobs, and its line
@@ -126,6 +130,25 @@ pub const Body = union(Kind) {
     child_finished: Finished,
     snapshot: Snapshot,
     closed: void,
+    input_accepted: InputAccepted,
+    input_delivered: InputRef,
+    input_withdrawn: InputRef,
+
+    pub const InputAcceptedImage = struct {
+        id: u64,
+        path: []const u8,
+        media_type: []const u8,
+        snapshot_path: []const u8,
+        snapshot_sha256: []const u8,
+    };
+
+    pub const InputAccepted = struct {
+        id: u64,
+        text: []const u8,
+        blobs: []const []const u8 = &.{},
+        images: []const InputAcceptedImage = &.{},
+    };
+    pub const InputRef = struct { id: u64 };
 
     pub const Created = struct {
         id: []const u8,
@@ -155,11 +178,12 @@ pub const Body = union(Kind) {
         blobs: []const []const u8 = &.{},
     };
 
-    /// The blobs a line refers to: an item's or a setting's, else none.
+    /// The blobs a line refers to: an item's, a setting's, or a large accepted input's.
     pub fn blobRefs(body: Body) []const []const u8 {
         return switch (body) {
             .item => |piece| piece.blobs,
             .set => |s| s.blobs,
+            .input_accepted => |a| a.blobs,
             else => &.{},
         };
     }
@@ -224,6 +248,31 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
             if (s.compaction_offset) |offset| try w.number("compaction_offset", offset);
         },
         .closed => {},
+        .input_accepted => |a| {
+            try w.number("id", a.id);
+            try w.string("text", a.text);
+            try w.blobList(a.blobs);
+            if (a.images.len > 0) {
+                try w.key("images");
+                try out.append(gpa, '[');
+                for (a.images, 0..) |img, i| {
+                    if (i > 0) try out.append(gpa, ',');
+                    try out.appendSlice(gpa, "{\"id\":");
+                    try out.print(gpa, "{d}", .{img.id});
+                    try out.appendSlice(gpa, ",\"path\":");
+                    try appendJsonString(gpa, out, img.path);
+                    try out.appendSlice(gpa, ",\"media_type\":");
+                    try appendJsonString(gpa, out, img.media_type);
+                    try out.appendSlice(gpa, ",\"snapshot_path\":");
+                    try appendJsonString(gpa, out, img.snapshot_path);
+                    try out.appendSlice(gpa, ",\"snapshot_sha256\":");
+                    try appendJsonString(gpa, out, img.snapshot_sha256);
+                    try out.append(gpa, '}');
+                }
+                try out.append(gpa, ']');
+            }
+        },
+        .input_delivered, .input_withdrawn => |r| try w.number("id", r.id),
     }
 }
 
@@ -288,6 +337,14 @@ fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
             .compaction_offset = try f.opt(u64, "compaction_offset"),
         } },
         .closed => .closed,
+        .input_accepted => .{ .input_accepted = .{
+            .id = try f.req(u64, "id"),
+            .text = try f.req([]const u8, "text"),
+            .blobs = try f.opt([]const []const u8, "blobs") orelse &.{},
+            .images = try f.opt([]const Body.InputAcceptedImage, "images") orelse &.{},
+        } },
+        .input_delivered => .{ .input_delivered = .{ .id = try f.req(u64, "id") } },
+        .input_withdrawn => .{ .input_withdrawn = .{ .id = try f.req(u64, "id") } },
     };
 }
 
@@ -781,6 +838,69 @@ test "every kind's fields round trip, raw values byte for byte" {
     try testing.expectEqual(@as(?u64, 400), snap.compaction_offset);
 
     try testing.expectEqual(Body.closed, try roundTrip(arena, .closed));
+
+    const accepted_escaped = (try roundTrip(arena, .{ .input_accepted = .{
+        .id = 42,
+        .text = "steer \"later\"\nline2 caf\u{e9}",
+    } })).input_accepted;
+    try testing.expectEqual(@as(u64, 42), accepted_escaped.id);
+    try testing.expectEqualStrings("steer \"later\"\nline2 caf\u{e9}", accepted_escaped.text);
+
+    const accepted_plain = (try roundTrip(arena, .{ .input_accepted = .{
+        .id = 43,
+        .text = "follow up",
+    } })).input_accepted;
+    try testing.expectEqual(@as(u64, 43), accepted_plain.id);
+    try testing.expectEqualStrings("follow up", accepted_plain.text);
+    try testing.expectEqual(@as(usize, 0), accepted_plain.images.len);
+
+    const img_sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const img_refs = [_]Body.InputAcceptedImage{.{
+        .id = 2,
+        .path = "/Users/example/pic.png",
+        .media_type = "image/png",
+        .snapshot_path = "/tmp/fx-snap/img-2.bin",
+        .snapshot_sha256 = img_sha,
+    }};
+    const accepted_images = (try roundTrip(arena, .{ .input_accepted = .{
+        .id = 44,
+        .text = "look [Image #2]",
+        .images = &img_refs,
+    } })).input_accepted;
+    try testing.expectEqual(@as(u64, 44), accepted_images.id);
+    try testing.expectEqual(@as(usize, 1), accepted_images.images.len);
+    try testing.expectEqual(@as(u64, 2), accepted_images.images[0].id);
+    try testing.expectEqualStrings("/Users/example/pic.png", accepted_images.images[0].path);
+    try testing.expectEqualStrings("image/png", accepted_images.images[0].media_type);
+    try testing.expectEqualStrings("/tmp/fx-snap/img-2.bin", accepted_images.images[0].snapshot_path);
+    try testing.expectEqualStrings(img_sha, accepted_images.images[0].snapshot_sha256);
+
+    const delivered = (try roundTrip(arena, .{ .input_delivered = .{ .id = 42 } })).input_delivered;
+    try testing.expectEqual(@as(u64, 42), delivered.id);
+
+    const withdrawn = (try roundTrip(arena, .{ .input_withdrawn = .{ .id = 43 } })).input_withdrawn;
+    try testing.expectEqual(@as(u64, 43), withdrawn.id);
+}
+
+test "input record bodies validate required fields" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try testing.expectError(error.BadBody, parseBody(arena, .input_accepted, ",\"id\":1"));
+    try testing.expectError(error.BadBody, parseBody(arena, .input_accepted, ",\"text\":\"hi\""));
+    try testing.expectError(error.BadBody, parseBody(arena, .input_delivered, ""));
+    try testing.expectError(error.BadBody, parseBody(arena, .input_withdrawn, ""));
+
+    const line_accepted = try parseLineBody(arena, .input_accepted, "{\"v\":1,\"seq\":2,\"ts\":1,\"kind\":\"input_accepted\",\"id\":7,\"text\":\"ok\",\"crc\":\"00000000\"}\n");
+    try testing.expectEqual(@as(u64, 7), line_accepted.input_accepted.id);
+    try testing.expectEqualStrings("ok", line_accepted.input_accepted.text);
+
+    const line_delivered = try parseLineBody(arena, .input_delivered, "{\"v\":1,\"seq\":3,\"ts\":1,\"kind\":\"input_delivered\",\"id\":7,\"crc\":\"00000000\"}\n");
+    try testing.expectEqual(@as(u64, 7), line_delivered.input_delivered.id);
+
+    const line_withdrawn = try parseLineBody(arena, .input_withdrawn, "{\"v\":1,\"seq\":4,\"ts\":1,\"kind\":\"input_withdrawn\",\"id\":8,\"crc\":\"00000000\"}\n");
+    try testing.expectEqual(@as(u64, 8), line_withdrawn.input_withdrawn.id);
 }
 
 test "a body missing a required field is rejected" {
@@ -871,4 +991,19 @@ test "an item line without a type is refused" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     try testing.expectError(error.BadBody, parseBody(arena_state.allocator(), .item, ",\"turn\":1,\"data\":{}"));
+}
+
+test "input_accepted, input_delivered, and input_withdrawn headers parse as known kinds" {
+    const cases = [_][]const u8{
+        "input_accepted",
+        "input_delivered",
+        "input_withdrawn",
+    };
+    for (cases) |name| {
+        var buf: [128]u8 = undefined;
+        const line = std.mem.print(&buf, "{{\"v\":1,\"seq\":2,\"ts\":100,\"kind\":\"{s}\"", .{name}) catch unreachable;
+        const h = try parseHeader(line);
+        try testing.expect(h.kind != null);
+        try testing.expectEqualStrings(name, @tagName(h.kind.?));
+    }
 }

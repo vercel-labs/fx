@@ -17,9 +17,18 @@
 \* Progress values are integers here; the spec allows floats, compared the
 \* same way.
 \*
+\* A line the client refused names a request when its id, a top-level member, was
+\* read before the line went wrong (`wire.responseId`): a reply that is cut, not
+\* UTF-8, nested too deep or repeats a key after its id. RefusedNaming is that line.
+\* It is the answer of the request it names, an invalid one, so a request in flight
+\* ends as an error at once, with no wait. A line that names a request not in flight
+\* is a stray, like a late reply: it changes nothing, and neither kind gives any
+\* request a grace.
+\*
 \* A line the client refused that names no request cannot be correlated: bytes
 \* that are not UTF-8, JSON nested past the engine's limit with its id after
-\* the bad part, or a line with no id at all. RefusedLine gives every normal
+\* the bad part, two ids, a bad `method` or `params`, or a line with no id at
+\* all. RefusedLine gives every normal
 \* request in flight that has no grace one: a deadline GraceTicks away, which
 \* never extends. A response inside the grace still matches. Progress for the
 \* request's own token clears its grace, and its other timers go on. A request
@@ -69,13 +78,15 @@ VARIABLES
     refusedAt,     \* ghost [Ids -> ticks, or NoTime]: when a refused line first found it in flight
     ownProgress,   \* ghost [Ids -> BOOLEAN]: progress accepted for it after such a line
     words,         \* ghost [Ids -> Words]: how a request that the grace ended was worded
-    foreignGrant   \* ghost: a refused line gave a grace to a request other than the one its stream carried
+    foreignGrant,  \* ghost: a refused line gave a grace to a request other than the one its stream carried
+    named,         \* ghost [Ids -> BOOLEAN]: a refused line named the request while it was in flight
+    namedGrant     \* ghost: a refused line that named a request gave a grace to some request
 
 vars == <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen,
-          now, refusals, sentEpoch, graceDue, armedEpoch, timerEpochs, refusedAt, ownProgress, words, foreignGrant>>
+          now, refusals, sentEpoch, graceDue, armedEpoch, timerEpochs, refusedAt, ownProgress, words, foreignGrant, named, namedGrant>>
 
 \* Everything the grace adds but its deadlines and timers.
-Rest == <<now, refusals, sentEpoch, armedEpoch, refusedAt, ownProgress, words, foreignGrant>>
+Rest == <<now, refusals, sentEpoch, armedEpoch, refusedAt, ownProgress, words, foreignGrant, named, namedGrant>>
 
 Init ==
     /\ req = [id \in Ids |-> "unused"]
@@ -96,6 +107,8 @@ Init ==
     /\ ownProgress = [id \in Ids |-> FALSE]
     /\ words = [id \in Ids |-> "none"]
     /\ foreignGrant = FALSE
+    /\ named = [id \in Ids |-> FALSE]
+    /\ namedGrant = FALSE
 
 Armed(id) == graceDue[id] # NoTime
 
@@ -125,7 +138,7 @@ Send(id) ==
     /\ req' = [req EXCEPT ![id] = "inflight"]
     /\ sentEpoch' = [sentEpoch EXCEPT ![id] = refusals]
     /\ SendGrace(id)
-    /\ UNCHANGED <<outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, now, refusals, refusedAt, ownProgress, words, foreignGrant>>
+    /\ UNCHANGED <<outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, now, refusals, refusedAt, ownProgress, words, foreignGrant, named, namedGrant>>
 
 Accept(id, kind) ==
     /\ Finish(id, kind)
@@ -179,7 +192,7 @@ ProgressReceived(id, p) ==
     THEN /\ progress' = [progress EXCEPT ![id] = p]
          /\ progressSeen' = progressSeen \cup {<<id, req[id]>>}
          /\ ProgressClears(id)
-         /\ UNCHANGED <<req, outcome, delivered, cancelSent, everDone, peerAnswered, now, refusals, sentEpoch, armedEpoch, refusedAt, words, foreignGrant>>
+         /\ UNCHANGED <<req, outcome, delivered, cancelSent, everDone, peerAnswered, now, refusals, sentEpoch, armedEpoch, refusedAt, words, foreignGrant, named, namedGrant>>
     ELSE UNCHANGED vars
 
 \* The server sends notifications/cancelled naming a client request. That
@@ -220,7 +233,18 @@ RefusedLine(s) ==
             /\ armedEpoch' = [id \in Ids |-> IF id \in Fresh(s) THEN refusals + 1 ELSE armedEpoch[id]]
             /\ timerEpochs' = IF Fresh(s) = {} THEN timerEpochs ELSE timerEpochs \cup {refusals + 1}
        ELSE UNCHANGED <<graceDue, armedEpoch, timerEpochs>>
-    /\ UNCHANGED <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, now, sentEpoch, words>>
+    /\ UNCHANGED <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, now, sentEpoch, words, named, namedGrant>>
+
+\* A line the client refused, whose id was read before the line went wrong, names request `id`. In flight, the line is
+\* its answer, an invalid one: it ends as an error at once, as `ResponseReceived` does, and no request gets a grace.
+\* Not in flight, it is a stray: nothing changes, and no request gets a grace from it.
+RefusedNaming(id) ==
+    /\ named' = [named EXCEPT ![id] = named[id] \/ req[id] = "inflight"]
+    /\ IF req[id] = "inflight"
+       THEN /\ Finish(id, "error")
+            /\ peerAnswered' = [peerAnswered EXCEPT ![id] = TRUE]
+            /\ UNCHANGED <<cancelSent, progress, progressSeen, now, refusals, sentEpoch, armedEpoch, refusedAt, ownProgress, words, foreignGrant, namedGrant>>
+       ELSE /\ UNCHANGED <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, now, refusals, sentEpoch, graceDue, armedEpoch, timerEpochs, refusedAt, ownProgress, words, foreignGrant, namedGrant>>
 
 \* The grace of a request that stayed silent runs out: it ends as malformed, and
 \* the server is told it was cancelled.
@@ -231,7 +255,7 @@ GraceExpired(id) ==
     /\ Finish(id, "malformed")
     /\ cancelSent' = [cancelSent EXCEPT ![id] = TRUE]
     /\ words' = [words EXCEPT ![id] = "malformed"]
-    /\ UNCHANGED <<progress, peerAnswered, progressSeen, now, refusals, sentEpoch, armedEpoch, refusedAt, ownProgress, foreignGrant>>
+    /\ UNCHANGED <<progress, peerAnswered, progressSeen, now, refusals, sentEpoch, armedEpoch, refusedAt, ownProgress, foreignGrant, named, namedGrant>>
 
 \* Time passes, but never past a grace that is due.
 Tick ==
@@ -239,7 +263,7 @@ Tick ==
     /\ now < MaxTime
     /\ \A id \in Ids : (~Armed(id) \/ graceDue[id] > now)
     /\ now' = now + 1
-    /\ UNCHANGED <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, refusals, sentEpoch, graceDue, armedEpoch, timerEpochs, refusedAt, ownProgress, words, foreignGrant>>
+    /\ UNCHANGED <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, refusals, sentEpoch, graceDue, armedEpoch, timerEpochs, refusedAt, ownProgress, words, foreignGrant, named, namedGrant>>
 
 Next ==
     \/ \E s \in Scopes: RefusedLine(s)
@@ -247,6 +271,7 @@ Next ==
     \/ \E id \in Ids:
         \/ Send(id)
         \/ \E kind \in PeerKind: ResponseReceived(id, kind)
+        \/ RefusedNaming(id)
         \/ CancelRequested(id)
         \/ TimedOut(id)
         \/ TransportLost(id)
@@ -275,6 +300,8 @@ TypeOK ==
     /\ ownProgress \in [Ids -> BOOLEAN]
     /\ words \in [Ids -> Words]
     /\ foreignGrant \in BOOLEAN
+    /\ named \in [Ids -> BOOLEAN]
+    /\ namedGrant \in BOOLEAN
 
 \* WIRE-01: a finished id never goes back in flight.
 IdsNeverReused == \A id \in Ids: everDone[id] => req[id] = "done"
@@ -351,4 +378,11 @@ WordsFixed == \A id \in Ids: words[id] # "server_text"
 SoonAfterRefusal ==
     \A id \in Ids: (req[id] = "inflight" /\ refusedAt[id] # NoTime /\ ~ownProgress[id])
         => now <= refusedAt[id] + GraceTicks
+
+\* A refused line that names a request in flight ends that request at once: it does not wait for a grace.
+NamedLineEndsRequest == \A id \in Ids: named[id] => req[id] = "done"
+
+\* A refused line that names a request, in flight or not, gives no request a grace: it is that request's answer, or a
+\* stray, and says nothing about the others.
+NamedLinesGiveNoGrace == ~namedGrant
 ====

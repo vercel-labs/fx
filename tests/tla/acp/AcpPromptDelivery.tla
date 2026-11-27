@@ -11,15 +11,17 @@
 (* A client sends prompts while a turn runs, each with a delivery in      *)
 (* `_meta["sh.fx/delivery"]`:                                              *)
 (*                                                                         *)
-(*  - A prompt that arrives while no turn runs starts one.                *)
+(*  - A prompt that arrives while no turn runs starts one. Its answer is   *)
+(*    the normal prompt answer, with no delivery result.                   *)
 (*  - A prompt with no delivery that arrives during a turn fails with     *)
 (*    -32600.                                                             *)
-(*  - A steer holds text only; one with an image fails with -32602. A     *)
-(*    steer that arrives while the model streams a reply cuts the reply   *)
-(*    short, and the turn takes it in its next request. One that          *)
-(*    arrives between requests waits, and the turn takes it at its next   *)
-(*    request: after the running tool, or, when the reply has ended, by   *)
-(*    going on instead of ending.                                         *)
+(*  - A steer that joins a running turn holds text only; one with an      *)
+(*    image fails with -32602. A prompt that starts a turn may hold any   *)
+(*    content block. A steer that arrives while the model streams a reply *)
+(*    cuts the reply short, and the turn takes it in its next request.    *)
+(*    One that arrives between requests waits, and the turn takes it at   *)
+(*    its next request: after the running tool, or, when the reply has    *)
+(*    ended, by going on instead of ending.                               *)
 (*  - A steer that arrives after the turn's last check for steers, while  *)
 (*    it finishes, waits until the turn stops taking input; it then runs  *)
 (*    as the next turn. Steers that arrive after that, and every          *)
@@ -38,7 +40,10 @@
 (* arrives while the turn finishes fails with -32600; a stop answers       *)
 (* waiting steers as cancelled and dropped; a late steer runs as its own  *)
 (* next turn; a queued prompt is a prompt during a turn, which fails with *)
-(* -32600; and $/cancel_request ignores a steer.                          *)
+(* -32600; $/cancel_request takes back a waiting steer and answers it     *)
+(* with success, cancelled and dropped (handleRequestCancellation in      *)
+(* src/acp/server.zig); and session/close answers waiting steers the same *)
+(* way (publishSteeringOutcomes).                                          *)
 (*                                                                         *)
 (* The phases of the running turn: "gen" while the model streams a reply, *)
 (* "decide" once the reply has streamed and before the turn's next        *)
@@ -72,7 +77,13 @@ Remove(s, m) == SelectSeq(s, LAMBDA x : x # m)
 NoAnswer == [kind |-> "none", stop |-> "", delivery |-> "", code |-> 0]
 Ok(stop, delivery) == [kind |-> "ok", stop |-> stop, delivery |-> delivery, code |-> 0]
 Err(code) == [kind |-> "err", stop |-> "", delivery |-> "", code |-> code]
-NoTurn == [owner |-> "none", ctx |-> {}, group |-> {}]
+\* direct: a prompt sent while no turn ran started this turn, so its owner's
+\* answer has no delivery result.
+NoTurn == [owner |-> "none", ctx |-> {}, group |-> {}, direct |-> FALSE]
+
+\* The delivery of an answer that carries no sh.fx/delivery result: the answer
+\* of a prompt that starts its own turn, and of a prompt that is not a steer.
+NoDelivery == "no delivery result"
 
 VARIABLES
     sent,     \* the prompts fx received, in order
@@ -83,7 +94,7 @@ VARIABLES
     late,     \* steers for the next turn, in order
     queue,    \* queued prompts, in order
     answers,  \* each prompt's answer
-    placed,   \* how many turns held each prompt
+    placed,   \* how many turns' model requests held each prompt
     started,  \* the prompt that started each turn, in order
     tools,
     cancels,
@@ -110,7 +121,7 @@ Place(ms) == [m \in Msgs |-> IF m \in ms THEN placed[m] + 1 ELSE placed[m]]
 \* The delivery a prompt that turn `t` held gets in its answer.
 Delivery(t, m) ==
     IF m \in t.group THEN "next_turn"
-    ELSE IF m = t.owner \/ Kind(m) # "steer" THEN "none"
+    ELSE IF m = t.owner \/ Kind(m) # "steer" THEN NoDelivery
     ELSE "absorbed"
 
 AnswerTurn(t, stop) ==
@@ -123,7 +134,7 @@ StartNext ==
              LET group == IF Rules THEN Range(late) ELSE {Head(late)} IN
              /\ running' = TRUE
              /\ phase' = "gen"
-             /\ cur' = [owner |-> Head(late), ctx |-> group, group |-> group]
+             /\ cur' = [owner |-> Head(late), ctx |-> group, group |-> group, direct |-> FALSE]
              /\ late' = IF Rules THEN <<>> ELSE Tail(late)
              /\ placed' = Place(group)
              /\ started' = Append(started, Head(late))
@@ -131,7 +142,7 @@ StartNext ==
       [] queue # <<>> ->
              /\ running' = TRUE
              /\ phase' = "gen"
-             /\ cur' = [owner |-> Head(queue), ctx |-> {Head(queue)}, group |-> {}]
+             /\ cur' = [owner |-> Head(queue), ctx |-> {Head(queue)}, group |-> {}, direct |-> FALSE]
              /\ queue' = Tail(queue)
              /\ placed' = Place({Head(queue)})
              /\ started' = Append(started, Head(queue))
@@ -150,7 +161,7 @@ Send(m) ==
        THEN \* Any prompt starts a turn when none runs.
             /\ running' = TRUE
             /\ phase' = "gen"
-            /\ cur' = [owner |-> m, ctx |-> {m}, group |-> {}]
+            /\ cur' = [owner |-> m, ctx |-> {m}, group |-> {}, direct |-> TRUE]
             /\ placed' = Place({m})
             /\ started' = Append(started, m)
             /\ UNCHANGED <<waiting, late, queue, answers>>
@@ -164,10 +175,12 @@ Send(m) ==
                      /\ late' = Append(late, m)
                      /\ UNCHANGED <<running, phase, cur, waiting, queue, answers, placed, started>>
               [] Kind(m) = "steer" /\ phase = "gen" /\ Rules ->
-                     \* The reply is cut short; the turn's next request holds the steer.
-                     /\ cur' = [cur EXCEPT !.ctx = @ \cup {m}]
-                     /\ placed' = Place({m})
-                     /\ UNCHANGED <<running, phase, waiting, late, queue, answers, started>>
+                     \* The reply is cut short, so the stream ends here. The turn's
+                     \* next request takes the steer, after a tool or when the reply
+                     \* has ended: ReplyEnd and ToolEnd hold the waiting steers.
+                     /\ waiting' = Append(waiting, m)
+                     /\ phase' = "decide"
+                     /\ UNCHANGED <<running, cur, late, queue, answers, placed, started>>
               [] Kind(m) = "steer" ->
                      /\ waiting' = Append(waiting, m)
                      /\ UNCHANGED <<running, phase, cur, late, queue, answers, placed, started>>
@@ -248,7 +261,7 @@ Cancel ==
             /\ CASE handed # <<>> ->
                         /\ running' = TRUE
                         /\ phase' = "gen"
-                        /\ cur' = [owner |-> Head(handed), ctx |-> Range(handed), group |-> Range(handed)]
+                        /\ cur' = [owner |-> Head(handed), ctx |-> Range(handed), group |-> Range(handed), direct |-> FALSE]
                         /\ late' = <<>>
                         /\ placed' = Place(Range(handed))
                         /\ started' = Append(started, Head(handed))
@@ -256,7 +269,7 @@ Cancel ==
                  [] queue # <<>> ->
                         /\ running' = TRUE
                         /\ phase' = "gen"
-                        /\ cur' = [owner |-> Head(queue), ctx |-> {Head(queue)}, group |-> {}]
+                        /\ cur' = [owner |-> Head(queue), ctx |-> {Head(queue)}, group |-> {}, direct |-> FALSE]
                         /\ queue' = Tail(queue)
                         /\ placed' = Place({Head(queue)})
                         /\ started' = Append(started, Head(queue))
@@ -271,23 +284,28 @@ Cancel ==
                     ELSE answers[m]]
             /\ StartNext
 
-\* $/cancel_request withdraws a steer or queued prompt that hasn't run.
+\* $/cancel_request withdraws a steer or queued prompt that hasn't run. Today
+\* it takes back only a waiting steer, and answers it with success.
 Withdraw(m) ==
-    /\ Rules
-    /\ m \in Range(waiting) \cup Range(late) \cup Range(queue)
-    /\ answers' = [answers EXCEPT ![m] = Err(-32800)]
+    /\ IF Rules
+       THEN m \in Range(waiting) \cup Range(late) \cup Range(queue)
+       ELSE m \in Range(waiting)
+    /\ answers' = [answers EXCEPT ![m] = (IF Rules THEN Err(-32800) ELSE Ok("cancelled", "dropped"))]
     /\ waiting' = Remove(waiting, m)
     /\ late' = Remove(late, m)
     /\ queue' = Remove(queue, m)
     /\ UNCHANGED <<sent, running, phase, cur, placed, started, tools, cancels, closed>>
 
 \* session/close stops the running turn and answers what hasn't run with -32800.
+\* Today it answers a waiting steer with success instead.
 Close ==
-    /\ AllowClose /\ Rules /\ ~closed
+    /\ AllowClose /\ ~closed
     /\ closed' = TRUE
     /\ answers' = [m \in Msgs |->
             IF running /\ m \in cur.ctx THEN Ok("cancelled", Delivery(cur, m))
-            ELSE IF m \in Range(waiting) \cup Range(late) \cup Range(queue) THEN Err(-32800)
+            \* Today fx refuses a late steer (libfx_steering.zig:398, :444), so this Ok is not fx's answer.
+            ELSE IF m \in Range(waiting) \cup Range(late) \cup Range(queue)
+            THEN (IF Rules THEN Err(-32800) ELSE Ok("cancelled", "dropped"))
             ELSE answers[m]]
     /\ running' = FALSE
     /\ cur' = NoTurn
@@ -333,7 +351,17 @@ NothingLost ==
             /\ (Kind(m) \in {"steer", "queue"} /\ m # "I" /\ answers[m].kind = "err") => answers[m].code = -32800
 
 \* A steer's delivery is where it ran; no steer is dropped.
-DeliveryValues == \A m \in Msgs : answers[m].delivery \in {"", "none", "absorbed", "next_turn"}
+DeliveryValues == \A m \in Msgs : answers[m].delivery \in {"", NoDelivery, "absorbed", "next_turn"}
+
+\* A steer is answered absorbed only after a model request held it.
+AbsorbedAfterRequest == \A m \in Msgs : answers[m].delivery = "absorbed" => placed[m] >= 1
+
+\* A prompt that starts its own turn, because none ran when it arrived, gets the
+\* normal answer of that turn with no delivery result.
+OwnerHasNoDelivery ==
+    [][(running /\ cur.direct) =>
+        ((answers[cur.owner].kind = "none" /\ answers'[cur.owner].kind # "none")
+         => answers'[cur.owner].delivery = NoDelivery)]_vars
 
 \* Queued prompts start their turns in the order fx received them.
 SentIndex(m) == CHOOSE k \in DOMAIN sent : sent[k] = m
@@ -353,4 +381,17 @@ LateRunTogether ==
 ImageSteerRefused ==
     [][(running /\ "I" \in Msgs /\ "I" \notin Range(sent) /\ "I" \in Range(sent')) =>
            answers'["I"] = Err(-32602)]_vars
+
+\* A steer or queued prompt that $/cancel_request or session/close takes out of
+\* the pending lists without running it is answered -32800. Other steps are not
+\* checked here: today a steer that arrives as the turn finishes fails with
+\* -32600 (StopInput), which AcpPromptDeliveryToday-withdraw does not check.
+PendingRefused ==
+    [][((\E m \in Msgs : Withdraw(m)) \/ Close) =>
+        \A m \in Msgs :
+        ((m \in Range(waiting) \cup Range(late) \cup Range(queue))
+         /\ m \notin Range(waiting') \cup Range(late') \cup Range(queue')
+         /\ m \notin cur'.ctx
+         /\ answers'[m].kind # "none")
+        => answers'[m] = Err(-32800)]_vars
 =============================================================================

@@ -1,4 +1,4 @@
-// Walks the connection-open hand-off (src/gateway/open_job.zig) along its
+// Walks the connection-open hand-off (src/core/shared/open_job.zig) along its
 // model, tests/tla/gateway_open/OpenCancel.tla, with the design's constants.
 //
 // TLC writes the model's state graph. The driver walks every edge along a
@@ -261,7 +261,7 @@ function report(name: string, walks: Walk[], outcome: ReturnType<typeof check>):
 
 const out = outDir("gateway-open-driver");
 const started = performance.now();
-const module = join(REPO_ROOT, "src", "gateway", "open_job.zig");
+const module = join(REPO_ROOT, "src", "core", "shared", "open_job.zig");
 const lab = buildLab(module, out, "gateway_open_lab");
 const graph = await loadGraph(out);
 const walks = [...edgeWalks(graph), ...randomWalks(graph, options.seed)];

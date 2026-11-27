@@ -13,7 +13,9 @@ const mcp_kept_sign_outs = @import("../mcp_host/kept_sign_outs.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
+const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const output_contracts = @import("../output/output_contracts.zig");
 const provider_catalog = @import("provider_catalog.zig");
 const provider_picker_catalog = @import("provider_picker_catalog.zig");
 const oauth_transport = @import("oauth_transport.zig");
@@ -1214,9 +1216,16 @@ pub const ProviderPreparationIntent = union(enum) {
     },
 };
 
+/// How long team preparation waits for a slower `/credits` reply after
+/// `/models` finishes, so a stalled credits check never blocks login (`RULES.md` R2.3).
+pub const default_team_credits_wait_ms: i64 = 1_500;
+const team_credits_poll_ms: u64 = 10;
+
 pub const ProviderPreparationInput = struct {
     intent: ProviderPreparationIntent,
     catalog_provider: model_catalog.Provider,
+    credits_provider: ?gateway_provider.CreditsProvider = null,
+    team_credits_wait_ms: i64 = default_team_credits_wait_ms,
     models_path: []const u8,
     preferred_source: ?credentials.Source = null,
     primary_model: ?[]const u8 = null,
@@ -1242,9 +1251,11 @@ pub const ProviderPreparation = struct {
     host_managed: bool,
     thread: ?std.Thread = null,
     cancel_requested: std.atomic.Value(bool) = .init(false),
+    credits_cancel: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     credential: ?credentials.Credential = null,
     catalog: ?model_catalog.ProviderResult = null,
+    credits: ?output_contracts.CreditsSnapshot = null,
     failure: ?anyerror = null,
 
     fn start(alloc: Allocator, runtime: *const Runtime, input: ProviderPreparationInput) !*ProviderPreparation {
@@ -1268,6 +1279,27 @@ pub const ProviderPreparation = struct {
         self.thread = try std.Thread.spawn(.{}, run, .{self});
         return self;
     }
+
+    const TeamCreditsTask = struct {
+        alloc: Allocator,
+        provider: gateway_provider.CreditsProvider,
+        credential: ?[]const u8,
+        credential_source: credentials.Source,
+        tenant: ?[]const u8,
+        cancel_flag: *std.atomic.Value(bool),
+        done: std.atomic.Value(bool) = .init(false),
+        snapshot: output_contracts.CreditsSnapshot = .{},
+
+        fn run(task: *TeamCreditsTask) void {
+            task.snapshot = task.provider.fetch(task.alloc, .{
+                .credential = task.credential,
+                .credential_source = task.credential_source,
+                .tenant = task.tenant,
+                .cancel_flag = task.cancel_flag,
+            });
+            task.done.store(true, .release);
+        }
+    };
 
     fn run(self: *ProviderPreparation) void {
         defer self.done.store(true, .release);
@@ -1299,6 +1331,32 @@ pub const ProviderPreparation = struct {
                 self.credential.?.gatewayTeam(),
                 self.credential.?.accountId(),
             );
+
+        var credits_task: TeamCreditsTask = undefined;
+        var credits_future: ?std.Io.Future(void) = null;
+        if (comptime !builtin.single_threaded) {
+            if (self.input.intent == .team and !self.host_managed) {
+                if (self.input.credits_provider) |credits_provider| {
+                    if (self.credential) |credential| {
+                        credits_task = .{
+                            .alloc = self.alloc,
+                            .provider = credits_provider,
+                            .credential = credential.token,
+                            .credential_source = credential.source,
+                            .tenant = credential.gatewayTeam(),
+                            .cancel_flag = &self.credits_cancel,
+                        };
+                        credits_future = io_mod.getIo().concurrent(TeamCreditsTask.run, .{&credits_task}) catch null;
+                    }
+                }
+            }
+        }
+        defer if (credits_future) |*future| {
+            self.credits_cancel.store(true, .seq_cst);
+            future.await(io_mod.getIo());
+            credits_task.snapshot.deinit(self.alloc);
+        };
+
         self.catalog = self.input.catalog_provider.fetch(self.alloc, .{
             .access = access,
             .endpoint = self.input.models_path,
@@ -1308,9 +1366,35 @@ pub const ProviderPreparation = struct {
             self.failure = err;
             return;
         };
+
+        if (credits_future) |*future| {
+            const catalog_ok = self.catalog != null and self.catalog.? == .catalog;
+            if (catalog_ok and !self.cancel_requested.load(.seq_cst)) {
+                const deadline = io_mod.awakeMilliTimestamp() + self.input.team_credits_wait_ms;
+                while (!credits_task.done.load(.acquire)) {
+                    if (self.cancel_requested.load(.seq_cst) or io_mod.awakeMilliTimestamp() >= deadline) {
+                        self.credits_cancel.store(true, .seq_cst);
+                        break;
+                    }
+                    // Poll the concurrent credits task until it finishes or hits the wait budget (RULES.md R2.3).
+                    io_mod.sleep(team_credits_poll_ms * std.time.ns_per_ms);
+                }
+            } else {
+                self.credits_cancel.store(true, .seq_cst);
+            }
+            const finished_in_time = credits_task.done.load(.acquire) and catalog_ok and !self.cancel_requested.load(.seq_cst);
+            future.await(io_mod.getIo());
+            credits_future = null;
+            if (finished_in_time) {
+                self.credits = credits_task.snapshot;
+            } else {
+                credits_task.snapshot.deinit(self.alloc);
+            }
+        }
     }
 
     pub fn requestCancel(self: *ProviderPreparation) void {
+        self.credits_cancel.store(true, .seq_cst);
         if (!self.cancel_requested.swap(true, .seq_cst)) {
             debug_trace.logf("auth", "provider preparation cancelled target={t}", .{self.input.target()});
         }
@@ -1327,6 +1411,7 @@ pub const ProviderPreparation = struct {
             .catalog => |*catalog| model_catalog.freeModelCatalog(self.alloc, catalog),
             .failure => {},
         };
+        if (self.credits) |*snapshot| snapshot.deinit(self.alloc);
         if (self.input.primary_model) |value| self.alloc.free(value);
         if (self.input.preferred_model) |value| self.alloc.free(value);
         self.alloc.free(self.input.models_path);
@@ -6175,4 +6260,117 @@ test "process exit leaves a prompt's credential refresh running instead of waiti
     transport.release.store(true, .seq_cst);
     while (!task.poll()) std.Thread.yield() catch {};
     task.deinit();
+}
+
+const PreparationTestCredits = struct {
+    entered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    cancelled: std.atomic.Value(bool) = .init(false),
+    remaining: ?[]const u8 = null,
+    no_token_pass: bool = false,
+
+    fn provider(self: *PreparationTestCredits) gateway_provider.CreditsProvider {
+        return .{ .context = self, .fetch_fn = fetch };
+    }
+
+    fn fetch(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider.CreditsLookupInput) output_contracts.CreditsSnapshot {
+        const self: *PreparationTestCredits = @ptrCast(@alignCast(raw.?));
+        self.entered.store(true, .release);
+        while (!self.release.load(.acquire)) {
+            if (input.cancel_flag) |flag| {
+                if (flag.load(.seq_cst)) {
+                    self.cancelled.store(true, .release);
+                    return .{ .err_message = alloc.dupe(u8, "cancelled") catch null };
+                }
+            }
+            // Yielding is best-effort while the test waits for release or cancel.
+            std.Thread.yield() catch {};
+        }
+        if (self.no_token_pass) return .{ .no_token_pass = true };
+        return .{
+            .token_pass = .{
+                .remaining = if (self.remaining) |value| alloc.dupe(u8, value) catch null else null,
+            },
+        };
+    }
+};
+
+test "team preparation fetches credits in parallel with the model catalog" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var catalog: PreparationTestCatalog = .{};
+    catalog.release.store(true, .release);
+    var credits: PreparationTestCredits = .{ .remaining = "79.92906" };
+    credits.release.store(true, .release);
+
+    var candidate: credentials.Credential = .{
+        .token = try alloc.dupe(u8, "candidate-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_tp"),
+        .team_slug = try alloc.dupe(u8, "tp-team"),
+    };
+    defer candidate.deinit(alloc);
+
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .team = .{ .index = 0, .activate_gateway = false } },
+        .catalog_provider = catalog.provider(),
+        .credits_provider = credits.provider(),
+        .models_path = "/coding-agent/v1/models",
+        .candidate = candidate,
+    });
+
+    while (true) {
+        if (runtime.takeProviderPreparation()) |task| {
+            defer task.deinit();
+            try std.testing.expect(task.catalog != null and task.catalog.? == .catalog);
+            try std.testing.expect(task.credits != null);
+            try std.testing.expectEqualStrings("79.92906", task.credits.?.token_pass.?.remaining.?);
+            break;
+        }
+        // Yielding is best-effort while waiting for the worker thread to finish.
+        std.Thread.yield() catch {};
+    }
+}
+
+test "team preparation cancels a slow credits lookup at its wait budget" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var catalog: PreparationTestCatalog = .{};
+    catalog.release.store(true, .release);
+    var credits: PreparationTestCredits = .{ .remaining = "79.92906" };
+
+    var candidate: credentials.Credential = .{
+        .token = try alloc.dupe(u8, "candidate-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_slow"),
+        .team_slug = try alloc.dupe(u8, "slow-team"),
+    };
+    defer candidate.deinit(alloc);
+
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .team = .{ .index = 0, .activate_gateway = false } },
+        .catalog_provider = catalog.provider(),
+        .credits_provider = credits.provider(),
+        .team_credits_wait_ms = 25,
+        .models_path = "/coding-agent/v1/models",
+        .candidate = candidate,
+    });
+
+    while (true) {
+        if (runtime.takeProviderPreparation()) |task| {
+            defer task.deinit();
+            try std.testing.expect(task.catalog != null and task.catalog.? == .catalog);
+            try std.testing.expect(task.credits == null);
+            try std.testing.expect(credits.cancelled.load(.acquire));
+            break;
+        }
+        // Yielding is best-effort while waiting for the worker thread to finish.
+        std.Thread.yield() catch {};
+    }
 }

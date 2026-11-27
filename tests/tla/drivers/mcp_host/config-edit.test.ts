@@ -10,14 +10,14 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { artifacts, binary } from "../lib/context";
-import { fixture, fxEnv, runFx, save, type Fixture, type Ran } from "./driver";
+import { artifacts, binary, targetHelpers } from "../lib/context";
+import { fixture, fxEnv, runFx, save, waitFor, type Fixture, type Ran } from "./driver";
 import { checkTrace, type TraceRecord, type Value } from "./trace";
 
 type Cls = "ok" | "bad" | "auth";
 type File = "profile" | "project";
 const NAMES = ["a", "b", "c"];
-const MODEL: Record<string, Value> = { ObsNames: NAMES, ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true };
+const MODEL: Record<string, Value> = { ObsNames: NAMES, ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true, ObsDeep: true };
 
 const OK_URL = "https://ok.example/mcp";
 const BAD_URL = "http://example.com/mcp";
@@ -30,14 +30,20 @@ const argsOf = (cls: Cls) => (cls === "bad" ? [BAD_URL] : cls === "auth" ? [OK_U
 
 /** The files before a scenario's first command, as the model describes them. */
 interface Spec {
-  st: "absent" | "ok" | "broken";
+  st: "absent" | "ok" | "deep" | "broken";
   ent?: Partial<Record<string, Cls>>;
   /** The profile's misspelled servers key: after the real one, after 70 other keys, or holding 64 entries that aren't servers first. */
   typo?: "key" | "last" | "wide";
+  /** The server the misspelled key holds: a name of NAMES, or (by default) one that isn't. */
+  holds?: string;
   both?: boolean;
   /** Over 64 top-level keys, with no misspelled key. */
   big?: boolean;
 }
+
+/** An unrelated key nested past the limit an edit writes back (64 levels) and past the 256 the JSON writer holds. */
+const DEEP_LEVELS = 300;
+const nested = (levels: number): unknown => Array.from({ length: levels }).reduce<unknown>((inner) => [inner], []);
 
 const fillers = (count: number) => Object.fromEntries(Array.from({ length: count }, (_, i) => [`note${i}`, i]));
 
@@ -47,8 +53,9 @@ function documentOf(spec: Spec): Record<string, unknown> {
   if (spec.big || spec.typo === "last") Object.assign(doc, fillers(70));
   doc.mcpServers = servers;
   if (spec.both) doc.mcp = {};
-  if (spec.typo === "key" || spec.typo === "last") doc.mcp_servers = { z: { command: "x" } };
-  if (spec.typo === "wide") doc.servers = { ...Object.fromEntries(Array.from({ length: 64 }, (_, i) => [`n${i}`, i])), real: { command: "y" } };
+  if (spec.typo === "key" || spec.typo === "last") doc.mcp_servers = { [spec.holds ?? "z"]: { command: "x" } };
+  if (spec.st === "deep") doc.notes = nested(DEEP_LEVELS);
+  if (spec.typo === "wide") doc.servers = { ...Object.fromEntries(Array.from({ length: 64 }, (_, i) => [`n${i}`, i])), [spec.holds ?? "real"]: { command: "y" } };
   return doc;
 }
 
@@ -63,14 +70,15 @@ class Scenario {
     this.paths = { profile: join(this.f.home, ".fx", "mcp.json"), project: join(this.f.workspace, ".mcp.json") };
     const model = (file: File, spec: Spec) => ({
       st: spec.st,
-      typo: file === "profile" && !!spec.typo,
+      // What the misspelled key holds, as the model says it: nothing, a server of NAMES, or another one.
+      typo: file === "profile" && spec.typo ? (spec.holds && NAMES.includes(spec.holds) ? spec.holds : "other") : "no-typo",
       both: file === "profile" && !!spec.both,
       big: file === "profile" && (!!spec.big || spec.typo === "last" || spec.typo === "wide"),
       ent: Object.fromEntries(NAMES.map((n) => [n, spec.ent?.[n] ?? "none"])),
     });
     for (const [file, spec] of [["profile", profile], ["project", project]] as const) {
       if (spec.st === "broken") writeFileSync(this.paths[file], "{ nope");
-      if (spec.st === "ok") writeFileSync(this.paths[file], JSON.stringify(documentOf(spec)), { mode: file === "profile" ? 0o600 : 0o644 });
+      if (spec.st === "ok" || spec.st === "deep") writeFileSync(this.paths[file], JSON.stringify(documentOf(spec)), { mode: file === "profile" ? 0o600 : 0o644 });
     }
     this.records.push({ event: "init", data: { profile: model("profile", profile), project: model("project", project) } });
   }
@@ -89,8 +97,10 @@ class Scenario {
   async remove(file: File, name: string) {
     const before = sha(this.paths[file]);
     const ran = await this.run(["mcp", "remove", file === "project" ? "--project" : "--global", name]);
-    const outcome = ran.stdout.startsWith("Removed ") ? "removed" : ran.stderr.startsWith("Couldn't remove ") ? "refused" : ran.stderr.startsWith("No MCP server named ") ? "missing" : `unexpected: ${ran.stdout}${ran.stderr}`;
+    const outcome = ran.stdout.startsWith("Removed ") ? "removed" : ran.stderr.startsWith("Couldn't remove ") ? "refused" : ran.stderr.startsWith("No MCP server named ") ? (ran.stderr.trimEnd().includes("\n") ? "hinted" : "missing") : `unexpected: ${ran.stdout}${ran.stderr}`;
     expect(outcome === "removed" ? ran.code === 0 : ran.code === 1).toBe(true);
+    // The hint is one more line, and it names the file and the key.
+    if (outcome === "hinted") expect(ran.stderr.trimEnd().split("\n")[1]).toMatch(/^\S+ is in ~\/\.fx\/mcp\.json, but the key (that starts with )?"[^"]*"/);
     this.records.push({ event: "remove", data: { file, name, outcome, same: sha(this.paths[file]) === before } });
     return ran;
   }
@@ -104,6 +114,87 @@ class Scenario {
     return loaded;
   }
 
+  /** What `fx status --json` lists from the file, and the entries of it that its configuration issues note as skipped. */
+  async inspect(file: File) {
+    const ran = await this.run(["status", "--json"]);
+    expect(ran.code, ran.stderr).toBe(0);
+    const mcp = JSON.parse(ran.stdout).mcp as { servers: { name: string; source: string }[]; configuration_issues: string[] };
+    // The project's servers have the source "workspace".
+    const source = file === "profile" ? "profile" : "workspace";
+    const shown = mcp.servers.filter((server) => server.source === source && NAMES.includes(server.name)).map((server) => server.name).sort();
+    const noted = mcp.configuration_issues
+      .flatMap((issue) => {
+        const found = /^(~\/\.fx\/mcp\.json|\.mcp\.json) server '([^']+)' was skipped/.exec(issue);
+        return found && (found[1] === "~/.fx/mcp.json") === (file === "profile") ? [found[2]!] : [];
+      })
+      .sort();
+    this.records.push({ event: "inspect", data: { file, shown, noted } });
+    return { shown, noted };
+  }
+
+  /**
+   * The servers a real `fx acp` session that asks for the profile's servers (`_meta.fx.profileMcpServers`) lists: the
+   * names the model's first request holds in its list of MCP servers. The session's project servers are left out, as
+   * a project server runs only once the person approves it.
+   */
+  async acp() {
+    const { startFakeGateway, fakeGatewayFinalText } = await targetHelpers();
+    const model = "openai/gpt-5";
+    const gateway = startFakeGateway([fakeGatewayFinalText("ACP_LIST_DONE")], { models: [{ id: model, type: "language", tags: ["tool-use"] }] });
+    const child = Bun.spawn([binary, "acp"], {
+      cwd: this.f.workspace,
+      env: fxEnv(this.f, { VERCEL_OIDC_TOKEN: "", FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: model }),
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const decoder = new TextDecoder();
+    const reader = child.stdout.getReader();
+    let buffer = "";
+    const readLine = async (): Promise<string> => {
+      while (!buffer.includes("\n")) {
+        // A session that never answers ends with the test's own timeout, and the `finally` stops it.
+        const next = await reader.read();
+        if (next.done) throw new Error("fx acp ended before it answered");
+        buffer += decoder.decode(next.value);
+      }
+      const at = buffer.indexOf("\n");
+      const line = buffer.slice(0, at);
+      buffer = buffer.slice(at + 1);
+      return line;
+    };
+    const rpc = async (id: number, method: string, params: unknown): Promise<any> => {
+      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      await child.stdin.flush();
+      for (;;) {
+        const message = JSON.parse(await readLine());
+        if (message.id === id) return message;
+      }
+    };
+    try {
+      expect((await rpc(1, "initialize", { protocolVersion: 1 })).error).toBeUndefined();
+      const created = await rpc(2, "session/new", { cwd: this.f.workspace, mcpServers: [], _meta: { fx: { profileMcpServers: true } } });
+      expect(created.error).toBeUndefined();
+      const prompt = rpc(3, "session/prompt", { sessionId: created.result.sessionId, prompt: [{ type: "text", text: "List the servers." }] });
+      const body = await waitFor("the model's first request", () => gateway.requests[0]?.body, 30_000);
+      await prompt;
+      writeFileSync(join(this.f.base, "acp-model-request.json"), body);
+      const strings: string[] = [];
+      const walk = (value: unknown) => {
+        if (typeof value === "string") strings.push(value);
+        else if (Array.isArray(value)) value.forEach(walk);
+        else if (value && typeof value === "object") Object.values(value).forEach(walk);
+      };
+      walk(JSON.parse(body));
+      const shown = [...new Set(strings.flatMap((text) => [...text.matchAll(/^- ([a-z])$/gm)].map((found) => found[1]!)).filter((name) => NAMES.includes(name)))].sort();
+      this.records.push({ event: "acp", data: { file: "profile", shown } });
+      return shown;
+    } finally {
+      child.kill();
+      gateway.stop();
+    }
+  }
+
   /** The harness edits a file itself, as an editor would, without fx's lock. */
   tamper(kind: string, file: File, name = "a", cls: Cls = "ok") {
     const path = this.paths[file];
@@ -112,12 +203,15 @@ class Scenario {
     const doc = !replaces && existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>) : {};
     const write = () => writeFileSync(path, JSON.stringify(doc));
     switch (kind) {
-      case "typo_appears": doc.mcp_servers = { z: { command: "x" } }; write(); break;
+      // The key holds the server `name` when that is one of NAMES, and a server that isn't one of them otherwise.
+      case "typo_appears": doc.mcp_servers = { [NAMES.includes(name) ? name : "z"]: { command: "x" } }; write(); break;
       case "typo_fixed": for (const key of ["mcp_servers", "servers"]) delete doc[key]; write(); break;
       case "grows": Object.assign(doc, fillers(70)); write(); break;
       case "both_appear": doc.mcp = {}; write(); break;
       case "both_merged": delete doc.mcp; write(); break;
       case "hand": ((doc.mcpServers ??= {}) as Record<string, unknown>)[name] = entryOf(cls); write(); break;
+      case "deepens": doc.notes = nested(DEEP_LEVELS); write(); break;
+      case "flattens": delete doc.notes; write(); break;
       case "breaks": writeFileSync(path, "{ nope"); break;
       case "repairs": writeFileSync(path, "{}"); break;
       case "deletes": rmSync(path, { force: true }); break;
@@ -211,7 +305,7 @@ test("a profile whose servers key looks misspelled is never rewritten by add or 
 test("a misspelled key that appears between two commands, with no lock taken, is found by the next one", async () => {
   const s = new Scenario("config-edit-typo-between", { st: "ok", ent: { a: "ok" } }, NONE);
   await s.add("profile", "b", "ok");
-  s.tamper("typo_appears", "profile");
+  s.tamper("typo_appears", "profile", "z");
   await s.add("profile", "c", "ok");
   await s.remove("profile", "b");
   s.tamper("typo_fixed", "profile");
@@ -236,6 +330,71 @@ test("a misspelled key whose first 64 entries aren't servers is found", async ()
   await s.remove("profile", "a");
   s.tamper("typo_fixed", "profile");
   await s.add("profile", "b", "ok");
+  await s.list("profile");
+  await s.verify();
+}, 240_000);
+
+test("a name that only the misspelled key holds gets a hint with the key, a name nowhere gets none, and neither command touches the file", async () => {
+  const s = new Scenario("config-edit-typo-hint", { st: "ok", ent: { a: "ok" }, typo: "key", holds: "b" }, NONE);
+  const bytes = () => readFileSync(s.paths.profile, "utf8");
+  const before = bytes();
+  const hinted = await s.remove("profile", "b");
+  expect(hinted.code).toBe(1);
+  expect(hinted.stdout).toBe("");
+  expect(hinted.stderr.split("\n")[0]).toBe("No MCP server named b in ~/.fx/mcp.json.");
+  expect(hinted.stderr.split("\n")[1]).toContain('b is in ~/.fx/mcp.json, but the key "mcp_servers" looks like a misspelling of "mcpServers"');
+  // An entry of the real key is refused, as before; a name that is nowhere is only "No MCP server named".
+  await s.remove("profile", "a");
+  const nowhere = await s.remove("profile", "c");
+  expect(nowhere.stderr).toBe("No MCP server named c in ~/.fx/mcp.json.\n");
+  expect(bytes()).toBe(before);
+  // The key is fixed by hand: the name is a plain miss. A key that appears between two commands is found by the next one.
+  s.tamper("typo_fixed", "profile");
+  const plain = await s.remove("profile", "b");
+  expect(plain.stderr).toBe("No MCP server named b in ~/.fx/mcp.json.\n");
+  s.tamper("typo_appears", "profile", "c");
+  const again = await s.remove("profile", "c");
+  expect(again.code).toBe(1);
+  expect(again.stderr.split("\n")[1]).toContain('c is in ~/.fx/mcp.json, but the key "mcp_servers"');
+  await s.list("profile");
+  await s.verify();
+}, 240_000);
+
+test("the hint reads every key, though fx's load scan gives up on that file: a misspelled key after 70 others, or after 64 entries that aren't servers", async () => {
+  for (const typo of ["last", "wide"] as const) {
+    const s = new Scenario(`config-edit-typo-hint-${typo}`, { st: "ok", ent: { a: "ok" }, typo, holds: "b" }, NONE);
+    const before = readFileSync(s.paths.profile, "utf8");
+    const hinted = await s.remove("profile", "b");
+    expect(hinted.code).toBe(1);
+    expect(hinted.stderr.split("\n")[1]).toContain("b is in ~/.fx/mcp.json, but the key ");
+    expect(readFileSync(s.paths.profile, "utf8")).toBe(before);
+    await s.list("profile");
+    await s.verify();
+  }
+}, 240_000);
+
+test("a file nested past the limit is read, and refused by add and remove, until it is flattened", async () => {
+  const s = new Scenario("config-edit-deep", { st: "deep", ent: { a: "ok" } }, { st: "deep", ent: { b: "ok" } });
+  const bytes = () => [s.paths.profile, s.paths.project].map(sha);
+  const before = bytes();
+  // The reader loads both files, so each server is listed, and a remove finds its name and says why it can't edit.
+  expect(await s.list("profile")).toEqual(["a"]);
+  const added = await s.add("profile", "c", "ok");
+  expect(added.stderr).toContain("is nested more than 64 levels deep");
+  const removed = await s.remove("profile", "a");
+  expect(removed.stderr).toStartWith("Couldn't remove a from ~/.fx/mcp.json: the file is nested more than 64 levels deep");
+  // A name the file doesn't hold is a plain miss, as in any file.
+  await s.remove("profile", "c");
+  await s.add("project", "c", "ok");
+  await s.remove("project", "b");
+  expect(await s.list("project")).toEqual(["b"]);
+  expect(bytes()).toEqual(before);
+  // Flattened by hand, the file is edited again; nested again, it is refused again.
+  s.tamper("flattens", "profile");
+  await s.add("profile", "c", "ok");
+  await s.remove("profile", "a");
+  s.tamper("deepens", "profile");
+  await s.remove("profile", "c");
   await s.list("profile");
   await s.verify();
 }, 240_000);
@@ -311,9 +470,10 @@ test("fault: twenty fx processes adding at once each keep their entry, and the e
 }, 240_000);
 
 // How many adds a kill must end for the test to say anything about a kill mid-add, and how many adds it may make
-// to get there.
+// to get there. Under 16 busy loops on 8 CPUs it took 40 to 98 adds to end 5, so the limit leaves room for a runner
+// that is slower still.
 const KILLS_AT_LEAST = 5;
-const ADDS_AT_MOST = 120;
+const ADDS_AT_MOST = 240;
 
 test("crash: a kill at any moment of an add leaves the profile as it was or as the add made it, and the next fx takes the lock", async () => {
   const s = new Scenario("config-edit-crash", { st: "ok", ent: { a: "ok" } }, NONE);
@@ -391,4 +551,49 @@ test("stress: add and remove on a profile with 1,000 servers stay fast, and the 
   console.log(`STRESS servers=1000 ${Object.entries(timings).map(([k, v]) => `${k}=${v}`).join(" ")}`);
   // Parsing the file a few times per command must stay far inside a second or two on a busy machine.
   for (const [what, ms] of Object.entries(timings)) expect({ what, ok: ms < 8000 }).toEqual({ what, ok: true });
+}, 240_000);
+
+test("status skips a bad entry of the profile with a note, and still shows its good entries and the project's servers (trace ACCEPTED)", async () => {
+  const s = new Scenario("config-edit-inspect", { st: "ok", ent: { a: "ok", b: "bad" } }, { st: "ok", ent: { c: "ok" } });
+  expect(await s.inspect("profile")).toEqual({ shown: ["a"], noted: ["b"] });
+  expect(await s.inspect("project")).toEqual({ shown: ["c"], noted: [] });
+  s.tamper("hand", "profile", "b", "ok");
+  expect(await s.inspect("profile")).toEqual({ shown: ["a", "b"], noted: [] });
+  await s.verify();
+}, 240_000);
+
+test("status skips what each file's reader skips: an Authorization header is skipped from the profile and loads from .mcp.json (trace ACCEPTED)", async () => {
+  const s = new Scenario("config-edit-inspect-classes", { st: "ok", ent: { a: "auth", b: "ok", c: "bad" } }, { st: "ok", ent: { a: "auth", b: "bad" } });
+  expect(await s.inspect("profile")).toEqual({ shown: ["b"], noted: ["a", "c"] });
+  expect(await s.inspect("project")).toEqual({ shown: ["a"], noted: ["b"] });
+  await s.verify();
+}, 240_000);
+
+test("status reads a profile nested past the edit's limit like any other: its bad entry is noted and its good one shows (trace ACCEPTED)", async () => {
+  const s = new Scenario("config-edit-inspect-deep", { st: "deep", ent: { a: "ok", b: "bad" } }, NONE);
+  expect(await s.inspect("profile")).toEqual({ shown: ["a"], noted: ["b"] });
+  await s.verify();
+}, 240_000);
+
+test("a profile that isn't JSON still fails the whole inspection: no server of either file shows, and nothing is noted (trace ACCEPTED)", async () => {
+  const s = new Scenario("config-edit-inspect-broken", { st: "broken" }, { st: "ok", ent: { c: "ok" } });
+  expect(await s.inspect("profile")).toEqual({ shown: [], noted: [] });
+  expect(await s.inspect("project")).toEqual({ shown: [], noted: [] });
+  s.tamper("repairs", "profile");
+  expect(await s.inspect("project")).toEqual({ shown: ["c"], noted: [] });
+  await s.verify();
+}, 240_000);
+
+test("an ACP session that asks for the profile's servers lists the good entries beside a bad one, as the terminal app does (trace ACCEPTED)", async () => {
+  const s = new Scenario("config-edit-acp", { st: "ok", ent: { a: "ok", b: "bad", c: "auth" } }, NONE);
+  const terminal = await s.inspect("profile");
+  expect(terminal.shown).toEqual(["a"]);
+  expect(await s.acp()).toEqual(terminal.shown);
+  await s.verify();
+}, 240_000);
+
+test("an ACP session goes on without the servers of a profile that isn't JSON (trace ACCEPTED)", async () => {
+  const s = new Scenario("config-edit-acp-broken", { st: "broken" }, NONE);
+  expect(await s.acp()).toEqual([]);
+  await s.verify();
 }, 240_000);

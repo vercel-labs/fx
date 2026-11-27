@@ -122,6 +122,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          # The dev channel step compares this commit with the one in dev.json.
+          fetch-depth: 0
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -190,10 +192,40 @@ jobs:
           set -euo pipefail
           echo "updated=false" >> "$GITHUB_OUTPUT"
 
-          MAIN_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
-          if [ "$MAIN_SHA" != "$RELEASE_SHA" ]; then
-            echo "main advanced to ${MAIN_SHA}; leaving dev.json unchanged"
+          # Move forward only. CI on main often ends after newer commits merge,
+          # so this build may be behind main and still newer than dev.json.
+          # dev.json is read through the CDN, which caches it for 60 seconds.
+          # Runs go one at a time and each builds for minutes before this
+          # step, so the read sees the previous run's write unless the CDN
+          # serves a copy past that age.
+          CURRENT_SHA=$(curl -fsS --max-time 30 https://releases.fx.sh/dev.json | jq -r '.commit // empty') || CURRENT_SHA=""
+          if [ -z "$CURRENT_SHA" ]; then
+            echo "::warning::could not read a commit from dev.json; only main's newest commit may replace it"
+          fi
+          CURRENT_KNOWN=false
+          if [ -n "$CURRENT_SHA" ] && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null; then
+            CURRENT_KNOWN=true
+          fi
+          if [ "$CURRENT_KNOWN" = true ] && [ "$CURRENT_SHA" != "$RELEASE_SHA" ] &&
+            git merge-base --is-ancestor "$RELEASE_SHA" "$CURRENT_SHA"; then
+            echo "dev.json names ${CURRENT_SHA}, which already includes ${RELEASE_SHA}; leaving it unchanged"
             exit 0
+          elif [ "$CURRENT_KNOWN" = true ] && git merge-base --is-ancestor "$CURRENT_SHA" "$RELEASE_SHA"; then
+            # Equal commits land here too, so a rerun writes dev.json again
+            # and retries the fx-web deploy.
+            echo "dev.json names ${CURRENT_SHA}; pointing it at ${RELEASE_SHA}"
+          else
+            # The pointer is unreadable or outside this history, so only
+            # main's newest commit may replace it.
+            MAIN_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
+            if [ "$MAIN_SHA" != "$RELEASE_SHA" ]; then
+              if [ -z "$CURRENT_SHA" ]; then
+                echo "dev.json could not be read, and main advanced to ${MAIN_SHA}; leaving dev.json unchanged"
+              else
+                echo "dev.json commit ${CURRENT_SHA} is not in the history of ${RELEASE_SHA}, and main advanced to ${MAIN_SHA}; leaving dev.json unchanged"
+              fi
+              exit 0
+            fi
           fi
 
           VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')

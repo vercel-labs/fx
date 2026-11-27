@@ -10,13 +10,14 @@ const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const chat_completions_protocol = @import("chat_completions_protocol.zig");
 const responses_protocol = @import("responses_protocol.zig");
+const tool_call_ids = @import("tool_call_ids.zig");
 const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
 const endpoint = "https://cli-chat-proxy.grok.com/v1/responses";
 // The proxy gates this as Grok wire compatibility; fx identifies itself separately below.
-const version_lookup = @import("provider_versions.zig");
+const versions = @import("../core/gateway/provider_versions.zig");
 const e2e_endpoint_env = "FX_TEST_XAI_GROK_RESPONSES_URL";
 const max_error_body_bytes: usize = 256 * 1024;
 const max_sse_line_bytes: usize = 1024 * 1024;
@@ -270,15 +271,11 @@ pub fn streamPrepared(
     defer auth_headers.deinit(alloc);
     const request_endpoint = responsesEndpoint() catch |err| return stream_provider.failResult(err);
     const uri = try std.Uri.parse(request_endpoint);
-    const compatibility = if (auth_headers.include_subscription_headers)
-        try version_lookup.resolve(alloc, .grok, request.cancel_flag, request.deadline)
-    else
-        null;
 
     var extra_headers_buf: [max_extra_headers]std.http.Header = undefined;
     const extra_headers = extraHeaders(&extra_headers_buf, .{
         .subscription = auth_headers.include_subscription_headers,
-        .client_version = if (compatibility) |*version| version.slice() else null,
+        .client_version = if (auth_headers.include_subscription_headers) versions.grok_client_version else null,
         .account_id = auth_headers.account_id,
         .model = request.model,
         .session_id = request.session_id,
@@ -379,6 +376,7 @@ pub fn completeFromStream(
         request.cancel_flag,
         request.content_capture_limit,
         progress,
+        .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages },
     );
     errdefer {
         var owned = stream_provider.Result{ .completed = .{
@@ -404,8 +402,9 @@ fn consumeSse(
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
     progress: ?sse_stream.Progress,
+    conversation: tool_call_ids.Conversation,
 ) !types.ModelCompletion {
-    var reducer = responses_protocol.Reducer.init(alloc);
+    var reducer = try responses_protocol.Reducer.init(alloc, conversation);
     defer reducer.deinit(alloc);
     var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .max_total_bytes = max_sse_aggregate_bytes, .progress = progress };
     defer sse.deinit(alloc);
@@ -665,6 +664,7 @@ test "xAI Grok SSE maps text reasoning tools and usage" {
         &cancelled,
         null,
         null,
+        .{},
     );
     defer {
         if (completion.content) |value| std.testing.allocator.free(@constCast(value));
@@ -842,7 +842,6 @@ const XaiTestEnvironment = struct {
         };
         errdefer self.map.deinit();
         try self.map.put(e2e_endpoint_env, responses_url);
-        try self.map.put("FX_TEST_GROK_CLIENT_VERSION", "1.0.6");
         io_mod.setEnvironMap(&self.map);
         return self;
     }
@@ -1005,6 +1004,7 @@ fn consumeTestSse(bytes: []const u8) !types.ModelCompletion {
         &cancelled,
         null,
         null,
+        .{},
     );
 }
 
@@ -1174,4 +1174,35 @@ test "an xAI event that is not JSON resends, and a duplicate key still ends the 
     try std.testing.expect(gateway_client.networkFailureEvidence(error.MalformedXaiGrokSseEvent, .possibly_sent) != null);
     try expectTestSseError(error.InvalidXaiGrokSseEvent, partial ++ "data: {\"type\":\"a\",\"type\":\"b\"}\n\n");
     try std.testing.expect(gateway_client.networkFailureEvidence(error.InvalidXaiGrokSseEvent, .possibly_sent) == null);
+}
+
+test "eb03: ChatMessage.input_id leaves Grok request body byte-identical" {
+    const alloc = std.testing.allocator;
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Be concise." }};
+    const without_id = [_]types.ChatMessage{
+        .{ .role = .user, .content = "initial prompt" },
+        .{ .role = .assistant, .content = "working" },
+        .{ .role = .user, .content = "follow up steer", .restored_steering = true },
+    };
+    var with_id = without_id;
+    with_id[0].input_id = 42;
+    with_id[2].input_id = 43;
+
+    const body_without = try buildRequest(alloc, .{
+        .model = "grok-3",
+        .instructions = &instructions,
+        .messages = &without_id,
+        .tool_choice = .auto,
+        .provider_options = .{},
+    });
+    defer alloc.free(body_without);
+    const body_with = try buildRequest(alloc, .{
+        .model = "grok-3",
+        .instructions = &instructions,
+        .messages = &with_id,
+        .tool_choice = .auto,
+        .provider_options = .{},
+    });
+    defer alloc.free(body_with);
+    try std.testing.expectEqualStrings(body_without, body_with);
 }

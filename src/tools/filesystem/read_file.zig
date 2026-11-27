@@ -41,24 +41,26 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     var parsed = args.parse(args_json) catch |err| return .{ .failure = try args.takeFailure(err) };
     defer parsed.deinit();
     const path = args.requiredString(parsed.value.object, "path") catch |err| return .{ .failure = try args.takeFailure(err) };
+    // Check the line fields before allocating the input, so a rejected call
+    // leaves nothing to free.
+    const start_line: ?usize = switch (try parseOptionalPositive(ctx.allocator, parsed.value.object, "start_line")) {
+        .missing => null,
+        .value => |value| value,
+        .failure => |body| return .{ .failure = body },
+    };
+    const line_count: ?usize = switch (try parseOptionalPositive(ctx.allocator, parsed.value.object, "line_count")) {
+        .missing => null,
+        .value => |value| @min(value, max_line_count),
+        .failure => |body| return .{ .failure = body },
+    };
 
     const input = try ctx.allocator.create(Input);
     errdefer ctx.allocator.destroy(input);
     input.* = .{
         .path = try ctx.allocator.dupe(u8, path),
     };
-    errdefer input.deinit(ctx.allocator);
-
-    switch (try parseOptionalPositive(ctx.allocator, parsed.value.object, "start_line")) {
-        .missing => {},
-        .value => |value| input.start_line = value,
-        .failure => |body| return .{ .failure = body },
-    }
-    switch (try parseOptionalPositive(ctx.allocator, parsed.value.object, "line_count")) {
-        .missing => {},
-        .value => |value| input.line_count = @min(value, max_line_count),
-        .failure => |body| return .{ .failure = body },
-    }
+    if (start_line) |value| input.start_line = value;
+    if (line_count) |value| input.line_count = value;
 
     return .{ .input = .{ .ptr = input, .deinit_fn = inputDeinit } };
 }
@@ -69,8 +71,11 @@ const PositiveParse = union(enum) {
     failure: []u8,
 };
 
+/// Zero counts as absent: models send `line_count: 0` to mean "no count" and
+/// `start_line: 0` to mean "from the top", so those read with the defaults.
 fn parseOptionalPositive(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) tool_dispatch.DispatchError!PositiveParse {
     const value = object.get(key) orelse return .missing;
+    if (value == .integer and value.integer == 0) return .missing;
     if (value != .integer or value.integer < 1) {
         return .{ .failure = try alloc.print("read_file field \"{s}\" must be a positive integer", .{key}) };
     }
@@ -677,6 +682,70 @@ test "read_file honors line range fields and uses active output shape" {
     const expected = try std.testing.allocator.print("<path>{s}</path>\n<content>\n2\ttwo\n3\tthree\n... [showing 2 of 3 lines; use start_line/line_count to read more.]\n</content>", .{path});
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, result.body);
+}
+
+test "read_file reads line_count 0 with the default count" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "file.txt", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "one\ntwo\nthree\n");
+    }
+    const path = try tmpPath(std.testing.allocator, tmp, "file.txt");
+    defer std.testing.allocator.free(path);
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\",\"start_line\":1,\"line_count\":0}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    const expected = try std.testing.allocator.print("<path>{s}</path>\n<content>\n1\tone\n2\ttwo\n3\tthree\n</content>", .{path});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, result.body);
+}
+
+test "read_file reads start_line 0 from the first line" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "file.txt", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "one\ntwo\nthree\n");
+    }
+    const path = try tmpPath(std.testing.allocator, tmp, "file.txt");
+    defer std.testing.allocator.free(path);
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\",\"start_line\":0,\"line_count\":2}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    const expected = try std.testing.allocator.print("<path>{s}</path>\n<content>\n1\tone\n2\ttwo\n... [showing 2 of 3 lines; use start_line/line_count to read more.]\n</content>", .{path});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, result.body);
+}
+
+test "read_file rejects a negative line_count" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "file.txt", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "one\n");
+    }
+    const path = try tmpPath(std.testing.allocator, tmp, "file.txt");
+    defer std.testing.allocator.free(path);
+    const args = try std.testing.allocator.print("{{\"path\":\"{s}\",\"line_count\":-1}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.failure, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "read_file field \"line_count\" must be a positive integer") != null);
 }
 
 test "read_file omits binary content using active success output" {
