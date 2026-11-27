@@ -1,8 +1,8 @@
 #!/bin/sh
-# Model-checks DurableSession.tla, PromptIntake.tla, ImageStore.tla,
-# DurableSteer.tla and AgentRouting.tla with TLC, confirms each witness is
-# violated, and writes the state graphs the drivers in ../drivers/ walk
-# against the code.
+# Model-checks DurableSession.tla, DurableHandOff.tla, PromptIntake.tla,
+# ImageStore.tla, DurableSteer.tla and AgentRouting.tla with TLC, confirms
+# each witness is violated, and writes the state graphs the drivers in
+# ../drivers/ walk against the code.
 #
 # Needs Java 11+ and tla2tools.jar:
 #   brew install openjdk
@@ -15,6 +15,7 @@
 #   bun ../drivers/drive.mjs write && bun ../drivers/drive.mjs cutoff
 #   bun ../drivers/drive.mjs leased   # the Heartbeat graph, on a World without liveness
 #   bun ../drivers/drive.mjs queue    # the QueueHeld graph, on a World whose queue shows it
+#   bun ../drivers/drive.mjs handoff  # the hand-off graph: a host stops one worker's process
 #   bun ../drivers/drive-intake.mjs   # prompts with images
 #   bun ../drivers/drive-images.mjs   # images stored once, across crashes and reopens
 #   bun ../drivers/drive-agents.mjs   # AgentRouting
@@ -73,6 +74,41 @@ for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoAct
         echo "== witness $witness NOT reached" >&2; status=1
     fi
 done
+# DurableHandOff.tla: a host hands one worker's process off, as on SIGTERM
+# (agent.handOff()). The lookup graph is the one drive.mjs handoff walks; the
+# send config adds a freeze and a call with effects.
+echo "== DurableHandOff (lookup)"
+if "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
+    -metadir "$work/handoff-lookup" -dump dot,actionlabels "graphs/handoff" \
+    -config DurableHandOff-lookup.cfg DurableHandOff.tla > "$work/handoff-lookup.log" 2>&1; then
+    grep -E 'distinct states|depth of' "$work/handoff-lookup.log"
+else
+    cat "$work/handoff-lookup.log"; status=1
+fi
+echo "== DurableHandOff (send)"
+if "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup \
+    -metadir "$work/handoff-send" -config DurableHandOff-send.cfg DurableHandOff.tla > "$work/handoff-send.log" 2>&1; then
+    grep -E 'distinct states|depth of' "$work/handoff-send.log"
+else
+    cat "$work/handoff-send.log"; status=1
+fi
+# Each hand-off witness must break its invariant. Today breaks HandOffReleases:
+# SIGTERM ends the process while it holds its lease. TakesWork and Retakes
+# break AskedClaimsNothing: an asked worker claims, or takes the session back
+# at the bound. YieldFirst breaks YieldMakesProgress, CountsCutoff breaks
+# YieldIsNoCutoff, and Continues breaks NotContinued: another worker finishes
+# the turn after a hand-off.
+for pair in Today:HandOffReleases TakesWork:AskedClaimsNothing Retakes:AskedClaimsNothing \
+    YieldFirst:YieldMakesProgress CountsCutoff:YieldIsNoCutoff Continues:NotContinued; do
+    witness="${pair%%:*}" invariant="${pair#*:}"
+    if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/hw-$witness" \
+        -config "HandOffWitness-$witness.cfg" DurableHandOff.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then
+        echo "== hand-off witness $witness reached"
+    else
+        echo "== hand-off witness $witness NOT reached" >&2; status=1
+    fi
+done
+
 # DurableSteer.tla: where each message a user sends ends up. The ideal graph
 # has no faults, and the faults graph adds cancels, deadline handoffs and
 # client retries.
