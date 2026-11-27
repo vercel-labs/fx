@@ -3512,7 +3512,7 @@ tmuxTest(
     const refused = await session.captureFullScrollback();
     expect(refused).toContain("not allowed for this team");
     expect(refused).toContain("Vercel team example-internal-team");
-    expect(refused).toContain("press Esc twice, run /login, choose another team, and send it again");
+    expect(refused).toContain("Wrong team? Press Esc twice, run /login, choose another team, and send it again");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -4400,7 +4400,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     expect(Date.now() - cancelStarted).toBeLessThan(500);
     expect(cancelledPane).toContain("▪ Cancelled");
-    expect(cancelledPane).not.toContain("system: cancelled");
+    expect(cancelledPane).not.toContain("⊘ Cancelled");
     expect(cancelledPane).not.toContain("Cancelling");
     expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -7144,7 +7144,7 @@ tmuxTest(
         FX_TEST_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
       });
       await session.waitForComposer(TIMEOUT);
-      const failureVisible = session.waitForText("request failed: reply too large to read", TIMEOUT);
+      const failureVisible = session.waitForText("Request failed: reply too large to read", TIMEOUT);
       await session.sendText("Recover from a bounded Grok response.");
       await failureVisible;
       await session.sendText("Accept another prompt after recovery.");
@@ -7153,7 +7153,7 @@ tmuxTest(
       await session.waitForText("GROK_AFTER_LIMIT_OK", TIMEOUT);
 
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toContain("request failed: reply too large to read");
+      expect(scrollback).toContain("Request failed: reply too large to read");
       expect(scrollback).not.toContain("XaiGrokSseEventTooLarge");
       expect(grok.bodies).toHaveLength(3);
       expect(gateway.requests).toHaveLength(0);
