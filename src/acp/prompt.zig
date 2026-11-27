@@ -3330,8 +3330,11 @@ fn writeSubagentMeta(writer: *std.Io.Writer, asker: SubagentAsker) !void {
 }
 
 fn writeValidatedToolArguments(alloc: Allocator, writer: *std.Io.Writer, arguments_json: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch
-        return error.InvalidToolArgumentsJson;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| return switch (err) {
+        // Out of memory says nothing about the arguments.
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidToolArgumentsJson,
+    };
     defer parsed.deinit();
     try std.json.Stringify.value(parsed.value, .{}, writer);
 }
@@ -5347,6 +5350,16 @@ test "ACP permission arguments are validated and reserialized before emission" {
         writeValidatedToolArguments(alloc, &malformed.writer, "{\"path\":}"),
     );
     try std.testing.expectEqual(@as(usize, 0), malformed.written().len);
+}
+
+test "out of memory while a subagent's tool arguments are checked is out of memory, not invalid arguments" {
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        writeValidatedToolArguments(failing.allocator(), &out.writer, "{\"path\":\"README.md\"}"),
+    );
 }
 
 test "acp exposes web_search progress updates" {
