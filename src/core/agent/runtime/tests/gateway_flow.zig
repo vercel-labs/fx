@@ -4367,6 +4367,68 @@ test "retained context automatic compaction archives oversized parallel results 
     try std.testing.expect(std.mem.find(u8, second, result_b) != null);
 }
 
+test "a turn whose step a compaction summarized hands the session its whole turn, however the turn ends (D87)" {
+    const alloc = std.testing.allocator;
+    const old_text = "OLDER_HISTORY_SENTINEL " ++ text_utils.repeat("o", 52_000);
+    const result_a = "RECENT_EXACT_A\n" ++ text_utils.repeat("a", 13_000);
+    const result_b = "RECENT_EXACT_B\n" ++ text_utils.repeat("b", 13_000);
+    const calls = [_]ToolCall{
+        toolCall("retained-a", "read_file", "{\"path\":\"a.txt\"}"),
+        toolCall("retained-b", "read_file", "{\"path\":\"b.txt\"}"),
+    };
+    const later_calls = [_]ToolCall{toolCall("cut-off", "read_file", "{\"path\":\"c.txt\"}")};
+    const first: FakeCompletion = .{ .tool_calls = &calls };
+    const summary: FakeCompletion = .{ .content = "Turn 1\nIn between: Earlier work established the project facts." };
+    const cut_off: FakeCompletion = .{ .tool_calls = &later_calls, .finish_reason = .length };
+    const Ending = struct { name: []const u8, completions: []const FakeCompletion };
+    // A reply, two empty replies (`finishFailedTurnWithNotice`), and a reply
+    // cut off again after its resend.
+    const endings = [_]Ending{
+        .{ .name = "completed", .completions = &.{ first, summary, .{ .content = "Continued from the observed results." } } },
+        .{ .name = "empty", .completions = &.{ first, summary, .{}, .{} } },
+        .{ .name = "length", .completions = &.{ first, summary, cut_off, cut_off } },
+    };
+    for (endings) |ending| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(result_dir);
+        var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(old_text) }};
+        const history = [_]HistoryTurn{.{ .assistant = .{
+            .user = .{ .text = @constCast("previous work") },
+            .assistant = @constCast("previous work done"),
+            .execution = .{ .tool_steps = &old_steps },
+        } }};
+        var gateway = FakeGateway.init(alloc, ending.completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        const model = "provider/retained-context";
+        const context_window = (estimateTextTokens(old_text) + (estimateTextTokens(result_a) + estimateTextTokens(result_b)) / 2) * 5 / 4;
+        const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = @intCast(context_window) } }};
+        hooks.available_capability_overrides = &capabilities;
+        hooks.permission_decisions = &.{ .once, .once };
+        hooks.exec_plans = &.{ .{ .result = .{ .model_output = result_a } }, .{ .result = .{ .model_output = result_b } } };
+        var tool_store = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, result_dir, .tool_results, .writable);
+        defer tool_store.deinit();
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.session_child_capability = &tool_store;
+        var job = fixture.job();
+        job.model = @constCast(model);
+        job.history = @constCast(&history);
+        try runFakePrompt(&gateway, &hooks, config, job);
+        errdefer std.debug.print("ending {s}\n", .{ending.name});
+        const turn = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant;
+        // fx's history goes on from the cut; the log gets the step it summarized.
+        try std.testing.expectEqual(@as(usize, 0), turn.execution.tool_steps.len);
+        const whole = turn.saved_execution orelse return error.TestExpectedSavedExecution;
+        try std.testing.expectEqual(@as(usize, 1), whole.tool_steps.len);
+        try std.testing.expectEqualStrings(result_a, whole.tool_steps[0].tool_results[0].output);
+        try std.testing.expectEqualStrings(result_b, whole.tool_steps[0].tool_results[1].output);
+    }
+}
+
 test "retained context compaction preserves recovered historical replay" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
