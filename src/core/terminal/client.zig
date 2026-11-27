@@ -1858,12 +1858,41 @@ const LifeSignal = struct {
 
     /// Blocks until the process is gone, for at most `timeout_ms`.
     fn waitGone(signal: *LifeSignal, timeout_ms: i32) !void {
-        var fds = [_]std.posix.pollfd{.{ .fd = signal.read_fd, .events = std.posix.POLL.IN, .revents = 0 }};
-        if ((try std.posix.poll(&fds, timeout_ms)) == 0) return error.TestProcessStillRuns;
+        if (!try readableOrAtEnd(signal.read_fd, timeout_ms)) return error.TestProcessStillRuns;
         var byte: [1]u8 = undefined;
         if ((try std.posix.read(signal.read_fd, &byte)) != 0) return error.TestLifeSignalFailed;
     }
 };
+
+/// Whether `fd`, the read end of a named pipe, holds data or has reached its
+/// end within `timeout_ms`. On macOS only `select` says that the last writer
+/// of a named pipe has gone; `poll` and `kqueue` stay silent.
+fn readableOrAtEnd(fd: std.posix.fd_t, timeout_ms: i32) !bool {
+    if (comptime builtin.target.os.tag != .macos) {
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        return (try std.posix.poll(&fds, timeout_ms)) != 0;
+    }
+    const system = struct {
+        const FdSet = extern struct { bits: [32]u32 };
+        extern "c" fn select(
+            count: c_int,
+            read_set: *FdSet,
+            write_set: ?*FdSet,
+            error_set: ?*FdSet,
+            timeout: *std.c.timeval,
+        ) c_int;
+    };
+    var read_set: system.FdSet = .{ .bits = @splat(0) };
+    const index: usize = @intCast(@divFloor(fd, 32));
+    read_set.bits[index] |= @as(u32, 1) << @intCast(@mod(fd, 32));
+    var timeout: std.c.timeval = .{
+        .sec = @divFloor(timeout_ms, 1000),
+        .usec = @mod(timeout_ms, 1000) * 1000,
+    };
+    const ready = system.select(fd + 1, &read_set, null, null, &timeout);
+    if (ready < 0) return error.TestSelectFailed;
+    return ready > 0;
+}
 
 /// A process a test started, with the identity it had, so the test ends it by
 /// pid only while it is still that process.
