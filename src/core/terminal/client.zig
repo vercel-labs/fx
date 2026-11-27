@@ -2010,7 +2010,8 @@ const ExitGate = struct {
     var alive: ?*LifeSignal = null;
     var session_id: [128]u8 = undefined;
     var session_id_len: usize = 0;
-    var failed = false;
+    /// The first error a hook met, which the test returns.
+    var failure: ?anyerror = null;
     var launcher: ?TestProcess = null;
     /// Holds the close's last step until the host has decided what to do with
     /// the ended launcher, so that step cannot run first and hide whether the
@@ -2028,7 +2029,7 @@ const ExitGate = struct {
         alive = alive_signal;
         session_id_len = @min(id.len, session_id.len);
         @memcpy(session_id[0..session_id_len], id[0..session_id_len]);
-        failed = false;
+        failure = null;
         launcher = null;
         wait_for_launcher_decision = false;
         native_session.test_after_exit_record = &afterRecord;
@@ -2047,26 +2048,26 @@ const ExitGate = struct {
         if (!std.mem.eql(u8, id, session_id[0..session_id_len])) return;
         if (launcher_pid) |pid| launcher = TestProcess.init(pid);
         const go_signal = go orelse return;
-        go_signal.send() catch {
-            failed = true;
+        go_signal.send() catch |err| {
+            failure = err;
             return;
         };
         const forked_signal = forked orelse return;
-        forked_signal.wait(15_000) catch {
-            failed = true;
+        forked_signal.wait(15_000) catch |err| {
+            failure = err;
             return;
         };
         const alive_signal = alive orelse return;
-        alive_signal.waitStarted(15_000) catch {
-            failed = true;
+        alive_signal.waitStarted(15_000) catch |err| {
+            failure = err;
         };
     }
 
     fn beforeKill(id: []const u8) void {
         if (!wait_for_launcher_decision) return;
         if (!std.mem.eql(u8, id, session_id[0..session_id_len])) return;
-        LauncherWatch.waitFor(&LauncherWatch.decided, 15_000) catch {
-            failed = true;
+        LauncherWatch.waitFor(&LauncherWatch.decided, 15_000) catch |err| {
+            failure = err;
         };
     }
 
@@ -2140,7 +2141,7 @@ fn expectExitEndsLateChild(output: OutputEnds) !void {
 
     fixture.runtime.closeOwnedTerminals();
     // The hook ran after the shell's tree was recorded and waited for the child.
-    if (ExitGate.failed) return error.TestExitGateFailed;
+    if (ExitGate.failure) |err| return err;
     const late = TestProcess.init(try readPid(&fixture, "late.pid"));
     // Past the failed assertions, so the test never leaves its child behind.
     defer late.end();
@@ -2339,7 +2340,7 @@ test "closing owned terminals for exit leaves a setsid program and another runti
     defer ExitGate.disarm();
 
     fixture.runtime.closeOwnedTerminals();
-    try std.testing.expect(!ExitGate.failed);
+    if (ExitGate.failure) |err| return err;
     const late = TestProcess.init(try readPid(&fixture, "late.pid"));
     defer late.end();
     try std.testing.expect(fixture.runtime.backend_drained);

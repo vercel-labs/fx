@@ -1543,6 +1543,9 @@ const Session = struct {
     /// Set under `mutex` once the control thread has seen the launcher end.
     /// Only then may `reapLauncher` collect it.
     launcher_ended: bool = false,
+    /// Set under `mutex` once the exit close has ended what was left in the
+    /// terminal's session. Only the exit close sets it.
+    exit_swept: bool = false,
     control_file: ?std.Io.File = null,
     liveness_file: ?std.Io.File = null,
     output_thread: ?std.Thread = null,
@@ -2030,6 +2033,10 @@ const Session = struct {
             self.exit_tree = null;
         }
         self.endLauncherSession();
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        self.exit_swept = true;
+        self.mutex.unlock(zio);
         self.reapLauncher();
     }
 
@@ -2085,9 +2092,9 @@ const Session = struct {
     /// macOS makes that the usual case, because it ends the PTY's output as
     /// soon as the session leader exits, even while a late child holds the
     /// PTY, so nothing keeps the host from collecting the launcher at once.
-    /// The entry is collected by `reapLauncher`, when the session cannot hold a
-    /// process any more or the terminal is closed or freed or the exit path has
-    /// ended what is left in it (`tests/tla/terminal/TerminalLifecycle.tla`
+    /// The entry is collected by `reapLauncher`, when `settleEndedLauncher`
+    /// finds the session empty, or the terminal is closed or freed, or the exit
+    /// path has ended what is left in it (`tests/tla/terminal/TerminalLifecycle.tla`
     /// `LauncherHeldWhileSessionHasMembers`).
     fn awaitLauncherEnd(self: *Session) void {
         const pid = (self.launcher orelse return).id orelse return;
@@ -2109,7 +2116,7 @@ const Session = struct {
         self.mutex.lockUncancelable(zio);
         self.launcher_ended = true;
         self.mutex.unlock(zio);
-        self.reapLauncherIfSessionEmpty();
+        self.settleEndedLauncher();
     }
 
     /// A launcher that ended badly, with nothing reported yet, loses the terminal.
@@ -2121,15 +2128,29 @@ const Session = struct {
         if (!reported and !clean) self.markLost();
     }
 
-    /// Collects an ended launcher as soon as its session holds no live
-    /// process: nothing can join an empty session, so nothing is left for the
-    /// entry to prove.
-    fn reapLauncherIfSessionEmpty(self: *Session) void {
+    /// Decides what happens to a launcher that has just ended. The exit close
+    /// ends the terminal's session and collects the launcher itself, so while
+    /// it runs this leaves the launcher to it, or collects it when the close
+    /// has already ended the session. That keeps a process list off the exit's
+    /// time budget, and a late child that is still dying after the close
+    /// killed it would show up in one as a member. Otherwise the launcher is
+    /// collected as soon as its session holds no live process: nothing can
+    /// join an empty session, so nothing is left for the entry to prove.
+    fn settleEndedLauncher(self: *Session) void {
         const target = self.launcherTarget() orelse {
             // Without its identity the exit path ends nothing in the session.
             self.reapLauncher();
             return;
         };
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        const exiting = self.ending_with_owner;
+        const swept = self.exit_swept;
+        self.mutex.unlock(zio);
+        if (exiting) {
+            if (swept) self.reapLauncher() else self.launcherEvent(.kept, target.pid);
+            return;
+        }
         const empty = process_tree.sessionIsEmpty(self.alloc, target.pid) catch |err| {
             debug_trace.logf(
                 "terminal",
