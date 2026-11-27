@@ -34,7 +34,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { completion as configuredCompletion, createConfiguredProviderFixture } from "./fixtures/chat-completions";
-import { childLines, childWork, compactionRecordPath, copyV1Fixture, holdChildAnswer, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, withoutConversionNotice } from "./saved-sessions";
+import { childLines, childWork, compactionRecordPath, copyV1Fixture, holdChildAnswer, logLines, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, withoutConversionNotice } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -204,13 +204,10 @@ const RACE_PROMPT = "Read notes.txt until told to stop. RACE_MAIN_PROMPT";
 
 /// The records the `compaction_records` lines of session `id` list, besides
 /// each line's own map, which every such line lists too (D50). The mid-turn
-/// compaction makes fx write the turn afresh as superseded, which logLines
-/// refuses. logLinesAfterCompaction accepts that supersede only when a
-/// compaction in the same turn explains it, so this read also checks it is the
-/// designed one.
+/// compaction leaves the turn whole in the log, so no turn is superseded.
 function listedRecords(home: string, id: string): string[] {
   const listed: string[] = [];
-  for (const line of logLinesAfterCompaction(home, id) as any[]) {
+  for (const line of logLines(home, id) as any[]) {
     if (line.kind !== "set" || line.key !== "compaction_records") continue;
     expect(line.blobs).toContain(line.value.map);
     listed.push(...(line.blobs as string[]).filter((hash) => hash !== line.value.map));
@@ -9294,6 +9291,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(gateway.requests).toHaveLength(8);
           expect(readFileSync(join(root.workspace, "effects.txt"), "utf8")).toBe("once\n");
           expect(readFileSync(tracePath, "utf8")).not.toContain("event=transaction_failed");
+          // The clipped page streams with the preview its commit gives it, so
+          // no turn is written again.
+          logLines(root.home, sessionId);
         } finally {
           await tui?.kill();
           gateway.stop();
@@ -9575,6 +9575,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         let restartReport = "";
         let summarizedFollowUp = false;
         let readCompacted = false;
+        let restartSentFollowUpRead: boolean | null = null;
         const gateway = startDynamicFakeGateway((body) => {
           const request = JSON.parse(body);
           if (request.tools.length === 0) {
@@ -9599,6 +9600,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             expect(body).toContain("compacted_conversation");
             expect(body).toContain(`Its diagnostic is ${diagnosticHandle}.`);
             expect(body).toContain("with read_tool_result");
+            restartSentFollowUpRead = hasToolResult(body, "cancel-follow-up-read");
             return fakeGatewayFinalText("CANCEL_RESTART_COMPLETE");
           }
           if (hasCurrentToolResult(body, "cancel-follow-up-read")) {
@@ -9695,8 +9697,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           }
           const calls = savedToolCallIds(history);
           expect(calls.filter((id) => id === "cancelled-history-child")).toHaveLength(1);
-          // A read the compaction took is in its record, not the saved turn.
-          expect(calls.filter((id) => id === "cancel-follow-up-read")).toHaveLength(readCompacted ? 0 : 1);
+          // The saved turn keeps the read, even one a compaction took into its
+          // record (D87); the request after the restart still leaves that one out.
+          expect(calls.filter((id) => id === "cancel-follow-up-read")).toHaveLength(1);
+          expect(restartSentFollowUpRead).not.toBeNull();
+          if (readCompacted) expect(restartSentFollowUpRead).toBe(false);
           expect(history.some((turn) => turn.assistant === "CANCEL_RESTART_COMPLETE")).toBe(true);
           await tui.sendText("/quit");
           await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 15000);
