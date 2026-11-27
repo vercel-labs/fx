@@ -203,6 +203,7 @@ const RawEnviron = io_mod.RawEnviron;
 const footer_rows: u16 = 4;
 const active_poll_timeout_ms: i32 = 8;
 const focused_ui_worker_poll_timeout_ms: i32 = 1;
+const idle_poll_timeout_ms: i32 = 250;
 const idle_wasm_poll_timeout_ms: i32 = 16;
 const resize_debounce_ms: i64 = 100;
 const max_transcript_bytes: usize = 256 * 1024;
@@ -216,30 +217,52 @@ const max_read_file_line_len: usize = 2000;
 const max_command_output_bytes: usize = 64 * 1024;
 const input_escape_timeout_ms: i64 = 30;
 
-/// The first frame counts as focused work: an idle wait before it would only
-/// delay the launch.
-fn nativeLoopPollTimeoutMs(
-    default_timeout_ms: i32,
-    first_frame_pending: bool,
-    auth_refresh_active: bool,
-    skills_refresh_active: bool,
-    transcript_page_work_active: bool,
-    file_listing_hold_pending: bool,
-    pending_input_restore_active: bool,
-    /// A time-bounded drain put events back: run the next iteration without
-    /// waiting for input.
-    next_iteration_due: bool,
-) i32 {
-    if (next_iteration_due) return 0;
-    return if (first_frame_pending or
-        auth_refresh_active or
-        skills_refresh_active or
-        transcript_page_work_active or
-        file_listing_hold_pending or
-        pending_input_restore_active)
-        @min(default_timeout_ms, focused_ui_worker_poll_timeout_ms)
-    else
-        default_timeout_ms;
+const LoopTimeoutFacts = struct {
+    next_iteration_due: bool = false,
+    first_frame_pending: bool = false,
+    auth_refresh_active: bool = false,
+    skills_refresh_active: bool = false,
+    transcript_page_work_active: bool = false,
+    file_listing_hold_pending: bool = false,
+    pending_input_restore_active: bool = false,
+    render_pending: bool = false,
+    animation_visible: bool = false,
+    pacer_pending: bool = false,
+    agent_active: bool = false,
+    escape_pending: bool = false,
+    gesture_armed: bool = false,
+    resize_pending: bool = false,
+    open_ui_waiting: bool = false,
+
+    fn focused(self: LoopTimeoutFacts) bool {
+        return self.first_frame_pending or
+            self.auth_refresh_active or
+            self.skills_refresh_active or
+            self.transcript_page_work_active or
+            self.file_listing_hold_pending or
+            self.pending_input_restore_active;
+    }
+
+    fn active(self: LoopTimeoutFacts) bool {
+        return self.render_pending or
+            self.animation_visible or
+            self.pacer_pending or
+            self.agent_active or
+            self.escape_pending or
+            self.gesture_armed or
+            self.resize_pending or
+            self.open_ui_waiting;
+    }
+};
+
+/// Returns the native poll timeout in ms. An idle session waits up to
+/// `idle_poll_timeout_ms`; any background work not listed here waits at most
+/// that long and never hangs.
+fn loopTimeoutMs(facts: LoopTimeoutFacts) i32 {
+    if (facts.next_iteration_due) return 0;
+    if (facts.focused()) return @min(active_poll_timeout_ms, focused_ui_worker_poll_timeout_ms);
+    if (facts.active()) return active_poll_timeout_ms;
+    return idle_poll_timeout_ms;
 }
 
 const max_prompt_history: usize = 100;
@@ -1388,18 +1411,63 @@ const App = struct {
     pub fn loopPollTimeoutMs(ctx: *anyopaque, default_timeout_ms: i32) i32 {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (comptime !host_target.is_wasm) {
-            return nativeLoopPollTimeoutMs(
-                default_timeout_ms,
-                self.shell.render_requests.hasReason(.first_frame),
-                self.auth.sourceInventoryRefreshActive(),
-                self.skills.refreshActive(),
-                self.fullTranscriptFocusedWorkActive(),
-                InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
-                self.pendingInputRestoreActive(),
-                self.takeDrainContinuationDue(),
-            );
+            return loopTimeoutMs(self.loopTimeoutFacts());
         }
         return if (self.pacer.hasPending()) default_timeout_ms else idle_wasm_poll_timeout_ms;
+    }
+
+    fn loopTimeoutFacts(self: *App) LoopTimeoutFacts {
+        return .{
+            .next_iteration_due = self.takeDrainContinuationDue(),
+            .first_frame_pending = self.shell.render_requests.hasReason(.first_frame),
+            .auth_refresh_active = self.auth.sourceInventoryRefreshActive(),
+            .skills_refresh_active = self.skills.refreshActive(),
+            .transcript_page_work_active = self.fullTranscriptFocusedWorkActive(),
+            .file_listing_hold_pending = InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
+            .pending_input_restore_active = self.pendingInputRestoreActive(),
+            .render_pending = self.shell.render_requests.hasPending(),
+            .animation_visible = self.shell.render_requests.animation_visible,
+            .pacer_pending = self.pacer.hasPending(),
+            .agent_active = self.anyAgentLoopActive(),
+            .escape_pending = self.terminal_input_runtime.hasPendingTerminalAction(),
+            .gesture_armed = self.anyInputGestureArmed(),
+            .resize_pending = resize_interlock.resizePending() or !shell_runtime.resizeLifecycleIdle(&self.shell),
+            .open_ui_waiting = self.openUiWaitingForBackground(),
+        };
+    }
+
+    fn anyAgentLoopActive(self: *App) bool {
+        if (AgentsAppRuntime.firstOpen(self) and agentLoopActive(&self.main_agent)) return true;
+        for (self.child_agents.items) |child| {
+            if (agentLoopActive(&child.agent)) return true;
+        }
+        return false;
+    }
+
+    fn agentLoopActive(agent: *agents.Agent) bool {
+        return agent.stream.active or agent.worker.isProcessing() or agent.worker.hasPendingEvents();
+    }
+
+    fn anyInputGestureArmed(self: *const App) bool {
+        const gestures = self.input_runtime.gestures;
+        return gestures.ctrlCExitArmed() or
+            gestures.escapeClearArmed() or
+            gestures.escapeInterruptArmed();
+    }
+
+    fn openUiWaitingForBackground(self: *App) bool {
+        const picker = &self.input_runtime.picker.file_completion;
+        const file_listing_in_flight = picker.active and !picker.indexed and picker.directory_request != null;
+        const model_loading = self.model_cache.menu.active and self.model_cache.isLoading();
+        const mcp_loading = self.mcp.host_menu.active and self.mcp.host_menu_tools == .loading;
+        const session_picker = &self.screenAgent().session_persistence.session_picker;
+        const session_loading = session_picker.active and
+            (session_picker.load_state == .loading or session_picker.loading_more);
+        return self.input_runtime.usage_menu.active or
+            file_listing_in_flight or
+            model_loading or
+            mcp_loading or
+            session_loading;
     }
 
     /// Whether any agent's budgeted drain put events back for the loop's next
@@ -4698,16 +4766,49 @@ test "process io connects through a reachable address while fx tasks hold every 
 }
 
 test "focused UI workers retain a bounded native poll timeout" {
-    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, true, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, false, true, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true, false));
-    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false, true));
-    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true, true));
+    try std.testing.expectEqual(@as(i32, 250), loopTimeoutMs(.{}));
+    try std.testing.expectEqual(@as(i32, 1), loopTimeoutMs(.{ .first_frame_pending = true }));
+    try std.testing.expectEqual(@as(i32, 1), loopTimeoutMs(.{ .auth_refresh_active = true }));
+    try std.testing.expectEqual(@as(i32, 1), loopTimeoutMs(.{ .skills_refresh_active = true }));
+    try std.testing.expectEqual(@as(i32, 1), loopTimeoutMs(.{ .transcript_page_work_active = true }));
+    try std.testing.expectEqual(@as(i32, 1), loopTimeoutMs(.{ .file_listing_hold_pending = true }));
+    try std.testing.expectEqual(@as(i32, 1), loopTimeoutMs(.{ .pending_input_restore_active = true }));
+    try std.testing.expectEqual(@as(i32, 1), loopTimeoutMs(.{
+        .first_frame_pending = true,
+        .auth_refresh_active = true,
+        .skills_refresh_active = true,
+        .transcript_page_work_active = true,
+        .file_listing_hold_pending = true,
+        .pending_input_restore_active = true,
+        .render_pending = true,
+    }));
+    try std.testing.expectEqual(@as(i32, 0), loopTimeoutMs(.{ .next_iteration_due = true }));
+    try std.testing.expectEqual(@as(i32, 0), loopTimeoutMs(.{
+        .next_iteration_due = true,
+        .first_frame_pending = true,
+        .auth_refresh_active = true,
+        .skills_refresh_active = true,
+        .transcript_page_work_active = true,
+        .file_listing_hold_pending = true,
+        .pending_input_restore_active = true,
+        .render_pending = true,
+    }));
+}
+
+test "loopTimeoutMs returns active 8 ms timeout for each active fact" {
+    const active_cases = [_]LoopTimeoutFacts{
+        .{ .render_pending = true },
+        .{ .animation_visible = true },
+        .{ .pacer_pending = true },
+        .{ .agent_active = true },
+        .{ .escape_pending = true },
+        .{ .gesture_armed = true },
+        .{ .resize_pending = true },
+        .{ .open_ui_waiting = true },
+    };
+    for (active_cases) |facts| {
+        try std.testing.expectEqual(@as(i32, 8), loopTimeoutMs(facts));
+    }
 }
 
 test "poll timeout is not 1 ms while only a held restore result waits" {
@@ -4744,7 +4845,7 @@ test "poll timeout is not 1 ms while only a held restore result waits" {
     // The background task finished and is waiting for handoff (`isActive()` is still true).
     try std.testing.expect(app.main_agent.session_persistence.pending_input_restore.isActive());
     try std.testing.expect(!app.pendingInputRestoreActive());
-    try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
 }
 
 test "footer runtime compatibility facade exports composeFooterFrame" {
@@ -4899,6 +5000,7 @@ fn runAcpServer(_: ?*anyopaque, alloc: Allocator, cfg: acp_runner.Config) anyerr
 
 fn handleSigWinchNative(_: std.posix.SIG) callconv(.c) void {
     resize_interlock.noteResizeSignal();
+    shell_runtime.notifyResizeWakePipe();
 }
 
 fn handleSigWinchWeb() callconv(.c) void {

@@ -43,6 +43,57 @@ else
 pub const ResizeApprovalInterlock = resize_runtime.ResizeApprovalInterlock;
 pub const RedrawMode = resize_runtime.RedrawMode;
 
+var resize_wake_write_fd: if (supports_resize_signal) std.atomic.Value(std.posix.fd_t) else void =
+    if (supports_resize_signal) .init(-1) else {};
+
+/// Called from the SIGWINCH handler, so it only loads an atomic and writes one
+/// byte, and it keeps the interrupted code's errno.
+pub fn notifyResizeWakePipe() void {
+    if (!supports_resize_signal) return;
+    const fd = resize_wake_write_fd.load(.acquire);
+    if (fd < 0) return;
+    const saved_errno = std.c._errno().*;
+    defer std.c._errno().* = saved_errno;
+    const byte = [_]u8{1};
+    while (true) {
+        const rc = std.c.write(fd, &byte, 1);
+        if (rc >= 0) return;
+        switch (std.posix.errno(rc)) {
+            .INTR => continue,
+            .AGAIN => return,
+            else => return,
+        }
+    }
+}
+
+fn closeWakePipe(pipe: *[2]std.posix.fd_t) void {
+    for (pipe) |*fd| {
+        if (fd.* >= 0) {
+            _ = std.c.close(fd.*);
+            fd.* = -1;
+        }
+    }
+}
+
+fn drainNonblockingPipe(fd: std.posix.fd_t) void {
+    var buf: [64]u8 = undefined;
+    while (true) {
+        const rc = std.c.read(fd, &buf, buf.len);
+        if (rc > 0) continue;
+        if (rc < 0 and std.posix.errno(rc) == .INTR) continue;
+        return;
+    }
+}
+
+fn pollResultFromRevents(revents: i16) PollResult {
+    return .{
+        .readable = (revents & std.posix.POLL.IN) != 0,
+        .hung_up = (revents & std.posix.POLL.HUP) != 0,
+        // macOS sets POLLNVAL when session teardown revokes the tty (`tests/tla/terminal_hangup/TerminalHangup.tla` `NoSpin`).
+        .has_error = (revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0,
+    };
+}
+
 pub const PollResult = struct {
     readable: bool = false,
     hung_up: bool = false,
@@ -71,6 +122,7 @@ pub const TerminalState = struct {
     alternate_mouse_tracking_active: bool = false,
     signal_handler_installed: bool = false,
     old_winch_action: ?std.posix.Sigaction = null,
+    resize_wake_pipe: [2]std.posix.fd_t = .{ -1, -1 },
 
     pub fn fileApprovalScreenActive(self: TerminalState) bool {
         return self.alternate_screen_owner == .file_approval;
@@ -143,6 +195,13 @@ pub const TerminalState = struct {
     pub fn installResizeSignal(self: *TerminalState, handler: ResizeHandler) void {
         if (!supports_resize_signal) return;
 
+        if (self.resize_wake_pipe[0] < 0) {
+            self.resize_wake_pipe = std.Io.Threaded.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true }) catch .{ -1, -1 };
+        }
+        if (self.resize_wake_pipe[1] >= 0) {
+            resize_wake_write_fd.store(self.resize_wake_pipe[1], .release);
+        }
+
         const act: std.posix.Sigaction = .{
             .handler = .{ .handler = handler },
             .mask = std.posix.sigemptyset(),
@@ -156,11 +215,18 @@ pub const TerminalState = struct {
     }
 
     pub fn uninstallResizeSignal(self: *TerminalState) void {
-        if (!supports_resize_signal or !self.signal_handler_installed) return;
-        if (self.old_winch_action) |old| {
-            std.posix.sigaction(std.posix.SIG.WINCH, &old, null);
+        if (!supports_resize_signal) return;
+        if (self.signal_handler_installed) {
+            if (self.old_winch_action) |old| {
+                std.posix.sigaction(std.posix.SIG.WINCH, &old, null);
+            }
+            self.signal_handler_installed = false;
         }
-        self.signal_handler_installed = false;
+        resize_wake_write_fd.store(-1, .release);
+        // The wake pipe stays open: a handler already running on another
+        // thread may have loaded its fd, and closing it here would let that
+        // write land in a reused descriptor. The next install reuses it, and
+        // it closes when the process exits.
     }
 
     pub fn queryLayout(self: TerminalState, footer_rows: u16) !Layout {
@@ -265,20 +331,35 @@ pub const TerminalState = struct {
                 else => .{},
             };
         }
-        var fds = [_]std.posix.pollfd{.{
-            .fd = self.stdin_fd,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
+        const wake_fd = self.resize_wake_pipe[0];
+        if (wake_fd < 0) {
+            var fds = [_]std.posix.pollfd{.{
+                .fd = self.stdin_fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            _ = try std.posix.poll(&fds, timeout_ms);
+            return pollResultFromRevents(fds[0].revents);
+        }
 
-        _ = try std.posix.poll(&fds, timeout_ms);
-        const revents = fds[0].revents;
-        return .{
-            .readable = (revents & std.posix.POLL.IN) != 0,
-            .hung_up = (revents & std.posix.POLL.HUP) != 0,
-            // macOS sets POLLNVAL when session teardown revokes the tty (`tests/tla/terminal_hangup/TerminalHangup.tla` `NoSpin`).
-            .has_error = (revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0,
+        var fds = [_]std.posix.pollfd{
+            .{
+                .fd = self.stdin_fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+            .{
+                .fd = wake_fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
         };
+        _ = try std.posix.poll(&fds, timeout_ms);
+        if ((fds[1].revents & std.posix.POLL.IN) != 0) {
+            drainNonblockingPipe(wake_fd);
+        }
+        // Hangup and error state must come only from stdin (`TerminalHangup.tla` `NoSpin`).
+        return pollResultFromRevents(fds[0].revents);
     }
 };
 
@@ -741,6 +822,48 @@ test "pollInput reports a revoked or closed descriptor as closed" {
     const terminal = TerminalState{ .stdin_fd = closed };
     const poll_result = try terminal.pollInput(0);
     try std.testing.expect(poll_result.closed());
+}
+
+fn testSigWinchWake(_: std.posix.SIG) callconv(.c) void {
+    notifyResizeWakePipe();
+}
+
+test "pollInput wakes promptly on SIGWINCH during a long timeout" {
+    if (comptime !supports_resize_signal) return error.SkipZigTest;
+
+    const stdin_pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer closeTestFd(stdin_pipe[0]);
+    defer closeTestFd(stdin_pipe[1]);
+
+    var terminal = TerminalState{ .stdin_fd = stdin_pipe[0] };
+    terminal.installResizeSignal(testSigWinchWake);
+    defer terminal.uninstallResizeSignal();
+
+    const Sender = struct {
+        fn run(pid: std.c.pid_t) void {
+            // Makes the signal likely to land during `poll`; a signal before it leaves a byte in the pipe, so either order passes.
+            io_mod.sleep(5 * std.time.ns_per_ms);
+            _ = std.c.kill(pid, std.posix.SIG.WINCH);
+        }
+    };
+    const pid = std.c.getpid();
+    var thread = try std.Thread.spawn(.{}, Sender.run, .{pid});
+    defer thread.join();
+
+    const started_ms = io_mod.milliTimestamp();
+    const poll_result = try terminal.pollInput(500);
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+
+    try std.testing.expect(!poll_result.readable);
+    try std.testing.expect(!poll_result.closed());
+    try std.testing.expect(elapsed_ms < 50);
+
+    // Uninstall disarms the signal's write target and keeps the pipe open.
+    terminal.uninstallResizeSignal();
+    try std.testing.expectEqual(@as(std.posix.fd_t, -1), resize_wake_write_fd.load(.acquire));
+    try std.testing.expect(terminal.resize_wake_pipe[0] >= 0 and terminal.resize_wake_pipe[1] >= 0);
+    notifyResizeWakePipe();
+    closeWakePipe(&terminal.resize_wake_pipe);
 }
 
 test "TerminalState.read returns 0 when the terminal hangs up" {
