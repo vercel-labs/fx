@@ -49,6 +49,20 @@ pub fn classify(err: anyerror) model_catalog.Failure {
     return .{ .category = .transport, .retryable = true };
 }
 
+/// The wait before the one retry of a cut-off answer.
+const cut_off_retry_wait_ns: u64 = 250 * std.time.ns_per_ms;
+
+/// The wait before the next try, or null when the call must not try again.
+/// `tries_made` counts the tries already made, starting at 1. A cut-off answer
+/// gets one retry; a broken answer, a refused connection, and every later try
+/// get none. The caller handles cancellation.
+pub fn retryWaitNs(err: anyerror, tries_made: u32) ?u64 {
+    if (tries_made != 1) return null;
+    const failure = classify(err);
+    if (failure.category != .malformed_response or !failure.retryable) return null;
+    return cut_off_retry_wait_ns;
+}
+
 fn isCutOff(err: anyerror) bool {
     for (cut_off_answer_errors) |cut_off| {
         if (err == cut_off) return true;
@@ -117,4 +131,20 @@ test "catalog fetch failures split unreadable answers from connection failures" 
     try expectClassified(error.ConnectionRefused, .transport, true);
     try expectClassified(error.ReadFailed, .transport, true);
     try expectClassified(error.Cancelled, .cancellation, false);
+}
+
+test "a cut-off first try gets one retry after the cut-off wait" {
+    try std.testing.expectEqual(@as(?u64, 250 * std.time.ns_per_ms), retryWaitNs(error.HttpBodyCutOff, 1));
+}
+
+test "a cut-off second try gets no retry" {
+    try std.testing.expectEqual(@as(?u64, null), retryWaitNs(error.HttpBodyCutOff, 2));
+}
+
+test "a broken first try gets no retry" {
+    try std.testing.expectEqual(@as(?u64, null), retryWaitNs(error.BadGzipHeader, 1));
+}
+
+test "a refused first try gets no retry" {
+    try std.testing.expectEqual(@as(?u64, null), retryWaitNs(error.ConnectionRefused, 1));
 }

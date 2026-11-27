@@ -281,6 +281,24 @@ pub fn get(
     deadline: ?std.Io.Clock.Timestamp,
     cooperative_pulse: ?stream_provider.CooperativePulse,
 ) !GetResponse {
+    return getBounded(alloc, transport, url, headers, max_body_bytes, cancel_flag, deadline, cooperative_pulse) catch |err| switch (err) {
+        error.ResponseTooLarge => error.HostStreamFailed,
+        else => |other| other,
+    };
+}
+
+/// `get`, but a body over `max_body_bytes` fails with `error.ResponseTooLarge`,
+/// so a caller can tell a size cap from a failed stream.
+pub fn getBounded(
+    alloc: Allocator,
+    transport: Transport,
+    url: []const u8,
+    headers: []const std.http.Header,
+    max_body_bytes: usize,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: ?std.Io.Clock.Timestamp,
+    cooperative_pulse: ?stream_provider.CooperativePulse,
+) !GetResponse {
     var headers_json: std.Io.Writer.Allocating = .init(alloc);
     defer headers_json.deinit();
     try std.json.Stringify.value(headers, .{}, &headers_json.writer);
@@ -301,7 +319,7 @@ pub fn get(
         try pulse(cooperative_pulse);
     }
     const http_status = httpStatus(status_code) orelse return error.HostStreamFailed;
-    const body = try readBody(alloc, transport, handle, max_body_bytes, cancel_flag, deadline, cooperative_pulse);
+    const body = try readBoundedBody(alloc, transport, handle, max_body_bytes, cancel_flag, deadline, cooperative_pulse);
     return .{ .status = http_status, .body = body };
 }
 
@@ -526,6 +544,22 @@ fn readBody(
     deadline: ?std.Io.Clock.Timestamp,
     cooperative_pulse: ?stream_provider.CooperativePulse,
 ) ![]u8 {
+    return readBoundedBody(alloc, transport, handle, max_bytes, cancel_flag, deadline, cooperative_pulse) catch |err| switch (err) {
+        error.ResponseTooLarge => error.HostStreamFailed,
+        else => |other| other,
+    };
+}
+
+/// `readBody`, but a body over `max_bytes` fails with `error.ResponseTooLarge`.
+fn readBoundedBody(
+    alloc: Allocator,
+    transport: Transport,
+    handle: i32,
+    max_bytes: usize,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: ?std.Io.Clock.Timestamp,
+    cooperative_pulse: ?stream_provider.CooperativePulse,
+) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     var chunk: [4096]u8 = undefined;
@@ -541,7 +575,7 @@ fn readBody(
         if (count < 0) return error.HostStreamFailed;
         if (count == 0) break;
         const len: usize = @intCast(count);
-        if (len > max_bytes - out.items.len) return error.HostStreamFailed;
+        if (len > max_bytes - out.items.len) return error.ResponseTooLarge;
         try out.appendSlice(alloc, chunk[0..len]);
     }
     return out.toOwnedSlice(alloc);
@@ -830,6 +864,16 @@ test "a host GET stops at its limit, on cancellation, on a failed status and at 
         try std.testing.expectEqual(host.opens, host.closes);
         try std.testing.expectEqual(@as(usize, if (case.cancelled_before) 0 else 1), host.opens);
     }
+}
+
+test "a host GET over its limit reports ResponseTooLarge to getBounded and HostStreamFailed to get" {
+    const url = "https://usage.example.test/v1/report";
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var bounded_host: ScriptedGet = .{ .chunks = &.{ "hello ", "world" } };
+    try std.testing.expectError(error.ResponseTooLarge, getBounded(std.testing.allocator, bounded_host.transport(), url, &.{}, 5, &cancel_flag, null, null));
+    try std.testing.expectEqual(bounded_host.opens, bounded_host.closes);
+    var plain_host: ScriptedGet = .{ .chunks = &.{ "hello ", "world" } };
+    try std.testing.expectError(error.HostStreamFailed, get(std.testing.allocator, plain_host.transport(), url, &.{}, 5, &cancel_flag, null, null));
 }
 
 test "a key quoted in a gateway error never reaches the failure detail" {
