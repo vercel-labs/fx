@@ -57,8 +57,11 @@ fn parseCheckIntervalMs(text: ?[]const u8) u64 {
 }
 
 /// The build that an earlier check installed while this fx runs. Later checks
-/// compare a release with it, not with the running build, so only a newer
-/// release replaces it.
+/// compare a release with it, not with the running build, so the installed
+/// release is never installed again: a dev release replaces it when its commit
+/// differs, and a stable release when its version is higher
+/// (`update_target.Target.shouldInstall`). This tracks what fx installed, not
+/// the file itself, so a binary another process writes there is not noticed.
 const StagedBuild = struct {
     installed: bool = false,
     channel: update_target.Channel = .stable,
@@ -80,8 +83,8 @@ const StagedBuild = struct {
         self.installed = true;
     }
 
-    /// The build a release must be newer than: the staged one once a check
-    /// has installed one, otherwise the running build.
+    /// The build a release is compared with: the staged one once a check has
+    /// installed one, otherwise the running build.
     fn baseline(self: *const StagedBuild, current: update_target.CurrentBuild) update_target.CurrentBuild {
         if (!self.installed) return current;
         return .{
@@ -289,8 +292,8 @@ pub const AutoUpgrade = struct {
     ) void {
         defer self.stopped.store(true, .release);
         const interval_ms = checkIntervalMs();
-        // Checks go on after an update is ready, so a newer release replaces
-        // the waiting one and Ctrl+G restarts into the newest.
+        // Checks go on after an update is ready, so a later release replaces
+        // the waiting one and Ctrl+G restarts into the latest.
         var staged: StagedBuild = .{};
         self.sleepInterruptible(initial_delay_ms);
 
@@ -317,7 +320,7 @@ pub const AutoUpgrade = struct {
 
         var label_buf: [64]u8 = undefined;
         const label = target.writeDisplayLabel(&label_buf) catch return;
-        // With an update already waiting, the newer one downloads behind it:
+        // With an update already waiting, the later one downloads behind it:
         // the footer keeps offering Ctrl+G, and a failed download leaves the
         // waiting update in place, since only a finished install replaces it.
         if (!staged.installed) {
@@ -325,8 +328,12 @@ pub const AutoUpgrade = struct {
             self.setState(.downloading);
         }
 
-        self.downloadAndInstall(alloc, target, cdn_base) catch {
-            if (!staged.installed) self.setState(.failed);
+        self.downloadAndInstall(alloc, target, cdn_base) catch |err| {
+            if (staged.installed) {
+                debug_trace.logf("upgrade", "event=later_download_dropped target={s} err={s} kept=waiting_update", .{ label, @errorName(err) });
+                return;
+            }
+            self.setState(.failed);
             return;
         };
         staged.record(target);
@@ -507,7 +514,7 @@ test "the check interval is thirty minutes unless a positive number of milliseco
     try std.testing.expectEqual(default_check_interval_ms, parseCheckIntervalMs("99999999999"));
 }
 
-test "a staged dev build is the baseline, so only a newer revision replaces it" {
+test "a staged dev build is the baseline, so only a different revision replaces it" {
     const alloc = std.testing.allocator;
     const current: update_target.CurrentBuild = .{
         .channel = .stable,
