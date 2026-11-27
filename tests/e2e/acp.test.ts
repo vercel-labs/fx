@@ -10244,6 +10244,34 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "unknown method returns error -32601",
+    async () => {
+      // Its own profile and fake gateway, as the other tests here use: the
+      // developer's profile can select a provider that refuses initialize.
+      const root = createIsolatedRoot("fx-acp-unknown-method-");
+      const gateway = startFakeGateway([]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const init = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+        expect(init.error).toBeUndefined();
+        expect(init.result.protocolVersion).toBe(1);
+        const resp = await client.request("nonexistent/method", {}, 2) as any;
+        expect(resp.error).toBeDefined();
+        expect(resp.error.code).toBe(-32601);
+        expect(resp.error.message).toContain("Method not found");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session/list leaves an empty home unchanged",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-acp-no-create-"));
@@ -15027,19 +15055,6 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
   );
 
   test(
-    "unknown method returns error -32601",
-    async () => {
-      client = await AcpClient.create();
-      await client.request("initialize", { protocolVersion: 1 }, 1);
-      const resp = await client.request("nonexistent/method", {}, 2) as any;
-      expect(resp.error).toBeDefined();
-      expect(resp.error.code).toBe(-32601);
-      expect(resp.error.message).toContain("Method not found");
-    },
-    TIMEOUT,
-  );
-
-  test(
     "invalid JSON returns parse error -32700",
     async () => {
       client = await AcpClient.create();
@@ -15526,3 +15541,157 @@ test("ACP keeps an idle Claude session's cache warm until the next session repla
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 45000);
+
+test(
+  "ACP names the model in turn context and carries model switches via session/set_config_option in <fx-context-update>",
+  async () => {
+    const root = createIsolatedRoot("fx-acp-model-identity-");
+    const modelB = "openai/gpt-5.4";
+    const gateway = startFakeGateway([
+      finalText("ACP_MODEL_TURN_1"),
+      finalText("ACP_MODEL_TURN_2"),
+      finalText("ACP_MODEL_TURN_3"),
+    ], {
+      models: [
+        { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+        { id: modelB, type: "language", tags: ["tool-use"] },
+      ],
+    });
+    let client: AcpClient | undefined;
+    try {
+      client = await AcpClient.create({
+        cwd: root.workspace,
+        env: fakeGatewayEnv(root, gateway),
+      });
+      await client.request("initialize", { protocolVersion: 1 }, 1);
+      await client.request("session/new", { mcpServers: [] }, 2);
+      await client.readLine(); // consume session/update notification
+
+      await runPrompt(client, "First ACP turn.", TIMEOUT);
+      const setModel = await client.request("session/set_config_option", {
+        configId: "model",
+        value: modelB,
+      }, 3) as any;
+      expect(setModel.result.configOptions.find((o: any) => o.id === "model")?.currentValue).toBe(modelB);
+
+      await runPrompt(client, "Second ACP turn.", TIMEOUT);
+      await runPrompt(client, "Third ACP turn.", TIMEOUT);
+
+      expect(gateway.requests).toHaveLength(3);
+      const firstBody = gateway.requests[0]!.body;
+      const secondBody = gateway.requests[1]!.body;
+      const thirdBody = gateway.requests[2]!.body;
+
+      const firstInstr = acpInstructions(firstBody);
+      const firstInstrText = (JSON.parse(firstInstr) as Array<{ content: unknown }>)
+        .map((m) => acpContentText(m.content))
+        .join("\n");
+      expect(firstInstrText).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${FAKE_GATEWAY_MODEL}\\n`));
+      expect(acpInstructions(secondBody)).toBe(firstInstr);
+      expect(acpInstructions(thirdBody)).toBe(firstInstr);
+
+      const secondUser = acpContentText(acpGatewayRequest(secondBody).prompt.filter((m) => m.role === "user").at(-1)?.content);
+      expect(secondUser).toContain("<fx-context-update>");
+      expect(secondUser).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelB}\\n`));
+
+      const thirdUser = acpContentText(acpGatewayRequest(thirdBody).prompt.filter((m) => m.role === "user").at(-1)?.content);
+      expect(thirdUser).not.toContain("<fx-context-update>");
+    } finally {
+      await client?.close();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test(
+  "ACP held turn keeps naming the model it sends when session/set_config_option changes the session model mid-turn",
+  async () => {
+    const root = createIsolatedRoot("fx-acp-model-switch-mid-turn-");
+    const modelB = "openai/gpt-5.4";
+    const held = deferred<Response>();
+    let childSteps = 0;
+    const isChild = (body: string) => body.includes("You are the subagent");
+    writeFileSync(join(root.workspace, "note.txt"), "held turn note\n");
+    const gateway = startDynamicFakeGateway((body) => {
+      if (isChild(body)) {
+        childSteps += 1;
+        return childSteps === 1 ? held.promise : finalText("HELD_CHILD_DONE");
+      }
+      if (body.includes("held_subagent_call")) {
+        return finalText("HELD_PARENT_DONE");
+      }
+      return fakeGatewayToolCall("held_subagent_call", "subagent", {
+        request: { action: "message", agent: "worker", message: "Read note.txt and report." },
+      });
+    }, {
+      models: [
+        { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+        { id: modelB, type: "language", tags: ["tool-use"] },
+      ],
+    });
+    let client: AcpClient | undefined;
+    try {
+      client = await AcpClient.create({
+        cwd: root.workspace,
+        env: fakeGatewayEnv(root, gateway),
+      });
+      await startAutoSession(client);
+
+      sendPrompt(client, 9101, "Start the worker subagent.");
+      await waitForCondition("the subagent's first model request", () => childSteps === 1, TIMEOUT);
+
+      // End the parent prompt so session/set_config_option can change the session
+      // model while the subagent's turn is still running on its held request.
+      client.send({ jsonrpc: "2.0", id: 9102, method: "session/cancel", params: {} });
+      const ended = await readUntilResponses(client, [9101], TIMEOUT);
+      expect(ended.responses.get(9101).result.stopReason).toBe("cancelled");
+
+      const switched = await client.request("session/set_config_option", {
+        configId: "model",
+        value: modelB,
+      }, 9103) as any;
+      expect(switched.result.configOptions.find((o: any) => o.id === "model")?.currentValue).toBe(modelB);
+
+      // Resolve the held step with a tool call so the subagent sends a second request in the same turn.
+      held.resolve(fakeGatewayToolCall("held_child_read", "read_file", { path: "note.txt" }));
+      await waitForCondition(
+        "the subagent's second model request",
+        () => gateway.requests.filter((r) => isChild(r.body)).length === 2,
+        TIMEOUT,
+      );
+
+      const childReqs = gateway.requests.filter((r) => isChild(r.body));
+      expect(childReqs).toHaveLength(2);
+      for (const req of childReqs) {
+        expect(req.headers.get("ai-language-model-id")).toBe(FAKE_GATEWAY_MODEL);
+      }
+      const secondChildInstrText = (JSON.parse(acpInstructions(childReqs[1]!.body)) as Array<{ content: unknown }>)
+        .map((m) => acpContentText(m.content))
+        .join("\n");
+      expect(secondChildInstrText).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${FAKE_GATEWAY_MODEL}\\n`));
+      expect(secondChildInstrText).not.toContain(`model: ${modelB}`);
+      expect(acpConversation(childReqs[1]!.body)).not.toContain("<fx-context-update>");
+
+      // The next prompt on the session uses the new model and announces it once.
+      const followUp = await runPrompt(client, "Follow up after model switch.", TIMEOUT);
+      expect(followUp.promptResult.result.stopReason).toBe("end_turn");
+      const followUpReq = gateway.requests.find((r) => {
+        const latestUser = acpContentText(acpGatewayRequest(r.body).prompt.filter((m) => m.role === "user").at(-1)?.content);
+        return latestUser.includes("Follow up after model switch.");
+      });
+      expect(followUpReq).toBeDefined();
+      expect(followUpReq!.headers.get("ai-language-model-id")).toBe(modelB);
+      const followUpUser = acpContentText(acpGatewayRequest(followUpReq!.body).prompt.filter((m) => m.role === "user").at(-1)?.content);
+      expect(followUpUser).toContain("<fx-context-update>");
+      expect(followUpUser).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelB}\\n`));
+    } finally {
+      held.resolve(finalText("held cleanup"));
+      await client?.close();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);

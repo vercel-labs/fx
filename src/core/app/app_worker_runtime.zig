@@ -9,6 +9,7 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const token_pass_check = @import("token_pass_check.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
+const personal_shortcut_runtime = @import("personal_shortcut_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
@@ -1716,6 +1717,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime agents.hasAgentField(App, "child_run")) {
                 if (lifecycle == .turn_finished) app_agents_runtime.Runtime(App).noteChildTurnFinished(app, agent, lifecycle.turn_finished);
             }
+            if (lifecycle == .turn_finished) personal_shortcut_runtime.Runtime(App).reloadAfterTurn(app);
             if (transition.applied_activity_kind) |kind| {
                 applyToolActivity(&agent.stream, kind);
             }
