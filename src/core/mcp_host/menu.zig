@@ -51,7 +51,7 @@ pub const Choice = enum {
         };
     }
 
-    pub fn asksFor(c: Choice, row: Row) bool {
+    fn asksFor(c: Choice, row: Row) bool {
         return switch (c) {
             .turn_on => row.status.source == .workspace,
             else => c.asks(),
@@ -269,7 +269,7 @@ pub const State = struct {
         @memcpy(s.error_buf[0..n], msg[0..n]);
     }
 
-    pub fn clearError(s: *State) void {
+    fn clearError(s: *State) void {
         s.error_len = 0;
     }
 

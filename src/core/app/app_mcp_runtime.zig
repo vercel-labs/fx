@@ -954,7 +954,9 @@ pub const State = struct {
                 // A confirmed Remove went back to the list already.
                 if (self.host_menu.screen == .list) self.stopMenuTools();
                 if (run.choice == .turn_off or run.choice == .turn_on) {
-                    try self.startToggle(home, workspace_root, run.server, run.choice == .turn_on);
+                    self.startToggle(home, workspace_root, run.server, run.choice == .turn_on) catch |err| {
+                        self.recordStartToggleError(run.server, run.choice == .turn_on, err);
+                    };
                 } else {
                     try self.startVerbs(home, workspace_root, &.{ run.choice.verb().?, run.server }, .warnings_only);
                 }
@@ -1001,14 +1003,24 @@ pub const State = struct {
                 a.destroy(job);
                 _ = self.host_verbs.fetchSub(1, .acq_rel);
             }
-            if (self.host_closing.load(.acquire)) return error.Canceled;
+            if (self.host_closing.load(.acquire)) {
+                debug_trace.logf("mcp", "MCP toggle dropped at exit server={s} enable={}", .{ job.name, job.enable });
+                return error.Canceled;
+            }
             self.applyToggle(job.home, job.workspace_root, job.name, job.enable);
         }
     };
 
+    fn recordStartToggleError(self: *State, name: []const u8, enable: bool, err: anyerror) void {
+        const action_word = if (enable) "turn on" else "turn off";
+        var err_arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+        defer err_arena.deinit();
+        self.recordToggleError(err_arena.allocator(), name, action_word, mcp_verbs.describe(err));
+    }
+
     /// Persists turning `name` on or off without using CLI verbs, requesting a
     /// host reload on success or recording the error in the menu on failure.
-    pub fn applyToggle(self: *State, home: []const u8, workspace_root: []const u8, name: []const u8, enable: bool) void {
+    fn applyToggle(self: *State, home: []const u8, workspace_root: []const u8, name: []const u8, enable: bool) void {
         const a = std.heap.c_allocator;
         var arena: std.heap.ArenaAllocator = .init(a);
         defer arena.deinit();
@@ -1780,4 +1792,56 @@ test "hostMenuKey requires approval confirmation before turning on a project ser
     defer after.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), after.choices.approved.len);
     try std.testing.expectEqualStrings("proj_srv", after.choices.approved[0]);
+}
+
+test "ToggleJob logs dropped user toggle at exit and recordStartToggleError surfaces spawn failures in menu" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir_path);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ dir_path, "trace.log" });
+    defer alloc.free(trace_path);
+
+    try debug_trace.configure(.{ .file_path = trace_path });
+    defer debug_trace.shutdown();
+
+    var state: State = .{};
+    defer state.deinit();
+    state.host_sink = try std.heap.c_allocator.create(State.HostSink);
+    state.host_sink.?.* = .{};
+
+    // Starting a toggle error surfaces in the menu rather than bubbling up.
+    state.recordStartToggleError("user_srv", false, error.ConcurrencyUnavailable);
+    mcp_menu.open(&state.host_menu);
+    state.host_menu.screen = .server;
+    @memcpy(state.host_menu.selected_buf[0.."user_srv".len], "user_srv");
+    state.host_menu.selected_len = "user_srv".len;
+    const rows = [_]mcp_menu.Row{.{ .status = .{ .name = "user_srv", .source = .profile, .transport = .http, .state = .ready } }};
+    state.host_menu_rows = &rows;
+    state.host_menu_at_ms = io_mod.milliTimestamp();
+    defer state.host_menu_rows = &.{};
+    _ = state.refreshHostMenu("");
+    try std.testing.expectEqualStrings("Couldn't turn off user_srv: something went wrong.", state.host_menu.errorText().?);
+
+    // Dropping a toggle at shutdown emits a trace line naming server and enable.
+    const a = std.heap.c_allocator;
+    const job = try a.create(State.ToggleJob);
+    job.* = .{
+        .state = &state,
+        .enable = true,
+        .home = try a.dupe(u8, ""),
+        .workspace_root = try a.dupe(u8, ""),
+        .name = try a.dupe(u8, "user_srv"),
+    };
+    state.host_closing.store(true, .release);
+    _ = state.host_verbs.fetchAdd(1, .acq_rel);
+    try std.testing.expectError(error.Canceled, State.ToggleJob.run(job));
+    try std.testing.expectEqual(@as(usize, 0), state.host_verbs.load(.acquire));
+
+    var trace_file = try tmp.dir.openFile(io_mod.getIo(), "trace.log", .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace_bytes = try io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
+    defer alloc.free(trace_bytes);
+    try std.testing.expect(std.mem.find(u8, trace_bytes, "MCP toggle dropped at exit server=user_srv enable=true") != null);
 }

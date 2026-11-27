@@ -90,7 +90,7 @@ pub fn remove(alloc: Allocator, file: File, text: []const u8, name: []const u8) 
 /// The file with `name`'s `"enabled"` field set to `enabled`, keeping every
 /// other server, key, number spelling, and order unchanged. Returns null when
 /// `name` isn't in the file.
-pub fn setEnabled(alloc: Allocator, file: File, text: []const u8, name: []const u8, enabled: bool) Error!?[]u8 {
+fn setEnabled(alloc: Allocator, file: File, text: []const u8, name: []const u8, enabled: bool) Error!?[]u8 {
     try requireShallow(text);
     var arena: std.heap.ArenaAllocator = .init(alloc);
     defer arena.deinit();
