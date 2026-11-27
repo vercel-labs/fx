@@ -73,26 +73,7 @@ pub fn prepare(
     durable_output: []const u8,
     inline_cap: usize,
 ) !PreparedResult {
-    if (output_bytes > large_result_threshold_bytes or
-        durable_output.len > inline_cap)
-    {
-        return prepareStoredResult(
-            alloc,
-            .{ .legacy_dir = result_dir },
-            tool_call_id,
-            tool_name,
-            output_bytes,
-            durable_output,
-        );
-    }
-    return prepareExternallyBackedInlineResult(
-        alloc,
-        .{ .legacy_dir = result_dir },
-        tool_call_id,
-        tool_name,
-        output_bytes,
-        durable_output,
-    );
+    return prepareAt(alloc, .{ .legacy_dir = result_dir }, tool_call_id, tool_name, output_bytes, durable_output, inline_cap);
 }
 
 pub fn prepareManaged(
@@ -104,26 +85,24 @@ pub fn prepareManaged(
     durable_output: []const u8,
     inline_cap: usize,
 ) !PreparedResult {
-    if (output_bytes > large_result_threshold_bytes or
-        durable_output.len > inline_cap)
-    {
-        return prepareStoredResult(
-            alloc,
-            .{ .managed = capability },
-            tool_call_id,
-            tool_name,
-            output_bytes,
-            durable_output,
-        );
+    return prepareAt(alloc, .{ .managed = capability }, tool_call_id, tool_name, output_bytes, durable_output, inline_cap);
+}
+
+/// A large result is stored and the model gets its preview and handle; a small one is kept inline, with the same
+/// handle beside it.
+fn prepareAt(
+    alloc: Allocator,
+    target: StorageTarget,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    output_bytes: usize,
+    durable_output: []const u8,
+    inline_cap: usize,
+) !PreparedResult {
+    if (output_bytes > large_result_threshold_bytes or durable_output.len > inline_cap) {
+        return prepareStoredResult(alloc, target, tool_call_id, tool_name, output_bytes, durable_output);
     }
-    return prepareExternallyBackedInlineResult(
-        alloc,
-        .{ .managed = capability },
-        tool_call_id,
-        tool_name,
-        output_bytes,
-        durable_output,
-    );
+    return prepareExternallyBackedInlineResult(alloc, target, tool_call_id, tool_name, output_bytes, durable_output);
 }
 
 fn prepareExternallyBackedInlineResult(
