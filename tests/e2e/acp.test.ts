@@ -15358,3 +15358,66 @@ test("ACP keeps an idle Claude session's cache warm until the next session repla
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 45000);
+
+test(
+  "ACP names the model in turn context and carries model switches via session/set_config_option in <fx-context-update>",
+  async () => {
+    const root = createIsolatedRoot("fx-acp-model-identity-");
+    const modelB = "openai/gpt-5.4";
+    const gateway = startFakeGateway([
+      finalText("ACP_MODEL_TURN_1"),
+      finalText("ACP_MODEL_TURN_2"),
+      finalText("ACP_MODEL_TURN_3"),
+    ], {
+      models: [
+        { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+        { id: modelB, type: "language", tags: ["tool-use"] },
+      ],
+    });
+    let client: AcpClient | undefined;
+    try {
+      client = await AcpClient.create({
+        cwd: root.workspace,
+        env: fakeGatewayEnv(root, gateway),
+      });
+      await client.request("initialize", { protocolVersion: 1 }, 1);
+      await client.request("session/new", { mcpServers: [] }, 2);
+      await client.readLine(); // consume session/update notification
+
+      await runPrompt(client, "First ACP turn.", TIMEOUT);
+      const setModel = await client.request("session/set_config_option", {
+        configId: "model",
+        value: modelB,
+      }, 3) as any;
+      expect(setModel.result.configOptions.find((o: any) => o.id === "model")?.currentValue).toBe(modelB);
+
+      await runPrompt(client, "Second ACP turn.", TIMEOUT);
+      await runPrompt(client, "Third ACP turn.", TIMEOUT);
+
+      expect(gateway.requests).toHaveLength(3);
+      const firstBody = gateway.requests[0]!.body;
+      const secondBody = gateway.requests[1]!.body;
+      const thirdBody = gateway.requests[2]!.body;
+
+      const firstInstr = acpInstructions(firstBody);
+      const firstInstrText = (JSON.parse(firstInstr) as Array<{ content: unknown }>)
+        .map((m) => acpContentText(m.content))
+        .join("\n");
+      expect(firstInstrText).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${FAKE_GATEWAY_MODEL}\\n`));
+      expect(acpInstructions(secondBody)).toBe(firstInstr);
+      expect(acpInstructions(thirdBody)).toBe(firstInstr);
+
+      const secondUser = acpContentText(acpGatewayRequest(secondBody).prompt.filter((m) => m.role === "user").at(-1)?.content);
+      expect(secondUser).toContain("<fx-context-update>");
+      expect(secondUser).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelB}\\n`));
+
+      const thirdUser = acpContentText(acpGatewayRequest(thirdBody).prompt.filter((m) => m.role === "user").at(-1)?.content);
+      expect(thirdUser).not.toContain("<fx-context-update>");
+    } finally {
+      await client?.close();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);

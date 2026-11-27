@@ -2434,6 +2434,7 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .interactive = false,
         .permission_mode = ctx.permission_mode,
+        .model = ctx.model,
         .subagents = if (ctx.subagent_host) |team_host| try team_host.teamNote(arena, ctx.active_turn_id) else null,
     }, arena, messages);
 }

@@ -17047,3 +17047,62 @@ test("main's own quiet command gets the notice and no relay, since main has no p
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 45_000);
+
+test("a subagent started with its own model names that child model in its turn context", async () => {
+  const root = createFixtureRoot("subagent-own-model");
+  const childModel = "anthropic/claude-opus-4.6";
+  const childPrompt = "SUBAGENT_OWN_MODEL_TASK";
+  const gateway = startDynamicFakeGateway((body) => {
+    const latest = latestUserText(body);
+    if (latest.includes(childPrompt) && !latest.includes("Start the helper")) {
+      return fakeGatewayFinalText("SUBAGENT_MODEL_REPLY");
+    }
+    if (latest.includes(REPORT_HEADER) || hasToolResultAnywhere(body, "child-model-call")) {
+      return fakeGatewayFinalText("MAIN_SAW_CHILD_MODEL");
+    }
+    return fakeGatewayToolCall("child-model-call", "subagent", {
+      request: {
+        action: "message",
+        agent: "helper",
+        message: childPrompt,
+        model: childModel,
+      },
+    });
+  }, {
+    models: [
+      { id: MODEL, type: "language", tags: ["tool-use"] },
+      { id: childModel, type: "language", tags: ["tool-use"] },
+    ],
+  });
+
+  try {
+    const result = await runFx(["ask", "--json", "--full-access", "Start the helper on its own model."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+      timeoutMs: 30_000,
+    });
+    expect(result.code, result.stderr).toBe(0);
+    expect(parseAskJson(result.stdout).output).toContain("MAIN_SAW_CHILD_MODEL");
+
+    const childReq = gateway.requests.find((request) => request.headers.get("ai-language-model-id") === childModel);
+    const mainReq = gateway.requests.find((request) => request.headers.get("ai-language-model-id") === MODEL);
+    expect(childReq).toBeDefined();
+    expect(mainReq).toBeDefined();
+
+    const childSystem = gatewayRequest(childReq!.body).prompt
+      .filter((m) => m.role === "system")
+      .map((m) => contentText(m.content))
+      .join("\n");
+    const mainSystem = gatewayRequest(mainReq!.body).prompt
+      .filter((m) => m.role === "system")
+      .map((m) => contentText(m.content))
+      .join("\n");
+
+    expect(childSystem).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${childModel}\\n`));
+    expect(childSystem).not.toContain(`model: ${MODEL}`);
+    expect(mainSystem).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${MODEL}\\n`));
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45_000);
