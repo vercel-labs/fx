@@ -181,6 +181,8 @@ Security is permission-first. All sensitive tool behavior must integrate with `s
 
 * Host-generated review holds retain their advice for the agent and transcript, but carry a saved `review_feedback` marker that excludes them from later security evidence, including after recovery. Old unmarked results remain untrusted evidence; never infer the marker from output text. Quoted review accusations are not proof of an attack, and handling plans or test instructions as data is not itself prompt injection
 
+* Set `FX_DEBUG_REVIEW_RECORD=1` to save every safety review send to `~/.fx/review-records/<UTC day>-<pid>.jsonl`: the exact request body, the reviewer's answer, the send's result and time, and whether it was the first review or the confirming one. The folder is private to the user (0700) and each file is 0600. fx never reads or uploads these files, but they can hold the action's full text and the tool results the reviewer saw. Unset, fx writes nothing.
+
 * A command form that fx runs without review, through `command_effect.plan` or `command_effect.knownReversibleAutoCommand`, must be listed in `parity_review_free_commands` in `src/core/shell_command/command_effect.zig`. The shell parity tests check that sh, dash, bash, and zsh, with and without `extendedglob`, run each one exactly as fx parsed it, and the nightly `shell_parity` fuzz target checks generated commands the same way
 
 Do not bypass the permission system for new tools.

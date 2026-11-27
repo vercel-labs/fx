@@ -5,9 +5,11 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -2407,6 +2409,129 @@ describe("lean auto mode reliability", () => {
       expect(gateway.classifierRequests).toHaveLength(2);
       expect(gateway.classifierRequests[1]!.body).toBe(gateway.classifierRequests[0]!.body);
       expect(readFileSync(tracePath, "utf8")).toContain("event=auto_review_confirm_result result=clear");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a reviewed action is saved to the review records only when FX_DEBUG_REVIEW_RECORD is 1",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.workspace, "review-record-clear-marker");
+      const command = `touch ${marker}`;
+      const gateway = startGateway(
+        [
+          commandCall(command, "record_clear_action"),
+          fakeGatewayFinalText("Recorded clear action ran."),
+        ],
+        [fakeGatewayPermissionDecision("clear", "record_clear_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Create the marker file."],
+        {
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root, gateway), FX_DEBUG_REVIEW_RECORD: "1" },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(existsSync(marker)).toBe(true);
+      expect(gateway.classifierRequests).toHaveLength(1);
+
+      const recordsDir = join(root.home, ".fx", "review-records");
+      const files = readdirSync(recordsDir);
+      expect(files).toHaveLength(1);
+      expect(files[0]).toMatch(/^\d{4}-\d{2}-\d{2}-\d+\.jsonl$/);
+      expect(statSync(recordsDir).mode & 0o777).toBe(0o700);
+      const recordPath = join(recordsDir, files[0]!);
+      expect(statSync(recordPath).mode & 0o777).toBe(0o600);
+      const content = readFileSync(recordPath, "utf8");
+      expect(content.endsWith("\n")).toBe(true);
+      const lines = content.slice(0, -1).split("\n");
+      expect(lines).toHaveLength(1);
+      const record = JSON.parse(lines[0]!);
+      expect(record.v).toBe(1);
+      expect(record.review).toBe("first");
+      expect(record.attempt).toBe(1);
+      expect(record.result).toBe("answered");
+      expect(record.model).toBe(gateway.classifierRequests[0]!.headers.get("ai-language-model-id"));
+      expect(record.target_call_id).toBe("record_clear_action");
+      expect(record.answer).toContain("clear");
+      expect(record.payload).toContain(command);
+
+      // The same reviewed action without the variable runs and writes no record.
+      const plainRoot = createIsolatedRoot();
+      const plainMarker = join(plainRoot.workspace, "review-record-plain-marker");
+      const plainGateway = startGateway(
+        [
+          commandCall(`touch ${plainMarker}`, "plain_clear_action"),
+          fakeGatewayFinalText("Plain clear action ran."),
+        ],
+        [fakeGatewayPermissionDecision("clear", "plain_clear_review")],
+      );
+      const plain = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Create the marker file."],
+        {
+          cwd: plainRoot.workspace,
+          env: { ...gatewayEnv(plainRoot, plainGateway), FX_DEBUG_REVIEW_RECORD: "0" },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(plain.code, `stdout: ${plain.stdout}\nstderr: ${plain.stderr}`).toBe(0);
+      expect(existsSync(plainMarker)).toBe(true);
+      expect(plainGateway.classifierRequests).toHaveLength(1);
+      expect(existsSync(join(plainRoot.home, ".fx", "review-records"))).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a confirmed caution saves both reviews to the review records",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.workspace, "confirmed-caution-record-marker");
+      const command = `touch ${marker}`;
+      const gateway = startGateway(
+        [
+          commandCall(command, "recorded_caution_action"),
+          fakeGatewayFinalText("Recorded caution held."),
+        ],
+        [fakeGatewayHeldDecision("recorded_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Create the marker file."],
+        {
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root, gateway), FX_DEBUG_REVIEW_RECORD: "1" },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.confirmationRequests).toHaveLength(1);
+      expect(gateway.confirmationRequests[0]!.body).toBe(gateway.classifierRequests[0]!.body);
+
+      const recordsDir = join(root.home, ".fx", "review-records");
+      const files = readdirSync(recordsDir);
+      expect(files).toHaveLength(1);
+      const content = readFileSync(join(recordsDir, files[0]!), "utf8");
+      expect(content.endsWith("\n")).toBe(true);
+      const lines = content.slice(0, -1).split("\n").map((line) => JSON.parse(line));
+      expect(lines).toHaveLength(2);
+      const [first, confirm] = lines;
+      expect(first.review).toBe("first");
+      expect(first.answer).toContain("caution");
+      expect(first.target_call_id).toBe("recorded_caution_action");
+      expect(first.payload).toContain(command);
+      expect(confirm.review).toBe("confirm");
+      expect(confirm.answer).toContain("caution");
+      expect(confirm.target_call_id).toBe(first.target_call_id);
+      expect(confirm.payload).toBe(first.payload);
     },
     TIMEOUT,
   );
