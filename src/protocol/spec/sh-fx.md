@@ -66,7 +66,7 @@ In this exchange, `sh.fx/example` stands for a real capability name:
 
 After `initialize`, these rules apply to the connection:
 
-- fx sends an extension's notifications and `_meta` keys to a client only when both lists name the extension. A client that lists no `sh.fx/` capability receives only standard ACP messages.
+- fx sends an extension's notifications and `_meta` keys to a client only when both lists name the extension. Once fx has moved to the new names and the period that accepts the old ones has ended, a client that lists no `sh.fx/` capability receives only standard ACP messages. Until then, fx sends the `libfx/*` names from the table under Names in use today, as it does today.
 - A client calls an extension's methods only when fx's list names the extension. fx answers a method it doesn't support with the JSON-RPC error `-32601`, "Method not found".
 - Each side ignores the names it doesn't know in the other side's list.
 
