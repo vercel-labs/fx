@@ -24,6 +24,7 @@ pub const ToolExecutionRequest = runtime_tool_contracts.ToolExecutionRequest;
 pub const DiffEntryPayload = runtime_tool_contracts.DiffEntryPayload;
 pub const ToolCallValidationResult = runtime_tool_contracts.ToolCallValidationResult;
 pub const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
+pub const CurrentSelection = runtime_deps.CurrentSelection;
 pub const RefreshedGatewayCredential = runtime_deps.RefreshedGatewayCredential;
 pub const TurnProgress = runtime_deps.TurnProgress;
 pub const TextEmission = runtime_deps.TextEmission;
@@ -61,6 +62,7 @@ test {
     _ = @import("runtime/finalization.zig");
     _ = @import("runtime/model_call_record.zig");
     _ = @import("runtime/orchestrator.zig");
+    _ = @import("runtime/output_limit.zig");
     _ = @import("runtime/resend_strategy.zig");
     _ = @import("runtime/request_recovery.zig");
     _ = @import("runtime/request_image_budget.zig");

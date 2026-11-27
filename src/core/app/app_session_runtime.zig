@@ -3234,6 +3234,12 @@ pub fn Runtime(comptime App: type) type {
             try v2.savePromptImages(alloc, images);
         }
 
+        /// Writes `patch` to `agent`'s own session, and for main to the
+        /// person's settings as well. A subagent's model choice is kept in its
+        /// own session alone, so a choice made for it from any view, with the
+        /// card, the picker or `/model` on its screen, never changes the
+        /// person's settings (`src/core/app/provider_runtime.zig`
+        /// `subagentPreferences`).
         pub fn commitRuntimePreferences(
             app: *App,
             agent: *AppAgent,
@@ -3247,25 +3253,27 @@ pub fn Runtime(comptime App: type) type {
                 agent.session_persistence.fast_mode_model_bound =
                     patch.model != null and patch.fast_mode != null;
             }
-
-            var settings_attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
-                patch.userSettingsPatch(),
-            );
-            switch (settings_attempt) {
-                .outcome => |outcome| {
-                    result.settings_outcome = outcome;
-                    settings_attempt = undefined;
-                },
-                .failure => |failure| {
-                    result.settings_error = failure.err;
-                    result.settings_failure_cleanup = failure.cleanup;
-                    settings_attempt = undefined;
-                },
-            }
-            // A subagent keeps no workspace seed for new sessions: its
+            // A subagent keeps no workspace seed for new sessions either: its
             // preferences live in its own session alone.
             const subagent = if (comptime @hasField(App, "screen_owner")) agent.role == .subagent else false;
+
+            if (!subagent) {
+                var settings_attempt = config_runtime.attemptUserPreferences(
+                    app.alloc,
+                    patch.userSettingsPatch(),
+                );
+                switch (settings_attempt) {
+                    .outcome => |outcome| {
+                        result.settings_outcome = outcome;
+                        settings_attempt = undefined;
+                    },
+                    .failure => |failure| {
+                        result.settings_error = failure.err;
+                        result.settings_failure_cleanup = failure.cleanup;
+                        settings_attempt = undefined;
+                    },
+                }
+            }
             if (result.settings_error == null and !subagent) {
                 applyPreferencePatch(
                     app.alloc,
@@ -3336,6 +3344,43 @@ pub fn Runtime(comptime App: type) type {
             const v2 = agent.session_persistence.v2 orelse return null;
             if (!v2.saved()) return null;
             return v2.id();
+        }
+
+        /// Writes an OSC 7577 resume report after each main loop pass, and only
+        /// when the main chat's saved session changes. It runs only when the
+        /// terminal gave fx a token. The main chat, not a subagent on screen, is
+        /// what a restart brings back.
+        pub fn reportProgramResume(app: *App) void {
+            if (comptime (!@hasField(App, "program_resume") or !@hasDecl(App, "programResumeToken"))) return;
+            const token = App.programResumeToken() orelse return;
+            const session_id = savedSessionId(&app.main_agent) orelse return;
+            if (!app.program_resume.changed(session_id)) return;
+            // pathForPeerReexec allocates two copies of the path, so twice the path size fits any path fx can hold.
+            var path_buffer: [2 * std.Io.Dir.max_path_bytes]u8 = undefined;
+            const executable: []const u8 = App.programResumeExecutable(&path_buffer) orelse "fx";
+            const pid: u32 = @intCast(std.c.getpid());
+            const time_s = @divFloor(io_mod.milliTimestamp(), std.time.ms_per_s);
+            const bytes = app.program_resume.update(token, .{
+                .pid = pid,
+                .time_s = time_s,
+                .executable = executable,
+                .cwd = app.workspace_root,
+            }, session_id) orelse return;
+            const kind: []const u8 = if (app.program_resume.reported) "resume" else "clear";
+            debug_trace.logf("program_resume", "report kind={s} bytes={d}", .{ kind, bytes.len });
+            app.writeProgramResume(bytes);
+        }
+
+        /// Writes the report that removes this terminal's resume record, when fx
+        /// has reported one. Called when the person quits.
+        pub fn clearProgramResume(app: *App) void {
+            if (comptime (!@hasField(App, "program_resume") or !@hasDecl(App, "programResumeToken"))) return;
+            const token = App.programResumeToken() orelse return;
+            const pid: u32 = @intCast(std.c.getpid());
+            const time_s = @divFloor(io_mod.milliTimestamp(), std.time.ms_per_s);
+            const bytes = app.program_resume.clear(token, pid, time_s) orelse return;
+            debug_trace.logf("program_resume", "report kind=clear bytes={d}", .{bytes.len});
+            app.writeProgramResume(bytes);
         }
 
         /// Replaces the cached footer title. App owns the copy.
@@ -3702,6 +3747,12 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn requestUpgradeResumeHandoff(agent: *AppAgent) void {
             agent.session_persistence.resume_handoff_intent = .upgrade_requested;
+        }
+
+        /// Takes back `requestUpgradeResumeHandoff` when the restart is cancelled.
+        pub fn cancelUpgradeResumeHandoff(agent: *AppAgent) void {
+            if (agent.session_persistence.resume_handoff_intent != .upgrade_requested) return;
+            agent.session_persistence.resume_handoff_intent = .none;
         }
 
         pub fn prepareResumeHandoff(agent: *AppAgent) !void {
@@ -10685,7 +10736,7 @@ test "resumeRequestedSession preserves failed partial terminal reason" {
 
     try std.testing.expect(std.mem.find(u8, app.assistant_text.items, "partial response") != null);
     try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
-    try std.testing.expectEqualStrings("✗ system: failed", app.notices.items[1]);
+    try std.testing.expectEqualStrings("✗ Failed", app.notices.items[1]);
     try std.testing.expect(std.mem.find(u8, app.notices.items[1], "cancelled") == null);
 }
 

@@ -1858,7 +1858,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT * 2);
 
-  test("a reply whose limit ran out before a cut-off tool call is resent and the turn finishes", async () => {
+  test("a reply whose limit ran out before a cut-off tool call is asked for again in smaller steps and the turn finishes", async () => {
     const sentinel = "cut-call-ran.txt";
     const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
       "fx-tui-length-resend-",
@@ -1899,9 +1899,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(existsSync(join(root!, "workspace", sentinel))).toBe(false);
     const scrollback = await session!.captureFullScrollback();
     // The notice wraps at the pane's width.
-    expect(scrollback.replace(/\s+/g, " ")).toContain("Retrying with low effort.");
+    expect(scrollback.replace(/\s+/g, " ")).toContain("Asking the model to do it in smaller steps, at low effort.");
     expect(scrollback).not.toContain("did not run them");
-    expect(scrollback).not.toContain("response hit provider length limit");
+    expect(scrollback).not.toContain("The response hit the provider's length limit and may be incomplete.");
     expect(scrollback).not.toContain("UnknownToolLifecycleIdentity");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
     await session!.sendText("Confirm a later prompt is still usable.");
@@ -3356,7 +3356,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session!.sendText("Trigger restricted provider.");
       // The reason goes to the transcript; the status line says what to do.
-      await session!.waitForText("API access denied · HTTP 403 · Provider: wafer", TIMEOUT);
+      await session!.waitForText("⚠ Your team has restricted access to this provider.", TIMEOUT);
       await session!.waitForText("The provider rejected this request · press Esc", TIMEOUT);
       await session!.sendKeys("Escape");
       await session!.waitForPane(
@@ -3366,10 +3366,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests.length).toBe(1);
-      expect(countOccurrences(scrollback, "API access denied · HTTP 403 · Provider: wafer")).toBe(1);
-      expect(scrollback).toContain(
-        "no_providers_available: Your team has restricted access to this",
-      );
+      const restrictedNotice = "⚠ Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer";
+      const flatScrollback = scrollback.replace(/\s+/g, " ");
+      expect(countOccurrences(flatScrollback, restrictedNotice)).toBe(1);
+      expect(scrollback).not.toContain("API access denied");
       expect(scrollback).not.toContain('{"error"');
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -3610,7 +3610,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.requests.length).toBe(4);
       expect(scrollback).not.toContain("Try again later");
-      expect(scrollback).not.toContain("request failed");
+      expect(scrollback).not.toContain("Request failed");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -3677,7 +3677,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.requests).toHaveLength(2);
       // The provider's reason showed once, while the picker was up.
-      expect(countOccurrences(scrollback, "credit_card_required")).toBe(1);
+      expect(countOccurrences(scrollback.replace(/\s+/g, " "), "Buy credits to use AI Gateway.")).toBe(1);
+      // The HTTP code row shows only in Ctrl+O, not in the compact scrollback.
+      expect(scrollback).not.toContain("credit_card_required");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT * 2,
@@ -4066,6 +4068,120 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     TIMEOUT * 2,
   );
 
+  // fx queries cursor position (`\x1b[6n`) immediately before enabling
+  // interactive terminal modes via `writeLifecycleTerminalBytes`. Closing the
+  // pty master upon seeing `\x1b[6n` hits startup mode writes deterministically.
+  test.skipIf(!Bun.which("python3"))(
+    "a window that closes during startup exits quietly without a disk error or crash report",
+    () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-startup-hangup-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const driver = [
+        "import fcntl, os, pty, select, struct, subprocess, sys, termios",
+        "fx_bin, cwd, stderr_path = sys.argv[1:4]",
+        "master, slave = pty.openpty()",
+        "fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 100, 0, 0))",
+        "def preexec():",
+        "    os.dup2(slave, 0)",
+        "    os.dup2(slave, 1)",
+        "    err_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)",
+        "    os.dup2(err_fd, 2)",
+        "    if err_fd > 2: os.close(err_fd)",
+        "    if slave > 2: os.close(slave)",
+        "    os.close(master)",
+        "proc = subprocess.Popen([fx_bin], cwd=cwd, preexec_fn=preexec, close_fds=False)",
+        "os.close(slave)",
+        "buf = bytearray()",
+        "while True:",
+        "    ready, _, _ = select.select([master], [], [], 10.0)",
+        "    if not ready:",
+        "        proc.kill()",
+        "        proc.wait(timeout=4)",
+        "        raise TimeoutError('timed out waiting for cursor probe')",
+        "    buf.extend(os.read(master, 4096))",
+        "    if b'\\x1b[6n' in buf:",
+        "        os.close(master)",
+        "        break",
+        "print(proc.wait(timeout=10))",
+      ].join("\n");
+
+      const env: Record<string, string> = {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        HOME: home,
+        TERM: "xterm-256color",
+        FX_AUTO_UPGRADE: "0",
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SOUND: "0",
+        FX_TEST_SKIP_ONBOARDING: "1",
+        FX_THEME: "dark",
+      };
+      const result = execFileSync("python3", ["-c", driver, FX_BIN, workspace, stderrPath], {
+        env,
+        encoding: "utf8",
+      }).trim();
+
+      expect({
+        status: result,
+        stderr: readFileSync(stderrPath, "utf8"),
+        crashReport: existsSync(join(home, ".fx", "diagnostics", "last-crash.jsonl")),
+      }).toEqual({ status: "0", stderr: "", crashReport: false });
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable() || !Bun.which("python3"))(
+    "a window that closes during an idle session exits quietly without a disk error or crash report",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-hangup-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const statusPath = join(root, "exit-status");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const wrapper =
+        `python3 -c 'import signal, subprocess, sys; signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGHUP}); status = subprocess.run(sys.argv[2:]).returncode; open(sys.argv[1], "w").write(str(status))'`;
+      session = await TmuxSession.create({
+        cmd: `${wrapper} ${statusPath} ${FX_BIN}`,
+        cwd: workspace,
+        width: 100,
+        height: 32,
+        stderrPath,
+        env: {
+          HOME: home,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_SKIP_ONBOARDING: "1",
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+      const pid = session.processPid();
+      await session.kill();
+      session = null;
+
+      await waitForCondition(
+        () => existsSync(statusPath) && readFileSync(statusPath, "utf8") !== "" && !isProcessAlive(pid),
+        "fx to exit after its idle window closed",
+      );
+
+      expect({
+        status: readFileSync(statusPath, "utf8").trim(),
+        stderr: readFileSync(stderrPath, "utf8"),
+        crashReport: existsSync(join(home, ".fx", "diagnostics", "last-crash.jsonl")),
+      }).toEqual({ status: "0", stderr: "", crashReport: false });
+    },
+    TIMEOUT,
+  );
+
   test(
     "recovering tool lifecycle admits resumed tools on the same turn",
     async () => {
@@ -4267,9 +4383,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.requests).toHaveLength(3);
       expect(scrollback).toContain("What can fx do differently?");
-      expect(scrollback).not.toContain("system: cancelled");
+      expect(scrollback).not.toContain("⊘ Cancelled");
       expect(scrollback).not.toContain("Cancelling");
-      expect(scrollback).not.toContain("request failed: ModelError");
+      expect(scrollback).not.toContain("Request failed: ModelError");
       expect(scrollback).not.toContain("must not send");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -4611,10 +4727,75 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // The status row never becomes transcript.
       expect(scrollback).not.toContain("Gateway error ·");
       expect(scrollback).not.toContain("What should fx do?");
-      expect(scrollback).not.toContain("request failed: ModelError");
+      expect(scrollback).not.toContain("Request failed: ModelError");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
+  );
+
+  test(
+    "TUI names the model in turn context, announces /model switches in <fx-context-update>, and keeps frozen instructions identical",
+    async () => {
+      const modelB = "openai/gpt-5.4";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-model-identity-",
+        [
+          fakeGatewayFinalText("TUI_MODEL_TURN_1"),
+          fakeGatewayFinalText("TUI_MODEL_TURN_2"),
+          fakeGatewayFinalText("TUI_MODEL_TURN_3"),
+        ],
+        {
+          models: [
+            { id: MODEL, type: "language", tags: ["tool-use"] },
+            { id: modelB, type: "language", tags: ["tool-use"] },
+          ],
+        },
+      );
+
+      await session!.sendText("First model turn.");
+      await session!.waitForPane((pane) => pane.includes("TUI_MODEL_TURN_1") && turnSettled(pane), TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+
+      await session!.sendText(`/model ${modelB}`);
+      await session!.waitForText(`Switched to ${modelB}`, TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+
+      await session!.sendText("Second model turn.");
+      await session!.waitForPane((pane) => pane.includes("TUI_MODEL_TURN_2") && turnSettled(pane), TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+
+      await session!.sendText("Third model turn.");
+      await session!.waitForPane((pane) => pane.includes("TUI_MODEL_TURN_3") && turnSettled(pane), TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+
+      expect(queuedGateway.requests).toHaveLength(3);
+      const parseReq = (body: string) => JSON.parse(body) as { prompt: Array<{ role: string; content: unknown; providerOptions?: unknown }> };
+      const leadingSystem = (req: ReturnType<typeof parseReq>) => {
+        const firstNonSystem = req.prompt.findIndex((m) => m.role !== "system");
+        return req.prompt.slice(0, firstNonSystem < 0 ? req.prompt.length : firstNonSystem);
+      };
+      const req1 = parseReq(queuedGateway.requests[0]!.body);
+      const req2 = parseReq(queuedGateway.requests[1]!.body);
+      const req3 = parseReq(queuedGateway.requests[2]!.body);
+
+      const sys1 = leadingSystem(req1);
+      const sys2 = leadingSystem(req2);
+      const sys3 = leadingSystem(req3);
+      expect(JSON.stringify(sys2)).toBe(JSON.stringify(sys1));
+      expect(JSON.stringify(sys3)).toBe(JSON.stringify(sys1));
+
+      const turnCtx1 = sys1.map((m) => contentText(m.content)).find((text) => text.includes("<fx-turn-context>")) ?? "";
+      expect(turnCtx1).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${MODEL}\\n`));
+
+      const latestUser2 = contentText(req2.prompt.filter((m) => m.role === "user").at(-1)?.content);
+      expect(latestUser2).toContain("<fx-context-update>");
+      expect(latestUser2).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelB}\\n`));
+
+      const latestUser3 = contentText(req3.prompt.filter((m) => m.role === "user").at(-1)?.content);
+      expect(latestUser3).not.toContain("<fx-context-update>");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
   );
 
   test(
@@ -7499,7 +7680,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       await waitForCondition(() => hold.cancelled, "stream cancellation");
       expect(afterFirst).toContain("▪ Cancelled");
-      expect(afterFirst).not.toContain("system: cancelled");
+      expect(afterFirst).not.toContain("⊘ Cancelled");
       expect(afterFirst).not.toContain("Cancelling");
       expect(session.isPaneAlive()).toBe(true);
 
@@ -7521,7 +7702,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(
         countOccurrences(scrollback, "What can fx do differently?"),
       ).toBe(1);
-      expect(scrollback).not.toContain("system: cancelled");
+      expect(scrollback).not.toContain("⊘ Cancelled");
       expect(scrollback).not.toContain("Cancelling");
       expect(countOccurrences(trace, "source=input_active_stream")).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

@@ -5,7 +5,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { logLines, rootSessionIds, savedSessionIds } from "./saved-sessions";
 import {
   CHILD_MARKER,
@@ -130,6 +130,17 @@ const LAST_TWO_FAILED: StoryStep[] = [
 const HERE_DOCUMENT: StoryStep[] = [
   { at: 0, calls: [sh("cat > notes.md <<'EOF'\nThe model's notes\nEOF\nwc -l notes.md")] },
   { at: 1, text: "The notes are saved." },
+];
+
+// A command with a space after it, as a real session's model sent it: first
+// long enough that its run returns while it still runs, then quick. It
+// searches the test's own saved sessions.
+const SPACED_COMMAND = `cd ~/.fx/sessions/v2; grep -l -i "Chief Of Staff" */log.jsonl 2>/dev/null | head; `;
+const SPACED_COMMANDS: StoryStep[] = [
+  { at: 0, calls: [{ name: "shell", input: { action: "run", command: `sleep 2; ${SPACED_COMMAND}`, yield_time_ms: 500 } }] },
+  { at: 1, calls: [{ name: "shell", input: { action: "interact", session_id: "shell-1", yield_time_ms: 30_000 } }] },
+  { at: 2, text: "I will search once more.", calls: [{ name: "shell", input: { action: "run", command: SPACED_COMMAND, yield_time_ms: 120_000 } }] },
+  { at: 3, text: "No session log names it." },
 ];
 
 // Commands whose rows name only the programs they run: env unsets two
@@ -1898,6 +1909,47 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(resumed);
     await resumed.waitForText("Both files export their functions.", TIMEOUT);
     expectJoined(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a command sent with a space after it shows its short form while it runs, after it ends, and after resume",
+  async () => {
+    const { root, gateway, session, pane, tape } = await runStory(SPACED_COMMANDS, {
+      prompt: "which session did I rename?",
+      finalText: "No session log names it.",
+      record: true,
+    });
+    const rows = (lines: string[]) => lines.filter((line) => /^(●|├|└) /.test(line));
+    const live = rows(paneLines(pane));
+    expect(live).toEqual(["● Ran sleep, grep · 2 calls ✓", "● Ran grep ✓"]);
+
+    // Every frame fx drew names the command by its steps, also while it ran.
+    const replay = await runFx(["replay", tape!, "--frames"], { cwd: root.workspace, env: { HOME: root.home } });
+    expect(replay.code).toBe(0);
+    const frameRows = rows(replay.stdout.split("\n").map((line) => line.replace(/^\|/, "").replace(/\|$/, "").trimEnd()));
+    expect(frameRows.some((row) => /^● (Running|Still running|Waiting for) sleep, grep\b/.test(row))).toBe(true);
+    expect(frameRows.filter((row) => row.includes("Chief Of Staff"))).toEqual([]);
+
+    // Ctrl+O still shows the whole command.
+    await session.sendKeys("C-o");
+    const full = await session.waitForText("esc close", TIMEOUT);
+    expect(full).toContain(`grep -l -i "Chief Of Staff" */log.jsonl 2>/dev/null | head;`);
+    await session.sendKeys("C-o");
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("No session log names it.", TIMEOUT);
+    expect(rows(paneLines(await resumed.waitForComposer(TIMEOUT)))).toEqual(live);
   },
   TIMEOUT * 3,
 );

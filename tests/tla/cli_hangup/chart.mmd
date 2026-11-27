@@ -1,0 +1,13 @@
+stateDiagram-v2
+    [*] --> Running: CLI command starts
+    Running --> TerminalGone: Terminal hangs up (EIO / POLLHUP / POLLERR / POLLNVAL)
+    Running --> OpenError: Open-terminal or file I/O error
+    Running --> FinishedOk: Command completes normally (exit 0)
+
+    TerminalGone --> Propagated: Boundary maps via ui_terminal.terminalGone -> TerminalHungUp
+    Propagated --> QuietExit129: Subcommand catches rethrow TerminalHungUp -> commandFailure exits 129 (stderr empty)
+
+    OpenError --> ReportedExit1: Error preserved -> commandFailure reports message and exits 1
+    QuietExit129 --> [*]
+    ReportedExit1 --> [*]
+    FinishedOk --> [*]

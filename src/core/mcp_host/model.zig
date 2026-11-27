@@ -1093,7 +1093,7 @@ test "a subagent made before its parent's server starts may use the server's too
     try testing.expectEqual(@as(usize, 1), view.servers.len);
     try testing.expectEqualStrings("fake", view.servers[0].name);
     try testing.expectEqual(@as(usize, 0), view.tools.len);
-    const child: Access = .{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } };
+    const child: Access = .{ .scoped = .{ .captured = &view } };
     try testing.expect(c.hasTool("mcp_fake_echo", child));
     try testing.expectEqual(c.currentGeneration(), (try c.validateTool(a, "mcp_fake_echo", "{}", child)).valid);
     const result = (try c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .access = child })).?;
@@ -1103,7 +1103,7 @@ test "a subagent made before its parent's server starts may use the server's too
     var other = try view.clone(testing.allocator);
     defer other.deinit(testing.allocator);
     other.runtime_generation +%= 1;
-    const stale: Access = .{ .scoped = .{ .captured = &other, .admission_authority_generation = 0, .live = undefined } };
+    const stale: Access = .{ .scoped = .{ .captured = &other } };
     try testing.expect(!c.hasTool("mcp_fake_echo", stale));
     try testing.expectError(error.McpAccessDenied, c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .access = stale }));
 }
@@ -1202,7 +1202,7 @@ test "an MCP server's tools reach the model under fx's names" {
     var view = try c.snapshotAccessView(testing.allocator, "child", "parent");
     defer view.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), view.tools.len);
-    try testing.expect(Access.allowsTool(.{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } }, c.currentGeneration(), "mcp_fake_echo"));
+    try testing.expect(c.hasTool("mcp_fake_echo", .{ .scoped = .{ .captured = &view } }));
     const names = try c.serverNames(testing.allocator);
     defer {
         for (names) |name| testing.allocator.free(name);
@@ -1289,7 +1289,7 @@ test "a reload beside a call that is out and a reader of the access view ends on
     // A subagent's admission: the view it was given.
     var view = try c.snapshotAccessView(testing.allocator, "child", "parent");
     defer view.deinit(testing.allocator);
-    const child: Access = .{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } };
+    const child: Access = .{ .scoped = .{ .captured = &view } };
 
     // Its calls, one on each server, which never answer.
     const Caller = struct {
@@ -1895,13 +1895,40 @@ test "what the catalog leaves out of a server's tools is what the count says was
     defer c.names.deinit();
     c.builtins = .{};
     const built = try c.build(a, "srv", &listed);
-    const counted = try dropped_tools.count(gpa, &list);
+    const counted = try dropped_tools.reading(gpa, &list);
     // Every listed tool is in the catalog or in the count, and no tool is in both.
-    try testing.expectEqual(listed.len, built.len + counted.total());
+    try testing.expectEqual(listed.len, built.len + counted.dropped.total());
     try testing.expectEqual(@as(usize, 2), built.len);
+    try testing.expectEqual(@as(usize, counted.kept), built.len);
     try testing.expectEqualStrings("good", built[0].original_name);
     try testing.expectEqualStrings("fine", built[1].original_name);
-    try testing.expectEqual(@as(u32, 2), counted.total());
+    try testing.expectEqual(@as(u32, 2), counted.dropped.total());
+}
+
+test "a tool the engine skips for its inputSchema takes no name: the model gets a later good tool of the name" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const skipped = [_][]const u8{ "{\"name\":\"a\"}", "{\"name\":\"a\",\"inputSchema\":null}", "{\"name\":\"a\",\"inputSchema\":[]}" };
+    for (skipped) |bad| {
+        var list = try dropped_tools.listOf(gpa, &.{
+            bad,
+            "{\"name\":\"a\",\"description\":\"the good one\",\"inputSchema\":{\"type\":\"object\"}}",
+        });
+        defer list.deinit(gpa);
+        var listed: [1]runtime_mod.Tool = undefined;
+        try testing.expectEqual(listed.len, list.len());
+        listed[0] = .{ .name = list.get(0).name, .raw = list.get(0).raw };
+        var c: Catalog = undefined;
+        c.names = .init(gpa);
+        defer c.names.deinit();
+        c.builtins = .{};
+        const built = try c.build(a, "srv", &listed);
+        try testing.expectEqual(@as(usize, 1), built.len);
+        try testing.expectEqualStrings("a", built[0].original_name);
+        try testing.expectEqualStrings("the good one", built[0].description);
+    }
 }
 
 test "a call the server answers with a 401 tells the model it refused the login, in the server's quoted words" {
