@@ -1,8 +1,13 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const io_mod = @import("io.zig");
 const profile_paths = @import("profile_paths.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// Without it every entry point below does nothing, as in a build whose
+/// environment holds no `FX_TRACE*`, and the log's formatting is not built.
+const trace_compiled_in = build_options.trace_log;
 
 const State = struct {
     configured: bool = false,
@@ -34,6 +39,7 @@ var next_step_id = std.atomic.Value(u64).init(1);
 var next_subagent_id = std.atomic.Value(u64).init(1);
 
 pub fn configureFromEnv(alloc: Allocator, workspace_root: []const u8) void {
+    if (comptime !trace_compiled_in) return;
     const options = loadOptionsFromEnv(alloc, workspace_root) catch return;
     defer if (options.file_path) |path| alloc.free(path);
     if (options.file_path == null and !options.stderr_enabled) return;
@@ -53,6 +59,7 @@ pub fn shutdown() void {
 }
 
 pub fn activeLogPath() ?[]const u8 {
+    if (comptime !trace_compiled_in) return null;
     const zio = io_mod.getIo();
     state_mutex.lockUncancelable(zio);
     defer state_mutex.unlock(zio);
@@ -75,6 +82,7 @@ pub fn nextSubagentId() u64 {
 }
 
 pub fn logf(scope: []const u8, comptime fmt: []const u8, args: anytype) void {
+    if (comptime !trace_compiled_in) return;
     var line: TraceLine = undefined;
     if (!line.begin(scope)) return;
     line.print(fmt, args);
@@ -82,6 +90,7 @@ pub fn logf(scope: []const u8, comptime fmt: []const u8, args: anytype) void {
 }
 
 pub fn eventf(scope: []const u8, event: []const u8, ctx: TraceContext, comptime fmt: []const u8, args: anytype) void {
+    if (comptime !trace_compiled_in) return;
     var line: TraceLine = undefined;
     if (!line.beginEvent(scope, event, ctx, fmt.len != 0)) return;
     if (fmt.len != 0) line.print(fmt, args);
@@ -332,6 +341,7 @@ pub fn configureForTestWithScopes(alloc: Allocator, path: []const u8, scope_filt
 }
 
 pub fn configure(options: Options) !void {
+    if (comptime !trace_compiled_in) return;
     const zio = io_mod.getIo();
     state_mutex.lockUncancelable(zio);
     defer state_mutex.unlock(zio);
@@ -370,6 +380,7 @@ fn rotateIfTooLarge(path: []const u8, max_bytes: u64) void {
 }
 
 pub fn isEnabled() bool {
+    if (comptime !trace_compiled_in) return false;
     const zio = io_mod.getIo();
     state_mutex.lockUncancelable(zio);
     defer state_mutex.unlock(zio);
@@ -377,6 +388,7 @@ pub fn isEnabled() bool {
 }
 
 pub fn isScopeEnabled(scope: []const u8) bool {
+    if (comptime !trace_compiled_in) return false;
     const zio = io_mod.getIo();
     state_mutex.lockUncancelable(zio);
     defer state_mutex.unlock(zio);
