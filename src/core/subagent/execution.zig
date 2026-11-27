@@ -21,8 +21,6 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const session_store = @import("../session/session_store.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
-const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
-const mcp_access = @import("../mcp/access_policy.zig");
 const types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
 
@@ -33,23 +31,6 @@ const unannounced_approval_feedback = "fx could not tell your parent about this 
 
 /// What a child reads when fx could not hold the request for an answer.
 const unheld_approval_feedback = "fx could not hold this request for your parent's answer, so it was refused.";
-
-/// The MCP view a subagent may use now, taken from its freshly resolved live
-/// authority, which this consumes. The subagent engine and child agents both
-/// use it.
-pub fn liveMcpViewFrom(
-    alloc: Allocator,
-    authority: *authority_mod.Snapshot,
-) !tool_mcp_runtime.ResolvedLiveView {
-    defer authority.deinit(alloc);
-    const view = authority.mcp_view orelse return error.McpRuntimeUnavailable;
-    authority.mcp_view = null;
-    return .{
-        .authority_generation = mcp_access.authorityGeneration(view),
-        .action_authority_generation = authority.generation,
-        .view = view,
-    };
-}
 
 /// Decides one tool call against a subagent's live authority, resolved fresh
 /// from `resolver` for `child_id`. The child engine and child agents both use
