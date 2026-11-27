@@ -29,9 +29,18 @@ const Allocator = std.mem.Allocator;
 
 /// `image/png` in base64, the encoding the protocol uses for MIME types.
 const png_mime_base64 = "aW1hZ2UvcG5n";
+const text_utf8_mime_base64 = "dGV4dC9wbGFpbjtjaGFyc2V0PXV0Zi04";
+const text_mime_base64 = "dGV4dC9wbGFpbg==";
+const listing_mime_base64 = "Lg==";
+const paste_event_name_base64 = "UGFzdGUgZXZlbnQ=";
 const mode_query = "\x1b[?5522$p";
 const packet_prefix = "\x1b]5522;";
 const mode_report_prefix = "\x1b[?5522;";
+
+/// Maximum decoded password bytes accepted on a paste-event listing.
+pub const max_paste_password_bytes: usize = 128;
+/// Maximum decoded MIME-list bytes accepted on a paste-event listing.
+pub const max_paste_mime_list_bytes: usize = 4096;
 
 /// The bytes fx writes to ask the terminal for the clipboard image.
 pub const image_read_request = mode_query ++ packet_prefix ++ "type=read;" ++ png_mime_base64 ++ "\x1b\\";
@@ -110,6 +119,84 @@ pub fn holdsReplyStart(candidate: []const u8, request_open: bool) bool {
     return request_open and candidate.len >= 2 and !std.mem.eql(u8, candidate, "\x1b[");
 }
 
+pub const PasteLocation = enum {
+    clipboard,
+    primary,
+};
+
+pub const PasteMime = enum {
+    png,
+    text_utf8,
+    text,
+};
+
+fn mimeBase64(mime: PasteMime) []const u8 {
+    return switch (mime) {
+        .png => png_mime_base64,
+        .text_utf8 => text_utf8_mime_base64,
+        .text => text_mime_base64,
+    };
+}
+
+/// Picks the preferred MIME type from an ASCII-whitespace-separated list.
+pub fn pickPasteMime(mimes: []const u8, image_allowed: bool) ?PasteMime {
+    var has_png = false;
+    var has_text_utf8 = false;
+    var has_text = false;
+    var index: usize = 0;
+    while (index < mimes.len) {
+        while (index < mimes.len and std.ascii.isWhitespace(mimes[index])) : (index += 1) {}
+        if (index == mimes.len) break;
+        const start = index;
+        while (index < mimes.len and !std.ascii.isWhitespace(mimes[index])) : (index += 1) {}
+        const token = mimes[start..index];
+        if (image_allowed and std.mem.eql(u8, token, "image/png")) {
+            has_png = true;
+        } else if (std.mem.eql(u8, token, "text/plain;charset=utf-8")) {
+            has_text_utf8 = true;
+        } else if (std.mem.eql(u8, token, "text/plain")) {
+            has_text = true;
+        }
+    }
+    if (has_png) return .png;
+    if (has_text_utf8) return .text_utf8;
+    if (has_text) return .text;
+    return null;
+}
+
+/// Writes an OSC 5522 follow-up read request for a kitty paste event.
+pub fn writePasteReadRequest(
+    writer: *std.Io.Writer,
+    password: []const u8,
+    location: PasteLocation,
+    mime: PasteMime,
+) std.Io.Writer.Error!void {
+    try writer.writeAll(packet_prefix);
+    try writer.writeAll("type=read");
+    if (location == .primary) try writer.writeAll(":loc=primary");
+    if (password.len > 0) {
+        try writer.writeAll(":pw=");
+        const chunk_cap = 3 * 32;
+        var b64_buf: [std.base64.standard.Encoder.calcSize(chunk_cap)]u8 = undefined;
+        defer std.crypto.secureZero(u8, &b64_buf);
+        var raw_offset: usize = 0;
+        while (raw_offset < password.len) {
+            const chunk_len = @min(chunk_cap, password.len - raw_offset);
+            const encoded = std.base64.standard.Encoder.encode(
+                &b64_buf,
+                password[raw_offset .. raw_offset + chunk_len],
+            );
+            try writer.writeAll(encoded);
+            raw_offset += chunk_len;
+        }
+    }
+    try writer.writeAll(":name=");
+    try writer.writeAll(paste_event_name_base64);
+    try writer.writeByte(';');
+    try writer.writeAll(mimeBase64(mime));
+    try writer.writeAll("\x1b\\");
+}
+
 pub const Outcome = union(enum) {
     /// The PNG bytes the terminal sent.
     image: std.ArrayList(u8),
@@ -137,6 +224,106 @@ pub const Outcome = union(enum) {
     }
 };
 
+/// Decoded metadata from an unsolicited OSC 5522 paste-event listing.
+/// Caller owns `password` and `mimes` and must release them with `deinit`.
+pub const PasteEvent = struct {
+    password: std.ArrayList(u8),
+    location: PasteLocation,
+    mimes: std.ArrayList(u8),
+
+    pub fn deinit(self: *PasteEvent, alloc: Allocator) void {
+        if (self.password.capacity > 0) {
+            std.crypto.secureZero(u8, self.password.allocatedSlice());
+        }
+        self.password.deinit(alloc);
+        self.mimes.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const PasteEventOutcome = union(enum) {
+    paste_event: PasteEvent,
+    busy,
+    timed_out,
+    malformed,
+
+    pub fn deinit(self: *PasteEventOutcome, alloc: Allocator) void {
+        switch (self.*) {
+            .paste_event => |*event| event.deinit(alloc),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
+
+pub const TextOutcome = union(enum) {
+    /// The decoded text bytes the terminal sent.
+    text: std.ArrayList(u8),
+    /// The clipboard holds no text for the requested MIME type.
+    no_text,
+    /// The terminal cannot read the clipboard for fx.
+    unsupported,
+    /// The user or the system refused the read.
+    denied,
+    /// The terminal was busy, for example with another client.
+    busy,
+    /// The terminal reported the protocol but sent no complete reply in time.
+    timed_out,
+    /// The text is larger than the reader's limit, or than fx could hold.
+    too_large,
+    /// The reply broke the protocol.
+    malformed,
+
+    pub fn deinit(self: *TextOutcome, alloc: Allocator) void {
+        switch (self.*) {
+            .text => |*bytes| {
+                if (bytes.capacity > 0) {
+                    std.crypto.secureZero(u8, bytes.allocatedSlice());
+                }
+                bytes.deinit(alloc);
+            },
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
+
+const RequestKind = enum {
+    image,
+    text,
+};
+
+const RequestError = enum {
+    unsupported,
+    denied,
+    busy,
+    timed_out,
+    too_large,
+    malformed,
+
+    fn toImageOutcome(self: RequestError) Outcome {
+        return switch (self) {
+            .unsupported => .unsupported,
+            .denied => .denied,
+            .busy => .busy,
+            .timed_out => .timed_out,
+            .too_large => .too_large,
+            .malformed => .malformed,
+        };
+    }
+
+    fn toTextOutcome(self: RequestError) TextOutcome {
+        return switch (self) {
+            .unsupported => .unsupported,
+            .denied => .denied,
+            .busy => .busy,
+            .timed_out => .timed_out,
+            .too_large => .too_large,
+            .malformed => .malformed,
+        };
+    }
+};
+
 const Phase = union(enum) {
     idle,
     /// The request is out and the mode report has not come. Holds the deadline.
@@ -145,9 +332,21 @@ const Phase = union(enum) {
     awaiting_reply: i64,
     /// The terminal sent `OK`. DATA packets follow until `DONE`.
     receiving: i64,
+    /// Unsolicited `OK` arrived while idle; collecting `DATA:mime=Lg==` and `DONE`.
+    listing: i64,
     /// The transfer failed and its outcome is set; later packets of it are
     /// consumed until it ends.
     discarding: i64,
+};
+
+const BusyListing = union(enum) {
+    none,
+    /// Bare `OK` arrived during `.receiving`; confirmed as a busy listing if
+    /// `DATA:mime=Lg==` follows, or fails the open transfer otherwise.
+    tentative: i64,
+    /// Listing packets are consumed without disturbing the open request
+    /// (`tests/tla/clipboard_protocol/PasteEvents.tla` `OneRequestAtATime`).
+    confirmed: i64,
 };
 
 /// Who takes input bytes before the theme monitor and the composer.
@@ -169,6 +368,8 @@ const Packet = struct {
     kind: []const u8,
     status: []const u8,
     mime: ?[]const u8,
+    loc: ?[]const u8,
+    pw: ?[]const u8,
     payload: []const u8,
 };
 
@@ -176,8 +377,21 @@ const Packet = struct {
 /// call `poll` on every loop turn and take the outcome when it is set.
 pub const Reader = struct {
     phase: Phase = .idle,
-    max_image_bytes: usize = 0,
-    image: std.ArrayList(u8) = .empty,
+    request_kind: RequestKind = .image,
+    request_mime: PasteMime = .png,
+    max_payload_bytes: usize = 0,
+    payload: std.ArrayList(u8) = .empty,
+    /// When a bare `OK` arrives in `.awaiting_mode` or `.awaiting_reply`, save
+    /// that phase until the first `DATA` reveals whether it is our reply or a
+    /// passwordless paste-event listing.
+    saved_awaiting_phase: ?Phase = null,
+    listing_has_pw: bool = false,
+    listing_location: PasteLocation = .clipboard,
+    listing_loc_invalid: bool = false,
+    listing_saw_mime_list: bool = false,
+    listing_password: std.ArrayList(u8) = .empty,
+    listing_mimes: std.ArrayList(u8) = .empty,
+    busy_listing: BusyListing = .none,
     packet: std.ArrayList(u8) = .empty,
     owner: InputOwner = .none,
     /// When a packet that owns input gives it up for lack of bytes.
@@ -186,41 +400,74 @@ pub const Reader = struct {
     packet_invalid: bool = false,
     resync_dropped_bytes: usize = 0,
     outcome: ?Outcome = null,
+    text_outcome: ?TextOutcome = null,
+    paste_event_outcome: ?PasteEventOutcome = null,
 
     pub fn deinit(self: *Reader, alloc: Allocator) void {
-        if (self.image.items.len > 0) {
-            debug_trace.logf("clipboard", "clipboard image dropped bytes={d} reason=shutdown", .{self.image.items.len});
+        if (self.payload.items.len > 0) {
+            debug_trace.logf(
+                "clipboard",
+                "clipboard payload dropped bytes={d} kind={s} reason=shutdown",
+                .{ self.payload.items.len, @tagName(self.request_kind) },
+            );
         }
-        self.image.deinit(alloc);
-        self.packet.deinit(alloc);
+        zeroAndDeinitList(&self.payload, alloc);
+        zeroAndDeinitList(&self.listing_password, alloc);
+        self.listing_mimes.deinit(alloc);
+        zeroAndDeinitList(&self.packet, alloc);
         if (self.outcome) |*outcome| outcome.deinit(alloc);
+        if (self.text_outcome) |*outcome| outcome.deinit(alloc);
+        if (self.paste_event_outcome) |*outcome| outcome.deinit(alloc);
         self.* = .{};
     }
 
-    /// Whether a request is outstanding, its outcome is unread, or the rest
-    /// of a failed transfer is still arriving.
+    /// Whether a request is outstanding, an outcome is unread, or the rest of
+    /// a failed transfer is still arriving.
     pub fn pending(self: *const Reader) bool {
-        return self.phase != .idle or self.outcome != null;
+        return self.phase != .idle or
+            self.outcome != null or
+            self.text_outcome != null or
+            self.paste_event_outcome != null or
+            self.busy_listing != .none;
     }
 
-    /// Starts a request. The caller then writes `image_read_request`.
+    /// Starts an image read request. The caller then writes `image_read_request`.
     pub fn begin(self: *Reader, now_ms: i64, max_image_bytes: usize) error{RequestPending}!void {
         if (self.pending()) return error.RequestPending;
-        self.max_image_bytes = max_image_bytes;
+        self.request_kind = .image;
+        self.request_mime = .png;
+        self.max_payload_bytes = max_image_bytes;
+        self.saved_awaiting_phase = null;
         self.phase = .{ .awaiting_mode = io_mod.addMillis(now_ms, mode_report_timeout_ms) };
+    }
+
+    /// Starts a text read request (such as a paste-event follow-up read, which
+    /// skips the DECRQM mode query and waits directly for the reply).
+    pub fn beginText(self: *Reader, now_ms: i64, max_text_bytes: usize, mime: PasteMime) error{RequestPending}!void {
+        std.debug.assert(mime != .png);
+        if (self.pending()) return error.RequestPending;
+        self.request_kind = .text;
+        self.request_mime = mime;
+        self.max_payload_bytes = max_text_bytes;
+        self.saved_awaiting_phase = null;
+        self.phase = .{ .awaiting_reply = io_mod.addMillis(now_ms, reply_timeout_ms) };
     }
 
     /// Ends a request whose bytes could not be written.
     pub fn cancel(self: *Reader) void {
-        std.debug.assert(self.phase == .awaiting_mode);
+        std.debug.assert(self.phase == .awaiting_mode or self.phase == .awaiting_reply);
         self.phase = .idle;
+        self.saved_awaiting_phase = null;
+        self.request_kind = .image;
+        self.request_mime = .png;
+        self.max_payload_bytes = 0;
     }
 
     pub fn noteModeReport(self: *Reader, alloc: Allocator, support: ModeSupport, now_ms: i64) void {
         switch (self.phase) {
             .awaiting_mode => switch (support) {
                 .supported => self.phase = .{ .awaiting_reply = io_mod.addMillis(now_ms, reply_timeout_ms) },
-                .unsupported => self.finish(alloc, .unsupported),
+                .unsupported => self.finishRequestError(alloc, .unsupported),
             },
             else => debug_trace.logf(
                 "clipboard",
@@ -247,7 +494,7 @@ pub const Reader = struct {
         if (self.owner != .none) return;
         self.owner = .resync;
         self.resync_dropped_bytes = 0;
-        self.fail(alloc, .timed_out, now_ms);
+        self.failCurrent(alloc, .timed_out, now_ms);
     }
 
     /// Starts a packet after its prefix, which the theme monitor consumed.
@@ -256,7 +503,7 @@ pub const Reader = struct {
         self.owner = .packet;
         self.packet_escape = false;
         self.packet_invalid = false;
-        self.packet.clearRetainingCapacity();
+        zeroAndClearList(&self.packet);
         self.packet.ensureTotalCapacity(alloc, max_packet_bytes) catch {
             debug_trace.logf("clipboard", "clipboard packet buffer unavailable reason=out_of_memory", .{});
             self.packet_invalid = true;
@@ -289,30 +536,49 @@ pub const Reader = struct {
                     "clipboard packet dropped bytes={d} reason=idle_timeout",
                     .{self.packet.items.len},
                 );
-                self.packet.clearRetainingCapacity();
+                zeroAndClearList(&self.packet);
                 // The terminal writes a packet in one piece, so its rest may
                 // still come after a network stall
                 // (`tests/tla/clipboard_protocol/ClipboardRead.tla` PacketTimeout).
                 self.owner = .resync;
                 self.resync_dropped_bytes = 0;
-                self.fail(alloc, .timed_out, now_ms);
+                self.failCurrent(alloc, .timed_out, now_ms);
                 return;
             },
             .resync => {},
+        }
+        switch (self.busy_listing) {
+            .none => {},
+            .tentative => |deadline_ms| if (now_ms >= deadline_ms) {
+                self.busy_listing = .none;
+            },
+            .confirmed => |deadline_ms| if (now_ms >= deadline_ms) {
+                self.busy_listing = .none;
+                self.finishPasteEvent(alloc, .busy);
+            },
         }
         switch (self.phase) {
             .idle => {},
             .awaiting_mode => |deadline_ms| if (now_ms >= deadline_ms) {
                 debug_trace.logf("clipboard", "clipboard mode report missing", .{});
-                self.finish(alloc, .unsupported);
+                self.finishRequestError(alloc, .unsupported);
             },
             .awaiting_reply => |deadline_ms| if (now_ms >= deadline_ms) {
-                self.finish(alloc, .timed_out);
+                self.finishRequestError(alloc, .timed_out);
             },
-            // The rest of a stalled transfer may still come; `fail` consumes
-            // it until it ends.
+            // The rest of a stalled transfer may still come; `failRequest`
+            // consumes it until it ends.
             .receiving => |deadline_ms| if (now_ms >= deadline_ms) {
-                self.fail(alloc, .timed_out, now_ms);
+                self.failRequest(alloc, .timed_out, now_ms);
+            },
+            .listing => |deadline_ms| if (now_ms >= deadline_ms) {
+                if (self.listing_has_pw or self.listing_saw_mime_list) {
+                    self.failListing(alloc, .timed_out, now_ms);
+                } else {
+                    debug_trace.logf("clipboard", "clipboard packet dropped status=OK reason=no_request", .{});
+                    self.resetListingState(alloc);
+                    self.phase = .idle;
+                }
             },
             .discarding => |deadline_ms| if (now_ms >= deadline_ms) {
                 self.phase = .idle;
@@ -323,6 +589,18 @@ pub const Reader = struct {
     pub fn takeOutcome(self: *Reader) ?Outcome {
         const outcome = self.outcome orelse return null;
         self.outcome = null;
+        return outcome;
+    }
+
+    pub fn takeTextOutcome(self: *Reader) ?TextOutcome {
+        const outcome = self.text_outcome orelse return null;
+        self.text_outcome = null;
+        return outcome;
+    }
+
+    pub fn takePasteEventOutcome(self: *Reader) ?PasteEventOutcome {
+        const outcome = self.paste_event_outcome orelse return null;
+        self.paste_event_outcome = null;
         return outcome;
     }
 
@@ -387,11 +665,11 @@ pub const Reader = struct {
 
     fn endPacket(self: *Reader, alloc: Allocator, now_ms: i64) void {
         self.owner = .none;
-        defer self.packet.clearRetainingCapacity();
-        if (self.packet_invalid) return self.fail(alloc, .malformed, now_ms);
+        defer zeroAndClearList(&self.packet);
+        if (self.packet_invalid) return self.failCurrent(alloc, .malformed, now_ms);
         const packet = parsePacket(self.packet.items) orelse {
             debug_trace.logf("clipboard", "clipboard packet unreadable bytes={d}", .{self.packet.items.len});
-            return self.fail(alloc, .malformed, now_ms);
+            return self.failCurrent(alloc, .malformed, now_ms);
         };
         if (!std.mem.eql(u8, packet.kind, "read")) {
             debug_trace.logf("clipboard", "clipboard packet ignored reason=not_a_read_reply", .{});
@@ -402,9 +680,15 @@ pub const Reader = struct {
 
     fn applyReadPacket(self: *Reader, alloc: Allocator, packet: Packet, now_ms: i64) void {
         const status = packet.status;
+        if (self.consumeBusyListingPacket(alloc, packet, now_ms)) return;
+
         const continues = std.mem.eql(u8, status, "OK") or std.mem.eql(u8, status, "DATA");
         switch (self.phase) {
             .idle => {
+                if (std.mem.eql(u8, status, "OK")) {
+                    self.startListingFromIdle(alloc, packet, now_ms);
+                    return;
+                }
                 debug_trace.logf(
                     "clipboard",
                     "clipboard packet dropped status={s} reason=no_request",
@@ -412,7 +696,15 @@ pub const Reader = struct {
                 );
                 return;
             },
+            .listing => {
+                self.applyListingPacket(alloc, packet, continues, now_ms);
+                return;
+            },
             .discarding => {
+                if (std.mem.eql(u8, status, "OK") and isExplicitListingStart(packet)) {
+                    self.busy_listing = .{ .confirmed = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
+                    return;
+                }
                 self.phase = if (continues) .{ .discarding = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) } else .idle;
                 return;
             },
@@ -420,74 +712,422 @@ pub const Reader = struct {
         }
 
         if (std.mem.eql(u8, status, "OK")) {
-            if (self.phase == .receiving) return self.fail(alloc, .malformed, now_ms);
+            // An `OK` with `pw` or `loc` cannot be a Ctrl+V read reply, so treat
+            // it as an incoming listing without disturbing the open request
+            // (`tests/tla/clipboard_protocol/PasteEvents.tla` `OneRequestAtATime`).
+            if (isExplicitListingStart(packet)) {
+                self.busy_listing = .{ .confirmed = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
+                return;
+            }
+            if (self.phase == .receiving) {
+                self.busy_listing = .{ .tentative = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
+                return;
+            }
+            self.saved_awaiting_phase = self.phase;
             self.phase = .{ .receiving = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
         } else if (std.mem.eql(u8, status, "DATA")) {
-            if (self.phase != .receiving) return self.fail(alloc, .malformed, now_ms);
+            if (self.phase != .receiving) {
+                self.saved_awaiting_phase = null;
+                return self.failRequest(alloc, .malformed, now_ms);
+            }
+            if (isListingData(packet) and self.saved_awaiting_phase != null and self.payload.items.len == 0) {
+                // The preceding bare `OK` belonged to a passwordless listing;
+                // restore the open request's phase and drop the listing as busy.
+                self.phase = self.saved_awaiting_phase.?;
+                self.saved_awaiting_phase = null;
+                self.busy_listing = .{ .confirmed = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
+                return;
+            }
+            self.saved_awaiting_phase = null;
             self.phase = .{ .receiving = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
-            // fx asks only for PNG; a terminal may still send other types.
+            // fx asks only for one MIME; a terminal may still send other types.
             const mime = packet.mime orelse return;
-            if (!std.mem.eql(u8, mime, png_mime_base64)) return;
+            if (!std.mem.eql(u8, mime, mimeBase64(self.request_mime))) return;
             self.appendData(alloc, packet.payload, now_ms);
         } else if (std.mem.eql(u8, status, "DONE")) {
-            if (self.image.items.len == 0) return self.finish(alloc, .no_image);
-            const image = self.image;
-            self.image = .empty;
-            self.finish(alloc, .{ .image = image });
+            self.saved_awaiting_phase = null;
+            self.finishRequestDone(alloc);
         } else if (std.mem.eql(u8, status, "EPERM")) {
-            self.finish(alloc, .denied);
+            self.finishRequestError(alloc, .denied);
         } else if (std.mem.eql(u8, status, "EBUSY")) {
-            self.finish(alloc, .busy);
+            self.finishRequestError(alloc, .busy);
         } else if (std.mem.eql(u8, status, "ENOSYS")) {
-            self.finish(alloc, .unsupported);
+            self.finishRequestError(alloc, .unsupported);
         } else {
             debug_trace.logf("clipboard", "clipboard packet unknown status_bytes={d}", .{status.len});
-            self.fail(alloc, .malformed, now_ms);
+            self.failRequest(alloc, .malformed, now_ms);
         }
+    }
+
+    fn consumeBusyListingPacket(self: *Reader, alloc: Allocator, packet: Packet, now_ms: i64) bool {
+        switch (self.busy_listing) {
+            .none => return false,
+            .tentative => {
+                if (isListingData(packet)) {
+                    self.busy_listing = .{ .confirmed = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
+                    return true;
+                }
+                self.busy_listing = .none;
+                self.failRequest(alloc, .malformed, now_ms);
+                return true;
+            },
+            .confirmed => {
+                if (isListingData(packet)) {
+                    self.busy_listing = .{ .confirmed = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
+                    return true;
+                }
+                if (std.mem.eql(u8, packet.status, "DONE")) {
+                    self.busy_listing = .none;
+                    self.finishPasteEvent(alloc, .busy);
+                    return true;
+                }
+                return false;
+            },
+        }
+    }
+
+    fn startListingFromIdle(self: *Reader, alloc: Allocator, packet: Packet, now_ms: i64) void {
+        self.resetListingState(alloc);
+        const location = parsePasteLocation(packet.loc);
+        if (packet.pw) |pw_b64| {
+            self.listing_has_pw = true;
+            const loc = location orelse {
+                self.failListing(alloc, .malformed, now_ms);
+                return;
+            };
+            self.listing_location = loc;
+            var pw_buf: [max_paste_password_bytes]u8 = undefined;
+            defer std.crypto.secureZero(u8, &pw_buf);
+            const pw_len = decodeBoundedBase64(&pw_buf, pw_b64) orelse {
+                self.failListing(alloc, .malformed, now_ms);
+                return;
+            };
+            self.listing_password.appendSlice(alloc, pw_buf[0..pw_len]) catch {
+                debug_trace.logf("clipboard", "paste password buffer unavailable reason=out_of_memory", .{});
+                self.failListing(alloc, .malformed, now_ms);
+                return;
+            };
+        } else {
+            self.listing_has_pw = false;
+            if (location) |loc| {
+                self.listing_location = loc;
+            } else {
+                self.listing_loc_invalid = true;
+            }
+        }
+        self.phase = .{ .listing = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
+    }
+
+    fn applyListingPacket(self: *Reader, alloc: Allocator, packet: Packet, continues: bool, now_ms: i64) void {
+        const status = packet.status;
+        if (packet.pw) |pw_b64| {
+            if (!self.listingMatchesPassword(pw_b64)) {
+                if (continues) {
+                    self.failListing(alloc, .malformed, now_ms);
+                } else {
+                    self.finishListing(alloc, .malformed);
+                }
+                return;
+            }
+        }
+
+        if (std.mem.eql(u8, status, "OK")) {
+            if (isExplicitListingStart(packet)) {
+                self.busy_listing = .{ .confirmed = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
+                return;
+            }
+            if (!self.listing_has_pw and !self.listing_saw_mime_list) {
+                debug_trace.logf("clipboard", "clipboard packet dropped status=OK reason=no_request", .{});
+                self.resetListingState(alloc);
+                self.phase = .idle;
+                self.startListingFromIdle(alloc, packet, now_ms);
+                return;
+            }
+            self.failListing(alloc, .malformed, now_ms);
+            return;
+        }
+
+        if (std.mem.eql(u8, status, "DATA")) {
+            if (!isListingData(packet)) {
+                if (!self.listing_has_pw and !self.listing_saw_mime_list) {
+                    debug_trace.logf("clipboard", "clipboard packet dropped status=OK reason=no_request", .{});
+                    debug_trace.logf("clipboard", "clipboard packet dropped status=DATA reason=no_request", .{});
+                    self.resetListingState(alloc);
+                    self.phase = .idle;
+                    return;
+                }
+                self.phase = .{ .listing = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
+                return;
+            }
+            if (self.listing_loc_invalid) {
+                self.failListing(alloc, .malformed, now_ms);
+                return;
+            }
+            self.listing_saw_mime_list = true;
+            self.phase = .{ .listing = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
+            self.appendListingMimeData(alloc, packet.payload, now_ms);
+            return;
+        }
+
+        if (std.mem.eql(u8, status, "DONE")) {
+            if (!self.listing_has_pw and !self.listing_saw_mime_list) {
+                debug_trace.logf("clipboard", "clipboard packet dropped status=OK reason=no_request", .{});
+                debug_trace.logf("clipboard", "clipboard packet dropped status=DONE reason=no_request", .{});
+                self.resetListingState(alloc);
+                self.phase = .idle;
+                return;
+            }
+            if (!self.listing_saw_mime_list) {
+                self.finishListing(alloc, .malformed);
+                return;
+            }
+            const password = self.listing_password;
+            self.listing_password = .empty;
+            const mimes = self.listing_mimes;
+            self.listing_mimes = .empty;
+            const location = self.listing_location;
+            self.finishListing(alloc, .{ .paste_event = .{
+                .password = password,
+                .location = location,
+                .mimes = mimes,
+            } });
+            return;
+        }
+
+        if (!self.listing_has_pw and !self.listing_saw_mime_list) {
+            debug_trace.logf("clipboard", "clipboard packet dropped status=OK reason=no_request", .{});
+            debug_trace.logf(
+                "clipboard",
+                "clipboard packet dropped status={s} reason=no_request",
+                .{traceStatus(status)},
+            );
+            self.resetListingState(alloc);
+            self.phase = .idle;
+            return;
+        }
+        self.finishListing(alloc, .malformed);
+    }
+
+    fn listingMatchesPassword(self: *const Reader, pw_b64: []const u8) bool {
+        if (!self.listing_has_pw) return false;
+        var pw_buf: [max_paste_password_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &pw_buf);
+        const pw_len = decodeBoundedBase64(&pw_buf, pw_b64) orelse return false;
+        return std.mem.eql(u8, pw_buf[0..pw_len], self.listing_password.items);
+    }
+
+    fn appendListingMimeData(self: *Reader, alloc: Allocator, payload: []const u8, now_ms: i64) void {
+        const decoder = std.base64.standard.Decoder;
+        const size = decoder.calcSizeForSlice(payload) catch return self.failListing(alloc, .malformed, now_ms);
+        if (size > max_paste_mime_list_bytes - self.listing_mimes.items.len) {
+            return self.failListing(alloc, .malformed, now_ms);
+        }
+        self.listing_mimes.ensureUnusedCapacity(alloc, size) catch {
+            debug_trace.logf("clipboard", "paste mime list buffer unavailable bytes={d} reason=out_of_memory", .{size});
+            return self.failListing(alloc, .malformed, now_ms);
+        };
+        const start = self.listing_mimes.items.len;
+        decoder.decode(self.listing_mimes.unusedCapacitySlice()[0..size], payload) catch {
+            return self.failListing(alloc, .malformed, now_ms);
+        };
+        self.listing_mimes.items.len = start + size;
     }
 
     fn appendData(self: *Reader, alloc: Allocator, payload: []const u8, now_ms: i64) void {
         const decoder = std.base64.standard.Decoder;
-        const size = decoder.calcSizeForSlice(payload) catch return self.fail(alloc, .malformed, now_ms);
-        if (size > self.max_image_bytes - self.image.items.len) return self.fail(alloc, .too_large, now_ms);
-        self.image.ensureUnusedCapacity(alloc, size) catch {
-            debug_trace.logf("clipboard", "clipboard image buffer unavailable bytes={d} reason=out_of_memory", .{size});
-            return self.fail(alloc, .too_large, now_ms);
+        const size = decoder.calcSizeForSlice(payload) catch return self.failRequest(alloc, .malformed, now_ms);
+        if (size > self.max_payload_bytes - self.payload.items.len) return self.failRequest(alloc, .too_large, now_ms);
+        self.payload.ensureUnusedCapacity(alloc, size) catch {
+            debug_trace.logf(
+                "clipboard",
+                "clipboard payload buffer unavailable bytes={d} kind={s} reason=out_of_memory",
+                .{ size, @tagName(self.request_kind) },
+            );
+            return self.failRequest(alloc, .too_large, now_ms);
         };
-        const start = self.image.items.len;
-        decoder.decode(self.image.unusedCapacitySlice()[0..size], payload) catch {
-            return self.fail(alloc, .malformed, now_ms);
+        const start = self.payload.items.len;
+        decoder.decode(self.payload.unusedCapacitySlice()[0..size], payload) catch {
+            return self.failRequest(alloc, .malformed, now_ms);
         };
-        self.image.items.len = start + size;
+        self.payload.items.len = start + size;
     }
 
-    /// Ends a request that has no more packets to come.
-    fn finish(self: *Reader, alloc: Allocator, outcome: Outcome) void {
-        std.debug.assert(self.outcome == null);
+    fn finishRequestDone(self: *Reader, alloc: Allocator) void {
+        if (self.payload.items.len == 0) {
+            self.phase = .idle;
+            self.saved_awaiting_phase = null;
+            zeroAndFreeList(&self.payload, alloc);
+            zeroAndFreeList(&self.packet, alloc);
+            switch (self.request_kind) {
+                .image => self.storeImageOutcome(alloc, .no_image),
+                .text => self.storeTextOutcome(alloc, .no_text),
+            }
+            return;
+        }
+        const data = self.payload;
+        self.payload = .empty;
         self.phase = .idle;
-        self.image.clearAndFree(alloc);
-        self.packet.clearAndFree(alloc);
+        self.saved_awaiting_phase = null;
+        zeroAndFreeList(&self.packet, alloc);
+        switch (self.request_kind) {
+            .image => self.storeImageOutcome(alloc, .{ .image = data }),
+            .text => self.storeTextOutcome(alloc, .{ .text = data }),
+        }
+    }
+
+    fn finishRequestError(self: *Reader, alloc: Allocator, err: RequestError) void {
+        self.phase = .idle;
+        self.saved_awaiting_phase = null;
+        zeroAndFreeList(&self.payload, alloc);
+        zeroAndFreeList(&self.packet, alloc);
+        switch (self.request_kind) {
+            .image => self.storeImageOutcome(alloc, err.toImageOutcome()),
+            .text => self.storeTextOutcome(alloc, err.toTextOutcome()),
+        }
+    }
+
+    fn storeImageOutcome(self: *Reader, alloc: Allocator, outcome: Outcome) void {
+        if (self.outcome != null) {
+            var dropped = outcome;
+            dropped.deinit(alloc);
+            debug_trace.logf("clipboard", "clipboard outcome dropped reason=outcome_pending", .{});
+            return;
+        }
         self.outcome = outcome;
     }
 
-    /// Ends a request in the middle of its transfer. Later packets of the
-    /// transfer are consumed until it ends.
-    fn fail(self: *Reader, alloc: Allocator, outcome: Outcome, now_ms: i64) void {
+    fn storeTextOutcome(self: *Reader, alloc: Allocator, outcome: TextOutcome) void {
+        if (self.text_outcome != null) {
+            var dropped = outcome;
+            dropped.deinit(alloc);
+            debug_trace.logf("clipboard", "clipboard text outcome dropped reason=outcome_pending", .{});
+            return;
+        }
+        self.text_outcome = outcome;
+    }
+
+    fn failRequest(self: *Reader, alloc: Allocator, err: RequestError, now_ms: i64) void {
         switch (self.phase) {
-            .idle, .discarding => return,
+            .idle, .discarding, .listing => return,
             .awaiting_mode, .awaiting_reply, .receiving => {},
         }
-        if (self.image.items.len > 0) {
+        if (self.payload.items.len > 0) {
             debug_trace.logf(
                 "clipboard",
-                "clipboard image dropped bytes={d} reason={s}",
-                .{ self.image.items.len, @tagName(outcome) },
+                "clipboard payload dropped bytes={d} kind={s} reason={s}",
+                .{ self.payload.items.len, @tagName(self.request_kind), @tagName(err) },
             );
         }
-        self.finish(alloc, outcome);
+        self.finishRequestError(alloc, err);
         self.phase = .{ .discarding = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
     }
+
+    fn resetListingState(self: *Reader, alloc: Allocator) void {
+        self.listing_has_pw = false;
+        self.listing_location = .clipboard;
+        self.listing_loc_invalid = false;
+        self.listing_saw_mime_list = false;
+        zeroAndFreeList(&self.listing_password, alloc);
+        self.listing_mimes.clearAndFree(alloc);
+    }
+
+    fn finishPasteEvent(self: *Reader, alloc: Allocator, outcome: PasteEventOutcome) void {
+        if (self.paste_event_outcome != null) {
+            var dropped = outcome;
+            dropped.deinit(alloc);
+            debug_trace.logf("clipboard", "paste event outcome dropped reason=outcome_pending", .{});
+            return;
+        }
+        self.paste_event_outcome = outcome;
+    }
+
+    fn finishListing(self: *Reader, alloc: Allocator, outcome: PasteEventOutcome) void {
+        self.phase = .idle;
+        self.resetListingState(alloc);
+        zeroAndFreeList(&self.packet, alloc);
+        self.finishPasteEvent(alloc, outcome);
+    }
+
+    fn failListing(self: *Reader, alloc: Allocator, outcome: PasteEventOutcome, now_ms: i64) void {
+        if (self.listing_mimes.items.len > 0) {
+            debug_trace.logf(
+                "clipboard",
+                "paste listing dropped bytes={d} reason={s}",
+                .{ self.listing_mimes.items.len, @tagName(outcome) },
+            );
+        }
+        self.finishListing(alloc, outcome);
+        self.phase = .{ .discarding = io_mod.addMillis(now_ms, transfer_idle_timeout_ms) };
+    }
+
+    fn failCurrent(self: *Reader, alloc: Allocator, err: RequestError, now_ms: i64) void {
+        switch (self.phase) {
+            .idle, .discarding => {},
+            .awaiting_mode, .awaiting_reply, .receiving => {
+                if (self.busy_listing == .confirmed) {
+                    self.busy_listing = .none;
+                    self.finishPasteEvent(alloc, .busy);
+                } else {
+                    self.busy_listing = .none;
+                }
+                self.failRequest(alloc, err, now_ms);
+            },
+            .listing => {
+                self.busy_listing = .none;
+                if (self.listing_has_pw or self.listing_saw_mime_list) {
+                    const paste_err: PasteEventOutcome = switch (err) {
+                        .timed_out => .timed_out,
+                        else => .malformed,
+                    };
+                    self.failListing(alloc, paste_err, now_ms);
+                } else {
+                    debug_trace.logf("clipboard", "clipboard packet dropped status=OK reason=no_request", .{});
+                    self.resetListingState(alloc);
+                    self.phase = .idle;
+                }
+            },
+        }
+    }
 };
+
+fn zeroAndClearList(list: *std.ArrayList(u8)) void {
+    if (list.items.len > 0) std.crypto.secureZero(u8, list.items);
+    list.clearRetainingCapacity();
+}
+
+fn zeroAndFreeList(list: *std.ArrayList(u8), alloc: Allocator) void {
+    if (list.capacity > 0) std.crypto.secureZero(u8, list.allocatedSlice());
+    list.clearAndFree(alloc);
+}
+
+fn zeroAndDeinitList(list: *std.ArrayList(u8), alloc: Allocator) void {
+    if (list.capacity > 0) std.crypto.secureZero(u8, list.allocatedSlice());
+    list.deinit(alloc);
+}
+
+fn parsePasteLocation(loc: ?[]const u8) ?PasteLocation {
+    const value = loc orelse return .clipboard;
+    if (std.mem.eql(u8, value, "primary")) return .primary;
+    return null;
+}
+
+fn decodeBoundedBase64(out: []u8, encoded: []const u8) ?usize {
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(encoded) catch return null;
+    if (size > out.len) return null;
+    decoder.decode(out[0..size], encoded) catch return null;
+    return size;
+}
+
+fn isExplicitListingStart(packet: Packet) bool {
+    return packet.pw != null or packet.loc != null;
+}
+
+fn isListingData(packet: Packet) bool {
+    if (!std.mem.eql(u8, packet.status, "DATA")) return false;
+    const mime = packet.mime orelse return false;
+    return std.mem.eql(u8, mime, listing_mime_base64);
+}
 
 /// Parses a packet body, the bytes between the prefix and the terminator:
 /// colon-separated `key=value` metadata, then `;` and the payload.
@@ -497,6 +1137,8 @@ fn parsePacket(body: []const u8) ?Packet {
     var kind: ?[]const u8 = null;
     var status: []const u8 = "";
     var mime: ?[]const u8 = null;
+    var loc: ?[]const u8 = null;
+    var pw: ?[]const u8 = null;
     var fields = std.mem.splitScalar(u8, metadata, ':');
     while (fields.next()) |field| {
         const equals = std.mem.findScalar(u8, field, '=') orelse return null;
@@ -508,12 +1150,18 @@ fn parsePacket(body: []const u8) ?Packet {
             status = value;
         } else if (std.mem.eql(u8, key, "mime")) {
             mime = value;
+        } else if (std.mem.eql(u8, key, "loc")) {
+            loc = value;
+        } else if (std.mem.eql(u8, key, "pw")) {
+            pw = value;
         }
     }
     return .{
         .kind = kind orelse return null,
         .status = status,
         .mime = mime,
+        .loc = loc,
+        .pw = pw,
         .payload = if (split) |index| body[index + 1 ..] else "",
     };
 }
@@ -983,6 +1631,7 @@ fn fuzzReaderOnTerminalInput(_: void, smith: *std.testing.Smith) !void {
     try testing.expect(!drive.reader.ownsInput());
     try testing.expect(!drive.reader.pending());
     try testing.expectEqual(drive.requests, drive.outcomes);
+    try testing.expectEqual(drive.text_requests, drive.text_outcomes);
 }
 
 /// Routes input as `App.loopHandleByte` does: the reader first while it owns
@@ -990,9 +1639,12 @@ fn fuzzReaderOnTerminalInput(_: void, smith: *std.testing.Smith) !void {
 const FuzzDrive = struct {
     reader: Reader = .{},
     max_image_bytes: usize,
+    max_text_bytes: usize = 128,
     now_ms: i64 = 0,
     requests: usize = 0,
     outcomes: usize = 0,
+    text_requests: usize = 0,
+    text_outcomes: usize = 0,
     candidate: [16]u8 = undefined,
     candidate_len: usize = 0,
     /// The theme monitor holds the candidate through a stall
@@ -1054,13 +1706,499 @@ const FuzzDrive = struct {
         self.reader.poll(testing.allocator, self.now_ms);
         if (self.reader.takeOutcome()) |taken| {
             var outcome = taken;
-            outcome.deinit(testing.allocator);
+            defer outcome.deinit(testing.allocator);
+            if (outcome == .image) {
+                try testing.expect(outcome.image.items.len <= self.max_image_bytes);
+            }
             self.outcomes += 1;
+        }
+        if (self.reader.takeTextOutcome()) |taken| {
+            var outcome = taken;
+            defer outcome.deinit(testing.allocator);
+            if (outcome == .text) {
+                try testing.expect(outcome.text.items.len <= self.max_text_bytes);
+            }
+            self.text_outcomes += 1;
+        }
+        if (self.reader.takePasteEventOutcome()) |taken| {
+            var outcome = taken;
+            defer outcome.deinit(testing.allocator);
+            if (outcome == .paste_event) {
+                const pe = &outcome.paste_event;
+                try testing.expect(pe.password.items.len <= max_paste_password_bytes);
+                try testing.expect(pe.mimes.items.len <= max_paste_mime_list_bytes);
+                if (pickPasteMime(pe.mimes.items, true)) |mime| {
+                    var req_buf: [512]u8 = undefined;
+                    var w: std.Io.Writer = .fixed(&req_buf);
+                    try writePasteReadRequest(&w, pe.password.items, pe.location, mime);
+                    if (!self.reader.pending() and mime != .png) {
+                        try self.reader.beginText(self.now_ms, self.max_text_bytes, mime);
+                        self.text_requests += 1;
+                    }
+                }
+            }
         }
         try testing.expect(self.outcomes <= self.requests);
         try testing.expect(self.requests <= self.outcomes + 1);
-        try testing.expect(self.reader.image.items.len <= self.max_image_bytes);
+        try testing.expect(self.text_outcomes <= self.text_requests);
+        try testing.expect(self.text_requests <= self.text_outcomes + 1);
+        const max_payload = @max(self.max_image_bytes, self.max_text_bytes);
+        try testing.expect(self.reader.payload.items.len <= max_payload);
+        try testing.expect(self.reader.listing_mimes.items.len <= max_paste_mime_list_bytes);
+        try testing.expect(self.reader.listing_password.items.len <= max_paste_password_bytes);
         try testing.expect(self.reader.packet.items.len <= max_packet_bytes);
         try testing.expect(self.reader.resync_dropped_bytes < max_packet_bytes);
     }
 };
+
+fn encodeBase64Alloc(alloc: Allocator, bytes: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+    _ = std.base64.standard.Encoder.encode(out, bytes);
+    return out;
+}
+
+fn deliverMimeData(reader: *Reader, mime_b64: []const u8, chunk: []const u8, pw_suffix: []const u8, terminator: []const u8, now_ms: i64) !void {
+    const payload = try encodeBase64Alloc(testing.allocator, chunk);
+    defer testing.allocator.free(payload);
+    const body = try testing.allocator.print(
+        "type=read:status=DATA:mime={s}{s};{s}",
+        .{ mime_b64, pw_suffix, payload },
+    );
+    defer testing.allocator.free(body);
+    deliverPacket(reader, body, terminator, now_ms);
+}
+
+fn expectPasteEventOutcome(reader: *Reader, expected: std.meta.Tag(PasteEventOutcome)) !void {
+    var outcome = reader.takePasteEventOutcome() orelse return error.TestExpectedOutcome;
+    defer outcome.deinit(testing.allocator);
+    try testing.expectEqual(expected, std.meta.activeTag(outcome));
+}
+
+fn expectTextOutcome(reader: *Reader, expected: std.meta.Tag(TextOutcome)) !void {
+    var outcome = reader.takeTextOutcome() orelse return error.TestExpectedOutcome;
+    defer outcome.deinit(testing.allocator);
+    try testing.expectEqual(expected, std.meta.activeTag(outcome));
+}
+
+test "pickPasteMime selects by priority with exact ASCII whitespace tokens" {
+    try testing.expectEqual(@as(?PasteMime, .png), pickPasteMime("text/plain image/png text/plain;charset=utf-8", true));
+    try testing.expectEqual(@as(?PasteMime, .text_utf8), pickPasteMime("text/plain image/png text/plain;charset=utf-8", false));
+    try testing.expectEqual(@as(?PasteMime, .text), pickPasteMime("text/html\ttext/plain\r\n", true));
+    try testing.expectEqual(@as(?PasteMime, null), pickPasteMime("", true));
+    try testing.expectEqual(@as(?PasteMime, null), pickPasteMime("  \t\n\r ", true));
+    try testing.expectEqual(@as(?PasteMime, null), pickPasteMime("text/html application/json image/pngx text/plain;charset=utf-8;extra", true));
+}
+
+test "writePasteReadRequest matches spec examples" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writePasteReadRequest(&w, "secret123", .clipboard, .text);
+    try testing.expectEqualStrings(
+        "\x1b]5522;type=read:pw=c2VjcmV0MTIz:name=UGFzdGUgZXZlbnQ=;dGV4dC9wbGFpbg==\x1b\\",
+        w.buffered(),
+    );
+
+    w = .fixed(&buf);
+    try writePasteReadRequest(&w, "secret123", .primary, .text);
+    try testing.expectEqualStrings(
+        "\x1b]5522;type=read:loc=primary:pw=c2VjcmV0MTIz:name=UGFzdGUgZXZlbnQ=;dGV4dC9wbGFpbg==\x1b\\",
+        w.buffered(),
+    );
+
+    w = .fixed(&buf);
+    try writePasteReadRequest(&w, "secret123", .clipboard, .text_utf8);
+    try testing.expectEqualStrings(
+        "\x1b]5522;type=read:pw=c2VjcmV0MTIz:name=UGFzdGUgZXZlbnQ=;dGV4dC9wbGFpbjtjaGFyc2V0PXV0Zi04\x1b\\",
+        w.buffered(),
+    );
+
+    w = .fixed(&buf);
+    try writePasteReadRequest(&w, "secret123", .clipboard, .png);
+    try testing.expectEqualStrings(
+        "\x1b]5522;type=read:pw=c2VjcmV0MTIz:name=UGFzdGUgZXZlbnQ=;aW1hZ2UvcG5n\x1b\\",
+        w.buffered(),
+    );
+}
+
+test "reader decodes spec paste event listings with clipboard, primary, image, and BEL" {
+    // 1. Plain text from clipboard, BEL terminators, pw repeated in DATA and DONE.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK:pw=c2VjcmV0MTIz", "\x07", 0);
+        try deliverMimeData(&reader, "Lg==", "text/plain", ":pw=c2VjcmV0MTIz", "\x07", 1);
+        deliverPacket(&reader, "type=read:status=DONE:pw=c2VjcmV0MTIz", "\x07", 2);
+
+        var outcome = reader.takePasteEventOutcome().?;
+        defer outcome.deinit(testing.allocator);
+        try testing.expectEqual(PasteLocation.clipboard, outcome.paste_event.location);
+        try testing.expectEqualStrings("secret123", outcome.paste_event.password.items);
+        try testing.expectEqualStrings("text/plain", outcome.paste_event.mimes.items);
+        try testing.expectEqual(@as(?PasteMime, .text), pickPasteMime(outcome.paste_event.mimes.items, true));
+        try testing.expect(!reader.pending());
+    }
+
+    // 2. HTML + text from primary, pw not repeated in DATA or DONE.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK:loc=primary:pw=c2VjcmV0MTIz", "\x1b\\", 0);
+        try deliverMimeData(&reader, "Lg==", "text/html\ntext/plain;charset=utf-8\ntext/plain", "", "\x1b\\", 1);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 2);
+
+        var outcome = reader.takePasteEventOutcome().?;
+        defer outcome.deinit(testing.allocator);
+        try testing.expectEqual(PasteLocation.primary, outcome.paste_event.location);
+        try testing.expectEqualStrings("secret123", outcome.paste_event.password.items);
+        try testing.expectEqual(@as(?PasteMime, .text_utf8), pickPasteMime(outcome.paste_event.mimes.items, true));
+    }
+
+    // 3. Listing with image/png.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK:pw=c2VjcmV0MTIz", "\x1b\\", 0);
+        try deliverMimeData(&reader, "Lg==", "image/png text/plain", "", "\x07", 1);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 2);
+
+        var outcome = reader.takePasteEventOutcome().?;
+        defer outcome.deinit(testing.allocator);
+        try testing.expectEqual(@as(?PasteMime, .png), pickPasteMime(outcome.paste_event.mimes.items, true));
+        try testing.expectEqual(@as(?PasteMime, .text), pickPasteMime(outcome.paste_event.mimes.items, false));
+    }
+
+    // 4. Listing without pw in OK, DATA:mime=Lg== identifies it as a listing.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK", "\x1b\\", 0);
+        try deliverMimeData(&reader, "Lg==", "text/plain", "", "\x1b\\", 1);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 2);
+
+        var outcome = reader.takePasteEventOutcome().?;
+        defer outcome.deinit(testing.allocator);
+        try testing.expectEqualStrings("", outcome.paste_event.password.items);
+        try testing.expectEqualStrings("text/plain", outcome.paste_event.mimes.items);
+    }
+}
+
+test "reader rejects mismatched password, bad loc, and empty/unknown listings appropriately" {
+    // Mismatched pw in DATA.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK:pw=c2VjcmV0MTIz", "\x1b\\", 0);
+        try deliverMimeData(&reader, "Lg==", "text/plain", ":pw=b3RoZXI=", "\x1b\\", 1);
+        try expectPasteEventOutcome(&reader, .malformed);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 2);
+        try testing.expect(reader.takePasteEventOutcome() == null);
+        try testing.expect(!reader.pending());
+    }
+
+    // Mismatched pw in DONE.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK:pw=c2VjcmV0MTIz", "\x1b\\", 0);
+        try deliverMimeData(&reader, "Lg==", "text/plain", "", "\x1b\\", 1);
+        deliverPacket(&reader, "type=read:status=DONE:pw=b3RoZXI=", "\x1b\\", 2);
+        try expectPasteEventOutcome(&reader, .malformed);
+        try testing.expect(!reader.pending());
+    }
+
+    // Invalid loc value.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK:loc=secondary:pw=c2VjcmV0MTIz", "\x1b\\", 0);
+        try expectPasteEventOutcome(&reader, .malformed);
+        try deliverMimeData(&reader, "Lg==", "text/plain", "", "\x1b\\", 1);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 2);
+        try testing.expect(reader.takePasteEventOutcome() == null);
+        try testing.expect(!reader.pending());
+    }
+
+    // Empty MIME list.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK:pw=c2VjcmV0MTIz", "\x1b\\", 0);
+        deliverPacket(&reader, "type=read:status=DATA:mime=Lg==;", "\x1b\\", 1);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 2);
+        var outcome = reader.takePasteEventOutcome().?;
+        defer outcome.deinit(testing.allocator);
+        try testing.expectEqualStrings("", outcome.paste_event.mimes.items);
+        try testing.expectEqual(@as(?PasteMime, null), pickPasteMime(outcome.paste_event.mimes.items, true));
+    }
+
+    // Only unknown types.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK:pw=c2VjcmV0MTIz", "\x1b\\", 0);
+        try deliverMimeData(&reader, "Lg==", "text/html application/pdf", "", "\x1b\\", 1);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 2);
+        var outcome = reader.takePasteEventOutcome().?;
+        defer outcome.deinit(testing.allocator);
+        try testing.expectEqual(@as(?PasteMime, null), pickPasteMime(outcome.paste_event.mimes.items, true));
+    }
+}
+
+test "reader rejects oversize listing password and mime list as malformed" {
+    // Password > max_paste_password_bytes.
+    {
+        var pw_raw: [max_paste_password_bytes + 1]u8 = @splat('p');
+        const pw_b64 = try encodeBase64Alloc(testing.allocator, &pw_raw);
+        defer testing.allocator.free(pw_b64);
+        const ok_body = try testing.allocator.print("type=read:status=OK:pw={s}", .{pw_b64});
+        defer testing.allocator.free(ok_body);
+
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, ok_body, "\x1b\\", 0);
+        try expectPasteEventOutcome(&reader, .malformed);
+        try deliverMimeData(&reader, "Lg==", "text/plain", "", "\x1b\\", 1);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 2);
+        try testing.expect(reader.takePasteEventOutcome() == null);
+        try testing.expect(!reader.pending());
+    }
+
+    // MIME list > max_paste_mime_list_bytes across chunks.
+    {
+        var list_raw: [max_paste_mime_list_bytes + 1]u8 = @splat('a');
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK:pw=c2VjcmV0MTIz", "\x1b\\", 0);
+        try deliverMimeData(&reader, "Lg==", list_raw[0..3000], "", "\x1b\\", 1);
+        try deliverMimeData(&reader, "Lg==", list_raw[3000..], "", "\x1b\\", 2);
+        try expectPasteEventOutcome(&reader, .malformed);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 3);
+        try testing.expect(reader.takePasteEventOutcome() == null);
+        try testing.expect(!reader.pending());
+    }
+}
+
+test "reader reports busy paste event without disturbing an open Ctrl+V request" {
+    // Listing arrives while Ctrl+V is waiting for its reply (with pw).
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        try reader.begin(0, 1024);
+        reader.noteModeReport(testing.allocator, .supported, 1);
+
+        deliverPacket(&reader, "type=read:status=OK:pw=c2VjcmV0MTIz", "\x1b\\", 2);
+        try deliverMimeData(&reader, "Lg==", "text/plain", ":pw=c2VjcmV0MTIz", "\x1b\\", 3);
+        deliverPacket(&reader, "type=read:status=DONE:pw=c2VjcmV0MTIz", "\x1b\\", 4);
+
+        try expectPasteEventOutcome(&reader, .busy);
+        try testing.expect(reader.takeOutcome() == null);
+        try testing.expect(reader.pending());
+
+        deliverPacket(&reader, "type=read:status=OK", "\x1b\\", 5);
+        try deliverData(&reader, test_png, 6);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 7);
+
+        var outcome = reader.takeOutcome().?;
+        defer outcome.deinit(testing.allocator);
+        try testing.expectEqualStrings(test_png, outcome.image.items);
+        try testing.expect(!reader.pending());
+    }
+
+    // Listing without pw arrives while Ctrl+V is waiting for its reply.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        try reader.begin(0, 1024);
+        reader.noteModeReport(testing.allocator, .supported, 1);
+
+        deliverPacket(&reader, "type=read:status=OK", "\x1b\\", 2);
+        try deliverMimeData(&reader, "Lg==", "text/plain", "", "\x1b\\", 3);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 4);
+
+        try expectPasteEventOutcome(&reader, .busy);
+        try testing.expect(reader.takeOutcome() == null);
+        try testing.expect(reader.pending());
+
+        deliverPacket(&reader, "type=read:status=OK", "\x1b\\", 5);
+        try deliverData(&reader, test_png, 6);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 7);
+
+        var outcome = reader.takeOutcome().?;
+        defer outcome.deinit(testing.allocator);
+        try testing.expectEqualStrings(test_png, outcome.image.items);
+        try testing.expect(!reader.pending());
+    }
+}
+
+test "reader assembles chunked text replies, skips non-matching mimes, enforces cap, and handles EPERM" {
+    // Chunked text/plain;charset=utf-8 reply with extra text/html skipped.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        try reader.beginText(0, 1024, .text_utf8);
+        deliverPacket(&reader, "type=read:status=OK", "\x1b\\", 1);
+        try deliverMimeData(&reader, "dGV4dC9odG1s", "<b>ignored</b>", "", "\x1b\\", 2);
+        try deliverMimeData(&reader, "dGV4dC9wbGFpbjtjaGFyc2V0PXV0Zi04", "hello ", "", "\x1b\\", 3);
+        try deliverMimeData(&reader, "dGV4dC9wbGFpbg==", "plain ignored", "", "\x1b\\", 4);
+        try deliverMimeData(&reader, "dGV4dC9wbGFpbjtjaGFyc2V0PXV0Zi04", "world", "", "\x1b\\", 5);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 6);
+
+        var outcome = reader.takeTextOutcome().?;
+        defer outcome.deinit(testing.allocator);
+        try testing.expectEqualStrings("hello world", outcome.text.items);
+        try testing.expect(!reader.pending());
+    }
+
+    // Empty text reply.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        try reader.beginText(0, 1024, .text);
+        deliverPacket(&reader, "type=read:status=OK", "\x1b\\", 1);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 2);
+        try expectTextOutcome(&reader, .no_text);
+        try testing.expect(!reader.pending());
+    }
+
+    // Text reply over cap.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        try reader.beginText(0, 5, .text);
+        deliverPacket(&reader, "type=read:status=OK", "\x1b\\", 1);
+        try deliverMimeData(&reader, "dGV4dC9wbGFpbg==", "abc", "", "\x1b\\", 2);
+        try deliverMimeData(&reader, "dGV4dC9wbGFpbg==", "def", "", "\x1b\\", 3);
+        try expectTextOutcome(&reader, .too_large);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 4);
+        try testing.expect(reader.takeTextOutcome() == null);
+        try testing.expect(!reader.pending());
+    }
+
+    // EPERM on text read.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        try reader.beginText(0, 1024, .text);
+        deliverPacket(&reader, "type=read:status=EPERM", "\x1b\\", 1);
+        try expectTextOutcome(&reader, .denied);
+        try testing.expect(!reader.pending());
+    }
+
+    // beginText enforces RequestPending, supports cancel(), and times out at reply_timeout_ms.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        try reader.beginText(0, 1024, .text);
+        try testing.expectError(error.RequestPending, reader.begin(1, 1024));
+        try testing.expectError(error.RequestPending, reader.beginText(1, 1024, .text_utf8));
+        reader.cancel();
+        try testing.expect(!reader.pending());
+
+        try reader.beginText(10, 1024, .text);
+        reader.poll(testing.allocator, 10 + reply_timeout_ms - 1);
+        try testing.expect(reader.takeTextOutcome() == null);
+        reader.poll(testing.allocator, 10 + reply_timeout_ms);
+        try expectTextOutcome(&reader, .timed_out);
+        try testing.expect(!reader.pending());
+    }
+}
+
+test "reader handles listing stalls, boundary caps, and idle OK without pw or Lg==" {
+    // Mid-packet stall during listing uses packet_idle_timeout_ms.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK:pw=c2VjcmV0MTIz", "\x1b\\", 0);
+        reader.beginPacket(testing.allocator, 1);
+        for ("type=read:status=DA") |byte| try testing.expect(reader.feedOwnedByte(testing.allocator, byte, 1));
+        reader.poll(testing.allocator, 1 + packet_idle_timeout_ms - 1);
+        try testing.expect(reader.takePasteEventOutcome() == null);
+        reader.poll(testing.allocator, 1 + packet_idle_timeout_ms);
+        try expectPasteEventOutcome(&reader, .timed_out);
+        try testing.expect(!reader.feedOwnedByte(testing.allocator, ' ', 2 + packet_idle_timeout_ms));
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 3 + packet_idle_timeout_ms);
+        try testing.expect(!reader.pending());
+    }
+
+    // Inter-packet stall during listing uses transfer_idle_timeout_ms.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK:pw=c2VjcmV0MTIz", "\x1b\\", 0);
+        reader.poll(testing.allocator, transfer_idle_timeout_ms - 1);
+        try testing.expect(reader.takePasteEventOutcome() == null);
+        reader.poll(testing.allocator, transfer_idle_timeout_ms);
+        try expectPasteEventOutcome(&reader, .timed_out);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", transfer_idle_timeout_ms + 1);
+        try testing.expect(!reader.pending());
+    }
+
+    // Exact caps succeed (128-byte password, 4096-byte MIME list).
+    {
+        var pw_raw: [max_paste_password_bytes]u8 = @splat('p');
+        const pw_b64 = try encodeBase64Alloc(testing.allocator, &pw_raw);
+        defer testing.allocator.free(pw_b64);
+        const ok_body = try testing.allocator.print("type=read:status=OK:pw={s}", .{pw_b64});
+        defer testing.allocator.free(ok_body);
+
+        var list_raw: [max_paste_mime_list_bytes]u8 = @splat(' ');
+        @memcpy(list_raw[0.."text/plain".len], "text/plain");
+
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, ok_body, "\x1b\\", 0);
+        try deliverMimeData(&reader, "Lg==", list_raw[0..3000], "", "\x1b\\", 1);
+        try deliverMimeData(&reader, "Lg==", list_raw[3000..], "", "\x1b\\", 2);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 3);
+
+        var outcome = reader.takePasteEventOutcome().?;
+        defer outcome.deinit(testing.allocator);
+        try testing.expectEqual(max_paste_password_bytes, outcome.paste_event.password.items.len);
+        try testing.expectEqual(max_paste_mime_list_bytes, outcome.paste_event.mimes.items.len);
+        try testing.expectEqual(@as(?PasteMime, .text), pickPasteMime(outcome.paste_event.mimes.items, true));
+    }
+
+    // Bare OK followed directly by DONE in idle produces no outcome.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK", "\x1b\\", 0);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 1);
+        try testing.expect(reader.takePasteEventOutcome() == null);
+        try testing.expect(!reader.pending());
+    }
+
+    // Bare OK without pw followed by DATA with pw is malformed.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK", "\x1b\\", 0);
+        try deliverMimeData(&reader, "Lg==", "text/plain", ":pw=c2VjcmV0MTIz", "\x1b\\", 1);
+        try expectPasteEventOutcome(&reader, .malformed);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 2);
+        try testing.expect(!reader.pending());
+    }
+
+    // Listing while open Ctrl+V transfer is already receiving chunks.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        try reader.begin(0, 1024);
+        reader.noteModeReport(testing.allocator, .supported, 1);
+        deliverPacket(&reader, "type=read:status=OK", "\x1b\\", 2);
+        try deliverData(&reader, test_png[0..6], 3);
+
+        deliverPacket(&reader, "type=read:status=OK:pw=c2VjcmV0MTIz", "\x1b\\", 4);
+        try deliverMimeData(&reader, "Lg==", "text/plain", ":pw=c2VjcmV0MTIz", "\x1b\\", 5);
+        deliverPacket(&reader, "type=read:status=DONE:pw=c2VjcmV0MTIz", "\x1b\\", 6);
+        try expectPasteEventOutcome(&reader, .busy);
+        try testing.expect(reader.takeOutcome() == null);
+
+        try deliverData(&reader, test_png[6..], 7);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 8);
+        var outcome = reader.takeOutcome().?;
+        defer outcome.deinit(testing.allocator);
+        try testing.expectEqualStrings(test_png, outcome.image.items);
+        try testing.expect(!reader.pending());
+    }
+}
