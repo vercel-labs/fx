@@ -1689,7 +1689,7 @@ pub fn beginPermissionRequest(state: *ServerState) ?u64 {
 /// A request no longer in the registry settled nothing and nobody denied it,
 /// so the wait fails with `error.PermissionPromptClosed`, as a subagent's wait
 /// does (`tests/tla/acp/AcpChildApproval.tla` ParentReadsTrue).
-pub fn awaitPermissionDecision(state: *ServerState, id: u64) error{PermissionPromptClosed}!types.ToolPermissionDecision {
+pub fn awaitPermissionDecision(state: *ServerState, id: u64) error{ PermissionPromptClosed, OutOfMemory }!types.ToolPermissionDecision {
     const response = awaitOutboundResponse(state, id, .permission) orelse {
         debug_trace.logf("acp", "parent permission request gone id={d}", .{id});
         return error.PermissionPromptClosed;
@@ -1700,14 +1700,18 @@ pub fn awaitPermissionDecision(state: *ServerState, id: u64) error{PermissionPro
 /// The decision a client's answer to permission request `id` carries, and
 /// frees the answer. Only an exact allow option allows; a cancelled, error,
 /// malformed, or unknown answer denies, and the trace names which kind of
-/// answer it was. A cancelled request is traced where it was cancelled.
-fn takePermissionDecision(alloc: Allocator, id: u64, owned: OutboundResponse) types.ToolPermissionDecision {
+/// answer it was. A cancelled request is traced where it was cancelled. Out
+/// of memory while the answer is read is an error, not a denial.
+fn takePermissionDecision(alloc: Allocator, id: u64, owned: OutboundResponse) error{OutOfMemory}!types.ToolPermissionDecision {
     var response = owned;
     defer response.deinit(alloc);
     if (response.cancelled) return .deny;
     if (response.error_json != null) return denyAnswer(id, "client_error");
     const raw = response.result_json orelse return denyAnswer(id, "no_result");
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return denyAnswer(id, "malformed_answer");
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return denyAnswer(id, "malformed_answer"),
+    };
     defer parsed.deinit();
     return parsePermissionDecision(parsed.value) orelse denyAnswer(id, "unknown_outcome");
 }
@@ -1769,7 +1773,7 @@ pub fn awaitPermissionDecisionOrStop(
     state: *ServerState,
     id: u64,
     stop: *const std.atomic.Value(bool),
-) error{ PermissionPromptClosed, PermissionPromptStopped }!types.ToolPermissionDecision {
+) error{ PermissionPromptClosed, PermissionPromptStopped, OutOfMemory }!types.ToolPermissionDecision {
     const poll: std.Io.Timeout = .{ .duration = .{
         .raw = .fromMilliseconds(subagent_stop_poll_ms),
         .clock = .awake,
@@ -5280,7 +5284,7 @@ fn fuzzPermissionAnswer(_: void, smith: *std.testing.Smith) anyerror!void {
             return err;
         };
     }
-    const decision = takePermissionDecision(alloc, 1, answer);
+    const decision = try takePermissionDecision(alloc, 1, answer);
     if (decision == .deny) return;
     try std.testing.expect(how == 'r');
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
@@ -5334,6 +5338,21 @@ test "ACP outbound waiters resolve to deny on cancellation" {
     cancelPermissionRequest(&state, second);
     try std.testing.expectEqual(types.ToolPermissionDecision.deny, try awaitPermissionDecision(&state, second));
     try std.testing.expect(capture.saw_request_cancellation);
+}
+
+test "out of memory while a client's permission answer is read is out of memory, not a denial" {
+    const alloc = std.testing.allocator;
+    var state = ServerState{ .alloc = alloc, .cfg = undefined, .writer = jsonrpc.Writer.init() };
+    defer state.pending_outbound.deinit(alloc);
+    const id = beginPermissionRequest(&state) orelse return error.TestExpectedEqual;
+    handleClientResponse(&state, alloc, &.{
+        .id = .{ .integer = @intCast(id) },
+        .result_raw = "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_once\"}}",
+    });
+    // The answer is read with an allocator that is out of memory.
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
+    state.alloc = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, awaitPermissionDecision(&state, id));
 }
 
 test "a subagent's requests leave the registry's last slot to the parent's own" {

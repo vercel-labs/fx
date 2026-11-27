@@ -144,6 +144,70 @@ const AllocatingHostPrompter = struct {
     }
 };
 
+test "out of memory while a subagent's approval phase changes is out of memory, not an unavailable approval" {
+    var turn = TurnContext.initHosted(std.testing.allocator, 8);
+    defer turn.deinit();
+    turn.child_id = "child_a";
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
+    var phase: AllocatingPhase = .{ .alloc = failing.allocator() };
+    turn.phase_context = &phase;
+    turn.phase_fn = AllocatingPhase.apply;
+    var host_context: u8 = 0;
+    turn.host_prompter = .{ .context = &host_context, .request_fn = AllocatingHostPrompter.request };
+    const call: types.ToolCall = .{ .id = "call_1", .name = "shell", .arguments_json = "{}" };
+    const request: permission_request.PermissionRequest = .{ .label = "run a command" };
+    try std.testing.expectError(error.OutOfMemory, turn.askHost(std.testing.allocator, request, call, null, null, "child_a", "work_1"));
+}
+
+test "a failed phase restore after an answer is the error the approval returns" {
+    var turn = TurnContext.initHosted(std.testing.allocator, 8);
+    defer turn.deinit();
+    turn.child_id = "child_a";
+    var phase_context: u8 = 0;
+    turn.phase_context = &phase_context;
+    turn.phase_fn = RefusingRestorePhase.apply;
+    var host_context: u8 = 0;
+    turn.host_prompter = .{ .context = &host_context, .request_fn = AllocatingHostPrompter.request };
+    const call: types.ToolCall = .{ .id = "call_1", .name = "shell", .arguments_json = "{}" };
+    const request: permission_request.PermissionRequest = .{ .label = "run a command" };
+    try std.testing.expectError(error.CommitFailed, turn.askHost(std.testing.allocator, request, call, null, null, "child_a", "work_1"));
+}
+
+test "a failed phase restore does not hide the approval's own out-of-memory error" {
+    var turn = TurnContext.initHosted(std.testing.allocator, 8);
+    defer turn.deinit();
+    turn.child_id = "child_a";
+    var phase_context: u8 = 0;
+    turn.phase_context = &phase_context;
+    turn.phase_fn = RefusingRestorePhase.apply;
+    var host_context: u8 = 0;
+    turn.host_prompter = .{ .context = &host_context, .request_fn = AllocatingHostPrompter.request };
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
+    const call: types.ToolCall = .{ .id = "call_1", .name = "shell", .arguments_json = "{}" };
+    const request: permission_request.PermissionRequest = .{ .label = "run a command" };
+    try std.testing.expectError(error.OutOfMemory, turn.askHost(failing.allocator(), request, call, null, null, "child_a", "work_1"));
+}
+
+/// A phase function that allocates, as the owner's does when it loads the
+/// child's state, so an out-of-memory allocator fails the phase change.
+const AllocatingPhase = struct {
+    alloc: Allocator,
+
+    fn apply(raw: *anyopaque, _: []const u8, _: []const u8, _: child_state.Phase) anyerror!void {
+        const self: *AllocatingPhase = @ptrCast(@alignCast(raw));
+        const scratch = try self.alloc.alloc(u8, 1);
+        self.alloc.free(scratch);
+    }
+};
+
+/// A phase function that takes the child to awaiting approval but refuses to
+/// take it back to running.
+const RefusingRestorePhase = struct {
+    fn apply(_: *anyopaque, _: []const u8, _: []const u8, phase: child_state.Phase) anyerror!void {
+        if (phase == .running) return error.PhaseRefused;
+    }
+};
+
 test "child compaction preserves work identity and permits final commit" {
     const alloc = std.testing.allocator;
     var parent: child_state.TestParent = undefined;
@@ -608,12 +672,22 @@ pub const TurnContext = struct {
         host.observer = null;
         self.transitionPhase(work_id, .awaiting_approval) catch |err| {
             debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=phase err={s}", .{ child_id, work_id, @errorName(err) });
-            return error.PermissionPromptUnavailable;
+            return if (err == error.OutOfMemory) err else error.PermissionPromptUnavailable;
         };
-        defer self.transitionPhase(work_id, .running) catch |err| {
-            debug_trace.logf("subagent", "approval phase not restored child_id={s} work_id={s} err={s}", .{ child_id, work_id, @errorName(err) });
+        const answer = host.request(alloc, request, call, review, grant_offer);
+        // The phase goes back to running on every path. When the approval
+        // succeeded, a failed restore is the turn's error and the answer is
+        // freed. When the approval already failed, its error stays, and the
+        // restore failure is only traced.
+        self.transitionPhase(work_id, .running) catch |restore_err| {
+            debug_trace.logf("subagent", "approval phase not restored child_id={s} work_id={s} err={s}", .{ child_id, work_id, @errorName(restore_err) });
+            if (answer) |response| {
+                var owned = response;
+                owned.deinit();
+                return restore_err;
+            } else |_| {}
         };
-        return host.request(alloc, request, call, review, grant_offer) catch |err| {
+        return answer catch |err| {
             debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=host err={s}", .{ child_id, work_id, @errorName(err) });
             // The error that names the cause passes through, and so does out
             // of memory, which names no cause but is no refusal either. Any
