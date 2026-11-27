@@ -2155,46 +2155,17 @@ const App = struct {
         return browser_workspace_tools.selectToolSet(false, self.workspaceHostInfo() != null);
     }
 
-    pub fn hasMcpTool(self: *App, name: []const u8, access: tool_mcp_runtime.Access) bool {
-        return self.mcp.hasTool(name, access);
-    }
-
-    pub fn validateMcpTool(
-        self: *App,
-        arena: Allocator,
-        name: []const u8,
-        arguments_json: []const u8,
-        access: tool_mcp_runtime.Access,
-    ) !tool_mcp_runtime.ValidationResult {
-        return self.mcp.validateTool(arena, name, arguments_json, access);
-    }
-
-    pub fn callMcpTool(
-        self: *App,
-        arena: Allocator,
-        name: []const u8,
-        arguments_json: []const u8,
-        max_tool_result_bytes: usize,
-        options: tool_mcp_runtime.CallOptions,
-    ) !?tool_mcp_runtime.CallResult {
-        return self.mcp.callTool(arena, name, arguments_json, max_tool_result_bytes, options);
-    }
-
-    pub fn searchMcpTools(self: *App, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) !tool_mcp_runtime.SearchResult {
-        return self.mcp.searchTools(arena, request, permission_rules, self.context_limits, access, cancel_flag);
-    }
-
-    pub fn mcpToolSchemaJson(self: *App, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) !?tool_mcp_runtime.ToolSchemaResult {
-        return self.mcp.toolSchema(arena, name, permission_rules, self.context_limits, access, cancel_flag);
+    pub fn wireMcp(self: *App, tc: *tool_runtime.Context) void {
+        self.mcp.wire(tc);
     }
 
     pub fn addMcpSlack(self: *App) !void {
         return app_commands.Handlers(App).addSlack(self);
     }
 
-    /// `mode` is the mode of the agent that refreshes the tool: its rules are none in full access.
-    pub fn snapshotMcpDefinition(self: *App, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, mode: types.PermissionMode) !tool_mcp_runtime.DefinitionSnapshot {
-        return self.mcp.snapshotToolDefinition(alloc, name, known, permissions.mcpRules(mode, self.permission_engine.rules), self.context_limits, .unrestricted);
+    /// The refresh of `agent`'s selected tool, under the agent's own mode and MCP view.
+    pub fn snapshotMcpDefinition(self: *App, agent: *agents.Agent, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
+        return AgentAppRuntime.snapshotMcpDefinition(self, agent, alloc, name, known, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn snapshotMcpToolNames(self: *App, alloc: Allocator) ![][]u8 {
@@ -6319,6 +6290,219 @@ test "the per-step refresh of an MCP tool takes the rules of the mode of the age
     // Full access keeps the tool the rule names; ask drops it.
     try std.testing.expect(yolo_refresh == .current);
     try std.testing.expect(ask_refresh == .unavailable);
+}
+
+fn tuiToolContext(app: *App, agent: *agents.Agent) tool_runtime.Context {
+    return App.AgentAppRuntime.toolContext(app, agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+}
+
+/// The context ACP and `fx ask` give a run: `tui`'s, with the MCP operations
+/// of `host`'s catalog (`Catalog.wire`), or none when there is no host.
+fn catalogWiredContext(tui: tool_runtime.Context, mcp: ?*mcp_host.Host) tool_runtime.Context {
+    var ctx = tui;
+    ctx.mcp_ctx = null;
+    ctx.mcp_has_tool = null;
+    ctx.mcp_access_changed = null;
+    ctx.mcp_validate_tool = null;
+    ctx.mcp_call_tool = null;
+    ctx.mcp_search_tools = null;
+    ctx.mcp_tool_schema = null;
+    ctx.mcp_snapshot_tool = null;
+    if (mcp) |h| h.catalog.wire(&ctx);
+    return ctx;
+}
+
+fn expectSameToolbox(tui: tool_runtime.Context, wired: tool_runtime.Context, arena: Allocator, arguments_json: []const u8) ![]const u8 {
+    const call: types.ToolCall = .{ .id = "1", .name = "toolbox", .arguments_json = arguments_json };
+    const from_tui = try tool_runtime.executeToolCall(tui, arena, call);
+    const from_catalog = try tool_runtime.executeToolCall(wired, arena, call);
+    try std.testing.expectEqual(from_catalog.status, from_tui.status);
+    try std.testing.expectEqualStrings(from_catalog.model_output, from_tui.model_output);
+    return from_tui.model_output;
+}
+
+test "one catalog adapter: with no MCP host the TUI's toolbox search says what ACP and fx ask say" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+
+    const tui = tuiToolContext(&app, (&app).screenAgent());
+    const wired = catalogWiredContext(tui, null);
+    const said = try expectSameToolbox(tui, wired, arena_state.allocator(), "{\"search\":\"echo\"}");
+    try std.testing.expect(std.mem.find(u8, said, "\"mcp_state\":\"unavailable\"") != null);
+    // Nothing of MCP is wired, so a shell command gets no `fx mcp call` bridge either.
+    try std.testing.expect(tui.mcp_ctx == null);
+    try std.testing.expect(tui.mcp_call_tool == null);
+}
+
+test "one catalog adapter: a subagent whose MCP view the servers changed under hears why in the TUI too" {
+    const alloc = std.testing.allocator;
+    const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
+    const mcp_contract = @import("core/mcp/mcp_contract.zig");
+
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    const mcp = try mcp_host.Host.create(alloc, std.testing.io, &configs, &f.inherited, f.options(), .{});
+    defer mcp.destroy();
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    app.mcp.host = mcp;
+    defer app.mcp.host = null;
+    const child = try addTestChildAgent(&app, "child-1");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    var child_run = try testChildRun(alloc, &resolver, false, null);
+    var view = try mcp.catalog.snapshotAccessView(alloc, "child-1", "main-session");
+    view.runtime_generation +%= 1;
+    child_run.admission.mcp_view = view;
+    App.AgentsAppRuntime.installChildRun(&app, child, child_run);
+
+    const Check = struct {
+        fn run(live_host: *mcp_host.Host, a: *App, agent: *agents.Agent) anyerror!void {
+            var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena_state.deinit();
+            const tui = tuiToolContext(a, agent);
+            const wired = catalogWiredContext(tui, live_host);
+            const said = try expectSameToolbox(tui, wired, arena_state.allocator(), "{\"open\":\"mcp_fake_echo\",\"kind\":\"tool\"}");
+            try std.testing.expect(std.mem.find(u8, said, "is not available to this work") != null);
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, mcp, Check.run);
+}
+
+test "one catalog adapter: a search keeps the limits its caller narrowed in the TUI too" {
+    const alloc = std.testing.allocator;
+    const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
+    const mcp_contract = @import("core/mcp/mcp_contract.zig");
+    const lexical_relevance = @import("core/shared/lexical_relevance.zig");
+
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    const mcp = try mcp_host.Host.create(alloc, std.testing.io, &configs, &f.inherited, f.options(), .{});
+    defer mcp.destroy();
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    app.mcp.host = mcp;
+    defer app.mcp.host = null;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tui = tuiToolContext(&app, (&app).screenAgent());
+    const wired = catalogWiredContext(tui, mcp);
+    var narrow = tui.context_limits;
+    narrow.mcp_search_result_bytes.value = .{ .bytes = 100 };
+    const query = try lexical_relevance.prepare("echo");
+    const request: tool_mcp_runtime.SearchRequest = .{ .query = &query, .kind = .mcp };
+    const from_tui = try tui.mcp_search_tools.?(tui.mcp_ctx.?, arena, request, .{}, narrow, .unrestricted, null);
+    const from_catalog = try wired.mcp_search_tools.?(wired.mcp_ctx.?, arena, request, .{}, narrow, .unrestricted, null);
+    try std.testing.expect(std.mem.find(u8, from_catalog.model_output, "context_limit") != null);
+    try std.testing.expectEqualStrings(from_catalog.model_output, from_tui.model_output);
+}
+
+test "one catalog adapter: the per-step refresh of an MCP tool keeps the servers an instance's profile names" {
+    const alloc = std.testing.allocator;
+    const Permission = app_permission_runtime.Runtime(App);
+    const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
+    const mcp_contract = @import("core/mcp/mcp_contract.zig");
+    const lexical_relevance = @import("core/shared/lexical_relevance.zig");
+
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    const mcp = try mcp_host.Host.create(alloc, std.testing.io, &configs, &f.inherited, f.options(), .{});
+    defer mcp.destroy();
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer Permission.deinitSessionGrants(&app, &app.main_agent);
+    const instance = try addTestChildAgent(&app, "instance-2");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    instance.agent.role = .instance;
+    Permission.initMode(&app, &instance.agent, .ask);
+    app.mcp.host = mcp;
+    defer app.mcp.host = null;
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const query = try lexical_relevance.prepare("echo");
+    const found = try mcp.catalog.searchTools(arena, .{ .query = &query, .kind = .mcp }, .{}, .{}, .unrestricted, null);
+    const binding = found.selected_tools[0].mcp_binding.?;
+
+    // The instance may use only server "other", so the tool of "fake" is gone for it.
+    instance.agent.profile.profile.mcp_servers = &[_][]const u8{"other"};
+    const deps = app_callbacks.Bindings(App).agentRuntimeDeps(&app, &instance.agent);
+    const tui = tuiToolContext(&app, &instance.agent);
+    const wired = catalogWiredContext(tui, mcp);
+    const from_catalog = try tool_runtime.snapshotMcpDefinition(wired, arena, "mcp_fake_echo", binding);
+    const from_tui = try deps.snapshot_mcp_definition.?(deps.ctx, arena, "mcp_fake_echo", binding);
+    try std.testing.expect(from_catalog == .unavailable);
+    try std.testing.expect(from_tui == .unavailable);
+}
+
+test "one catalog adapter: a context asks the host there is when an operation runs, and gives it back" {
+    const alloc = std.testing.allocator;
+    const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
+    const mcp_contract = @import("core/mcp/mcp_contract.zig");
+    const lexical_relevance = @import("core/shared/lexical_relevance.zig");
+
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const first_configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    const second_configs = [_]mcp_contract.McpServerConfig{.{ .name = "other", .command = f.server }};
+    const first = try mcp_host.Host.create(alloc, std.testing.io, &first_configs, &f.inherited, f.options(), .{});
+    defer first.destroy();
+    const second = try mcp_host.Host.create(alloc, std.testing.io, &second_configs, &f.inherited, f.options(), .{});
+    defer second.destroy();
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.mcp.host = null;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    app.mcp.host = first;
+    const ctx = tuiToolContext(&app, (&app).screenAgent());
+    try std.testing.expect(ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_fake_echo", .unrestricted));
+
+    // A reload that brought a new host: the context made before it sees the new one.
+    app.mcp.host = second;
+    try std.testing.expect(!ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_fake_echo", .unrestricted));
+    try std.testing.expect(ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_other_echo", .unrestricted));
+
+    // The last server went: the context says MCP is unavailable and breaks nothing.
+    app.mcp.host = null;
+    try std.testing.expect(!ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_other_echo", .unrestricted));
+    try std.testing.expect(try ctx.mcp_call_tool.?(ctx.mcp_ctx.?, arena, "mcp_other_echo", "{}", 4096, .{}) == null);
+    const query = try lexical_relevance.prepare("echo");
+    const found = try ctx.mcp_search_tools.?(ctx.mcp_ctx.?, arena, .{ .query = &query, .kind = .mcp }, .{}, ctx.context_limits, .unrestricted, null);
+    try std.testing.expectEqualStrings(tool_mcp_runtime.unavailable_search_output, found.model_output);
+
+    // Every operation gave its host back.
+    try std.testing.expectEqual(@as(usize, 0), first.leases);
+    try std.testing.expectEqual(@as(usize, 0), second.leases);
 }
 
 test "visiting a child agent puts its context, transcript, and pacer on the screen until it returns" {

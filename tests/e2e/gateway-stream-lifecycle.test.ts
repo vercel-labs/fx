@@ -17336,6 +17336,71 @@ test("a subagent started with its own model names that child model in its turn c
   }
 }, 45_000);
 
+test("a repeated subagent message with the same model and effort is delivered and completes", async () => {
+  const root = createFixtureRoot("subagent-repeat-same-settings");
+  const childModel = "anthropic/claude-opus-4.6";
+  let secondSendToolResult = "";
+  const sendWithSettings = (id: string, message: string) =>
+    fakeGatewaySse([
+      {
+        type: "tool-call",
+        toolCallId: id,
+        toolName: "subagent",
+        input: {
+          request: {
+            action: "message",
+            agent: "reviewer",
+            message,
+            model: childModel,
+            effort: "low",
+          },
+        },
+      },
+      finishWithUsage("tool-calls", 100, 10, 1),
+    ]);
+  const gateway = startDynamicFakeGateway((body) => {
+    if (!body.includes('"name":"subagent"')) {
+      if (body.includes("SECOND_REVIEW_TASK")) return fakeGatewayFinalText("REVIEW_TWO_DONE");
+      return fakeGatewayFinalText("REVIEW_ONE_DONE");
+    }
+    if (hasCurrentToolResult(body, "send_two")) {
+      secondSendToolResult = toolResultOutput(body, "send_two");
+      return fakeGatewayFinalText("SECOND_DISPATCHED");
+    }
+    const reports = allReports(body);
+    if (reports.some((report) => String(report.output).includes("REVIEW_TWO_DONE"))) {
+      return fakeGatewayFinalText("ALL_REVIEWS_DONE");
+    }
+    if (reports.some((report) => String(report.output).includes("REVIEW_ONE_DONE"))) {
+      return sendWithSettings("send_two", "SECOND_REVIEW_TASK");
+    }
+    if (hasCurrentToolResult(body, "send_one")) return fakeGatewayFinalText("FIRST_DISPATCHED");
+    return sendWithSettings("send_one", "FIRST_REVIEW_TASK");
+  }, {
+    classifierDecision: "clear",
+    models: [
+      { id: MODEL, type: "language", tags: ["tool-use"] },
+      { id: childModel, type: "language", tags: ["tool-use"] },
+    ],
+  });
+
+  try {
+    const result = await runFx(["ask", "--yolo", "--json", "--", "Send two tasks to reviewer with the same model and effort."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+      timeoutMs: 40_000,
+    });
+    expect(result.code).toBe(0);
+    expect(secondSendToolResult).toContain('"ok":true');
+    expect(secondSendToolResult).not.toContain("override_after_create");
+    const json = parseAskJson(result.stdout);
+    expect(json.final_output).toBe("ALL_REVIEWS_DONE");
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 60_000);
+
 test("fx ask --json encodes control bytes in permission target resolution failure messages", async () => {
   const root = createFixtureRoot("encode-permission-paths");
   const tracePath = join(root.root, "trace.log");
