@@ -147,6 +147,8 @@ const LauncherControl = struct {
     command_path: ?[]const u8,
     child_pid: std.posix.pid_t,
     watchdog: *LauncherWatchdog,
+    /// Where the launcher reports to the host: its standard error.
+    report_fd: std.posix.fd_t = std.posix.STDERR_FILENO,
     done: std.atomic.Value(bool) = .init(false),
     phase: ControlPhase = .awaiting_shell,
     failed: bool = false,
@@ -199,7 +201,12 @@ const LauncherControl = struct {
                 ) catch {};
             }
             writeAllFd(stream.socket.handle, &.{1}, false) catch |err| {
-                // The shell has ended, so nothing is left to read the answer.
+                // The marker helper waits only `marker_ack_timeout_ms` for
+                // this answer. When the host holds the release longer, the
+                // helper gives up and its socket closes, the shell ends, and
+                // the release wait above returns because `done` is set.
+                // Failing here would report the shell's real end as a failed
+                // start (`failed`, which `LauncherControl.run` records).
                 if (self.done.load(.acquire)) return;
                 return err;
             };
@@ -222,7 +229,7 @@ const LauncherControl = struct {
                     self.bootstrap_path,
                 ) catch {};
                 try writeControlFd(
-                    std.posix.STDERR_FILENO,
+                    self.report_fd,
                     .shell_ready,
                     @intCast(self.child_pid),
                 );
@@ -236,7 +243,7 @@ const LauncherControl = struct {
                     self.command_path.?,
                 ) catch {};
                 try writeControlFd(
-                    std.posix.STDERR_FILENO,
+                    self.report_fd,
                     .command_started,
                     @intCast(self.child_pid),
                 );
@@ -5508,6 +5515,70 @@ const LauncherIdentity = struct {
         return answer;
     }
 };
+
+test "a release wait that ends with the shell is not a failed start when the marker helper already gave up" {
+    if (!isSupported()) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    const io = std.testing.io;
+    var path_buffer: [96]u8 = undefined;
+    const path = try std.mem.print(&path_buffer, "/tmp/fx-launcher-ack-{d}.sock", .{std.c.getpid()});
+    var command_buffer: [96]u8 = undefined;
+    const command_path = try std.mem.print(&command_buffer, "/tmp/fx-launcher-ack-{d}.command", .{std.c.getpid()});
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    const address = try std.Io.net.UnixAddress.init(path);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    var report: [2]c_int = undefined;
+    if (std.c.pipe(&report) != 0) return error.PipeFailed;
+    defer closeFd(report[0]);
+    defer closeFd(report[1]);
+
+    // The launcher waits for the shell's `command_started` marker, answered by
+    // the host's release, which never comes in this test.
+    var watchdog = LauncherWatchdog{ .child_pid = 1 };
+    const nonce = "0123456789abcdef0123456789abcdef";
+    var control = LauncherControl{
+        .server = &server,
+        .control_path = path,
+        .bootstrap_path = command_path,
+        .nonce = nonce,
+        .command_path = command_path,
+        .child_pid = 1,
+        .watchdog = &watchdog,
+        .report_fd = report[1],
+        .phase = .shell_ready,
+    };
+    const thread = try std.Thread.spawn(.{}, LauncherControl.run, .{&control});
+    var joined = false;
+    defer if (!joined) {
+        control.done.store(true, .release);
+        thread.join();
+    };
+
+    var helper = try address.connect(io);
+    var helper_open = true;
+    defer if (helper_open) helper.close(io);
+    var marker: [marker_frame_len]u8 = undefined;
+    @memcpy(marker[0..control_nonce_len], nonce);
+    marker[control_nonce_len] = @backingInt(MarkerKind.command_started);
+    try writeAllFd(helper.socket.handle, &marker, false);
+    var reported: [control_frame_len]u8 = undefined;
+    var fds = [_]std.posix.pollfd{.{ .fd = report[0], .events = std.posix.POLL.IN, .revents = 0 }};
+    if ((try std.posix.poll(&fds, 5_000)) == 0) return error.TestLauncherNeverReported;
+    try readExactFd(report[0], &reported);
+    try std.testing.expectEqual(@as(u8, @backingInt(ControlKind.command_started)), reported[0]);
+
+    // The helper gives up on its answer, and its socket closes. Then the
+    // shell ends.
+    helper.close(io);
+    helper_open = false;
+    control.done.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expect(!control.failed);
+    try std.testing.expectEqual(ControlPhase.command_started, control.phase);
+}
 
 test "the exit close ends a launcher's session only while the launcher is the process it was" {
     if (!isSupported()) return error.SkipZigTest;
