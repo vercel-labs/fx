@@ -77,7 +77,7 @@ pub const Runtime = struct {
         self.shell.setCommandOutputRenderPolicy(.{
             .code_highlight_theme = if (ui_render.is_light) .light else .dark,
         });
-        const start = normalizeStartCursor(layout, cursor);
+        const start = shell_runtime.normalizeStartCursor(layout, cursor);
         self.shell.shadow_vt.?.cursor_row = start.row;
         self.shell.shadow_vt.?.cursor_col = start.col;
         self.shell.cursor_row = start.row;
@@ -520,16 +520,6 @@ fn zeroFooterRows(rows: u16) render_engine.footer_layout.FooterRows {
         .hint = rows,
         .total_rows = 0,
     };
-}
-
-fn normalizeStartCursor(
-    layout: types.Layout,
-    cursor: shell_runtime.CursorPosition,
-) shell_runtime.CursorPosition {
-    var row = @min(@max(cursor.row, 1), layout.rows);
-    const col = @min(@max(cursor.col, 1), layout.cols);
-    if (col > 1 and row < layout.rows) row += 1;
-    return .{ .row = row, .col = 1 };
 }
 
 test "ask presentation paints ask header and assistant into a footerless frame without prompt echo" {
