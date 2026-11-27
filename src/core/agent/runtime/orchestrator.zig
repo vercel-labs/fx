@@ -6333,6 +6333,7 @@ fn finishUncertainToolReview(
     );
     try request.replaceStatus(.{
         .kind = .unsafe_tool_start,
+        .attempt = request.attempt(),
         .diagnostic = diagnostic,
     });
     try finalization.finish(.paused, null, null);
@@ -6349,6 +6350,7 @@ fn pushUnsafeNoRetryStatus(
             .assistant_output => .unsafe_assistant_output,
             .tool_start => .unsafe_tool_start,
         },
+        .attempt = request.attempt(),
         .diagnostic = diagnostic,
     });
 }
@@ -14687,4 +14689,27 @@ test "eb03: UserTurn carries job.input_id in turn-piece writes, checkpoints, and
     try std.testing.expectEqual(@as(usize, 1), notice_fake.history_turns.items.len);
     try std.testing.expectEqual(@as(?u64, 64), notice_fake.history_turns.items[0].assistant.user.input_id);
     try std.testing.expectEqual(@as(?u64, 64), notice_fake.finish_user_input_id);
+}
+
+test "pushUnsafeNoRetryStatus records request.attempt() on unsafe_assistant_output and unsafe_tool_start" {
+    const support = @import("tests/support.zig");
+    const alloc = std.testing.allocator;
+    var fake = support.FakeAgentRuntimeDeps.init(alloc);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var fixture = support.PromptFixture{};
+    var request = runtime_request_recovery.RequestRecovery.init(&deps, &fixture.cancel_flag, .{});
+    defer request.deinit();
+
+    _ = try request.start(false, null);
+    try pushUnsafeNoRetryStatus(&request, .assistant_output, types.ModelFailureDiagnostic.init("provider_error"));
+    const first = fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1];
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.unsafe_assistant_output, first.kind);
+    try std.testing.expectEqual(@as(usize, 1), first.attempt);
+
+    _ = try request.failed(.{ .kind = .content_filter });
+    try pushUnsafeNoRetryStatus(&request, .tool_start, types.ModelFailureDiagnostic.init("provider_error"));
+    const second = fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1];
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.unsafe_tool_start, second.kind);
+    try std.testing.expectEqual(@as(usize, 2), second.attempt);
 }

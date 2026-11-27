@@ -8342,4 +8342,53 @@ describe("fx login Token Pass status", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "fx ask --json reports recovery.attempt for unsafe no-retry tool reconciliation",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace, { recursive: true });
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          {
+            type: "tool-call",
+            toolCallId: "provider_publish_unsafe_1",
+            toolName: "provider_publish",
+            input: { target: "prod" },
+            providerExecuted: true,
+          },
+          { type: "finish", finishReason: { unified: "error", raw: "provider_error" } },
+        ]),
+        fakeGatewaySse([
+          { type: "finish", finishReason: { unified: "error", raw: "MALFORMED_FUNCTION_CALL" } },
+        ]),
+      ]);
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "fake-unsafe-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const res = await runFx(["ask", "--json", "--no-save", "unsafe reconciliation"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+        const json = JSON.parse(res.stdout);
+        expect(json.recovery).toMatchObject({
+          state: "failed",
+          attempt: 2,
+          cause: "server",
+          message: "⚠ Tool state needs review · malformed tool call during reconciliation · context preserved",
+        });
+        expect("partial" in json).toBe(false);
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
 });

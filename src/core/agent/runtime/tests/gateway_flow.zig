@@ -6697,6 +6697,7 @@ test "processQueuedPrompt stops for review when a malformed reply answers a rese
     try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
     const status = hooks.route_recovery_statuses.items[hooks.route_recovery_statuses.items.len - 1];
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.unsafe_tool_start, status.kind);
+    try std.testing.expectEqual(@as(usize, 2), status.attempt);
     try std.testing.expectEqualStrings("MalformedToolCallDuringReconciliation", status.diagnostic.?.view());
 }
 
@@ -6756,6 +6757,7 @@ test "processQueuedPrompt stops for review when uncertain tool reconciliation re
     try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
     const status = hooks.route_recovery_statuses.items[hooks.route_recovery_statuses.items.len - 1];
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.unsafe_tool_start, status.kind);
+    try std.testing.expectEqual(@as(usize, 2), status.attempt);
     try std.testing.expectEqualStrings("UnexpectedToolCallDuringReconciliation", status.diagnostic.?.view());
     const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
     try std.testing.expectEqual(session_codec.RecoveryToolState.uncertain, checkpoint.tool_state);
