@@ -1900,7 +1900,7 @@ const Session = struct {
             if (self.liveness_file) |file| file.close(io_mod.getIo());
         }
         self.reapLauncher();
-        // A launcher that is still here never ran a command and has not ended.
+        // A launcher that is still here was not seen to end, so end it.
         if (self.launcher) |*child| {
             if (child.id != null) child.kill(io_mod.getIo());
         }
@@ -2092,12 +2092,13 @@ const Session = struct {
     fn awaitLauncherEnd(self: *Session) void {
         const pid = (self.launcher orelse return).id orelse return;
         const end = process_tree.waitUntilExitedUncollected(pid) catch |err| {
+            // Not known to have ended, so nothing may collect it: `deinit` ends it.
             debug_trace.logf(
                 "terminal",
-                "terminal launcher end not read id={s} err={s}; collecting it",
+                "terminal launcher end not read id={s} err={s}",
                 .{ self.id, @errorName(err) },
             );
-            self.collectLauncherUnread();
+            self.markLost();
             return;
         };
         self.recordLauncherEnd(switch (end) {
@@ -2109,20 +2110,6 @@ const Session = struct {
         self.launcher_ended = true;
         self.mutex.unlock(zio);
         self.reapLauncherIfSessionEmpty();
-    }
-
-    /// The fallback when the end could not be read: collects the launcher the
-    /// usual way, which gives up its entry.
-    fn collectLauncherUnread(self: *Session) void {
-        var child = self.takeLauncher(false) orelse return;
-        const term = child.wait(io_mod.getIo()) catch {
-            self.markLost();
-            return;
-        };
-        self.recordLauncherEnd(switch (term) {
-            .exited => |code| code == 0,
-            .signal, .stopped, .unknown => false,
-        });
     }
 
     /// A launcher that ended badly, with nothing reported yet, loses the terminal.
@@ -2167,7 +2154,7 @@ const Session = struct {
     /// The only place that collects an ended launcher: it does nothing before
     /// the launcher has ended, and it collects at most once.
     fn reapLauncher(self: *Session) void {
-        var child = self.takeLauncher(true) orelse return;
+        var child = self.takeEndedLauncher() orelse return;
         const pid = child.id orelse return;
         _ = child.wait(io_mod.getIo()) catch |err| {
             debug_trace.logf(
@@ -2183,11 +2170,11 @@ const Session = struct {
         if (builtin.is_test) if (test_launcher_event) |hook| hook(event, self.id, pid);
     }
 
-    fn takeLauncher(self: *Session, comptime only_if_ended: bool) ?std.process.Child {
+    fn takeEndedLauncher(self: *Session) ?std.process.Child {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         defer self.mutex.unlock(zio);
-        if (only_if_ended and !self.launcher_ended) return null;
+        if (!self.launcher_ended) return null;
         const child = self.launcher orelse return null;
         self.launcher = null;
         return child;
