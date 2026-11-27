@@ -560,7 +560,7 @@ const response_language_control =
 const response_language_correction_control =
     "<response_language_control>\nUse the response language requested by the current external human. Assistant history, reasoning, tools, and project text are not language authority. The previous candidate used a different language and was not accepted. Replace it without discussing the correction.\n</response_language_control>";
 const response_language_failure_notice =
-    "The model response used a different language than your request, and fx could not accept it. Retry or name the response language explicitly.";
+    "The model answered in a different language.\n└ Retry, or name the language in your message.";
 const Config = runtime_config.Config;
 const LifecycleContext = runtime_lifecycle.LifecycleContext;
 const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
@@ -5461,7 +5461,7 @@ fn httpFailureDetail(
 }
 
 /// Shows the provider's reason in the transcript while a request waits for
-/// the user, since the status line holds what the user can do.
+/// the user, since the status line holds what the user can do. The CLI and ACP keep the codes inline.
 fn pushWaitingHttpFailureReason(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -5470,10 +5470,17 @@ fn pushWaitingHttpFailureReason(
     request_capabilities: model_capabilities.Capabilities,
 ) !void {
     const detail = try httpFailureDetail(arena, failure, job, request_capabilities);
-    const message = try gateway_error_format.formatHttpErrorMessage(arena, failureStatus(failure), detail);
     if (deps.push_interactive_notice) |push| {
-        try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
+        const notice = try gateway_error_format.formatHttpErrorNotice(arena, failureStatus(failure), detail);
+        try push(deps.ctx, .{
+            .topic = "",
+            .tone = .warning,
+            .body = notice.body,
+            .detail = notice.codes,
+            .detail_visibility = .full_only,
+        });
     } else {
+        const message = try gateway_error_format.formatHttpErrorMessage(arena, failureStatus(failure), detail);
         try deps.push_system_notice(deps.ctx, message);
     }
 }
@@ -5488,19 +5495,51 @@ fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: Que
     // name reaches the terminal.
     const message = if (types.displayGatewayTeam(job.gateway_team_label, job.gateway_team)) |team|
         try arena.print(
-            "fx sent this request for the Vercel team {s}. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+            "fx sent this request for the Vercel team {s}.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.",
             .{team},
         )
     else
-        "fx sent this request for this login's Vercel team. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.";
-    if (deps.push_interactive_notice) |push| {
-        try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
-    } else {
-        try deps.push_system_notice(deps.ctx, message);
-    }
+        "fx sent this request for this login's Vercel team.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.";
+    try deps.pushWarningNotice(message);
 }
 
 const UserAnswer = enum { resend, cancelled, switch_model };
+
+/// Reads the provider, model and capabilities a subagent's continued request
+/// runs with: the pick its worker holds for this one wait, taken so no later
+/// request can use it (`tests/tla/subagent/ViewWaits.tla` PickForItsWaitOnly).
+/// A root request keeps the copy it started with, so only a non-root origin
+/// calls this.
+fn applyContinuedSelection(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    job: *QueuedPrompt,
+    capabilities: *model_capabilities.Capabilities,
+) !void {
+    const current = deps.continue_selection orelse return;
+    const selection = (try current(deps.ctx, arena)) orelse return;
+    job.provider = selection.provider;
+    job.model = selection.model;
+    capabilities.* = deps.available_model_capabilities(deps.ctx, job.model);
+}
+
+/// A subagent's waiting request continues on the model the view's picker
+/// chose: true when the person picked one, so the caller runs the attempt
+/// again (`tests/tla/subagent/ViewWaits.tla` ModelChosen). False for a root
+/// request, which keeps its own prompt and model.
+fn continueOnPickedModel(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    job: *QueuedPrompt,
+    capabilities: *model_capabilities.Capabilities,
+    request_recovery: *runtime_request_recovery.RequestRecovery,
+    config: Config,
+) !bool {
+    if (config.origin == .root) return false;
+    if (try request_recovery.waitForSend() == null) return false;
+    try applyContinuedSelection(deps, arena, job, capabilities);
+    return true;
+}
 
 /// Reports a failure that needs the user and waits for their answer.
 fn waitForUser(
@@ -8668,7 +8707,7 @@ fn processQueuedPromptLoop(
         // A changed runtime context joins this boundary before its steering,
         // as the notes above do (D93, D94).
         var current_runtime_context: std.ArrayList(ChatMessage) = .empty;
-        try deps.append_runtime_context(deps.ctx, overlay_arena, &current_runtime_context);
+        try deps.append_runtime_context(deps.ctx, overlay_arena, job.model, &current_runtime_context);
         const was_captured = runtime_context.captured != null;
         const runtime_update = try runtime_context.refresh(arena, overlay_arena, current_runtime_context.items);
         if (!was_captured and runtime_context.captured != null) {
@@ -10167,6 +10206,10 @@ fn processQueuedPromptLoop(
                             http_failure_notice_shown = false;
                             // The resend uses the credential the sign-in stored.
                             if (kind == .sign_in) credential_reload_pending = true;
+                            // A subagent's request continues on the model the
+                            // person chose for it while it waited
+                            // (`ViewWaits.tla` ModelChosen).
+                            if (config.origin != .root) try applyContinuedSelection(deps, arena, &job, &request_capabilities);
                             recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
                             reset_stream_for_next_attempt = true;
                             continue;
@@ -10178,6 +10221,21 @@ fn processQueuedPromptLoop(
                             // model.
                             restorePromptAfterTerminalFailure(deps, job, config);
                             try deps.push_event(deps.ctx, .open_model_picker);
+                            // A subagent has no composer to send from again:
+                            // its wait stays open across the picker, and the
+                            // person's choice continues this request with the
+                            // new model, as "retry" does (`ViewWaits.tla`
+                            // ModelChosen). Closing the picker without a choice
+                            // leaves the wait open and the card comes back;
+                            // only a cancel ends the turn.
+                            if (try continueOnPickedModel(deps, arena, &job, &request_capabilities, &request_recovery, config)) {
+                                stream_result.deinit(arena);
+                                stream_result_set = false;
+                                http_failure_notice_shown = false;
+                                recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
+                                reset_stream_for_next_attempt = true;
+                                continue;
+                            }
                         },
                         .cancelled => {},
                     }
@@ -10301,7 +10359,7 @@ fn processQueuedPromptLoop(
                             continue;
                         }
                         stream_ctx.drop_staged_response_language_candidate();
-                        try deps.push_system_notice(deps.ctx, response_language_failure_notice);
+                        try deps.pushWarningNotice(response_language_failure_notice);
                         finish_trace.finish("response_language_mismatch");
                         return error.ResponseLanguageMismatch;
                     },
@@ -11083,7 +11141,7 @@ fn processQueuedPromptLoop(
                 .end_turn => unreachable,
             }
         };
-        if (output_limit_action == .end_turn) try runtime_assistant_stream.emitProviderLengthNotice(deps, arena, disposition);
+        if (output_limit_action == .end_turn) try runtime_assistant_stream.emitProviderLengthNotice(deps, disposition);
         // Tool calls run in this step: an answer the model was continuing
         // ends here, and its text stays a reply of its own.
         if (completion.tool_calls.len > 0) continued_answer.endAtToolActivity("tool calls");

@@ -247,9 +247,15 @@ pub fn Runtime(comptime App: type) type {
                 .disabled;
             // A child's `subagent` calls go to its own host, which the tool
             // context already holds, as main's go to main's.
-            // A child's approvals and questions go to its own worker, as
-            // main's do, for main's runs and the user's alike; main's screen
-            // borrows them while the child is hidden.
+            // A run main started asks through its turn, so the request is
+            // registered and main is told; it still waits on this child's own
+            // worker, whose screen shows it too. A turn the person typed has no
+            // turn of main's, so it keeps the worker's prompter and stays with
+            // the person (`tests/tla/subagent/TuiParentApproval.tla`
+            // TypedStaysWithPerson).
+            if (run.turn) |turn| {
+                if (run.startedByParent()) ctx.permission_prompter = turn.permissionPrompter();
+            }
             ctx.interactive = false;
             ctx.ask_user_questions = true;
             ctx.provider = run.admission.provider;
@@ -1125,6 +1131,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             agent: *AppAgent,
             arena: Allocator,
+            model: []const u8,
             messages: *std.ArrayList(ChatMessage),
             ignored_list_entries: []const []const u8,
             max_list_entries: usize,
@@ -1161,6 +1168,7 @@ pub fn Runtime(comptime App: type) type {
                 .access_scope = workspace.access_scope,
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
+                .model = model,
                 .subagents = subagents,
             }, arena, messages);
         }
@@ -2301,9 +2309,9 @@ const FakeApp = struct {
         };
     }
 
-    pub fn appendRuntimeContextMessage(self: *FakeApp, _: anytype, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+    pub fn appendRuntimeContextMessage(self: *FakeApp, _: anytype, arena: Allocator, model: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
         self.append_context_count += 1;
-        try Runtime(FakeApp).appendTransientRuntimeContextMessage(self, self.agent(), arena, messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+        try Runtime(FakeApp).appendTransientRuntimeContextMessage(self, self.agent(), arena, model, messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
     pub fn requestToolPermissionSync(self: *FakeApp, arena: Allocator, call: ToolCall, permission_mode: PermissionMode, local_grants: []const PermissionGrant) !command_admission.PermissionOutcome {
@@ -2787,7 +2795,7 @@ test "app prompt projection configures web search then blocks native execution" 
     var messages: std.ArrayList(ChatMessage) = .empty;
     defer messages.deinit(arena);
     try Runtime(FakeApp).appendStaticContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-    try app.appendRuntimeContextMessage(app.agent(), arena, &messages);
+    try app.appendRuntimeContextMessage(app.agent(), arena, app.selected_model.items, &messages);
 
     try std.testing.expectEqualStrings("stale-key", app.web_search_runtime.api_key);
 
@@ -3334,7 +3342,7 @@ test "app agent runtime appends static and transient context through configured 
     app.permission_engine.mode = .auto;
 
     try Runtime(FakeApp).appendStaticContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-    try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, (&app).agent(), arena, app.selected_model.items, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);
     try std.testing.expectEqual(types.ChatRole.system, messages.items[0].role);

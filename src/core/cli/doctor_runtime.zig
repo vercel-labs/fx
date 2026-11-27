@@ -6,6 +6,8 @@ const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const settings_keys = @import("../config/settings_keys.zig");
+const workspace_trust = @import("../workspace_trust/workspace_trust.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const settings_messages = @import("settings_messages.zig");
 const host = @import("../hosts/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -124,6 +126,7 @@ pub fn collect(
         try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
         snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
+        try appendWorkspaceTrustCheck(&checks, alloc, snapshot.workspace_root);
         try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
 
         snapshot.checks = try checks.toOwnedSlice(alloc);
@@ -157,6 +160,7 @@ pub fn collect(
         .max_agent_steps = detailed.settings.max_agent_steps,
     }, default_agent_step_limit);
     snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
+    try appendWorkspaceTrustCheck(&checks, alloc, snapshot.workspace_root);
     try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
 
     snapshot.checks = try checks.toOwnedSlice(alloc);
@@ -562,6 +566,42 @@ fn appendGitCheck(checks: *std.ArrayList(Check), alloc: Allocator, workspace_roo
     return true;
 }
 
+const TrustFacts = struct {
+    asking: bool,
+    session_only: bool,
+    key: []const u8,
+};
+
+const TrustReport = struct {
+    status: CheckStatus,
+    detail: []u8,
+};
+
+/// Trust is information, not a problem, so the status is always ok.
+fn workspaceTrustReport(alloc: Allocator, facts: TrustFacts) Allocator.Error!TrustReport {
+    const detail = if (facts.session_only)
+        try alloc.dupe(u8, "fx asks every time the terminal UI starts here.")
+    else if (facts.asking)
+        try alloc.dupe(u8, "fx asks before the terminal UI starts here.")
+    else
+        try alloc.print(
+            "fx trusts this folder (saved for {f}). To be asked again, remove \"trusted\" from that folder's entry in {s}.",
+            .{ text_utils.terminalSafe(facts.key), profile_paths.displayText("~/.fx/settings.json") },
+        );
+    return .{ .status = .ok, .detail = detail };
+}
+
+fn appendWorkspaceTrustCheck(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8) !void {
+    var trust_gate = try workspace_trust.gate.Gate.open(alloc, workspace_root, io_mod.homeDir(), false);
+    defer trust_gate.deinit(alloc);
+    const report = try workspaceTrustReport(alloc, .{
+        .asking = trust_gate.asking(),
+        .session_only = trust_gate.scope_session_only,
+        .key = trust_gate.key,
+    });
+    try appendCheckOwned(checks, alloc, "trust", report.status, report.detail);
+}
+
 /// Whether `workspace_root` or a folder above it has a `.git` file or folder.
 fn inGitRepository(alloc: Allocator, workspace_root: []const u8) !bool {
     var dir: ?[]const u8 = workspace_root;
@@ -946,6 +986,28 @@ test "session count check preserves empty and latest details" {
     try std.testing.expectEqualStrings("sessions", checks.items[1].name);
     try std.testing.expectEqual(CheckStatus.ok, checks.items[1].status);
     try std.testing.expectEqualStrings("2 saved session(s); latest=session-2", checks.items[1].detail);
+}
+
+test "the workspace trust check says how to be asked again" {
+    const alloc = std.testing.allocator;
+
+    const trusted = try workspaceTrustReport(alloc, .{ .asking = false, .session_only = false, .key = "/Users/example/code/r" });
+    defer alloc.free(trusted.detail);
+    try std.testing.expectEqual(CheckStatus.ok, trusted.status);
+    try std.testing.expectEqualStrings(
+        "fx trusts this folder (saved for /Users/example/code/r). To be asked again, remove \"trusted\" from that folder's entry in ~/.fx/settings.json.",
+        trusted.detail,
+    );
+
+    const not_yet = try workspaceTrustReport(alloc, .{ .asking = true, .session_only = false, .key = "/Users/example/code/r" });
+    defer alloc.free(not_yet.detail);
+    try std.testing.expectEqual(CheckStatus.ok, not_yet.status);
+    try std.testing.expectEqualStrings("fx asks before the terminal UI starts here.", not_yet.detail);
+
+    const session_only = try workspaceTrustReport(alloc, .{ .asking = true, .session_only = true, .key = "/Users/example" });
+    defer alloc.free(session_only.detail);
+    try std.testing.expectEqual(CheckStatus.ok, session_only.status);
+    try std.testing.expectEqualStrings("fx asks every time the terminal UI starts here.", session_only.detail);
 }
 
 test "doctor startup check fails when the provider has no model to run" {

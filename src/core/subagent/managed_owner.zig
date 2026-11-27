@@ -91,7 +91,14 @@ const Slot = struct {
     /// turns too: stopping the turn cancels it instead of shutting it down.
     hosted: bool = false,
     work_id: ?[]const u8 = null,
-    route_refs: usize = 0,
+    /// References a resolution holds to this slot's route. `pinWorkerRoute`
+    /// takes one without the owner's lock, because a resolution holds the
+    /// registry's mutex there and a stop holds the owner's while it waits for
+    /// the child's worker (worker -> registry -> owner -> worker).
+    route_refs: std.atomic.Value(usize) = .init(0),
+    /// Set before `detachWorker` drops the worker: a route that is closed takes
+    /// no new reference, so none outlives the worker.
+    route_closed: std.atomic.Value(bool) = .init(false),
     waiters: usize = 0,
     route_changed: std.Io.Condition = .init,
     thread: ?std.Thread = null,
@@ -219,6 +226,11 @@ pub const Owner = struct {
     services: execution.Services,
     authority_resolver: *authority.Resolver,
     approvals: *approval_registry.Registry,
+    /// Told when a child's approval request is registered, so its parent hears.
+    approval_note: ?struct {
+        context: *anyopaque,
+        note_fn: *const fn (*anyopaque, []const u8, []const u8, []const u8) bool,
+    } = null,
     max_history_turns: usize = 8,
     mutex: std.Io.Mutex = .init,
     waiters_changed: std.Io.Condition = .init,
@@ -1066,7 +1078,7 @@ fn destroySlot(owner: *Owner, slot: *Slot) void {
     owner.mutex.lockUncancelable(io_mod.getIo());
     while (slot.waiters != 0) owner.waiters_changed.waitUncancelable(io_mod.getIo(), &owner.mutex);
     owner.mutex.unlock(io_mod.getIo());
-    std.debug.assert(slot.route_refs == 0);
+    std.debug.assert(slot.route_refs.load(.seq_cst) == 0);
     freeLeftovers(owner.alloc, slot);
     owner.alloc.free(slot.child_id);
     owner.alloc.destroy(slot);
@@ -1558,6 +1570,16 @@ fn runOneSnapshot(slot: *Slot, snapshot: *const RunSnapshot, work_id: []u8) OneO
     turn.phase_fn = Owner.phaseTransition;
     turn.begin_context = slot;
     turn.begin_fn = hostedTurnBegins;
+    // A run main started is noted, whether this host runs the turn in a session
+    // of its own (fx ask, ACP) or on the child's agent (the app). A turn the
+    // person typed on the child's screen is not: its approval stays with the
+    // person (`tests/tla/subagent/TuiParentApproval.tla` TypedStaysWithPerson).
+    if (snapshot.active.started_by == .parent) {
+        if (owner.approval_note) |hook| {
+            turn.approval_note_context = hook.context;
+            turn.approval_note_fn = hook.note_fn;
+        }
+    }
     turn.live_metrics = &slot.metrics;
     // The interactive app runs the turn on the child's own agent. Bound before
     // `slot.worker` is read, so cancel, steering, and approvals reach it.
@@ -1570,6 +1592,9 @@ fn runOneSnapshot(slot: *Slot, snapshot: *const RunSnapshot, work_id: []u8) OneO
     if (start_test_controls.armed()) start_test_controls.holdStart(slot.child_id, &slot.cancel);
     owner.mutex.lockUncancelable(io_mod.getIo());
     slot.worker = turn.workerRuntime();
+    // A slot runs its later works too: this run's route is open again, and the
+    // last run's `detachWorker` waited for every reference it had.
+    slot.route_closed.store(false, .seq_cst);
     slot.hosted = turn.hosted_worker != null;
     // A hosted turn begins later, on the child's own agent, which asks
     // `hostedTurnBegins` then: until it does, the count stays for a stop.
@@ -1788,13 +1813,22 @@ fn cancelWorkerApproval(raw: *anyopaque) void {
     if (slot.worker) |worker| worker.cancelApprovalTurn();
 }
 
+/// Takes a reference to the slot's worker without the owner's lock: the
+/// registry's mutex is held here (`approval_registry.resolveIndexLocked`), and
+/// a stop or close holds the owner's mutex while it waits for the child's
+/// worker, so taking that mutex inside the registry's would close the cycle
+/// worker -> registry -> owner -> worker. One read of `route_closed` is enough:
+/// a pin runs only for a binding still in the registry, so `invalidateChild`
+/// has not removed it, and `detachWorker` sets `route_closed` before it takes
+/// the registry for that removal. A pin that read a closed route starts after
+/// the close; one that read an open route has incremented by then, so its
+/// increment is visible to the wait that follows. `releaseWorkerRoute` gives it
+/// back after the registry is unlocked, and the slot is freed only after every
+/// reference is gone (`destroySlot`).
 fn pinWorkerRoute(raw: *anyopaque) bool {
     const slot: *Slot = @ptrCast(@alignCast(raw));
-    const owner = slot.owner;
-    owner.mutex.lockUncancelable(io_mod.getIo());
-    defer owner.mutex.unlock(io_mod.getIo());
-    if (slot.worker == null) return false;
-    slot.route_refs += 1;
+    if (slot.route_closed.load(.seq_cst)) return false;
+    _ = slot.route_refs.fetchAdd(1, .seq_cst);
     return true;
 }
 
@@ -1803,9 +1837,8 @@ fn releaseWorkerRoute(raw: *anyopaque) void {
     const owner = slot.owner;
     owner.mutex.lockUncancelable(io_mod.getIo());
     defer owner.mutex.unlock(io_mod.getIo());
-    std.debug.assert(slot.route_refs > 0);
-    slot.route_refs -= 1;
-    if (slot.route_refs == 0) slot.route_changed.broadcast(io_mod.getIo());
+    std.debug.assert(slot.route_refs.load(.seq_cst) > 0);
+    if (slot.route_refs.fetchSub(1, .seq_cst) == 1) slot.route_changed.broadcast(io_mod.getIo());
 }
 
 /// Keeps the parent's messages the ended turn never took as works of their
@@ -1881,10 +1914,17 @@ fn freeLeftovers(alloc: Allocator, slot: *Slot) void {
 
 fn detachWorker(slot: *Slot, active: *const child_state.ActiveWork) void {
     const owner = slot.owner;
-    _ = owner.approvals.invalidateChild(slot.child_id) catch |err|
+    // No new reference may start: the worker is about to go. Set before the
+    // bindings are removed, so a resolution that finds one sees a closed route
+    // and rejects instead of pinning a worker that is ending.
+    slot.route_closed.store(true, .seq_cst);
+    const dropped = owner.approvals.invalidateChild(slot.child_id) catch |err| blk: {
         debugFailure(slot.child_id, "approval_invalidate", err);
+        break :blk 0;
+    };
+    if (dropped > 0) debug_trace.logf("subagent", "approval requests dropped child={s} count={d} reason=worker_detached", .{ slot.child_id, dropped });
     owner.mutex.lockUncancelable(io_mod.getIo());
-    while (slot.route_refs > 0) {
+    while (slot.route_refs.load(.seq_cst) > 0) {
         slot.route_changed.waitUncancelable(io_mod.getIo(), &owner.mutex);
     }
     if (slot.worker) |worker| {
@@ -2182,7 +2222,7 @@ const CancellationJoinTest = struct {
         const turn = self.turn.?;
         Owner.phaseTransition(self.owner, "child", "work", .awaiting_approval) catch
             return error.PermissionRegistrationFailed;
-        self.owner.approvals.registerTool("approval", "child", "parent", "work", request, &.{}, turn.approval_worker_route.?, 1) catch
+        self.owner.approvals.registerTool("approval", "child", "parent", "work", request, .{ .id = "call-1", .name = "shell", .arguments_json = "{}" }, &.{}, turn.approval_worker_route.?, 1) catch
             return error.PermissionRegistrationFailed;
         self.request_id = request.id;
         self.registered.set(io_mod.getIo());
@@ -2308,7 +2348,7 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
         }
         try std.testing.expectEqual(@as(u64, 2), approvals.pendingRevision());
         owner.mutex.lockUncancelable(io_mod.getIo());
-        const retained = slot.worker != null and slot.route_refs == 1 and slot.completion == .running;
+        const retained = slot.worker != null and slot.route_refs.load(.seq_cst) == 1 and slot.completion == .running;
         owner.mutex.unlock(io_mod.getIo());
         try std.testing.expect(retained);
     }
@@ -2489,6 +2529,7 @@ test "worker detach invalidates approval routes before worker deinit" {
         "root",
         "work",
         .{ .id = 9, .label = "review" },
+        .{ .id = "call-1", .name = "shell", .arguments_json = "{}" },
         &.{},
         route,
         1,
@@ -2679,4 +2720,252 @@ test "slotMain records user starter and user_stop cause when user-started contin
     try std.testing.expectEqual(@as(usize, 1), fixture.end_count);
     try std.testing.expect(fixture.ends[0].report_owed);
     try std.testing.expectEqual(child_state.EndFacts{ .started_by = .user, .cause = .user_stop }, fixture.ends[0].end);
+}
+
+test "an approval resolution does not wait for the owner's lock a stop holds" {
+    const alloc = std.testing.allocator;
+    var approvals = approval_registry.Registry{ .alloc = alloc };
+    defer approvals.deinit();
+    var owner = Owner{
+        .alloc = alloc,
+        .children = undefined,
+        .state_store = undefined,
+        .services = undefined,
+        .authority_resolver = undefined,
+        .approvals = &approvals,
+    };
+    const slot = try alloc.create(Slot);
+    defer alloc.destroy(slot);
+    slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, "child-1") };
+    defer alloc.free(slot.child_id);
+    const Submit = struct {
+        fn submit(
+            _: *anyopaque,
+            _: u64,
+            _: permission_request.OwnedPermissionResponse,
+            _: ?worker_runtime.WorkerRuntime.PermissionCommit,
+        ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+            return .accepted;
+        }
+
+        fn cancel(_: *anyopaque) void {}
+
+        fn release(_: *anyopaque) void {}
+    };
+    var route = workerRoute(slot);
+    route.submit_fn = Submit.submit;
+    route.cancel_fn = Submit.cancel;
+    // `release` takes the owner's lock by design, to wake `detachWorker`; this
+    // test measures the pin, which must not take it, so release is recorded
+    // without the lock.
+    route.release_fn = Submit.release;
+    try approvals.registerTool(
+        "approval-1",
+        "child-1",
+        "root",
+        "work-1",
+        .{ .id = 7, .label = "Allow?" },
+        .{ .id = "call-1", .name = "shell", .arguments_json = "{}" },
+        &.{},
+        route,
+        1,
+    );
+    const Runner = struct {
+        fn run(app: *approval_registry.Registry, done: *std.Io.Event) void {
+            _ = app.resolve("approval-1", "child-1", .once, null, 0) catch {
+                // The decision is not what this test reads.
+            };
+            done.set(io_mod.getIo());
+        }
+    };
+    // A stop or close holds this lock and waits for the child's worker; a note
+    // holds the child's worker and waits for the registry. Resolution holds the
+    // registry, so its pin must not want this lock too (worker -> registry ->
+    // owner -> worker). It fails the deadline here instead of hanging.
+    var done: std.Io.Event = .unset;
+    owner.mutex.lockUncancelable(io_mod.getIo());
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ &approvals, &done });
+    const resolved = if (done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } })) |_| true else |_| false;
+    owner.mutex.unlock(io_mod.getIo());
+    thread.join();
+    try std.testing.expect(resolved);
+}
+
+test "invalidateChild cancels the child's worker without the registry held" {
+    const alloc = std.testing.allocator;
+    var approvals = approval_registry.Registry{ .alloc = alloc };
+    defer approvals.deinit();
+    var owner = Owner{
+        .alloc = alloc,
+        .children = undefined,
+        .state_store = undefined,
+        .services = undefined,
+        .authority_resolver = undefined,
+        .approvals = &approvals,
+    };
+    const slot = try alloc.create(Slot);
+    defer alloc.destroy(slot);
+    slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, "child-1") };
+    defer alloc.free(slot.child_id);
+    const Route = struct {
+        slot: *Slot,
+        entered: *std.Io.Event,
+
+        fn submit(
+            _: *anyopaque,
+            _: u64,
+            _: permission_request.OwnedPermissionResponse,
+            _: ?worker_runtime.WorkerRuntime.PermissionCommit,
+        ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+            return .accepted;
+        }
+
+        fn cancel(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.entered.set(io_mod.getIo());
+            // Blocks on the owner's mutex, which the test holds as a stop does.
+            cancelWorkerApproval(self.slot);
+        }
+
+        fn pin(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return pinWorkerRoute(self.slot);
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            releaseWorkerRoute(self.slot);
+        }
+    };
+    var entered: std.Io.Event = .unset;
+    var route_owner = Route{ .slot = slot, .entered = &entered };
+    const route = approval_registry.WorkerRoute{
+        .context = &route_owner,
+        .submit_fn = Route.submit,
+        .cancel_fn = Route.cancel,
+        .pin_fn = Route.pin,
+        .release_fn = Route.release,
+    };
+    try approvals.registerTool(
+        "approval-1",
+        "child-1",
+        "root",
+        "work-1",
+        .{ .id = 7, .label = "Allow?" },
+        .{ .id = "call-1", .name = "shell", .arguments_json = "{}" },
+        &.{},
+        route,
+        1,
+    );
+    const Invalidate = struct {
+        fn run(app: *approval_registry.Registry, done: *std.Io.Event) void {
+            _ = app.invalidateChild("child-1") catch {
+                // The count is not what this test reads.
+            };
+            done.set(io_mod.getIo());
+        }
+    };
+    const Note = struct {
+        fn run(app: *approval_registry.Registry, done: *std.Io.Event) void {
+            app.markNoted("approval-1");
+            done.set(io_mod.getIo());
+        }
+    };
+    var invalidated: std.Io.Event = .unset;
+    var noted: std.Io.Event = .unset;
+    owner.mutex.lockUncancelable(io_mod.getIo());
+    const invalidator = try std.Thread.spawn(.{}, Invalidate.run, .{ &approvals, &invalidated });
+    // Deterministic: the cancel is inside the invalidation, blocked on the lock.
+    try entered.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+    const noter = try std.Thread.spawn(.{}, Note.run, .{ &approvals, &noted });
+    const note_finished = if (noted.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } })) |_| true else |_| false;
+    owner.mutex.unlock(io_mod.getIo());
+    invalidator.join();
+    noter.join();
+    // A registry-only call had to wait for a worker cancel that waits for the
+    // owner's lock: the invalidation held the registry across it.
+    try std.testing.expect(note_finished);
+}
+
+test "a resolution completes while the route closes and reopens" {
+    const alloc = std.testing.allocator;
+    var approvals = approval_registry.Registry{ .alloc = alloc };
+    defer approvals.deinit();
+    var owner = Owner{
+        .alloc = alloc,
+        .children = undefined,
+        .state_store = undefined,
+        .services = undefined,
+        .authority_resolver = undefined,
+        .approvals = &approvals,
+    };
+    const slot = try alloc.create(Slot);
+    defer alloc.destroy(slot);
+    slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, "child-1") };
+    defer alloc.free(slot.child_id);
+    const Route = struct {
+        slot: *Slot,
+
+        fn submit(
+            _: *anyopaque,
+            _: u64,
+            _: permission_request.OwnedPermissionResponse,
+            _: ?worker_runtime.WorkerRuntime.PermissionCommit,
+        ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+            return .accepted;
+        }
+
+        fn cancel(_: *anyopaque) void {}
+
+        fn pin(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return pinWorkerRoute(self.slot);
+        }
+
+        fn release(_: *anyopaque) void {}
+    };
+    var route_owner = Route{ .slot = slot };
+    const route = approval_registry.WorkerRoute{
+        .context = &route_owner,
+        .submit_fn = Route.submit,
+        .cancel_fn = Route.cancel,
+        .pin_fn = Route.pin,
+        .release_fn = Route.release,
+    };
+    var done: std.Io.Event = .unset;
+    var stop = std.atomic.Value(bool).init(false);
+    const Rounds = struct {
+        fn run(app: *approval_registry.Registry, route_value: approval_registry.WorkerRoute, finished: *std.Io.Event) void {
+            var index: usize = 0;
+            while (index < 2000) : (index += 1) {
+                var buffer: [32]u8 = undefined;
+                const id = std.mem.print(&buffer, "approval-{d}", .{index}) catch break;
+                app.registerTool(id, "child-1", "root", "work-1", .{ .id = 7, .label = "Allow?" }, .{ .id = "call-1", .name = "shell", .arguments_json = "{}" }, &.{}, route_value, 1) catch break;
+                _ = app.resolve(id, "child-1", .once, null, 0) catch {
+                    // The decision is not what this test reads.
+                };
+            }
+            finished.set(io_mod.getIo());
+        }
+    };
+    const Toggle = struct {
+        fn run(slot_value: *Slot, stopped: *std.atomic.Value(bool)) void {
+            while (!stopped.load(.seq_cst)) {
+                slot_value.route_closed.store(true, .seq_cst);
+                slot_value.route_closed.store(false, .seq_cst);
+            }
+        }
+    };
+    // A stop holds the owner's lock; with a give-back under that lock, a
+    // resolution that read an open route and found it closed after incrementing
+    // would stall here.
+    owner.mutex.lockUncancelable(io_mod.getIo());
+    const toggler = try std.Thread.spawn(.{}, Toggle.run, .{ slot, &stop });
+    const resolver = try std.Thread.spawn(.{}, Rounds.run, .{ &approvals, route, &done });
+    const finished = if (done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } })) |_| true else |_| false;
+    stop.store(true, .seq_cst);
+    owner.mutex.unlock(io_mod.getIo());
+    toggler.join();
+    resolver.join();
+    try std.testing.expect(finished);
 }

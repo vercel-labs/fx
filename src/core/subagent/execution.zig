@@ -26,6 +26,12 @@ const history_range = @import("../shared/history_range.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// What a child reads when its approval request could not be announced.
+const unannounced_approval_feedback = "fx could not tell your parent about this request, so it was refused.";
+
+/// What a child reads when fx could not hold the request for an answer.
+const unheld_approval_feedback = "fx could not hold this request for your parent's answer, so it was refused.";
+
 /// Decides one tool call against a subagent's live authority, resolved fresh
 /// from `resolver` for `child_id`. The child engine and child agents both use
 /// it, so a subagent is held to its admission's tools and integrations
@@ -302,6 +308,10 @@ pub const TurnContext = struct {
     /// Null where no slot owns the turn.
     begin_context: ?*anyopaque = null,
     begin_fn: ?*const fn (*anyopaque) bool = null,
+    /// Called once a child's approval request is registered, so its parent
+    /// hears that the child waits on it. Null when nothing listens.
+    approval_note_context: ?*anyopaque = null,
+    approval_note_fn: ?*const fn (*anyopaque, []const u8, []const u8, []const u8) bool = null,
     live_metrics: ?*live_metrics.LiveMetrics = null,
     /// This child's event queue, which only the main loop drains.
     /// Borrowed from the subagent host for the turn.
@@ -501,6 +511,7 @@ pub const TurnContext = struct {
                 work_id,
                 prepared,
             ),
+            .call = call,
             .grants = grant_offer orelse &.{grant},
         };
         return self.workerRuntime().requestPermissionBlockingObserved(
@@ -508,12 +519,27 @@ pub const TurnContext = struct {
             request,
             review,
             .{ .context = &context, .observe_fn = PermissionObservation.observe },
-        );
+        ) catch |err| switch (err) {
+            // A request whose note went nowhere, or that fx could not hold for
+            // an answer, is refused at once with the reason the subagent reads
+            // (RULES.md R4.2): waiting would be for ever.
+            error.PermissionRegistrationFailed, error.PermissionCapacityExceeded => return permission_request.OwnedPermissionResponse.init(
+                alloc,
+                .deny,
+                try alloc.dupe(u8, if (context.note_failed) unannounced_approval_feedback else unheld_approval_feedback),
+            ),
+            else => return err,
+        };
     }
 
     const PermissionObservation = struct {
         turn: *TurnContext,
         stable_id: [64]u8,
+        /// The exact call the request is for, which the parent's answer checks.
+        call: types.ToolCall,
+        /// Set when the note to the parent could not be posted, so the refusal
+        /// names that reason instead of a request fx could not hold.
+        note_failed: bool = false,
         grants: []const types.PermissionGrant,
 
         fn observe(
@@ -530,12 +556,32 @@ pub const TurnContext = struct {
                 self.turn.alloc,
                 &self.stable_id,
                 request,
+                self.call,
                 self.grants,
             ) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.CapacityExceeded => error.PermissionCapacityExceeded,
                 else => error.PermissionRegistrationFailed,
             };
+            // The request is registered first, so the parent's answer finds it.
+            // Only a posted note counts as noted (`ParentApproval.tla` `Note`),
+            // and a note that could not be posted refuses the request at once
+            // (RULES.md R4.2), so the subagent never waits on a note nobody got.
+            if (self.turn.approval_note_fn) |note| {
+                const child_id = self.turn.child_id orelse return;
+                const context = self.turn.approval_note_context orelse return;
+                if (!note(context, child_id, self.turn.child_name orelse child_id, request.label)) {
+                    // Not `resolve` here: this observer runs under the worker's
+                    // mutex, which resolving takes again, so it would deadlock.
+                    // Withdrawing and failing clears the worker's request before
+                    // it waits, and `requestChildPermission` answers it with the
+                    // refusal the subagent reads.
+                    self.note_failed = true;
+                    if (self.turn.approval_registry) |registry| registry.withdraw(&self.stable_id);
+                    return error.PermissionRegistrationFailed;
+                }
+                if (self.turn.approval_registry) |registry| registry.markNoted(&self.stable_id);
+            }
         }
     };
 
@@ -573,6 +619,7 @@ pub const TurnContext = struct {
         alloc: Allocator,
         stable_request_id: []const u8,
         request: permission_request.PermissionRequest,
+        call: types.ToolCall,
         grants: []const types.PermissionGrant,
     ) (approval_registry_mod.Error || authority_mod.Error)!void {
         const registry = self.approval_registry orelse
@@ -590,6 +637,7 @@ pub const TurnContext = struct {
             authority.root_id,
             work_id,
             request,
+            call,
             grants,
             worker_route,
             io_mod.milliTimestamp(),
@@ -785,4 +833,456 @@ test "a subagent's tool calls are decided against its admission, whichever engin
         error.ChildNotAttached,
         resolveLiveToolActionFor(&resolver, "missing-child", null, arena.allocator(), .{ .id = "call-2", .name = "read_file", .arguments_json = "{}" }, home, "", .none),
     );
+}
+
+test "a request whose note cannot be posted is refused at once and withdrawn" {
+    const alloc = std.testing.allocator;
+    const Host = struct {
+        fn resolve(_: ?*anyopaque, a: Allocator, _: []const u8) authority_mod.HostResolveError!authority_mod.HostAuthority {
+            return authority_mod.HostAuthority.capture(a, &.{ "read_file", "shell" }, &.{}, .{}, &.{}) catch
+                return error.OutOfMemory;
+        }
+    };
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var child_registry = try child_state.Registry.init(alloc, parent.parent.id());
+    defer child_registry.deinit(alloc);
+    var work = child_state.ActiveWork{
+        .id = try alloc.dupe(u8, "work-1"),
+        .message = try alloc.dupe(u8, "task"),
+        .permission_mode = .ask,
+        .created_at_ms = 1,
+    };
+    defer work.deinit(alloc);
+    try child_registry.appendPersistent(alloc, "child-1", "worker", "", work);
+    try parent.stateStore().save(alloc, child_registry);
+    var resolver = authority_mod.Resolver{
+        .children = &parent.children,
+        .root_id = parent.parent.id(),
+        .host = .{ .resolve_fn = Host.resolve },
+    };
+    var approvals = approval_registry_mod.Registry{ .alloc = alloc };
+    defer approvals.deinit();
+    const Route = struct {
+        fn submit(
+            _: *anyopaque,
+            _: u64,
+            response: permission_request.OwnedPermissionResponse,
+            _: ?worker_runtime.WorkerRuntime.PermissionCommit,
+        ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+            var owned = response;
+            owned.deinit();
+            return .accepted;
+        }
+
+        fn cancel(_: *anyopaque) void {}
+
+        fn pin(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn release(_: *anyopaque) void {}
+    };
+    const Phase = struct {
+        fn apply(_: *anyopaque, _: []const u8, _: []const u8, _: child_state.Phase) anyerror!void {}
+    };
+    const NoNote = struct {
+        fn note(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
+            return false;
+        }
+    };
+    var context: u8 = 0;
+    var turn = TurnContext{
+        .alloc = alloc,
+        .runtime = undefined,
+        .managed_executions = undefined,
+        .child = null,
+        .child_id = "child-1",
+        .active_work_id = "work-1",
+        .approval_registry = &approvals,
+        .approval_worker_route = .{
+            .context = &context,
+            .submit_fn = Route.submit,
+            .cancel_fn = Route.cancel,
+            .pin_fn = Route.pin,
+            .release_fn = Route.release,
+        },
+        .live_authority = &resolver,
+        .phase_context = &context,
+        .phase_fn = Phase.apply,
+        .approval_note_context = &context,
+        .approval_note_fn = NoNote.note,
+    };
+
+    var response = try turn.permissionPrompter().request(
+        alloc,
+        .{ .label = "Allow?" },
+        .{ .id = "call-1", .name = "shell", .arguments_json = "{}" },
+        null,
+        null,
+    );
+    defer response.deinit();
+    // The worker's request was cleared before it waited, and the binding is
+    // gone, so the parent's answer can never find a request nobody was told of.
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, response.decision);
+    try std.testing.expect(std.mem.find(u8, response.feedback.?, "could not tell your parent") != null);
+    try std.testing.expect((try approvals.firstPendingForChild(alloc, "child-1")) == null);
+}
+
+test "a request the registry cannot hold is refused with its own reason" {
+    const alloc = std.testing.allocator;
+    const Host = struct {
+        fn resolve(_: ?*anyopaque, a: Allocator, _: []const u8) authority_mod.HostResolveError!authority_mod.HostAuthority {
+            return authority_mod.HostAuthority.capture(a, &.{"shell"}, &.{}, .{}, &.{}) catch
+                return error.OutOfMemory;
+        }
+    };
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var child_registry = try child_state.Registry.init(alloc, parent.parent.id());
+    defer child_registry.deinit(alloc);
+    var work = child_state.ActiveWork{
+        .id = try alloc.dupe(u8, "work-1"),
+        .message = try alloc.dupe(u8, "task"),
+        .permission_mode = .ask,
+        .created_at_ms = 1,
+    };
+    defer work.deinit(alloc);
+    try child_registry.appendPersistent(alloc, "child-1", "worker", "", work);
+    try parent.stateStore().save(alloc, child_registry);
+    var resolver = authority_mod.Resolver{
+        .children = &parent.children,
+        .root_id = parent.parent.id(),
+        .host = .{ .resolve_fn = Host.resolve },
+    };
+    var approvals = approval_registry_mod.Registry{ .alloc = alloc };
+    defer approvals.deinit();
+    const Route = struct {
+        fn submit(
+            _: *anyopaque,
+            _: u64,
+            response: permission_request.OwnedPermissionResponse,
+            _: ?worker_runtime.WorkerRuntime.PermissionCommit,
+        ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+            var owned = response;
+            owned.deinit();
+            return .accepted;
+        }
+
+        fn cancel(_: *anyopaque) void {}
+
+        fn pin(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn release(_: *anyopaque) void {}
+    };
+    const Phase = struct {
+        fn apply(_: *anyopaque, _: []const u8, _: []const u8, _: child_state.Phase) anyerror!void {}
+    };
+    var context: u8 = 0;
+    const route = approval_registry_mod.WorkerRoute{
+        .context = &context,
+        .submit_fn = Route.submit,
+        .cancel_fn = Route.cancel,
+        .pin_fn = Route.pin,
+        .release_fn = Route.release,
+    };
+    // `max_pending` is 64: fill it so the next registration cannot be held.
+    var slot: [16]u8 = undefined;
+    for (0..approval_registry_mod.max_pending) |index| {
+        const id = try std.mem.print(&slot, "fill-{d}", .{index});
+        try approvals.registerTool(id, "child-fill", parent.parent.id(), "work", .{ .id = index + 1, .label = "fill" }, .{ .id = "call-fill", .name = "shell", .arguments_json = "{}" }, &.{}, route, 1);
+    }
+    var turn = TurnContext{
+        .alloc = alloc,
+        .runtime = undefined,
+        .managed_executions = undefined,
+        .child = null,
+        .child_id = "child-1",
+        .active_work_id = "work-1",
+        .approval_registry = &approvals,
+        .approval_worker_route = route,
+        .live_authority = &resolver,
+        .phase_context = &context,
+        .phase_fn = Phase.apply,
+    };
+
+    var response = try turn.permissionPrompter().request(
+        alloc,
+        .{ .label = "Allow?" },
+        .{ .id = "call-1", .name = "shell", .arguments_json = "{}" },
+        null,
+        null,
+    );
+    defer response.deinit();
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, response.decision);
+    try std.testing.expect(std.mem.find(u8, response.feedback.?, "could not hold this request") != null);
+}
+
+test "a request is not counted as noted while its note is being posted" {
+    const alloc = std.testing.allocator;
+    const Host = struct {
+        fn resolve(_: ?*anyopaque, a: Allocator, _: []const u8) authority_mod.HostResolveError!authority_mod.HostAuthority {
+            return authority_mod.HostAuthority.capture(a, &.{ "read_file", "shell" }, &.{}, .{}, &.{}) catch
+                return error.OutOfMemory;
+        }
+    };
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var child_registry = try child_state.Registry.init(alloc, parent.parent.id());
+    defer child_registry.deinit(alloc);
+    var work = child_state.ActiveWork{
+        .id = try alloc.dupe(u8, "work-1"),
+        .message = try alloc.dupe(u8, "task"),
+        .permission_mode = .ask,
+        .created_at_ms = 1,
+    };
+    defer work.deinit(alloc);
+    try child_registry.appendPersistent(alloc, "child-1", "worker", "", work);
+    try parent.stateStore().save(alloc, child_registry);
+    var resolver = authority_mod.Resolver{
+        .children = &parent.children,
+        .root_id = parent.parent.id(),
+        .host = .{ .resolve_fn = Host.resolve },
+    };
+    var approvals = approval_registry_mod.Registry{ .alloc = alloc };
+    defer approvals.deinit();
+    const Route = struct {
+        fn submit(
+            raw: *anyopaque,
+            request_id: u64,
+            response: permission_request.OwnedPermissionResponse,
+            commit: ?worker_runtime.WorkerRuntime.PermissionCommit,
+        ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+            // The answer reaches the turn's own worker, which is what wakes it.
+            const worker: *worker_runtime.WorkerRuntime = @ptrCast(@alignCast(raw));
+            return worker.submitPermissionResponseAfterCommit(request_id, response, commit);
+        }
+
+        fn cancel(_: *anyopaque) void {}
+
+        fn pin(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn release(_: *anyopaque) void {}
+    };
+    const Phase = struct {
+        fn apply(_: *anyopaque, _: []const u8, _: []const u8, _: child_state.Phase) anyerror!void {}
+    };
+    // The note reads the registry from inside its own post, before the mark.
+    // `allPendingNoted` takes only the registry mutex, which the observer does
+    // not hold, so this cannot deadlock.
+    const Posting = struct {
+        approvals: *approval_registry_mod.Registry,
+        root_id: []const u8,
+        noted_while_posting: ?bool = null,
+
+        fn note(raw: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.noted_while_posting = self.approvals.allPendingNoted(self.root_id);
+            return true;
+        }
+    };
+    var note_context = Posting{ .approvals = &approvals, .root_id = parent.parent.id() };
+    var context: u8 = 0;
+    var turn = TurnContext{
+        .alloc = alloc,
+        .runtime = undefined,
+        .managed_executions = undefined,
+        .child = null,
+        .child_id = "child-1",
+        .active_work_id = "work-1",
+        .approval_registry = &approvals,
+        .live_authority = &resolver,
+        .phase_context = &context,
+        .phase_fn = Phase.apply,
+        .approval_note_context = &note_context,
+        .approval_note_fn = Posting.note,
+    };
+    // The route answers through the turn's own worker, so the request wakes.
+    turn.approval_worker_route = .{
+        .context = &turn.worker,
+        .submit_fn = Route.submit,
+        .cancel_fn = Route.cancel,
+        .pin_fn = Route.pin,
+        .release_fn = Route.release,
+    };
+
+    // The request waits for its answer, so it runs on its own thread, as it
+    // does on the subagent's.
+    const Runner = struct {
+        fn run(prompter: permission_prompter.Prompter, out: *?permission_request.OwnedPermissionResponse, done: *std.Io.Event) void {
+            out.* = prompter.request(
+                std.testing.allocator,
+                .{ .label = "Allow?" },
+                .{ .id = "call-1", .name = "shell", .arguments_json = "{}" },
+                null,
+                null,
+            ) catch null;
+            done.set(io_mod.getIo());
+        }
+    };
+    // An answer is accepted only while the worker runs a turn.
+    _ = turn.worker.beginDirectProcessing(1);
+    defer turn.worker.finishProcessing();
+    var response: ?permission_request.OwnedPermissionResponse = null;
+    var done: std.Io.Event = .unset;
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ turn.permissionPrompter(), &response, &done });
+
+    // Once the note returned, its mark is visible to the fallback.
+    var marked_seen = false;
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        if (approvals.allPendingNoted(parent.parent.id())) {
+            marked_seen = true;
+            break;
+        }
+        io_mod.sleep(10 * std.time.ns_per_ms);
+    }
+    var pending = (try approvals.firstPendingForChild(alloc, "child-1")) orelse {
+        thread.join();
+        return error.TestUnexpectedResult;
+    };
+    defer pending.deinit(alloc);
+    _ = try approvals.resolve(pending.request_id, pending.child_id, .once, null, io_mod.milliTimestamp());
+    done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } }) catch {
+        thread.join();
+        return error.Timeout;
+    };
+    thread.join();
+
+    var answered = response orelse return error.TestUnexpectedResult;
+    defer answered.deinit();
+    // The note's post never saw its own request counted as noted.
+    try std.testing.expectEqual(false, note_context.noted_while_posting.?);
+    try std.testing.expect(marked_seen);
+    try std.testing.expectEqual(types.ToolPermissionDecision.once, answered.decision);
+}
+
+test "a refused stop answer ends a child's permission wait with the reason" {
+    const alloc = std.testing.allocator;
+    const Host = struct {
+        fn resolve(_: ?*anyopaque, a: Allocator, _: []const u8) authority_mod.HostResolveError!authority_mod.HostAuthority {
+            return authority_mod.HostAuthority.capture(a, &.{ "read_file", "shell" }, &.{}, .{}, &.{}) catch
+                return error.OutOfMemory;
+        }
+    };
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var child_registry = try child_state.Registry.init(alloc, parent.parent.id());
+    defer child_registry.deinit(alloc);
+    var work = child_state.ActiveWork{
+        .id = try alloc.dupe(u8, "work-1"),
+        .message = try alloc.dupe(u8, "task"),
+        .permission_mode = .ask,
+        .created_at_ms = 1,
+    };
+    defer work.deinit(alloc);
+    try child_registry.appendPersistent(alloc, "child-1", "worker", "", work);
+    try parent.stateStore().save(alloc, child_registry);
+    var resolver = authority_mod.Resolver{
+        .children = &parent.children,
+        .root_id = parent.parent.id(),
+        .host = .{ .resolve_fn = Host.resolve },
+    };
+    var approvals = approval_registry_mod.Registry{ .alloc = alloc };
+    defer approvals.deinit();
+    const Route = struct {
+        fn submit(
+            raw: *anyopaque,
+            request_id: u64,
+            response: permission_request.OwnedPermissionResponse,
+            commit: ?worker_runtime.WorkerRuntime.PermissionCommit,
+        ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+            const worker: *worker_runtime.WorkerRuntime = @ptrCast(@alignCast(raw));
+            return worker.submitPermissionResponseAfterCommit(request_id, response, commit);
+        }
+
+        fn cancel(_: *anyopaque) void {}
+
+        fn pin(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn release(_: *anyopaque) void {}
+    };
+    const Phase = struct {
+        fn apply(_: *anyopaque, _: []const u8, _: []const u8, _: child_state.Phase) anyerror!void {}
+    };
+    // The note signals that the request is registered, so the refusal below
+    // meets it without polling.
+    const Note = struct {
+        registered: *std.Io.Event,
+
+        fn post(raw: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.registered.set(io_mod.getIo());
+            return true;
+        }
+    };
+    var context: u8 = 0;
+    var registered: std.Io.Event = .unset;
+    var note = Note{ .registered = &registered };
+    var turn = TurnContext{
+        .alloc = alloc,
+        .runtime = undefined,
+        .managed_executions = undefined,
+        .child = null,
+        .child_id = "child-1",
+        .active_work_id = "work-1",
+        .approval_registry = &approvals,
+        .live_authority = &resolver,
+        .phase_context = &context,
+        .phase_fn = Phase.apply,
+        .approval_note_context = &note,
+        .approval_note_fn = Note.post,
+    };
+    turn.approval_worker_route = .{
+        .context = &turn.worker,
+        .submit_fn = Route.submit,
+        .cancel_fn = Route.cancel,
+        .pin_fn = Route.pin,
+        .release_fn = Route.release,
+    };
+    _ = turn.worker.beginDirectProcessing(1);
+    defer turn.worker.finishProcessing();
+
+    const Runner = struct {
+        fn run(prompter: permission_prompter.Prompter, out: *?permission_request.OwnedPermissionResponse, done: *std.Io.Event) void {
+            out.* = prompter.request(
+                std.testing.allocator,
+                .{ .label = "Allow?" },
+                .{ .id = "call-1", .name = "shell", .arguments_json = "{}" },
+                null,
+                null,
+            ) catch null;
+            done.set(io_mod.getIo());
+        }
+    };
+    var response: ?permission_request.OwnedPermissionResponse = null;
+    var done: std.Io.Event = .unset;
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ turn.permissionPrompter(), &response, &done });
+    registered.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } }) catch {
+        thread.join();
+        return error.Timeout;
+    };
+
+    const refused = approvals.refuseChild("child-1", "Your parent stopped you before answering this request. Do not retry it.");
+    try std.testing.expectEqual(@as(usize, 1), refused.accepted);
+    done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } }) catch {
+        thread.join();
+        return error.Timeout;
+    };
+    thread.join();
+
+    var answered = response orelse return error.TestUnexpectedResult;
+    defer answered.deinit();
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, answered.decision);
+    try std.testing.expect(std.mem.find(u8, answered.feedback.?, "Your parent stopped you before answering this request") != null);
 }

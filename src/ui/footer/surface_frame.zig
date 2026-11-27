@@ -25,6 +25,8 @@ const effort_menu_presentation = @import("effort_menu_presentation.zig");
 const fork_menu_presentation = @import("fork_menu_presentation.zig");
 const agents_menu_presentation = @import("agents_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
+const wait_card_ui = @import("wait_card_ui.zig");
+const trust_prompt_ui = @import("trust_prompt_ui.zig");
 const render_input = @import("render_input.zig");
 const surface_invalidation = @import("surface_invalidation.zig");
 const footer_paint_plan = @import("paint_plan.zig");
@@ -34,6 +36,7 @@ const render_engine = @import("../render_engine.zig");
 const render_request = @import("../render_request.zig");
 const transcript_runtime = @import("../transcript/runtime.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
+const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
 const activity_overlay = render_engine.activity_overlay;
@@ -381,20 +384,27 @@ fn buildFooterSurfaceProjection(
     const viewer_active = ctx.transcript_depth.active();
     const activity_projection: ActivityProjection = if (viewer_active) .none else activity.projection;
     const active_label = if (viewer_active) null else activity.active_label;
-    const approval_active = approval != null;
+    const trust_active = render_input.shownTrustPrompt(ctx) != null;
+    const approval_active = !trust_active and approval != null;
     const question_projection = switch (mode) {
         .reservation => null,
-        .measurement, .frame => if (!viewer_active and !approval_active) ctx.question else null,
+        .measurement, .frame => if (!viewer_active and !trust_active and !approval_active) ctx.question else null,
     };
-    const compact_command_menu = if (!viewer_active and !approval_active and question_projection == null)
+    // The wait card takes the block the question panel takes, and only when
+    // no approval, question, or Folder access screen has it.
+    const wait_card_projection = switch (mode) {
+        .reservation => null,
+        .measurement, .frame => if (!viewer_active and !trust_active and !approval_active and question_projection == null) ctx.wait_card else null,
+    };
+    const compact_command_menu = if (!viewer_active and !trust_active and !approval_active and question_projection == null and wait_card_projection == null)
         render_input.activeCompactCommandMenu(ctx)
     else
         null;
     const compact_command_active = compact_command_menu != null;
-    const modal_active = !viewer_active and switch (mode) {
+    const modal_active = !viewer_active and (trust_active or switch (mode) {
         .reservation => approval_active or compact_command_active,
-        .measurement, .frame => approval_active or question_projection != null or compact_command_active,
-    };
+        .measurement, .frame => approval_active or question_projection != null or wait_card_projection != null or compact_command_active,
+    });
     const input_visible = ctx.composer_visible and !modal_active and !viewer_active;
     const composer_top_chrome_rows = footer_paint_plan.composerTopChromeRows();
     // The provider flow's inline API-key field is rendered in the composer column,
@@ -528,7 +538,7 @@ fn buildFooterSurfaceProjection(
         .file
     else
         .model_stage;
-    const sizing_request = if (approval) |value| value.request else null;
+    const sizing_request = if (approval_active) approval.?.request else null;
     const file_request = if (sizing_request) |request| request.file else null;
     const banner_rows = if (viewer_active) 0 else steeringBannerRowsForLayout(
         ctx,
@@ -605,7 +615,14 @@ fn buildFooterSurfaceProjection(
         banner_rows,
         agents_menu_presentation.max_inline_rows,
     );
-    const picker_rows: u16 = if (sizing_request) |request|
+    const picker_rows: u16 = if (render_input.shownTrustPrompt(ctx)) |prompt|
+        try trust_prompt_ui.panelRowCount(
+            alloc,
+            prompt,
+            shell.layout.cols,
+            question_ui.questionPanelRowBudget(shell.layout.rows, banner_rows),
+        )
+    else if (sizing_request) |request|
         if (request.file) |request_file|
             approval_ui.fileApprovalPickerRows(request_file)
         else
@@ -622,6 +639,8 @@ fn buildFooterSurfaceProjection(
             shell.layout.cols,
             question_ui.questionPanelRowBudget(shell.layout.rows, banner_rows),
         )
+    else if (wait_card_projection) |card|
+        wait_card_ui.rowCount(card, question_ui.questionPanelRowBudget(shell.layout.rows, banner_rows))
     else if (compact_command_menu) |menu|
         compact_command_menu_presentation.footerRowCount(menu, shell.layout.cols, shell.layout.rows)
     else if (show_auth_picker)
@@ -1311,7 +1330,7 @@ pub noinline fn resolveSurfaceFooterReservation(
 
     var bottom_reservation = BottomReservationState{};
     const input_visible_for_transient =
-        ctx.composer_visible and approval == null;
+        ctx.composer_visible and approval == null and render_input.shownTrustPrompt(ctx) == null;
     const composer_top_chrome_rows_for_transient = footer_paint_plan.composerTopChromeRows();
     const banner_rows_for_transient = steeringBannerRowsForLayout(
         ctx,
@@ -1321,7 +1340,7 @@ pub noinline fn resolveSurfaceFooterReservation(
         composer_top_chrome_rows_for_transient,
         0,
     );
-    const banner_active_for_transient = approval != null or banner_rows_for_transient > 0;
+    const banner_active_for_transient = approval != null or render_input.shownTrustPrompt(ctx) != null or banner_rows_for_transient > 0;
     var frame_plan = footer_paint_plan.planFooterPaint(shell, .{
         .active_label = active_label,
         .activity_projection = activity_projection,
@@ -1411,7 +1430,7 @@ fn prepareSurfaceFooterFrameInternal(
 
     if (!reservation.precomputed) {
         const input_visible_for_transient =
-            ctx.composer_visible and approval == null;
+            ctx.composer_visible and approval == null and render_input.shownTrustPrompt(ctx) == null;
         const composer_top_chrome_rows_for_transient = footer_paint_plan.composerTopChromeRows();
         const banner_rows_for_transient = steeringBannerRowsForLayout(
             ctx,
@@ -1421,7 +1440,7 @@ fn prepareSurfaceFooterFrameInternal(
             composer_top_chrome_rows_for_transient,
             0,
         );
-        const banner_active_for_transient = approval != null or banner_rows_for_transient > 0;
+        const banner_active_for_transient = approval != null or render_input.shownTrustPrompt(ctx) != null or banner_rows_for_transient > 0;
         const visible_banner_active_for_transient = banner_rows_for_transient > 0;
         frame_plan = footer_paint_plan.planFooterPaint(shell, .{
             .active_label = active_label,
@@ -3160,4 +3179,118 @@ test "file approval preparation over active subagent view keeps a valid footer i
         approval_ui.fileApprovalPickerRows(prompt.request.?.file.?),
         shell.extra_input_rows,
     );
+}
+
+test "the folder access panel replaces the composer" {
+    const auth_runtime = @import("../../core/auth/auth_runtime.zig");
+    const workspace_trust = @import("../../core/workspace_trust/workspace_trust.zig");
+    const alloc = std.testing.allocator;
+    const rows = [_]workspace_trust.prompt.Row{
+        .{ .name = "AGENTS.md", .detail = "instructions for the agent" },
+    };
+    const prompt: workspace_trust.prompt.Prompt = .{
+        .folder = "/Users/example/code/some-repo",
+        .cover = .this_folder,
+        .rows = &rows,
+    };
+
+    for ([_]u16{ 80, 48 }) |cols| {
+        var approval = ApprovalPrompt{};
+        defer approval.deinit(alloc);
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        try input.edit_state.input.appendSlice(alloc, "draft composer input");
+        input.edit_state.cursor = input.edit_state.input.items.len;
+
+        var shell = surfaceTestShell(30, cols);
+        defer shell.deinit(alloc);
+
+        var ctx = surfaceTestContext(&input);
+        ctx.trust_prompt = &prompt;
+        ctx.auth_picker = auth_runtime.PickerView{
+            .active = true,
+            .available_sources = auth_runtime.SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login }),
+            .selected_choice = .{ .source = .fx_login },
+            .active_source = .fx_login,
+            .include_skip = false,
+        };
+
+        var force_redraw = false;
+        const reservation = try resolveSurfaceFooterReservation(
+            alloc,
+            &shell,
+            &force_redraw,
+            approval.projection(),
+            ctx,
+            currentSurfaceFooterTranscriptState(&shell),
+        );
+        var metrics = Metrics{};
+        var frame = try prepareSurfaceFooterFrameWithReservation(
+            alloc,
+            &shell,
+            &metrics,
+            &force_redraw,
+            approval.projection(),
+            ctx,
+            reservation,
+            FrameInvalidationSet.empty(),
+        );
+        defer frame.deinit(alloc);
+        try frame.paint.validate();
+        try std.testing.expect(!frame.composed.cursor_visible);
+
+        var shadow = try vt_emulator.Grid.init(alloc, shell.layout.cols, shell.layout.rows);
+        defer shadow.deinit();
+        var surface = try render_engine.frame_surface.FrameSurface.initFromShadow(alloc, frame.paint, shadow);
+        defer surface.deinit();
+        _ = try footer_viewport.paintFooterIntoSurface(&surface, &frame.composed);
+        var target = try surface.copyToTargetGrid(alloc);
+        defer target.deinit();
+
+        var saw_title = false;
+        var saw_allow = false;
+        var saw_exit = false;
+        var saw_hint = false;
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(alloc);
+        var row_buf: std.ArrayList(u8) = .empty;
+        defer row_buf.deinit(alloc);
+
+        var row_num: u16 = 1;
+        while (row_num <= shell.layout.rows) : (row_num += 1) {
+            row_buf.clearRetainingCapacity();
+            try target.rowTextTrimmed(row_num, &row_buf);
+            const trimmed = std.mem.trim(u8, row_buf.items, " ");
+            if (std.mem.eql(u8, trimmed, "Folder access")) saw_title = true;
+            if (std.mem.eql(u8, trimmed, "❯ Yes, allow")) saw_allow = true;
+            if (std.mem.eql(u8, trimmed, "No, exit")) saw_exit = true;
+            if (std.mem.find(u8, row_buf.items, "enter confirm") != null and
+                std.mem.find(u8, row_buf.items, "esc exit") != null)
+            {
+                saw_hint = true;
+            }
+            try std.testing.expect(std.mem.find(u8, row_buf.items, "┃") == null);
+            try std.testing.expect(std.mem.find(u8, row_buf.items, "draft composer input") == null);
+            try std.testing.expect(std.mem.find(u8, row_buf.items, "Sign in with") == null);
+            try std.testing.expect(std.mem.find(u8, row_buf.items, "fx login") == null);
+
+            if (trimmed.len > 0) {
+                var tokens = std.mem.tokenizeScalar(u8, trimmed, ' ');
+                while (tokens.next()) |token| {
+                    if (joined.items.len > 0) try joined.append(alloc, ' ');
+                    try joined.appendSlice(alloc, token);
+                }
+            }
+        }
+
+        try std.testing.expect(saw_title);
+        try std.testing.expect(saw_allow);
+        try std.testing.expect(saw_exit);
+        try std.testing.expect(saw_hint);
+        try std.testing.expect(std.mem.find(
+            u8,
+            joined.items,
+            "Allow fx to read, edit, delete and run files in this folder, within your permission mode?",
+        ) != null);
+    }
 }
