@@ -1527,6 +1527,58 @@ test "steering banner keeps two clean lines and a composer gap in both delivery 
     }
 }
 
+test "narrow parent steering banner carries label and wraps text onto second row" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+
+    // Width 15 -> content_width 13 -> 1 cell left after "from main · ", so "😀hello"
+    // cannot fit on row 0 and must wrap onto row 1 instead of truncating empty.
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 12,
+            .cols = 15,
+            .content_bottom = 6,
+            .divider_top_row = 7,
+            .input_row = 8,
+            .divider_bottom_row = 9,
+            .hint_row = 10,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 4,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    const messages = [_][]const u8{"😀hello"};
+    const authors = [_]types.MessageAuthor{.parent};
+    var ctx = testContext(&input);
+    ctx.steering_messages = &messages;
+    ctx.steering_message_authors = &authors;
+    ctx.steering_waits_for_boundary = true;
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .input_visible = true,
+        .composer_top_chrome_rows = composerTopChromeRows(),
+        .picker_rows = 0,
+        .footer_extra_rows = 3,
+        .banner_active = true,
+        .banner_rows = 3,
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+    defer frame.deinit(alloc);
+
+    const banner = frame_plan.paint.footer.banner;
+    try expectFrameRowContains(&frame, banner, shell.layout.cols, "┋ from main ·");
+    try expectFrameRowContains(&frame, banner + 1, shell.layout.cols, "┋ 😀hello");
+}
+
 test "current composer renders a white connected rail across its rows" {
     const alloc = std.testing.allocator;
     ui_render.initTheme(false, null);

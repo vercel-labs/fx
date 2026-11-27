@@ -586,6 +586,12 @@ pub fn steering_message_layout_with_author(
     const limit = @min(row_limit, max_message_layout_rows);
     var offset: usize = 0;
     while (layout.row_count < limit) {
+        if (layout.content_width == 0) {
+            layout.rows[layout.row_count] = "";
+            layout.row_count += 1;
+            layout.truncated = message.len > 0;
+            break;
+        }
         const row_width: u16 = if (author == .parent and layout.row_count == 0)
             layout.content_width -| parent_steering_prefix_width
         else
@@ -630,7 +636,8 @@ pub fn steering_message_layout_with_author(
         layout.rows[layout.row_count] = message[start..end];
         layout.row_count += 1;
         if (offset == message.len) break;
-        if (layout.row_count == limit or (row_width > 0 and !hard_break and end == start)) {
+        const first_parent_row_deferred = author == .parent and layout.row_count == 1 and limit > 1 and layout.content_width > row_width;
+        if (layout.row_count == limit or (row_width > 0 and !hard_break and end == start and !first_parent_row_deferred)) {
             layout.rows[layout.row_count - 1] = message[start..@min(end, ellipsis_end)];
             layout.truncated = true;
             break;
@@ -711,6 +718,28 @@ test "steering preview layout retains prefix slices at row boundaries" {
         try std.testing.expectEqualStrings(case.second, layout.rows[1]);
         try std.testing.expectEqual(case.truncated, layout.truncated);
     }
+}
+
+test "parent steering layout advances past narrow first row instead of dropping message" {
+    // Wide glyph does not fit in the 1 cell left after "from main · " at width 15.
+    const wide = steering_message_layout_with_author("😀hello", .parent, 15, true, 2);
+    try std.testing.expectEqual(@as(u16, 2), wide.row_count);
+    try std.testing.expectEqualStrings("", wide.rows[0]);
+    try std.testing.expectEqualStrings("😀hello", wide.rows[1]);
+    try std.testing.expect(!wide.truncated);
+
+    // Zero cells left after prefix at width 12 still carries text onto row 1.
+    const narrow = steering_message_layout_with_author("check parser", .parent, 12, true, 2);
+    try std.testing.expectEqual(@as(u16, 2), narrow.row_count);
+    try std.testing.expectEqualStrings("", narrow.rows[0]);
+    try std.testing.expectEqualStrings("check", narrow.rows[1]);
+    try std.testing.expect(narrow.truncated);
+
+    // Zero content width stops at one row instead of emitting blank rows.
+    const zero = steering_message_layout_with_author("check", .parent, 2, true, 2);
+    try std.testing.expectEqual(@as(u16, 1), zero.row_count);
+    try std.testing.expectEqualStrings("", zero.rows[0]);
+    try std.testing.expect(zero.truncated);
 }
 
 pub fn transientActivityGapRows(shell: *const TranscriptRuntime, tool_before_activity: bool) u16 {

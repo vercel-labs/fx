@@ -80,8 +80,14 @@ pub fn composeSteeringMessageRowsWithAuthor(
         try row.appendSlice(alloc, if (waits_for_boundary) ui_render.dim_style else ui_render.hint_style);
         if (waits_for_boundary) try row_text.appendClipped(alloc, &row, "┋ ", width);
         if (author == .parent and index == 0) {
-            try row_text.appendClipped(alloc, &row, render_input.parent_steering_prefix, layout.content_width);
-            try appendMessageLayoutRowWithWidth(alloc, &row, layout, index, layout.content_width -| render_input.parent_steering_prefix_width);
+            const prefix_ellipsis = layout.truncated and layout.row_count == 1 and
+                layout.content_width <= render_input.parent_steering_prefix_width and layout.content_width > 0;
+            try row_text.appendClipped(alloc, &row, render_input.parent_steering_prefix, layout.content_width - @as(u16, @intFromBool(prefix_ellipsis)));
+            if (prefix_ellipsis) {
+                try row.appendSlice(alloc, "…");
+            } else {
+                try appendMessageLayoutRowWithWidth(alloc, &row, layout, index, layout.content_width -| render_input.parent_steering_prefix_width);
+            }
         } else {
             try appendMessageLayoutRow(alloc, &row, layout, index);
         }

@@ -1483,7 +1483,7 @@ const App = struct {
         author: types.MessageAuthor,
     ) !bool {
         try AgentAppRuntime.refreshProjectContext(self, agent);
-        self.noteModelCatalogActivity();
+        if (author == .user) self.noteModelCatalogActivity();
         agent.session.setConversationLanguageFromUserMessage(prompt);
 
         debug_trace.logf(
@@ -9059,6 +9059,11 @@ test "subagent first prompt from main queues .parent and saves an author item in
     try fixture.init();
     defer fixture.deinit();
     const app = &fixture.app;
+    app.context_enabled = false;
+    defer {
+        app.model_cache.deinit();
+        app.token_pass_check.deinit();
+    }
     const child = try addTestChildAgent(app, "child-1");
     child.session_attached = true;
     child.view_built = true;

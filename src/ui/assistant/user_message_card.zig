@@ -1047,3 +1047,32 @@ test "buildTurnCardWithSkillTokensForTerminalPresentation renders dim from main 
     try std.testing.expect(std.mem.find(u8, user_card, "┃\x1b[0m \x1b[1mtyped by user") != null);
     try std.testing.expect(std.mem.find(u8, user_card, "from main") == null);
 }
+
+test "parent card escapes control bytes, OSC sequences, and wraps long text without rail or bold" {
+    setStyle(false, null);
+    const alloc = std.testing.allocator;
+    const long_word = text_utils.repeat("superlongsegmentwithoutspacesthatwrapsacrossrows", 6);
+    const hostile = "before \x1b[31mred\x1b[0m\rCR\x07BEL\x1b]2;pwned\x07 " ++ long_word;
+    const card = try buildTurnCardWithSkillTokensForTerminalPresentation(
+        alloc,
+        .parent,
+        hostile,
+        &.{},
+        40,
+        &.{},
+    );
+    defer alloc.free(card);
+
+    const header = shared_theme.fx_dark.statusline_style ++ "from main\x1b[0m\n";
+    try std.testing.expect(std.mem.startsWith(u8, card, header));
+    const body = card[header.len..];
+    try std.testing.expect(std.mem.findScalar(u8, body, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, body, '\r') == null);
+    try std.testing.expect(std.mem.findScalar(u8, body, 0x07) == null);
+    try std.testing.expect(std.mem.find(u8, body, "┃") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\\x0dCR\\x07BEL") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\\x1b") != null);
+    try std.testing.expect(std.mem.find(u8, body, "pwned") != null);
+    try std.testing.expect(std.mem.count(u8, body, "\n") > 4);
+    try std.testing.expect(std.mem.startsWith(u8, body, "  before\n"));
+}
