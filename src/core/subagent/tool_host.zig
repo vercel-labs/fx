@@ -7652,15 +7652,14 @@ const GapTrace = struct {
 };
 
 /// What every gap test builds: a parent log, main's worker, a fixture that
-/// runs the children, the host, and a trace for the `mailbox` scope. Its parts
-/// point at each other, so it stays where `init` built it.
+/// runs the children, and the host. Its parts point at each other, so it stays
+/// where `init` built it.
 const GapFixture = struct {
     arena_state: std.heap.ArenaAllocator,
     parent: child_state.TestParent,
     worker: worker_runtime.WorkerRuntime,
     fixture: MailboxFixture,
     runtime: *Runtime,
-    trace: GapTrace,
     armed: bool,
 
     const Options = struct {
@@ -7685,21 +7684,17 @@ const GapFixture = struct {
         errdefer self.fixture.deinit();
         self.runtime = try mailboxRuntime(alloc, &self.fixture, &self.parent);
         errdefer self.runtime.deinit();
-        try self.trace.init(alloc);
-        errdefer self.trace.deinit(alloc);
         self.armed = false;
         if (options.armed) self.arm();
     }
 
-    /// Releases a held host first, so the runtime can join it, and keeps the
-    /// trace until the runtime's threads are gone.
+    /// Releases a held host first, so the runtime can join it.
     fn deinit(self: *GapFixture) void {
         const alloc = std.testing.allocator;
         SettleGap.go.set(io_mod.getIo());
         if (self.armed) SettleGap.disarm();
         self.runtime.deinit();
         self.fixture.deinit();
-        self.trace.deinit(alloc);
         self.worker.deinit(alloc);
         self.parent.deinit();
         self.arena_state.deinit();
@@ -7790,15 +7785,17 @@ const GapWait = struct {
 
     /// Starts the wait, and returns once it is about to block: the host has
     /// found that something can still arrive and sends `noteWaitBlocking`
-    /// right before it blocks. The wait's thread is joined on failure.
+    /// right before it blocks. On failure the wait's thread is joined first,
+    /// then the hook is disarmed, because that thread may still read the hook
+    /// until it has returned.
     fn startBlocked(self: *GapWait) !void {
         WaitBlocking.arm();
         errdefer WaitBlocking.disarm();
         try self.start();
         WaitBlocking.blocked.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
-            WaitBlocking.disarm();
             self.worker.requestCancel();
             self.thread.join();
+            WaitBlocking.disarm();
             std.debug.print("wait never blocked\n", .{});
             return error.WaitNeverBlocked;
         };
