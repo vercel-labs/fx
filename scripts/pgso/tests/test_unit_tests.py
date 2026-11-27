@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import pathlib
 import sys
@@ -39,6 +41,14 @@ class TransformedUnitTestsTests(unittest.TestCase):
         path.write_text(f"#!{sys.executable}\n{body}\n")
         path.chmod(0o755)
         return path
+
+    def run_tests_capturing_stdout(self, binary: pathlib.Path) -> tuple[dict[str, object], str]:
+        """A retry that passes prints a workflow command. On the job's own stdout the
+        runner would turn it into a real annotation, so the tests that retry read it here."""
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            summary = unit_tests.run_tests(binary, self.root, self.paths.logs / "unit-tests.json")
+        return summary, stdout.getvalue()
 
     def test_the_unit_test_artifact_has_its_own_layout(self) -> None:
         self.assertEqual("fx-test", self.paths.control_binary.name)
@@ -178,8 +188,9 @@ class TransformedUnitTestsTests(unittest.TestCase):
             "sys.stderr.write('1/2 a...OK\\n2/2 b...OK\\nAll 2 tests passed.\\n')",
         )
 
-        summary = unit_tests.run_tests(binary, self.root, self.paths.logs / "unit-tests.json")
+        summary, stdout = self.run_tests_capturing_stdout(binary)
 
+        self.assertIn("::warning title=Unit tests passed only on retry::b", stdout.splitlines())
         self.assertEqual(2, summary["passed"])
         self.assertTrue(summary["retried"])
         self.assertEqual(["b"], summary["first_attempt"]["failed_tests"])
@@ -204,8 +215,9 @@ class TransformedUnitTestsTests(unittest.TestCase):
             "sys.stderr.write('\\n'.join(lines) + '\\nAll 16000 tests passed.\\n')",
         )
 
-        summary = unit_tests.run_tests(binary, self.root, self.paths.logs / "unit-tests.json")
+        summary, stdout = self.run_tests_capturing_stdout(binary)
 
+        self.assertIn("::warning title=Unit tests passed only on retry::an early test", stdout.splitlines())
         first = json.loads((self.paths.logs / "unit-tests.json").read_text())
         self.assertGreater(first["stderr_total_chars"], 1024 * 1024)
         self.assertFalse(first["stderr_truncated"])

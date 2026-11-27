@@ -1093,7 +1093,7 @@ test "a subagent made before its parent's server starts may use the server's too
     try testing.expectEqual(@as(usize, 1), view.servers.len);
     try testing.expectEqualStrings("fake", view.servers[0].name);
     try testing.expectEqual(@as(usize, 0), view.tools.len);
-    const child: Access = .{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } };
+    const child: Access = .{ .scoped = .{ .captured = &view } };
     try testing.expect(c.hasTool("mcp_fake_echo", child));
     try testing.expectEqual(c.currentGeneration(), (try c.validateTool(a, "mcp_fake_echo", "{}", child)).valid);
     const result = (try c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .access = child })).?;
@@ -1103,7 +1103,7 @@ test "a subagent made before its parent's server starts may use the server's too
     var other = try view.clone(testing.allocator);
     defer other.deinit(testing.allocator);
     other.runtime_generation +%= 1;
-    const stale: Access = .{ .scoped = .{ .captured = &other, .admission_authority_generation = 0, .live = undefined } };
+    const stale: Access = .{ .scoped = .{ .captured = &other } };
     try testing.expect(!c.hasTool("mcp_fake_echo", stale));
     try testing.expectError(error.McpAccessDenied, c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .access = stale }));
 }
@@ -1202,7 +1202,7 @@ test "an MCP server's tools reach the model under fx's names" {
     var view = try c.snapshotAccessView(testing.allocator, "child", "parent");
     defer view.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), view.tools.len);
-    try testing.expect(Access.allowsTool(.{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } }, c.currentGeneration(), "mcp_fake_echo"));
+    try testing.expect(c.hasTool("mcp_fake_echo", .{ .scoped = .{ .captured = &view } }));
     const names = try c.serverNames(testing.allocator);
     defer {
         for (names) |name| testing.allocator.free(name);
@@ -1289,7 +1289,7 @@ test "a reload beside a call that is out and a reader of the access view ends on
     // A subagent's admission: the view it was given.
     var view = try c.snapshotAccessView(testing.allocator, "child", "parent");
     defer view.deinit(testing.allocator);
-    const child: Access = .{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } };
+    const child: Access = .{ .scoped = .{ .captured = &view } };
 
     // Its calls, one on each server, which never answer.
     const Caller = struct {
