@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
-import { composerContains, FAKE_GATEWAY_MODEL, fakeGatewayFinalText, fakeShellRun, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { composerContains, FAKE_GATEWAY_MODEL, fakeGatewayFinalText, fakeShellRun, startFakeGateway, TmuxSession, tmuxAvailable, turnSettled } from "./tmux-helpers";
 
 const tmuxTest = test.skipIf(!tmuxAvailable());
 const PASTE_START = ["1b", "5b", "32", "30", "30", "7e"] as const;
@@ -114,7 +114,7 @@ tmuxTest("native-clear recovery after a tool call keeps fx running and the tool 
     await session.waitForComposer(10_000);
     await session.sendLiteral("run the check");
     await session.sendKeys("Enter");
-    await session.waitForText("TOOL_TURN_DONE", 10_000);
+    await session.waitForPane((pane) => pane.includes("TOOL_TURN_DONE") && turnSettled(pane), 10_000);
 
     clearPaneTerminal(session);
     await session.sendLiteral("abc");
@@ -264,7 +264,7 @@ tmuxTest("typing inside the ctrl+o full transcript never starts the native-clear
     // One completed turn so the full transcript has content to open.
     await session.sendLiteral("hello");
     await session.sendKeys("Enter");
-    await session.waitForText("ctrl-o probe target", 10_000);
+    await session.waitForPane((pane) => pane.includes("ctrl-o probe target") && turnSettled(pane), 10_000);
 
     // Control: a printable byte in the main view starts and settles the probe.
     await session.sendLiteral("a");

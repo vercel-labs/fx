@@ -78,6 +78,8 @@ Key rules:
 
 * `src/core/recovery/` decides how one model request recovers: when to retry, how long to wait, when to try another way, what the status line says, and what to save so the request survives a closed window or a crash. fx reports events to `step` and carries out the plan it returns. The module performs no I/O, reads no clock, and never allocates. Outside code imports only its front door, `recovery.zig`, and the module imports only the standard library. `tests/tla/recovery/Recovery.tla` models it, and `scripts/check-recovery-boundary.sh` enforces the boundary in CI.
 
+* `src/core/quiesce/` decides when a running turn stops for its host: only at the save right before a model request, after the prompt's first request, and never in a compaction or a paused retry. The libfx journal asks it at its host's deadline, and the agent loop asks it when the TUI restarts for an upgrade (Ctrl+G). Like `src/core/recovery/`, it performs no I/O, reads no clock, never allocates, and imports only the standard library. `tests/tla/recovery/Resume.tla` models the restart.
+
 * `src/core/agents/` owns `Agent`, one conversation's own state: its session, worker, stream, prompts, submission, title, totals, attachments, diffs, and undo stack. `App.main_agent` holds the main conversation's. Outside code imports only its front door, `agents.zig`, and the folder never imports `src/ui/`, the terminal runtime, or `main.zig`, nor a file that imports `src/ui/` or `main.zig` itself, because the app that shows an agent owns the screen. Generic helpers probe these fields with `agents.hasAgentField`, not `@hasField`, and test apps nest them under `main_agent` the same way. `scripts/check-agents-boundary.sh` enforces the imports in CI.
 
 * `src/core/shell_command/safe_git.zig` runs git for the `fx pr` and `fx issue` snapshot and for the agent's direct read-only `git status`, `git diff`, and `git log` when the command does not use the user's own shell environment. It turns off every program a repository's own config can name and refuses to run when git would use a different repository than the one fx read. In `auto` mode a git command it refuses is returned to the agent without running. Commands that run in a shell use git with the repository's full config: git in the shell tool's default `user` environment, and the routine commands `auto` mode runs without review, such as `git status` with other flags, `git fetch`, or `npm test`.
@@ -237,25 +239,13 @@ Use the `zig` skill (`.fx/skills/zig/SKILL.md`) when you write, review, or upgra
 
 ### Zig 0.17 Standard Library
 
-fx does not use declarations that Zig 0.17 deprecates. They still compile, so check new code against this list:
+fx does not use declarations that Zig 0.17 deprecates or removed. They can still compile, so `Build & Test` runs `python3 .fx/skills/zig/scripts/check_deprecated.py src build.zig benchmarks tests`. It fails on a std declaration it can name, such as `std.fmt.bufPrint`, and lists a match that depends on the receiver's type, such as `.getLast()`, only with `--review`. Its rule tables are the only list, and each finding names the replacement, so run it with `--review` on the files you change. fx also has its own rules:
 
-* Format with `alloc.print(fmt, args)` and `std.mem.print(buf, fmt, args)`, not `std.fmt.allocPrint` or `std.fmt.bufPrint`.
-
-* Search with the `std.mem.find` family (`find`, `findScalar`, `findAny`, `findLast`, `findScalarLast`, and their `Pos` variants), not `indexOf` or `lastIndexOf`. Trim with `trimStart` and `trimEnd`.
-
-* Copy overlapping slices with `@memmove(dest, src)`, not `std.mem.copyForwards` or `copyBackwards`. Both slices must have the same length.
-
-* Resolve paths with `std.Io.Dir.path.resolveAlloc` and `relativeAlloc`.
-
-* Read the target from `builtin.target.os`, `builtin.target.cpu`, and `builtin.target.abi`, and the optimization mode from `builtin.optimize` (`.debug`, `.safe`, `.fast`, `.small`). Gate safety-only work on `builtin.optimize.runtimeSafety()`. Language types live in `std.lang`, not `std.builtin`.
-
-* Use `std.ArrayList`, `std.array_hash_map.String` and `.Auto`, and `std.bit_set.Dynamic` and `.Static`, not the `Unmanaged` or `BitSet` aliases. Read the last list item with `last()`.
-
-* Convert enums with `@backingInt` and `@fromBackingInt`. Divide rounding up with `@divCeil`.
+* Decode one UTF-8 sequence with `display_width.decodeUtf8Sequence` from `src/core/shared/display_width.zig`.
 
 * `@hasDecl` only finds `pub` declarations, so a declaration that a duck-typed caller probes for must be `pub`.
 
-* Decode one UTF-8 sequence with `display_width.decodeUtf8Sequence` from `src/core/shared/display_width.zig`, not `std.unicode.utf8Decode`.
+* Divide rounding up with `@divCeil`.
 
 ### Testing
 
@@ -333,7 +323,7 @@ Do not run the complete deterministic test suite locally as the default developm
 
 After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. Linux is the gate for every change because most fx behavior is identical on every platform:
 
-* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the agents, compactor, indexer, and recovery boundaries, model-checks request recovery, the empty-reply nudge, the malformed tool call feedback, and the compaction row's number, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
+* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, deprecated Zig declarations, the PGSO corpus, the public surface, and the agents, compactor, indexer, and recovery boundaries, model-checks request recovery, the empty-reply nudge, the malformed tool call feedback, and the compaction row's number, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
 * `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests every target's binary. See **Binary Size Observability**.
 * `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
 
@@ -343,7 +333,7 @@ macOS runs only when `scripts/detect-macos-need.sh` finds a change that can beha
 
 The durable-session model check in the `SDK (Bun + N-API/WASM)` job takes about 40 minutes, so a pull request runs it only when `scripts/detect-ci-need.sh` finds a change to code libfx owns: `sdk/`, `tests/tla/sdk/`, the drivers in `tests/tla/drivers/*.mjs`, the Node-API and WebAssembly core entry points, `src/acp/`, `src/core/hosts/`, `src/core/session_manager/`, `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs it, which catches a durable-session regression in shared code such as the agent loop after it merges. To run it for any other change, run `gh workflow run ci.yml --ref <branch>`. If the detector cannot read the change, `Build & Test` fails instead of passing.
 
-The `TLA+ MCP engine models and driver` and `TLA+ MCP host models and drivers` jobs run in parallel and take about 20 minutes each, so a pull request runs their model checks and drivers only when the same detector finds a change to `src/mcp/`, `src/core/mcp_host/`, `src/core/mcp/`, `src/core/shared/net_connect.zig`, the models in `tests/tla/mcp/` and `tests/tla/mcp_host/`, their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, and `tests/tla/drivers/lib/`, the `tests/e2e/fixtures/mcp-*` servers, the helpers those drivers load (`tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs them, and the same `gh workflow run ci.yml --ref <branch>` runs them for any other change.
+The `TLA+ MCP engine models and driver`, `TLA+ MCP host SignIn model`, `TLA+ MCP host other models` and `TLA+ MCP host drivers` jobs run in parallel and take 7 to 28 minutes, so a pull request runs their model checks and drivers only when the same detector finds a change to `src/mcp/`, `src/core/mcp_host/`, `src/core/mcp/`, `src/core/shared/net_connect.zig`, the models in `tests/tla/mcp/` and `tests/tla/mcp_host/`, their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, and `tests/tla/drivers/lib/`, the `tests/e2e/fixtures/mcp-*` servers, the helpers those drivers load (`tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs them, and the same `gh workflow run ci.yml --ref <branch>` runs them for any other change.
 
 The `TLA+ transcript window model` job takes about 4 minutes, so a pull request runs it only when the same detector finds a change to `src/ui/transcript/transcript_window*`, the model in `tests/tla/transcript_window/`, its drivers in `tests/tla/drivers/transcript_window/`, the driver code they share (`tests/tla/drivers/lib/` and `tests/tla/drivers/graph.mjs`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. It runs `tests/tla/transcript_window/check.sh --ci`, which leaves out the planted bugs and the run of a built fx along the model; run `tests/tla/transcript_window/check.sh` without `--ci` before you change the window.
 
@@ -355,7 +345,7 @@ The custom model connection model check, `.github/workflows/tla-configured-provi
 
 The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. To qualify any other change, run `gh workflow run pgso-macos-arm64.yml --ref <branch>`. The stable release always runs it.
 
-The Linux arm64 PGSO workflow, `.github/workflows/pgso-linux-arm64.yml`, builds and qualifies a Linux candidate in one job on a GitHub-hosted arm64 runner, which takes several hours. It runs on the same pull request paths, with its own workflow file in place of the macOS one, and `gh workflow run pgso-linux-arm64.yml --ref <branch>` runs it for any other change. The stable release always runs it and ships its candidate as the Linux arm64 binary. `.github/workflows/pgso-linux-x86_64.yml` does the same on a GitHub-hosted x86_64 runner, on the same pull request paths with its own workflow file, and the stable release ships its candidate as the Linux x86_64 binary.
+The Linux arm64 PGSO workflow, `.github/workflows/pgso-linux-arm64.yml`, builds and qualifies a Linux candidate on GitHub-hosted arm64 runners with the same sharded jobs as the macOS workflow. It runs on the same pull request paths, with its own workflow file in place of the macOS one, and `gh workflow run pgso-linux-arm64.yml --ref <branch>` runs it for any other change. The stable release always runs it and ships its candidate as the Linux arm64 binary. `.github/workflows/pgso-linux-x86_64.yml` does the same on a GitHub-hosted x86_64 runner, on the same pull request paths with its own workflow file, and the stable release ships its candidate as the Linux x86_64 binary.
 
 Live model evals and the live ACP suite need credentials and are not deterministic, so they run only on request. Run the live ACP suite with `gh workflow run ci.yml --ref <branch> -f acp_live=true`.
 
@@ -475,7 +465,7 @@ To prepare a release:
 3. Write the changelog entry in `CHANGELOG.md` at the top, under a new `## <version>` heading, wrapped in `<!-- release:start -->` and `<!-- release:end -->` markers. Remove the markers from the previous release entry so only the new release has them.
 4. Open a PR and merge to `main`
 
-When the PR merges, CI compares the version tag to what exists in git. If the tag is missing, it builds all platform binaries, creates the git tag, and publishes a GitHub Release with the binaries attached. The release body is extracted from the content between the `<!-- release:start -->` and `<!-- release:end -->` markers in `CHANGELOG.md`.
+When the PR merges, CI compares the version tag to what exists in git. If the tag is missing, it builds all platform binaries, creates the git tag, and publishes a GitHub Release with the binaries attached. Only the push that changes the version starts a release. To retry a failed release after a fix, run the Release workflow on `main` by hand with `validate_only` off. The release body is extracted from the content between the `<!-- release:start -->` and `<!-- release:end -->` markers in `CHANGELOG.md`.
 
 ### Writing the changelog
 

@@ -393,6 +393,10 @@ pub const TranscriptEntry = union(enum) {
         id: u32,
         created_at_ms: i64 = 0,
         inline_hidden: bool = false,
+        /// Holds a line fx wrote between steps, such as the empty-reply
+        /// nudge. It draws as any other text; the main screen draws the
+        /// turn's later calls below it (`breaksPresentationGroup`).
+        operational: bool = false,
         segments: AssistantTurnSegments,
     };
 
@@ -2429,6 +2433,7 @@ const RenderedEntries = struct {
     bytes: []u8,
     target_entry_start_line: ?usize,
     target_entry_start_byte: ?usize,
+    tail_start_byte: ?usize = null,
 };
 
 const BlockSequenceState = struct {
@@ -2451,6 +2456,14 @@ const BlockSequenceState = struct {
     fn attachedNewlineCountBefore(self: BlockSequenceState) u16 {
         if (!self.emitted_any) return 0;
         return 1 -| @intFromBool(self.previous_ends_with_newline);
+    }
+
+    /// The newlines that continue the previous block's text: the newlines its
+    /// text ended with, which the block drops, so the blank rows they make stay
+    /// as they will when the next text commits into the same block.
+    fn continuedTextNewlineCountBefore(self: BlockSequenceState) usize {
+        if (!self.emitted_any) return 0;
+        return @max(1, self.final_tail_newlines) -| @intFromBool(self.previous_ends_with_newline);
     }
 
     fn observe(
@@ -2482,6 +2495,8 @@ const RenderEntriesOptions = struct {
     summary_transcript_indices: []usize = &.{},
     line_provenance: ?*std.ArrayList(LineProvenance) = null,
     entry_overrides: []const EntryRenderOverride = &.{},
+    /// Rendered after the committed entries, and never captured in a prefix.
+    tail: []const TranscriptEntry = &.{},
     /// Continue after this prefix instead of rendering from the first entry.
     resume_from: ?*const PreparationResume = null,
     /// Save the renderer's state before the entry at this index (or after the
@@ -2573,6 +2588,7 @@ const RenderEntriesBuilder = struct {
     target_entry_start_byte: ?usize = null,
     record_marks: bool = false,
     marks: std.ArrayList(PreparationMark) = .empty,
+    tail_start_byte: ?usize = null,
 
     fn deinit(self: *RenderEntriesBuilder, alloc: Allocator) void {
         self.out.deinit(alloc);
@@ -2696,7 +2712,39 @@ const RenderEntriesBuilder = struct {
         checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !void {
         try self.appendSeparatorBefore(alloc, block.kind, options.line_provenance);
+        try self.appendBlockAfterSeparator(alloc, entry, block, options, block_provenance, checkpoint);
+    }
 
+    /// Starts an assistant text block where the previous block's text would
+    /// continue, after the blank rows that text ended with, as the text of one
+    /// turn continues in the same block.
+    fn appendContinuedBlock(
+        self: *RenderEntriesBuilder,
+        alloc: Allocator,
+        entry: TranscriptEntry,
+        block: RenderedBlock,
+        options: RenderEntriesOptions,
+        block_provenance: []const LineProvenance,
+        checkpoint: ?*build_checkpoint.BuildCheckpoint,
+    ) !void {
+        const newlines = self.sequence.continuedTextNewlineCountBefore();
+        try self.out.appendNTimes(alloc, '\n', newlines);
+        self.line_index += newlines;
+        if (options.line_provenance) |lines| {
+            try lines.appendNTimes(alloc, .block_separator, newlines -| 1);
+        }
+        try self.appendBlockAfterSeparator(alloc, entry, block, options, block_provenance, checkpoint);
+    }
+
+    fn appendBlockAfterSeparator(
+        self: *RenderEntriesBuilder,
+        alloc: Allocator,
+        entry: TranscriptEntry,
+        block: RenderedBlock,
+        options: RenderEntriesOptions,
+        block_provenance: []const LineProvenance,
+        checkpoint: ?*build_checkpoint.BuildCheckpoint,
+    ) !void {
         const entry_id = entry.id();
         if (self.record_marks) try self.marks.append(alloc, .{
             .entry_id = entry_id,
@@ -2740,6 +2788,7 @@ const RenderEntriesBuilder = struct {
             .bytes = try self.out.toOwnedSlice(alloc),
             .target_entry_start_line = self.target_entry_start_line,
             .target_entry_start_byte = self.target_entry_start_byte,
+            .tail_start_byte = self.tail_start_byte,
         };
     }
 };
@@ -2810,8 +2859,43 @@ fn renderEntriesInterruptible(
         try builder.appendBlock(alloc, entry, block, options, &.{}, checkpoint);
     }
     if (options.capture_at == entries.len) try builder.capture(alloc, options, entries.len);
+    try appendTailEntries(&builder, alloc, options.tail, cols, styles, options, checkpoint);
 
     return builder.finish(alloc);
+}
+
+/// Draws the provisional tail with the same per-entry renderer as committed
+/// entries. Its first rendered byte is the tail start, which the caller uses
+/// as a finality floor, so tail rows never enter native history.
+fn appendTailEntries(
+    builder: *RenderEntriesBuilder,
+    alloc: Allocator,
+    tail: []const TranscriptEntry,
+    cols: u16,
+    styles: Styles,
+    options: RenderEntriesOptions,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !void {
+    for (tail) |entry| {
+        try build_checkpoint.tick(checkpoint);
+        if (!isEntryVisibleInCompactPresentation(entry)) continue;
+        const block = try renderEntryToBlockForPresentationInterruptible(
+            alloc,
+            entry,
+            cols,
+            styles,
+            .compact,
+            checkpoint,
+        );
+        defer block.deinit(alloc);
+        if (!renderedBlockHasContent(block)) continue;
+        if (builder.tail_start_byte == null) builder.tail_start_byte = builder.out.items.len;
+        if (block.kind == .assistant_turn and builder.sequence.previous_kind == .assistant_turn) {
+            try builder.appendContinuedBlock(alloc, entry, block, options, &.{}, checkpoint);
+        } else {
+            try builder.appendBlock(alloc, entry, block, options, &.{}, checkpoint);
+        }
+    }
 }
 
 /// `renderEntriesToBytes` that continues after `resume_from` and saves the
@@ -2953,6 +3037,7 @@ pub const TranscriptPreparationBytes = struct {
     trailing_boundary_blank_rows: u16,
     target_entry_start_line: ?usize = null,
     target_entry_start_byte: ?usize = null,
+    tail_start_byte: ?usize = null,
     folded_summary_indices: []usize,
     line_provenance: []const LineProvenance = &.{},
 
@@ -2976,6 +3061,7 @@ pub const TranscriptPreparationOptions = struct {
     folded_summary_entry_ids: []const ?u32 = &.{},
     capture_provenance: bool = false,
     entry_overrides: []const EntryRenderOverride = &.{},
+    tail: []const TranscriptEntry = &.{},
     resume_from: ?*const PreparationResume = null,
     capture_at: ?usize = null,
     captured: ?*?PreparationResume = null,
@@ -3029,6 +3115,7 @@ pub fn renderEntriesForPreparationInterruptible(
             .summary_transcript_indices = summary_indices,
             .line_provenance = if (options.capture_provenance) &line_provenance else null,
             .entry_overrides = options.entry_overrides,
+            .tail = options.tail,
             .resume_from = options.resume_from,
             .capture_at = options.capture_at,
             .captured = options.captured,
@@ -3054,6 +3141,7 @@ pub fn renderEntriesForPreparationInterruptible(
             .trailing_boundary_blank_rows = boundary.blank_rows,
             .target_entry_start_line = rendered.target_entry_start_line,
             .target_entry_start_byte = rendered.target_entry_start_byte,
+            .tail_start_byte = rendered.tail_start_byte,
             .folded_summary_indices = summary_indices,
             .line_provenance = owned_provenance,
         };
@@ -3066,6 +3154,7 @@ pub fn renderEntriesForPreparationInterruptible(
         .trailing_boundary_blank_rows = boundary.blank_rows,
         .target_entry_start_line = rendered.target_entry_start_line,
         .target_entry_start_byte = rendered.target_entry_start_byte,
+        .tail_start_byte = rendered.tail_start_byte,
         .folded_summary_indices = summary_indices,
         .line_provenance = owned_provenance,
     };
@@ -3231,6 +3320,18 @@ pub fn compactTailVisibleBlockKindForProjection(
         entry_actions,
         .compact,
     );
+}
+
+/// The last visible block kind on screen: the provisional tail when it shows
+/// anything, otherwise the committed entries. The footer gap follows it.
+pub fn compactTailVisibleBlockKindWithTail(
+    entries: []const TranscriptEntry,
+    tail: []const TranscriptEntry,
+    omitted_entry_id: ?u32,
+    entry_actions: []const EntryRenderAction,
+) ?TranscriptBlockKind {
+    return tailVisibleBlockKindOmittingEntries(tail, null, &.{}, .compact) orelse
+        compactTailVisibleBlockKindForProjection(entries, omitted_entry_id, entry_actions);
 }
 
 fn tailVisibleBlockKindOmittingEntries(

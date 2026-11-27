@@ -248,7 +248,7 @@ fn statusWidth(arena: Allocator, rows: []const menu.Row, width: u16) !usize {
     var want: usize = 22;
     for (rows) |r| {
         if (r.status.tools_error == null) continue;
-        want = @max(want, (try verbs.statusText(arena, runState(r.status))).len);
+        want = @max(want, (try verbs.runStatusText(arena, r.status)).len);
     }
     // The source column keeps its 7 columns and the 2 before them.
     const room = @as(usize, width) -| start -| (2 + 7);
@@ -276,7 +276,7 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
     try row.appendSlice(alloc, if (needs_you) ui_render.hint_style else ui_render.dim_style);
     // A refused tool list says so whole where the row has room, and in its short words where it has not, so the
     // cut never takes the word that says it.
-    const text = try verbs.statusText(arena, runState(r.status));
+    const text = try verbs.runStatusText(arena, r.status);
     const shown = if (r.status.tools_error != null and text.len > status_width) verbs.refusedShort(r.status) else text;
     try row_text.appendTerminalSafeSingleLine(alloc, &row, shown, status_width);
     try row.appendSlice(alloc, ui_render.reset_style);
@@ -289,19 +289,11 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
     return row;
 }
 
-/// The status without its saved login: the menu says how a server runs, and
-/// its screen puts the login beside that.
-fn runState(s: anytype) @TypeOf(s) {
-    var out = s;
-    out.signed_in = false;
-    return out;
-}
-
 /// The status fact on a server's screen. Its tool count is beside its
 /// tools' heading and its login is in its choices, so neither repeats here.
 fn statusFact(arena: Allocator, s: menu.Row) ![]const u8 {
     if (s.status.state == .ready and !s.status.needs_login and s.status.tools_error == null) return "ready";
-    return verbs.statusText(arena, runState(s.status));
+    return verbs.runStatusText(arena, s.status);
 }
 
 /// Line `line` of a server's screen below its title.
@@ -309,11 +301,19 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
     if (line < l.lead) {
         const facts = l.lead - 1;
         if (line >= facts) return .empty;
-        const protocol_lines: usize = @intFromBool(r.status.version != null);
         if (line == 0) return row_text.composeFactRow(alloc, if (r.status.transport == .stdio) "runs" else @tagName(r.status.transport), r.target orelse "", width, fact_col, "");
         if (line == 1) return row_text.composeFactRow(alloc, "file", p.fileOf(r), width, fact_col, "");
         if (line == 2) return row_text.composeFactRow(alloc, "status", try statusFact(arena, r), width, fact_col, "");
-        if (line == 3 and protocol_lines == 1) return row_text.composeFactRow(alloc, "protocol", r.status.version.?, width, fact_col, "");
+        // Then the facts a server has only sometimes, in the order `fx mcp show` prints them: the tools fx left out, its
+        // protocol, its error.
+        var later = line - 3;
+        if (try verbs.droppedText(arena, r.status)) |left_out| {
+            if (later == 0) return row_text.composeFactRow(alloc, "left out", left_out, width, fact_col, "");
+            later -= 1;
+        }
+        if (r.status.version) |version| {
+            if (later == 0) return row_text.composeFactRow(alloc, "protocol", version, width, fact_col, "");
+        }
         return row_text.composeFactRow(alloc, "error", r.status.last_error orelse "", width, fact_col, ui_render.hint_style);
     }
     var buf: [menu.max_choices]menu.Choice = undefined;
@@ -708,6 +708,26 @@ test "the list says how a server runs; its login shows on its screen" {
     try testing.expectEqualStrings("ready, tool list refused", try statusFact(arena.allocator(), .{ .status = ready }));
 }
 
+test "the list and the screen of a server say its status in the words of verbs.runStatusText, for every state" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    for ([_]host_runtime.State{ .idle, .connecting, .ready, .retrying, .failed }) |state| {
+        for ([_]bool{ false, true }) |held| {
+            var s = testStatus("any", state);
+            s.signed_in = held;
+            const row: menu.Row = .{ .status = s };
+            const want = try verbs.runStatusText(arena.allocator(), s);
+            const rows = [_]menu.Row{row};
+            var p: Projection = .{ .rows = &rows };
+            menu.open(&p.state);
+            const shown = try render(p, 88);
+            defer testing.allocator.free(shown);
+            try testing.expect(std.mem.find(u8, shown, want) != null);
+            if (state != .ready) try testing.expectEqualStrings(want, try statusFact(arena.allocator(), row));
+        }
+    }
+}
+
 test "a refused tool list shows whole in the list where the row has room, and in short words where it has not" {
     var none = testStatus("none", .ready);
     none.tools_error = "a field is written twice";
@@ -788,6 +808,43 @@ test "a server's screen: facts, choices with their commands, then tools" {
     // On a tool, Enter does nothing, so the hint doesn't offer it.
     p.state.cursor = 2;
     try testing.expectEqualStrings("↑↓ navigate     esc back", hintVariants(p)[0]);
+}
+
+test "a server's screen says what fx left out of its tool list, between its status and its protocol" {
+    var gh = testStatus("github", .ready);
+    gh.tools = 2;
+    gh.version = "2025-11-25";
+    gh.dropped.add(.repeated_field, 1);
+    const rows = [_]menu.Row{.{ .status = gh, .target = "https://h/mcp" }};
+    const tools = [_]menu.Tool{ .{ .name = "create_issue", .description = "Create a new issue." }, .{ .name = "search_code", .description = "Search for code." } };
+    var p: Projection = .{ .rows = &rows, .tools = .{ .ready = &tools } };
+    menu.open(&p.state);
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    // The fact is one more line before the blank that ends the facts.
+    try testing.expectEqual(@as(usize, 6), p.layout(rows[0]).lead);
+    const text = try render(p, 88);
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.startsWith(u8, text,
+        \\  github
+        \\  http      https://h/mcp
+        \\  file      ~/.fx/mcp.json
+        \\  status    ready
+        \\  left out  1 tool: a field is written twice
+        \\  protocol  2025-11-25
+        \\
+        \\
+    ));
+    // A server that left nothing out has no such line, and its facts are where they were.
+    var quiet = gh;
+    quiet.dropped = .{};
+    const quiet_rows = [_]menu.Row{.{ .status = quiet, .target = "https://h/mcp" }};
+    var q: Projection = .{ .rows = &quiet_rows, .tools = .{ .ready = &tools } };
+    menu.open(&q.state);
+    _ = menu.press(&q.state, .{ .rows = &quiet_rows }, .enter);
+    try testing.expectEqual(@as(usize, 5), q.layout(quiet_rows[0]).lead);
+    const quiet_text = try render(q, 88);
+    defer testing.allocator.free(quiet_text);
+    try testing.expect(std.mem.find(u8, quiet_text, "left out") == null);
 }
 
 test "a long tool list scrolls with the selection and counts what's below" {

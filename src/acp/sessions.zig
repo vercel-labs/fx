@@ -428,8 +428,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         });
     }
     if (state.cfg.allow_acp_mcp) {
-        try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
-        try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
+        try appendMcpConfigs(state, alloc, msg.params_raw, workspace_root, &mcp_configs);
     }
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
@@ -817,8 +816,7 @@ fn handleRestoreSession(
             });
         }
     } else {
-        try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
-        try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
+        try appendMcpConfigs(state, alloc, msg.params_raw, workspace_root, &mcp_configs);
     }
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
@@ -958,6 +956,7 @@ fn handleRestoreSession(
     if (kind.replaysHistory()) {
         try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
     }
+    try notifyPendingAcceptedInputs(state, alloc, session_id);
     try sendActiveSessionInfoUpdate(state, alloc);
 
     setObserverHooks(state, observer_hooks);
@@ -970,34 +969,53 @@ fn handleRestoreSession(
     );
 }
 
-/// Adds the user's profile MCP servers after the request's own servers when
-/// the client sets `_meta.fx.profileMcpServers`. ACP sessions otherwise use
-/// only client-supplied and approved project servers. Request entries win
-/// name collisions, and profile entries win over project entries.
-fn appendProfileMcpConfigsIfRequested(
+/// Adds the project's MCP servers after the request's own, and the user's profile servers too when the client sets
+/// `_meta.fx.profileMcpServers`. ACP sessions otherwise use only client-supplied and approved project servers. With the
+/// profile, the servers are the ones the terminal app runs: an entry fx can't read is skipped, `${VAR}` is expanded, a
+/// name a terminal can't print is skipped, and the host keeps a note for each skip (`builtin_mcp.composeHostConfigs`).
+/// Request entries win name collisions, and profile entries win over project entries.
+fn appendMcpConfigs(
     state: *server.ServerState,
     alloc: Allocator,
     params_raw: ?[]const u8,
+    workspace_root: []const u8,
     configs: *mcp_servers.OwnedServerConfigs,
 ) !void {
-    if (!profileMcpRequested(alloc, params_raw)) return;
+    var project = try loadProjectMcpConfigs(state, alloc, workspace_root);
+    defer project.deinit(alloc);
+    if (!profileMcpRequested(alloc, params_raw)) {
+        try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &project.configs);
+        return;
+    }
     const home = state.cfg.home_override orelse io_mod.homeDir() orelse {
         debug_trace.logf("mcp", "ACP profile MCP servers skipped reason=no_home", .{});
+        try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &project.configs);
         return;
     };
     const config_path = try builtin_mcp.configPathFromHome(alloc, home);
     defer alloc.free(config_path);
-    var profile = builtin_mcp.loadConfigFromPath(alloc, config_path) catch |err| {
+    var loaded: builtin_mcp.NativeConfigs = .{};
+    defer loaded.deinit(alloc);
+    var profile = builtin_mcp.readProfile(alloc, config_path, &loaded.diagnostics) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("mcp", "ACP profile MCP servers unavailable err={s}", .{@errorName(err)});
+        try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &project.configs);
         return;
     };
     defer {
         for (profile.items) |*config| config.deinit(alloc);
         profile.deinit(alloc);
     }
-    debug_trace.logf("mcp", "ACP profile MCP servers requested count={d}", .{profile.items.len});
-    try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &profile);
+    try builtin_mcp.mergeNativeConfigs(alloc, &loaded, &profile, &project);
+    // Read only while the servers are composed.
+    var inherited = try io_mod.cloneEnvironMap(alloc);
+    defer inherited.deinit();
+    try builtin_mcp.composeHostConfigs(alloc, &loaded, configs.items.items, &inherited);
+    debug_trace.logf("mcp", "ACP profile MCP servers requested count={d} notes={d}", .{ loaded.configs.items.len, loaded.diagnostics.items.len });
+    const notes = try builtin_mcp.renderNotes(alloc, loaded.diagnostics.items);
+    configs.setNotes(alloc, notes);
+    try configs.items.appendSlice(alloc, loaded.configs.items);
+    loaded.configs.clearRetainingCapacity();
 }
 
 fn profileMcpRequested(alloc: Allocator, params_raw: ?[]const u8) bool {
@@ -1008,23 +1026,24 @@ fn profileMcpRequested(alloc: Allocator, params_raw: ?[]const u8) bool {
     return acp_types.fxMetaBool(parsed.value.object, "profileMcpServers") orelse false;
 }
 
-fn appendProjectMcpConfigs(
+/// The session's project servers, which run in its workspace, and the notes for the entries fx skipped. Empty when the
+/// project's choices can't be read.
+fn loadProjectMcpConfigs(
     state: *server.ServerState,
     alloc: Allocator,
     workspace_root: []const u8,
-    configs: *mcp_servers.OwnedServerConfigs,
-) !void {
+) !project_config.WorkspaceParseResult {
     var choices = if (state.cfg.home_override) |home|
         config_runtime.loadProjectMcpChoicesFromHome(alloc, home, workspace_root) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
-            return;
+            return .{};
         }
     else
         config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
-            return;
+            return .{};
         };
     defer choices.deinit(alloc);
 
@@ -1034,7 +1053,7 @@ fn appendProjectMcpConfigs(
         .workspace,
         choices.choices,
     );
-    defer workspace.deinit(alloc);
+    errdefer workspace.deinit(alloc);
     for (workspace.diagnostics.items) |diagnostic| {
         var name_buf: [256]u8 = undefined;
         var variable_buf: [160]u8 = undefined;
@@ -1061,11 +1080,7 @@ fn appendProjectMcpConfigs(
         if (config.transport != .stdio or config.cwd != null) continue;
         config.cwd = try alloc.dupe(u8, workspace_root);
     }
-    try project_config.appendWorkspaceAfterAcpPrimary(
-        alloc,
-        &configs.items,
-        &workspace.configs,
-    );
+    return workspace;
 }
 
 fn sameSessionId(active_session_id: []const u8, requested_session_id: []const u8) bool {
@@ -1158,6 +1173,7 @@ fn reloadActiveSession(
     if (kind.replaysHistory()) {
         try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
     }
+    try notifyPendingAcceptedInputs(state, alloc, session_id);
     try sendActiveSessionInfoUpdate(state, alloc);
     return writeLoadSessionResponse(state, alloc, msg, active.model, observer_hooks);
 }
@@ -2020,6 +2036,73 @@ fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_i
     );
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+}
+
+fn formatPendingInputsNotice(alloc: Allocator, texts: []const []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try session_adapter.writeUndeliveredPromptPrefix(&out.writer, texts.len);
+    try out.writer.writeAll(":");
+    for (texts) |text| {
+        try out.writer.writeAll("\n\n");
+        try out.writer.writeAll(text);
+    }
+    return out.toOwnedSlice();
+}
+
+/// Reports pending accepted prompts on load/resume through `agent_message_chunk`
+/// (same channel as `interruptedTurnNotice` and `ConversionNotice`), then marks
+/// them withdrawn so they are never sent to the model or re-reported.
+fn notifyPendingAcceptedInputs(
+    state: *server.ServerState,
+    alloc: Allocator,
+    session_id: []const u8,
+) !void {
+    if (comptime !server.has_v2_session_store) return;
+    const active = if (state.active_session) |*value| value else return;
+    const v2 = active.v2 orelse return;
+    var reader = v2.pendingInputsReader();
+    defer reader.deinit();
+    // In-place ACP reloads reuse the open handle after prior withdrawals at higher seqs.
+    reader.up_to_seq = null;
+    var pending = reader.read(alloc, null) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=pending_accepted_inputs_read_failed surface=acp err={s}", .{@errorName(err)});
+            const notice = try session_adapter.formatPendingRestoreFailedNotice(alloc, err);
+            defer alloc.free(notice);
+            sendAgentHistoryChunk(state, alloc, session_id, notice) catch |send_err| {
+                debug_trace.logf("session", "event=restore_notice_failed surface=acp err={s}", .{@errorName(send_err)});
+            };
+            return;
+        },
+    };
+    defer pending.deinit(alloc);
+    if (pending.ids.len == 0 and pending.unreadable_ids.len == 0) return;
+
+    if (pending.ids.len > 0) {
+        if (formatPendingInputsNotice(alloc, pending.texts)) |notice| {
+            defer alloc.free(notice);
+            sendAgentHistoryChunk(state, alloc, session_id, notice) catch |err| {
+                debug_trace.logf("session", "event=restore_notice_failed surface=acp err={s}", .{@errorName(err)});
+            };
+        } else |err| {
+            debug_trace.logf("session", "event=restore_notice_failed surface=acp err={s}", .{@errorName(err)});
+        }
+    }
+
+    active.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer active.session_write_mutex.unlock(io_mod.getIo());
+    if (pending.ids.len > 0) {
+        v2.recordInputsWithdrawn(pending.ids) catch |err| {
+            debug_trace.logf("session", "event=input_withdrawn_batch_failed surface=acp count={d} err={s}", .{ pending.ids.len, @errorName(err) });
+        };
+    }
+    if (pending.unreadable_ids.len > 0) {
+        v2.recordInputsWithdrawn(pending.unreadable_ids) catch |err| {
+            debug_trace.logf("session", "event=input_withdrawn_unreadable_failed surface=acp count={d} err={s}", .{ pending.unreadable_ids.len, @errorName(err) });
+        };
+    }
 }
 
 fn sendAvailableCommands(state: *server.ServerState, alloc: Allocator, session_id: []const u8, commands_json: []const u8) !void {
@@ -3048,6 +3131,29 @@ const test_session_mode_registry = mode_registry.Registry{
     .modes = test_session_modes[0..],
 };
 
+/// AI Gateway's catalog with a fetch that fails at once, as on a runner with
+/// no network. Session requests in these tests still refresh the catalog,
+/// but never reach AI Gateway (R7.3), and no load outlives its test.
+const OfflineTestCatalog = struct {
+    var fetch_count = std.atomic.Value(usize).init(0);
+
+    fn fetch(_: ?*anyopaque, _: Allocator, _: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+        _ = fetch_count.fetchAdd(1, .monotonic);
+        return .{ .failure = .{ .category = .transport } };
+    }
+};
+
+const acp_session_test_bundle = bundle: {
+    var catalog = test_builtin_gateway.model_catalog_provider;
+    catalog.fetch_fn = OfflineTestCatalog.fetch;
+    // A catalog that reports no connection loads on the caller's thread
+    // (`CapabilityResolver.loadWithin`).
+    catalog.reports_connection = false;
+    var gateway_bundle = test_builtin_gateway.provider_bundle;
+    gateway_bundle.model_catalog = catalog;
+    break :bundle gateway_bundle;
+};
+
 fn acpSessionTestConfig() server.Config {
     return .{
         .default_model = "test/model",
@@ -3056,7 +3162,7 @@ fn acpSessionTestConfig() server.Config {
         .gateway_chat_url = "http://127.0.0.1/unused",
         .gateway_models_path = "/v1/models",
         .gateway_provider = test_builtin_gateway.provider,
-        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
+        .provider_set = provider_set.gateway_only(acp_session_test_bundle),
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "test" },
         .ignored_list_entries = &.{},
@@ -3098,6 +3204,42 @@ fn initAcpSessionTestState(
         .agent_step_limit = 8,
         .max_tool_result_bytes = 64 * 1024,
     };
+}
+
+test "ACP session tests refresh the model catalog without AI Gateway" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+    var msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    const fetches_before = OfflineTestCatalog.fetch_count.load(.monotonic);
+    try handleNewSession(&state, arena, &msg);
+
+    try std.testing.expectEqual(fetches_before + 1, OfflineTestCatalog.fetch_count.load(.monotonic));
+    try std.testing.expectEqual(
+        @as(?model_catalog.FailureCategory, .transport),
+        state.capability_resolver.downFailure(),
+    );
 }
 
 test "ACP project MCP loading expands workspace environment templates" {
@@ -3573,4 +3715,407 @@ test "libfx/new rejects a session id that is not header and path safe" {
     }
     const long = "{\"sessionId\":\"" ++ text_utils.repeat("a", 256) ++ "\"}";
     try std.testing.expectError(error.InvalidSessionId, requestedLibfxSessionId(alloc, long));
+}
+
+test "eb03: formatPendingInputsNotice formats singular and plural notices with prompt texts" {
+    const alloc = std.testing.allocator;
+    const single = try formatPendingInputsNotice(alloc, &.{"first steer"});
+    defer alloc.free(single);
+    try std.testing.expectEqualStrings(
+        "1 prompt you sent before fx stopped was not delivered:\n\nfirst steer",
+        single,
+    );
+
+    const multiple = try formatPendingInputsNotice(alloc, &.{ "first steer", "second steer" });
+    defer alloc.free(multiple);
+    try std.testing.expectEqualStrings(
+        "2 prompts you sent before fx stopped were not delivered:\n\nfirst steer\n\nsecond steer",
+        multiple,
+    );
+}
+
+test "eb03: ACP session/load and session/resume report pending accepted inputs once without altering history" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    inline for (.{ handleLoadSession, handleResumeSession }) |restore| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+        try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+        const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        defer alloc.free(home_path);
+        const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+        defer alloc.free(workspace_path);
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-pending.jsonl", .{ .read = true });
+        defer capture.close(io_mod.getIo());
+        var state = try initAcpSessionTestState(arena, workspace_path, capture);
+        defer state.deinit();
+        state.cfg.auth_mode = .host_managed;
+        state.credential_source = .host_managed;
+        state.cfg.allow_acp_mcp = false;
+        state.cfg.home_override = home_path;
+        state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+        var new_msg = jsonrpc.Message{
+            .id = .{ .integer = 1 },
+            .method = "session/new",
+            .params_raw = "{\"mcpServers\":[]}",
+        };
+        try handleNewSession(&state, arena, &new_msg);
+        const v2 = state.active_session.?.v2.?;
+        try v2.commitTurn(.{ .assistant = .{
+            .user = .{ .text = @constCast("initial turn") },
+            .assistant = @constCast("initial reply"),
+        } }, types.ConversationLanguage.default());
+        _ = try v2.recordInputAccepted("undelivered steer one");
+        _ = try v2.recordInputAccepted("undelivered steer two");
+        const sid = try arena.dupe(u8, state.active_session.?.session_id);
+        try server.releaseActiveSession(&state);
+
+        // Truncate the capture file before the first restore so we inspect only restore output.
+        var restore_capture = try tmp.dir.createFile(io_mod.getIo(), "acp-restore.jsonl", .{ .read = true });
+        defer restore_capture.close(io_mod.getIo());
+        state.writer = .{ .stdout = restore_capture };
+
+        var restore_msg = jsonrpc.Message{
+            .id = .{ .integer = 2 },
+            .method = if (restore == handleLoadSession) "session/load" else "session/resume",
+            .params_raw = try arena.print("{{\"sessionId\":\"{s}\",\"mcpServers\":[]}}", .{sid}),
+        };
+        try restore(&state, arena, &restore_msg);
+        try restore_capture.sync(io_mod.getIo());
+
+        var read_first = try tmp.dir.openFile(io_mod.getIo(), "acp-restore.jsonl", .{});
+        defer read_first.close(io_mod.getIo());
+        const first_out = try io_mod.readFileToEnd(alloc, &read_first, 64 * 1024);
+        defer alloc.free(first_out);
+        try std.testing.expect(std.mem.find(u8, first_out, "2 prompts you sent before fx stopped were not delivered:") != null);
+        try std.testing.expect(std.mem.find(u8, first_out, "undelivered steer one") != null);
+        try std.testing.expect(std.mem.find(u8, first_out, "undelivered steer two") != null);
+        try std.testing.expectEqual(@as(usize, 1), state.active_session.?.session_rt.agent.history.items.len);
+
+        // A second restore does not report them again.
+        try server.releaseActiveSession(&state);
+        var second_capture = try tmp.dir.createFile(io_mod.getIo(), "acp-restore-2.jsonl", .{ .read = true });
+        defer second_capture.close(io_mod.getIo());
+        state.writer = .{ .stdout = second_capture };
+        try restore(&state, arena, &restore_msg);
+        try second_capture.sync(io_mod.getIo());
+        var read_second = try tmp.dir.openFile(io_mod.getIo(), "acp-restore-2.jsonl", .{});
+        defer read_second.close(io_mod.getIo());
+        const second_out = try io_mod.readFileToEnd(alloc, &read_second, 64 * 1024);
+        defer alloc.free(second_out);
+        try std.testing.expect(std.mem.find(u8, second_out, "were not delivered:") == null);
+    }
+}
+
+test "eb03: failed ACP restore notice still withdraws accepted inputs" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace_path);
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-init.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.cfg.auth_mode = .host_managed;
+    state.credential_source = .host_managed;
+    state.cfg.allow_acp_mcp = false;
+    state.cfg.home_override = home_path;
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    const v2 = state.active_session.?.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("initial turn") },
+        .assistant = @constCast("initial reply"),
+    } }, types.ConversationLanguage.default());
+    _ = try v2.recordInputAccepted("withdraw despite acp notice error");
+    const sid = try arena.dupe(u8, state.active_session.?.session_id);
+    try server.releaseActiveSession(&state);
+
+    const FailingWriter = struct {
+        fn write(_: ?*anyopaque, _: []const u8) !void {
+            return error.BrokenPipe;
+        }
+    };
+    var sink: u8 = 0;
+    state.writer = jsonrpc.Writer.initCallback(&sink, FailingWriter.write);
+    const reopened = try session_adapter.Session.resumeSession(alloc, &state.sessions_v2.?, .{ .id = sid }, workspace_path, .acp);
+    state.active_session = .{
+        .session_id = try alloc.dupe(u8, sid),
+        .v2 = reopened,
+        .model = try alloc.dupe(u8, "m"),
+        .mode = "default",
+        .workspace_root = workspace_path,
+        .api_key = &.{},
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = session_runtime.SessionRuntime.init(10),
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    defer {
+        state.active_session.?.session_rt.deinit(alloc);
+        alloc.free(state.active_session.?.session_id);
+        alloc.free(state.active_session.?.model);
+        if (state.active_session.?.v2) |s| s.close();
+        state.active_session = null;
+    }
+
+    try notifyPendingAcceptedInputs(&state, alloc, sid);
+    var remaining = try reopened.pendingAcceptedInputs(alloc);
+    defer remaining.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), remaining.ids.len);
+
+    // Reloading on the same open handle sees the withdrawal at seq > opened_last_seq.
+    var second_calls: usize = 0;
+    const CountWriter = struct {
+        fn write(raw: ?*anyopaque, _: []const u8) !void {
+            const count: *usize = @ptrCast(@alignCast(raw.?));
+            count.* += 1;
+        }
+    };
+    state.writer = jsonrpc.Writer.initCallback(&second_calls, CountWriter.write);
+    try notifyPendingAcceptedInputs(&state, alloc, sid);
+    try std.testing.expectEqual(@as(usize, 0), second_calls);
+}
+
+test "eb03: notifyPendingAcceptedInputs scans without holding session_write_mutex" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace_path);
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-init-lock.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.cfg.auth_mode = .host_managed;
+    state.credential_source = .host_managed;
+    state.cfg.allow_acp_mcp = false;
+    state.cfg.home_override = home_path;
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    const v2 = state.active_session.?.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("initial turn") },
+        .assistant = @constCast("initial reply"),
+    } }, types.ConversationLanguage.default());
+    _ = try v2.recordInputAccepted("lock-free acp scan");
+    const sid = try arena.dupe(u8, state.active_session.?.session_id);
+    try server.releaseActiveSession(&state);
+
+    const reopened = try session_adapter.Session.resumeSession(alloc, &state.sessions_v2.?, .{ .id = sid }, workspace_path, .acp);
+
+    const SyncWriter = struct {
+        mutex: *std.Io.Mutex,
+        locked_ready: std.Io.Event = .unset,
+        scan_done: std.Io.Event = .unset,
+        saw_locked_during_scan: std.atomic.Value(bool) = .init(false),
+        frames: std.ArrayList(u8) = .empty,
+
+        fn write(raw: ?*anyopaque, line: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.mutex.tryLock()) {
+                self.mutex.unlock(io_mod.getIo());
+            } else {
+                self.saw_locked_during_scan.store(true, .release);
+            }
+            try self.frames.appendSlice(std.testing.allocator, line);
+            self.scan_done.set(io_mod.getIo());
+        }
+
+        fn holdLock(self: *@This()) void {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            self.locked_ready.set(io_mod.getIo());
+            self.scan_done.waitUncancelable(io_mod.getIo());
+            self.mutex.unlock(io_mod.getIo());
+        }
+    };
+
+    state.active_session = .{
+        .session_id = try alloc.dupe(u8, sid),
+        .v2 = reopened,
+        .model = try alloc.dupe(u8, "m"),
+        .mode = "default",
+        .workspace_root = workspace_path,
+        .api_key = &.{},
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = session_runtime.SessionRuntime.init(10),
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    defer {
+        state.active_session.?.session_rt.deinit(alloc);
+        alloc.free(state.active_session.?.session_id);
+        alloc.free(state.active_session.?.model);
+        if (state.active_session.?.v2) |s| s.close();
+        state.active_session = null;
+    }
+
+    var ctx = SyncWriter{ .mutex = &state.active_session.?.session_write_mutex };
+    defer ctx.frames.deinit(alloc);
+    state.writer = jsonrpc.Writer.initCallback(&ctx, SyncWriter.write);
+
+    const holder = try std.Thread.spawn(.{}, SyncWriter.holdLock, .{&ctx});
+    ctx.locked_ready.waitUncancelable(io_mod.getIo());
+    try notifyPendingAcceptedInputs(&state, alloc, sid);
+    holder.join();
+
+    try std.testing.expect(ctx.saw_locked_during_scan.load(.acquire));
+    try std.testing.expect(std.mem.find(u8, ctx.frames.items, "lock-free acp scan") != null);
+    var remaining = try reopened.pendingAcceptedInputs(alloc);
+    defer remaining.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), remaining.ids.len);
+}
+
+test "eb03: failed ACP pending input scan sends error chunk and leaves records pending" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace_path);
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-init-err.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.cfg.auth_mode = .host_managed;
+    state.credential_source = .host_managed;
+    state.cfg.allow_acp_mcp = false;
+    state.cfg.home_override = home_path;
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    const v2 = state.active_session.?.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("initial turn") },
+        .assistant = @constCast("initial reply"),
+    } }, types.ConversationLanguage.default());
+    _ = try v2.recordInputAccepted("keep across failed acp scan");
+    const sid = try arena.dupe(u8, state.active_session.?.session_id);
+    try server.releaseActiveSession(&state);
+
+    var notice_capture = try tmp.dir.createFile(io_mod.getIo(), "acp-err-notice.jsonl", .{ .read = true });
+    defer notice_capture.close(io_mod.getIo());
+    state.writer = .{ .stdout = notice_capture };
+
+    const reopened = try session_adapter.Session.resumeSession(alloc, &state.sessions_v2.?, .{ .id = sid }, workspace_path, .acp);
+    state.active_session = .{
+        .session_id = try alloc.dupe(u8, sid),
+        .v2 = reopened,
+        .model = try alloc.dupe(u8, "m"),
+        .mode = "default",
+        .workspace_root = workspace_path,
+        .api_key = &.{},
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = session_runtime.SessionRuntime.init(10),
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    defer if (state.active_session != null) {
+        state.active_session.?.session_rt.deinit(alloc);
+        alloc.free(state.active_session.?.session_id);
+        alloc.free(state.active_session.?.model);
+        if (state.active_session.?.v2) |s| s.close();
+        state.active_session = null;
+    };
+
+    const log_rel = try std.Io.Dir.path.join(alloc, &.{ "home", ".fx", "sessions", "v2", sid, "log.jsonl" });
+    defer alloc.free(log_rel);
+    const saved_log = try tmp.dir.readFileAlloc(io_mod.getIo(), log_rel, alloc, .limited(1 << 20));
+    defer alloc.free(saved_log);
+    {
+        var f = try tmp.dir.openFile(io_mod.getIo(), log_rel, .{ .mode = .read_write });
+        defer f.close(io_mod.getIo());
+        try f.writePositionalAll(io_mod.getIo(), "not valid json\n", 0);
+    }
+
+    try notifyPendingAcceptedInputs(&state, alloc, sid);
+    try notice_capture.sync(io_mod.getIo());
+    var read_out = try tmp.dir.openFile(io_mod.getIo(), "acp-err-notice.jsonl", .{});
+    defer read_out.close(io_mod.getIo());
+    const out = try io_mod.readFileToEnd(alloc, &read_out, 64 * 1024);
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.find(u8, out, "Couldn't restore prompts sent before fx stopped: corrupt.") != null);
+
+    // Close active_session, restore log.jsonl, and verify the accepted record is still pending.
+    state.active_session.?.session_rt.deinit(alloc);
+    alloc.free(state.active_session.?.session_id);
+    alloc.free(state.active_session.?.model);
+    if (state.active_session.?.v2) |s| s.close();
+    state.active_session = null;
+
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = log_rel, .data = saved_log });
+    const retry = try session_adapter.Session.resumeSession(alloc, &state.sessions_v2.?, .{ .id = sid }, workspace_path, .acp);
+    defer retry.close();
+    var remaining = try retry.pendingAcceptedInputs(alloc);
+    defer remaining.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), remaining.ids.len);
+    try std.testing.expectEqualStrings("keep across failed acp scan", remaining.texts[0]);
 }

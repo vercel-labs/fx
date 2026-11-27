@@ -20,7 +20,7 @@ import {
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
 import { LineQueue } from "./line-queue";
 import { commandReplays, onlySessionId, savedSessionIds, savedText, storeRoot } from "./saved-sessions";
 import { latestTraceReportPath, readTraceReport, traceReportNames, waitForNewTraceReport } from "./trace-report";
@@ -37,6 +37,7 @@ import {
   TITLE_GENERATION_MARKER,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -844,7 +845,7 @@ describe("effect-aware command permissions", () => {
         10_000,
       );
       await activeSession.sendKeys("1");
-      await activeSession.waitForText("history feedback live complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("history feedback live complete") && turnSettled(pane), TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
       // The two commands share one row by their steps, which is the group's
@@ -904,7 +905,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("/resume");
       await activeSession.waitForText("Run the prepared two-command history fixture.", TIMEOUT);
       await activeSession.sendKeys("Enter");
-      await activeSession.waitForText("history feedback cli resume complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("history feedback cli resume complete") && turnSettled(pane), TIMEOUT);
       const pickerScrollback = await activeSession.captureFullScrollback();
       const pickerCommandsRow = pickerScrollback.indexOf("Ran touch, printf");
       expect(pickerCommandsRow).toBeGreaterThanOrEqual(0);
@@ -1092,7 +1093,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run pwd once in auto mode.");
-      await activeSession.waitForText("direct auto complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("direct auto complete") && turnSettled(pane), TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
       // The group's only call is its header.
@@ -1379,7 +1380,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run the prepared command.");
-      await activeSession.waitForText("COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("COMMAND_SUMMARY_WIDTH_COMPLETE") && turnSettled(pane), TIMEOUT);
 
       const narrow = await activeSession.captureFullScrollback();
       // The command is long, so its row shows its steps in short form at every
@@ -1395,7 +1396,7 @@ describe("effect-aware command permissions", () => {
       expect(wideRow).toBe("● Ran printf ✓");
 
       await activeSession.sendText("Run the next prepared command.");
-      await activeSession.waitForText("WORKSPACE_COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("WORKSPACE_COMMAND_SUMMARY_WIDTH_COMPLETE") && turnSettled(pane), TIMEOUT);
       const workspaceWide = await activeSession.captureFullScrollback();
       // The second command is long too, and its row never shows the
       // workspace path.
@@ -1479,7 +1480,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("Run the lossless direct printf fixture.");
       await activeSession.waitForText("DIRECT_LOSSLESS_DONE", TIMEOUT);
       await activeSession.waitForPane(
-        (pane) => pane.includes("DIRECT_LOSSLESS_DONE") && !pane.includes("Streaming ("),
+        (pane) => pane.includes("DIRECT_LOSSLESS_DONE") && turnSettled(pane),
         TIMEOUT,
       );
 
@@ -1509,7 +1510,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("Run the lossy direct printf fixture.");
       await activeSession.waitForText("DIRECT_LOSSY_DONE", TIMEOUT);
       await activeSession.waitForPane(
-        (pane) => pane.includes("DIRECT_LOSSY_DONE") && !pane.includes("Streaming ("),
+        (pane) => pane.includes("DIRECT_LOSSY_DONE") && turnSettled(pane),
         TIMEOUT,
       );
       const lossyCompact = await activeSession.captureFullScrollback();
@@ -1654,7 +1655,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("/output quiet");
-      await activeSession.waitForText(responseRows.at(-1)!, TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes(responseRows.at(-1)!) && turnSettled(pane), TIMEOUT);
       expect(promptText(gateway.requests[0]!.body)).toContain("/output quiet");
       expect(gateway.requests).toHaveLength(2);
       const compact = await activeSession.captureFullScrollback();
@@ -1814,7 +1815,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("diagnostic fixture complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("diagnostic fixture complete") && turnSettled(pane), TIMEOUT);
       expect(readFileSync(fixturePath, "utf8")).toBe("same twice same\n");
 
       await activeSession.sendText("/trace");
@@ -1941,7 +1942,7 @@ describe("effect-aware command permissions", () => {
     await activeSession.waitForComposer(TIMEOUT);
     await activeSession.sendText(rootPrompt);
     if (shipFails) {
-      await activeSession.waitForText("report noted 1", TIMEOUT * 2);
+      await activeSession.waitForPane((pane) => pane.includes("report noted 1") && turnSettled(pane), TIMEOUT * 2);
       // Ship's request failed while main's turn was still taking in reports,
       // so the view shows the card for it instead of the footer's note.
       const card = await activeSession.waitForText("Open ship's screen", TIMEOUT);
@@ -1952,7 +1953,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendKeys("4");
       await activeSession.waitForPane((pane) => !pane.includes("Open ship's screen"), TIMEOUT);
     } else {
-      await activeSession.waitForText("report noted 2", TIMEOUT * 2);
+      await activeSession.waitForPane((pane) => pane.includes("report noted 2") && turnSettled(pane), TIMEOUT * 2);
     }
     await activeSession.waitForComposer(TIMEOUT);
 
@@ -2059,7 +2060,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Say hello.");
-      await activeSession.waitForText("nothing to delegate", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("nothing to delegate") && turnSettled(pane), TIMEOUT);
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
         process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
@@ -2138,7 +2139,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("window filled", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("window filled") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2259,7 +2260,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("cuts done", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("cuts done") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2355,7 +2356,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("wrapped secrets done", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("wrapped secrets done") && turnSettled(pane), 120_000);
       // The prose and the table are on screen in pieces: no row holds a whole
       // secret. The command output is folded once the turn ends, and its
       // entries keep the rows it was wrapped into.
@@ -2439,7 +2440,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("many secrets done", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("many secrets done") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2509,7 +2510,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("AAAAAA", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("AAAAAA") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2589,7 +2590,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("probe done", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("probe done") && turnSettled(pane), TIMEOUT);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2743,7 +2744,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText(failPrompt);
       await activeSession.waitForText("HTTP 400", TIMEOUT);
       await activeSession.sendText(fillPrompt);
-      await activeSession.waitForText("network window filled", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("network window filled") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2821,7 +2822,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Render the trace fixture.");
-      await activeSession.waitForText("TRACE_RENDER_DONE", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("TRACE_RENDER_DONE") && turnSettled(pane), TIMEOUT);
       await activeSession.waitForStableComposer(TIMEOUT);
       await activeSession.resizeWindow(100, 32);
       await activeSession.waitForStableComposer(TIMEOUT);
@@ -2910,7 +2911,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Say ready.");
-      await activeSession.waitForText("TRACE_FAULT_READY", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("TRACE_FAULT_READY") && turnSettled(pane), TIMEOUT);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText("Could not create trace.", TIMEOUT);
@@ -3175,7 +3176,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForPane(
         (pane) =>
           pane.includes("classifier approved complete") &&
-          !pane.includes("Streaming ("),
+          turnSettled(pane),
         TIMEOUT,
       );
 
@@ -4291,7 +4292,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
 
       await harness.initialSession.waitForText("auto · gpt-5", TIMEOUT);
       await harness.initialSession.sendText("Save a turn before changing permission mode.");
-      await harness.initialSession.waitForText("permission resume seed complete", TIMEOUT);
+      await harness.initialSession.waitForPane((pane) => pane.includes("permission resume seed complete") && turnSettled(pane), TIMEOUT);
       expect(harness.initialGateway.requests).toHaveLength(1);
 
       await harness.initialSession.sendText("/permissions ask");
@@ -4502,12 +4503,12 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
 
       await activeSession.sendKeys("2");
       await activeSession.sendKeys("Enter");
-      await activeSession.waitForText("first always approval complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("first always approval complete") && turnSettled(pane), TIMEOUT);
       expect(existsSync(marker)).toBe(true);
 
       rmSync(marker);
       await activeSession.sendText("Create the reusable marker again.");
-      const finalPane = await activeSession.waitForText("second always approval complete", TIMEOUT);
+      const finalPane = await activeSession.waitForPane((pane) => pane.includes("second always approval complete") && turnSettled(pane), TIMEOUT);
 
       expect(finalPane).toContain("second always approval complete");
       expect(existsSync(marker)).toBe(true);
@@ -5451,7 +5452,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Say hello.");
-      await activeSession.waitForText("setup traced", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("setup traced") && turnSettled(pane), TIMEOUT);
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
         process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
@@ -5705,7 +5706,7 @@ class AcpClient {
   static create(cwd: string, env: Record<string, string | undefined>) {
     return new AcpClient(nodeSpawn(FX_BIN, ["acp"], {
       cwd,
-      env: definedEnv({ ...process.env, ...env, NO_COLOR: "1" }),
+      env: definedEnv(fxChildEnv({ ...env, NO_COLOR: "1" })),
       stdio: ["pipe", "pipe", "pipe"],
     }));
   }

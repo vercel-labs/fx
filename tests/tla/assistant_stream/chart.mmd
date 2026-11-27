@@ -1,0 +1,31 @@
+%% One row of a streamed reply, in design_a (the design in StreamTail.tla).
+%% The tail shows the Open and Waiting rows, below the committed rows.
+%% design_a breaks no rule: check.sh finds every invariant and VisibleNeverShrinks true.
+stateDiagram-v2
+    state "Open line, shown in the tail" as Open
+    state "Ended line, waiting for a possible underline, shown in the tail" as Waiting
+    state "Committed row, on screen for good" as Committed
+    state "In scrollback, out of the screen" as History
+
+    [*] --> Open : the first token of a line arrives
+    Open --> Open : a word or a mark arrives
+    Open --> Waiting : the line's newline arrives
+    Open --> Committed : the reply ends
+    Waiting --> Committed : the next token arrives (text, a newline, or an underline), or the reply ends
+    Committed --> History : the screen is full, so the top row scrolls up
+
+    note right of Committed : Plain or bold, or a heading when an underline was under it
+    note right of Waiting : Shown with its final cells until the next token decides it
+
+%% Rule breaks in the other variants (check.sh shows each one fails):
+%% mutant_drop_waiting breaks VisibleNeverShrinks. Shortest path: a word arrives (Open),
+%%   then the newline arrives (Open to Waiting). The row leaves the screen until it is committed.
+%% mutant_never_commit breaks EndCommitsAll. Shortest path TLC reports: one token (a lone close mark),
+%%   then the reply ends. The tail still holds a row at the end, and nothing is committed.
+%%
+%% Events this chart leaves out:
+%%   an underline line on its own (it commits nothing; it only makes the row above a heading),
+%%   a pause between tokens (the model has no clock),
+%%   ScrollLag 1 (the same states; the scroll to History comes one row later),
+%%   the current and design_b variants (no tail),
+%%   nested marks, line wrapping at the terminal width, and a resize.

@@ -3,9 +3,9 @@
 // or exit, and a fake model that waits on each with shell interact calls of
 // chosen yields. Every interact result becomes one observation: why the wait
 // ended (from its state and how long it took), whether it said running,
-// carried quiet_notice and output, and whether quiet_ms had reached the
-// limit. TLC then checks that QuietWait has a behavior that gives every
-// observation in order (QuietWaitTrace.tla).
+// carried quiet_notice and output, whether fx emitted a quiet_crossing event,
+// and whether quiet_ms had reached the limit. TLC then checks that QuietWait
+// has a behavior that gives every observation in order (QuietWaitTrace.tla).
 //
 // Usage (from the repository root, after zig build):
 //   bun tests/tla/drivers/managed_execution/binary.ts
@@ -17,7 +17,7 @@
 //
 // Exit codes: 0 every run accepted, 1 a rejected run (or a tampered run that
 // was accepted), 2 a toolchain or harness failure.
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { binary, targetHelpers, testEnvironment } from "../lib/context";
@@ -43,6 +43,7 @@ type Observation = {
   ends: string[];
   running: boolean;
   notice: boolean;
+  crossed: boolean;
   quietDue: boolean[];
   output: boolean;
   // For the report.
@@ -118,13 +119,20 @@ function shellResult(body: string, callId: string): Record<string, any> {
   throw new Error(`missing tool result for ${callId}`);
 }
 
-function observe(result: Record<string, any>, yieldMs: number, waitedMs: number): Observation {
+function countCrossings(tracePath: string): number {
+  if (!existsSync(tracePath)) return 0;
+  return readFileSync(tracePath, "utf8").split("\n").filter((line) => line.includes("event=quiet_crossing")).length;
+}
+
+function observe(result: Record<string, any>, yieldMs: number, waitedMs: number, crossed: boolean): Observation {
   const running = result.state === "running";
+  // Under the new rule, a running wait never ends early before its ceiling; an
+  // early return yields `ends: []` so QuietWaitTrace rejects it.
   const ends = !running
     ? ["done"]
     : waitedMs < yieldMs - EarlyMs
-      ? ["quiet"]
-      : result.quiet_notice !== undefined && waitedMs < yieldMs + EarlyMs ? ["quiet", "ceiling"] : ["ceiling"];
+      ? []
+      : ["ceiling"];
   const quietMs = typeof result.quiet_ms === "number" ? result.quiet_ms : null;
   const base = yieldMs / TickMs;
   return {
@@ -132,6 +140,7 @@ function observe(result: Record<string, any>, yieldMs: number, waitedMs: number)
     ends,
     running,
     notice: typeof result.quiet_notice === "string",
+    crossed,
     quietDue: quietMs === null ? [false, true] : [quietMs >= LimitMs],
     output: typeof result.output_delta === "string" && result.output_delta.length > 0,
     yieldMs,
@@ -145,6 +154,7 @@ async function runOnce(index: number, plan: Plan, out: string): Promise<Observat
   const root = realpathSync(mkdtempSync(join(tmpdir(), `fx-quiet-wait-${index}-`)));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
+  const tracePath = join(root, "trace.log");
   mkdirSync(join(home, ".fx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   writeFileSync(join(home, ".fx", "settings.json"), "{}");
@@ -153,6 +163,7 @@ async function runOnce(index: number, plan: Plan, out: string): Promise<Observat
   let sent = 0;
   let sessionId = "";
   let waitStarted = 0;
+  let crossingsBefore = 0;
   const finish = (text: string) => fakeGatewayFinalText(text);
   const gateway = startDynamicFakeGateway((body: string) => {
     const now = Date.now();
@@ -171,7 +182,10 @@ async function runOnce(index: number, plan: Plan, out: string): Promise<Observat
       } else if (sent <= plan.yields.length + 1) {
         const k = sent - 2;
         const result = shellResult(body, `quiet_wait_${k}`);
-        observations.push(observe(result, plan.yields[k]!, now - waitStarted));
+        const crossingsNow = countCrossings(tracePath);
+        const crossed = crossingsNow > crossingsBefore;
+        crossingsBefore = crossingsNow;
+        observations.push(observe(result, plan.yields[k]!, now - waitStarted, crossed));
         if (result.state !== "running") return finish("Quiet wait run ended.");
       } else {
         return finish("Quiet wait run ended.");
@@ -201,6 +215,8 @@ async function runOnce(index: number, plan: Plan, out: string): Promise<Observat
         FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
         FX_MODEL: MODEL,
         FX_TEST_SHELL_QUIET_NOTICE_MS: String(LimitMs),
+        FX_TRACE_LOG: tracePath,
+        FX_TRACE_SCOPES: "shell",
       }),
       stdout: "pipe",
       stderr: "pipe",
@@ -227,7 +243,7 @@ function observedModule(observations: Observation[]): string {
   const records = observations.map((o) =>
     `[ceils |-> ${tlaSet(o.ceils.map(String))}, ends |-> ${tlaSet(o.ends.map((e) => `"${e}"`))}, ` +
     `running |-> ${tlaBool(o.running)}, notice |-> ${tlaBool(o.notice)}, ` +
-    `quietDue |-> ${tlaSet(o.quietDue.map(tlaBool))}, output |-> ${tlaBool(o.output)}]`
+    `crossed |-> ${tlaBool(o.crossed)}, quietDue |-> ${tlaSet(o.quietDue.map(tlaBool))}, output |-> ${tlaBool(o.output)}]`
   );
   return [
     "------------------------- MODULE QuietWaitObserved -------------------------",
@@ -273,7 +289,10 @@ for (let i = 0; i < options.runs; i += 1) {
   const plan = planFor(random);
   const observations = await runOnce(i, plan, out);
   waits += observations.length;
-  for (const o of observations) endCounts.set(o.ends.join("|"), (endCounts.get(o.ends.join("|")) ?? 0) + 1);
+  for (const o of observations) {
+    const label = o.ends.length === 0 ? "early" : o.ends.join("|");
+    endCounts.set(label, (endCounts.get(label) ?? 0) + 1);
+  }
   writeFileSync(join(out, `run-${i}.observations.json`), `${JSON.stringify(observations, null, 2)}\n`);
   const good = await accepted(observations, join(out, `trace-${i}`));
   console.log(`run ${i}: ${observations.length} waits ${good ? "ACCEPTED" : "REJECTED"}: ${plan.command} yields ${JSON.stringify(plan.yields)}`);

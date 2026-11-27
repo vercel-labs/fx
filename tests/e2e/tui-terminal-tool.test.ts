@@ -22,6 +22,7 @@ import {
   terminalFixtureShell,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -401,7 +402,7 @@ test.skipIf(!tmuxAvailable())(
 
     // The turn ends with the command still running.
     releaseFinal();
-    await session.waitForText("CHECK_VERB_DONE", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("CHECK_VERB_DONE") && turnSettled(pane), TIMEOUT);
     await session.waitForText("● Waited for python3 · 2 calls", TIMEOUT);
     await session.sendText("/quit");
     await session.waitForText("CHECK_SHELL>", TIMEOUT);
@@ -531,7 +532,7 @@ test.skipIf(!tmuxAvailable())(
 
     await active.sendText("Start the command and return control while it remains active.");
     await active.sendKeys("Enter");
-    await active.waitForText("PHASE_ONE_READY", TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("PHASE_ONE_READY") && turnSettled(pane), TIMEOUT);
     expect(sessionId.length).toBeGreaterThan(0);
     expect(toolResultEnvelope(
       gateway.requests[1]!.body,
@@ -647,10 +648,10 @@ test.skipIf(!tmuxAvailable())(
 
     await active.sendText("Run the first captured command.");
     await active.sendKeys("Enter");
-    await active.waitForText("FIRST_REUSED_CALL_DONE", TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("FIRST_REUSED_CALL_DONE") && turnSettled(pane), TIMEOUT);
     await active.sendText("Run the second captured command.");
     await active.sendKeys("Enter");
-    await active.waitForText("SECOND_REUSED_CALL_DONE", TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("SECOND_REUSED_CALL_DONE") && turnSettled(pane), TIMEOUT);
 
     const firstSessionId = findSessionId(JSON.parse(gateway.requests[1]!.body));
     const secondSessionId = findSessionId(JSON.parse(gateway.requests[3]!.body));
@@ -846,7 +847,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Run and observe the session.");
-    await session.waitForText("WIDTH_FLOW_DONE", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("WIDTH_FLOW_DONE") && turnSettled(pane), TIMEOUT);
     await Bun.sleep(300);
 
     // The 126-column activity cap used to freeze these phrases with trailing
@@ -919,7 +920,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Run and observe the session.");
-    await session.waitForText("FULL_WIDTH_FLOW_DONE", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("FULL_WIDTH_FLOW_DONE") && turnSettled(pane), TIMEOUT);
     await Bun.sleep(300);
 
     // The main view shows the launch command's steps in short form. The
@@ -1038,7 +1039,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText(`${FX_BIN} 2>${fixture.stderrPath}`);
     await session.waitForStableComposer(TIMEOUT);
     await session.sendText("Run and observe the session.");
-    await session.waitForText("RESUME_WIDTH_DONE", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("RESUME_WIDTH_DONE") && turnSettled(pane), TIMEOUT);
     await session.sendText("/quit");
     await session.waitForText("RESUME_SHELL>", TIMEOUT);
 
@@ -1293,7 +1294,7 @@ test.skipIf(!tmuxAvailable())(
 
     const first = await launch(fixture, gateway);
     await first.sendText("Start the managed TTY.");
-    await first.waitForText("SHELL_TTY_RESUME_STARTED", TIMEOUT);
+    await first.waitForPane((pane) => pane.includes("SHELL_TTY_RESUME_STARTED") && turnSettled(pane), TIMEOUT);
     expect(sessionId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
     const shellPid = await waitForRecordedPid(fixture.home, sessionId);
     expect(processAlive(shellPid)).toBe(true);

@@ -1217,6 +1217,64 @@ export const scenarios: Scenario[] = [
         expectThat(!trace.some((t) => t.machine === "request" && (t.event === "refused_line" || t.event === "grace_expired")), "a refused line that names its list gave a grace"),
       ),
   }),
+  // ---- a list whose reply names no request: no id could be read, so the grace ends it, and it says so (tests/tla/mcp/Catalog.tla PageUnreadable) ----
+  engineScenario({
+    name: "u12-list-refused-no-id",
+    description:
+      "A stdio tool list reply whose id comes after the part fx cannot read names no request: the list waits out the grace, then ends refused, and the status says the answer is not a readable tool list, not that the server never answered",
+    servers: {
+      a: {
+        rules: [discover, listen, { method: "tools/list", raw: '{"jsonrpc":"2.0","result":{"resultType":"complete","tools":[]},"extra":nope,"id":{id}}' }],
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["tools a", "expect a.tools.fail 5000", "status"],
+    machines: { a: [...BASE, "catalog"] },
+    check: (lines, _logs, trace) =>
+      first(
+        same(status(lines, "a")?.list_refusal, "the answer is not a readable tool list", "the list refusal"),
+        expectThat(trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "no grace_expired step in the request trace"),
+      ),
+  }),
+  engineScenario({
+    name: "u12-list-refused-http-sse-no-id",
+    description:
+      "An SSE event on a tool list's own stream that names no request, on a stream that stays open: the list ends refused when the grace runs out, with the same words as on stdio",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", sse: true, before: ["not an object"], hang: true },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["tools h", "expect h.tools.fail 5000", "status"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+    check: (lines, _logs, trace) =>
+      first(
+        same(status(lines, "h")?.list_refusal, "the answer is not a readable tool list", "the list refusal"),
+        expectThat(trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "no grace_expired step in the request trace"),
+      ),
+  }),
+  engineScenario({
+    name: "u12-list-and-call-refused-line",
+    description:
+      "A tool list and a call are in flight together and the call's reply is a line fx cannot read: both get the grace and end, the call as malformed and the list with no reason, because the line is no more the list's than the call's",
+    servers: {
+      a: {
+        rules: [discover, { method: "tools/list", noReply: true }, { method: "tools/call", tool: "silent", delayMs: 400, rawBytes: 40, noReply: true }],
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["tools a", "call a silent", "expect a.called.1.malformed 5000", "expect a.tools.fail 5000", "status"],
+    machines: { a: [...BASE, "catalog"] },
+    check: (lines, _logs, trace) =>
+      first(
+        same(trace.filter((t) => t.machine === "request" && t.event === "grace_expired").length, 2, "grace_expired steps in the request trace"),
+        expectThat(status(lines, "a")?.list_refusal == null, `the list was refused: ${JSON.stringify(status(lines, "a")?.list_refusal)}`),
+      ),
+  }),
   engineScenario({
     name: "u12-refused-http-json-body",
     description: "An HTTP JSON body the engine cannot read ends its call at once as malformed, not as an HTTP failure",

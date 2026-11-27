@@ -985,8 +985,13 @@ pub fn Runtime(comptime App: type) type {
             // first, as Esc, in `routeAgentsMenuInput`.
             if (resolved == .open_agent_list) {
                 if (comptime @hasDecl(App, "openAgentsMenu")) {
-                    if (app.shell.fullTranscriptActive()) return .done;
-                    if (!app_agents_runtime.Runtime(App).hasAnotherAgent(app)) return .done;
+                    if (agentsMenuRefusal(app)) |reason| {
+                        // The key is gone, and the trace is the only record:
+                        // the footer shows the switch key itself only once
+                        // another agent exists.
+                        debug_trace.logf("input", "open_agent_list refused reason={s}", .{reason});
+                        return .done;
+                    }
                     dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
                     // The list sets the draft aside itself, so the model
                     // picker's goes back to the composer first.
@@ -1857,6 +1862,15 @@ pub fn Runtime(comptime App: type) type {
         fn submitAgentsMenuSelection(app: *App) !bool {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
             return app_agents_runtime.Runtime(App).submitMenu(app);
+        }
+
+        /// Why Ctrl+X opens no agent list as the app is now, the reason its
+        /// trace line names, or null when it opens one: the full transcript
+        /// owns the screen, or there is no other agent to switch to.
+        fn agentsMenuRefusal(app: *App) ?[]const u8 {
+            if (app.shell.fullTranscriptActive()) return "full_transcript";
+            if (!app_agents_runtime.Runtime(App).hasAnotherAgent(app)) return "no_other_agent";
+            return null;
         }
 
         fn agentsMenuActive(app: *App) bool {
@@ -3473,6 +3487,8 @@ const FakeApprovalShell = struct {
         .hint_row = 24,
     },
     transcript: std.ArrayList(u8) = .empty,
+
+    pub fn freezeAssistantTail(_: *FakeApprovalShell, _: std.mem.Allocator, _: []const u8) !void {}
 
     fn deinit(self: *FakeApprovalShell, alloc: std.mem.Allocator) void {
         self.transcript.deinit(alloc);

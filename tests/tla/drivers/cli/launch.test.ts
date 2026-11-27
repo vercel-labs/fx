@@ -11,6 +11,7 @@ import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fxChildEnv } from "../../../evals/eval-helpers";
 import { artifacts, binary, shellQuote, targetHelpers } from "../lib/context";
 import { checkTrace, type Design, type Observation, type ObservedRequest, type TraceResult } from "./bridge";
 import {
@@ -82,7 +83,7 @@ function fixture(s: Scenario): Fixture {
     },
   });
   const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) if (value !== undefined && key !== "FX_MODEL") env[key] = value;
+  for (const [key, value] of Object.entries(fxChildEnv())) if (value !== undefined && key !== "FX_MODEL") env[key] = value;
   Object.assign(env, {
     HOME: home, TMPDIR: root,
     AI_GATEWAY_API_KEY: "fake-mfv-key", FX_PROVIDER: "gateway",
