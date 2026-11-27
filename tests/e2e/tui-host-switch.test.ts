@@ -569,6 +569,28 @@ async function withFx(
   }
 }
 
+function expectCommittedBeforeNextTurn(traceText: string, completedTurnsBeforeReport: number) {
+  const rootSessionId = /\[wiring\] action=Open session=([^\s]+)/.exec(traceText)?.[1];
+  expect(rootSessionId).toBeDefined();
+  const lines = traceText.split("\n");
+  const commitLines: number[] = [];
+  const beginLines: number[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!;
+    if (line.includes(`[wiring] action=EndTurn session=${rootSessionId} end=commit`)) commitLines.push(i);
+    if (line.includes(`[wiring] action=BeginTurn session=${rootSessionId}`)) beginLines.push(i);
+  }
+  expect(commitLines.length).toBeGreaterThanOrEqual(completedTurnsBeforeReport);
+  expect(beginLines.length).toBeGreaterThanOrEqual(completedTurnsBeforeReport + 1);
+  const commitIdx = commitLines[completedTurnsBeforeReport - 1]!;
+  const nextBeginIdx = beginLines[completedTurnsBeforeReport]!;
+  expect(commitIdx).toBeLessThan(nextBeginIdx);
+  expect(lines.slice(commitIdx + 1, nextBeginIdx).some((line) => line.includes("[worker] event=worker_begin "))).toBe(true);
+  const heldCount = traceText.match(/event=commit_gate_held\b/g)?.length ?? 0;
+  const releasedCount = traceText.match(/event=commit_gate_released [^\n]*reason=committed/g)?.length ?? 0;
+  expect(releasedCount).toBe(heldCount);
+}
+
 // Main starts a writer and a helper that finishes. The writer's prompt (an
 // approval or a question) stays open on main's screen. The gateway holds main's
 // reply that ends its first turn until the prompt is on the screen, and the
@@ -686,8 +708,8 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "question" | "non
     if (prompt === "none") {
       await session.waitForText("SWITCH_MAIN_REPORT_1", 30_000);
     } else {
-      // It came with the prompt still open: the save released it.
-      expect(trace()).toMatch(/event=commit_gate_released [^\n]*reason=committed/);
+      // It came with the prompt still open: the turn committed before the report turn started.
+      expectCommittedBeforeNextTurn(trace(), 1);
       const open = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_ONE") && pane.includes(promptText), 15_000);
 
       // The first turn shows above the open prompt, once, and the prompt stays.
@@ -712,7 +734,7 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "question" | "non
       expectReportCarriesFirstTurn(reports[1]!, "SWITCH_MAIN_ONE", ["main_w", "main_h", "main_s"]);
       expect(reports[1]).toContain("SWITCH_MAIN_REPORT_1");
       expect(trace()).not.toContain("event=commit_gate_expired");
-      expect(trace().match(/event=commit_gate_released [^\n]*reason=committed/g)?.length).toBe(2);
+      expectCommittedBeforeNextTurn(trace(), 2);
       const second = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_REPORT_1") && pane.includes(promptText), 15_000);
       expect(second).not.toContain("SWITCH_MAIN_REPORT_2");
       expect((await session.captureFullScrollback()).split("SWITCH_MAIN_REPORT_1").length - 1).toBe(1);

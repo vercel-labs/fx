@@ -320,9 +320,8 @@ pub fn Bindings(comptime App: type) type {
             return app_agents_runtime.appOf(App, agent);
         }
 
-        pub fn finishPromptPresentation(app: *App, agent: *AppAgent, finished: types.FinishedPrompt) !assistant_pacer.FinishResult {
-            try app_session_runtime.Runtime(App).appendFinishedPrompt(app, agent, finished);
-            if (finished.summary) |summary| {
+        pub fn finishPromptPresentation(app: *App, presentation: assistant_pacer.DeferredPresentation) assistant_pacer.FinishResult {
+            if (presentation.summary) |summary| {
                 _ = app.shell.appendTurnSummaryEntry(app.alloc, summary) catch |err| {
                     return .{ .presentation_failed = err };
                 };
@@ -570,7 +569,24 @@ pub fn Bindings(comptime App: type) type {
                 .code_block = agentPushCodeBlock,
                 .thematic_rule = agentPushThematicRule,
                 .assistant_tail = agentPushAssistantTail,
+                .paced_steps = true,
             };
+        }
+
+        pub fn pacerPausedByPrompt(app: *const App, agent: *const AppAgent) bool {
+            const approval = if (comptime agents.hasAgentField(App, "approval_prompt"))
+                agent.approval_prompt.isActive()
+            else
+                false;
+            const question = if (comptime agents.hasAgentField(App, "question_prompt"))
+                agent.question_prompt.isActive()
+            else
+                false;
+            const api_key = if (comptime @hasField(App, "auth") and @hasDecl(@TypeOf(app.auth), "apiKeyEntryActive"))
+                app.auth.apiKeyEntryActive()
+            else
+                false;
+            return approval or question or api_key;
         }
 
         pub fn workerEventHandlers(agent: *AppAgent) app_worker_runtime.WorkerEventHandlers {
@@ -1701,7 +1717,6 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeAppendText(ctx: *anyopaque, text: []const u8) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            app.pacer.dropTail();
             try app.pacer.enqueue(app.alloc, text);
         }
 
@@ -1750,13 +1765,21 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeAppendAssistantTail(ctx: *anyopaque, events: []assistant_presentation.Event) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
+            if (events.len == 0 and !app.pacer.hasPendingText() and !app.pacer.hasTail()) {
+                assistant_presentation.freeEventSlice(std.heap.c_allocator, events);
+                app.shell.clearAssistantTail(app.alloc);
+                return;
+            }
             const id = app.shell.stageAssistantTail(std.heap.c_allocator, events);
-            app.pacer.setTail(id);
+            try app.pacer.setTailAt(app.alloc, id, io_mod.nanoTimestamp());
         }
 
         fn workerBridgeDrainAssistantText(ctx: *anyopaque) !app_worker_runtime.AssistantTextDrainResult {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
+            if (!pacerPausedByPrompt(app, agent) and app.pacer.hasPending()) {
+                return .blocked;
+            }
             try app.pacer.flushPresentationAtBoundary(
                 app.alloc,
                 io_mod.nanoTimestamp(),
@@ -1863,8 +1886,22 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeAppendHistoryTurn(ctx: *anyopaque, finished: types.FinishedPrompt) !app_worker_runtime.HistoryDelivery {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            if (try app_worker_runtime.Runtime(App).deferFinish(app, agent, finished)) return .retained;
-            return .{ .settled = try appendHistoryTurn(app, agent, finished) };
+            commitFinishedPrompt(app, agent, finished) catch |err| {
+                return .{ .commit_failed = err };
+            };
+            const presentation = assistant_pacer.DeferredPresentation.fromFinishedPrompt(finished);
+            if (app.pacer.deferFinish(presentation)) return .retained;
+            if (comptime @hasDecl(App, "finishPromptPresentation")) {
+                switch (app.finishPromptPresentation(presentation)) {
+                    .committed => {},
+                    .presentation_failed => |err| debug_trace.logf(
+                        "worker",
+                        "immediate finish presentation failed kind=turn_summary size=1 reason={s}",
+                        .{@errorName(err)},
+                    ),
+                }
+            }
+            return .{ .settled = .committed };
         }
 
         fn workerBridgeSessionGrant(ctx: *anyopaque, grant: types.PermissionGrant) !void {
@@ -1879,21 +1916,12 @@ pub fn Bindings(comptime App: type) type {
             try app.writeDomainNotice(notice, true);
         }
 
-        fn appendHistoryTurn(app: *App, agent: *AppAgent, finished: types.FinishedPrompt) !assistant_pacer.FinishResult {
-            if (comptime @hasDecl(App, "finishPromptPresentation")) {
-                return app.finishPromptPresentation(agent, finished);
-            }
+        fn commitFinishedPrompt(app: *App, agent: *AppAgent, finished: types.FinishedPrompt) !void {
             if (comptime @hasDecl(App, "appendFinishedPrompt")) {
                 try app.appendFinishedPrompt(finished);
-                return .committed;
-            }
-            if (comptime @hasDecl(App, "appendHistoryTurn")) {
-                try app.appendHistoryTurn(agent, finished.turn);
-                if (finished.snapshot_file_ownership) |ownership| ownership.transfer();
-                return .committed;
+                return;
             }
             try app_session_runtime.Runtime(App).appendFinishedPrompt(app, agent, finished);
-            return .committed;
         }
     };
 }
@@ -2012,9 +2040,22 @@ const FakeSession = struct {
 const FakePacer = struct {
     text: std.ArrayList(u8) = .empty,
     defer_history: bool = false,
+    block_drain: bool = false,
     enqueue_count: usize = 0,
     flush_count: usize = 0,
     tail_id: ?u64 = null,
+
+    pub fn hasPending(self: *const FakePacer) bool {
+        return self.block_drain;
+    }
+
+    pub fn hasPendingText(self: *const FakePacer) bool {
+        return self.text.items.len > 0;
+    }
+
+    pub fn hasTail(self: *const FakePacer) bool {
+        return self.tail_id != null;
+    }
 
     fn deinit(self: *FakePacer, alloc: std.mem.Allocator) void {
         self.text.deinit(alloc);
@@ -2029,13 +2070,13 @@ const FakePacer = struct {
         self.tail_id = null;
     }
 
-    fn setTail(self: *FakePacer, id: u64) void {
+    pub fn setTailAt(self: *FakePacer, alloc: std.mem.Allocator, id: u64, _: i128) !void {
+        _ = alloc;
         self.tail_id = id;
     }
 
-    pub fn deferFinish(self: *FakePacer, alloc: std.mem.Allocator, finished: types.FinishedPrompt) !bool {
-        _ = alloc;
-        _ = finished;
+    pub fn deferFinish(self: *FakePacer, presentation: assistant_pacer.DeferredPresentation) bool {
+        _ = presentation;
         return self.defer_history;
     }
 
@@ -2063,6 +2104,8 @@ const FakeShell = struct {
         assistant_presentation.freeEventSlice(alloc, events);
         return 0;
     }
+
+    pub fn clearAssistantTail(_: *FakeShell, _: std.mem.Allocator) void {}
 
     pub fn replaceableEntryId(self: *FakeShell) ?u32 {
         _ = self;
@@ -2783,6 +2826,15 @@ test "app semantic presentation sink retains payload ownership only after succes
     retained.deinit(std.heap.c_allocator);
 }
 
+test "app semantic presentation sink enables paced word steps on TUI tail sink" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const sink = Bindings(FakeApp).semanticPresentationSink((&app).agent());
+    try std.testing.expect(sink.assistant_tail != null);
+    try std.testing.expect(sink.paced_steps);
+}
+
 test "interactive stream adapter queues byte-identical rendered spans" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
@@ -3409,4 +3461,421 @@ test "eb03: buildWorkerDeps wires withdraw_accepted_input only when v2 session i
     var pending = try v2.pendingAcceptedInputs(alloc);
     defer pending.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), pending.ids.len);
+}
+
+test "workerBridgeDrainAssistantText blocks while pacer has pending output" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.pacer.block_drain = true;
+
+    const deps = Bindings(FakeApp).workerEventHandlers((&app).agent());
+    try std.testing.expectEqual(
+        app_worker_runtime.AssistantTextDrainResult.blocked,
+        try deps.drain_assistant_text(deps.ctx),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.pacer.flush_count);
+
+    app.pacer.block_drain = false;
+    try std.testing.expectEqual(
+        app_worker_runtime.AssistantTextDrainResult.drained,
+        try deps.drain_assistant_text(deps.ctx),
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.pacer.flush_count);
+}
+
+const CommitSplitTestApp = struct {
+    const session_adapter = @import("../session/session_adapter.zig");
+    const session_codec = @import("../session/session_codec.zig");
+    const model_provider = @import("../config/model_provider.zig");
+    const tool_dispatch = @import("../tooling/tool_dispatch.zig");
+
+    alloc: Allocator,
+    workspace_root: []const u8,
+    main_agent: struct {
+        total_input_tokens: u64 = 0,
+        total_output_tokens: u64 = 0,
+        total_web_search_requests: u64 = 0,
+        session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
+        session_persistence: app_session_runtime.Persistence = .{},
+        worker: worker_runtime.WorkerRuntime = .{},
+        stream: types.StreamState = .{},
+        approval_prompt: struct {
+            pub fn isActive(_: *const @This()) bool {
+                return false;
+            }
+            pub fn syncRequest(_: *@This(), _: Allocator, _: anytype) !bool {
+                return false;
+            }
+            pub fn syncReview(_: *@This(), _: anytype) bool {
+                return false;
+            }
+        } = .{},
+        question_prompt: struct {
+            pub fn isActive(_: *const @This()) bool {
+                return false;
+            }
+            pub fn syncFrom(_: *@This(), _: Allocator, _: anytype) !void {}
+            pub fn discard(_: *@This(), _: Allocator, _: []const u8) void {}
+        } = .{},
+        change_tracker: change_tracker_mod.ChangeTracker = .{},
+    } = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
+    shell: transcript_runtime.TranscriptRuntime = .{},
+    pacer: assistant_pacer.AssistantPacer = .{},
+    metrics: types.Metrics = .{},
+    summary_presentations: usize = 0,
+    notifications_finished: usize = 0,
+    fail_presentation: bool = false,
+    commit_attempts: usize = 0,
+    second_turn: ?types.HistoryTurn = null,
+
+    pub fn appendFinishedPrompt(self: *@This(), finished: types.FinishedPrompt) !void {
+        self.commit_attempts += 1;
+        if (self.commit_attempts == 1) {
+            if (self.second_turn) |turn| {
+                try self.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = turn } });
+            }
+        }
+        return app_session_runtime.Runtime(@This()).appendFinishedPrompt(self, self.agent(), finished);
+    }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
+
+    pub fn toolRegistry(_: *@This(), _: anytype) tool_dispatch.Registry {
+        return .{};
+    }
+
+    pub fn notificationPresentationFinished(self: *CommitSplitTestApp) void {
+        self.notifications_finished += 1;
+    }
+
+    pub fn finishPromptPresentation(self: *CommitSplitTestApp, presentation: assistant_pacer.DeferredPresentation) assistant_pacer.FinishResult {
+        if (presentation.summary != null) self.summary_presentations += 1;
+        if (self.fail_presentation) return .{ .presentation_failed = error.OutOfMemory };
+        return Bindings(CommitSplitTestApp).finishPromptPresentation(self, presentation);
+    }
+
+    fn pacerEmit(ctx: *anyopaque, text: []const u8) anyerror!void {
+        const self: *CommitSplitTestApp = @ptrCast(@alignCast(ctx));
+        _ = try self.shell.streamAssistantChunk(self.alloc, &self.metrics, text);
+    }
+
+    fn pacerFinish(ctx: *anyopaque, presentation: assistant_pacer.DeferredPresentation) anyerror!assistant_pacer.FinishResult {
+        const self: *CommitSplitTestApp = @ptrCast(@alignCast(ctx));
+        return self.finishPromptPresentation(presentation);
+    }
+
+    pub fn pacerCallbacks(self: *CommitSplitTestApp) assistant_pacer.TickCallbacks {
+        return .{
+            .emit_ctx = self,
+            .emit_fn = pacerEmit,
+            .finish_ctx = self,
+            .finish_fn = pacerFinish,
+        };
+    }
+
+    pub fn writeUserPromptCard(_: *@This(), _: anytype, _: types.UserTurn) !void {}
+    pub fn writeTranscript(_: *@This(), _: []const u8, _: bool) !void {}
+    pub fn writeDomainNotice(_: *@This(), _: types.SemanticNotice, _: bool) !void {}
+    pub fn writeCommandOutputChunk(_: *@This(), _: command_output_content.Stream, _: []const u8, _: bool) !void {}
+    pub fn flushCommandOutputSummary(_: *@This(), _: bool) !void {}
+    pub fn allowToolForSession(_: *@This(), _: anytype, _: []const u8, _: []const u8) !void {}
+    pub fn registerAndEmitDiffBlock(_: *@This(), _: anytype, payload: diff_mod.DiffEntryPayload) !void {
+        diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
+    }
+
+    fn initWithV2Session(alloc: Allocator, root: []const u8) !CommitSplitTestApp {
+        const store_ptr = try alloc.create(session_adapter.Store);
+        errdefer alloc.destroy(store_ptr);
+        store_ptr.* = try session_adapter.Store.open(alloc, root);
+
+        var app = CommitSplitTestApp{ .alloc = alloc, .workspace_root = root };
+        app.agent().session_persistence.v2_store = store_ptr;
+        const prefs = session_codec.DurableSessionPreferences{
+            .provider = model_provider.ProviderId.gateway,
+            .model = @constCast("test-model"),
+            .effort = .auto,
+            .fast_mode = false,
+        };
+        app.agent().session_persistence.v2 = try session_adapter.Session.create(alloc, store_ptr, root, .app, .{
+            .preferences = prefs,
+            .language = types.ConversationLanguage.default(),
+            .permission_state = .{},
+        });
+        return app;
+    }
+
+    fn deinitAll(self: *CommitSplitTestApp) void {
+        app_session_runtime.Runtime(CommitSplitTestApp).deinitPersistence(self, self.agent());
+        self.agent().session.deinit(self.alloc);
+        self.agent().worker.deinit(std.heap.c_allocator);
+        self.agent().change_tracker.deinit(self.alloc);
+        self.input_runtime.deinit(self.alloc);
+        self.shell.deinit(self.alloc);
+        self.pacer.deinit(self.alloc);
+    }
+
+    fn countTurnSummaries(self: *const CommitSplitTestApp) usize {
+        var count: usize = 0;
+        for (self.shell.notebook.entries.items) |entry| {
+            switch (entry) {
+                .raw_bytes => |raw| if (raw.class == .turn_summary) {
+                    count += 1;
+                },
+                else => {},
+            }
+        }
+        return count;
+    }
+};
+
+test "finish drained while text is pending commits to session and clears gate immediately, showing summary only after reveal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var app = try CommitSplitTestApp.initWithV2Session(alloc, root);
+    defer app.deinitAll();
+    const agent = app.agent();
+    agent.worker.enableCommitGate();
+
+    const summary: types.TurnSummary = .{
+        .thinking_duration_ms = 500,
+        .turn_duration_ms = 1_200,
+        .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+    };
+    const turn: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("save now") },
+        .assistant = @constCast("one two three"),
+    } };
+
+    agent.stream = .{
+        .active = true,
+        .phase = .generating,
+        .turn_started_ms = 42_000,
+        .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+    };
+    try agent.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("one two three") } });
+    try agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
+        .turn = turn,
+        .summary = summary,
+        .terminal_outcome = .completed,
+    } });
+    try std.testing.expectEqual(@as(u32, 1), agent.worker.unacknowledged_finishes);
+
+    try app_worker_runtime.Runtime(CommitSplitTestApp).tick(&app, agent, Bindings(CommitSplitTestApp).workerEventHandlers(agent));
+
+    // Committed to memory, written to v2 session, and commit gate cleared immediately,
+    // while presentation remains deferred behind pending pacer text with captured turn timing.
+    try std.testing.expectEqual(@as(usize, 1), agent.session.historyLen());
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
+    try std.testing.expect(!agent.worker.commitGateWaitsForCommit());
+    try std.testing.expect(app.pacer.hasPending());
+    try std.testing.expect(app.pacer.deferred_presentation != null);
+    try std.testing.expectEqual(@as(?i64, 42_000), app.pacer.completedAssistantPresentationStartedMs());
+    try std.testing.expectEqual(summary.token_progress, app.pacer.completedAssistantPresentationTokenProgress().?);
+    try std.testing.expectEqual(@as(usize, 0), app.summary_presentations);
+    try std.testing.expectEqual(@as(usize, 0), app.countTurnSummaries());
+
+    const session_id = try alloc.dupe(u8, agent.session_persistence.v2.?.id());
+    defer alloc.free(session_id);
+    {
+        agent.session_persistence.v2.?.close();
+        agent.session_persistence.v2 = null;
+        const reopened = try CommitSplitTestApp.session_adapter.Session.resumeSession(alloc, agent.session_persistence.v2_store.?, .{ .id = session_id }, root, .app);
+        defer reopened.close();
+        var loaded = try reopened.restore(alloc);
+        defer loaded.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), loaded.history.len);
+        try std.testing.expectEqualStrings("one two three", loaded.history[0].assistant.assistant);
+    }
+
+    // Draining the pacer reveals the text and then appends the summary row.
+    var now_ns: i128 = 0;
+    while (app.pacer.hasPending()) : (now_ns += assistant_pacer.reveal_frame_ns) {
+        try app.pacer.tick(alloc, now_ns, app.pacerCallbacks());
+    }
+    try std.testing.expectEqual(@as(usize, 1), app.summary_presentations);
+    try std.testing.expectEqual(@as(usize, 1), app.countTurnSummaries());
+    try std.testing.expect(app.pacer.deferred_presentation == null);
+}
+
+test "clearPacer after a committed deferred finish drops only presentation and the turn stays committed" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var app = try CommitSplitTestApp.initWithV2Session(alloc, root);
+    defer app.deinitAll();
+    const agent = app.agent();
+    agent.worker.enableCommitGate();
+
+    const turn: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("keep committed") },
+        .assistant = @constCast("pending answer"),
+    } };
+    try agent.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("pending answer") } });
+    try agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
+        .turn = turn,
+        .summary = .{ .token_progress = .{ .output_tokens = 9 } },
+        .terminal_outcome = .completed,
+    } });
+    try app_worker_runtime.Runtime(CommitSplitTestApp).tick(&app, agent, Bindings(CommitSplitTestApp).workerEventHandlers(agent));
+    try std.testing.expect(app.pacer.deferred_presentation != null);
+    try std.testing.expectEqual(@as(usize, 1), agent.session.historyLen());
+
+    app_worker_runtime.Runtime(CommitSplitTestApp).clearPacer(&app, agent, "cancel");
+
+    try std.testing.expect(!app.pacer.hasPending());
+    try std.testing.expect(app.pacer.deferred_presentation == null);
+    try std.testing.expectEqual(@as(usize, 0), app.summary_presentations);
+    try std.testing.expectEqual(@as(usize, 0), app.countTurnSummaries());
+    try std.testing.expectEqual(@as(usize, 1), agent.session.historyLen());
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
+
+    const session_id = try alloc.dupe(u8, agent.session_persistence.v2.?.id());
+    defer alloc.free(session_id);
+    agent.session_persistence.v2.?.close();
+    agent.session_persistence.v2 = null;
+    const reopened = try CommitSplitTestApp.session_adapter.Session.resumeSession(alloc, agent.session_persistence.v2_store.?, .{ .id = session_id }, root, .app);
+    defer reopened.close();
+    var loaded = try reopened.restore(alloc);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), loaded.history.len);
+    try std.testing.expectEqualStrings("pending answer", loaded.history[0].assistant.assistant);
+}
+
+test "drain commit failure is attempted once, acknowledges gate once, and preserves second finish gate count" {
+    const alloc = testing_allocator.no_resize;
+    var app: CommitSplitTestApp = .{
+        .alloc = alloc,
+        .workspace_root = "/tmp/workspace",
+        .second_turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("second") },
+            .assistant = @constCast("queued second"),
+        } },
+    };
+    defer app.deinitAll();
+
+    const agent = app.agent();
+    agent.worker.enableCommitGate();
+    const first_turn: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("first") },
+        .assistant = @constCast("failing first"),
+    } };
+    try agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = first_turn } });
+    try std.testing.expectEqual(@as(u32, 1), agent.worker.unacknowledged_finishes);
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+    defer app.alloc = alloc;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        app_worker_runtime.Runtime(CommitSplitTestApp).tick(&app, agent, Bindings(CommitSplitTestApp).workerEventHandlers(agent)),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), app.commit_attempts);
+    try std.testing.expectEqual(@as(u32, 1), agent.worker.unacknowledged_finishes);
+}
+
+test "immediate presentation failure after drain commit traces, keeps turn committed, and does not fail drain" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "immediate-pres-fail.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "worker");
+
+    var app = try CommitSplitTestApp.initWithV2Session(alloc, root);
+    defer app.deinitAll();
+    app.fail_presentation = true;
+    const agent = app.agent();
+    agent.worker.enableCommitGate();
+
+    const turn: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("immediate") },
+        .assistant = @constCast("saved reply"),
+    } };
+    try agent.worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{
+        .turn = turn,
+        .summary = .{ .token_progress = .{ .output_tokens = 7 } },
+        .terminal_outcome = .completed,
+    } });
+
+    try app_worker_runtime.Runtime(CommitSplitTestApp).tick(&app, agent, Bindings(CommitSplitTestApp).workerEventHandlers(agent));
+
+    try std.testing.expectEqual(@as(usize, 1), agent.session.historyLen());
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
+    try std.testing.expectEqual(@as(usize, 1), app.summary_presentations);
+    try std.testing.expectEqual(@as(usize, 0), app.notifications_finished);
+    try std.testing.expect(!app.pacer.hasPending());
+
+    debug_trace.shutdown();
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &file, 64 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "immediate finish presentation failed"));
+
+    const session_id = try alloc.dupe(u8, agent.session_persistence.v2.?.id());
+    defer alloc.free(session_id);
+    agent.session_persistence.v2.?.close();
+    agent.session_persistence.v2 = null;
+    const reopened = try CommitSplitTestApp.session_adapter.Session.resumeSession(alloc, agent.session_persistence.v2_store.?, .{ .id = session_id }, root, .app);
+    defer reopened.close();
+    var loaded = try reopened.restore(alloc);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), loaded.history.len);
+    try std.testing.expectEqualStrings("saved reply", loaded.history[0].assistant.assistant);
+}
+
+test "empty assistant tail clear with idle pacer does not block provisional tool lifecycle drain" {
+    const alloc = std.testing.allocator;
+    var app = CommitSplitTestApp{
+        .alloc = alloc,
+        .workspace_root = "/tmp/workspace",
+    };
+    defer {
+        app.agent().session.deinit(alloc);
+        app.agent().worker.deinit(std.heap.c_allocator);
+        app.agent().change_tracker.deinit(alloc);
+        app.input_runtime.deinit(alloc);
+        app.shell.deinit(alloc);
+        app.pacer.deinit(alloc);
+    }
+
+    const agent = app.agent();
+    const empty_events = try std.heap.c_allocator.alloc(assistant_presentation.Event, 0);
+    try agent.worker.pushEvent(std.heap.c_allocator, .{
+        .assistant_presentation = .{ .assistant_tail = empty_events },
+    });
+    const call_id = try std.heap.c_allocator.dupe(u8, "approval-cancel-resize");
+    const tool_name = try std.heap.c_allocator.dupe(u8, "shell");
+    try agent.worker.pushEvent(std.heap.c_allocator, .{ .tool_lifecycle = .{ .provisional = .{
+        .id = .{ .turn_id = 2, .call_id = call_id },
+        .tool_name = tool_name,
+        .activity_kind = .command,
+    } } });
+
+    try app_worker_runtime.Runtime(CommitSplitTestApp).tick(
+        &app,
+        agent,
+        Bindings(CommitSplitTestApp).workerEventHandlers(agent),
+    );
+
+    try std.testing.expect(!app.pacer.hasPending());
+    try std.testing.expectEqual(@as(usize, 0), agent.worker.worker_events.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.notebook.entries.items.len);
 }

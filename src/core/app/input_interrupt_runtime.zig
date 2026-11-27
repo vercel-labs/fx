@@ -274,20 +274,22 @@ test "a cancel drops the finished turn the pacer held, so a later report is not 
     agent.worker.enableCommitGate();
     agent.stream.active = true;
 
-    // A turn finished. The loop took its finish into the pacer, which is
-    // still showing the answer, so nothing has committed it.
+    // A turn finished and was committed and acknowledged at drain, while the
+    // pacer still shows the answer.
     const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
     try agent.worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
     var taken = agent.worker.takeEvents();
     for (taken.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
     taken.deinit(alloc);
+    agent.worker.acknowledgeFinishCommitted();
     try app.pacer.enqueue(alloc, "still showing");
-    try std.testing.expect(try app.pacer.deferFinish(alloc, .{ .turn = turn }));
-    try std.testing.expectEqual(@as(u32, 1), agent.worker.unacknowledged_finishes);
+    try std.testing.expect(app.pacer.deferFinish(@import("../../ui/assistant/pacer.zig").DeferredPresentation.fromFinishedPrompt(.{ .turn = turn })));
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
 
-    // The user cancels. The pacer's turn is dropped, and the worker is told.
+    // The user cancels. Only the pacer's deferred presentation is dropped; the
+    // commit gate stays clear.
     try InterruptRuntime(App).cancelActiveOperation(&app, agent);
-    try std.testing.expect(app.pacer.deferred_turn == null);
+    try std.testing.expect(app.pacer.deferred_presentation == null);
     try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
 
     // A later turn finishes and is committed, and a report missed it.

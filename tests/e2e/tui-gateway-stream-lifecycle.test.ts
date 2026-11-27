@@ -2799,7 +2799,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const paragraphFrame = grids.findIndex((grid) => grid.includes(renderedSentence));
       const toolFrame = grids.findIndex((grid) => grid.includes(toolMarker));
 
-      expect(prefixLengths).toEqual([renderedSentence.length]);
+      for (const grid of grids) {
+        expect(grid).not.toContain("**");
+        const prefixRow = grid
+          .split("\n")
+          .find((row) => row.startsWith("|  PACING_STREAM_SENTENCE"));
+        if (prefixRow) {
+          const visiblePrefix = prefixRow.slice(3).replace(/\|$/, "").trimEnd();
+          expect(renderedSentence.startsWith(visiblePrefix)).toBe(true);
+        }
+      }
+      expect(prefixLengths.length).toBeGreaterThan(0);
+      for (let index = 1; index < prefixLengths.length; index += 1) {
+        expect(prefixLengths[index]!).toBeGreaterThan(prefixLengths[index - 1]!);
+      }
+      expect(prefixLengths.at(-1)).toBe(renderedSentence.length);
       expect(paragraphFrame).toBeGreaterThanOrEqual(0);
       expect(toolFrame).toBeGreaterThanOrEqual(0);
       expect(paragraphFrame).toBeLessThan(toolFrame);

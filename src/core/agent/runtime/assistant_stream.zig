@@ -5,6 +5,7 @@ const permission_auto_classifier = @import("../../permissions/auto_classifier.zi
 const types = @import("../../shared/types.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const display_width = @import("../../shared/display_width.zig");
 const token_estimate = @import("../../shared/token_estimate.zig");
 const assistant_presentation = @import("../assistant_presentation.zig");
 const io_mod = @import("../../shared/io.zig");
@@ -37,6 +38,10 @@ const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 const TablePayload = assistant_presentation.TablePayload;
 const CodeBlockPayload = assistant_presentation.CodeBlockPayload;
 const response_language_probe_limit_bytes: usize = 4096;
+const staged_tail_preview_cap_bytes: usize = 4096;
+const staged_tail_preview_stride_words: usize = 16;
+const max_word_steps_per_chunk: usize = 32;
+const max_paced_tail_bytes: usize = 8 * 1024;
 
 const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.read_file,
@@ -58,6 +63,8 @@ pub const SemanticPresentationSink = struct {
     /// is the allocator that made them. Null when the sink shows no tail, so
     /// the stream builds no preview for it.
     assistant_tail: ?*const fn (ctx: *anyopaque, alloc: Allocator, events: []assistant_presentation.Event) anyerror!void,
+    /// True when the sink's consumer paces revealed text word by word.
+    paced_steps: bool = false,
 };
 
 /// The tool calls a reply started, every tool alike, kept without allocation
@@ -190,6 +197,15 @@ pub const StreamChunkContext = struct {
     response_language_accepted: bool = false,
     response_language_hold_until_completion: bool = false,
     response_language_next_probe_bytes: usize = 5,
+    staged_markdown: assistant_presentation.MarkdownProcessor = .{},
+    staged_link_id: u32 = 1,
+    staged_out: std.ArrayList(u8) = .empty,
+    staged_saw_visible_text: bool = false,
+    staged_initial_line_prefix: std.ArrayList(u8) = .empty,
+    staged_shown_bytes: usize = 0,
+    staged_words_since_preview: usize = 0,
+    staged_preview_cap_traced: bool = false,
+    paced_tail_fallback_traced: bool = false,
     /// The tail last sent to the sink, to skip a send when nothing changed.
     sent_tail: std.ArrayList(assistant_presentation.Event) = .empty,
     /// Tail previews this stream has rendered. A test reads it to see that a sink with no tail builds none.
@@ -233,7 +249,22 @@ pub const StreamChunkContext = struct {
         self.interrupted_source.deinit(self.alloc);
         self.initial_line_prefix.deinit(self.alloc);
         self.provisional_statuses.deinit(self.alloc);
+        self.resetStagedPresentation();
         deinitEventList(self.alloc, &self.sent_tail);
+    }
+
+    fn resetStagedPresentation(self: *StreamChunkContext) void {
+        self.staged_markdown.deinit(self.alloc);
+        self.staged_markdown = .{};
+        self.staged_link_id = self.markdown.link_ids.*;
+        self.staged_out.deinit(self.alloc);
+        self.staged_out = .empty;
+        self.staged_initial_line_prefix.deinit(self.alloc);
+        self.staged_initial_line_prefix = .empty;
+        self.staged_saw_visible_text = false;
+        self.staged_shown_bytes = 0;
+        self.staged_words_since_preview = 0;
+        self.staged_preview_cap_traced = false;
     }
 
     pub fn start_response(self: *StreamChunkContext) !void {
@@ -261,6 +292,7 @@ pub const StreamChunkContext = struct {
         self.markdown.deinit(self.alloc);
         self.markdown = .{};
         self.initial_line_prefix.clearRetainingCapacity();
+        self.resetStagedPresentation();
         self.saw_visible_text = false;
         self.response_started = false;
         self.last_byte_was_newline = false;
@@ -275,6 +307,7 @@ pub const StreamChunkContext = struct {
         self.first_model_output_at_ms = null;
         self.streamed_output_bytes = 0;
         self.published_phase = null;
+        self.paced_tail_fallback_traced = false;
         try sendAssistantTail(self);
     }
 
@@ -301,7 +334,14 @@ pub const StreamChunkContext = struct {
     pub fn accept_staged_response_language(self: *StreamChunkContext) !void {
         if (!self.response_language_staging()) return;
         self.response_language_accepted = true;
-        try publishAssistantChunkResolved(self, self.raw_text.items);
+        const shown_len = @min(self.staged_shown_bytes, self.raw_text.items.len);
+        defer self.resetStagedPresentation();
+        if (shown_len > 0) {
+            try publishAssistantChunkResolvedWithMode(self, self.raw_text.items[0..shown_len], .one_shot);
+        }
+        if (shown_len < self.raw_text.items.len) {
+            try publishAssistantChunkResolvedWithMode(self, self.raw_text.items[shown_len..], .split_words);
+        }
     }
 
     pub fn drop_staged_response_language_candidate(self: *StreamChunkContext) void {
@@ -309,7 +349,7 @@ pub const StreamChunkContext = struct {
         if (self.raw_text.items.len > 0) {
             debug_trace.logf(
                 "agent",
-                "dropping rejected response language candidate bytes={d}",
+                "dropping rejected response language candidate kind=staged_response size={d} reason=language_mismatch",
                 .{self.raw_text.items.len},
             );
         }
@@ -319,6 +359,14 @@ pub const StreamChunkContext = struct {
         self.last_byte_was_newline = false;
         self.trailing_newline_count = 0;
         self.response_language_next_probe_bytes = 5;
+        self.resetStagedPresentation();
+        finishAssistantTail(self) catch |err| {
+            debug_trace.logf(
+                "agent",
+                "staged assistant tail dropped kind=staged_tail size=1 reason=clear_failed err={s}",
+                .{@errorName(err)},
+            );
+        };
     }
 
     fn response_language_staging(self: *const StreamChunkContext) bool {
@@ -492,8 +540,9 @@ fn streamAssistantChunk(stream_ctx: *StreamChunkContext, chunk: []const u8) !voi
     const alloc = stream_ctx.alloc;
     try stream_ctx.raw_text.appendSlice(alloc, chunk);
     if (stream_ctx.response_language_staging()) {
-        if (stream_ctx.response_language_hold_until_completion) return;
-        if (stream_ctx.raw_text.items.len >= stream_ctx.response_language_next_probe_bytes) {
+        if (!stream_ctx.response_language_hold_until_completion and
+            stream_ctx.raw_text.items.len >= stream_ctx.response_language_next_probe_bytes)
+        {
             const prefix_len = @min(
                 stream_ctx.raw_text.items.len,
                 response_language_probe_limit_bytes,
@@ -501,6 +550,7 @@ fn streamAssistantChunk(stream_ctx: *StreamChunkContext, chunk: []const u8) !voi
             const prefix = stream_ctx.raw_text.items[0..prefix_len];
             if (response_language.evidence(prefix).script == stream_ctx.response_language_expected) {
                 try stream_ctx.accept_staged_response_language();
+                return;
             } else if (prefix_len == response_language_probe_limit_bytes) {
                 stream_ctx.response_language_next_probe_bytes = std.math.maxInt(usize);
             } else {
@@ -510,12 +560,26 @@ fn streamAssistantChunk(stream_ctx: *StreamChunkContext, chunk: []const u8) !voi
                 );
             }
         }
+        try pushStagedAssistantTail(stream_ctx, chunk);
         return;
     }
     try publishAssistantChunkResolved(stream_ctx, chunk);
 }
 
+const ChunkSplitMode = enum {
+    split_words,
+    one_shot,
+};
+
 fn publishAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const u8) !void {
+    try publishAssistantChunkResolvedWithMode(stream_ctx, chunk, .split_words);
+}
+
+fn publishAssistantChunkResolvedWithMode(
+    stream_ctx: *StreamChunkContext,
+    chunk: []const u8,
+    split_mode: ChunkSplitMode,
+) !void {
     if (chunk.len == 0) return;
     const alloc = stream_ctx.alloc;
     try stream_ctx.start_response();
@@ -573,23 +637,281 @@ fn publishAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const
         &thematic_rule_completion
     else
         null;
-    if (initial_prefix_to_emit) |prefix| {
-        try stream_ctx.markdown.pushWithCompletions(alloc, prefix, &out, .{
-            .table = table_completion,
-            .code = semantic_code_completion,
-            .thematic_rule = semantic_thematic_rule_completion,
-        });
+    const paces_steps = if (stream_ctx.semantic_presentation) |sink|
+        sink.assistant_tail != null and sink.paced_steps
+    else
+        false;
+    const EmitState = struct {
+        stream_ctx: *StreamChunkContext,
+        out: *std.ArrayList(u8),
+        initial_prefix_to_emit: ?[]const u8,
+        table_completion: ?*const assistant_presentation.TableCompletion,
+        semantic_code_completion: ?*const assistant_presentation.CodeBlockCompletion,
+        semantic_thematic_rule_completion: ?*const assistant_presentation.ThematicRuleCompletion,
+
+        fn emitSlice(self: *@This(), alloc_arg: Allocator, slice: []const u8, _: usize, _: bool) !void {
+            if (self.initial_prefix_to_emit) |prefix| {
+                self.initial_prefix_to_emit = null;
+                try self.stream_ctx.markdown.pushWithCompletions(alloc_arg, prefix, self.out, .{
+                    .table = self.table_completion,
+                    .code = self.semantic_code_completion,
+                    .thematic_rule = self.semantic_thematic_rule_completion,
+                });
+            }
+            try self.stream_ctx.markdown.pushWithCompletions(alloc_arg, slice, self.out, .{
+                .table = self.table_completion,
+                .code = self.semantic_code_completion,
+                .thematic_rule = self.semantic_thematic_rule_completion,
+            });
+            if (self.out.items.len > 0) {
+                try self.stream_ctx.hooks.push_text(self.stream_ctx.hooks.ctx, .{ .assistant_rendered = self.out.items });
+                self.stream_ctx.recordTextOutput(self.out.items);
+                self.out.clearRetainingCapacity();
+            }
+            try sendAssistantTail(self.stream_ctx);
+        }
+    };
+    var emit_state = EmitState{
+        .stream_ctx = stream_ctx,
+        .out = &out,
+        .initial_prefix_to_emit = initial_prefix_to_emit,
+        .table_completion = table_completion,
+        .semantic_code_completion = semantic_code_completion,
+        .semantic_thematic_rule_completion = semantic_thematic_rule_completion,
+    };
+    try pushPacedMarkdownSteps(
+        stream_ctx,
+        alloc,
+        &stream_ctx.markdown,
+        chunk,
+        start,
+        paces_steps,
+        !paces_steps or split_mode == .one_shot,
+        &emit_state,
+        EmitState.emitSlice,
+    );
+}
+
+fn pushPacedMarkdownSteps(
+    stream_ctx: *StreamChunkContext,
+    alloc: Allocator,
+    md: anytype,
+    chunk: []const u8,
+    start: usize,
+    paces_steps: bool,
+    force_one_shot: bool,
+    emit_ctx: anytype,
+    comptime emit_fn: anytype,
+) !void {
+    const open_tail_bytes = md.openTailByteCount();
+    if (paces_steps and !force_one_shot and open_tail_bytes >= max_paced_tail_bytes) {
+        traceLargeOpenTailFallback(stream_ctx, open_tail_bytes);
     }
-    try stream_ctx.markdown.pushWithCompletions(alloc, chunk[start..], &out, .{
-        .table = table_completion,
-        .code = semantic_code_completion,
-        .thematic_rule = semantic_thematic_rule_completion,
-    });
-    if (out.items.len > 0) {
-        try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = out.items });
-        stream_ctx.recordTextOutput(out.items);
+    if (force_one_shot or open_tail_bytes >= max_paced_tail_bytes) {
+        try emit_fn(emit_ctx, alloc, chunk[start..], chunk.len, true);
+        return;
     }
-    try sendAssistantTail(stream_ctx);
+
+    const total_pieces = countWordPieces(chunk, start);
+    var step_index: usize = 0;
+    var pos = start;
+    while (pos < chunk.len) : (step_index += 1) {
+        const current_open_bytes = md.openTailByteCount();
+        if (step_index > 0 and current_open_bytes >= max_paced_tail_bytes) {
+            traceLargeOpenTailFallback(stream_ctx, current_open_bytes);
+            try emit_fn(emit_ctx, alloc, chunk[pos..], chunk.len, true);
+            break;
+        }
+        const piece_end = nextGroupedPieceEnd(chunk, pos, step_index, total_pieces, max_word_steps_per_chunk);
+        try emit_fn(emit_ctx, alloc, chunk[pos..piece_end], piece_end, false);
+        pos = piece_end;
+    }
+}
+
+fn traceLargeOpenTailFallback(stream_ctx: *StreamChunkContext, open_bytes: usize) void {
+    if (stream_ctx.paced_tail_fallback_traced) return;
+    stream_ctx.paced_tail_fallback_traced = true;
+    debug_trace.logf(
+        "agent",
+        "paced tail split skipped kind=open_tail size={d} cap_bytes={d} reason=tail_bytes_limit",
+        .{ open_bytes, max_paced_tail_bytes },
+    );
+}
+
+fn countWordPieces(text: []const u8, start: usize) usize {
+    var count: usize = 0;
+    var pos = start;
+    while (pos < text.len) {
+        pos = display_width.nextWordPieceEnd(text, pos, false);
+        count += 1;
+    }
+    return count;
+}
+
+fn nextGroupedPieceEnd(
+    text: []const u8,
+    pos: usize,
+    step_index: usize,
+    total_pieces: usize,
+    max_steps: usize,
+) usize {
+    if (total_pieces <= max_steps) return display_width.nextWordPieceEnd(text, pos, false);
+    const base = total_pieces / max_steps;
+    const rem = total_pieces % max_steps;
+    const group_count = base + @intFromBool(step_index < rem);
+    var end = pos;
+    var taken: usize = 0;
+    while (taken < group_count and end < text.len) : (taken += 1) {
+        end = display_width.nextWordPieceEnd(text, end, false);
+    }
+    return end;
+}
+
+fn pushStagedAssistantTail(stream_ctx: *StreamChunkContext, chunk: []const u8) !void {
+    if (comptime !assistant_presentation.builds_previews) return;
+    if (!stream_ctx.hooks.render_assistant_text) return;
+    const sink = stream_ctx.semantic_presentation orelse return;
+    if (sink.assistant_tail == null) return;
+
+    const alloc = stream_ctx.alloc;
+    if (!stream_ctx.staged_saw_visible_text) {
+        stream_ctx.staged_link_id = stream_ctx.markdown.link_ids.*;
+    }
+    stream_ctx.staged_markdown.link_ids = &stream_ctx.staged_link_id;
+    var start: usize = 0;
+    var clear_staged_initial_prefix = false;
+    defer if (clear_staged_initial_prefix) stream_ctx.staged_initial_line_prefix.clearRetainingCapacity();
+    if (!stream_ctx.staged_saw_visible_text) {
+        while (start < chunk.len and isTrimmedAssistantPrefixByte(chunk[start])) : (start += 1) {
+            switch (chunk[start]) {
+                ' ', '\t' => try stream_ctx.staged_initial_line_prefix.append(alloc, chunk[start]),
+                '\n' => stream_ctx.staged_initial_line_prefix.clearRetainingCapacity(),
+                else => {},
+            }
+        }
+        if (start == chunk.len) return;
+        if (hasResponseLeadingIndentedCodePrefix(stream_ctx.staged_initial_line_prefix.items)) {
+            try stream_ctx.staged_markdown.pushWithCompletions(
+                alloc,
+                stream_ctx.staged_initial_line_prefix.items,
+                &stream_ctx.staged_out,
+                .{},
+            );
+        }
+        stream_ctx.staged_saw_visible_text = true;
+        clear_staged_initial_prefix = true;
+    }
+
+    const chunk_raw_start = stream_ctx.raw_text.items.len - chunk.len;
+    const StagedEmitState = struct {
+        stream_ctx: *StreamChunkContext,
+        sink: SemanticPresentationSink,
+        chunk_raw_start: usize,
+
+        fn emitSlice(self: *@This(), alloc_arg: Allocator, slice: []const u8, piece_end: usize, force_deliver: bool) !void {
+            try self.stream_ctx.staged_markdown.pushWithCompletions(
+                alloc_arg,
+                slice,
+                &self.stream_ctx.staged_out,
+                .{},
+            );
+            if (force_deliver or self.stream_ctx.staged_out.items.len < staged_tail_preview_cap_bytes) {
+                try deliverStagedTailSnapshot(self.sink, self.stream_ctx);
+                self.stream_ctx.staged_shown_bytes = if (force_deliver)
+                    self.stream_ctx.raw_text.items.len
+                else
+                    self.chunk_raw_start + piece_end;
+                self.stream_ctx.staged_words_since_preview = 0;
+                return;
+            }
+            if (!self.stream_ctx.staged_preview_cap_traced) {
+                self.stream_ctx.staged_preview_cap_traced = true;
+                debug_trace.logf(
+                    "agent",
+                    "staged tail preview throttled staged_bytes={d} cap_bytes={d} stride_words={d}",
+                    .{
+                        self.stream_ctx.staged_out.items.len,
+                        staged_tail_preview_cap_bytes,
+                        staged_tail_preview_stride_words,
+                    },
+                );
+            }
+            self.stream_ctx.staged_words_since_preview += 1;
+            if (self.stream_ctx.staged_words_since_preview >= staged_tail_preview_stride_words) {
+                self.stream_ctx.staged_words_since_preview = 0;
+                try deliverStagedTailSnapshot(self.sink, self.stream_ctx);
+                self.stream_ctx.staged_shown_bytes = self.chunk_raw_start + piece_end;
+            }
+        }
+    };
+    var staged_state = StagedEmitState{
+        .stream_ctx = stream_ctx,
+        .sink = sink,
+        .chunk_raw_start = chunk_raw_start,
+    };
+    try pushPacedMarkdownSteps(
+        stream_ctx,
+        alloc,
+        &stream_ctx.staged_markdown,
+        chunk,
+        start,
+        sink.paced_steps,
+        !sink.paced_steps,
+        &staged_state,
+        StagedEmitState.emitSlice,
+    );
+}
+
+fn deliverStagedTailSnapshot(
+    sink: SemanticPresentationSink,
+    stream_ctx: *StreamChunkContext,
+) !void {
+    const alloc = stream_ctx.alloc;
+    var tail: std.ArrayList(assistant_presentation.Event) = .empty;
+    defer deinitEventList(alloc, &tail);
+
+    if (stream_ctx.staged_out.items.len > 0) {
+        const text = try alloc.dupe(u8, stream_ctx.staged_out.items);
+        errdefer alloc.free(text);
+        try tail.append(alloc, .{ .text = text });
+    }
+    stream_ctx.tail_previews_built += 1;
+    _ = try stream_ctx.staged_markdown.renderProvisional(alloc, &tail);
+    if (eventSlicesEqual(tail.items, stream_ctx.sent_tail.items)) return;
+    try deliverAssistantTail(sink, stream_ctx, try tail.toOwnedSlice(alloc));
+}
+
+fn eventSlicesEqual(a: []const assistant_presentation.Event, b: []const assistant_presentation.Event) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |lhs, rhs| {
+        if (!eventsEqual(lhs, rhs)) return false;
+    }
+    return true;
+}
+
+fn eventsEqual(a: assistant_presentation.Event, b: assistant_presentation.Event) bool {
+    const Tag = std.meta.Tag(assistant_presentation.Event);
+    if (@as(Tag, a) != @as(Tag, b)) return false;
+    return switch (a) {
+        .text => |t| std.mem.eql(u8, t, b.text),
+        .attempt_restart => |t| std.mem.eql(u8, t, b.attempt_restart),
+        .thematic_rule, .attempt_start, .operational_text_shown => true,
+        .code_block => |cb| std.mem.eql(u8, cb.language, b.code_block.language) and
+            std.mem.eql(u8, cb.code, b.code_block.code),
+        .table => |t| blk: {
+            if (t.column_count != b.table.column_count) break :blk false;
+            if (!std.mem.eql(assistant_presentation.TableColumnAlign, t.alignments, b.table.alignments)) break :blk false;
+            if (t.rows.len != b.table.rows.len) break :blk false;
+            for (t.rows, b.table.rows) |r1, r2| {
+                if (r1.cells.len != r2.cells.len) break :blk false;
+                for (r1.cells, r2.cells) |c1, c2| {
+                    if (!std.mem.eql(u8, c1, c2)) break :blk false;
+                }
+            }
+            break :blk true;
+        },
+        .assistant_tail => |events| eventSlicesEqual(events, b.assistant_tail),
+    };
 }
 
 pub fn flushAssistantStream(stream_ctx: *StreamChunkContext) !void {
@@ -2456,4 +2778,607 @@ test "emitProviderLengthNotice ignores non-length finish reasons" {
     try emitProviderLengthNotice(&hooks, arena_state.allocator(), .completed);
 
     try std.testing.expectEqual(@as(usize, 0), capture.notices.items.len);
+}
+
+fn collectWordPieces(alloc: Allocator, text: []const u8) !std.ArrayList([]const u8) {
+    var pieces: std.ArrayList([]const u8) = .empty;
+    errdefer pieces.deinit(alloc);
+    var pos: usize = 0;
+    while (pos < text.len) {
+        const end = display_width.nextWordPieceEnd(text, pos, false);
+        try std.testing.expect(end > pos);
+        try pieces.append(alloc, text[pos..end]);
+        pos = end;
+    }
+    return pieces;
+}
+
+fn expectPieceSlices(expected: []const []const u8, actual: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |exp, act| {
+        try std.testing.expectEqualStrings(exp, act);
+    }
+}
+
+test "nextWordPieceEnd splits ASCII, spaces, newlines, CJK, emoji, and keeps cut UTF-8 whole" {
+    const alloc = std.testing.allocator;
+
+    {
+        var pieces = try collectWordPieces(alloc, "hello world foo");
+        defer pieces.deinit(alloc);
+        try expectPieceSlices(&.{ "hello ", "world ", "foo" }, pieces.items);
+    }
+    {
+        var pieces = try collectWordPieces(alloc, "  a   b  ");
+        defer pieces.deinit(alloc);
+        try expectPieceSlices(&.{ "  ", "a   ", "b  " }, pieces.items);
+    }
+    {
+        var pieces = try collectWordPieces(alloc, "one\n\ntwo\r\nDone.");
+        defer pieces.deinit(alloc);
+        try expectPieceSlices(&.{ "one\n\n", "two\r\n", "Done." }, pieces.items);
+    }
+    {
+        var pieces = try collectWordPieces(alloc, "hi你好 world");
+        defer pieces.deinit(alloc);
+        try expectPieceSlices(&.{ "hi", "你", "好 ", "world" }, pieces.items);
+    }
+    {
+        var pieces = try collectWordPieces(alloc, "hi 😀🎉!");
+        defer pieces.deinit(alloc);
+        try expectPieceSlices(&.{ "hi ", "😀", "🎉", "!" }, pieces.items);
+    }
+    {
+        var pieces = try collectWordPieces(alloc, "你\xe4\xb8");
+        defer pieces.deinit(alloc);
+        try expectPieceSlices(&.{ "你", "\xe4\xb8" }, pieces.items);
+    }
+    {
+        var pieces = try collectWordPieces(alloc, "abc\xe4\xb8");
+        defer pieces.deinit(alloc);
+        try expectPieceSlices(&.{"abc\xe4\xb8"}, pieces.items);
+    }
+}
+
+test "publishAssistantChunkResolved emits word-step tails when tail sink is present" {
+    const alloc = std.testing.allocator;
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var tail_calls: usize = 0;
+    const TailSink = struct {
+        fn push(raw: *anyopaque, a: Allocator, events: []assistant_presentation.Event) anyerror!void {
+            const count: *usize = @ptrCast(@alignCast(raw));
+            defer assistant_presentation.freeEventSlice(a, events);
+            count.* += 1;
+        }
+    };
+    var hook_set = capture.hooks();
+    var sink = capture.semanticPresentationSink();
+    sink.ctx = &tail_calls;
+    sink.assistant_tail = TailSink.push;
+    sink.paced_steps = true;
+
+    var stream_ctx = StreamChunkContext{
+        .hooks = &hook_set,
+        .semantic_presentation = sink,
+        .turn_id = 1,
+        .alloc = alloc,
+    };
+    defer stream_ctx.deinit();
+
+    try streamAssistantChunk(&stream_ctx, "one two three");
+    try std.testing.expectEqual(@as(usize, 3), tail_calls);
+}
+
+const StagedTailCapture = struct {
+    alloc: Allocator,
+    calls: usize = 0,
+    last_events: usize = 0,
+    last_text: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *StagedTailCapture) void {
+        self.last_text.deinit(self.alloc);
+    }
+
+    fn push(raw: *anyopaque, a: Allocator, events: []assistant_presentation.Event) anyerror!void {
+        const self: *StagedTailCapture = @ptrCast(@alignCast(raw));
+        defer assistant_presentation.freeEventSlice(a, events);
+        self.calls += 1;
+        self.last_events = events.len;
+        self.last_text.clearRetainingCapacity();
+        for (events) |event| switch (event) {
+            .text => |text| try self.last_text.appendSlice(self.alloc, text),
+            else => {},
+        };
+    }
+
+    fn nopTable(_: *anyopaque, table: TablePayload) anyerror!void {
+        var owned = table;
+        owned.deinit(std.testing.allocator);
+    }
+
+    fn nopCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayload) anyerror!void {
+        var owned = block;
+        owned.deinit(std.testing.allocator);
+    }
+
+    fn nopRule(_: *anyopaque) anyerror!void {}
+};
+
+test "staged language gate streams provisional tails without committing before accept" {
+    const alloc = std.testing.allocator;
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var tail_cap = StagedTailCapture{ .alloc = alloc };
+    defer tail_cap.deinit();
+    var hook_set = capture.hooks();
+
+    var stream_ctx = StreamChunkContext{
+        .hooks = &hook_set,
+        .semantic_presentation = .{
+            .ctx = &tail_cap,
+            .table = StagedTailCapture.nopTable,
+            .code_block = StagedTailCapture.nopCodeBlock,
+            .thematic_rule = StagedTailCapture.nopRule,
+            .assistant_tail = StagedTailCapture.push,
+            .paced_steps = true,
+        },
+        .turn_id = 1,
+        .alloc = alloc,
+        .response_language_expected = .latin,
+    };
+    defer stream_ctx.deinit();
+
+    // Below 5-byte probe threshold: stays staged and emits provisional tail without .assistant_rendered.
+    try streamAssistantChunk(&stream_ctx, "  hi");
+    try std.testing.expectEqual(@as(usize, 0), capture.text_spans.items.len);
+    try std.testing.expectEqual(@as(usize, 1), tail_cap.calls);
+    try std.testing.expectEqualStrings("hi", tail_cap.last_text.items);
+}
+
+test "accepting staged language gate commits identical output and replaces provisional tail" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{ "\n  **bold", " word**\n", "next" };
+
+    var baseline_cap = StreamCapture{};
+    defer baseline_cap.deinit(alloc);
+    var baseline_tail = StagedTailCapture{ .alloc = alloc };
+    defer baseline_tail.deinit();
+    var baseline_hooks = baseline_cap.hooks();
+    var baseline_ctx = StreamChunkContext{
+        .hooks = &baseline_hooks,
+        .semantic_presentation = .{
+            .ctx = &baseline_tail,
+            .table = StagedTailCapture.nopTable,
+            .code_block = StagedTailCapture.nopCodeBlock,
+            .thematic_rule = StagedTailCapture.nopRule,
+            .assistant_tail = StagedTailCapture.push,
+            .paced_steps = true,
+        },
+        .turn_id = 1,
+        .alloc = alloc,
+    };
+    defer baseline_ctx.deinit();
+    for (chunks) |chunk| try streamAssistantChunk(&baseline_ctx, chunk);
+
+    var staged_cap = StreamCapture{};
+    defer staged_cap.deinit(alloc);
+    var staged_tail = StagedTailCapture{ .alloc = alloc };
+    defer staged_tail.deinit();
+    var staged_hooks = staged_cap.hooks();
+    var staged_ctx = StreamChunkContext{
+        .hooks = &staged_hooks,
+        .semantic_presentation = .{
+            .ctx = &staged_tail,
+            .table = StagedTailCapture.nopTable,
+            .code_block = StagedTailCapture.nopCodeBlock,
+            .thematic_rule = StagedTailCapture.nopRule,
+            .assistant_tail = StagedTailCapture.push,
+            .paced_steps = true,
+        },
+        .turn_id = 1,
+        .alloc = alloc,
+        .response_language_expected = .latin,
+        .response_language_hold_until_completion = true,
+    };
+    defer staged_ctx.deinit();
+    for (chunks) |chunk| try streamAssistantChunk(&staged_ctx, chunk);
+    try std.testing.expectEqual(@as(usize, 0), staged_cap.text_spans.items.len);
+    const tail_calls_before_accept = staged_tail.calls;
+
+    try staged_ctx.accept_staged_response_language();
+
+    var baseline_joined: std.ArrayList(u8) = .empty;
+    defer baseline_joined.deinit(alloc);
+    for (baseline_cap.text_spans.items) |span| try baseline_joined.appendSlice(alloc, span);
+
+    var staged_joined: std.ArrayList(u8) = .empty;
+    defer staged_joined.deinit(alloc);
+    for (staged_cap.text_spans.items) |span| try staged_joined.appendSlice(alloc, span);
+
+    try std.testing.expectEqualStrings(baseline_joined.items, staged_joined.items);
+    try std.testing.expectEqual(tail_calls_before_accept + 1, staged_tail.calls);
+    try std.testing.expectEqualStrings(baseline_tail.last_text.items, staged_tail.last_text.items);
+}
+
+test "dropping staged language candidate emits empty tail and no committed text" {
+    const alloc = std.testing.allocator;
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var tail_cap = StagedTailCapture{ .alloc = alloc };
+    defer tail_cap.deinit();
+    var hook_set = capture.hooks();
+
+    var stream_ctx = StreamChunkContext{
+        .hooks = &hook_set,
+        .semantic_presentation = .{
+            .ctx = &tail_cap,
+            .table = StagedTailCapture.nopTable,
+            .code_block = StagedTailCapture.nopCodeBlock,
+            .thematic_rule = StagedTailCapture.nopRule,
+            .assistant_tail = StagedTailCapture.push,
+            .paced_steps = true,
+        },
+        .turn_id = 1,
+        .alloc = alloc,
+        .response_language_expected = .latin,
+        .response_language_hold_until_completion = true,
+    };
+    defer stream_ctx.deinit();
+
+    try streamAssistantChunk(&stream_ctx, "alpha beta");
+    try std.testing.expectEqual(@as(usize, 0), capture.text_spans.items.len);
+    try std.testing.expect(tail_cap.calls > 0);
+    try std.testing.expect(tail_cap.last_events > 0);
+
+    const calls_before_drop = tail_cap.calls;
+    stream_ctx.drop_staged_response_language_candidate();
+    try std.testing.expectEqual(@as(usize, 0), capture.text_spans.items.len);
+    try std.testing.expectEqual(calls_before_drop + 1, tail_cap.calls);
+    try std.testing.expectEqual(@as(usize, 0), tail_cap.last_events);
+}
+
+test "response_language_hold_until_completion streams word-by-word provisional tails" {
+    const alloc = std.testing.allocator;
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var tail_cap = StagedTailCapture{ .alloc = alloc };
+    defer tail_cap.deinit();
+    var hook_set = capture.hooks();
+
+    var stream_ctx = StreamChunkContext{
+        .hooks = &hook_set,
+        .semantic_presentation = .{
+            .ctx = &tail_cap,
+            .table = StagedTailCapture.nopTable,
+            .code_block = StagedTailCapture.nopCodeBlock,
+            .thematic_rule = StagedTailCapture.nopRule,
+            .assistant_tail = StagedTailCapture.push,
+            .paced_steps = true,
+        },
+        .turn_id = 1,
+        .alloc = alloc,
+        .response_language_expected = .latin,
+        .response_language_hold_until_completion = true,
+    };
+    defer stream_ctx.deinit();
+
+    try streamAssistantChunk(&stream_ctx, "alpha beta\ngamma");
+    try std.testing.expectEqual(@as(usize, 0), capture.text_spans.items.len);
+    try std.testing.expectEqual(@as(usize, 3), tail_cap.calls);
+    try std.testing.expectEqualStrings("alpha beta\ngamma", tail_cap.last_text.items);
+}
+
+test "English-gated first chunk accepted immediately emits word-step tails for all unshown words" {
+    const alloc = std.testing.allocator;
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var tail_cap = StagedTailCapture{ .alloc = alloc };
+    defer tail_cap.deinit();
+    var hook_set = capture.hooks();
+
+    var stream_ctx = StreamChunkContext{
+        .hooks = &hook_set,
+        .semantic_presentation = .{
+            .ctx = &tail_cap,
+            .table = StagedTailCapture.nopTable,
+            .code_block = StagedTailCapture.nopCodeBlock,
+            .thematic_rule = StagedTailCapture.nopRule,
+            .assistant_tail = StagedTailCapture.push,
+            .paced_steps = true,
+        },
+        .turn_id = 1,
+        .alloc = alloc,
+        .response_language_expected = .latin,
+    };
+    defer stream_ctx.deinit();
+
+    try streamAssistantChunk(
+        &stream_ctx,
+        "one two three four five six seven eight nine ten eleven twelve",
+    );
+    try std.testing.expect(stream_ctx.response_language_accepted);
+    try std.testing.expectEqual(@as(usize, 12), tail_cap.calls);
+    try std.testing.expectEqualStrings(
+        "one two three four five six seven eight nine ten eleven twelve",
+        tail_cap.last_text.items,
+    );
+}
+
+test "staged language gate throttles previews past byte cap, traces once, and accept publishes unshown bytes word-split" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "staged-throttle-trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "agent");
+
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var tail_cap = StagedTailCapture{ .alloc = alloc };
+    defer tail_cap.deinit();
+    var hook_set = capture.hooks();
+
+    var stream_ctx = StreamChunkContext{
+        .hooks = &hook_set,
+        .semantic_presentation = .{
+            .ctx = &tail_cap,
+            .table = StagedTailCapture.nopTable,
+            .code_block = StagedTailCapture.nopCodeBlock,
+            .thematic_rule = StagedTailCapture.nopRule,
+            .assistant_tail = StagedTailCapture.push,
+            .paced_steps = true,
+        },
+        .turn_id = 1,
+        .alloc = alloc,
+        .response_language_expected = .latin,
+        .response_language_hold_until_completion = true,
+    };
+    defer stream_ctx.deinit();
+
+    // 50-byte line (10 words); 81 lines = 4050 bytes (< staged_tail_preview_cap_bytes).
+    const line = "word word word word word word word word word word\n";
+    var all_input: std.ArrayList(u8) = .empty;
+    defer all_input.deinit(alloc);
+
+    for (0..81) |_| {
+        try streamAssistantChunk(&stream_ctx, line);
+        try all_input.appendSlice(alloc, line);
+    }
+    try std.testing.expectEqual(@as(usize, 810), tail_cap.calls);
+    try std.testing.expect(!stream_ctx.staged_preview_cap_traced);
+
+    // Line 82's 10th word pushes staged_out to 4100 >= 4096 and starts throttling.
+    try streamAssistantChunk(&stream_ctx, line);
+    try all_input.appendSlice(alloc, line);
+    try std.testing.expect(stream_ctx.staged_preview_cap_traced);
+    try std.testing.expectEqual(@as(usize, 819), tail_cap.calls);
+
+    // 31 more words complete 32 words past cap (2 * staged_tail_preview_stride_words).
+    const two_stride_tail =
+        "w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16\n" ++
+        "w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31\n";
+    try streamAssistantChunk(&stream_ctx, two_stride_tail);
+    try all_input.appendSlice(alloc, two_stride_tail);
+    try std.testing.expectEqual(@as(usize, 821), tail_cap.calls);
+
+    // 5 trailing unshown words (< stride): no preview emitted yet, stays unshown until accept.
+    const unshown_tail = "tail1 tail2 tail3 tail4 tail5";
+    try streamAssistantChunk(&stream_ctx, unshown_tail);
+    try all_input.appendSlice(alloc, unshown_tail);
+    try std.testing.expectEqual(@as(usize, 821), tail_cap.calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.text_spans.items.len);
+
+    // Trace fired exactly once across all throttled words.
+    var trace_file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
+    defer trace_file.close(std.testing.io);
+    const trace_bytes = try io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
+    defer alloc.free(trace_bytes);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace_bytes, "staged tail preview throttled"));
+
+    // Accept flushes shown prefix one-shot (1 tail reset) + 5 unshown words word-split (5 tails).
+    const calls_before_accept = tail_cap.calls;
+    try stream_ctx.accept_staged_response_language();
+    try std.testing.expectEqual(calls_before_accept + 6, tail_cap.calls);
+    try flushAssistantStream(&stream_ctx);
+
+    var baseline_cap = StreamCapture{};
+    defer baseline_cap.deinit(alloc);
+    var baseline_tail = StagedTailCapture{ .alloc = alloc };
+    defer baseline_tail.deinit();
+    var baseline_hooks = baseline_cap.hooks();
+    var baseline_ctx = StreamChunkContext{
+        .hooks = &baseline_hooks,
+        .semantic_presentation = .{
+            .ctx = &baseline_tail,
+            .table = StagedTailCapture.nopTable,
+            .code_block = StagedTailCapture.nopCodeBlock,
+            .thematic_rule = StagedTailCapture.nopRule,
+            .assistant_tail = StagedTailCapture.push,
+        },
+        .turn_id = 1,
+        .alloc = alloc,
+    };
+    defer baseline_ctx.deinit();
+    try streamAssistantChunk(&baseline_ctx, all_input.items);
+    try flushAssistantStream(&baseline_ctx);
+
+    var staged_joined: std.ArrayList(u8) = .empty;
+    defer staged_joined.deinit(alloc);
+    for (capture.text_spans.items) |span| try staged_joined.appendSlice(alloc, span);
+
+    var baseline_joined: std.ArrayList(u8) = .empty;
+    defer baseline_joined.deinit(alloc);
+    for (baseline_cap.text_spans.items) |span| try baseline_joined.appendSlice(alloc, span);
+
+    try std.testing.expectEqualStrings(baseline_joined.items, staged_joined.items);
+}
+
+test "sink with paced_steps false keeps one-shot tail emission per chunk" {
+    const alloc = std.testing.allocator;
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var tail_cap = StagedTailCapture{ .alloc = alloc };
+    defer tail_cap.deinit();
+    var hook_set = capture.hooks();
+
+    var stream_ctx = StreamChunkContext{
+        .hooks = &hook_set,
+        .semantic_presentation = .{
+            .ctx = &tail_cap,
+            .table = StagedTailCapture.nopTable,
+            .code_block = StagedTailCapture.nopCodeBlock,
+            .thematic_rule = StagedTailCapture.nopRule,
+            .assistant_tail = StagedTailCapture.push,
+            .paced_steps = false,
+        },
+        .turn_id = 1,
+        .alloc = alloc,
+    };
+    defer stream_ctx.deinit();
+
+    try streamAssistantChunk(&stream_ctx, "one two three four");
+    try std.testing.expectEqual(@as(usize, 1), tail_cap.calls);
+    try std.testing.expectEqualStrings("one two three four", tail_cap.last_text.items);
+}
+
+test "paced sink caps a 200-word chunk to at most max_word_steps_per_chunk tails" {
+    const alloc = std.testing.allocator;
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var tail_cap = StagedTailCapture{ .alloc = alloc };
+    defer tail_cap.deinit();
+    var hook_set = capture.hooks();
+
+    var stream_ctx = StreamChunkContext{
+        .hooks = &hook_set,
+        .semantic_presentation = .{
+            .ctx = &tail_cap,
+            .table = StagedTailCapture.nopTable,
+            .code_block = StagedTailCapture.nopCodeBlock,
+            .thematic_rule = StagedTailCapture.nopRule,
+            .assistant_tail = StagedTailCapture.push,
+            .paced_steps = true,
+        },
+        .turn_id = 1,
+        .alloc = alloc,
+    };
+    defer stream_ctx.deinit();
+
+    var big_chunk: std.ArrayList(u8) = .empty;
+    defer big_chunk.deinit(alloc);
+    for (0..200) |idx| {
+        if (idx > 0) try big_chunk.append(alloc, ' ');
+        try big_chunk.print(alloc, "w{d:0>3}", .{idx});
+    }
+
+    try streamAssistantChunk(&stream_ctx, big_chunk.items);
+    try std.testing.expect(tail_cap.calls > 1);
+    try std.testing.expect(tail_cap.calls <= max_word_steps_per_chunk);
+    try std.testing.expectEqualStrings(big_chunk.items, tail_cap.last_text.items);
+}
+
+test "paced sink skips word split when open tail exceeds max_paced_tail_bytes and traces once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "open-tail-fallback-trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "agent");
+
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var tail_cap = StagedTailCapture{ .alloc = alloc };
+    defer tail_cap.deinit();
+    var hook_set = capture.hooks();
+
+    var stream_ctx = StreamChunkContext{
+        .hooks = &hook_set,
+        .semantic_presentation = .{
+            .ctx = &tail_cap,
+            .table = StagedTailCapture.nopTable,
+            .code_block = StagedTailCapture.nopCodeBlock,
+            .thematic_rule = StagedTailCapture.nopRule,
+            .assistant_tail = StagedTailCapture.push,
+            .paced_steps = true,
+        },
+        .turn_id = 1,
+        .alloc = alloc,
+    };
+    defer stream_ctx.deinit();
+
+    const long_open_line = try alloc.alloc(u8, max_paced_tail_bytes + 64);
+    defer alloc.free(long_open_line);
+    @memset(long_open_line, 'a');
+
+    try streamAssistantChunk(&stream_ctx, long_open_line);
+    try std.testing.expect(stream_ctx.markdown.openTailByteCount() >= max_paced_tail_bytes);
+
+    const calls_before_small = tail_cap.calls;
+    try streamAssistantChunk(&stream_ctx, " alpha beta gamma delta");
+    try std.testing.expectEqual(calls_before_small + 1, tail_cap.calls);
+
+    try streamAssistantChunk(&stream_ctx, " epsilon zeta eta");
+    try std.testing.expectEqual(calls_before_small + 2, tail_cap.calls);
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
+    defer trace_file.close(std.testing.io);
+    const trace_bytes = try io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
+    defer alloc.free(trace_bytes);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace_bytes, "paced tail split skipped"));
+    try std.testing.expect(std.mem.find(u8, trace_bytes, "kind=open_tail") != null);
+    try std.testing.expect(std.mem.find(u8, trace_bytes, "reason=tail_bytes_limit") != null);
+    try std.testing.expect(std.mem.find(u8, trace_bytes, "alpha") == null);
+}
+
+test "staged language preview does not advance link_id_counter before accept" {
+    const alloc = std.testing.allocator;
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var tail_cap = StagedTailCapture{ .alloc = alloc };
+    defer tail_cap.deinit();
+    var hook_set = capture.hooks();
+    var link_ids: u32 = 1;
+
+    var stream_ctx = StreamChunkContext{
+        .hooks = &hook_set,
+        .semantic_presentation = .{
+            .ctx = &tail_cap,
+            .table = StagedTailCapture.nopTable,
+            .code_block = StagedTailCapture.nopCodeBlock,
+            .thematic_rule = StagedTailCapture.nopRule,
+            .assistant_tail = StagedTailCapture.push,
+            .paced_steps = true,
+        },
+        .markdown = .{ .link_ids = &link_ids },
+        .turn_id = 1,
+        .alloc = alloc,
+        .response_language_expected = .latin,
+        .response_language_hold_until_completion = true,
+    };
+    defer stream_ctx.deinit();
+
+    try streamAssistantChunk(&stream_ctx, "Open `http://localhost:3210/test.`\n");
+    try std.testing.expectEqual(@as(u32, 1), link_ids);
+    try std.testing.expect(std.mem.find(u8, tail_cap.last_text.items, "id=fx-1;") != null);
+
+    try stream_ctx.accept_staged_response_language();
+    try flushAssistantStream(&stream_ctx);
+    try std.testing.expectEqual(@as(u32, 2), link_ids);
+
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(alloc);
+    for (capture.text_spans.items) |span| try committed.appendSlice(alloc, span);
+    try std.testing.expect(std.mem.find(u8, committed.items, "id=fx-1;") != null);
+    try std.testing.expect(std.mem.find(u8, committed.items, "id=fx-2;") == null);
 }

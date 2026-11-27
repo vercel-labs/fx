@@ -836,7 +836,16 @@ fn turnActivityProjection(
 ) ActivityProjection {
     _ = shell;
     if (!ctx.stream.active) {
-        if (!ctx.writing_response and !ctx.completed_assistant_presentation_tail) return .none;
+        if (ctx.completed_assistant_presentation_tail) {
+            var deferred_stream = ctx.stream;
+            deferred_stream.phase = .generating;
+            deferred_stream.last_activity_kind = null;
+            if (activity_status.buildTurnLabel(buf, deferred_stream, ctx.now_ms)) |label| {
+                return .{ .turn_thinking = .{ .label = label } };
+            }
+            return .{ .turn_thinking = .{ .label = "• Generating" } };
+        }
+        if (!ctx.writing_response) return .none;
         return .{ .turn_thinking = .{
             .label = activity_status.buildCompletedTurnLabel(buf, ctx.stream),
             .tone = .neutral,
@@ -1415,11 +1424,17 @@ test "frame-owned activity shows live streaming token progress" {
     var tail_buf: [256]u8 = undefined;
     switch (frameOwnedActivityProjection(&tail_buf, &shell, tail_ctx, null)) {
         .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings("  (↑50k ↓1.2k)", thinking.label);
-            try std.testing.expectEqual(ActivityProjection.Tone.neutral, thinking.tone);
+            try std.testing.expectEqualStrings("• Generating (12s) (↑50k ↓1.2k)", thinking.label);
+            try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
+
+    var done_ctx = tail_ctx;
+    done_ctx.writing_response = false;
+    done_ctx.completed_assistant_presentation_tail = false;
+    var done_buf: [256]u8 = undefined;
+    try std.testing.expect(frameOwnedActivityProjection(&done_buf, &shell, done_ctx, null) == .none);
 }
 
 test "static turn status reserves wrapped activity rows" {

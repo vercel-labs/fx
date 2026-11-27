@@ -3644,6 +3644,9 @@ test "completed presentation tail keeps activity slot until turn summary" {
 
     var ctx = defaultFooterContext(&input);
     ctx.stream.active = true;
+    ctx.stream.turn_started_ms = 1_000;
+    ctx.stream.token_progress = .{ .input_tokens = 200, .output_tokens = 118 };
+    ctx.now_ms = 5_000;
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
@@ -3664,8 +3667,11 @@ test "completed presentation tail keeps activity slot until turn summary" {
 
     const assistant_row = try findRowContaining(&h, "assistant starts here");
     try expectGridNotContains(&h, "Thinking");
-    const footer_after_assistant = try findFirstDividerRowAfter(&h, assistant_row);
-    try expectOnlyBlankRowsBetween(&h, assistant_row, footer_after_assistant);
+    try expectGridContains(&h, "• Generating (4s) (↑200 ↓118)");
+    const generating_row = try findRowContaining(&h, "• Generating (4s) (↑200 ↓118)");
+    try expectOnlyBlankRowsBetween(&h, assistant_row, generating_row);
+    const footer_after_assistant = try findFirstDividerRowAfter(&h, generating_row);
+    try expectExactlyOneBlankRowBetween(&h, generating_row, footer_after_assistant);
 
     try std.testing.expect(!h.shell.transcript_band_dirty);
     try std.testing.expect(!h.shell.render_requests.hasPending());
@@ -3683,6 +3689,7 @@ test "completed presentation tail keeps activity slot until turn summary" {
     try h.flush();
 
     try expectGridNotContains(&h, "Thinking");
+    try expectGridNotContains(&h, "Generating");
     const summary_row = try findRowContaining(&h, "  4s (↑200 ↓118)");
     const footer_after_summary = try findFirstDividerRowAfter(&h, summary_row);
     try expectExactlyOneBlankRowBetween(&h, summary_row, footer_after_summary);

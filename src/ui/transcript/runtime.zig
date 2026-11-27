@@ -5083,7 +5083,8 @@ pub const TranscriptNotebook = struct {
 /// painted and committed. Each agent keeps one set, and the screen holds the
 /// set of the agent on it (`TranscriptRuntime.swapSlot`).
 const transcript_slot_fields = [_][:0]const u8{
-    "staged_assistant_tail",
+    "staged_assistant_tails",
+    "staged_assistant_tails_alloc",
     "staged_assistant_tail_id",
     "assistant_tail",
     "notebook",
@@ -5217,6 +5218,8 @@ pub const TranscriptSlot = blk: {
     break :blk @Struct(.auto, null, &transcript_slot_fields, &slot_types, &slot_attrs);
 };
 
+pub const max_staged_assistant_tails: usize = 4096;
+
 /// The assistant tail the pacer has not reached yet. The runtime owns `events`.
 pub const StagedAssistantTail = struct {
     id: u64,
@@ -5225,7 +5228,8 @@ pub const StagedAssistantTail = struct {
 };
 
 pub const TranscriptRuntime = struct {
-    staged_assistant_tail: ?StagedAssistantTail = null,
+    staged_assistant_tails: std.ArrayList(StagedAssistantTail) = .empty,
+    staged_assistant_tails_alloc: ?Allocator = null,
     staged_assistant_tail_id: u64 = 0,
     /// The unfinished assistant text and blocks, drawn after the committed rows.
     assistant_tail: std.ArrayList(render_engine.transcript_blocks.TranscriptEntry) = .empty,
@@ -5495,6 +5499,14 @@ pub const TranscriptRuntime = struct {
         holder.deinit(alloc);
     }
 
+    /// Stages an assistant tail on an off-screen `TranscriptSlot`.
+    pub fn stageSlotAssistantTail(slot: *TranscriptSlot, alloc: Allocator, events: []assistant_presentation.Event) u64 {
+        var holder: TranscriptRuntime = .{};
+        holder.swapSlot(slot);
+        defer holder.swapSlot(slot);
+        return holder.stageAssistantTail(alloc, events);
+    }
+
     pub fn deinit(self: *TranscriptRuntime, alloc: Allocator) void {
         self.disableShadowVt();
         self.full_transcript_window_load.deinit();
@@ -5519,31 +5531,118 @@ pub const TranscriptRuntime = struct {
         self.footer_viewport.deinit(alloc);
         self.ui_observer.deinit(alloc);
         const shown_entries = self.assistant_tail.items.len;
-        const staged_events = if (self.staged_assistant_tail) |staged| staged.events.len else 0;
+        var staged_events: usize = 0;
+        for (self.staged_assistant_tails.items) |staged| staged_events += staged.events.len;
         if (shown_entries > 0 or staged_events > 0) {
-            debug_trace.logf("transcript", "assistant tail dropped at deinit shown_entries={d} staged_events={d}", .{ shown_entries, staged_events });
+            debug_trace.logf(
+                "transcript",
+                "assistant tail dropped kind=assistant_tail size={d} staged_events={d} reason=deinit",
+                .{ shown_entries, staged_events },
+            );
         }
         self.discardStagedAssistantTail();
+        if (self.staged_assistant_tails_alloc) |list_alloc| {
+            self.staged_assistant_tails.deinit(list_alloc);
+            self.staged_assistant_tails_alloc = null;
+        }
         transcript_store.freeAssistantTail(self, alloc);
     }
 
     /// Holds the assistant tail until the pacer reaches it, and returns its id.
-    /// Takes ownership of `events`. A tail staged before is freed.
+    /// Takes ownership of `events`. Appends to a bounded FIFO, dropping the oldest on overflow.
     pub fn stageAssistantTail(self: *TranscriptRuntime, alloc: Allocator, events: []assistant_presentation.Event) u64 {
-        self.discardStagedAssistantTail();
         self.staged_assistant_tail_id += 1;
-        self.staged_assistant_tail = .{ .id = self.staged_assistant_tail_id, .events = events, .alloc = alloc };
-        return self.staged_assistant_tail_id;
+        const id = self.staged_assistant_tail_id;
+        if (self.staged_assistant_tails.items.len >= max_staged_assistant_tails) {
+            const oldest = self.staged_assistant_tails.orderedRemove(0);
+            const oldest_len = oldest.events.len;
+            assistant_presentation.freeEventSlice(oldest.alloc, oldest.events);
+            debug_trace.logf(
+                "transcript",
+                "staged assistant tail dropped kind=staged_assistant_tail size={d} reason=queue_full tail_id={d} cap={d}",
+                .{ oldest_len, oldest.id, max_staged_assistant_tails },
+            );
+        }
+        const list_alloc = self.staged_assistant_tails_alloc orelse alloc;
+        self.staged_assistant_tails.append(list_alloc, .{
+            .id = id,
+            .events = events,
+            .alloc = alloc,
+        }) catch |err| {
+            const events_len = events.len;
+            assistant_presentation.freeEventSlice(alloc, events);
+            debug_trace.logf(
+                "transcript",
+                "staged assistant tail dropped kind=staged_assistant_tail size={d} reason=append_failed err={s} tail_id={d}",
+                .{ events_len, @errorName(err), id },
+            );
+            return id;
+        };
+        if (self.staged_assistant_tails_alloc == null) self.staged_assistant_tails_alloc = list_alloc;
+        return id;
     }
 
-    /// The pacer reports a due tail: its events become the transcript's tail.
+    /// The pacer reports a due tail: its events become the transcript's tail,
+    /// and any staged entries with a smaller id are freed.
     pub fn applyStagedAssistantTail(self: *TranscriptRuntime, alloc: Allocator, id: u64) void {
-        const staged = self.staged_assistant_tail orelse return;
-        if (staged.id != id) return;
-        self.staged_assistant_tail = null;
-        defer assistant_presentation.freeEventSlice(staged.alloc, staged.events);
-        const entries = transcript_store.tailEntriesFromEvents(alloc, staged.events) catch |err| {
-            debug_trace.logf("transcript", "assistant tail not applied err={s}", .{@errorName(err)});
+        var match_idx: ?usize = null;
+        var drop_count: usize = 0;
+        for (self.staged_assistant_tails.items, 0..) |entry, idx| {
+            if (entry.id < id) {
+                drop_count = idx + 1;
+            } else if (entry.id == id) {
+                match_idx = idx;
+                break;
+            } else {
+                break;
+            }
+        }
+
+        if (match_idx) |idx| {
+            const matched = self.staged_assistant_tails.items[idx];
+            for (self.staged_assistant_tails.items[0..idx]) |older| {
+                assistant_presentation.freeEventSlice(older.alloc, older.events);
+            }
+            const remaining = self.staged_assistant_tails.items.len - (idx + 1);
+            if (remaining > 0) {
+                @memmove(
+                    self.staged_assistant_tails.items[0..remaining],
+                    self.staged_assistant_tails.items[idx + 1 ..],
+                );
+            }
+            self.staged_assistant_tails.items.len = remaining;
+            defer assistant_presentation.freeEventSlice(matched.alloc, matched.events);
+            self.applyStagedEvents(alloc, matched.events);
+            return;
+        }
+
+        if (drop_count > 0) {
+            for (self.staged_assistant_tails.items[0..drop_count]) |older| {
+                assistant_presentation.freeEventSlice(older.alloc, older.events);
+            }
+            const remaining = self.staged_assistant_tails.items.len - drop_count;
+            if (remaining > 0) {
+                @memmove(
+                    self.staged_assistant_tails.items[0..remaining],
+                    self.staged_assistant_tails.items[drop_count..],
+                );
+            }
+            self.staged_assistant_tails.items.len = remaining;
+            debug_trace.logf(
+                "transcript",
+                "staged assistant tail dropped kind=staged_assistant_tail size={d} reason=stale_id target_id={d}",
+                .{ drop_count, id },
+            );
+        }
+    }
+
+    fn applyStagedEvents(self: *TranscriptRuntime, alloc: Allocator, events: []const assistant_presentation.Event) void {
+        const entries = transcript_store.tailEntriesFromEvents(alloc, events) catch |err| {
+            debug_trace.logf(
+                "transcript",
+                "staged assistant tail dropped kind=staged_assistant_tail size={d} reason=apply_failed err={s}",
+                .{ events.len, @errorName(err) },
+            );
             transcript_store.clearAssistantTail(self, alloc);
             return;
         };
@@ -5562,9 +5661,10 @@ pub const TranscriptRuntime = struct {
     }
 
     fn discardStagedAssistantTail(self: *TranscriptRuntime) void {
-        const staged = self.staged_assistant_tail orelse return;
-        self.staged_assistant_tail = null;
-        assistant_presentation.freeEventSlice(staged.alloc, staged.events);
+        for (self.staged_assistant_tails.items) |staged| {
+            assistant_presentation.freeEventSlice(staged.alloc, staged.events);
+        }
+        self.staged_assistant_tails.clearRetainingCapacity();
     }
 
     fn releasePendingResumeSource(self: *TranscriptRuntime, alloc: Allocator) usize {
@@ -16431,18 +16531,30 @@ test "staged assistant tail applies only the id it was staged under" {
 
     const first = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "one"));
     const second = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "two"));
-    try std.testing.expect(first != second);
-    runtime.applyStagedAssistantTail(alloc, first);
-    try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
-    try std.testing.expect(runtime.staged_assistant_tail != null);
+    const third = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "three"));
+    try std.testing.expect(first < second and second < third);
 
     runtime.applyStagedAssistantTail(alloc, second);
     try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
     try std.testing.expectEqualStrings("two", runtime.assistant_tail.items[0].assistant_turn.segments.text.items);
-    try std.testing.expect(runtime.staged_assistant_tail == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.staged_assistant_tails.items.len);
+    try std.testing.expectEqual(third, runtime.staged_assistant_tails.items[0].id);
 
+    // Applying a stale (already freed) id changes nothing.
+    runtime.applyStagedAssistantTail(alloc, first);
     runtime.applyStagedAssistantTail(alloc, second);
     try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+    try std.testing.expectEqualStrings("two", runtime.assistant_tail.items[0].assistant_turn.segments.text.items);
+    try std.testing.expectEqual(@as(usize, 1), runtime.staged_assistant_tails.items.len);
+
+    runtime.applyStagedAssistantTail(alloc, third);
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+    try std.testing.expectEqualStrings("three", runtime.assistant_tail.items[0].assistant_turn.segments.text.items);
+    try std.testing.expectEqual(@as(usize, 0), runtime.staged_assistant_tails.items.len);
+
+    runtime.applyStagedAssistantTail(alloc, third);
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+    try std.testing.expectEqualStrings("three", runtime.assistant_tail.items[0].assistant_turn.segments.text.items);
 }
 
 test "staged assistant tail is freed when a newer tail replaces it and when the runtime deinits" {
@@ -16528,4 +16640,25 @@ test "an assistant block append clears the shown tail through the committed muta
     transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &events));
     _ = try runtime.appendAssistantThematicRule(alloc);
     try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
+}
+
+test "staged assistant tail FIFO applies matching id and frees older staged entries" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+
+    const first = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "one"));
+    const second = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "two"));
+    const third = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "three"));
+    try std.testing.expect(first < second and second < third);
+    try std.testing.expectEqual(@as(usize, 3), runtime.staged_assistant_tails.items.len);
+
+    runtime.applyStagedAssistantTail(alloc, second);
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+    try std.testing.expectEqualStrings("two", runtime.assistant_tail.items[0].assistant_turn.segments.text.items);
+    try std.testing.expectEqual(@as(usize, 1), runtime.staged_assistant_tails.items.len);
+    try std.testing.expectEqual(third, runtime.staged_assistant_tails.items[0].id);
+
+    runtime.discardStagedAssistantTail();
+    try std.testing.expectEqual(@as(usize, 0), runtime.staged_assistant_tails.items.len);
 }

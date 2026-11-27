@@ -13,9 +13,12 @@ const TailCapture = struct {
     calls: usize = 0,
     last_events: usize = 0,
     last_text: std.ArrayList(u8) = .empty,
+    history: std.ArrayList([]u8) = .empty,
 
     fn deinit(self: *TailCapture) void {
         self.last_text.deinit(self.alloc);
+        for (self.history.items) |entry| self.alloc.free(entry);
+        self.history.deinit(self.alloc);
     }
 
     fn sink(self: *TailCapture) SemanticPresentationSink {
@@ -25,6 +28,7 @@ const TailCapture = struct {
             .code_block = unexpectedCodeBlock,
             .thematic_rule = unexpectedRule,
             .assistant_tail = capture,
+            .paced_steps = true,
         };
     }
 
@@ -38,6 +42,7 @@ const TailCapture = struct {
             .text => |text| try self.last_text.appendSlice(self.alloc, text),
             else => {},
         };
+        try self.history.append(self.alloc, try self.alloc.dupe(u8, self.last_text.items));
     }
 
     fn unexpectedTable(_: *anyopaque, _: assistant_presentation.TablePayload) !void {
@@ -70,8 +75,10 @@ test "the stream sends the open line as a tail and not as committed text" {
 
     runtime_assistant_stream.onStreamContentChunk(&stream_ctx, "Plain **bo");
 
-    try std.testing.expectEqual(@as(usize, 1), capture_state.calls);
-    try std.testing.expect(std.mem.find(u8, capture_state.last_text.items, "bo") != null);
+    try std.testing.expectEqual(@as(usize, 0), hooks.texts.items.len);
+    try std.testing.expectEqual(@as(usize, 2), capture_state.calls);
+    try std.testing.expectEqualStrings("Plain ", capture_state.history.items[0]);
+    try std.testing.expectEqualStrings("Plain \x1b[1mbo\x1b[22m", capture_state.history.items[1]);
     try std.testing.expect(std.mem.find(u8, capture_state.last_text.items, "**") == null);
 }
 
@@ -97,11 +104,20 @@ test "the stream sends a tail only when it changes" {
     try std.testing.expectEqual(settled, capture_state.calls);
 
     runtime_assistant_stream.onStreamContentChunk(&stream_ctx, "Plain **bo");
-    try std.testing.expectEqual(settled + 1, capture_state.calls);
-    try std.testing.expect(std.mem.find(u8, capture_state.last_text.items, "bo") != null);
+    try std.testing.expectEqual(settled + 2, capture_state.calls);
+    try std.testing.expectEqualStrings("Plain ", capture_state.history.items[settled]);
+    try std.testing.expectEqualStrings("Plain \x1b[1mbo\x1b[22m", capture_state.history.items[settled + 1]);
 
     runtime_assistant_stream.onStreamContentChunk(&stream_ctx, "**\n");
-    try std.testing.expectEqual(settled + 2, capture_state.calls);
+    try std.testing.expectEqual(settled + 3, capture_state.calls);
+    try std.testing.expectEqualStrings("Plain \x1b[1mbo\x1b[22m\n", capture_state.history.items[settled + 2]);
+
+    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+    try std.testing.expectEqual(settled + 4, capture_state.calls);
+    try std.testing.expectEqual(@as(usize, 0), capture_state.last_events);
+
+    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+    try std.testing.expectEqual(settled + 4, capture_state.calls);
 }
 
 test "the stream ends with an empty tail" {
@@ -120,10 +136,12 @@ test "the stream ends with an empty tail" {
     defer stream_ctx.deinit();
 
     runtime_assistant_stream.onStreamContentChunk(&stream_ctx, "Plain **bo");
-    try std.testing.expectEqual(@as(usize, 1), capture_state.calls);
+    try std.testing.expectEqual(@as(usize, 2), capture_state.calls);
+    try std.testing.expectEqualStrings("Plain ", capture_state.history.items[0]);
+    try std.testing.expectEqualStrings("Plain \x1b[1mbo\x1b[22m", capture_state.history.items[1]);
 
     try runtime_assistant_stream.finishAssistantTail(&stream_ctx);
-    try std.testing.expectEqual(@as(usize, 2), capture_state.calls);
+    try std.testing.expectEqual(@as(usize, 3), capture_state.calls);
     try std.testing.expectEqual(@as(usize, 0), capture_state.last_events);
 }
 
@@ -143,10 +161,13 @@ test "a tool boundary flush sends an empty tail" {
     defer stream_ctx.deinit();
 
     runtime_assistant_stream.onStreamContentChunk(&stream_ctx, "Plain **bo");
-    try std.testing.expectEqual(@as(usize, 1), capture_state.calls);
+    try std.testing.expectEqual(@as(usize, 2), capture_state.calls);
+    try std.testing.expectEqualStrings("Plain ", capture_state.history.items[0]);
+    try std.testing.expectEqualStrings("Plain \x1b[1mbo\x1b[22m", capture_state.history.items[1]);
     try std.testing.expect(capture_state.last_events > 0);
 
     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+    try std.testing.expectEqual(@as(usize, 3), capture_state.calls);
     try std.testing.expectEqual(@as(usize, 0), capture_state.last_events);
 }
 
@@ -165,7 +186,7 @@ test "a sink with no tail consumer gets no tail and builds no preview" {
     };
     defer consuming_ctx.deinit();
     runtime_assistant_stream.onStreamContentChunk(&consuming_ctx, "Plain **bo");
-    try std.testing.expectEqual(@as(usize, 1), consuming_ctx.tail_previews_built);
+    try std.testing.expectEqual(@as(usize, 2), consuming_ctx.tail_previews_built);
 
     var no_tail_owner: u8 = 0;
     var silent_ctx = StreamChunkContext{

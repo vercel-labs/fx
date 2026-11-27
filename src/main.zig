@@ -3195,13 +3195,13 @@ const App = struct {
         return SessionAppRuntime.fastModeModelBound(self, agent);
     }
 
-    pub fn finishPromptPresentation(self: *App, agent: *agents.Agent, finished: types.FinishedPrompt) !assistant_pacer.FinishResult {
-        return app_callbacks.Bindings(App).finishPromptPresentation(self, agent, finished);
+    pub fn finishPromptPresentation(self: *App, presentation: assistant_pacer.DeferredPresentation) assistant_pacer.FinishResult {
+        return app_callbacks.Bindings(App).finishPromptPresentation(self, presentation);
     }
 
-    pub fn pacerFinish(ctx: *anyopaque, finished: types.FinishedPrompt) anyerror!assistant_pacer.FinishResult {
+    pub fn pacerFinish(ctx: *anyopaque, presentation: assistant_pacer.DeferredPresentation) anyerror!assistant_pacer.FinishResult {
         const self: *App = @ptrCast(@alignCast(ctx));
-        const result = try app_callbacks.Bindings(App).finishPromptPresentation(self, self.screenAgent(), finished);
+        const result = app_callbacks.Bindings(App).finishPromptPresentation(self, presentation);
         if (result == .committed) self.releaseHeldNotifications();
         return result;
     }
@@ -3909,12 +3909,11 @@ const App = struct {
         return AgentsAppRuntime.subagentWaitCount(self);
     }
 
-    /// Handles the events and paced text of the agent in context.
-    fn tickAgentInContext(_: void, self: *App, agent: *agents.Agent) anyerror!void {
-        // An agent's session can start while another's transcript is on
-        // screen; its transcript window starts the first time its own is.
-        SessionAppRuntime.ensureTranscriptWindow(self, agent);
-        const handlers = app_callbacks.Bindings(App).workerEventHandlers(agent);
+    fn tickAgentWorkerOnce(
+        self: *App,
+        agent: *agents.Agent,
+        handlers: app_worker_runtime.WorkerEventHandlers,
+    ) anyerror!void {
         if (comptime host_target.is_wasm) {
             try WorkerAppRuntime.tick(self, agent, handlers);
         } else {
@@ -3922,12 +3921,25 @@ const App = struct {
             // keys and paints before applying them.
             try WorkerAppRuntime.tickWithinBudget(self, agent, handlers, app_worker_runtime.interactive_drain_budget_ns);
         }
+    }
+
+    /// Handles the events and paced text of the agent in context.
+    fn tickAgentInContext(_: void, self: *App, agent: *agents.Agent) anyerror!void {
+        // An agent's session can start while another's transcript is on
+        // screen; its transcript window starts the first time its own is.
+        SessionAppRuntime.ensureTranscriptWindow(self, agent);
+        const was_paused_by_prompt = app_callbacks.Bindings(App).pacerPausedByPrompt(self, agent);
+        const handlers = app_callbacks.Bindings(App).workerEventHandlers(agent);
+        try tickAgentWorkerOnce(self, agent, handlers);
+        const now_paused_by_prompt = app_callbacks.Bindings(App).pacerPausedByPrompt(self, agent);
+        if (!was_paused_by_prompt and now_paused_by_prompt and agent.worker.hasPendingEvents()) {
+            try tickAgentWorkerOnce(self, agent, handlers);
+        }
         const now_ns = io_mod.nanoTimestamp();
-        if (!agent.approval_prompt.isActive() and !agent.question_prompt.isActive() and !self.auth.apiKeyEntryActive()) {
+        if (!now_paused_by_prompt) {
             try self.pacer.tick(self.alloc, now_ns, self.pacerCallbacks());
         } else {
             self.pacer.pause(now_ns);
-            WorkerAppRuntime.flushPacerForHeldMail(self, agent, now_ns);
         }
     }
 
@@ -6386,13 +6398,16 @@ test "a hidden child with only a due tail is visited and its tail is applied" {
 
     const events = try alloc.alloc(assistant_presentation.Event, 1);
     events[0] = .{ .text = try alloc.dupe(u8, "Tail only") };
-    child.screen.transcript.staged_assistant_tail_id = 1;
-    child.screen.transcript.staged_assistant_tail = .{ .id = 1, .events = events, .alloc = alloc };
-    child.screen.pacer.setTail(1);
-    try std.testing.expect(!child.screen.pacer.hasPending());
+    const tail_id = TranscriptRuntime.stageSlotAssistantTail(&child.screen.transcript, alloc, events);
+    try child.screen.pacer.setTailAt(alloc, tail_id, 0);
+    try std.testing.expect(child.screen.pacer.hasTail());
+    try std.testing.expect(child.screen.pacer.hasPending());
+    try std.testing.expectEqual(@as(usize, 0), child.screen.pacer.pending.items.len);
 
     try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
 
+    try std.testing.expect(!child.screen.pacer.hasPending());
+    try std.testing.expect(!child.screen.pacer.hasTail());
     try std.testing.expectEqual(@as(usize, 1), child.screen.transcript.assistant_tail.items.len);
     try std.testing.expectEqualStrings(
         "Tail only",
@@ -6413,13 +6428,16 @@ test "a hidden main agent with only a due tail is visited and its tail lands in 
 
     const events = try alloc.alloc(assistant_presentation.Event, 1);
     events[0] = .{ .text = try alloc.dupe(u8, "Main tail only") };
-    app.main_screen.transcript.staged_assistant_tail_id = 1;
-    app.main_screen.transcript.staged_assistant_tail = .{ .id = 1, .events = events, .alloc = alloc };
-    app.main_screen.pacer.setTail(1);
-    try std.testing.expect(!app.main_screen.pacer.hasPending());
+    const tail_id = TranscriptRuntime.stageSlotAssistantTail(&app.main_screen.transcript, alloc, events);
+    try app.main_screen.pacer.setTailAt(alloc, tail_id, 0);
+    try std.testing.expect(app.main_screen.pacer.hasTail());
+    try std.testing.expect(app.main_screen.pacer.hasPending());
+    try std.testing.expectEqual(@as(usize, 0), app.main_screen.pacer.pending.items.len);
 
     try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
 
+    try std.testing.expect(!app.main_screen.pacer.hasPending());
+    try std.testing.expect(!app.main_screen.pacer.hasTail());
     try std.testing.expectEqual(@as(usize, 1), app.main_screen.transcript.assistant_tail.items.len);
     try std.testing.expectEqualStrings(
         "Main tail only",
@@ -6454,12 +6472,268 @@ test "the shown tail stays until the committed text replaces it in the same tick
     try App.WorkerAppRuntime.pushAssistantTail(&app, &app.main_agent, &next);
     try App.tickAgentInContext({}, &app, &app.main_agent);
 
+    // While "bold\n" is still pending after the first word tick, the shown tail stays.
+    try std.testing.expect(app.pacer.hasPending());
+    try std.testing.expectEqual(@as(usize, 1), app.shell.assistant_tail.items.len);
+    try std.testing.expectEqualStrings(
+        "Streaming bold",
+        app.shell.assistant_tail.items[0].assistant_turn.segments.text.items,
+    );
+
+    var now_ns: i128 = io_mod.nanoTimestamp();
+    var ticks: usize = 0;
+    while (app.pacer.hasPending()) : (ticks += 1) {
+        try std.testing.expect(ticks < 1_000);
+        now_ns += assistant_pacer.reveal_frame_ns;
+        try app.pacer.tick(alloc, now_ns, app.pacerCallbacks());
+    }
+
     try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "Streaming bold\n") != null);
     try std.testing.expectEqual(@as(usize, 1), app.shell.assistant_tail.items.len);
     try std.testing.expectEqualStrings(
         "Next line",
         app.shell.assistant_tail.items[0].assistant_turn.segments.text.items,
     );
+}
+
+test "active approval prompt flushes pending reply text before draining queued tool_lifecycle in one tick" {
+    const alloc = std.testing.allocator;
+    const gpa = std.heap.c_allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.main_agent.worker.deinit(gpa);
+    defer app.main_agent.approval_prompt.deinit(alloc);
+
+    try app.pacer.enqueue(alloc, "pending reply text before tool");
+    try std.testing.expect(app.pacer.hasPending());
+
+    const call_id = try gpa.dupe(u8, "call-approval-flush");
+    const tool_name = try gpa.dupe(u8, "shell");
+    try app.main_agent.worker.pushEvent(gpa, .{ .tool_lifecycle = .{ .provisional = .{
+        .id = .{ .turn_id = 1, .call_id = call_id },
+        .tool_name = tool_name,
+        .activity_kind = .command,
+    } } });
+
+    app.main_agent.worker.worker_processing = true;
+    app.main_agent.worker.active_turn_id = 1;
+    app.main_agent.worker.pending_permission_request_shared = try permission_request.OwnedPermissionRequest.dupe(
+        gpa,
+        .{ .id = 7, .label = "shell ls" },
+    );
+    app.main_agent.worker.pending_permission_waiting = true;
+    _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{ .id = 7, .label = "shell ls" });
+    try std.testing.expect(app.main_agent.approval_prompt.isActive());
+
+    try App.tickAgentInContext({}, &app, &app.main_agent);
+
+    try std.testing.expect(!app.pacer.hasPending());
+    try std.testing.expect(!app.main_agent.worker.hasPendingEvents());
+    try std.testing.expectEqual(@as(usize, 2), app.shell.notebook.entries.items.len);
+    try std.testing.expect(app.shell.notebook.entries.items[0] == .assistant_turn);
+    try std.testing.expect(std.mem.find(u8, app.shell.notebook.entries.items[0].assistant_turn.segments.text.items, "pending reply text before tool") != null);
+    try std.testing.expect(app.shell.notebook.entries.items[1] == .raw_bytes);
+    try std.testing.expect(app.shell.notebook.entries.items[1].raw_bytes.class == .tool_status);
+}
+
+test "newly opened approval prompt flushes pending reply text and drains tool_lifecycle before frame commit" {
+    const alloc = std.testing.allocator;
+    const gpa = std.heap.c_allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.main_agent.worker.deinit(gpa);
+    defer app.main_agent.approval_prompt.deinit(alloc);
+
+    try app.pacer.enqueue(alloc, "48 words before shell call");
+    try std.testing.expect(app.pacer.hasPending());
+
+    const call_id = try gpa.dupe(u8, "call-newly-opened-approval");
+    const tool_name = try gpa.dupe(u8, "shell");
+    try app.main_agent.worker.pushEvent(gpa, .{ .tool_lifecycle = .{ .provisional = .{
+        .id = .{ .turn_id = 1, .call_id = call_id },
+        .tool_name = tool_name,
+        .activity_kind = .command,
+    } } });
+
+    app.main_agent.worker.worker_processing = true;
+    app.main_agent.worker.active_turn_id = 1;
+    app.main_agent.worker.pending_permission_request_shared = try permission_request.OwnedPermissionRequest.dupe(
+        gpa,
+        .{ .id = 8, .label = "shell touch marker" },
+    );
+    app.main_agent.worker.pending_permission_waiting = true;
+    try std.testing.expect(!app.main_agent.approval_prompt.isActive());
+
+    try App.tickAgentInContext({}, &app, &app.main_agent);
+
+    try std.testing.expect(app.main_agent.approval_prompt.isActive());
+    try std.testing.expect(!app.pacer.hasPending());
+    try std.testing.expect(!app.main_agent.worker.hasPendingEvents());
+    try std.testing.expectEqual(@as(usize, 2), app.shell.notebook.entries.items.len);
+    try std.testing.expect(app.shell.notebook.entries.items[0] == .assistant_turn);
+    try std.testing.expect(std.mem.find(u8, app.shell.notebook.entries.items[0].assistant_turn.segments.text.items, "48 words before shell call") != null);
+    try std.testing.expect(app.shell.notebook.entries.items[1] == .raw_bytes);
+    try std.testing.expect(app.shell.notebook.entries.items[1].raw_bytes.class == .tool_status);
+}
+
+test "open question prompt keeps later turn streamed text paused in pacer until prompt closes" {
+    const alloc = std.testing.allocator;
+    const gpa = std.heap.c_allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+
+    const writer = try addTestChildAgent(&app, "writer-id");
+    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    const options = [_]types.QuestionOption{.{ .label = "Alpha", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Pick one?", .options = &options }};
+    try writer.agent.question_prompt.syncFrom(alloc, &entries);
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.main_agent.question_prompt.isActive());
+
+    try app.main_agent.worker.pushEvent(gpa, .{ .assistant_presentation = .{ .text = @constCast("later turn reply") } });
+    try App.tickAgentInContext({}, &app, &app.main_agent);
+
+    try std.testing.expect(app.pacer.hasPending());
+    try std.testing.expectEqual(@as(usize, 0), app.shell.notebook.entries.items.len);
+
+    app.main_agent.question_prompt.discard(alloc, "answered");
+    app.question_lender = null;
+    try std.testing.expect(!app.main_agent.question_prompt.isActive());
+
+    var now_ns: i128 = io_mod.nanoTimestamp();
+    var ticks: usize = 0;
+    while (app.pacer.hasPending()) : (ticks += 1) {
+        try std.testing.expect(ticks < 1_000);
+        now_ns += assistant_pacer.reveal_frame_ns;
+        try app.pacer.tick(alloc, now_ns, app.pacerCallbacks());
+    }
+    try std.testing.expect(!app.pacer.hasPending());
+    try std.testing.expectEqual(@as(usize, 1), app.shell.notebook.entries.items.len);
+    try std.testing.expect(std.mem.find(u8, app.shell.notebook.entries.items[0].assistant_turn.segments.text.items, "later turn reply") != null);
+}
+
+test "inline file approval flushes turn 1 pending text when begin_prompt boundary drains" {
+    const alloc = std.testing.allocator;
+    const gpa = std.heap.c_allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.main_agent.worker.deinit(gpa);
+    defer app.main_agent.approval_prompt.deinit(alloc);
+
+    try app.pacer.enqueue(alloc, "turn 1 pending text");
+    try std.testing.expect(app.pacer.hasPending());
+
+    const diff_mod = @import("core/output/diff.zig");
+    var lines = [_]diff_mod.PreviewLine{
+        .{ .op = .addition, .new_line = 1, .text = "SWITCH_WROTE" },
+    };
+    const req: permission_request.PermissionRequest = .{
+        .id = 9,
+        .label = "write_file switch-child.txt",
+        .file = .{
+            .kind = .write,
+            .intent = .mutation,
+            .preview = .{
+                .path = "switch-child.txt",
+                .lines = &lines,
+                .additions = 1,
+                .deletions = 0,
+                .truncated = false,
+            },
+            .scope = .workspace_files,
+        },
+    };
+    app.main_agent.worker.worker_processing = true;
+    app.main_agent.worker.active_turn_id = 1;
+    app.main_agent.worker.pending_permission_request_shared = try permission_request.OwnedPermissionRequest.dupe(gpa, req);
+    app.main_agent.worker.pending_permission_waiting = true;
+    _ = try app.main_agent.approval_prompt.syncRequest(alloc, req);
+    try std.testing.expect(app.main_agent.approval_prompt.isActive());
+
+    try app.main_agent.worker.pushEvent(gpa, .{
+        .begin_prompt = try types.dupeUserTurn(gpa, .{ .text = @constCast("next turn report"), .images = &.{} }),
+    });
+
+    try App.tickAgentInContext({}, &app, &app.main_agent);
+
+    try std.testing.expect(!app.pacer.hasPending());
+    try std.testing.expect(!app.main_agent.worker.hasPendingEvents());
+    var turn_one_index: ?usize = null;
+    var user_card_index: ?usize = null;
+    for (app.shell.notebook.entries.items, 0..) |entry, index| switch (entry) {
+        .assistant_turn => |turn| if (std.mem.find(u8, turn.segments.text.items, "turn 1 pending text") != null) {
+            try std.testing.expect(turn_one_index == null);
+            turn_one_index = index;
+        },
+        .user_turn => user_card_index = index,
+        else => {},
+    };
+    try std.testing.expect(turn_one_index.? < user_card_index.?);
+}
+
+test "open file approval alternate screen keeps later pending text paused out of review" {
+    const alloc = std.testing.allocator;
+    const gpa = std.heap.c_allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.main_agent.worker.deinit(gpa);
+    defer app.main_agent.approval_prompt.deinit(alloc);
+
+    const diff_mod = @import("core/output/diff.zig");
+    var lines = [_]diff_mod.PreviewLine{
+        .{ .op = .addition, .new_line = 1, .text = "must not be written" },
+    };
+    const req: permission_request.PermissionRequest = .{
+        .id = 11,
+        .label = "write_file pacer-gate.txt",
+        .file = .{
+            .kind = .write,
+            .intent = .mutation,
+            .preview = .{
+                .path = "pacer-gate.txt",
+                .lines = &lines,
+                .additions = 1,
+                .deletions = 0,
+                .truncated = false,
+            },
+            .scope = .workspace_files,
+        },
+    };
+    app.main_agent.worker.worker_processing = true;
+    app.main_agent.worker.active_turn_id = 1;
+    app.main_agent.worker.pending_permission_request_shared = try permission_request.OwnedPermissionRequest.dupe(gpa, req);
+    app.main_agent.worker.pending_permission_waiting = true;
+    _ = try app.main_agent.approval_prompt.syncRequest(alloc, req);
+    app.terminal.alternate_screen_owner = .file_approval;
+    defer app.terminal.alternate_screen_owner = .none;
+
+    try app.main_agent.worker.pushEvent(gpa, .{
+        .assistant_presentation = .{ .text = @constCast("pending review text") },
+    });
+    try App.tickAgentInContext({}, &app, &app.main_agent);
+
+    try std.testing.expect(app.pacer.hasPending());
+    try std.testing.expectEqual(@as(usize, 0), app.shell.notebook.entries.items.len);
 }
 
 test "a transcript keeps its resume handoff through a visit and drops it when another agent's takes the screen" {
@@ -6581,7 +6855,7 @@ test "the tick leaves hidden agents' work for a later pass while a scrollback ha
     try std.testing.expect(app.screenAgent() == &on_screen.agent);
 }
 
-test "a hidden agent's pacer is flushed for held mail once a scrollback handoff ends, and not while it is pending, under the sign-in key entry" {
+test "a hidden agent's finished turn is committed at drain once a scrollback handoff ends, releasing held mail under the sign-in key entry" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
@@ -6594,16 +6868,11 @@ test "a hidden agent's pacer is flushed for held mail once a scrollback handoff 
     const hidden = try addTestChildAgent(&app, "hidden");
     try App.AgentsAppRuntime.show(&app, on_screen);
 
-    // The hidden agent finished a turn that a report missed. The sign-in key
-    // entry is open, so no pacer is ticked and the hidden agent's keeps the
-    // finished turn, and its worker holds the report for the commit. (A
-    // subagent's approval would not do: a visit clears an approval its worker
-    // does not wait on.)
     const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
     const worker = &hidden.agent.worker;
     // `deinitChildren` leaves a worker to its owner. Its queue is allocated
     // with `c_allocator`, as `postAgentMessage` allocates it, and the turn the
-    // flush commits lands in the agent's session and names its title.
+    // drain commits lands in the agent's session and names its title.
     const gpa = std.heap.c_allocator;
     defer worker.deinit(gpa);
     defer hidden.agent.session_persistence.deinit(alloc);
@@ -6613,6 +6882,7 @@ test "a hidden agent's pacer is flushed for held mail once a scrollback handoff 
     worker.worker_processing = true;
     worker.active_turn_id = 9;
     worker.direct_steering_closed = true;
+    try worker.pushEvent(gpa, .{ .assistant_presentation = .{ .text = @constCast("still showing") } });
     try worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = turn } });
     try worker.postMail(gpa, .{
         .prompt = try gpa.dupe(u8, "a report"),
@@ -6624,11 +6894,6 @@ test "a hidden agent's pacer is flushed for held mail once a scrollback handoff 
         .grants = try gpa.alloc(types.PermissionGrant, 0),
     });
     worker.finishProcessing();
-    var taken = worker.takeEvents();
-    for (taken.items) |event| worker_runtime.freeWorkerEvent(gpa, event);
-    taken.deinit(gpa);
-    try hidden.screen.pacer.enqueue(alloc, "still showing");
-    try std.testing.expect(try hidden.screen.pacer.deferFinish(alloc, .{ .turn = turn }));
     app.auth.picker_active = true;
     app.auth.picker_stage = .api_key;
     defer app.auth.picker_active = false;
@@ -6636,19 +6901,18 @@ test "a hidden agent's pacer is flushed for held mail once a scrollback handoff 
     try std.testing.expect(worker.commitGateWaitsForCommit());
 
     // While the handoff is pending the tick skips the hidden agent: nothing is
-    // flushed, so no hidden transcript is swapped onto the screen.
+    // drained, so the report stays held and no hidden transcript touches screen.
     app.shell.pending_session_scrollback_handoff = .{ .remaining_rows = 1, .total_rows = 2, .terminal_cols = 80, .terminal_rows = 24 };
     for (0..3) |_| try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
-    try std.testing.expect(hidden.screen.pacer.deferred_turn != null);
     try std.testing.expectEqual(@as(u32, 1), worker.unacknowledged_finishes);
     try std.testing.expect(worker.commitGateWaitsForCommit());
     try std.testing.expect(app.screenAgent() == &on_screen.agent);
 
-    // Once the handoff ends, the agent's own tick flushes its pacer and the
-    // commit releases the held report.
+    // Once the handoff ends, draining commits the turn and releases the held
+    // report immediately while sign-in key entry keeps presentation paused.
     app.shell.pending_session_scrollback_handoff = null;
     try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
-    try std.testing.expect(hidden.screen.pacer.deferred_turn == null);
+    try std.testing.expect(hidden.screen.pacer.deferred_presentation != null);
     try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
     try std.testing.expect(!worker.commitGateWaitsForCommit());
     try std.testing.expect(app.screenAgent() == &on_screen.agent);
@@ -9651,6 +9915,7 @@ test "a hidden agent's turn that its own tick commits reaches the report queued 
     worker.worker_processing = true;
     worker.active_turn_id = 9;
     worker.direct_steering_closed = true;
+    try worker.pushEvent(gpa, .{ .assistant_presentation = .{ .text = @constCast("still showing") } });
     try worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = turn } });
     const earlier = try gpa.alloc(types.HistoryTurn, 1);
     earlier[0] = .{ .assistant = .{
@@ -9667,16 +9932,12 @@ test "a hidden agent's turn that its own tick commits reaches the report queued 
         .grants = try gpa.alloc(types.PermissionGrant, 0),
     });
     worker.finishProcessing();
-    var taken = worker.takeEvents();
-    for (taken.items) |event| worker_runtime.freeWorkerEvent(gpa, event);
-    taken.deinit(gpa);
-    try hidden.screen.pacer.enqueue(alloc, "still showing");
-    try std.testing.expect(try hidden.screen.pacer.deferFinish(alloc, .{ .turn = turn }));
     try std.testing.expectEqual(@as(u32, 1), worker.queued_history_owed);
 
-    // The agent's own tick shows the text and commits the turn.
+    // The agent's own tick drains and commits the turn immediately even while
+    // paced presentation remains deferred, so the report starts with it.
     try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
-    try std.testing.expect(hidden.screen.pacer.deferred_turn == null);
+    try std.testing.expect(hidden.screen.pacer.deferred_presentation != null);
     try std.testing.expectEqual(@as(usize, 1), hidden.agent.session.historyLen());
     try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
 
@@ -9686,6 +9947,29 @@ test "a hidden agent's turn that its own tick commits reaches the report queued 
     try std.testing.expectEqual(@as(usize, 2), work.prompt.history.len);
     try std.testing.expectEqualStrings("earlier answer", work.prompt.history[0].assistant.assistant);
     try std.testing.expectEqualStrings("the finished answer", work.prompt.history[1].assistant.assistant);
+
+    // Subsequent frame ticks drain the hidden agent's paced presentation cleanly.
+    var now_ns: i128 = io_mod.nanoTimestamp();
+    var ticks: usize = 0;
+    while (hidden.screen.pacer.hasPending()) : (ticks += 1) {
+        try std.testing.expect(ticks < 1_000);
+        now_ns += assistant_pacer.reveal_frame_ns;
+        try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
+        try hidden.screen.pacer.tick(alloc, now_ns, .{
+            .emit_ctx = &app,
+            .emit_fn = struct {
+                fn emit(_: *anyopaque, _: []const u8) anyerror!void {}
+            }.emit,
+            .finish_ctx = &app,
+            .finish_fn = struct {
+                fn finish(_: *anyopaque, _: assistant_pacer.DeferredPresentation) anyerror!assistant_pacer.FinishResult {
+                    return .committed;
+                }
+            }.finish,
+        });
+    }
+    try std.testing.expect(hidden.screen.pacer.deferred_presentation == null);
+    try std.testing.expect(!hidden.screen.pacer.hasPending());
 }
 
 test "a theme change leaves hidden agents alone while a scrollback handoff is pending" {

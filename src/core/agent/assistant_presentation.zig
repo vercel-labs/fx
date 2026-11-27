@@ -227,6 +227,15 @@ pub const MarkdownProcessor = struct {
     /// Innermost last; each entry's shift already includes its parents'.
     open_ordered_items: std.ArrayList(OpenOrderedItem) = .empty,
 
+    pub fn openTailByteCount(self: *const MarkdownProcessor) usize {
+        var total = self.line_buf.items.len +
+            self.pending_top_level_line.items.len +
+            self.pipe_buf.items.len +
+            self.code_buf.items.len;
+        for (self.footnotes.items) |note| total += note.body.items.len;
+        return total;
+    }
+
     pub fn deinit(self: *MarkdownProcessor, alloc: Allocator) void {
         self.line_buf.deinit(alloc);
         self.safe_line.deinit(alloc);

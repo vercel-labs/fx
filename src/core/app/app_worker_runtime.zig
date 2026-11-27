@@ -77,6 +77,7 @@ fn holdNoModelCall(_: *anyopaque, _: types.ModelCallRecord) !bool {
 /// A retained delivery owns its own payload; a settled delivery acknowledges history.
 pub const HistoryDelivery = union(enum) {
     retained,
+    commit_failed: anyerror,
     settled: assistant_pacer.FinishResult,
 };
 
@@ -171,7 +172,7 @@ fn writeRouteRecoveryBody(
     }
 }
 
-test "shutdown settles queued and pacer-owned finishes exactly once" {
+test "shutdown settles queued finishes once without double-saving a pacer-deferred presentation" {
     const session_runtime = @import("../session/session.zig");
     const session_adapter = @import("../session/session_adapter.zig");
     const ShutdownApp = struct {
@@ -241,13 +242,16 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
             .snapshot_file_ownership = ownership.handle(),
         };
         if (pacer_owned) {
+            try app_session_runtime.Runtime(ShutdownApp).appendFinishedPrompt(&app, (&app).agent(), finished);
             try app.pacer.enqueue(alloc, "unrendered tail");
-            try std.testing.expect(try app.pacer.deferFinish(alloc, finished));
+            try std.testing.expect(app.pacer.deferFinish(assistant_pacer.DeferredPresentation.fromFinishedPrompt(finished)));
+            try std.testing.expectEqual(@as(usize, 1), app.agent().session.historyLen());
         } else {
             try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = finished });
         }
-        // A later queued finish must follow the pacer-owned turn. Neither a
-        // begin nor a presentation event may invoke UI or admit another prompt.
+        // Shutdown drains queued worker finishes without double-saving a turn
+        // whose presentation remained deferred in the pacer. Neither a begin nor
+        // a presentation event may invoke UI or admit another prompt.
         try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast("later prompt") } });
         try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("do not render") } });
         try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
@@ -256,7 +260,7 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         } } } });
         app.agent().worker.requestShutdown();
         app_session_runtime.Runtime(ShutdownApp).recordShutdownFailure((&app).agent(), error.PreviousSessionSaveFailed);
-        try std.testing.expectEqual(@as(usize, 0), app.agent().session.historyLen());
+        try std.testing.expectEqual(@as(usize, if (pacer_owned) 1 else 0), app.agent().session.historyLen());
 
         try Runtime(ShutdownApp).settleFinishedPromptsForShutdown(&app, (&app).agent());
         try Runtime(ShutdownApp).settleFinishedPromptsForShutdown(&app, (&app).agent());
@@ -264,7 +268,7 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         try std.testing.expectEqual(@as(usize, 1), ownership.transfers);
         try std.testing.expectEqual(@as(usize, 0), ownership.references);
         try std.testing.expectEqual(@as(usize, 0), app.agent().worker.worker_events.items.len);
-        try std.testing.expect(app.pacer.deferred_turn == null);
+        try std.testing.expectEqual(pacer_owned, app.pacer.deferred_presentation != null);
         // Close the session before reloading so only what it saved can pass.
         const id = try alloc.dupe(u8, app.agent().session_persistence.v2.?.id());
         defer alloc.free(id);
@@ -477,11 +481,10 @@ pub fn Runtime(comptime App: type) type {
             return record.phase == .terminal and record.activity_kind == .command;
         }
 
-        /// After the worker joins, persist finished turns without presenting output
-        /// or admitting work. The pacer owns the finish preceding queued events.
+        /// After the worker joins, persist queued finished turns without presenting output
+        /// or admitting work. Any deferred presentation in the pacer belongs to a turn
+        /// that was already committed at drain.
         pub fn settleFinishedPromptsForShutdown(app: *App, agent: *AppAgent) !void {
-            try settleDeferredFinish(app, agent);
-
             var batch = DetachedWorkerEventBatch.init(
                 std.heap.c_allocator,
                 agent.worker.takeEvents(),
@@ -507,22 +510,9 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
-        fn settleDeferredFinish(app: *App, agent: *AppAgent) !void {
-            if (comptime !@hasField(@TypeOf(app.pacer), "deferred_turn")) return;
-            if (app.pacer.deferred_turn) |finished| {
-                app.pacer.deferred_turn = null;
-                app.pacer.deferred_started_ns = null;
-                defer types.freeFinishedPrompt(app.alloc, finished);
-                try persistFinishedPrompt(app, agent, finished);
-            }
-        }
-
-        /// Tells `agent`'s worker that a finished turn it pushed is gone
-        /// without a commit, so its commit gate stops waiting for it
-        /// (`WorkerRuntime.acknowledgeFinishDropped`). Every place that frees
-        /// a finished turn unsaved calls this or goes through `clearPacer` or
-        /// `deferFinish`; a turn that is saved is acknowledged by
-        /// `appendFinishedPrompt`.
+        /// Tells `agent`'s worker that a finished turn it pushed could not be
+        /// saved, so its commit gate stops waiting for it
+        /// (`WorkerRuntime.acknowledgeFinishDropped`).
         pub fn acknowledgeDroppedFinish(agent: *AppAgent, reason: []const u8) void {
             if (comptime @hasField(AppAgent, "worker") and
                 @hasDecl(@TypeOf(agent.worker), "acknowledgeFinishDropped"))
@@ -531,71 +521,17 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn pacerHoldsFinish(app: *App) bool {
-            if (comptime !@hasField(@TypeOf(app.pacer), "deferred_turn")) return false;
-            return app.pacer.deferred_turn != null;
-        }
-
-        /// Shows the finished turn that the pacer of `agent`, the agent in
-        /// context, keeps behind an open prompt, and commits it, when the
-        /// worker holds mail or a typed prompt for that commit. The loop does
-        /// not tick a pacer under a prompt, so the commit waits for the prompt
-        /// to close; and the held prompt's turn, whose start flushes the pacer
-        /// (`workerBridgeDrainAssistantText`), waits for the commit. Without
-        /// this the worker's time limit is all that ends the hold, and the held
-        /// prompt's turn then starts before the commit and cuts the finished
-        /// turn off in the session. It runs on the loop's thread, which owns
-        /// the pacer. A flush that fails is logged and not tried again until
-        /// the hold is over: the finished turn stays in the pacer, and the
-        /// worker's time limit ends the hold as it did before.
-        pub fn flushPacerForHeldMail(app: *App, agent: *AppAgent, now_ns: i128) void {
-            if (comptime !(@hasField(AppAgent, "worker") and
-                @hasDecl(@TypeOf(agent.worker), "commitGateWaitsForCommit")))
-            {
-                return;
-            }
-            if (!pacerHoldsFinish(app)) return;
-            if (!agent.worker.commitGateWaitsForCommit()) return;
-            debug_trace.logf("worker", "commit gate flushes the pacer behind a prompt for held mail", .{});
-            app.pacer.flushPresentationAtBoundary(app.alloc, now_ns, app.pacerCallbacks()) catch |err| {
-                debug_trace.logf("worker", "commit gate flush failed err={s}; the time limit ends the hold dropped=none", .{@errorName(err)});
-                agent.worker.noteCommitGateFlushFailed();
-            };
-        }
-
-        /// Clears the pacer of `agent`, the agent in context: the text it had
-        /// not shown, and a finished turn it deferred, which is never saved
-        /// then. A cancel and a session switch clear it. `reason` names which.
+        /// Clears the pacer of `app`: pending presentation text, tail slots, held
+        /// call lines, and any deferred presentation. History is already committed
+        /// at drain, so clearing the pacer never drops an unsaved turn.
         pub fn clearPacer(app: *App, agent: *AppAgent, reason: []const u8) void {
-            const held_finish = pacerHoldsFinish(app);
+            _ = agent;
+            _ = reason;
             app.pacer.clear(app.alloc);
-            if (held_finish) {
-                debug_trace.logf("worker", "pacer cleared a deferred finished turn unsaved reason={s}", .{reason});
-                acknowledgeDroppedFinish(agent, reason);
-            }
-        }
-
-        /// Defers `finished` in the pacer of `agent` while text is still being
-        /// shown. A finished turn the pacer already held is replaced and never
-        /// saved, so that one is acknowledged as dropped.
-        pub fn deferFinish(app: *App, agent: *AppAgent, finished: types.FinishedPrompt) !bool {
-            const replaced = pacerHoldsFinish(app);
-            const retained = app.pacer.deferFinish(app.alloc, finished) catch |err| {
-                if (replaced and !pacerHoldsFinish(app)) acknowledgeDroppedFinish(agent, "pacer_replaced");
-                return err;
-            };
-            if (retained and replaced) {
-                debug_trace.logf("worker", "pacer replaced a deferred finished turn unsaved", .{});
-                acknowledgeDroppedFinish(agent, "pacer_replaced");
-            }
-            return retained;
         }
 
         fn preserveFinishedAfterDrainFailure(app: *App, agent: *AppAgent, batch: *DetachedWorkerEventBatch, may_persist: bool) void {
             var can_persist = may_persist;
-            if (can_persist) settleDeferredFinish(app, agent) catch {
-                can_persist = false;
-            };
             while (batch.claim()) |event| {
                 defer worker_runtime.freeWorkerEvent(batch.alloc, event);
                 switch (event) {
@@ -1177,7 +1113,7 @@ pub fn Runtime(comptime App: type) type {
             }
             // Existence guard only: pass no clock so the label skips the counter.
             if (!agent.stream.active and app.pacer.hasCompletedAssistantPresentationTail()) {
-                return activity_status.buildTurnLabel(buf, .{ .active = true }, 0);
+                return activity_status.buildTurnLabel(buf, .{ .active = true, .phase = .generating }, 0);
             }
             if (activity_status.buildTurnLabel(buf, agent.stream, 0)) |label| return label;
             if (agent.stream.last_activity_kind == .ask) return ui_render.ask_activity_label;
@@ -1615,9 +1551,6 @@ pub fn Runtime(comptime App: type) type {
                     .finish_prompt => |finished| {
                         var accepted = false;
                         errdefer if (!accepted) {
-                            settleDeferredFinish(app, agent) catch {
-                                can_persist_finished = false;
-                            };
                             if (can_persist_finished) {
                                 persistFinishedPrompt(app, agent, finished) catch {
                                     can_persist_finished = false;
@@ -1628,12 +1561,27 @@ pub fn Runtime(comptime App: type) type {
                             }
                         };
                         try flushPendingCommandOutputAtTurnBoundary(app, handlers);
+                        const stream_before_reset = agent.stream;
                         resetStream(app, agent, false);
                         app.shell.render_requests.request(.footer);
                         const delivery = try handlers.append_history_turn(handlers.ctx, finished);
                         accepted = true;
                         switch (delivery) {
-                            .retained => {},
+                            .retained => {
+                                if (comptime @hasField(App, "pacer")) {
+                                    app.pacer.attachDeferredStreamMetrics(
+                                        stream_before_reset.turn_started_ms,
+                                        stream_before_reset.token_progress,
+                                    );
+                                }
+                            },
+                            .commit_failed => |err| {
+                                if (comptime agents.hasAgentField(App, "session_persistence")) {
+                                    app_session_runtime.Runtime(App).recordShutdownFailure(agent, err);
+                                }
+                                can_persist_finished = false;
+                                return err;
+                            },
                             .settled => |result| switch (result) {
                                 .committed => {},
                                 .presentation_failed => |err| return err,
@@ -1969,9 +1917,14 @@ const FakeWorker = struct {
     admission_snapshot: worker_runtime.InteractiveAdmissionSnapshot = .open,
     /// Finished turns the app told this worker it dropped without saving.
     dropped_finishes: usize = 0,
+    committed_finishes: usize = 0,
 
     pub fn acknowledgeFinishDropped(self: *FakeWorker, _: []const u8) void {
         self.dropped_finishes += 1;
+    }
+
+    pub fn acknowledgeFinishCommitted(self: *FakeWorker) void {
+        self.committed_finishes += 1;
     }
 
     pub fn compactionActivitySnapshot(self: *FakeWorker) @import("../output/compaction_activity.zig").Snapshot {
@@ -2391,7 +2344,7 @@ const FakeShell = struct {
 const FakePacer = struct {
     flushed: usize = 0,
     completed_assistant_presentation_tail: bool = false,
-    deferred_turn: ?types.FinishedPrompt = null,
+    deferred_presentation: ?assistant_pacer.DeferredPresentation = null,
     deferred_started_ns: ?i128 = null,
 
     fn flushPendingText(self: *FakePacer, callbacks: anytype) !void {
@@ -2402,6 +2355,8 @@ const FakePacer = struct {
     fn hasCompletedAssistantPresentationTail(self: *const FakePacer) bool {
         return self.completed_assistant_presentation_tail;
     }
+
+    fn attachDeferredStreamMetrics(_: *FakePacer, _: ?i64, _: ?types.TurnTokenProgress) void {}
 };
 
 const FakeSubagents = struct {
@@ -2464,7 +2419,6 @@ const FakeApp = struct {
     }
 
     fn deinit(self: *FakeApp) void {
-        if (self.pacer.deferred_turn) |finished| types.freeFinishedPrompt(self.alloc, finished);
         for (self.persisted_finishes.items) |finished| types.freeFinishedPrompt(self.alloc, finished);
         self.persisted_finishes.deinit(self.alloc);
         self.program_status_reports.deinit(self.alloc);
@@ -2482,6 +2436,7 @@ const FakeApp = struct {
     }
 
     pub fn appendFinishedPrompt(self: *FakeApp, finished: types.FinishedPrompt) !void {
+        defer self.agent().worker.acknowledgeFinishCommitted();
         if (self.finish_persistence_error) |err| return err;
         const owned = try types.dupeFinishedPrompt(self.alloc, finished);
         errdefer types.freeFinishedPrompt(self.alloc, owned);
@@ -2798,6 +2753,16 @@ const PacedTranscriptBridge = struct {
         try self.pacer.tick(self.app.alloc, now_ns, self.callbacks());
     }
 
+    fn drainPacer(self: *PacedTranscriptBridge) !void {
+        var now_ns: i128 = 0;
+        var ticks: usize = 0;
+        while (self.pacer.hasPending()) : (ticks += 1) {
+            try std.testing.expect(ticks < 1_000);
+            try self.tickPacer(now_ns);
+            now_ns += assistant_pacer.reveal_frame_ns;
+        }
+    }
+
     fn record(self: *PacedTranscriptBridge, value: u8) void {
         if (self.order_len < self.order.len) {
             self.order[self.order_len] = value;
@@ -2843,7 +2808,9 @@ const PacedTranscriptBridge = struct {
     fn appendHistoryTurn(raw: *anyopaque, finished: types.FinishedPrompt) !HistoryDelivery {
         const self: *PacedTranscriptBridge = @ptrCast(@alignCast(raw));
         self.history_count += 1;
-        if (try self.pacer.deferFinish(self.app.alloc, finished)) return .retained;
+        try self.app.appendFinishedPrompt(finished);
+        const presentation = assistant_pacer.DeferredPresentation.fromFinishedPrompt(finished);
+        if (self.pacer.deferFinish(presentation)) return .retained;
         self.finish_count += 1;
         return .{ .settled = .committed };
     }
@@ -2870,7 +2837,7 @@ const PacedTranscriptBridge = struct {
         );
     }
 
-    fn finish(raw: *anyopaque, _: types.FinishedPrompt) !assistant_pacer.FinishResult {
+    fn finish(raw: *anyopaque, _: assistant_pacer.DeferredPresentation) !assistant_pacer.FinishResult {
         const self: *PacedTranscriptBridge = @ptrCast(@alignCast(raw));
         self.finish_count += 1;
         self.record('F');
@@ -3518,7 +3485,7 @@ test "app worker holds a model call's line behind paced text instead of showing 
     try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.notebook.entries.items.len);
     try std.testing.expect(bridge.pacer.hasPending());
 
-    try bridge.tickPacer(0);
+    try bridge.drainPacer();
     try std.testing.expectEqual(@as(usize, 1), bridge.held_call_lines);
     try std.testing.expectEqual(text.len, bridge.emitted_when_call_written);
     try std.testing.expectEqual(@as(usize, 0), bridge.notice_count);
@@ -4413,7 +4380,7 @@ test "app worker drains prior paced batch without splitting assistant turn" {
         .assistant_presentation = .{ .text = @constCast("paced before start") },
     });
     try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
-    try bridge.tickPacer(0);
+    try bridge.drainPacer();
 
     try std.testing.expect(!bridge.pacer.hasPending());
     try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.notebook.entries.items.len);
@@ -4450,7 +4417,7 @@ test "core.app_worker_runtime question boundary drains paced text before opening
         .assistant_presentation = .{ .text = @constCast("paced before question") },
     });
     try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
-    try bridge.tickPacer(0);
+    try bridge.drainPacer();
     try std.testing.expect(!bridge.pacer.hasPending());
 
     app.agent().worker.pending_question = true;
@@ -4480,7 +4447,7 @@ test "core.app_worker_runtime prompt boundary drains paced text before writing t
         .assistant_presentation = .{ .text = @constCast("paced before prompt") },
     });
     try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
-    try bridge.tickPacer(0);
+    try bridge.drainPacer();
     try std.testing.expect(!bridge.pacer.hasPending());
 
     app.agent().stream = .{
@@ -4859,10 +4826,11 @@ test "core.app_worker_runtime text turn finishes after its rendered block" {
 
     try std.testing.expectEqual(@as(usize, 0), bridge.drain_count);
     try std.testing.expectEqual(@as(usize, 1), bridge.history_count);
+    try std.testing.expectEqual(@as(usize, 1), app.persisted_finishes.items.len);
     try std.testing.expectEqual(@as(usize, 0), bridge.finish_count);
     try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.notebook.entries.items.len);
     try std.testing.expect(bridge.pacer.hasPending());
-    try std.testing.expect(bridge.pacer.deferred_turn != null);
+    try std.testing.expect(bridge.pacer.deferred_presentation != null);
 
     try bridge.tickPacer(0);
     try std.testing.expectEqualStrings(
@@ -4870,7 +4838,7 @@ test "core.app_worker_runtime text turn finishes after its rendered block" {
         app.shell.lifecycle.notebook.entries.items[0].assistant_turn.segments.text.items,
     );
     try std.testing.expectEqual(@as(usize, 1), bridge.finish_count);
-    try std.testing.expect(bridge.pacer.deferred_turn == null);
+    try std.testing.expect(bridge.pacer.deferred_presentation == null);
     try std.testing.expect(!bridge.pacer.hasPending());
 }
 
@@ -5810,11 +5778,12 @@ test "worker finish delivery separates unaccepted work from committed presentati
     }
 }
 
-test "unaccepted worker finish records save failure and stops the detached suffix" {
+test "unaccepted worker finish records save failure, keeps deferred presentation intact, and stops the detached suffix" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
     app.agent().worker.processing = true;
     app.finish_persistence_error = error.InputOutput;
+    app.pacer.deferred_presentation = .{ .is_assistant = true, .terminal_outcome = .completed };
     const Capture = struct {
         fn history(_: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
             return error.InjectedDeliveryFailure;
@@ -5822,47 +5791,19 @@ test "unaccepted worker finish records save failure and stops the detached suffi
     };
     var handlers = NoopBridge.handlers(&app);
     handlers.append_history_turn = Capture.history;
-    for (0..2) |_| {
+    for ([_][]const u8{ "earlier answer", "answer" }) |answer| {
         try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
             .user = .{ .text = @constCast("request") },
-            .assistant = @constCast("answer"),
+            .assistant = @constCast(answer),
         } } } });
     }
     try std.testing.expectError(error.InjectedDeliveryFailure, Runtime(FakeApp).tick(&app, (&app).agent(), handlers));
     try std.testing.expectEqual(@as(?anyerror, error.InputOutput), app.agent().session_persistence.shutdown_failure);
     try std.testing.expectEqual(@as(usize, 0), app.persisted_finishes.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
-}
-
-test "a finish the drain's handler cannot save after the pacer's turn failed to save is acknowledged as dropped" {
-    const alloc = std.testing.allocator;
-    var app = FakeApp.init(alloc);
-    defer app.deinit();
-    app.agent().worker.processing = true;
-    app.finish_persistence_error = error.InputOutput;
-    // The pacer still holds an earlier finished turn. When the handler fails,
-    // the drain saves that turn first, and the save fails, so it may not save
-    // the finish the handler was applying.
-    app.pacer.deferred_turn = try types.dupeFinishedPrompt(alloc, .{ .turn = .{ .assistant = .{
-        .user = .{ .text = @constCast("earlier request") },
-        .assistant = @constCast("earlier answer"),
-    } } });
-    const Capture = struct {
-        fn history(_: *anyopaque, _: types.FinishedPrompt) !HistoryDelivery {
-            return error.InjectedDeliveryFailure;
-        }
-    };
-    var handlers = NoopBridge.handlers(&app);
-    handlers.append_history_turn = Capture.history;
-    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = .{ .assistant = .{
-        .user = .{ .text = @constCast("request") },
-        .assistant = @constCast("answer"),
-    } } } });
-    try std.testing.expectError(error.InjectedDeliveryFailure, Runtime(FakeApp).tick(&app, (&app).agent(), handlers));
-    try std.testing.expectEqual(@as(usize, 0), app.persisted_finishes.items.len);
-    try std.testing.expect(app.pacer.deferred_turn == null);
-    // The finish that was not saved is acknowledged as dropped, once.
+    try std.testing.expect(app.pacer.deferred_presentation != null);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.committed_finishes);
     try std.testing.expectEqual(@as(usize, 1), app.agent().worker.dropped_finishes);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.events.items.len);
 }
 
 test "a segment scan resumed at any split point decides like one full scan" {
@@ -6166,7 +6107,7 @@ const GateApp = struct {
     }
 };
 
-test "a finished turn the pacer replaces or clears is acknowledged as dropped, and the one it holds is not" {
+test "clearing or replacing a deferred presentation in the pacer does not drop or touch the worker commit gate" {
     const alloc = std.testing.allocator;
     var app: GateApp = .{ .alloc = alloc };
     defer app.agent().session_persistence.deinit(alloc);
@@ -6181,24 +6122,17 @@ test "a finished turn the pacer replaces or clears is acknowledged as dropped, a
     app.takeAndDrop();
     try std.testing.expectEqual(@as(u32, 2), agent.worker.unacknowledged_finishes);
 
+    // Replacing or clearing deferred presentations in the pacer touches
+    // presentation only and never calls acknowledgeFinishDropped.
     try app.pacer.enqueue(alloc, "text still showing");
-    const first: types.FinishedPrompt = .{ .turn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("first") } } };
-    const second: types.FinishedPrompt = .{ .turn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("second") } } };
-    try std.testing.expect(try Runtime(GateApp).deferFinish(&app, agent, first));
-    // The pacer holds the first turn, which a commit will still acknowledge.
+    try std.testing.expect(app.pacer.deferFinish(.{ .is_assistant = true, .terminal_outcome = .completed }));
+    try std.testing.expect(app.pacer.deferFinish(.{ .is_assistant = true, .terminal_outcome = .interrupted }));
     try std.testing.expectEqual(@as(u32, 2), agent.worker.unacknowledged_finishes);
-    // A second turn replaces it unsaved: that one is acknowledged as dropped.
-    try std.testing.expect(try Runtime(GateApp).deferFinish(&app, agent, second));
-    try std.testing.expectEqual(@as(u32, 1), agent.worker.unacknowledged_finishes);
-    // Clearing the pacer drops the second.
+
     Runtime(GateApp).clearPacer(&app, agent, "cancel");
-    try std.testing.expect(app.pacer.deferred_turn == null);
-    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
-    // Clearing a pacer that holds no turn acknowledges nothing.
-    try app.pushFinish("third");
-    app.takeAndDrop();
-    Runtime(GateApp).clearPacer(&app, agent, "cancel");
-    try std.testing.expectEqual(@as(u32, 1), agent.worker.unacknowledged_finishes);
+    try std.testing.expect(app.pacer.deferred_presentation == null);
+    try std.testing.expect(!app.pacer.hasPending());
+    try std.testing.expectEqual(@as(u32, 2), agent.worker.unacknowledged_finishes);
 }
 
 test "a finished turn the loop does not save after an earlier save failure is acknowledged as dropped" {
@@ -6222,10 +6156,12 @@ test "a finished turn the loop does not save after an earlier save failure is ac
     try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
 }
 
-/// An app whose pacer shows text into `emitted`, and whose finish callback
-/// acknowledges the commit the way `appendFinishedPrompt` does.
+/// An app whose drain commits history and acknowledges the commit gate
+/// immediately, while its pacer shows text into `emitted` and defers only
+/// presentation.
 const FlushApp = struct {
     alloc: std.mem.Allocator,
+    input_runtime: InputRuntime = .{},
     pacer: assistant_pacer.AssistantPacer = .{},
     main_agent: struct {
         total_input_tokens: u64 = 0,
@@ -6233,13 +6169,32 @@ const FlushApp = struct {
         session: @import("../session/session.zig").SessionRuntime = .{ .max_history_turns = 8 },
         session_persistence: app_session_runtime.Persistence = .{},
         worker: worker_runtime.WorkerRuntime = .{},
+        stream: types.StreamState = .{},
+        approval_prompt: FakeApprovalPrompt = .{},
+        question_prompt: FakeQuestionPrompt = .{},
+    } = .{},
+    shell: struct {
+        shimmer_active: bool = false,
+        render_requests: render_request.RenderRequestState = .{},
+        status_state: worker_status.State = .none,
+        pub fn activityProjection(_: *const @This()) activity_runtime.ActivityProjection {
+            return .none;
+        }
+        pub fn worker_status_state(self: *@This()) *worker_status.State {
+            return &self.status_state;
+        }
+        fn appendTurnSummaryEntry(_: *@This(), _: std.mem.Allocator, _: types.TurnSummary) !u32 {
+            return 0;
+        }
+        fn finishLifecycleBatch(_: *@This(), _: std.mem.Allocator) !void {}
+        fn resetCommandOutputDisplay(_: *@This(), _: std.mem.Allocator, _: []const u8) void {}
     } = .{},
     emitted: std.ArrayList(u8) = .empty,
     emit_attempts: usize = 0,
+    present_attempts: usize = 0,
     fail_emit: bool = false,
-    /// The commit acknowledges, as `appendFinishedPrompt` does in a `defer`,
-    /// and then fails.
     fail_commit: bool = false,
+    fail_presentation: bool = false,
     commits: usize = 0,
 
     const finished_turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
@@ -6248,16 +6203,83 @@ const FlushApp = struct {
         return &self.main_agent;
     }
 
+    pub fn writeDomainNotice(_: *@This(), _: types.SemanticNotice, _: bool) !void {}
+
     fn deinit(self: *FlushApp) void {
         self.agent().session_persistence.deinit(self.alloc);
         self.agent().session.deinit(self.alloc);
         self.agent().worker.deinit(std.heap.c_allocator);
+        self.input_runtime.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
         self.emitted.deinit(self.alloc);
     }
 
     fn pacerCallbacks(self: *FlushApp) assistant_pacer.TickCallbacks {
-        return .{ .emit_ctx = self, .emit_fn = FlushApp.emit, .finish_ctx = self, .finish_fn = FlushApp.finish };
+        return .{ .emit_ctx = self, .emit_fn = FlushApp.emit, .finish_ctx = self, .finish_fn = FlushApp.presentFinish };
+    }
+
+    fn noopLifecycleSnapshot(_: *anyopaque) activity_runtime.LifecycleSnapshot {
+        return .{
+            .finalized_turn_watermark = 0,
+            .active_tool_count = 0,
+            .focused_entry_id = null,
+            .focused_activity_kind = null,
+            .activity = .none,
+        };
+    }
+
+    fn noopLifecycleRecord(_: *anyopaque, _: types.ToolLifecycleId) ?activity_runtime.ToolPresentationRecord {
+        return null;
+    }
+
+    fn noopApplyLifecycle(raw: *anyopaque, _: std.mem.Allocator, _: types.ToolLifecycleEvent) !activity_runtime.LifecycleTransition {
+        return .{
+            .previous_focused_entry_id = null,
+            .snapshot = noopLifecycleSnapshot(raw),
+            .applied_activity_kind = null,
+            .terminal_record = null,
+        };
+    }
+
+    fn noopFinishLifecycleBatch(_: *anyopaque, _: std.mem.Allocator) !void {}
+
+    fn handlers(self: *FlushApp) WorkerEventHandlers {
+        return .{
+            .ctx = self,
+            .tool_lifecycle = .{
+                .ctx = self,
+                .snapshot_fn = noopLifecycleSnapshot,
+                .record_fn = noopLifecycleRecord,
+                .apply_fn = noopApplyLifecycle,
+                .finish_batch_fn = noopFinishLifecycleBatch,
+            },
+            .write_user_prompt = NoopBridge.user,
+            .append_text = appendText,
+            .drain_assistant_text = NoopBridge.drain,
+            .open_model_picker = NoopBridge.openModelPicker,
+            .semantic_notice = NoopBridge.notice,
+            .command_output = NoopBridge.output,
+            .command_output_complete = NoopBridge.outputComplete,
+            .diff_block = NoopBridge.diff,
+            .append_history_turn = appendHistoryTurn,
+            .session_grant = NoopBridge.grant,
+            .error_text = NoopBridge.err,
+        };
+    }
+
+    fn appendText(raw: *anyopaque, text: []const u8) anyerror!void {
+        const self: *FlushApp = @ptrCast(@alignCast(raw));
+        try self.pacer.enqueue(self.alloc, text);
+    }
+
+    fn appendHistoryTurn(raw: *anyopaque, finished: types.FinishedPrompt) anyerror!HistoryDelivery {
+        const self: *FlushApp = @ptrCast(@alignCast(raw));
+        self.commits += 1;
+        self.agent().worker.acknowledgeFinishCommitted();
+        if (self.fail_commit) return error.OutOfMemory;
+        const presentation = assistant_pacer.DeferredPresentation.fromFinishedPrompt(finished);
+        if (self.pacer.deferFinish(presentation)) return .retained;
+        return .{ .settled = try FlushApp.presentFinish(self, presentation) };
     }
 
     fn emit(ctx: *anyopaque, text: []const u8) anyerror!void {
@@ -6267,15 +6289,13 @@ const FlushApp = struct {
         try self.emitted.appendSlice(self.alloc, text);
     }
 
-    fn finish(ctx: *anyopaque, _: types.FinishedPrompt) anyerror!assistant_pacer.FinishResult {
+    fn presentFinish(ctx: *anyopaque, _: assistant_pacer.DeferredPresentation) anyerror!assistant_pacer.FinishResult {
         const self: *FlushApp = @ptrCast(@alignCast(ctx));
-        self.commits += 1;
-        self.agent().worker.acknowledgeFinishCommitted();
-        if (self.fail_commit) return error.OutOfMemory;
+        self.present_attempts += 1;
+        if (self.fail_presentation) return .{ .presentation_failed = error.BrokenPipe };
         return .committed;
     }
 
-    /// The request of a report or of typed text, as the worker queues it.
     fn queuedRequest(gpa: std.mem.Allocator, prompt: []const u8) !worker_runtime.QueuedPrompt {
         return .{
             .prompt = try gpa.dupe(u8, prompt),
@@ -6288,151 +6308,87 @@ const FlushApp = struct {
         };
     }
 
-    /// The pacer is still showing `shown` of a turn, and keeps that turn's
-    /// finish behind it, as an open prompt makes it.
-    fn pacerHoldsFinishedTurn(self: *FlushApp, shown: []const u8) !void {
-        try self.pacer.enqueue(self.alloc, shown);
-        try std.testing.expect(try Runtime(FlushApp).deferFinish(self, self.agent(), .{ .turn = finished_turn }));
-    }
-
-    /// The worker finished a turn that a report missed, and the loop took the
-    /// finish into its pacer, which a prompt keeps from showing it.
-    fn finishedTurnWithMailBehindOpenPrompt(self: *FlushApp, shown: []const u8) !void {
+    fn drainTurnWithMailBehindPacer(self: *FlushApp, shown: []const u8) !void {
         const gpa = std.heap.c_allocator;
         const worker = &self.agent().worker;
         worker.enableCommitGate();
         worker.worker_processing = true;
         worker.active_turn_id = 9;
         worker.direct_steering_closed = true;
+        try worker.pushEvent(gpa, .{ .assistant_presentation = .{ .text = @constCast(shown) } });
         try worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = finished_turn } });
         try worker.postMail(gpa, try queuedRequest(gpa, "a report"));
         try std.testing.expect(worker.queued_prompts.items[0].delivery.isContinuation());
         worker.finishProcessing();
-        self.dropWorkerEvents();
-        try self.pacerHoldsFinishedTurn(shown);
-    }
-
-    /// The loop took the worker's events, as its pass does before it hands a
-    /// finish to the pacer.
-    fn dropWorkerEvents(self: *FlushApp) void {
-        const gpa = std.heap.c_allocator;
-        var events = self.agent().worker.takeEvents();
-        for (events.items) |event| worker_runtime.freeWorkerEvent(gpa, event);
-        events.deinit(gpa);
-    }
-
-    /// The next turn's finish: the pacer's old text is gone, the worker has a
-    /// second finish, and the loop takes it into the pacer behind the prompt.
-    fn secondFinishBehindPacer(self: *FlushApp, shown: []const u8) !void {
-        self.pacer.clear(self.alloc);
-        try self.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = finished_turn } });
-        self.dropWorkerEvents();
-        try self.pacerHoldsFinishedTurn(shown);
+        try Runtime(FlushApp).tick(self, self.agent(), self.handlers());
     }
 };
 
-test "the loop flushes the pacer behind a prompt for held mail, and the commit releases the gate" {
+test "a finished turn with held mail behind paced text commits at drain and releases the gate immediately" {
     var app: FlushApp = .{ .alloc = std.testing.allocator };
     defer app.deinit();
     const agent = app.agent();
-    try app.finishedTurnWithMailBehindOpenPrompt("still showing");
-    try std.testing.expect(agent.worker.commitGateWaitsForCommit());
-    try std.testing.expect((try agent.worker.tryTakeNextWork(std.heap.c_allocator)) == null);
+    try app.drainTurnWithMailBehindPacer("still showing");
 
-    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
-
-    // The turn is shown and committed, once, and the mail may start.
-    try std.testing.expectEqualStrings("still showing", app.emitted.items);
+    // Committed and acknowledged at drain while presentation remains deferred in pacer.
     try std.testing.expectEqual(@as(usize, 1), app.commits);
-    try std.testing.expect(app.pacer.deferred_turn == null);
     try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
     try std.testing.expect(!agent.worker.commitGateWaitsForCommit());
+    try std.testing.expect(app.pacer.hasPending());
+    try std.testing.expect(app.pacer.deferred_presentation != null);
+    try std.testing.expectEqual(@as(usize, 0), app.present_attempts);
+
     const work = (try agent.worker.tryTakeNextWork(std.heap.c_allocator)) orelse return error.TestExpectedReportToStart;
     defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
     try std.testing.expectEqualStrings("a report", work.prompt.prompt);
 
-    // A later pass finds nothing to flush.
-    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
-    try std.testing.expectEqual(@as(usize, 1), app.commits);
+    try app.pacer.flushPresentationAtBoundary(app.alloc, 0, app.pacerCallbacks());
+    try std.testing.expectEqualStrings("still showing", app.emitted.items);
+    try std.testing.expectEqual(@as(usize, 1), app.present_attempts);
+    try std.testing.expect(!app.pacer.hasPending());
 }
 
-test "the loop leaves a pacer alone unless it holds a finished turn the worker holds mail or a typed prompt for" {
+test "a typed prompt behind a deferred presentation starts immediately once drained" {
     const gpa = std.heap.c_allocator;
+    var app: FlushApp = .{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    const agent = app.agent();
+    agent.worker.enableCommitGate();
+    try agent.worker.pushEvent(gpa, .{ .assistant_presentation = .{ .text = @constCast("still showing") } });
+    try agent.worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
+    try agent.worker.enqueuePrompt(gpa, try FlushApp.queuedRequest(gpa, "typed"));
+    try std.testing.expect(agent.worker.commitGateWaitsForCommit());
 
-    // Text still being shown, and no finished turn: nothing waits for a commit.
-    {
-        var app: FlushApp = .{ .alloc = std.testing.allocator };
-        defer app.deinit();
-        const agent = app.agent();
-        try app.finishedTurnWithMailBehindOpenPrompt("first turn");
-        app.pacer.clear(app.alloc);
-        try app.pacer.enqueue(app.alloc, "text of a running turn");
-        Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
-        try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
-        try std.testing.expect(app.pacer.hasPending());
-    }
+    try Runtime(FlushApp).tick(&app, agent, app.handlers());
+    try std.testing.expectEqual(@as(usize, 1), app.commits);
+    try std.testing.expect(app.pacer.deferred_presentation != null);
+    try std.testing.expect(!agent.worker.commitGateWaitsForCommit());
 
-    // A finished turn in the pacer, and a worker that holds no mail for it: a
-    // host that did not opt in, or no mail at all.
-    {
-        var app: FlushApp = .{ .alloc = std.testing.allocator };
-        defer app.deinit();
-        const agent = app.agent();
-        try app.pacerHoldsFinishedTurn("still showing");
-        Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
-        try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
-        try std.testing.expect(app.pacer.deferred_turn != null);
-
-        agent.worker.enableCommitGate();
-        try agent.worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
-        Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
-        try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
-    }
-
-    // A prompt the user typed after the turn finished heads the queue: the gate
-    // holds it, so the loop shows and commits the turn, and the prompt may start.
-    {
-        var app: FlushApp = .{ .alloc = std.testing.allocator };
-        defer app.deinit();
-        const agent = app.agent();
-        agent.worker.enableCommitGate();
-        try agent.worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
-        try agent.worker.enqueuePrompt(gpa, try FlushApp.queuedRequest(gpa, "typed"));
-        try app.pacerHoldsFinishedTurn("still showing");
-        try std.testing.expect(agent.worker.commitGateWaitsForCommit());
-        Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
-        try std.testing.expectEqualStrings("still showing", app.emitted.items);
-        try std.testing.expectEqual(@as(usize, 1), app.commits);
-        try std.testing.expect(app.pacer.deferred_turn == null);
-        try std.testing.expect(!agent.worker.commitGateWaitsForCommit());
-        const work = (try agent.worker.tryTakeNextWork(gpa)) orelse return error.TestExpectedTypedPromptToStart;
-        defer worker_runtime.freeWorkItem(gpa, work);
-        try std.testing.expectEqualStrings("typed", work.prompt.prompt);
-    }
+    const work = (try agent.worker.tryTakeNextWork(gpa)) orelse return error.TestExpectedTypedPromptToStart;
+    defer worker_runtime.freeWorkItem(gpa, work);
+    try std.testing.expectEqualStrings("typed", work.prompt.prompt);
 }
 
-test "a flush whose commit fails is not held against the next hold" {
+test "a drain commit failure is acknowledged without blocking the next hold" {
     var app: FlushApp = .{ .alloc = std.testing.allocator, .fail_commit = true };
     defer app.deinit();
     const agent = app.agent();
-    try app.finishedTurnWithMailBehindOpenPrompt("still showing");
+    try std.testing.expectError(error.OutOfMemory, app.drainTurnWithMailBehindPacer("still showing"));
 
-    // The commit acknowledges and fails inside the flush: the hold is over.
-    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
     try std.testing.expectEqual(@as(usize, 1), app.commits);
     try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
-    try std.testing.expect(!agent.worker.commit_gate_flush_failed);
+    try std.testing.expect(!agent.worker.commitGateWaitsForCommit());
 
-    // The next finish holds the same mail again, and the loop flushes for it.
     app.fail_commit = false;
-    try app.secondFinishBehindPacer("second");
-    try std.testing.expect(agent.worker.commitGateWaitsForCommit());
-    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+    app.pacer.clear(app.alloc);
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = @constCast("second") } });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
+    try Runtime(FlushApp).tick(&app, agent, app.handlers());
     try std.testing.expectEqual(@as(usize, 2), app.commits);
     try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
 }
 
-test "the loop flushes the pacer behind a prompt for text the user typed that missed the turn" {
+test "typed text that missed a finished turn starts immediately after drain commit while presentation stays deferred" {
     var app: FlushApp = .{ .alloc = std.testing.allocator };
     defer app.deinit();
     const agent = app.agent();
@@ -6441,66 +6397,53 @@ test "the loop flushes the pacer behind a prompt for text the user typed that mi
     worker.enableCommitGate();
     worker.worker_processing = true;
     worker.active_turn_id = 9;
-    // Typed while the turn ran, and not taken in before it ended.
     try worker.admitInteractivePrompt(gpa, try FlushApp.queuedRequest(gpa, "typed while the turn ran"));
+    try worker.pushEvent(gpa, .{ .assistant_presentation = .{ .text = @constCast("still showing") } });
     try worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
     worker.finishProcessing();
     try std.testing.expect(worker.queued_prompts.items[0].delivery.isContinuation());
-    var events = worker.takeEvents();
-    for (events.items) |event| worker_runtime.freeWorkerEvent(gpa, event);
-    events.deinit(gpa);
-    try app.pacerHoldsFinishedTurn("still showing");
-    try std.testing.expect(worker.commitGateWaitsForCommit());
 
-    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+    try Runtime(FlushApp).tick(&app, agent, app.handlers());
 
-    // The finished turn is shown and committed, and the typed text may start.
-    try std.testing.expectEqualStrings("still showing", app.emitted.items);
     try std.testing.expectEqual(@as(usize, 1), app.commits);
     try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
+    try std.testing.expect(app.pacer.deferred_presentation != null);
     const work = (try worker.tryTakeNextWork(gpa)) orelse return error.TestExpectedTextToStart;
     defer worker_runtime.freeWorkItem(gpa, work);
     try std.testing.expectEqualStrings("typed while the turn ran", work.prompt.prompt);
 }
 
-test "a flush that fails is logged once, keeps the finished turn, and is not tried again until the hold is over" {
+test "deferred presentation failure traces once, clears deferred_presentation, and does not block the commit gate" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "flush-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "presentation-fail-trace.log" });
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
     defer debug_trace.resetForTest();
-    try debug_trace.configureForTestWithScopes(alloc, trace_path, "worker");
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "pacer");
 
-    var app: FlushApp = .{ .alloc = alloc, .fail_emit = true };
+    var app: FlushApp = .{ .alloc = alloc, .fail_presentation = true };
     defer app.deinit();
     const agent = app.agent();
-    try app.finishedTurnWithMailBehindOpenPrompt("still showing");
-
-    for (0..5) |_| Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
-    try std.testing.expectEqual(@as(usize, 1), app.emit_attempts);
-    try std.testing.expectEqual(@as(usize, 0), app.commits);
-    // The turn stays in the pacer for the loop's own pass, and the gate keeps holding.
-    try std.testing.expect(app.pacer.deferred_turn != null);
-    try std.testing.expectEqual(@as(u32, 1), agent.worker.unacknowledged_finishes);
-    try std.testing.expect(agent.worker.commit_gate_flush_failed);
-
-    // The hold ends, and a later hold is tried again.
-    agent.worker.acknowledgeFinishDropped("cancel");
-    try std.testing.expect(!agent.worker.commit_gate_flush_failed);
-    app.fail_emit = false;
-    try app.secondFinishBehindPacer("second");
-    Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
+    try app.drainTurnWithMailBehindPacer("still showing");
     try std.testing.expectEqual(@as(usize, 1), app.commits);
+    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
+    try std.testing.expect(app.pacer.deferred_presentation != null);
+
+    // Draining the pacer hits presentation_failed: traced, cleared, and does not error.
+    try app.pacer.flushPresentationAtBoundary(alloc, 0, app.pacerCallbacks());
+    try std.testing.expectEqual(@as(usize, 1), app.present_attempts);
+    try std.testing.expect(app.pacer.deferred_presentation == null);
+    try std.testing.expect(!app.pacer.hasPending());
+    try std.testing.expect(!agent.worker.commitGateWaitsForCommit());
 
     debug_trace.shutdown();
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
     defer file.close(io_mod.getIo());
     const trace = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
     defer alloc.free(trace);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "commit gate flush failed err=BrokenPipe"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, trace, "commit gate flushes the pacer behind a prompt for held mail"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "deferred finish presentation failed"));
 }

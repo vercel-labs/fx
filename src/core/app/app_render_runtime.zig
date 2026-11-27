@@ -423,21 +423,6 @@ noinline fn approvalScreenNeedsClear(
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
-        fn appendDeferredHistoryForVisualEpoch(
-            ctx: *anyopaque,
-            finished: *const types.FinishedPrompt,
-        ) anyerror!assistant_pacer.DeferredFinishCommit {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            return switch (try app_session_runtime.Runtime(App).appendFinishedPromptForVisualEpoch(
-                app,
-                agents.screenAgentOf(app),
-                finished.*,
-            )) {
-                .uncommitted => .uncommitted,
-                .committed => .committed,
-            };
-        }
-
         pub fn resetVisualEpoch(
             app: *App,
             trigger: VisualEpochResetTrigger,
@@ -445,28 +430,7 @@ pub fn Runtime(comptime App: type) type {
             const welcome = try ui_render.welcomeMessage(app.alloc);
             defer app.alloc.free(welcome);
 
-            const committed = try app.pacer.discardDeferredPresentationForVisualEpoch(
-                app.alloc,
-                .{
-                    .ctx = app,
-                    .append_history = appendDeferredHistoryForVisualEpoch,
-                },
-            );
-            if (!committed) {
-                switch (trigger) {
-                    .native_clear_probe => debug_trace.logf(
-                        "native_clear",
-                        "native_clear_recovery_skipped reason=history_uncommitted",
-                        .{},
-                    ),
-                    .ctrl_l => debug_trace.logf(
-                        "render",
-                        "visual_epoch_reset_skipped trigger=ctrl_l reason=history_uncommitted",
-                        .{},
-                    ),
-                }
-                return false;
-            }
+            app.pacer.discardDeferredPresentationForVisualEpoch(app.alloc);
 
             try app.shell.resetVisualEpoch(app.alloc, welcome);
             try app.shell.requestTerminalReset(&app.metrics);
@@ -724,9 +688,12 @@ pub fn Runtime(comptime App: type) type {
                     if (stops_turn) visible_stream.active = false;
                 }
             }
-            if (!visible_stream.active) {
+            if (!visible_stream.active and app.pacer.hasCompletedAssistantPresentationTail()) {
                 if (app.pacer.completedAssistantPresentationTokenProgress()) |progress| {
                     visible_stream.token_progress = progress;
+                }
+                if (app.pacer.completedAssistantPresentationStartedMs()) |started_ms| {
+                    visible_stream.turn_started_ms = started_ms;
                 }
             }
 
@@ -3892,17 +3859,27 @@ const CoordinatorTestUpgrader = struct {
 const CoordinatorTestPacer = struct {
     pending: bool = false,
     completed_token_progress: ?types.TurnTokenProgress = null,
+    completed_turn_started_ms: ?i64 = null,
+    real: ?assistant_pacer.AssistantPacer = null,
 
     fn hasCompletedAssistantPresentationTail(self: *const CoordinatorTestPacer) bool {
+        if (self.real) |*p| return p.hasCompletedAssistantPresentationTail();
         return self.completed_token_progress != null;
     }
 
     fn hasPending(self: *const CoordinatorTestPacer) bool {
+        if (self.real) |*p| return p.hasPending();
         return self.pending;
     }
 
     fn completedAssistantPresentationTokenProgress(self: *const CoordinatorTestPacer) ?types.TurnTokenProgress {
+        if (self.real) |*p| return p.completedAssistantPresentationTokenProgress();
         return self.completed_token_progress;
+    }
+
+    pub fn completedAssistantPresentationStartedMs(self: *const CoordinatorTestPacer) ?i64 {
+        if (self.real) |*p| return p.completedAssistantPresentationStartedMs();
+        return self.completed_turn_started_ms;
     }
 };
 
@@ -4005,6 +3982,7 @@ const CoordinatorTestApp = struct {
         self.selected_model.deinit(self.alloc);
         self.workspace_identity.deinit(self.alloc);
         self.agent().pending_images.deinit(self.alloc);
+        if (self.pacer.real) |*p| p.deinit(self.alloc);
         self.model_cache.deinit();
     }
 
@@ -4156,18 +4134,20 @@ test "file picker real frame receipt promotes only visible rows and preserves pr
     try std.testing.expectEqual(@as(usize, 2), app.file_completion_calls);
 }
 
-test "core.app_render_runtime keeps final token progress during paced response tail" {
+test "core.app_render_runtime keeps Generating with turn start and tokens during paced response tail" {
     const alloc = std.testing.allocator;
     const progress: types.TurnTokenProgress = .{
         .input_tokens = 50_000,
         .output_tokens = 20_000,
     };
+    const started_ms = io_mod.milliTimestamp() - 12_000;
     var app = CoordinatorTestApp{
         .alloc = alloc,
         .shell = .{},
         .pacer = .{
             .pending = true,
             .completed_token_progress = progress,
+            .completed_turn_started_ms = started_ms,
         },
     };
     defer app.deinit();
@@ -4186,6 +4166,10 @@ test "core.app_render_runtime keeps final token progress during paced response t
     );
 
     try std.testing.expectEqual(progress, ctx.stream.token_progress);
+    try std.testing.expectEqual(started_ms, ctx.stream.turn_started_ms);
+    var expected_buf: [128]u8 = undefined;
+    const expected_secs = @divTrunc(ctx.now_ms - started_ms, std.time.ms_per_s);
+    const expected_label = try std.mem.print(&expected_buf, "• Generating ({d}s) (↑50k ↓20k)", .{expected_secs});
     var activity_buf: [128]u8 = undefined;
     switch (render_input.frameOwnedActivityProjection(
         &activity_buf,
@@ -4193,11 +4177,121 @@ test "core.app_render_runtime keeps final token progress during paced response t
         ctx,
         null,
     )) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "  (↑50k ↓20k)",
-            thinking.label,
-        ),
+        .turn_thinking => |thinking| {
+            try std.testing.expectEqualStrings(expected_label, thinking.label);
+            try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.thinking, thinking.tone);
+        },
         .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    app.pacer.pending = false;
+    app.pacer.completed_token_progress = null;
+    app.pacer.completed_turn_started_ms = null;
+    const done_ctx = Runtime(CoordinatorTestApp).footerContext(
+        &app,
+        (&app).agent(),
+        &upgrade_status_buf,
+        &waiting_note_buf,
+        0,
+        &steering,
+    );
+    var done_buf: [128]u8 = undefined;
+    try std.testing.expect(render_input.frameOwnedActivityProjection(
+        &done_buf,
+        &app.shell,
+        done_ctx,
+        null,
+    ) == .none);
+}
+
+test "core.app_render_runtime switches footer from Generating to done in the same tick the summary row is written" {
+    const alloc = std.testing.allocator;
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{},
+        .pacer = .{ .real = .{} },
+    };
+    defer app.deinit();
+
+    const pacer = &app.pacer.real.?;
+    const progress: types.TurnTokenProgress = .{ .input_tokens = 120, .output_tokens = 45 };
+    const summary: types.TurnSummary = .{
+        .thinking_duration_ms = 500,
+        .turn_duration_ms = 4_000,
+        .token_progress = progress,
+    };
+    const started_ms = io_mod.milliTimestamp() - 4_000;
+    try pacer.enqueue(alloc, "hello world");
+    try std.testing.expect(pacer.deferFinish(.{
+        .summary = summary,
+        .terminal_outcome = .completed,
+        .is_assistant = true,
+    }));
+    pacer.attachDeferredStreamMetrics(started_ms, progress);
+
+    const Callbacks = struct {
+        fn emit(raw: *anyopaque, text: []const u8) anyerror!void {
+            const target: *CoordinatorTestApp = @ptrCast(@alignCast(raw));
+            _ = try target.shell.streamAssistantChunk(target.alloc, &target.metrics, text);
+        }
+
+        fn finish(raw: *anyopaque, presentation: assistant_pacer.DeferredPresentation) anyerror!assistant_pacer.FinishResult {
+            const target: *CoordinatorTestApp = @ptrCast(@alignCast(raw));
+            if (presentation.summary) |s| {
+                _ = try target.shell.appendTurnSummaryEntry(target.alloc, s);
+            }
+            return .committed;
+        }
+
+        fn countSummaries(target: *const CoordinatorTestApp) usize {
+            var count: usize = 0;
+            for (target.shell.notebook.entries.items) |entry| switch (entry) {
+                .raw_bytes => |raw| if (raw.class == .turn_summary) {
+                    count += 1;
+                },
+                else => {},
+            };
+            return count;
+        }
+    };
+    const pacer_cb: assistant_pacer.TickCallbacks = .{
+        .emit_ctx = &app,
+        .emit_fn = Callbacks.emit,
+        .finish_ctx = &app,
+        .finish_fn = Callbacks.finish,
+    };
+
+    var upgrade_status_buf: [64]u8 = undefined;
+    var waiting_note_buf: [128]u8 = undefined;
+    const steering: SteeringProjection = .{};
+
+    // Tick 1 releases "hello " and keeps "world" + deferred presentation -> Generating.
+    try pacer.tick(alloc, 0, pacer_cb);
+    try std.testing.expect(pacer.hasPending());
+    try std.testing.expectEqual(@as(usize, 0), Callbacks.countSummaries(&app));
+    {
+        const ctx = Runtime(CoordinatorTestApp).footerContext(&app, (&app).agent(), &upgrade_status_buf, &waiting_note_buf, 0, &steering);
+        var expected_buf: [128]u8 = undefined;
+        const expected_secs = @divTrunc(ctx.now_ms - started_ms, std.time.ms_per_s);
+        const expected_label = try std.mem.print(&expected_buf, "• Generating ({d}s) (↑120 ↓45)", .{expected_secs});
+        var buf: [128]u8 = undefined;
+        switch (render_input.frameOwnedActivityProjection(&buf, &app.shell, ctx, null)) {
+            .turn_thinking => |thinking| {
+                try std.testing.expectEqualStrings(expected_label, thinking.label);
+                try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.thinking, thinking.tone);
+            },
+            .none, .tool_slot => return error.TestUnexpectedResult,
+        }
+    }
+
+    // Tick 2 releases "world", writes the summary row, and clears deferred presentation in the same tick -> done.
+    try pacer.tick(alloc, assistant_pacer.reveal_frame_ns, pacer_cb);
+    try std.testing.expect(!pacer.hasPending());
+    try std.testing.expectEqual(@as(usize, 1), Callbacks.countSummaries(&app));
+    {
+        const ctx = Runtime(CoordinatorTestApp).footerContext(&app, (&app).agent(), &upgrade_status_buf, &waiting_note_buf, 0, &steering);
+        var buf: [128]u8 = undefined;
+        try std.testing.expect(render_input.frameOwnedActivityProjection(&buf, &app.shell, ctx, null) == .none);
     }
 }
 
