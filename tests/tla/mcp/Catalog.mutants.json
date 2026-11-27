@@ -112,5 +112,47 @@
     "old": "               /\\ refused' = TRUE\n               /\\ lastAnswer' = \"refused\"",
     "new": "               /\\ refused' = refused\n               /\\ lastAnswer' = \"refused\"",
     "invariant": "RefusedIffLastAnswerRefused"
+  },
+  {
+    "description": "A page whose line fx could not read, ended by the grace, is not a refusal: fx says nothing about the list",
+    "old": "    /\\ refused' = TRUE\n    /\\ lastAnswer' = \"unreadable\"",
+    "new": "    /\\ refused' = refused\n    /\\ lastAnswer' = \"unreadable\"",
+    "invariant": "RefusedIffLastAnswerRefused"
+  },
+  {
+    "description": "A page that a grace ended on a line another request could have written is refused as unreadable, though its own answer is only late",
+    "old": "    /\\ lastAnswer' = lastAnswer\n    /\\ refused' = refused\n    /\\ graceLine' = IF",
+    "new": "    /\\ lastAnswer' = \"unreadable\"\n    /\\ refused' = TRUE\n    /\\ graceLine' = IF",
+    "invariant": "NoReasonFromAnotherRequestsLine"
+  },
+  {
+    "description": "A listing counts only its last page's tools left out, so an earlier page's are forgotten",
+    "old": "                  /\\ gatherDrop' = (gatherDrop \\/ d)\n",
+    "new": "                  /\\ gatherDrop' = d\n",
+    "invariant": "GatheredCountIsOfTheRunningListing"
+  },
+  {
+    "description": "An invalid cursor drops the pages gathered but not what they counted, so the count reaches the next pages",
+    "old": "               /\\ gatherDrop' = FALSE\n               /\\ runDrop' = FALSE\n               /\\ UNCHANGED <<dropped, listedDrop>>\n",
+    "new": "               /\\ gatherDrop' = gatherDrop\n               /\\ runDrop' = FALSE\n               /\\ UNCHANGED <<dropped, listedDrop>>\n",
+    "invariant": "GatheredCountIsOfTheRunningListing"
+  },
+  {
+    "description": "A listing that fails changes the count of the list that is still served",
+    "old": "    /\\ gatherDrop' = FALSE\n    /\\ runDrop' = FALSE\n    /\\ UNCHANGED <<dropped, listedDrop>>\n",
+    "new": "    /\\ gatherDrop' = FALSE\n    /\\ runDrop' = FALSE\n    /\\ dropped' = FALSE\n    /\\ UNCHANGED listedDrop\n",
+    "invariant": "PublishedCountBelongsToPublishedList"
+  },
+  {
+    "description": "A list that kept every tool leaves the earlier list's count in place",
+    "old": "               /\\ dropped' = (gatherDrop \\/ d)\n",
+    "new": "               /\\ dropped' = (dropped \\/ gatherDrop \\/ d)\n",
+    "invariant": "PublishedCountBelongsToPublishedList"
+  },
+  {
+    "description": "A listing that fails keeps what its pages counted, so the count reaches the next listing",
+    "old": "    /\\ gatherDrop' = FALSE\n    /\\ runDrop' = FALSE\n    /\\ UNCHANGED <<dropped, listedDrop>>\n",
+    "new": "    /\\ gatherDrop' = gatherDrop\n    /\\ runDrop' = runDrop\n    /\\ UNCHANGED <<dropped, listedDrop>>\n",
+    "invariant": "IdleGathersNothing"
   }
 ]

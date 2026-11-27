@@ -18,6 +18,7 @@ import {
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 60_000;
@@ -319,7 +320,7 @@ test.skipIf(!tmuxAvailable())("/effort <level> applies the level directly, and t
   await session.waitForText("Reasoning effort set to xhigh for acme/thinker", 5_000);
   expect(savedEffort(current)).toBe("xhigh");
   await session.sendText("first question");
-  await session.waitForText("ANSWER", 10_000);
+  await session.waitForPane((pane) => pane.includes("ANSWER") && turnSettled(pane), 10_000);
   await session.waitForComposer(10_000);
 
   await session.sendText("/effort default");
@@ -382,10 +383,10 @@ test.skipIf(!tmuxAvailable())("a level chosen during a turn applies to the next 
   await session.sendKeys("Enter");
   await session.waitForText("Next turn will use reasoning effort xhigh for acme/thinker", 5_000);
   held.release("FIRST_ANSWER");
-  await session.waitForText("FIRST_ANSWER", 10_000);
+  await session.waitForPane((pane) => pane.includes("FIRST_ANSWER") && turnSettled(pane), 10_000);
   await session.waitForComposer(10_000);
   await session.sendText("second question");
-  await session.waitForText("SECOND_ANSWER", 10_000);
+  await session.waitForPane((pane) => pane.includes("SECOND_ANSWER") && turnSettled(pane), 10_000);
   await session.waitForComposer(10_000);
   expect(readFileSync(current.stderrPath, "utf8")).toBe("");
   await quit(current);
@@ -522,7 +523,7 @@ test.skipIf(!tmuxAvailable())("Ctrl+T steps from default through the model's lev
   expect(pane).not.toContain("Reasoning effort");
 
   await session.sendKeys("Enter");
-  await session.waitForText("ANSWER", 10_000);
+  await session.waitForPane((pane) => pane.includes("ANSWER") && turnSettled(pane), 10_000);
   await session.waitForComposer(10_000);
   expect(readFileSync(current.stderrPath, "utf8")).toBe("");
   await quit(current);

@@ -374,6 +374,7 @@ async function checkTrace(observations: Obs[], dir: string): Promise<{ verdict: 
     `  MaxTurns = ${Math.max(1, turns)}`,
     "  Joins = TRUE",
     "  Commits = FALSE",
+    "  Handoff = FALSE",
     `  Bug = "none"`,
     "INVARIANTS",
     "  NotAllMatched",

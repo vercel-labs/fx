@@ -25,7 +25,7 @@ const TIMEOUT = 30_000;
 const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
 
 function createNotificationRoot(
-  notifications = { turn_end: true, attention_required: true },
+  sound = { turn_end: true, attention_required: true },
 ) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-notifications-")));
   const home = join(root, "home");
@@ -39,7 +39,7 @@ function createNotificationRoot(
     settingsPath,
     JSON.stringify({
       permission_mode: "ask",
-      notifications,
+      sound,
     }),
     { mode: 0o600 },
   );
@@ -140,8 +140,6 @@ test.skipIf(!tmuxAvailable())(
       );
 
       let settings = JSON.parse(readFileSync(settingsPath, "utf8"));
-      // Saving moves the older `notifications` group to `sound`.
-      expect(settings).not.toHaveProperty("notifications");
       expect(settings.sound).toEqual({
         turn_end: true,
         attention_required: true,
