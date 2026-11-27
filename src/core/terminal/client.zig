@@ -1656,6 +1656,99 @@ test "a cancel that lands right after the worker takes a request is not lost" {
     try std.testing.expectEqual(CompletionKind.cancelled, completion.kind);
 }
 
+fn configureTraceInTmp(alloc: Allocator, tmp: std.testing.TmpDir, name: []const u8) !void {
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, name });
+    defer alloc.free(path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, path);
+}
+
+fn expectTraceHas(alloc: Allocator, tmp: std.testing.TmpDir, name: []const u8, line: []const u8) !void {
+    debug_trace.shutdown();
+    const trace = try tmp.dir.readFileAlloc(std.testing.io, name, alloc, .limited(1024 * 1024));
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, line) != null);
+}
+
+fn finishAndTakeCancelled(runtime: *Runtime, worker: *RequestWorker) !void {
+    const correlation_id = worker.intent.correlation_id;
+    runtime.finishActive(worker, .{ .kind = .cancelled, .correlation_id = correlation_id });
+    var completion = runtime.takeCompletion().?;
+    defer completion.deinit();
+    try std.testing.expectEqual(CompletionKind.cancelled, completion.kind);
+}
+
+/// Ends every request still running, so `runtime.deinit` does not wait on a
+/// test that failed early.
+fn finishEveryActive(runtime: *Runtime) void {
+    for (runtime.active) |entry| {
+        const worker = entry orelse continue;
+        runtime.finishActive(worker, .{ .kind = .cancelled, .correlation_id = worker.intent.correlation_id });
+    }
+    while (runtime.takeCompletion()) |completion| {
+        var done = completion;
+        done.deinit();
+    }
+}
+
+test "a request whose worker allocation fails ends disconnected, and the next request runs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try configureTraceInTmp(alloc, tmp, "drop-trace.log");
+    defer debug_trace.resetForTest();
+
+    var runtime: Runtime = .{ .alloc = alloc };
+    defer runtime.deinit();
+    defer finishEveryActive(&runtime);
+    try admitTestIntent(&runtime, 31);
+
+    // workerMain passes null when its spare allocation fails.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    const spare = failing.allocator().create(RequestWorker) catch null;
+    try std.testing.expectEqual(Taken{ .unstarted = {} }, takeAndRegister(&runtime, spare));
+
+    var dropped = runtime.takeCompletion().?;
+    defer dropped.deinit();
+    try std.testing.expectEqual(CompletionKind.disconnected, dropped.kind);
+    try std.testing.expectEqual(@as(u64, 31), dropped.correlation_id.?.value);
+    try expectTraceHas(alloc, tmp, "drop-trace.log", "request dropped unstarted correlation=31 reason=allocation failed");
+
+    try admitTestIntent(&runtime, 32);
+    const worker = try alloc.create(RequestWorker);
+    try std.testing.expectEqual(Taken{ .started = worker }, takeAndRegister(&runtime, worker));
+    try finishAndTakeCancelled(&runtime, worker);
+}
+
+test "a full worker table refuses one more request, and the next request runs once a slot frees" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{ .alloc = alloc };
+    defer runtime.deinit();
+    defer finishEveryActive(&runtime);
+
+    // Every running request holds a correlation until its completion is taken,
+    // and the correlation table has as many entries as there are worker slots.
+    // So a request that would need a free slot is refused at admission first.
+    var running: [max_active_requests]*RequestWorker = undefined;
+    for (&running, 0..) |*worker, index| {
+        const correlation_id: u64 = 100 + index;
+        try admitTestIntent(&runtime, correlation_id);
+        worker.* = try alloc.create(RequestWorker);
+        try std.testing.expectEqual(Taken{ .started = worker.* }, takeAndRegister(&runtime, worker.*));
+    }
+
+    try std.testing.expectError(error.QueueFull, admitTestIntent(&runtime, 200));
+
+    try finishAndTakeCancelled(&runtime, running[0]);
+    try admitTestIntent(&runtime, 201);
+    const next = try alloc.create(RequestWorker);
+    try std.testing.expectEqual(Taken{ .started = next }, takeAndRegister(&runtime, next));
+    try finishAndTakeCancelled(&runtime, next);
+    for (running[1..]) |worker| try finishAndTakeCancelled(&runtime, worker);
+}
+
 /// The command of a terminal that stays idle until the fixture ends it. It
 /// writes its byte to the launch signal once it runs, and `exec` leaves no
 /// child behind.
