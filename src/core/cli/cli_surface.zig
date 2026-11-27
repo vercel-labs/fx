@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
 const terminal_env = @import("../shared/terminal_env.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
@@ -69,6 +70,7 @@ const mcp_health = @import("../mcp/health.zig");
 const project_config = @import("../mcp/project_config.zig");
 const mcp_host = @import("../mcp_host/host.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
+const mod_verbs = if (build_options.libfx) struct {} else @import("../mods/verbs.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
@@ -94,6 +96,7 @@ pub const Command = union(enum) {
     status: []const [:0]const u8,
     permissions: []const [:0]const u8,
     mcp: []const [:0]const u8,
+    mod: []const [:0]const u8,
     slack: []const [:0]const u8,
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
@@ -811,6 +814,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         'm' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .mcp)) return .{ .mcp = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .mod)) return .{ .mod = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .models)) return .{ .models = args[1..] };
         },
         'p' => {
@@ -2150,6 +2154,10 @@ fn runNonInteractiveWithDeps(
         .mcp => |rest| {
             return runTopLevelMcp(alloc, rest, cfg, deps);
         },
+        .mod => |rest| {
+            if (comptime build_options.libfx) return .handled_failure;
+            return runModVerbs(alloc, rest, deps);
+        },
         .models => |rest| {
             const opts = parseLocalSurfaceArgs(modelsListArgs(rest)) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .models, "models", err, rest);
@@ -3093,6 +3101,36 @@ fn runTopLevelMcp(
     deps: RunDeps,
 ) !RunResult {
     return runMcpVerbs(alloc, rest, cfg, deps);
+}
+
+fn runModVerbs(alloc: Allocator, rest: []const [:0]const u8, deps: RunDeps) !RunResult {
+    if (comptime build_options.libfx) return .handled_failure;
+    const home = io_mod.homeDir() orelse {
+        try writeStderr(deps, "fx mod: " ++ io_mod.no_home_dir_reason ++ "\n");
+        return .handled_failure;
+    };
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    debug_trace.configureFromEnv(alloc, workspace_root);
+    const args = try alloc.alloc([]const u8, rest.len);
+    defer alloc.free(args);
+    for (rest, args) |r, *a| a.* = r;
+    var out_buffer: [1024]u8 = undefined;
+    var err_buffer: [512]u8 = undefined;
+    var out: DepsWriter = .init(deps, .stdout, &out_buffer);
+    var err: DepsWriter = .init(deps, .stderr, &err_buffer);
+    const code = mod_verbs.run(.{
+        .gpa = alloc,
+        .out = &out.interface,
+        .err = &err.interface,
+        .surface = .cli,
+        .home = home,
+    }, args);
+    return switch (code) {
+        0 => .handled_success,
+        1 => .handled_failure,
+        else => .{ .handled_exit = code },
+    };
 }
 
 /// `fx mcp`: the verbs `/mcp` shares.

@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const agent_steps = @import("agent_steps.zig");
 const command_auth = if (build_options.libfx) struct {} else @import("../auth/command_auth.zig");
+const mods = if (build_options.libfx) struct {} else @import("../mods/mods.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -230,6 +231,7 @@ pub const ConfigDiagnosticCause = enum {
     invalid_additional_directories,
     invalid_skill_symlink_authorities,
     invalid_ultrafast_mode_override,
+    mod_provider_problem,
 };
 
 pub const ConfigDiagnostic = struct {
@@ -237,6 +239,7 @@ pub const ConfigDiagnostic = struct {
     cause: ConfigDiagnosticCause,
     setting_key: ?[]u8 = null,
     recovery_path: ?[]u8 = null,
+    message: ?[]u8 = null,
 
     pub fn reportAtStartup(self: ConfigDiagnostic) bool {
         return self.cause != .legacy_workspace_preferences and self.note() == null;
@@ -247,13 +250,14 @@ pub const ConfigDiagnostic = struct {
         return switch (self.cause) {
             .private_state_permissions_tightened => profile_paths.displayText("Other users could write to ~/.fx, so fx took that access away. " ++
                 "If you didn't write ~/.fx/settings.json yourself, check it."),
-            else => null,
+            else => self.message,
         };
     }
 
     pub fn deinit(self: *ConfigDiagnostic, alloc: Allocator) void {
         if (self.setting_key) |key| alloc.free(key);
         if (self.recovery_path) |path| alloc.free(path);
+        if (self.message) |msg| alloc.free(msg);
         self.* = undefined;
     }
 };
@@ -261,6 +265,7 @@ pub const ConfigDiagnostic = struct {
 pub fn writeDiagnosticMetadata(writer: *std.Io.Writer, diagnostic: ConfigDiagnostic) !void {
     if (diagnostic.setting_key) |key| try writer.print("; key={s}", .{key});
     if (diagnostic.recovery_path) |path| try writer.print("; recovery={s}", .{path});
+    if (diagnostic.message) |msg| try writer.print("; {s}", .{msg});
     if (diagnostic.cause == .retired_skill_match_fuzzy) {
         try writer.writeAll("; remove skill_match_fuzzy; skills now load only through explicit invocation or toolbox open");
     }
@@ -389,17 +394,187 @@ fn resolve_provider_selection(settings: *Settings) !void {
     if (settings.provider) |provider| settings.provider = try provider.bind(settings.providers orelse .{});
 }
 
-/// Reads only profile-global connection definitions. Caller owns the registry.
+/// Reads profile-global and enabled-mod connection definitions. Caller owns the registry.
 pub fn loadConfiguredProviders(alloc: Allocator) !configured_provider.Registry {
     var paths = try discoverPaths(alloc, ".");
     defer paths.deinit(alloc);
-    const bytes = (try readOptionalUserSettingsFile(alloc, paths)) orelse return .{};
-    defer alloc.free(bytes);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .duplicate_field_behavior = .@"error" });
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidSettingsShape;
-    const definitions = parsed.value.object.get("providers") orelse return .{};
-    return configured_provider.Registry.parse(alloc, definitions);
+    var settings_reg: ?configured_provider.Registry = null;
+    errdefer if (settings_reg) |*reg| reg.deinit(alloc);
+    if (try readOptionalUserSettingsFile(alloc, paths)) |bytes| {
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .duplicate_field_behavior = .@"error" });
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidSettingsShape;
+        if (parsed.value.object.get("providers")) |definitions| {
+            settings_reg = try configured_provider.Registry.parse(alloc, definitions);
+        }
+    }
+    if (comptime build_options.libfx) return settings_reg orelse .{};
+    const mods_root = try modsDirFromPaths(alloc, paths);
+    defer if (mods_root) |path| alloc.free(path);
+    return (try mergeProfileAndModProviders(alloc, settings_reg, mods_root, null)) orelse .{};
+}
+
+fn modsDirFromPaths(alloc: Allocator, paths: Paths) !?[]u8 {
+    if (paths.home_fx_dir) |fx_dir| {
+        return try std.Io.Dir.path.join(alloc, &.{ fx_dir, "mods" });
+    }
+    if (paths.user_settings) |settings_path| {
+        if (std.Io.Dir.path.dirname(settings_path)) |dir| {
+            return try std.Io.Dir.path.join(alloc, &.{ dir, "mods" });
+        }
+    }
+    return null;
+}
+
+/// Merges profile `settings.json` providers (first, winning on clashes) with
+/// enabled mod providers (in mod name order, dropping any name defined by two
+/// or more mods) into one bounded registry (`RULES.md` R1.8). Consumes
+/// `settings_providers` on success and frees it on error.
+fn mergeProfileAndModProviders(
+    alloc: Allocator,
+    settings_providers: ?configured_provider.Registry,
+    mods_root_path: ?[]const u8,
+    diagnostics: ?*std.ArrayList(ConfigDiagnostic),
+) !?configured_provider.Registry {
+    if (comptime build_options.libfx) return settings_providers;
+    var settings_reg = settings_providers;
+    errdefer if (settings_reg) |*reg| reg.deinit(alloc);
+
+    const root_path = mods_root_path orelse return settings_reg;
+    var mod_loaded = mods.loadModProviders(alloc, root_path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            if (diagnostics) |diag_list| {
+                try appendModDiagnostic(alloc, diag_list, try alloc.print("mods folder could not be read: {s}.", .{@errorName(err)}));
+            }
+            return settings_reg;
+        },
+    };
+    defer mod_loaded.deinit(alloc);
+
+    if (diagnostics) |diag_list| {
+        for (mod_loaded.problems) |problem| {
+            try appendModDiagnostic(alloc, diag_list, try alloc.dupe(u8, problem));
+        }
+    }
+
+    if (mod_loaded.entries.len == 0) return settings_reg;
+
+    const base_reg = settings_reg orelse configured_provider.Registry{};
+    const merged_arena = try alloc.create(std.heap.ArenaAllocator);
+    merged_arena.* = .init(alloc);
+    errdefer {
+        merged_arena.deinit();
+        alloc.destroy(merged_arena);
+    }
+    const owned = merged_arena.allocator();
+
+    var merged: std.ArrayList(configured_provider.Definition) = .empty;
+    for (base_reg.definitions) |def| {
+        try merged.append(owned, try def.clone(owned));
+    }
+
+    const entries = mod_loaded.entries;
+    for (entries, 0..) |entry, idx| {
+        const id = entry.definition.id;
+        if (base_reg.get(id) != null) {
+            if (diagnostics) |diag_list| {
+                try appendModDiagnostic(alloc, diag_list, try alloc.print(
+                    "mod {s}: provider {s} is already in {s}; using settings.",
+                    .{ entry.mod_name, id, profile_paths.displayText("~/.fx/settings.json") },
+                ));
+            }
+            continue;
+        }
+
+        // Check if another enabled mod also defines `id`.
+        var seen_earlier = false;
+        for (entries[0..idx]) |earlier| {
+            if (std.mem.eql(u8, earlier.definition.id, id)) {
+                seen_earlier = true;
+                break;
+            }
+        }
+        if (seen_earlier) continue;
+
+        var clash_count: usize = 1;
+        for (entries[idx + 1 ..]) |later| {
+            if (std.mem.eql(u8, later.definition.id, id)) clash_count += 1;
+        }
+        if (clash_count > 1) {
+            if (diagnostics) |diag_list| {
+                const msg = try formatModClashDiagnostic(alloc, id, entries[idx..]);
+                try appendModDiagnostic(alloc, diag_list, msg);
+            }
+            continue;
+        }
+
+        if (merged.items.len >= configured_provider.max_providers) {
+            if (diagnostics) |diag_list| {
+                try appendModDiagnostic(alloc, diag_list, try alloc.print(
+                    "mod {s}: provider {s} skipped; fx supports at most {d} custom connections.",
+                    .{ entry.mod_name, id, configured_provider.max_providers },
+                ));
+            }
+            continue;
+        }
+
+        try merged.append(owned, try entry.definition.clone(owned));
+    }
+
+    if (settings_reg) |*old| old.deinit(alloc);
+    settings_reg = null;
+
+    return .{
+        .definitions = try merged.toOwnedSlice(owned),
+        .arena = merged_arena,
+    };
+}
+
+fn appendModDiagnostic(
+    alloc: Allocator,
+    diagnostics: *std.ArrayList(ConfigDiagnostic),
+    owned_message: []u8,
+) !void {
+    errdefer alloc.free(owned_message);
+    try diagnostics.append(alloc, .{
+        .layer = .user,
+        .cause = .mod_provider_problem,
+        .message = owned_message,
+    });
+}
+
+fn formatModClashDiagnostic(
+    alloc: Allocator,
+    id: []const u8,
+    entries: []const mods.ModProviderEntry,
+) ![]u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(alloc);
+    for (entries) |entry| {
+        if (!std.mem.eql(u8, entry.definition.id, id)) continue;
+        var dup = false;
+        for (names.items) |existing| {
+            if (std.mem.eql(u8, existing, entry.mod_name)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) try names.append(alloc, entry.mod_name);
+    }
+    if (names.items.len == 2) {
+        return alloc.print("provider {s} is defined by both mod {s} and mod {s}; neither loaded.", .{ id, names.items[0], names.items[1] });
+    }
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print("provider {s} is defined by mods ", .{id});
+    for (names.items, 0..) |name, i| {
+        if (i > 0) try out.writer.writeAll(", ");
+        try out.writer.writeAll(name);
+    }
+    try out.writer.writeAll("; none loaded.");
+    return out.toOwnedSlice();
 }
 
 /// What to do when a saved session's custom connection changed or was
@@ -409,7 +584,7 @@ pub fn loadConfiguredProviders(alloc: Allocator) !configured_provider.Registry {
 pub fn sessionConnectionNotice(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.ConfiguredProviderChanged => profile_paths.displayText("This session's custom connection changed in ~/.fx/settings.json after the session was saved: its protocol, base_url, or auth. Change it back, or start a new session."),
-        error.ConfiguredProviderRemoved => profile_paths.displayText("This session's custom connection is no longer in ~/.fx/settings.json. Add it back, or start a new session."),
+        error.ConfiguredProviderRemoved => profile_paths.displayText("This session's custom connection is no longer in ~/.fx/settings.json or an installed mod. Add it back, or start a new session."),
         else => null,
     };
 }
@@ -520,10 +695,17 @@ fn commandAuthFailureMessage(alloc: Allocator) Allocator.Error!?[]u8 {
         const reason = text_utils.utf8PrefixByBytes(raw_reason, max_command_failure_display_bytes);
         count += 1;
         if (count == 1) {
-            only = try alloc.print(
-                "the sign-in command of connection {s} ({f}) failed: {s}; run it yourself to sign in, or fix providers.{s}.auth.command in {s}",
-                .{ definition.id, text_utils.terminalSafe(program), reason, definition.id, settings_path },
-            );
+            if (definition.mod_name) |mod_name| {
+                only = try alloc.print(
+                    "the sign-in command of connection {s} ({f}) failed: {s}; run it yourself to sign in, or fix mod {s}",
+                    .{ definition.id, text_utils.terminalSafe(program), reason, mod_name },
+                );
+            } else {
+                only = try alloc.print(
+                    "the sign-in command of connection {s} ({f}) failed: {s}; run it yourself to sign in, or fix providers.{s}.auth.command in {s}",
+                    .{ definition.id, text_utils.terminalSafe(program), reason, definition.id, settings_path },
+                );
+            }
         }
         if (count > max_listed_headers) continue;
         if (count > 1) try listed.appendSlice(alloc, "; ");
@@ -842,6 +1024,12 @@ fn loadMergedSettingsDetailedWithOptionalHome(
                 }
             }
         }
+    }
+
+    if (comptime !build_options.libfx) {
+        const mods_root = if (home_dir) |home| try profile_paths.modsDir(alloc, home) else null;
+        defer if (mods_root) |path| alloc.free(path);
+        settings.providers = try mergeProfileAndModProviders(alloc, settings.providers, mods_root, &diagnostics);
     }
 
     try resolve_provider_selection(&settings);
@@ -1469,11 +1657,15 @@ pub fn loadMergedSettingsFromPaths(alloc: Allocator, paths: Paths) !Settings {
         try mergeSettings(&settings, &user_settings, alloc);
 
         try mergeWorkspaceOverridesFromValue(&settings, alloc, parsed.value, paths.workspace_root);
-        try resolve_provider_selection(&settings);
-        return settings;
+    } else {
+        try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
     }
 
-    try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
+    if (comptime !build_options.libfx) {
+        const mods_root = try modsDirFromPaths(alloc, paths);
+        defer if (mods_root) |path| alloc.free(path);
+        settings.providers = try mergeProfileAndModProviders(alloc, settings.providers, mods_root, null);
+    }
     try resolve_provider_selection(&settings);
     return settings;
 }
@@ -5297,4 +5489,235 @@ test "experimental.workspace_capture is read from the profile only and stays off
     try std.testing.expectEqual(@as(?bool, null), project.experimental_workspace_capture);
     // A value of another type is refused, as for every other switch.
     try std.testing.expectError(error.InvalidExperimentalWorkspaceCaptureType, parseSettingsJson(alloc, "{\"experimental\":{\"workspace_capture\":\"yes\"}}"));
+}
+
+fn installFixtureMod(
+    alloc: Allocator,
+    tmp: *std.testing.TmpDir,
+    mods_root: []const u8,
+    mod_name: []const u8,
+    mod_json: []const u8,
+) !void {
+    const src_rel = try alloc.print("src-{s}", .{mod_name});
+    defer alloc.free(src_rel);
+    try tmp.dir.createDirPath(io_mod.getIo(), src_rel);
+    const src_abs = try io_mod.dirRealpathAlloc(alloc, tmp.dir, src_rel);
+    defer alloc.free(src_abs);
+    const mf_rel = try alloc.print("{s}/mod.json", .{src_rel});
+    defer alloc.free(mf_rel);
+    try writeFixtureFile(tmp.dir, mf_rel, mod_json);
+    const outcome = try mods.add(alloc, mods_root, mod_name, src_abs);
+    try std.testing.expectEqual(mods.Outcome.ok, outcome);
+}
+
+fn hasDiagnosticContaining(diagnostics: []const ConfigDiagnostic, needle: []const u8) bool {
+    for (diagnostics) |diag| {
+        const text = diag.note() orelse continue;
+        if (std.mem.find(u8, text, needle) != null) return true;
+    }
+    return false;
+}
+
+test "mods merge with settings: settings win, two-mod clash drops both, off/broken/.. skipped, and all loaders agree" {
+    if (comptime build_options.libfx) return;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/mods");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const mods_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/mods");
+    defer alloc.free(mods_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"providers\":{\"winner\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://settings.example.com/v1\",\"auth\":{\"type\":\"none\"}}}}",
+    );
+
+    // Mod `mod-win` clashes with settings on `winner` and also provides `from-rel`, `from-bare`, `from-abs`.
+    try installFixtureMod(alloc, &tmp, mods_root, "mod-win",
+        \\{"name":"mod-win","version":"1",
+        \\ "providers":{
+        \\   "winner":{"protocol":"openai-chat-completions","base_url":"https://mod.example.com/v1","auth":{"type":"none"}},
+        \\   "from-rel":{"protocol":"openai-chat-completions","base_url":"https://rel.example.com/v1","auth":{"type":"command","command":["bin/auth","--ok"]}},
+        \\   "from-bare":{"protocol":"openai-chat-completions","base_url":"https://bare.example.com/v1","auth":{"type":"command","command":["my-helper"]}},
+        \\   "from-abs":{"protocol":"openai-chat-completions","base_url":"https://abs.example.com/v1","auth":{"type":"command","command":["/usr/bin/env"]}}
+        \\ }}
+    );
+
+    // Two mods defining `clash`: neither loads it, diagnostic names both.
+    try installFixtureMod(alloc, &tmp, mods_root, "clash-a",
+        \\{"name":"clash-a","version":"1","providers":{"clash":{"protocol":"openai-chat-completions","base_url":"https://a.example.com/v1","auth":{"type":"none"}}}}
+    );
+    try installFixtureMod(alloc, &tmp, mods_root, "clash-b",
+        \\{"name":"clash-b","version":"1","providers":{"clash":{"protocol":"openai-chat-completions","base_url":"https://b.example.com/v1","auth":{"type":"none"}}}}
+    );
+
+    // Disabled mod contributes nothing and produces no diagnostic.
+    try installFixtureMod(alloc, &tmp, mods_root, "off-mod",
+        \\{"name":"off-mod","version":"1","providers":{"off-prov":{"protocol":"openai-chat-completions","base_url":"https://off.example.com/v1","auth":{"type":"none"}}}}
+    );
+    try std.testing.expectEqual(mods.Outcome.ok, try mods.setOn(alloc, mods_root, "off-mod", false));
+
+    // Broken mod (dangling link) and escaping `..` mod contribute nothing and yield diagnostics naming them.
+    var mods_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx/mods", .{});
+    defer mods_dir.close(io_mod.getIo());
+    try mods_dir.symLink(io_mod.getIo(), ".store/dangling-0000000000000001", "broken-mod", .{ .is_directory = true });
+
+    try installFixtureMod(alloc, &tmp, mods_root, "escape-mod",
+        \\{"name":"escape-mod","version":"1","providers":{"bad-rel":{"protocol":"openai-chat-completions","base_url":"https://esc.example.com/v1","auth":{"type":"command","command":["../escape"]}}}}
+    );
+
+    const home = try TestHome.install(alloc, home_root);
+    defer home.deinit();
+
+    var detailed = try loadMergedSettingsDetailedFromHome(alloc, home_root, workspace_root);
+    defer detailed.deinit(alloc);
+    var merged_settings = try loadMergedSettingsFromHome(alloc, home_root, workspace_root);
+    defer merged_settings.deinit(alloc);
+    var direct = try loadConfiguredProviders(alloc);
+    defer direct.deinit(alloc);
+
+    for ([_]configured_provider.Registry{ detailed.settings.providers.?, merged_settings.providers.?, direct }) |reg| {
+        try std.testing.expectEqual(@as(usize, 4), reg.definitions.len);
+        try std.testing.expectEqualStrings("https://settings.example.com/v1", reg.get("winner").?.base_url);
+        try std.testing.expect(reg.get("winner").?.mod_name == null);
+        try std.testing.expect(reg.get("clash") == null);
+        try std.testing.expect(reg.get("off-prov") == null);
+        try std.testing.expect(reg.get("bad-rel") == null);
+
+        const mod_win_link = try std.Io.Dir.path.join(alloc, &.{ mods_root, "mod-win" });
+        defer alloc.free(mod_win_link);
+        const expected_rel = try std.Io.Dir.path.join(alloc, &.{ mod_win_link, "bin/auth" });
+        defer alloc.free(expected_rel);
+
+        const rel = reg.get("from-rel").?;
+        try std.testing.expectEqualStrings(expected_rel, rel.auth.command[0]);
+        try std.testing.expectEqualStrings(mod_win_link, rel.working_dir.?);
+        try std.testing.expectEqualStrings("mod-win", rel.mod_name.?);
+
+        const bare = reg.get("from-bare").?;
+        try std.testing.expectEqualStrings("my-helper", bare.auth.command[0]);
+        try std.testing.expectEqualStrings(mod_win_link, bare.working_dir.?);
+
+        const abs = reg.get("from-abs").?;
+        try std.testing.expectEqualStrings("/usr/bin/env", abs.auth.command[0]);
+        try std.testing.expectEqualStrings(mod_win_link, abs.working_dir.?);
+    }
+
+    try std.testing.expect(hasDiagnosticContaining(detailed.diagnostics, "mod-win"));
+    try std.testing.expect(hasDiagnosticContaining(detailed.diagnostics, "winner"));
+    try std.testing.expect(hasDiagnosticContaining(detailed.diagnostics, "clash-a"));
+    try std.testing.expect(hasDiagnosticContaining(detailed.diagnostics, "clash-b"));
+    try std.testing.expect(hasDiagnosticContaining(detailed.diagnostics, "broken-mod"));
+    try std.testing.expect(hasDiagnosticContaining(detailed.diagnostics, "escape-mod"));
+    try std.testing.expect(hasDiagnosticContaining(detailed.diagnostics, "must stay inside the mod"));
+    try std.testing.expect(!hasDiagnosticContaining(detailed.diagnostics, "off-mod"));
+}
+
+test "mod provider binding_identity stays stable across unchanged update and changes when provider changes" {
+    if (comptime build_options.libfx) return;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/mods");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const mods_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/mods");
+    defer alloc.free(mods_root);
+
+    const v1_json =
+        \\{"name":"glm","version":"1.0.0","providers":{"glm":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"command","command":["bin/auth"]}}}}
+    ;
+    const v2_same_json =
+        \\{"name":"glm","version":"2.0.0","providers":{"glm":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"command","command":["bin/auth"]}}}}
+    ;
+    const v3_changed_json =
+        \\{"name":"glm","version":"3.0.0","providers":{"glm":{"protocol":"openai-chat-completions","base_url":"https://example.com/v2","auth":{"type":"command","command":["bin/auth"]}}}}
+    ;
+
+    try installFixtureMod(alloc, &tmp, mods_root, "glm", v1_json);
+    const home = try TestHome.install(alloc, home_root);
+    defer home.deinit();
+
+    var reg1 = try loadConfiguredProviders(alloc);
+    defer reg1.deinit(alloc);
+    const id1 = reg1.get("glm").?.binding_identity();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "src-v2");
+    const src_v2 = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src-v2");
+    defer alloc.free(src_v2);
+    try writeFixtureFile(tmp.dir, "src-v2/mod.json", v2_same_json);
+    try std.testing.expectEqual(mods.Outcome.ok, try mods.update(alloc, mods_root, "glm", src_v2));
+
+    var reg2 = try loadConfiguredProviders(alloc);
+    defer reg2.deinit(alloc);
+    try std.testing.expectEqual(id1, reg2.get("glm").?.binding_identity());
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "src-v3");
+    const src_v3 = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src-v3");
+    defer alloc.free(src_v3);
+    try writeFixtureFile(tmp.dir, "src-v3/mod.json", v3_changed_json);
+    try std.testing.expectEqual(mods.Outcome.ok, try mods.update(alloc, mods_root, "glm", src_v3));
+
+    var reg3 = try loadConfiguredProviders(alloc);
+    defer reg3.deinit(alloc);
+    try std.testing.expect(!std.mem.eql(u8, &id1, &reg3.get("glm").?.binding_identity()));
+}
+
+test "merged settings and mod providers stay bounded by max_providers" {
+    if (comptime build_options.libfx) return;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/mods");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const mods_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/mods");
+    defer alloc.free(mods_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    // 31 providers in settings + 2 in mods -> total capped at 32, second mod provider skipped with diagnostic.
+    var settings_buf: std.Io.Writer.Allocating = .init(alloc);
+    defer settings_buf.deinit();
+    try settings_buf.writer.writeAll("{\"providers\":{");
+    for (0..configured_provider.max_providers - 1) |i| {
+        if (i > 0) try settings_buf.writer.writeByte(',');
+        try settings_buf.writer.print("\"s{d}\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{{\"type\":\"none\"}}}}", .{i});
+    }
+    try settings_buf.writer.writeAll("}}");
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", settings_buf.written());
+
+    try installFixtureMod(alloc, &tmp, mods_root, "m1",
+        \\{"name":"m1","version":"1","providers":{"mod-p1":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"none"}}}}
+    );
+    try installFixtureMod(alloc, &tmp, mods_root, "m2",
+        \\{"name":"m2","version":"1","providers":{"mod-p2":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"none"}}}}
+    );
+
+    const home = try TestHome.install(alloc, home_root);
+    defer home.deinit();
+
+    var detailed = try loadMergedSettingsDetailedFromHome(alloc, home_root, workspace_root);
+    defer detailed.deinit(alloc);
+    const reg = detailed.settings.providers.?;
+    try std.testing.expectEqual(configured_provider.max_providers, reg.definitions.len);
+    try std.testing.expect(reg.get("mod-p1") != null);
+    try std.testing.expect(reg.get("mod-p2") == null);
+    try std.testing.expect(hasDiagnosticContaining(detailed.diagnostics, "m2"));
+    try std.testing.expect(hasDiagnosticContaining(detailed.diagnostics, "mod-p2"));
+}
+
+test "sessionConnectionNotice includes installed mods for removed connections" {
+    const notice = sessionConnectionNotice(error.ConfiguredProviderRemoved).?;
+    try std.testing.expect(std.mem.find(u8, notice, "settings.json or an installed mod") != null);
 }

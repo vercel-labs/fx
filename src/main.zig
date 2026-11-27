@@ -106,6 +106,7 @@ const file_index_mod = @import("core/workspace/file_index.zig");
 const mcp_host = @import("core/mcp_host/host.zig");
 const mcp_access_policy = @import("core/mcp/access_policy.zig");
 const app_mcp_runtime = @import("core/app/app_mcp_runtime.zig");
+const app_mods_runtime = if (build_options.libfx) struct {} else @import("core/app/app_mods_runtime.zig");
 const skill_commands = @import("core/skills/skill_commands.zig");
 const skill_runtime = @import("core/skills/skill_runtime.zig");
 const cli_surface = @import("core/cli/cli_surface.zig");
@@ -697,6 +698,7 @@ const App = struct {
 
     upgrader: auto_upgrade.AutoUpgrade = .{},
     mcp: app_mcp_runtime.State = .{},
+    mods: if (build_options.libfx) struct {} else app_mods_runtime.State = .{},
     /// The profiles `/launch` completes.
     launch_completion: app_profile_runtime.LaunchCompletion = .{},
     skills: skill_runtime.Runtime = .{},
@@ -1172,6 +1174,7 @@ const App = struct {
         self.trust.deinit(self.alloc);
         shutdown_trace.mark("credentials_saved");
         self.mcp.deinitForProcessExit();
+        if (comptime !build_options.libfx) self.mods.deinit();
         shutdown_trace.mark("mcp_children_terminated");
         if (comptime !build_options.libfx) command_auth.shutdown();
         shutdown_trace.mark("complete");
@@ -1264,6 +1267,7 @@ const App = struct {
         for (main_agent.diff_entries.items) |*entry| entry.deinit(std.heap.c_allocator);
         main_agent.diff_entries.deinit(std.heap.c_allocator);
         self.mcp.deinit();
+        if (comptime !build_options.libfx) self.mods.deinit();
         shutdown_trace.mark("mcp_deinit");
         self.launch_completion.deinit();
         self.skills.deinit(std.heap.c_allocator);
@@ -2066,6 +2070,16 @@ const App = struct {
 
     pub fn takeMcpHostNotices(self: *App) []app_mcp_runtime.State.HostNotice {
         return self.mcp.takeHostNotices();
+    }
+
+    pub fn runModVerbs(self: *App, rest: []const u8) !void {
+        if (comptime build_options.libfx or !host_profile.mods) return;
+        try self.mods.runVerbs(io_mod.homeDir() orelse "", rest);
+    }
+
+    pub fn takeModNotices(self: *App) if (build_options.libfx) []struct { text: []u8, warning: bool } else []app_mods_runtime.ModNotice {
+        if (comptime build_options.libfx or !host_profile.mods) return &.{};
+        return self.mods.takeNotices();
     }
 
     pub fn refreshMcpCompletion(self: *App) void {
@@ -3544,6 +3558,7 @@ const App = struct {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         try app_commands.Handlers(App).collectMcpHostFacts(self, self.screenAgent());
+        if (comptime !build_options.libfx) try app_commands.Handlers(App).collectModFacts(self);
         if (self.launch_completion.refresh(self.alloc, self.input_runtime.edit_state.input.items, io_mod.homeDir(), self.workspace_root, self.instances.seed.launchDefaults())) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
@@ -4573,7 +4588,10 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "credits") or
         std.mem.eql(u8, command, "balance") or
         // Reads AI Gateway usage reports over HTTP with a deadline.
-        std.mem.eql(u8, command, "usage");
+        std.mem.eql(u8, command, "usage") or
+        // `add` and `update` run git, and starting a program allocates.
+        std.mem.eql(u8, command, "mod") or
+        std.mem.eql(u8, command, "mods");
 }
 
 test "auth and upgrade commands use early threaded io without full entry config" {
@@ -4587,6 +4605,8 @@ test "auth and upgrade commands use early threaded io without full entry config"
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "teams")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "provider")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "usage")}));
+    try std.testing.expect(needsEarlyThreadedIo(&.{ @as([:0]const u8, "mod"), "add", "https://example.com/glm.git" }));
+    try std.testing.expect(needsEarlyThreadedIo(&.{ @as([:0]const u8, "mods"), "update" }));
 }
 
 test "every alias of an early threaded io command uses early threaded io" {
@@ -5782,6 +5802,11 @@ test {
     _ = @import("core/auth/command_token.zig");
     _ = @import("core/auth/command_helper.zig");
     _ = @import("core/auth/command_auth.zig");
+    _ = @import("core/mods/manifest.zig");
+    _ = @import("core/mods/source.zig");
+    _ = @import("core/mods/mods.zig");
+    _ = @import("core/mods/verbs.zig");
+    _ = @import("core/app/app_mods_runtime.zig");
     _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/subagent_turn_metrics.zig");

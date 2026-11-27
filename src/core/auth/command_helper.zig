@@ -7,7 +7,7 @@ const std = @import("std");
 const configured_provider = @import("../config/configured_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
-const select_watch = @import("../shared/select_watch.zig");
+const bounded_process = @import("../shared/bounded_process.zig");
 const secret = @import("secret.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -159,114 +159,20 @@ pub fn run(
     cancel_flag: ?*const std.atomic.Value(bool),
     timeout_ms: u32,
 ) std.mem.Allocator.Error!Result {
-    const spawn: Spawn = .{
-        .alloc = alloc,
+    const outcome = bounded_process.run(alloc, io_mod.getIo(), .{
         .argv = argv,
         .cwd = cwd,
-        .timeout = timeoutOf(timeout_ms),
-    };
-    const outcome = if (cancel_flag) |flag|
-        runCancellable(&spawn, flag)
-    else
-        ProcessOutcome{ .finished = runChild(&spawn) };
+        .stdout_limit = max_output_bytes,
+        .stderr_limit = max_stderr_bytes,
+        .timeout_ms = timeout_ms,
+        .cancel = cancel_flag,
+        .scrub_abandoned_stdout = true,
+    });
     return switch (outcome) {
         .finished => |result| finishRun(alloc, timeout_ms, result),
         .cancelled => failedWith(alloc, .cancelled, "the helper was cancelled", .{}),
         .unavailable => |err| failedWith(alloc, .spawn_failed, "the helper could not be run: {s}", .{@errorName(err)}),
     };
-}
-
-const Spawn = struct {
-    alloc: std.mem.Allocator,
-    argv: []const []const u8,
-    cwd: ?[]const u8,
-    timeout: std.Io.Timeout,
-};
-
-fn timeoutOf(timeout_ms: u32) std.Io.Timeout {
-    return .{ .duration = .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake } };
-}
-
-const ProcessOutcome = union(enum) {
-    finished: std.process.RunError!std.process.RunResult,
-    cancelled,
-    unavailable: std.Io.ConcurrentError,
-};
-
-const CancelCondition = struct {
-    flag: *const std.atomic.Value(bool),
-
-    pub fn cancelled(condition: CancelCondition) bool {
-        return condition.flag.load(.acquire);
-    }
-
-    pub fn expired(_: CancelCondition, _: std.Io) bool {
-        return false;
-    }
-};
-
-const CancelWatch = select_watch.Watch(CancelCondition);
-
-const RunEvent = union(enum) {
-    process: std.process.RunError!std.process.RunResult,
-    watch: std.Io.Cancelable!select_watch.Outcome,
-};
-
-fn runCancellable(spawn: *const Spawn, flag: *const std.atomic.Value(bool)) ProcessOutcome {
-    const io = io_mod.getIo();
-    var watch: CancelWatch = .{};
-    var select_buffer: [2]RunEvent = undefined;
-    var select: std.Io.Select(RunEvent) = .init(io, &select_buffer);
-    select.concurrent(.watch, CancelWatch.run, .{
-        &watch,
-        select.io,
-        CancelCondition{ .flag = flag },
-    }) catch |err| return .{ .unavailable = err };
-    select.concurrent(.process, runChild, .{spawn}) catch |err| {
-        watch.finish(&select);
-        return .{ .unavailable = err };
-    };
-    const event = select.await() catch {
-        abandonRun(spawn.alloc, &select, &watch);
-        return .cancelled;
-    };
-    switch (event) {
-        .process => |result| {
-            watch.finish(&select);
-            return .{ .finished = result };
-        },
-        .watch => {
-            abandonRun(spawn.alloc, &select, &watch);
-            return .cancelled;
-        },
-    }
-}
-
-/// A late result can hold the token, so its output is zeroed before it is freed.
-fn abandonRun(alloc: std.mem.Allocator, select: *std.Io.Select(RunEvent), watch: *CancelWatch) void {
-    watch.stop(select.io);
-    while (select.cancel()) |item| switch (item) {
-        .process => |result| if (result) |late| {
-            secret.zeroAndFree(alloc, late.stdout);
-            alloc.free(late.stderr);
-        } else |_| {},
-        .watch => {},
-    };
-}
-
-fn runChild(spawn: *const Spawn) std.process.RunError!std.process.RunResult {
-    return std.process.run(spawn.alloc, io_mod.getIo(), .{
-        .argv = spawn.argv,
-        .cwd = childCwd(spawn.cwd),
-        .stdout_limit = .limited(max_output_bytes),
-        .stderr_limit = .limited(max_stderr_bytes),
-        .timeout = spawn.timeout,
-    });
-}
-
-fn childCwd(cwd: ?[]const u8) std.process.Child.Cwd {
-    const path = cwd orelse return .inherit;
-    return .{ .path = path };
 }
 
 fn finishRun(

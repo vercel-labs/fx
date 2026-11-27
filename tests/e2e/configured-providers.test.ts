@@ -8,6 +8,7 @@ import * as messagesFake from "./fixtures/anthropic-messages";
 import * as responsesFake from "./fixtures/responses";
 import { holdChildAnswer, logLines, rootSessionIds } from "./saved-sessions";
 import { TmuxSession, reviewedActionEvidence, tmuxAvailable } from "./tmux-helpers";
+import { collectFiles, installCommandHelper, waitForCondition } from "./fixtures/shared-helpers";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
   const prefix = deltas.map(delta => `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`).join("");
@@ -1583,7 +1584,7 @@ describe("custom connection errors name the setting", () => {
       f.save();
       const resumed = await runFx(["ask", "--resume", session, "second turn"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
       expect(resumed.code).toBe(1);
-      expect(resumed.stderr).toBe("fx ask: This session's custom connection is no longer in ~/.fx/settings.json. Add it back, or start a new session.\n");
+      expect(resumed.stderr).toBe("fx ask: This session's custom connection is no longer in ~/.fx/settings.json or an installed mod. Add it back, or start a new session.\n");
       expect(f.requests).toHaveLength(1);
     } finally { f.close(); }
   }, 30000);
@@ -1606,34 +1607,6 @@ describe("custom connection errors name the setting", () => {
   }, 30000);
 });
 
-function installCommandHelper(home: string, name: string, scriptBody: string): string {
-  const dir = join(home, "helpers");
-  mkdirSync(dir, { recursive: true });
-  const scriptPath = join(dir, name);
-  writeFileSync(scriptPath, `#!/bin/sh\n${scriptBody}\n`);
-  chmodSync(scriptPath, 0o755);
-  return scriptPath;
-}
-
-function collectFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of readdirSync(dir)) {
-    const full = join(dir, entry);
-    const st = statSync(full);
-    if (st.isDirectory()) out.push(...collectFiles(full));
-    else if (st.isFile()) out.push(full);
-  }
-  return out;
-}
-
-async function waitForCondition(check: () => boolean, timeoutMs: number, stepMs = 25): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (check()) return true;
-    await Bun.sleep(stepMs);
-  }
-  return check();
-}
 
 describe("custom connection command auth", () => {
   test("1. helper token and header go out and helper runs once across tool call and answer", async () => {

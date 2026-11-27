@@ -112,6 +112,7 @@
     {"name": "verify-sessions", "argv": ["bun", "test", "--max-concurrency", "1", "./sessions.test.ts"], "test_file": "sessions.test.ts"},
     {"name": "verify-review-model-override", "argv": ["bun", "test", "--max-concurrency", "1", "./review-model-override.test.ts"], "test_file": "review-model-override.test.ts", "requires_tmux": false},
     {"name": "verify-configured-providers", "argv": ["bun", "test", "--max-concurrency", "1", "./configured-providers.test.ts"], "test_file": "configured-providers.test.ts", "requires_tmux": false},
+    {"name": "verify-mods", "argv": ["bun", "test", "--max-concurrency", "1", "./mods.test.ts"], "test_file": "mods.test.ts", "requires_tmux": true},
     {"name": "verify-oauth-keychain-migration", "argv": ["bun", "test", "--max-concurrency", "1", "./oauth-keychain-migration.test.ts"], "test_file": "oauth-keychain-migration.test.ts", "allow_keychain": true},
     {"name": "verify-mcp-verbs", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-verbs.test.ts"], "test_file": "mcp-verbs.test.ts"},
     {"name": "verify-mcp-subagent-bridge", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-subagent-bridge.test.ts"], "test_file": "mcp-subagent-bridge.test.ts"},

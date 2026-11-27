@@ -1,0 +1,1 @@
+{"name":"glm","version":"1.0.0","description":"GLM coding plan","providers":{"glm":{"protocol":"openai","base_url":"https://example.com/v1","auth":{"type":"command","command":["bin/glm-auth","token"]}}}}

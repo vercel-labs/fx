@@ -65,7 +65,7 @@ describe("TUI custom connection errors", () => {
     ["was removed", (f: ReturnType<typeof fixture>) => {
       delete (f.settings.providers as Record<string, unknown>).local;
       (f.settings as Record<string, unknown>).provider = "remote";
-    }, "fx: This session's custom connection is no longer in ~/.fx/settings.json. Add it back, or start a new session."],
+    }, "fx: This session's custom connection is no longer in ~/.fx/settings.json or an installed mod. Add it back, or start a new session."],
   ] as const)("resume: a session whose connection %s says so before the first frame", async (_name, edit, message) => {
     const f = fixture();
     let tui: TmuxSession | null = null;

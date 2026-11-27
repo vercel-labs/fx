@@ -29,6 +29,7 @@ import {
   tokenPassCatalog,
   turnSettled,
 } from "./tmux-helpers";
+import { runGit } from "./fixtures/shared-helpers";
 
 const TIMEOUT = 30_000;
 const MODEL = "openai/gpt-5";
@@ -161,18 +162,6 @@ function installRecorder(root: IsolatedRoot, name: string, marker: string) {
   return bin;
 }
 
-function runGit(cwd: string, args: string[]) {
-  const result = Bun.spawnSync(["/usr/bin/git", ...args], {
-    cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  expect(
-    result.exitCode,
-    `git ${args.join(" ")} failed: ${result.stderr.toString()}`,
-  ).toBe(0);
-  return result.stdout.toString();
-}
 
 function startGateway(
   responses: Parameters<typeof startFakeGateway>[0],
