@@ -5,6 +5,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const io_mod = @import("../shared/io.zig");
+const json_decode = @import("../shared/json_decode.zig");
 const permissions = @import("permissions.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -1044,7 +1045,7 @@ pub const StoredReads = struct {
         if (!self.canRead()) return read_limit_text;
         self.reads += 1;
         const Args = struct { handle: []const u8, start_byte: ?usize = null, byte_count: ?usize = null, query: ?[]const u8 = null };
-        const args = std.json.parseFromSliceLeaky(Args, arena, call.arguments_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        const args = json_decode.parseFromSliceLeaky(Args, arena, call.arguments_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return "read_prior_result needs a handle, and start_byte or query.",
         };
@@ -1055,12 +1056,12 @@ pub const StoredReads = struct {
         return self.readRange(arena, entry, text, args.start_byte orelse 1, @min(args.byte_count orelse room, room));
     }
 
-    /// Sends the bytes from `start_byte` (1 is the first), widened to whole
-    /// characters, and marks them sent.
+    /// Sends exactly the requested bytes from `start_byte` (1 is the first), at
+    /// most `count`, and marks them sent. Consecutive reads join without a gap;
+    /// a character split at an edge is escaped by `encodeTerminalSafe`.
     fn readRange(self: *StoredReads, arena: std.mem.Allocator, entry: *Entry, text: []const u8, start_byte: usize, count: usize) ![]const u8 {
-        const first = @min(if (start_byte == 0) 0 else start_byte - 1, text.len);
-        const start = text_utils.utf8BackwardBoundary(text, first);
-        const end = text_utils.utf8ForwardBoundary(text, @min(text.len, first + count));
+        const start = @min(if (start_byte == 0) 0 else start_byte - 1, text.len);
+        const end = @min(text.len, start + count);
         entry.sent.setRangeValue(.{ .start = start, .end = end }, true);
         self.bytes += end - start;
         try entry.shown.append(arena, text[start..end]);
@@ -3592,13 +3593,18 @@ const TraceFile = struct {
         return .{ .alloc = alloc, .tmp = tmp, .path = path };
     }
 
-    /// Stops the trace and checks that it holds the line for one held review:
-    /// its reads, the bytes the reviewer was sent, and the reason.
-    fn expectHoldLine(self: *TraceFile, read_bytes: usize, stored_bytes: usize, reads: usize, reason: []const u8) !void {
+    /// Stops the trace and returns everything it wrote. The caller frees it.
+    fn readAll(self: *TraceFile) ![]u8 {
         debug_trace.shutdown();
         var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), self.path, .{});
         defer file.close(io_mod.getIo());
-        const trace = try io_mod.readFileToEnd(self.alloc, &file, 1 << 20);
+        return io_mod.readFileToEnd(self.alloc, &file, 1 << 20);
+    }
+
+    /// Stops the trace and checks that it holds the line for one held review:
+    /// its reads, the bytes the reviewer was sent, and the reason.
+    fn expectHoldLine(self: *TraceFile, read_bytes: usize, stored_bytes: usize, reads: usize, reason: []const u8) !void {
+        const trace = try self.readAll();
         defer self.alloc.free(trace);
         const line = try self.alloc.print(
             "event=auto_review_answers_unread call_id=ask handle={s} read_bytes={d} stored_bytes={d} reads={d} reason={s} target_call_id=pending",
@@ -3736,6 +3742,86 @@ test "stored answers read past each limit hold a clear, and the review decides a
     }
 }
 
+test "two reads that end mid-character stay inside the byte caps" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The 0x80 continuation byte at index 32768 makes both reads' edges land mid-character.
+    const text = try arena.alloc(u8, max_stored_read_total_bytes);
+    @memset(text, 'a');
+    text[max_stored_read_bytes] = 0x80;
+    var fixture = StoredFixture{ .steps = &.{}, .text = text };
+    const entries = [_]PriorToolResultEntry{.{
+        .tool_call_id = "ask",
+        .tool_name = "ask_user_question",
+        .content = text[0..stored_test_preview_bytes],
+        .user_answer = true,
+        .stored_answers = .{ .handle = stored_test_handle, .bytes = text.len },
+    }};
+    var request = ProofFixture.request;
+    request.prior_tool_results = .{ .entries = &entries };
+    request.stored_results = .{ .context = &fixture, .read_fn = StoredFixture.readStored };
+    var reads = try StoredReads.init(arena, request, true);
+    var follow_up: std.ArrayList(types.ChatMessage) = .empty;
+    const calls = [_]types.ToolCall{
+        .{ .id = "read_1", .name = read_tool_name, .arguments_json = "{\"handle\":\"answers-1\",\"start_byte\":1,\"byte_count\":32768}" },
+        .{ .id = "read_2", .name = read_tool_name, .arguments_json = "{\"handle\":\"answers-1\",\"start_byte\":32769,\"byte_count\":32768}" },
+    };
+    try reads.answer(arena, .{ .tool_calls = &calls }, &follow_up);
+
+    try std.testing.expect(reads.bytes <= max_stored_read_total_bytes);
+    for (reads.entries[0].shown.items) |piece| {
+        try std.testing.expect(piece.len <= max_stored_read_bytes);
+    }
+}
+
+/// A stored answer list of about 57 KB, one answer long, with `utf8` starting at byte `char_at` (0-based).
+fn splitAnswersText(alloc: std.mem.Allocator, char_at: usize, utf8: []const u8) ![]u8 {
+    const head = "[{\"question\":\"Which branch?\",\"answer\":\"";
+    const tail = "\"}]";
+    const text = try alloc.alloc(u8, 57 * 1024);
+    @memset(text, 'x');
+    @memcpy(text[0..head.len], head);
+    @memcpy(text[char_at..][0..utf8.len], utf8);
+    @memcpy(text[text.len - tail.len ..], tail);
+    return text;
+}
+
+test "a read across a split character leaves no gap and the list stays clear" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Each case puts one multi-byte character across the edge at byte 32768.
+    const cases = [_]struct { char_at: usize, utf8: []const u8 }{
+        .{ .char_at = 32766, .utf8 = "\xe2\x82\xac" },
+        .{ .char_at = 32767, .utf8 = "\xe2\x82\xac" },
+        .{ .char_at = 32767, .utf8 = "\xc3\xa9" },
+    };
+    for (cases) |case| {
+        const text = try splitAnswersText(arena, case.char_at, case.utf8);
+        var fixture = StoredFixture{ .steps = &.{}, .text = text };
+        const entries = [_]PriorToolResultEntry{.{
+            .tool_call_id = "ask",
+            .tool_name = "ask_user_question",
+            .content = text[0..stored_test_preview_bytes],
+            .user_answer = true,
+            .stored_answers = .{ .handle = stored_test_handle, .bytes = text.len },
+        }};
+        var request = ProofFixture.request;
+        request.prior_tool_results = .{ .entries = &entries };
+        request.stored_results = .{ .context = &fixture, .read_fn = StoredFixture.readStored };
+        var reads = try StoredReads.init(arena, request, true);
+        var follow_up: std.ArrayList(types.ChatMessage) = .empty;
+        const calls = [_]types.ToolCall{
+            .{ .id = "read_1", .name = read_tool_name, .arguments_json = "{\"handle\":\"answers-1\",\"start_byte\":1,\"byte_count\":32768}" },
+            .{ .id = "read_2", .name = read_tool_name, .arguments_json = "{\"handle\":\"answers-1\",\"start_byte\":32769}" },
+        };
+        try reads.answer(arena, .{ .tool_calls = &calls }, &follow_up);
+        try std.testing.expectEqual(text.len, reads.bytes);
+        try std.testing.expectEqualStrings("", try reads.unread(arena, &reads.entries[0]));
+    }
+}
+
 test "the read tool is withdrawn when the review's read time runs out" {
     var reads: StoredReads = .{};
     try std.testing.expect(readsStillOffered(&reads, 1));
@@ -3799,6 +3885,61 @@ test "stored answers that do not list answers hold a clear once read" {
     try expectHeldUnread(outcome);
     try std.testing.expectEqual(steps.len, fixture.next);
     try trace.expectHoldLine(text.len, text.len, 1, "no_parse");
+}
+
+const leak_token = "fxleak-7f3c9a2e5b1d";
+
+/// `storedAnswersText` with `leak_token` inside answer 7, which starts past the
+/// first 4 KB the review is shown. The caller frees it.
+fn storedAnswersWithLeakToken(alloc: std.mem.Allocator) ![]u8 {
+    const base = try storedAnswersText(alloc, null);
+    defer alloc.free(base);
+    return std.mem.replaceOwned(u8, alloc, base, "Routine question 7\",\"answer\":\"", "Routine question 7\",\"answer\":\"" ++ leak_token ++ " ");
+}
+
+test "stored answers with a planted token stay out of the trace when held" {
+    const alloc = std.testing.allocator;
+    const text = try storedAnswersWithLeakToken(alloc);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.find(u8, text, leak_token) != null);
+    try std.testing.expect(std.mem.find(u8, text[0..stored_test_preview_bytes], leak_token) == null);
+
+    const clear_only = [_]StoredFixture.Step{.{ .decide = "{\"decision\":\"clear\"}" }};
+    var trace = try TraceFile.start(alloc);
+    defer trace.finish();
+    var fixture = StoredFixture{ .steps = &clear_only, .text = text };
+    var outcome = try runStoredReview(&fixture, true);
+    defer outcome.deinit(alloc);
+    try expectHeldUnread(outcome);
+    try std.testing.expect(std.mem.find(u8, @tagName(outcome.invalid), leak_token) == null);
+
+    const written = try trace.readAll();
+    defer alloc.free(written);
+    try std.testing.expect(std.mem.find(u8, written, leak_token) == null);
+    try trace.expectHoldLine(0, text.len, 0, "not_read");
+}
+
+test "stored answers with a planted token stay out of the trace when read and cleared" {
+    const alloc = std.testing.allocator;
+    const text = try storedAnswersWithLeakToken(alloc);
+    defer alloc.free(text);
+    const steps = [_]StoredFixture.Step{
+        .{ .read = "{\"handle\":\"answers-1\",\"start_byte\":1,\"byte_count\":32768}" },
+        .{ .read = "{\"handle\":\"answers-1\",\"start_byte\":32769}" },
+        .{ .decide = "{\"decision\":\"clear\"}" },
+    };
+    var trace = try TraceFile.start(alloc);
+    defer trace.finish();
+    var fixture = StoredFixture{ .steps = &steps, .text = text };
+    var outcome = try runStoredReview(&fixture, true);
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .valid);
+    try std.testing.expectEqual(Decision.clear, outcome.valid.decision);
+    try std.testing.expect(std.mem.find(u8, outcome.valid.rationale, leak_token) == null);
+
+    const written = try trace.readAll();
+    defer alloc.free(written);
+    try std.testing.expect(std.mem.find(u8, written, leak_token) == null);
 }
 
 test "a caution quoting stored answers read past the preview is proven" {
@@ -3922,6 +4063,168 @@ test "each reason stored answers do not count is named" {
     try std.testing.expectEqualStrings("no_parse", try reads.unread(arena, &entry));
     entry.text = text;
     try std.testing.expectEqualStrings("", try reads.unread(arena, &entry));
+}
+
+test "stored answer reads stay inside their limits and their text on fuzzed reviewer calls" {
+    try std.testing.fuzz({}, fuzzStoredAnswerReads, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            encodedPicks(.{ fuzz_answers_json, 1, 1, 1, 2 } ++ fuzz_range_read ++ fuzz_range_read_rest),
+            encodedPicks(.{ fuzz_answers_json, 1, 1, 1, 1 } ++ fuzz_query_read),
+            encodedPicks(.{ fuzz_answers_json, 1, 1, 1, 1 } ++ fuzz_foreign_read),
+            encodedPicks(.{ fuzz_answers_json, 1, 1, 6 } ++ fuzz_six_rounds),
+        }) ++ @import("fuzz_corpus").stored_answer_reads.*),
+    });
+}
+
+const fuzz_answers_json = "[{\"question\":\"Which branch?\",\"answer\":\"main\"},{\"question\":\"Delete fixtures?\",\"answer\":\"No, keep them\"}]";
+const fuzz_foreign_handle = "answers-2";
+const fuzz_max_text_bytes: usize = 70 * 1024;
+const fuzz_max_script_bytes: usize = 80 * 1024;
+const fuzz_max_argument_bytes: usize = 256;
+const fuzz_call_names = [_][]const u8{ read_tool_name, "permission_decision", "read_file" };
+const fuzz_query_texts = [_][]const u8{ "main", "fixtures", "missing" };
+const fuzz_refusals = [_][]const u8{
+    "Only read_prior_result runs here; call permission_decision on its own to decide.",
+    read_limit_text,
+    "read_prior_result needs a handle, and start_byte or query.",
+    "No stored answers in this review have that handle.",
+    "The stored answers could not be read.",
+};
+
+// The picks of one read call, in the order `fuzzReadCall` takes them: the
+// name, whether the arguments are random bytes, whether the handle is the
+// stored one, whether the read is a query, then the start and the byte count
+// as a (choice, number) pair each.
+const fuzz_range_read = .{ 0, 0, 1, 0, 3, 1, 3, 40 };
+const fuzz_range_read_rest = .{ 0, 0, 1, 0, 3, 41, 3, 1000 };
+const fuzz_query_read = .{ 0, 0, 1, 1, 0 };
+const fuzz_foreign_read = .{ 0, 0, 0, 0, 3, 1, 3, 40 };
+const fuzz_round_of_reads = .{3} ++ fuzz_range_read ++ fuzz_range_read ++ fuzz_range_read;
+const fuzz_six_rounds = fuzz_round_of_reads ++ fuzz_round_of_reads ++ fuzz_round_of_reads ++ fuzz_round_of_reads ++ fuzz_round_of_reads ++ fuzz_round_of_reads;
+
+/// Encodes each part as the bytes `std.testing.Smith` reads for it: an
+/// integer as 8 little-endian bytes, a string as a u32 length and its bytes.
+fn encodedPicks(comptime parts: anytype) []const u8 {
+    return comptime encoded: {
+        var out: []const u8 = &.{};
+        for (parts) |part| {
+            if (@typeInfo(@TypeOf(part)) == .pointer) {
+                const bytes: []const u8 = part;
+                var len: [4]u8 = undefined;
+                std.mem.writeInt(u32, &len, bytes.len, .little);
+                out = out ++ len ++ bytes[0..bytes.len].*;
+            } else {
+                var word: [8]u8 = undefined;
+                std.mem.writeInt(u64, &word, part, .little);
+                out = out ++ word;
+            }
+        }
+        break :encoded out;
+    };
+}
+
+/// The fuzzer's bytes are one script. An inner `Smith` picks the stored
+/// answers, the reviewer's rounds, and each read call from it.
+fn fuzzStoredAnswerReads(_: void, smith: *std.testing.Smith) anyerror!void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const script_buf = try arena.alloc(u8, fuzz_max_script_bytes);
+    var picks: std.testing.Smith = .{ .in = script_buf[0..smith.slice(script_buf)] };
+    const text_buf = try arena.alloc(u8, fuzz_max_text_bytes);
+    const text = text_buf[0..picks.slice(text_buf)];
+    const stored_bytes: usize = if (picks.value(bool)) text.len else picks.value(u32);
+    const offered = picks.value(bool);
+
+    var fixture = StoredFixture{ .steps = &.{}, .text = text };
+    const entries = [_]PriorToolResultEntry{.{
+        .tool_call_id = "ask",
+        .tool_name = "ask_user_question",
+        .content = text[0..@min(stored_test_preview_bytes, text.len)],
+        .user_answer = true,
+        .stored_answers = .{ .handle = stored_test_handle, .bytes = stored_bytes },
+    }};
+    var request = ProofFixture.request;
+    request.prior_tool_results = .{ .entries = &entries };
+    request.stored_results = .{ .context = &fixture, .read_fn = StoredFixture.readStored };
+    var reads = try StoredReads.init(arena, request, offered);
+    var follow_up: std.ArrayList(types.ChatMessage) = .empty;
+
+    const rounds = picks.valueRangeAtMost(u8, 1, 6);
+    for (0..rounds) |_| {
+        const call_count = picks.valueRangeAtMost(u8, 1, 3);
+        const calls = try arena.alloc(types.ToolCall, call_count);
+        for (calls, 0..) |*call, index| call.* = try fuzzReadCall(&picks, arena, index);
+        try reads.answer(arena, .{ .tool_calls = calls }, &follow_up);
+        try expectStoredReadsHold(&reads, follow_up.items, arena);
+    }
+}
+
+fn fuzzReadCall(picks: *std.testing.Smith, arena: std.mem.Allocator, index: usize) !types.ToolCall {
+    const id = try arena.print("call_{d}", .{index});
+    const name = fuzz_call_names[picks.index(fuzz_call_names.len)];
+    const arguments_json = try fuzzReadArguments(picks, arena);
+    return .{ .id = id, .name = name, .arguments_json = arguments_json };
+}
+
+fn fuzzReadArguments(picks: *std.testing.Smith, arena: std.mem.Allocator) ![]const u8 {
+    if (picks.value(bool)) {
+        const raw = try arena.alloc(u8, fuzz_max_argument_bytes);
+        return raw[0..picks.slice(raw)];
+    }
+    const handle = if (picks.value(bool)) stored_test_handle else fuzz_foreign_handle;
+    if (picks.value(bool)) {
+        const query = fuzz_query_texts[picks.index(fuzz_query_texts.len)];
+        return arena.print("{{\"handle\":\"{s}\",\"query\":\"{s}\"}}", .{ handle, query });
+    }
+    const start = try fuzzNumberText(picks, arena);
+    const count = try fuzzNumberText(picks, arena);
+    return arena.print("{{\"handle\":\"{s}\",\"start_byte\":{s},\"byte_count\":{s}}}", .{ handle, start, count });
+}
+
+/// A JSON number that is often 0, negative, or past any limit, and otherwise any i64.
+fn fuzzNumberText(picks: *std.testing.Smith, arena: std.mem.Allocator) ![]const u8 {
+    const choice = picks.index(4);
+    const raw = picks.value(i64);
+    return switch (choice) {
+        0 => "0",
+        1 => "-1",
+        2 => "18446744073709551615",
+        else => try arena.print("{d}", .{raw}),
+    };
+}
+
+fn expectStoredReadsHold(reads: *const StoredReads, follow_up: []const types.ChatMessage, arena: std.mem.Allocator) !void {
+    try std.testing.expect(reads.reads <= max_stored_reads);
+    try std.testing.expect(reads.bytes <= max_stored_read_total_bytes);
+    for (reads.entries) |entry| {
+        try std.testing.expect(entry.sent.count() <= entry.stored.bytes);
+    }
+    for (follow_up) |message| {
+        if (message.role != .tool) continue;
+        try expectToolResultText(message.content orelse return error.MissingToolResult);
+    }
+    try expectClearOnlyWhenRead(reads, arena);
+}
+
+fn expectToolResultText(content: []const u8) !void {
+    for (fuzz_refusals) |refusal| {
+        if (std.mem.eql(u8, content, refusal)) return;
+    }
+    try std.testing.expect(std.mem.startsWith(u8, content, "<stored_answers"));
+    try std.testing.expect(std.mem.endsWith(u8, content, "</stored_answers>") or std.mem.endsWith(u8, content, "</stored_answers_query>"));
+}
+
+fn expectClearOnlyWhenRead(reads: *const StoredReads, arena: std.mem.Allocator) !void {
+    const clear: ParseOutcome = .{ .valid = .{ .risk = .low, .decision = .clear, .rationale = try arena.dupe(u8, "clear") } };
+    const held = try reads.holdUnlessRead(arena, arena, clear, "review");
+    if (held != .valid or held.valid.decision != .clear) return;
+    for (reads.entries) |entry| {
+        const text = entry.text orelse return error.ClearWithoutStoredText;
+        try std.testing.expectEqual(entry.stored.bytes, entry.sent.count());
+        try std.testing.expect(try types.answeredQuestions(arena, text) != null);
+    }
 }
 
 test "a review logs each send so /trace can show a retried timeout" {

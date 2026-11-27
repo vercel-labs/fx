@@ -1273,6 +1273,83 @@ test "stored result reads support ranges and literal queries" {
     try std.testing.expect(std.mem.find(u8, queried, "needle two") != null);
 }
 
+test "whole stored result reads return the stored bytes exactly, legacy and managed" {
+    const alloc = std.testing.allocator;
+    const text = "alpha\nneedle one\n\xc3\xa9 beta\x00\n";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const legacy_handle = try storeLargeResult(alloc, dir, "call", "grep_files", text);
+    defer alloc.free(legacy_handle);
+    const legacy = try readWhole(alloc, dir, legacy_handle);
+    defer alloc.free(legacy);
+    try std.testing.expectEqualSlices(u8, text, legacy);
+
+    var memory = session_child_store.MemoryBlobsForTesting.init(alloc);
+    defer memory.deinit();
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
+    defer capability.deinit();
+    const managed_handle = try storeLargeResultManaged(alloc, &capability, "call", "grep_files", text);
+    defer alloc.free(managed_handle);
+    const managed = try readWholeManaged(alloc, &capability, managed_handle);
+    defer alloc.free(managed);
+    try std.testing.expectEqualSlices(u8, text, managed);
+}
+
+test "whole stored result over the read cap is refused, legacy and managed" {
+    const alloc = std.testing.allocator;
+    const over = try alloc.alloc(u8, read_max_bytes + 1);
+    defer alloc.free(over);
+    @memset(over, 'x');
+    const at_cap = over[0..read_max_bytes];
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const over_handle = try storeLargeResult(alloc, dir, "over", "grep_files", over);
+    defer alloc.free(over_handle);
+    try std.testing.expectError(error.ResultTooLarge, readWhole(alloc, dir, over_handle));
+    const cap_handle = try storeLargeResult(alloc, dir, "cap", "grep_files", at_cap);
+    defer alloc.free(cap_handle);
+    const whole = try readWhole(alloc, dir, cap_handle);
+    defer alloc.free(whole);
+    try std.testing.expectEqual(read_max_bytes, whole.len);
+
+    var memory = session_child_store.MemoryBlobsForTesting.init(alloc);
+    defer memory.deinit();
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
+    defer capability.deinit();
+    const managed_handle = try storeLargeResultManaged(alloc, &capability, "over", "grep_files", over);
+    defer alloc.free(managed_handle);
+    try std.testing.expectError(error.ResultTooLarge, readWholeManaged(alloc, &capability, managed_handle));
+}
+
+test "whole stored result of an unknown handle returns ResultHandleNotFound" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    // A stored result makes the folder private, which a read requires.
+    const known = try storeLargeResult(alloc, dir, "call", "grep_files", "known");
+    defer alloc.free(known);
+    const found = try readWhole(alloc, dir, known);
+    defer alloc.free(found);
+    try std.testing.expectEqualStrings("known", found);
+    try std.testing.expectError(error.ResultHandleNotFound, readWhole(alloc, dir, "result-missing.txt"));
+
+    var memory = session_child_store.MemoryBlobsForTesting.init(alloc);
+    defer memory.deinit();
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
+    defer capability.deinit();
+    const missing = try blobHandle(alloc, "never stored");
+    defer alloc.free(missing);
+    try std.testing.expectError(error.ResultHandleNotFound, readWholeManaged(alloc, &capability, missing));
+}
+
 test "range reads snap to utf8 rune boundaries" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
