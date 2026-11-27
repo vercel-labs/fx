@@ -66,6 +66,9 @@ jobs:
       - name: Check recovery boundary
         run: ./scripts/check-recovery-boundary.sh
 
+      - name: Check workspace trust boundary
+        run: ./scripts/check-workspace-trust-boundary.sh
+
       - name: Model-check request recovery
         run: |
           set -euo pipefail
@@ -92,6 +95,9 @@ jobs:
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/web_fetch_dns/check.sh design-b design-a
       - name: Model-check terminal hang-up
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/terminal_hangup/check.sh design-a design-b
+
+      - name: Model-check CLI hang-up
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/cli_hangup/check.sh design-a design-b
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -138,6 +144,9 @@ jobs:
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/web_fetch_dns/
       - name: Walk fx along the terminal hang-up model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/terminal_hangup/
+
+      - name: Walk fx along the CLI hang-up model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/cli_hangup/
 
       # The zsh user profile tests in src/core/execution/command_runner.zig
       # skip without /bin/zsh. They start interactive zsh with no terminal,
@@ -1195,6 +1204,7 @@ jobs:
             scripts/check-indexer-boundary.sh
             scripts/check-public-surface.sh
             scripts/check-recovery-boundary.sh
+            scripts/check-workspace-trust-boundary.sh
             scripts/detect-ci-need.sh
             scripts/detect-macos-need.sh
             scripts/dev-channel-forward.sh
