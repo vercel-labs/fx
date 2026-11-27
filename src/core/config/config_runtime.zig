@@ -2805,6 +2805,36 @@ test "loadStartupStatusSettings merges project defaults before profile layers" {
     try std.testing.expectEqual(@as(usize, 8), settings.max_agent_steps.?);
 }
 
+test "loadMergedSettings matches a workspace override when the workspace root has a trailing slash" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const user_settings = try std.testing.allocator.print(
+        "{{\"fast_mode\":true,\"workspaces\":{{\"{s}\":{{\"fast_mode\":false}}}}}}",
+        .{workspace_root},
+    );
+    defer std.testing.allocator.free(user_settings);
+
+    const workspace_with_slash = try std.testing.allocator.print("{s}/", .{workspace_root});
+    defer std.testing.allocator.free(workspace_with_slash);
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"fast_mode\":true}");
+
+    var settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_with_slash);
+    defer settings.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(false, settings.fast_mode.?);
+}
+
 test "max_agent_steps absence and explicit values resolve distinctly" {
     var absent = try parseSettingsJson(std.testing.allocator, "{}");
     defer absent.deinit(std.testing.allocator);

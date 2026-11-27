@@ -1288,6 +1288,7 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleSettings(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (std.mem.trim(u8, rest, " \t").len == 0) {
+                // A settings file that does not load gets the text status, which names the error.
                 var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch {
                     try session_commands.Commands(App).handleSettings(app, rest);
                     return;
