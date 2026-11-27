@@ -45,6 +45,7 @@
 #   yield-unclean       an upgrade's restart saved as a death              NoFalseCrashQuestion
 #   yield-first         a turn stopped for a restart before it is logged   YieldContinues
 #   yield-unsaved       a stop whose save failed, left as a clean stop     NoFalseCrashQuestion
+#   note-turn           a resumed turn started as a new turn with no work  SameTurn
 #   cancel-strands      a cancelled restart leaves a held turn stopped     HeldOnlyWhileRestartWaits
 #   cancel-keeps-relaunch  a quit after a cancel relaunches                CancelledRestartStays
 #   cancel-unsaved      a held turn sends with its clean record            CrashLoopAsks
@@ -114,6 +115,7 @@ Resume resume-mutation-no-lock OneWorker
 Resume resume-mutation-yield-unclean NoFalseCrashQuestion
 Resume resume-mutation-yield-first YieldContinues
 Resume resume-mutation-yield-unsaved NoFalseCrashQuestion
+Resume resume-mutation-note-turn SameTurn
 Resume resume-mutation-cancel-strands HeldOnlyWhileRestartWaits
 Resume resume-mutation-cancel-keeps-relaunch CancelledRestartStays
 Resume resume-mutation-cancel-unsaved CrashLoopAsks

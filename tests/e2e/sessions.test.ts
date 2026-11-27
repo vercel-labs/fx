@@ -6475,7 +6475,8 @@ function twoToolGateway(prefix: string, prompt: string, after: [string, string])
   const gateway = startDynamicFakeGateway(async (body) => {
     if (body.includes(after[0])) return fakeGatewayFinalText(after[1]);
     // The app resumes the turn the kill interrupted on its own.
-    if (body.includes("<session_resumed>")) return fakeGatewayFinalText(`${prefix}_RESUMED`);
+    // The resumed request carries the notice the model reads (continuation.zig resume_notice).
+    if (body.includes("Resuming from unexpected session interruption.")) return fakeGatewayFinalText(`${prefix}_RESUMED`);
     if (body.includes(prompt) && body.includes(`${prefix}_FIRST_TOOL_OUTPUT`)) {
       served();
       const input = JSON.stringify({ request: { yield_time_ms: 30_000, action: "run", command: "sleep 30" } });
@@ -6528,7 +6529,7 @@ test.skipIf(!tmuxAvailable())("an app killed while a tool runs answers that call
     // AutoResumes).
     await resumed.session.waitForText("APP_RESUMED", TIMEOUT);
     await resumed.session.waitForComposer(TIMEOUT);
-    expectToolKillRepaired(fixture, id, gateway.requests.find((request: any) => request.body.includes("<session_resumed>"))!.body, "APP");
+    expectToolKillRepaired(fixture, id, gateway.requests.find((request: any) => request.body.includes("Resuming from unexpected session interruption."))!.body, "APP");
     await resumed.session.sendText("After the app tool kill.");
     await resumed.session.waitForText("AFTER_APP_TOOL_KILL", TIMEOUT);
     await quitApp(resumed);

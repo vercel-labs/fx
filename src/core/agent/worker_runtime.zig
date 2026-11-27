@@ -133,6 +133,17 @@ pub const SteeringBoundaryResult = union(enum) {
     interrupt,
 };
 
+/// How the turn a queued prompt continues was stopped.
+pub const ContinuedTurn = enum {
+    /// Between steps, for an upgrade's restart: nothing went out for the
+    /// next request, so it sends with no new attempt and no status
+    /// (`recovery.Start.continues`).
+    yielded,
+    /// By a crash or a closed window: the turn goes on with fx's resume notice,
+    /// and its request goes out again as a resume.
+    stopped,
+};
+
 pub const QueuedPrompt = struct {
     turn_id: u64 = 0,
     input_id: ?u64 = null,
@@ -185,11 +196,11 @@ pub const QueuedPrompt = struct {
     /// The request a previous fx process left unfinished, which this turn's
     /// first model request resumes.
     recovery_resume: ?types.RecoveryResume = null,
-    /// Continues a turn that yielded for an upgrade's restart, from
-    /// `recovery_checkpoint`. `recovery_resume` still decides whether the
-    /// first request goes at once or asks first; this keeps the user's own
-    /// message and the turn's pieces, with no resume note.
-    continues_yielded_turn: bool = false,
+    /// Continues a turn a previous fx process stopped, from
+    /// `recovery_checkpoint`, as the same turn: the user's own message and the
+    /// turn's pieces, never a note in place of the user's message. `recovery_resume`
+    /// still decides whether the first request goes at once.
+    continuation: ?ContinuedTurn = null,
     /// True when this output surface already contains the checkpoint's
     /// assistant source. Recovery still restores the source for overlap and
     /// persistence, but publishes only novel continuation text.
@@ -2826,7 +2837,7 @@ pub const WorkerRuntime = struct {
         errdefer if (!transfer_history) {
             types.freeHistoryTurnSlice(alloc, job_history);
         };
-        if (queued.continues_yielded_turn) {
+        if (queued.continuation == .yielded) {
             try self.worker_events.append(alloc, .{
                 .begin_continued_prompt = queued.turn_id,
             });
@@ -6284,7 +6295,7 @@ test "a turn that continues a yielded one begins as continued, not resumed" {
     var prompt = try makePrompt(alloc, "ok", "model");
     prompt.turn_id = 42;
     prompt.recovery_resume = .{};
-    prompt.continues_yielded_turn = true;
+    prompt.continuation = .yielded;
     try runtime.enqueuePrompt(alloc, prompt);
     const next = (try runtime.tryTakeNextPrompt(alloc)).?;
     defer freeQueuedPrompt(alloc, next);

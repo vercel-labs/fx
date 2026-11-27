@@ -35,6 +35,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const session_codec = @import("../session/session_codec.zig");
+const continuation = @import("../continuation/continuation.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
 const session_event = @import("../session/session_event.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -383,20 +384,6 @@ const CheckpointAction = union(enum) {
     },
 };
 
-/// The checkpoint that continues a turn which yielded between steps, as
-/// libfx continues one (`libfx_journal.resumeCheckpoint` with `yielded`):
-/// its prompt and finished steps, no partial reply, nothing sent yet, and
-/// no tool evidence, so the resend strategy adds no text and the model
-/// reads no note. Owned by `alloc`; the caller calls `deinit`.
-fn yieldedTurnCheckpoint(
-    alloc: Allocator,
-    entry: types.InterruptedHistoryTurn,
-    provider: model_provider.ProviderId,
-    model: []const u8,
-) !session_codec.RecoveryCheckpoint {
-    return turnCheckpoint(alloc, entry.user, entry.execution, provider, model);
-}
-
 /// The checkpoint for a turn whose prompt and finished steps are `user` and
 /// `execution`, as the agent loop saves them before a model request. Owned by
 /// `alloc`; the caller calls `deinit`.
@@ -407,23 +394,7 @@ fn turnCheckpoint(
     provider: model_provider.ProviderId,
     model: []const u8,
 ) !session_codec.RecoveryCheckpoint {
-    const view: session_codec.RecoveryCheckpoint = .{
-        .turn_id = debug_trace.nextTurnId(),
-        .user = user,
-        .assistant_source = @constCast(""),
-        .execution = execution,
-        .cause = .network_interrupted,
-        .action = .retrying_request,
-        .tool_state = .none,
-        .authority = .{ .provider = provider, .model = @constCast(model) },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        // As the agent loop saves it: no cap of its own.
-        .max_provider_attempts = std.math.maxInt(u16) + 1,
-        .consumed_provider_attempts = 0,
-        .outstanding_reservation = false,
-    };
-    return view.dupe(alloc);
+    return session_codec.unsentTurnCheckpoint(user, execution, provider, model).dupe(alloc);
 }
 
 test "resume handoff policy requires requested durable non-pristine state" {
@@ -484,7 +455,7 @@ test "a yielded turn's checkpoint holds its prompt and steps and nothing sent" {
         .user = .{ .text = @constCast("work") },
         .terminal_reason = .cancelled,
     };
-    var checkpoint = try yieldedTurnCheckpoint(alloc, entry, .gateway, "test/model");
+    var checkpoint = try session_codec.stoppedTurnCheckpoint(alloc, entry, .gateway, "test/model", .yielded);
     defer checkpoint.deinit(alloc);
     try std.testing.expectEqualStrings("work", checkpoint.user.text);
     try std.testing.expectEqualStrings("", checkpoint.assistant_source);
@@ -2225,11 +2196,14 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.logf("recovery", "event=resume_pending record={} stale={} yielded={} saved_ms={d} now_ms={d}", .{ found.record != null, stale, found.yielded, found.saved_ms, now_ms });
         }
 
-        /// Sends the noted request again, as a turn whose prompt is fx's note
-        /// to the model. The recovery module decides whether it goes at once
-        /// or asks first.
+        /// Sends the noted request again: the turn a previous process stopped
+        /// goes on as the same turn (`continueStoppedTurn`). After a yield the
+        /// model reads nothing new; after a crash or a closed window it reads
+        /// fx's resume notice once. If the turn cannot go on, a notice says so
+        /// and the turn's work stays in the session. The recovery module
+        /// decides how the first request goes.
         pub fn startPendingResume(app: *App, agent: *AppAgent) void {
-            if (comptime !@hasDecl(App, "queueResumedRequest")) return;
+            if (comptime !@hasDecl(App, "queueContinuedTurn")) return;
             const resumed = agent.session_persistence.pending_request_resume orelse return;
             agent.session_persistence.pending_request_resume = null;
             const yielded = agent.session_persistence.pending_resume_yielded;
@@ -2239,19 +2213,9 @@ pub fn Runtime(comptime App: type) type {
             // screen (`commitStartupResumeReplayAnchor`), so nothing is read
             // before the first paint (RULES.md R2.2).
             debug_trace.logf("recovery", "event=resume_start yielded={}", .{yielded});
-            // A turn that stopped for an upgrade's restart goes on as the
-            // same turn, with no note to the model; if it cannot, the note
-            // resume still sends the request again.
-            // Only a host that restarts for an upgrade stops a turn so.
-            if (comptime runtime_profile.allows(App, .auto_upgrade)) {
-                if (yielded) {
-                    if (continueYieldedTurn(app, agent, resumed)) return else |err| {
-                        debug_trace.logf("recovery", "event=yield_continue_failed err={s} fallback=resume_note", .{@errorName(err)});
-                    }
-                }
-            }
-            _ = app.queueResumedRequest(agent, session_runtime.resumed_request_prompt, resumed) catch |err| {
-                debug_trace.logf("recovery", "event=resume_dropped reason=queue_failed err={s}", .{@errorName(err)});
+            const stop: continuation.Stop = if (yielded) .yielded else .interrupted;
+            continueStoppedTurn(app, agent, resumed, stop) catch |err| {
+                debug_trace.logf("recovery", "event=resume_dropped reason=continue_failed stop={s} err={s}", .{ @tagName(stop), @errorName(err) });
                 noteResumeDropped(app, err);
             };
         }
@@ -2266,35 +2230,44 @@ pub fn Runtime(comptime App: type) type {
                 debug_trace.logf("recovery", "event=resume_drop_notice_failed err={s}", .{@errorName(write_err)});
         }
 
-        /// Continues the turn that yielded for an upgrade's restart, which
-        /// the resume left as the history's newest turn: takes it out of the
-        /// history and queues a turn that goes on from its pieces. The
-        /// session's next turn then says it continues the yielded one, so a
-        /// later replay drops that one (`session_adapter.Session.setContinuesYielded`).
-        fn continueYieldedTurn(app: *App, agent: *AppAgent, resumed: types.RecoveryResume) !void {
-            if (comptime !@hasDecl(App, "queueYieldedTurn")) return error.YieldedTurnUnsupported;
-            const v2 = agent.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
-            const taken = agent.session.takeNewestTurn() orelse return error.YieldedTurnMissing;
+        /// Continues the turn a previous process stopped, which the resume left
+        /// as the history's newest turn: takes it out of the history and queues
+        /// a turn that goes on from its pieces as the same turn. A yield's turn
+        /// reads no new note; an interrupted turn reads fx's resume notice once,
+        /// after its finished steps. A CLI session's log holds the turn's own
+        /// pieces, so the continued turn's base is the turn as the log holds it,
+        /// and the next turn says it continues the stopped one, so a later replay
+        /// joins the two (`session_adapter.Session.setContinuesYielded`). A libfx
+        /// terminal session saves whole snapshots and needs no base.
+        fn continueStoppedTurn(app: *App, agent: *AppAgent, resumed: types.RecoveryResume, stop: continuation.Stop) !void {
+            if (comptime !@hasDecl(App, "queueContinuedTurn")) return error.ContinuedTurnUnsupported;
+            if (agent.session_persistence.v2 == null and agent.session_persistence.js_host_session == null) {
+                return error.SessionPersistenceUnavailable;
+            }
+            const taken = agent.session.takeNewestTurn() orelse return error.StoppedTurnMissing;
             var taken_owned_elsewhere = false;
             errdefer if (!taken_owned_elsewhere) agent.session.returnNewestTurn(taken);
             const entry = switch (taken.turn) {
                 .interrupted => |value| value,
-                else => return error.YieldedTurnMissing,
+                else => return error.StoppedTurnMissing,
             };
-            var checkpoint = try yieldedTurnCheckpoint(
+            var checkpoint = try session_codec.stoppedTurnCheckpoint(
                 app.alloc,
                 entry,
                 provider_runtime.providerOf(app, agent),
                 provider_runtime.modelOf(app, agent),
+                stop,
             );
             defer checkpoint.deinit(app.alloc);
-            v2.setContinuesYielded(&checkpoint.execution);
-            app.queueYieldedTurn(agent, &checkpoint, resumed) catch |err| {
-                v2.setContinuesYielded(null);
+            const v2 = agent.session_persistence.v2;
+            if (v2) |v2_session| v2_session.setContinuesYielded(&entry.execution);
+            const kind: worker_runtime.ContinuedTurn = if (stop == .yielded) .yielded else .stopped;
+            app.queueContinuedTurn(agent, &checkpoint, resumed, kind) catch |err| {
+                if (v2) |v2_session| v2_session.setContinuesYielded(null);
                 return err;
             };
             taken_owned_elsewhere = true;
-            debug_trace.logf("recovery", "event=yield_continued tool_steps={d}", .{entry.execution.tool_steps.len});
+            debug_trace.logf("recovery", "event=turn_continued stop={s} tool_steps={d}", .{ @tagName(stop), entry.execution.tool_steps.len });
             types.freeHistoryTurn(app.alloc, taken.turn);
         }
 
@@ -2704,7 +2677,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn scheduleMoreSessions(app: *App, agent: *AppAgent) !void {
             const picker = &agent.session_persistence.session_picker;
-            const continuation = picker.continuation orelse
+            const picker_continuation = picker.continuation orelse
                 return error.SessionStoreUnavailable;
             const source = pickerSource(app, agent) orelse return error.SessionStoreUnavailable;
             const active_id = pickerActiveId(agent);
@@ -2721,7 +2694,7 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 cache,
                 source.workspace_root,
-                continuation.view(),
+                picker_continuation.view(),
                 limit,
                 true,
             ) catch |err| {
@@ -5098,7 +5071,7 @@ pub fn Runtime(comptime App: type) type {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
                 if (steering.text.len == 0 or isRecoveryPrompt(steering.text)) continue;
-                try sink.appendUserTurn(savedSteeringTurn(steering.text), true);
+                try writeSavedSteering(sink, steering.text);
             }
         }
 
@@ -5149,6 +5122,16 @@ pub fn Runtime(comptime App: type) type {
             return .{ .text = text, .author = .user };
         }
 
+        /// A saved steering entry as it was shown live: fx's resume notice as the
+        /// notice a resumed request shows, and any other text as the user's own
+        /// message (RULES.md R4.4: fx's own text is never the user's words).
+        fn writeSavedSteering(sink: anytype, text: []u8) !void {
+            if (std.mem.eql(u8, text, continuation.resume_notice)) {
+                return sink.appendNotice(session_runtime.resumed_request_notice);
+            }
+            return sink.appendUserTurn(savedSteeringTurn(text), true);
+        }
+
         fn writePersistedSteeringAtBoundary(
             app: *App,
             sink: anytype,
@@ -5164,7 +5147,7 @@ pub fn Runtime(comptime App: type) type {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
                 if (item.text.len > 0 and !isRecoveryPrompt(item.text)) {
-                    try sink.appendUserTurn(savedSteeringTurn(item.text), true);
+                    try writeSavedSteering(sink, item.text);
                 }
                 index.* += 1;
             }
@@ -6865,8 +6848,10 @@ const TestApp = struct {
         authority_mutex: std.Io.Mutex = .init,
     } = .{},
     mcp_tool_names: std.ArrayList([]u8) = .empty,
-    resume_queue_count: usize = 0,
-    resume_queue_error: ?anyerror = null,
+    continued: ?session_codec.RecoveryCheckpoint = null,
+    continued_kind: ?worker_runtime.ContinuedTurn = null,
+    continued_count: usize = 0,
+    continue_error: ?anyerror = null,
 
     fn init(alloc: Allocator, workspace_root: []const u8) !TestApp {
         return .{
@@ -6875,10 +6860,18 @@ const TestApp = struct {
         };
     }
 
-    pub fn queueResumedRequest(self: *TestApp, _: anytype, _: []const u8, _: types.RecoveryResume) !bool {
-        self.resume_queue_count += 1;
-        if (self.resume_queue_error) |err| return err;
-        return true;
+    pub fn queueContinuedTurn(
+        self: *TestApp,
+        _: anytype,
+        checkpoint: *const session_codec.RecoveryCheckpoint,
+        _: types.RecoveryResume,
+        kind: worker_runtime.ContinuedTurn,
+    ) !void {
+        if (self.continue_error) |err| return err;
+        self.continued_count += 1;
+        self.continued_kind = kind;
+        if (self.continued) |*old| old.deinit(self.alloc);
+        self.continued = try checkpoint.dupe(self.alloc);
     }
 
     fn toolAdvertisementSet(_: *const TestApp, _: anytype) tool_set_contract.ToolSet {
@@ -6947,6 +6940,7 @@ const TestApp = struct {
         self.agent().session_title.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.agent().pending_images.deinit(self.alloc);
+        if (self.continued) |*checkpoint| checkpoint.deinit(self.alloc);
         for (self.notices.items) |notice| self.alloc.free(notice);
         self.notices.deinit(self.alloc);
         for (self.cards.items) |*card| card.deinit(self.alloc);
@@ -7366,20 +7360,159 @@ test "js-host resume restores transcript context preferences and revision" {
     );
 }
 
+/// Opens a v2 session in `workspace` for `agent`, whose newest history turn
+/// is a turn a previous process stopped after one finished tool step.
+fn seedStoppedTurn(alloc: Allocator, agent: anytype, workspace: []const u8) !void {
+    const persistence = &agent.session_persistence;
+    _ = try persistence.adoptStore(alloc, try session_adapter.Store.openFromEnv(alloc));
+    var model = "test-model".*;
+    persistence.v2 = try session_adapter.Session.create(alloc, persistence.v2_store.?, workspace, .app, .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = .literal("en"),
+        .permission_state = .{},
+    });
+    var steps = [_]types.ToolExecutionStep{.{}};
+    const stopped = try types.dupeHistoryTurn(alloc, .{ .interrupted = .{
+        .user = .{ .text = @constCast("work") },
+        .execution = .{ .tool_steps = &steps },
+        .stopped_by_exit = true,
+        .terminal_reason = .cancelled,
+    } });
+    try agent.session.agent.history.append(alloc, stopped);
+}
+
 test "a resumed request that cannot be queued says so in a notice" {
     const alloc = std.testing.allocator;
-    var app = try TestApp.init(alloc, "/workspace");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
     defer app.deinit();
-    (&app).agent().session_persistence.pending_request_resume = .{};
-    app.resume_queue_error = error.AccessDenied;
+    const agent = (&app).agent();
+    try seedStoppedTurn(alloc, agent, paths.workspace);
+    agent.session_persistence.pending_request_resume = .{};
+    app.continue_error = error.AccessDenied;
 
-    Runtime(TestApp).startPendingResume(&app, (&app).agent());
+    Runtime(TestApp).startPendingResume(&app, agent);
 
-    try std.testing.expectEqual(@as(usize, 1), app.resume_queue_count);
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expect(std.mem.find(u8, app.notices.items[0], "could not send the interrupted request again") != null);
     try std.testing.expect(std.mem.find(u8, app.notices.items[0], "AccessDenied") != null);
-    try std.testing.expect((&app).agent().session_persistence.pending_request_resume == null);
+    try std.testing.expect(agent.session_persistence.pending_request_resume == null);
+    try std.testing.expectEqual(@as(usize, 1), agent.session.historyLen());
+}
+
+test "a crash-stopped turn resumes as the same turn with the resume notice" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    const agent = (&app).agent();
+    try seedStoppedTurn(alloc, agent, paths.workspace);
+    agent.session_persistence.pending_request_resume = .{};
+
+    Runtime(TestApp).startPendingResume(&app, agent);
+
+    try std.testing.expectEqual(@as(usize, 1), app.continued_count);
+    try std.testing.expectEqual(worker_runtime.ContinuedTurn.stopped, app.continued_kind.?);
+    const checkpoint = app.continued.?;
+    try std.testing.expectEqualStrings("work", checkpoint.user.text);
+    const steering = checkpoint.execution.steering;
+    try std.testing.expectEqual(@as(usize, 1), steering.len);
+    try std.testing.expectEqualStrings(continuation.resume_notice, steering[0].text);
+    try std.testing.expectEqual(@as(usize, 1), steering[0].after_tool_step_count);
+}
+
+test "a yielded turn still resumes with no notice" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    const agent = (&app).agent();
+    try seedStoppedTurn(alloc, agent, paths.workspace);
+    agent.session_persistence.pending_request_resume = .{};
+    agent.session_persistence.pending_resume_yielded = true;
+
+    Runtime(TestApp).startPendingResume(&app, agent);
+
+    try std.testing.expectEqual(@as(usize, 1), app.continued_count);
+    try std.testing.expectEqual(worker_runtime.ContinuedTurn.yielded, app.continued_kind.?);
+    try std.testing.expectEqual(@as(usize, 0), app.continued.?.execution.steering.len);
+}
+
+test "a libfx terminal session continues the turn its reload stopped" {
+    const alloc = std.testing.allocator;
+    var fake = FakeJsHostSessionStore{
+        .state = try makeJsHostTestState(
+            alloc,
+            "reloaded-session",
+            "remember this prompt",
+            "remembered reply",
+        ),
+        .updated_at_ms = 99,
+    };
+    defer fake.deinit(alloc);
+    if (fake.state) |*state| {
+        state.recovery_checkpoint = try session_codec.unsentTurnCheckpoint(
+            .{ .text = @constCast("reloaded work") },
+            .{},
+            .gateway,
+            "test/model",
+        ).dupe(alloc);
+    }
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    try Runtime(TestApp).configureStartupPreferences(
+        &app,
+        (&app).agent(),
+        .gateway,
+        "startup/model",
+        .user_global,
+        "startup/model",
+        .auto,
+        false,
+        true,
+        false,
+        null,
+        null,
+        null,
+        null,
+    );
+    (&app).agent().session_persistence.js_host_store = fake.store();
+    app.requested_resume = .last;
+
+    try Runtime(TestApp).resumeRequestedJsHostSession(&app, (&app).agent());
+    Runtime(TestApp).startPendingResume(&app, (&app).agent());
+
+    try std.testing.expectEqual(@as(usize, 1), app.continued_count);
+    try std.testing.expectEqual(worker_runtime.ContinuedTurn.stopped, app.continued_kind.?);
+    const checkpoint = app.continued.?;
+    try std.testing.expectEqualStrings("reloaded work", checkpoint.user.text);
+    const steering = checkpoint.execution.steering;
+    try std.testing.expectEqual(@as(usize, 1), steering.len);
+    try std.testing.expectEqualStrings(continuation.resume_notice, steering[0].text);
 }
 
 test "js-host compaction store failure preserves live history and revision" {
@@ -8525,6 +8658,23 @@ test "execution replay shows the user's steering and not fx's own recovery promp
     try std.testing.expectEqual(@as(usize, 2), app.cards.items.len);
     try std.testing.expectEqualStrings("focus on rendering", app.cards.items[0].text);
     try std.testing.expectEqualStrings("later update", app.cards.items[1].text);
+}
+
+test "a replayed resume notice shows as fx's notice, not as the user's words" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var steps = [_]types.ToolExecutionStep{.{}};
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast(continuation.resume_notice), .after_tool_step_count = 0 },
+    };
+
+    try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), .{ .tool_steps = steps[0..], .steering = steering[0..] });
+
+    try std.testing.expectEqual(@as(usize, 0), app.cards.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], session_runtime.resumed_request_notice.body) != null);
 }
 
 test "execution replay draws a parent's steer as its own words, without the label" {

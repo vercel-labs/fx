@@ -8,6 +8,7 @@ const types = @import("../../../shared/types.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
+const continuation = @import("../../../continuation/continuation.zig");
 const session_child_store = @import("../../../session/session_child_store.zig");
 const result_store = @import("../../../session/result_store.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
@@ -1233,7 +1234,7 @@ test "a turn that continues a yielded one sends the user's own message, not the 
     defer hooks.deinit();
     var job = fixture.job();
     job.recovery_resume = .{};
-    job.continues_yielded_turn = true;
+    job.continuation = .yielded;
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
@@ -1279,7 +1280,7 @@ test "a turn that continues a yielded resume projects the stopped turn without i
     continued.prompt = @constCast(session_runtime.resumed_request_prompt);
     continued.history = history[0..];
     continued.recovery_resume = .{};
-    continued.continues_yielded_turn = true;
+    continued.continuation = .yielded;
     try runFakePrompt(&continued_gateway, &continued_hooks, continued_fixture.config(), continued);
 
     var resumed_gateway = FakeGateway.init(alloc, &completions);
@@ -1297,6 +1298,52 @@ test "a turn that continues a yielded resume projects the stopped turn without i
     try expectBodyNotContains(&continued_gateway, 0, "<turn_aborted>");
     try expectBodyNotContains(&continued_gateway, 0, "The previous response ended before completion.");
     try std.testing.expectEqualStrings(resumed_gateway.request_bodies.items[0], continued_gateway.request_bodies.items[0]);
+}
+
+test "a stopped continuation sends the user's prompt, its steps, and the resume notice" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "final" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.recovery_resume = .{};
+    job.continuation = .stopped;
+    var calls = [_]types.ToolCall{.{ .id = "call_1", .name = "read_file", .arguments_json = "{}" }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_1"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("file body"),
+        .output_bytes = 9,
+        .stored_output_bytes = 9,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    var steering = [_]types.PersistedSteering{.{ .text = @constCast(continuation.resume_notice), .after_tool_step_count = steps.len }};
+    job.recovery_checkpoint = .{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("user prompt") },
+        .assistant_source = @constCast(""),
+        .execution = .{ .tool_steps = &steps, .steering = &steering },
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("anthropic/claude-opus-4.6") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 0,
+    };
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    const body = gateway.request_bodies.items[0];
+    try std.testing.expect(std.mem.find(u8, body, "user prompt") != null);
+    try std.testing.expect(std.mem.find(u8, body, "file body") != null);
+    try std.testing.expect(std.mem.find(u8, body, continuation.resume_notice) != null);
+    try std.testing.expect(std.mem.find(u8, body, "session_resumed") == null);
 }
 
 test "processQueuedPrompt presents invalid registered call without running it" {

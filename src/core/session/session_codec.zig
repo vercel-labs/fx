@@ -12,6 +12,8 @@ const context_limits = @import("../config/context_limits.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const continuation = @import("../continuation/continuation.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -200,6 +202,190 @@ pub const RecoveryCheckpoint = struct {
         };
     }
 };
+
+/// An owned copy of `pending`, a turn a stop left, ready to go on. An
+/// interrupted turn that does not hold fx's resume notice yet gets it after
+/// its finished steps, then each text of `inputs` follows as steering the
+/// model reads for the first time. The attempt budget starts over and no
+/// reservation is outstanding. The CLI and libfx both go on through it, so the
+/// same stop gives the model the same turn. A turn reads the notice once
+/// (`tests/tla/durable/Resumption.tla` AtMostOneNotice). Owned by `alloc`; the
+/// caller calls `deinit`.
+pub fn resumedCheckpoint(
+    alloc: Allocator,
+    pending: RecoveryCheckpoint,
+    stop: continuation.Stop,
+    inputs: []const []const u8,
+) !RecoveryCheckpoint {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var view = pending;
+    const old = view.execution.steering;
+    const after = view.execution.tool_steps.len;
+    const notice = continuation.notice(stop, holdsResumeNotice(old));
+    if (stop == .interrupted and notice == .none) {
+        debug_trace.logf("session", "event=resume_notice_kept steering={d}", .{old.len});
+    }
+    const notice_count: usize = if (notice == .resumed) 1 else 0;
+    const steering = try scratch.allocator().alloc(types.PersistedSteering, old.len + notice_count + inputs.len);
+    @memcpy(steering[0..old.len], old);
+    if (notice == .resumed) {
+        steering[old.len] = .{ .text = @constCast(continuation.resume_notice), .after_tool_step_count = after };
+    }
+    for (inputs, steering[old.len + notice_count ..]) |input, *entry| {
+        entry.* = .{ .text = @constCast(input), .after_tool_step_count = after };
+    }
+    view.execution.steering = steering;
+    view.consumed_provider_attempts = 0;
+    view.outstanding_reservation = false;
+    return view.dupe(alloc);
+}
+
+fn holdsResumeNotice(steering: []const types.PersistedSteering) bool {
+    for (steering) |entry| {
+        if (std.mem.eql(u8, entry.text, continuation.resume_notice)) return true;
+    }
+    return false;
+}
+
+/// The checkpoint that goes on from an interrupted history turn: its user
+/// turn and finished steps, with no partial reply and nothing sent yet.
+/// Owned by `alloc`; the caller calls `deinit`.
+pub fn stoppedTurnCheckpoint(
+    alloc: Allocator,
+    entry: types.InterruptedHistoryTurn,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+    stop: continuation.Stop,
+) !RecoveryCheckpoint {
+    const pending = unsentTurnCheckpoint(entry.user, entry.execution, provider, model);
+    return resumedCheckpoint(alloc, pending, stop, &.{});
+}
+
+/// The checkpoint of an unsent turn, as the agent loop saves it. It borrows
+/// `user`, `execution`, and `model`; a caller that keeps it copies it.
+pub fn unsentTurnCheckpoint(
+    user: types.UserTurn,
+    execution: types.ExecutionMemory,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+) RecoveryCheckpoint {
+    return .{
+        .turn_id = debug_trace.nextTurnId(),
+        .user = user,
+        .assistant_source = @constCast(""),
+        .execution = execution,
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .tool_state = .none,
+        .authority = .{ .provider = provider, .model = @constCast(model) },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        // As the agent loop saves it: no cap of its own.
+        .max_provider_attempts = std.math.maxInt(u16) + 1,
+        .consumed_provider_attempts = 0,
+        .outstanding_reservation = false,
+    };
+}
+
+test "a stopped turn's checkpoint adds the resume notice only after an interruption" {
+    const alloc = std.testing.allocator;
+    var steps = [_]types.ToolExecutionStep{ .{}, .{} };
+    const entry: types.InterruptedHistoryTurn = .{
+        .user = .{ .text = @constCast("work") },
+        .execution = .{ .tool_steps = &steps },
+    };
+
+    var yielded = try stoppedTurnCheckpoint(alloc, entry, .gateway, "test/model", .yielded);
+    defer yielded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), yielded.execution.steering.len);
+    try std.testing.expect(!yielded.outstanding_reservation);
+
+    var interrupted = try stoppedTurnCheckpoint(alloc, entry, .gateway, "test/model", .interrupted);
+    defer interrupted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), interrupted.execution.steering.len);
+    try std.testing.expectEqualStrings(continuation.resume_notice, interrupted.execution.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 2), interrupted.execution.steering[0].after_tool_step_count);
+}
+
+test "a resumed checkpoint keeps its steering, then the notice and the inputs after the finished steps" {
+    const alloc = std.testing.allocator;
+    var steps = [_]types.ToolExecutionStep{ .{}, .{} };
+    var old = [_]types.PersistedSteering{.{ .text = @constCast("old note"), .after_tool_step_count = 1 }};
+    const pending: RecoveryCheckpoint = .{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("work") },
+        .assistant_source = @constCast(""),
+        .execution = .{ .tool_steps = &steps, .steering = &old },
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 2,
+        .outstanding_reservation = true,
+    };
+
+    var resumed = try resumedCheckpoint(alloc, pending, .interrupted, &.{"first input"});
+    defer resumed.deinit(alloc);
+    const steering = resumed.execution.steering;
+    try std.testing.expectEqual(@as(usize, 3), steering.len);
+    try std.testing.expectEqualStrings("old note", steering[0].text);
+    try std.testing.expectEqualStrings(continuation.resume_notice, steering[1].text);
+    try std.testing.expectEqual(@as(usize, 2), steering[1].after_tool_step_count);
+    try std.testing.expectEqualStrings("first input", steering[2].text);
+    try std.testing.expectEqual(@as(usize, 2), steering[2].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 0), resumed.consumed_provider_attempts);
+    try std.testing.expect(!resumed.outstanding_reservation);
+
+    var quiet = try resumedCheckpoint(alloc, pending, .yielded, &.{});
+    defer quiet.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), quiet.execution.steering.len);
+    try std.testing.expectEqualStrings("old note", quiet.execution.steering[0].text);
+}
+
+test "a turn resumed again keeps its one resume notice where the model first saw it" {
+    const alloc = std.testing.allocator;
+    var steps = [_]types.ToolExecutionStep{.{}};
+    const pending: RecoveryCheckpoint = .{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("work") },
+        .assistant_source = @constCast(""),
+        .execution = .{ .tool_steps = &steps },
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 0,
+    };
+
+    var first = try resumedCheckpoint(alloc, pending, .interrupted, &.{});
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), first.execution.steering.len);
+    try std.testing.expectEqual(@as(usize, 1), first.execution.steering[0].after_tool_step_count);
+
+    // The turn finishes another step, then is interrupted again.
+    var more_steps = [_]types.ToolExecutionStep{ .{}, .{} };
+    var later = first;
+    later.execution.tool_steps = &more_steps;
+    var third = try resumedCheckpoint(alloc, later, .interrupted, &.{"steer"});
+    defer third.deinit(alloc);
+    const steering = third.execution.steering;
+    try std.testing.expectEqual(@as(usize, 2), steering.len);
+    try std.testing.expectEqualStrings(continuation.resume_notice, steering[0].text);
+    try std.testing.expectEqual(@as(usize, 1), steering[0].after_tool_step_count);
+    try std.testing.expectEqualStrings("steer", steering[1].text);
+    try std.testing.expectEqual(@as(usize, 2), steering[1].after_tool_step_count);
+
+    var yielded = try resumedCheckpoint(alloc, third, .yielded, &.{});
+    defer yielded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), yielded.execution.steering.len);
+    try std.testing.expectEqualStrings(continuation.resume_notice, yielded.execution.steering[0].text);
+    try std.testing.expectEqualStrings("steer", yielded.execution.steering[1].text);
+}
 
 pub const DurableSessionState = struct {
     id: []u8,

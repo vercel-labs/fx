@@ -7341,7 +7341,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await resumedAsked.fired;
-      expect(gateway.requests[3].body).toContain("<session_resumed>");
+      expect(gateway.requests[3].body).not.toContain("<session_resumed>");
+      expect(gateway.requests[3].body).toContain(RESUME_NOTE);
       await heldAsked.fired;
       // The ready label shows only while fx is idle, and this turn runs until
       // Ctrl+G. The install replaces the installed copy with the small wrapper
@@ -11009,7 +11010,8 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
 // goes out again on the next `-c`, as `tests/tla/recovery/Resume.tla`
 // models it.
 
-const RESUME_NOTE = "<session_resumed>";
+// The text a resumed request carries for the model (`src/core/continuation/continuation.zig` `resume_notice`).
+const RESUME_NOTE = "Resuming from unexpected session interruption.";
 
 function resumeFixture(prefix: string) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
@@ -11463,8 +11465,9 @@ test.skipIf(!tmuxAvailable())(
       // The call that was running is answered as possibly run, so the model
       // decides whether running it again is safe.
       expect(resumed!.body).toContain("fx stopped while this tool was running");
-      // With a tool in flight the note keeps its caveat.
-      expect(resumed!.body).toContain("A tool that was running may have partly run.");
+      // The answer to the running call comes before the notice, which is last.
+      expect(requestMessages(resumed!.body).at(-1)).toBe(RESUME_NOTE);
+      expect(resumed!.body.indexOf("fx stopped while this tool was running")).toBeLessThan(resumed!.body.lastIndexOf(RESUME_NOTE));
       expect(readFileSync(second.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();
@@ -11473,6 +11476,64 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a crash during a tool resumes the same turn, and the next message sees one turn",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-same-turn-");
+    const prompt = "Run the slow step, then report.";
+    const next = "Now the next question.";
+    const unfinished = "fx stopped while this tool was running, so it may have partly run.";
+    const countOf = (text: string, needle: string) => text.split(needle).length - 1;
+    let toolStarted: () => void = () => {};
+    const running = new Promise<void>((resolve) => (toolStarted = resolve));
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(next)) return fakeGatewayFinalText("SAME_TURN_NEXT_8801");
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("SAME_TURN_RESUMED_8801");
+      if (body.includes(prompt)) {
+        toolStarted();
+        return fakeShellRun("same-turn-slow-1", "sleep 30");
+      }
+      return fakeGatewayFinalText("UNRELATED");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText(prompt);
+      await running;
+      await active.waitForText("sleep 30", TIMEOUT);
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      const before = gateway.requests.length;
+      const second = await launchFx(fixture, gateway, "-c", "second");
+      active = second.session;
+      await active.waitForText("SAME_TURN_RESUMED_8801", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      const resumed = gateway.requests.slice(before).find((request) => request.body.includes(RESUME_NOTE));
+      expect(resumed).toBeTruthy();
+      expect(resumed!.body).not.toContain("<session_resumed>");
+      expect(countOf(resumed!.body, unfinished)).toBe(1);
+      expect(countOf(resumed!.body, prompt)).toBe(1);
+
+      await active.sendText(next);
+      await active.waitForText("SAME_TURN_NEXT_8801", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      const third = gateway.requests.find((request) => request.body.includes(next));
+      expect(third).toBeTruthy();
+      expect(countOf(third!.body, prompt)).toBe(1);
+      expect(countOf(third!.body, unfinished)).toBe(1);
+      expect(requestMessages(third!.body).filter((text) => text === RESUME_NOTE)).toHaveLength(1);
+      expect(third!.body).not.toContain("<session_resumed>");
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
 );
 
 test.skipIf(!tmuxAvailable())(
@@ -11557,7 +11618,7 @@ test.skipIf(!tmuxAvailable())(
       expect(resumed!.body).not.toContain("The previous response ended before completion.");
       // No tool ran, so the note does not ask the model to check one.
       expect(resumed!.body).not.toContain("A tool that was running may have partly run.");
-      expect(messages.at(-1)).toContain("Nothing ran. Answer that message now.");
+      expect(messages.at(-1)).toBe(RESUME_NOTE);
 
       // The next message sees the resume as the resume request did.
       await active.sendText("Name the river.");
@@ -11566,7 +11627,7 @@ test.skipIf(!tmuxAvailable())(
       expect(followUp).toBeTruthy();
       const later = requestMessages(followUp!.body);
       expect(later.filter((text) => text.includes("Name the capital.")).length).toBe(1);
-      expect(later.filter((text) => text.includes("Nothing ran. Answer that message now.")).length).toBe(1);
+      expect(later.filter((text) => text === RESUME_NOTE).length).toBe(1);
       expect(followUp!.body).not.toContain("<turn_aborted>");
       expect(followUp!.body).not.toContain("A tool that was running may have partly run.");
       expect(readFileSync(second.stderrPath, "utf8")).toBe("");
@@ -11623,7 +11684,9 @@ test.skipIf(!tmuxAvailable())(
       const resumed = gateway.requests.slice(before).find((request) => request.body.includes(prompt));
       expect(resumed).toBeTruthy();
       const messages = requestMessages(resumed!.body);
-      // One stopped request, one note: the resume that was itself closed is gone.
+      // One stopped request, resumed once as far as the model can tell: the
+      // turn continues, and a resume closed before anything came back leaves
+      // its notice, which the next resume does not repeat.
       expect(messages.filter((text) => text.includes(prompt)).length).toBe(1);
       expect(messages.filter((text) => text.includes(RESUME_NOTE)).length).toBe(1);
       expect(resumed!.body).not.toContain("<turn_aborted>");

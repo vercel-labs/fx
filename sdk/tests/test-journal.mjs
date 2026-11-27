@@ -505,6 +505,8 @@ test("a call that a crash cut off is answered as possibly run, and its turn show
   assert.deepEqual({ ...ends[0], content: undefined }, { type: "tool_end", id: intent.data[0].id, name: "lookup", content: undefined, isError: true });
   assert.ok(ends[0].content.includes("may have partly run"));
   assert.ok(JSON.stringify(requests[0]).includes(JSON.stringify(ends[0].content).slice(1, -1)), "the turn shows what the model heard");
+  const continuePrompt = "Continue from the confirmed tool result above without repeating the tool.";
+  assert.equal(requests[0].filter((message) => message.role === "user" && textOf(message) === continuePrompt).length, 0, "the model is told no confirmed tool");
   assert.equal(events[0], ends[0], "before anything the resumed turn does");
 });
 
@@ -566,6 +568,36 @@ test("resume continues a crashed turn and tells the model", async () => {
   assert.equal(commits.at(-1).data.kind, "assistant");
   assert.equal(commits.at(-1).data.user.text, "remember plums");
   assertContiguous(crashed.events);
+});
+
+test("a turn resumed after each of several crashes tells the model once", async () => {
+  const notice = "Resuming from unexpected session interruption.";
+  const journal = eventJournal();
+  const agent = await createFxEngine(options(sourceBackend, journal));
+  await run(agent, "first");
+  await run(agent, "use the tool");
+  await agent.close();
+  // The process died during the request after the turn's tool step.
+  const step = journal.events.findIndex((event) => event.type === "tool_result");
+  let events = journal.events.slice(0, journal.events.findIndex((event, index) => index > step && event.type === "turn_progress") + 1);
+  const isNotice = (message) => message.role === "user" && textOf(message) === notice;
+  for (const resume of [1, 2, 3]) {
+    const store = eventJournal(events);
+    const resumed = await createFxEngine(options(targetBackend, store));
+    requests.length = 0;
+    const turn = resumed.resume();
+    for await (const _ of turn) {}
+    assert.equal((await turn.result).stopReason, "end_turn");
+    await resumed.close();
+    const prompt = requests[0];
+    assert.equal(prompt.filter(isNotice).length, 1, `resume ${resume} tells the model once`);
+    assert.ok(prompt.findIndex(isNotice) > prompt.findIndex((message) => message.role === "tool"), "after the step it followed");
+    // The process died again during that resume's first request: only the
+    // progress before it, which holds the notice, was stored.
+    assert.equal(store.events[events.length].type, "turn_progress");
+    events = store.events.slice(0, events.length + 1);
+    if (resume === 3) assertContiguous(store.events);
+  }
 });
 
 test("a crash after the final reply, before its turn ends, delivers the saved reply without asking the model again", async () => {

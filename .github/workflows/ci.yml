@@ -66,6 +66,9 @@ jobs:
       - name: Check recovery boundary
         run: ./scripts/check-recovery-boundary.sh
 
+      - name: Check continuation boundary
+        run: ./scripts/check-continuation-boundary.sh
+
       - name: Model-check request recovery
         run: |
           set -euo pipefail
@@ -1183,6 +1186,7 @@ jobs:
             benchmarks/startup.sh
             scripts/check-agents-boundary.sh
             scripts/check-compactor-boundary.sh
+            scripts/check-continuation-boundary.sh
             scripts/check-indexer-boundary.sh
             scripts/check-public-surface.sh
             scripts/check-recovery-boundary.sh

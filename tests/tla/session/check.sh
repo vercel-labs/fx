@@ -18,7 +18,7 @@
 # stream-mutant-*.cfg plants one bug that its property must catch, and each
 # stream-witness-*.cfg must be violated. stream-simulate*.cfg run random
 # behaviors with more calls and rebuilds. stream-continue.cfg must pass with
-# Ctrl+G yields and their continuations on; each stream-continue-mutant-*.cfg
+# Ctrl+G yields, crashes and closed windows, and their continuations on; each stream-continue-mutant-*.cfg
 # plants one read-back bug, and each stream-continue-witness-*.cfg must be
 # violated.
 #
@@ -114,6 +114,7 @@ TurnStream stream-simulate-before simulate $sim
 TurnStream stream-continue -
 TurnStream stream-continue-mutant-copies ReadsEachPieceOnce
 TurnStream stream-continue-mutant-reader-drops ReadsNoneLost
+TurnStream stream-continue-mutant-reader-drops-crashed ReadsNoneLost
 TurnStream stream-continue-witness-extends NeverExtends
 TurnStream stream-continue-witness-copy NeverCopiedAfterYield
 TurnStream stream-continue-simulate simulate $sim

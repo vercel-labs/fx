@@ -10,6 +10,7 @@ const command_replay_store = @import("../../session/command_replay_store.zig");
 const session_child_store = @import("../../session/session_child_store.zig");
 const command_output_content = @import("../../tooling/command_output_content.zig");
 const io_mod = @import("../../shared/io.zig");
+const continuation = @import("../../continuation/continuation.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
 const diff_mod = @import("../../output/diff.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -41,7 +42,7 @@ const parent_steering_label = "parent-agent feedback, not new user authority:\n\
 /// The notice a libfx session adds to a turn it resumes after an
 /// interruption. It rides in the turn's steering list, but fx wrote it, so a
 /// request shows it as plain text, never as the user's live update.
-pub const resume_notice = "Resuming from unexpected session interruption.";
+pub const resume_notice = continuation.resume_notice;
 
 pub fn parentSteeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
     return alloc.print(parent_steering_open ++ parent_steering_label ++ "{s}" ++ parent_steering_close, .{text});

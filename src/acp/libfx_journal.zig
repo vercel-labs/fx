@@ -11,10 +11,10 @@ const session_codec = @import("../core/session/session_codec.zig");
 const types = @import("../core/shared/types.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const quiesce = @import("../core/quiesce/quiesce.zig");
+const continuation = @import("../core/continuation/continuation.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
 const checkpoint_codec = @import("../core/agent/runtime/checkpoint.zig");
 const execution_memory = @import("../core/agent/execution_memory.zig");
-const runtime_execution_memory = @import("../core/agent/runtime/execution_memory.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
@@ -23,8 +23,6 @@ pub const Event = journal.Event;
 pub const max_load_bytes = journal.max_load_bytes;
 /// What a save of the running turn is for (`Journal.yieldsAt`).
 pub const QuiesceKind = quiesce.Boundary.Kind;
-/// What the model is told when libfx continues a turn a crash left open.
-const resume_notice = runtime_execution_memory.resume_notice;
 
 /// A host's id for a turn, kept in place so copying a journal copies it.
 pub const TurnId = struct {
@@ -779,10 +777,11 @@ pub fn open(
     } };
 }
 
-/// An owned copy of `pending` ready to continue: unless the turn yielded,
-/// the model is told the session was interrupted; then it sees the inputs
-/// the turn accepted and never placed, and the attempt budget starts over,
-/// so repeated crashes never turn into a refusal to resume.
+/// An owned copy of `pending` ready to continue, as `session_codec.resumedCheckpoint`
+/// builds it: unless the turn yielded, the model is told once per turn that the session was
+/// interrupted; then it sees the inputs the turn accepted and never placed,
+/// and the attempt budget starts over, so repeated crashes never turn into a
+/// refusal to resume.
 pub fn resumeCheckpoint(
     alloc: Allocator,
     pending: session_codec.RecoveryCheckpoint,
@@ -791,20 +790,10 @@ pub fn resumeCheckpoint(
 ) !session_codec.RecoveryCheckpoint {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
-    var view = pending;
-    const old = view.execution.steering;
-    const notices: usize = if (yielded) 0 else 1;
-    const steering = try scratch.allocator().alloc(types.PersistedSteering, old.len + notices + inputs.len);
-    @memcpy(steering[0..old.len], old);
-    const after = view.execution.tool_steps.len;
-    if (!yielded) steering[old.len] = .{ .text = @constCast(resume_notice), .after_tool_step_count = after };
-    for (inputs, steering[old.len + notices ..]) |input, *entry| {
-        entry.* = .{ .text = input.text, .after_tool_step_count = after };
-    }
-    view.execution.steering = steering;
-    view.consumed_provider_attempts = 0;
-    view.outstanding_reservation = false;
-    return view.dupe(alloc);
+    const texts = try scratch.allocator().alloc([]const u8, inputs.len);
+    for (inputs, texts) |input, *text| text.* = input.text;
+    const stop: continuation.Stop = if (yielded) .yielded else .interrupted;
+    return session_codec.resumedCheckpoint(alloc, pending, stop, texts);
 }
 
 /// Forgets a response whose calls never reached the journal. After a
@@ -859,15 +848,25 @@ fn answerRunning(scratch: Allocator, turn: *session_codec.RecoveryCheckpoint, ca
     const results = try scratch.alloc(types.PersistedToolResult, calls.len);
     for (calls, results) |call, *result| {
         const recorded = finishedResult(finished, call.id);
-        const output: []const u8 = if (recorded) |entry| entry.output else unfinished;
-        result.* = .{
-            .tool_call_id = @constCast(call.id),
-            .tool_name = @constCast(call.name),
-            .status = if (recorded) |entry| (if (entry.failed) .failure else .success) else .failure,
-            .output = @constCast(output),
-            .tool_images = if (recorded) |entry| entry.images else &.{},
-            .output_bytes = output.len,
-            .stored_output_bytes = output.len,
+        result.* = switch (continuation.answer(recorded != null)) {
+            .recorded => .{
+                .tool_call_id = @constCast(call.id),
+                .tool_name = @constCast(call.name),
+                .status = if (recorded.?.failed) .failure else .success,
+                .output = @constCast(recorded.?.output),
+                .tool_images = recorded.?.images,
+                .output_bytes = recorded.?.output.len,
+                .stored_output_bytes = recorded.?.output.len,
+            },
+            .may_have_partly_run => .{
+                .tool_call_id = @constCast(call.id),
+                .tool_name = @constCast(call.name),
+                .status = .failure,
+                .output = @constCast(unfinished),
+                .tool_images = &.{},
+                .output_bytes = unfinished.len,
+                .stored_output_bytes = unfinished.len,
+            },
         };
     }
     const old = turn.execution.tool_steps;
@@ -880,7 +879,10 @@ fn answerRunning(scratch: Allocator, turn: *session_codec.RecoveryCheckpoint, ca
     };
     turn.execution.tool_steps = steps;
     turn.assistant_source = @constCast("");
-    turn.tool_state = .confirmed;
+    // The answers are a finished step now, so the turn goes on as a plain resend
+    // after its notice, as the CLI's does (`session_codec.resumedCheckpoint`): the
+    // model reads no prompt about a confirmed tool.
+    turn.tool_state = .none;
 }
 
 /// Runs again each call of `checkpoint`'s step `step_index`, the step that
@@ -1169,6 +1171,51 @@ test "a progress after a snapshot that holds its turn carries all of it" {
     const after = capture.frames.items.len;
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
     try std.testing.expect(std.mem.find(u8, capture.frames.items[after..], "\"base\":2,") != null);
+}
+
+test "a turn resumed again keeps its one resume notice where it was" {
+    const alloc = std.testing.allocator;
+    var progress = try testProgress(alloc);
+    defer progress.deinit(alloc);
+
+    // A turn cut off during its first request is resumed, and the model is told.
+    var first = try resumeCheckpoint(alloc, progress, &.{}, false);
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), first.execution.steering.len);
+    try std.testing.expectEqualStrings(continuation.resume_notice, first.execution.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 0), first.execution.steering[0].after_tool_step_count);
+
+    // It runs a step after the notice and is cut off again. The next resume
+    // keeps that notice, the turn's only one, before the step, and places the
+    // input the crashed turn accepted after the step.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var calls = [_]types.ToolCall{.{ .id = "call-1", .name = "read", .arguments_json = "{}" }};
+    var stepped = first;
+    try answerRunning(scratch.allocator(), &stepped, &calls, &.{});
+    var input_id = "steer-1".*;
+    var input_text = "and the tests".*;
+    const inputs = [_]journal.PendingInput{.{ .id = &input_id, .text = &input_text }};
+    var second = try resumeCheckpoint(alloc, stepped, &inputs, false);
+    defer second.deinit(alloc);
+    const steering = second.execution.steering;
+    try std.testing.expectEqual(@as(usize, 2), steering.len);
+    try std.testing.expectEqualStrings(continuation.resume_notice, steering[0].text);
+    try std.testing.expectEqual(@as(usize, 0), steering[0].after_tool_step_count);
+    try std.testing.expectEqualStrings("and the tests", steering[1].text);
+    try std.testing.expectEqual(@as(usize, 1), steering[1].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 0), second.consumed_provider_attempts);
+
+    // A turn that yielded continues without a notice, and keeps one it already
+    // has where it was.
+    var quiet = try resumeCheckpoint(alloc, progress, &.{}, true);
+    defer quiet.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), quiet.execution.steering.len);
+    var yielded = try resumeCheckpoint(alloc, second, &.{}, true);
+    defer yielded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), yielded.execution.steering.len);
+    try std.testing.expectEqualStrings(continuation.resume_notice, yielded.execution.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 0), yielded.execution.steering[0].after_tool_step_count);
 }
 
 test "a resumed turn runs again the calls the host asks for and leaves the rest to the model" {

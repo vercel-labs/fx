@@ -78,7 +78,7 @@ const grep = process.argv.includes("--grep") ? process.argv[process.argv.indexOf
 let tampered = false;
 const timeoutMs = 20_000;
 const out = outDir("resume-driver");
-const resumeNote = "<session_resumed>";
+const resumeNote = "Resuming from unexpected session interruption.";
 
 // The model.
 

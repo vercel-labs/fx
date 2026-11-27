@@ -6909,11 +6909,11 @@ fn processQueuedPromptInner(
     );
     // A resumed request continues the turn fx stopped, so the stopped turn is
     // projected without its abort note, as a steering continuation is, and
-    // superseded resumes are dropped. A turn that continues a yielded one
+    // superseded resumes are dropped. A turn that continues a stopped one
     // projects its history as that turn did, so it is a resumed request when
-    // the yielded turn was one. A resume's prompt is the resume prompt, so the
+    // the stopped turn was one. A resume's prompt is the resume prompt, so the
     // prompt tells us which.
-    const resumed_request = job.recovery_resume != null and (!job.continues_yielded_turn or session_runtime.isResumePrompt(job.prompt));
+    const resumed_request = job.recovery_resume != null and (job.continuation == null or session_runtime.isResumePrompt(job.prompt));
     const resumed_history = if (resumed_request) session_runtime.withoutSupersededResumes(job.history) else job.history;
     if (job.delivery.isContinuation() or resumed_request) {
         try session_runtime.appendSteeringActiveContextHistoryChatMessages(
@@ -8313,7 +8313,7 @@ fn processQueuedPromptLoop(
     // A turn that continues a yielded one sends the request the yield
     // stopped, so the recovery module shows no retry for it.
     var recovery_resume: ?types.RecoveryResume = if (job.recovery_resume) |resumed|
-        .{ .record = resumed.record, .stale = resumed.stale, .continues = job.continues_yielded_turn }
+        .{ .record = resumed.record, .stale = resumed.stale, .continues = job.continuation == .yielded }
     else
         null;
     // Whether this prompt has sent a request yet, for a host that stops the

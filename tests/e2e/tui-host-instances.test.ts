@@ -2463,7 +2463,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         let resumedSent = false;
         const respond = (body: string): Response => {
           const latest = userTexts(body).at(-1) ?? "";
-          if (latest.includes("<session_resumed>")) {
+          if (latest.includes("Resuming from unexpected session interruption.")) {
             resumedSent = true;
             return text("inst_new", newReply);
           }

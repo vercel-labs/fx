@@ -1617,36 +1617,19 @@ const App = struct {
         SessionAppRuntime.startPendingResume(self, agent);
     }
 
-    /// Queues the turn that resumes a request a previous fx process left
-    /// unfinished. `note` is what the model reads; the transcript shows a
-    /// resume line instead of a user card.
-    pub fn queueResumedRequest(self: *App, agent: *agents.Agent, note: []const u8, resumed: types.RecoveryResume) !bool {
-        // The turn's project instructions, as a prompt the user sends gets
-        // them (`enqueuePromptWithSkillBindings`): this runs in a fresh
-        // process, whose context snapshot is still empty.
-        try AgentAppRuntime.refreshProjectContext(self, agent);
-        var queued = try self.snapshotPrompt(agent, note, &.{}, null, null, 0, false);
-        errdefer releaseUnadmittedPrompt(agent, queued);
-        queued.recovery_resume = resumed;
-        try agent.worker.enqueuePrompt(std.heap.c_allocator, queued);
-        WorkerAppRuntime.syncState(
-            self,
-            agent,
-            app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(agent),
-        );
-        return true;
-    }
-
-    /// Queues the turn that continues one a previous fx process stopped
-    /// between steps for an upgrade's restart. It goes on from `checkpoint`
-    /// as the same turn, so the model reads no note; the transcript shows the
+    /// Queues the turn that continues one a previous fx process stopped: one
+    /// that yielded between steps for an upgrade's restart, or one a crash or
+    /// a close stopped. It goes on from `checkpoint` as the same turn; the
+    /// model reads the resume notice in the checkpoint's steering, if the stop
+    /// left one, and no `<session_resumed>` note. The transcript shows the
     /// resume line instead of a user card. `resumed` lets the recovery module
-    /// ask first after two deaths or a day (`tests/tla/recovery/Resume.tla`).
-    pub fn queueYieldedTurn(
+    /// decide how the first request goes (`tests/tla/recovery/Resume.tla`).
+    pub fn queueContinuedTurn(
         self: *App,
         agent: *agents.Agent,
         checkpoint: *const session_codec.RecoveryCheckpoint,
         resumed: types.RecoveryResume,
+        kind: worker_runtime.ContinuedTurn,
     ) !void {
         // The same project instructions the turn sent before the restart, so
         // the prompt before each signed thinking block is unchanged. This runs
@@ -1655,7 +1638,7 @@ const App = struct {
         var queued = try self.snapshotPrompt(agent, checkpoint.user.text, &.{}, checkpoint, null, 0, false);
         errdefer releaseUnadmittedPrompt(agent, queued);
         queued.recovery_resume = resumed;
-        queued.continues_yielded_turn = true;
+        queued.continuation = kind;
         try agent.worker.enqueuePrompt(std.heap.c_allocator, queued);
         WorkerAppRuntime.syncState(
             self,
@@ -5621,6 +5604,7 @@ test {
     _ = @import("core/mcp/tool_lookup.zig");
     _ = @import("core/recovery/recovery.zig");
     _ = @import("core/quiesce/quiesce.zig");
+    _ = @import("core/continuation/continuation.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
