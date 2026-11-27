@@ -303,7 +303,6 @@ pub fn Handlers(comptime App: type) type {
                 .login = commandLogin,
                 .logout = commandLogout,
                 .provider = commandProvider,
-                .setup_alias = commandSetupAlias,
                 .show_status = commandShowStatus,
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
@@ -513,17 +512,6 @@ pub fn Handlers(comptime App: type) type {
             if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
             app.input_runtime.help_menu.open();
             app.shell.render_requests.request(.footer);
-        }
-
-        /// `/setup` is the deprecated alias of `/provider`.
-        fn commandSetupAlias(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try app.writeDomainNotice(.{
-                .topic = "",
-                .tone = .warning,
-                .body = "/setup " ++ command_specs.deprecated_until ++ "; use /login to sign in or add an API key, or /provider to choose a provider",
-            }, true);
-            try commandProvider(ctx);
         }
 
         fn commandLogin(ctx: *anyopaque) !void {
@@ -1535,12 +1523,12 @@ pub fn Handlers(comptime App: type) type {
             }, true);
         }
 
-        fn commandUnknown(ctx: *anyopaque, _: []const u8) !void {
+        fn commandUnknown(ctx: *anyopaque, cmd: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.writeDomainNotice(.{
                 .topic = "command",
                 .tone = .@"error",
-                .body = "Unknown command. Try /help.",
+                .body = command_router.removedSlashNotice(cmd) orelse "Unknown command. Try /help.",
             }, true);
         }
     };

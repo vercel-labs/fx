@@ -70,6 +70,12 @@ pub const List = struct {
         return list.spans.items.len;
     }
 
+    /// A number that changes when the list's tools do, so a reader that worked something out of them knows when to
+    /// do it again.
+    pub fn fingerprint(list: *const List) u64 {
+        return std.hash.Wyhash.hash(list.spans.items.len, list.bytes.items);
+    }
+
     pub fn get(list: *const List, index: usize) Tool {
         const s = list.spans.items[index];
         return .{
@@ -117,15 +123,94 @@ pub const Added = struct {
     added: u32 = 0,
     /// Tools without a plain, non-empty `name`, or whose `inputSchema` isn't an object.
     invalid: u32 = 0,
+    /// Tools with a field written twice, `name` included: no copy of it is trusted over the other.
+    repeated_field: u32 = 0,
+    /// Tools that are no JSON object, or that fx could not read for another reason.
+    unreadable: u32 = 0,
     /// Tools named like one listed earlier (the first wins).
     duplicate: u32 = 0,
     /// Over HTTP, tools with an invalid `x-mcp-header`; the first
     /// one is named, for the warning the spec asks for.
     bad_headers: u32 = 0,
+    /// Of `bad_headers`, the tools whose check gave up for size: a schema nested or branching past what it handles.
+    /// They are over a limit, not wrong.
+    header_limit: u32 = 0,
     first_bad: ?struct { name: []const u8, reason: http_headers.Invalid } = null,
+
+    /// What this page left out, by reason.
+    pub fn dropped(a: Added) Dropped {
+        var d: Dropped = .{};
+        d.add(.unnamed, a.invalid);
+        d.add(.repeated_field, a.repeated_field);
+        d.add(.over_limit, a.header_limit);
+        d.add(.unusable, a.unreadable);
+        d.add(.repeated_name, a.duplicate);
+        d.add(.bad_header, a.bad_headers -| a.header_limit);
+        return d;
+    }
 };
 
 pub const AddError = wire.DecodeError || std.mem.Allocator.Error;
+
+/// Why fx leaves one tool out of what a server listed. The set is closed and `words` gives each its fixed words, so
+/// nothing the server wrote reaches a screen; the host shows them beside a server's status.
+pub const Drop = enum {
+    /// No plain, non-empty `name`, or an `inputSchema` that is not an object (`Store.addPage`).
+    unnamed,
+    /// A field of the tool written twice, `name` included (`Store.addPage`).
+    repeated_field,
+    /// A name already listed by an earlier tool: the first one wins (`Store.addPage`).
+    repeated_name,
+    /// An `x-mcp-header` annotation that is not valid (`Store.addPage`).
+    bad_header,
+    /// A schema or another field past fx's size or nesting limits.
+    over_limit,
+    /// A definition fx cannot use for another reason: a field of the wrong type, a schema dialect it doesn't read.
+    unusable,
+
+    pub fn words(why: Drop) []const u8 {
+        return switch (why) {
+            .unnamed => "a name or schema is missing",
+            .repeated_field => "a field is written twice",
+            .repeated_name => "a name is used by two tools",
+            .bad_header => "an x-mcp-header is not valid",
+            .over_limit => "a limit on size or nesting is passed",
+            .unusable => "a definition can't be used",
+        };
+    }
+};
+
+/// How many tools of one list fx left out, by reason. A value with no words in it: it copies like a number.
+pub const Dropped = struct {
+    counts: [drop_reasons]u32 = @splat(0),
+
+    const drop_reasons = std.enums.values(Drop).len;
+
+    pub fn add(d: *Dropped, why: Drop, n: u32) void {
+        d.counts[@backingInt(why)] +|= n;
+    }
+
+    pub fn merge(d: *Dropped, other: Dropped) void {
+        for (&d.counts, other.counts) |*mine, theirs| mine.* +|= theirs;
+    }
+
+    pub fn total(d: Dropped) u32 {
+        var sum: u32 = 0;
+        for (d.counts) |n| sum +|= n;
+        return sum;
+    }
+
+    /// The reason every left-out tool has; null when none was left out or the reasons differ.
+    pub fn single(d: Dropped) ?Drop {
+        var found: ?Drop = null;
+        for (d.counts, 0..) |n, k| {
+            if (n == 0) continue;
+            if (found != null) return null;
+            found = @fromBackingInt(@intCast(k));
+        }
+        return found;
+    }
+};
 
 /// Why fx refused the server's answer to `tools/list`. The set is closed, and `words` gives each its fixed
 /// words, so nothing the server wrote reaches a screen: the host shows them beside a server's status.
@@ -143,6 +228,9 @@ pub const Refusal = enum {
     /// An HTTP status that no other flow reads (not a sign-in, nor a session's end) and a body with no
     /// JSON-RPC message. `text` puts the status number in the words.
     http_status,
+    /// The same, for a status that says the server can't answer now: `temporaryStatus`. The list is refused
+    /// like any other, and the words say it is temporary.
+    http_unavailable,
     /// A 2xx answer sent with a content type that is not JSON.
     not_json,
 
@@ -153,18 +241,36 @@ pub const Refusal = enum {
             .repeated_field => "a field is written twice",
             .tools_not_a_list => "\"tools\" is not a list",
             .unreadable => "the answer is not a readable tool list",
-            .http_status => "the server answered the list with an HTTP error",
+            .http_status, .http_unavailable => "the server answered the list with an HTTP error",
             .not_json => "the list is not valid JSON",
         };
     }
 
-    /// The words of a refusal, with the status number for `http_status` (a number fx read, never server text).
+    /// The words of a refusal, with the status number for the HTTP ones (a number fx read, never server text).
     /// They fit `text_max` bytes.
     pub fn text(refusal: Refusal, status: u16, buf: *[text_max]u8) []const u8 {
-        if (refusal != .http_status or status == 0) return refusal.words();
-        return std.mem.print(buf, "the server answered the list with HTTP {d}", .{status}) catch refusal.words();
+        if (status == 0) return refusal.words();
+        const temporary: []const u8 = switch (refusal) {
+            .http_status => "",
+            .http_unavailable => ", which is temporary",
+            else => return refusal.words(),
+        };
+        return std.mem.print(buf, "the server answered the list with HTTP {d}{s}", .{ status, temporary }) catch refusal.words();
+    }
+
+    /// The refusal for an HTTP answer to `tools/list` that no other flow reads, by its status.
+    pub fn ofStatus(status: u16) Refusal {
+        return if (temporaryStatus(status)) .http_unavailable else .http_status;
     }
 };
+
+/// The HTTP statuses that say the server can't answer now but may later: 429 (too many requests) and 503
+/// (unavailable). `fx mcp show` names each in the words it has for them (`verbs.zig`).
+pub const temporary_statuses = [_]u16{ 429, 503 };
+
+fn temporaryStatus(status: u16) bool {
+    return std.mem.findScalar(u16, &temporary_statuses, status) != null;
+}
 
 /// The most bytes `Refusal.text` writes.
 pub const text_max = 64;
@@ -206,8 +312,11 @@ pub const Store = struct {
         try elements.init(page.tools);
         while (try elements.next()) |raw| {
             var found: [2]?[]const u8 = undefined;
-            wire.objectFields(raw, &.{ "name", "inputSchema" }, &found) catch {
-                added.invalid += 1;
+            wire.objectFields(raw, &.{ "name", "inputSchema" }, &found) catch |err| {
+                switch (err) {
+                    error.DuplicateField => added.repeated_field += 1,
+                    else => added.unreadable += 1,
+                }
                 continue;
             };
             const name = wire.plainString(found[0] orelse "") orelse "";
@@ -224,6 +333,7 @@ pub const Store = struct {
                 var annotations: [http_headers.max_annotations]http_headers.Annotation = undefined;
                 if (http_headers.annotations(schema, &annotations)) |_| {} else |reason| {
                     added.bad_headers += 1;
+                    if (reason == error.TooMany or reason == error.Malformed) added.header_limit += 1;
                     if (added.first_bad == null) added.first_bad = .{ .name = name, .reason = reason };
                     continue;
                 }
@@ -374,11 +484,23 @@ test "an HTTP status goes into the words as a number, and nothing else does" {
     // No status, no number; every other reason keeps its fixed words whatever the status.
     try testing.expectEqualStrings(Refusal.http_status.words(), Refusal.http_status.text(0, &buf));
     for (std.enums.values(Refusal)) |refusal| {
-        if (refusal == .http_status) continue;
+        if (refusal == .http_status or refusal == .http_unavailable) continue;
         try testing.expectEqualStrings(refusal.words(), refusal.text(500, &buf));
     }
     // The longest words fit the buffer, and are plain ASCII.
     const longest = Refusal.http_status.text(65535, &buf);
+    try testing.expect(longest.len <= text_max);
+    for (longest) |byte| try testing.expect(byte >= ' ' and byte < 0x7f);
+}
+
+test "429 and 503 are refused as temporary, with their number and no other words from the server" {
+    var buf: [text_max]u8 = undefined;
+    try testing.expectEqual(Refusal.http_unavailable, Refusal.ofStatus(429));
+    try testing.expectEqual(Refusal.http_unavailable, Refusal.ofStatus(503));
+    for ([_]u16{ 400, 401, 403, 404, 500, 502, 504, 301 }) |status| try testing.expectEqual(Refusal.http_status, Refusal.ofStatus(status));
+    try testing.expectEqualStrings("the server answered the list with HTTP 503, which is temporary", Refusal.http_unavailable.text(503, &buf));
+    try testing.expectEqualStrings(Refusal.http_unavailable.words(), Refusal.http_unavailable.text(0, &buf));
+    const longest = Refusal.http_unavailable.text(65535, &buf);
     try testing.expect(longest.len <= text_max);
     for (longest) |byte| try testing.expect(byte >= ' ' and byte < 0x7f);
 }
@@ -427,7 +549,7 @@ test "gathers valid tools, skipping malformed ones and later duplicates" {
         \\{"name":"b"},{"name":"c","inputSchema":null},7,{"name":"\u0064","inputSchema":{}},
         \\{"name":"a","inputSchema":{}},{"name":"d","name":"e","inputSchema":{}}],"nextCursor":"p2"}
     ));
-    try testing.expectEqual(Added{ .added = 1, .invalid = 6, .duplicate = 1 }, first);
+    try testing.expectEqual(Added{ .added = 1, .invalid = 4, .unreadable = 1, .repeated_field = 1, .duplicate = 1 }, first);
     try testing.expectEqualStrings("\"p2\"", store.nextCursor().?);
     const second = try store.addPage(testing.allocator, try parsePage("{\"tools\":[{\"description\":\"x\",\"name\":\"b\",\"inputSchema\":{}},{\"name\":\"a\",\"inputSchema\":{}}]}"));
     try testing.expectEqual(Added{ .added = 1, .duplicate = 1 }, second);
@@ -551,4 +673,51 @@ test "reads tool call answers" {
     const failed = classifyCall((try wire.decode("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[],\"structuredContent\":[1,2],\"isError\":true}}")).response.body);
     try testing.expect(failed.result.is_error);
     try testing.expectEqualStrings("[1,2]", failed.result.structured.?);
+}
+
+test "what a list leaves out is counted by reason, and every reason has words fx wrote" {
+    var d: Dropped = .{};
+    try testing.expectEqual(@as(u32, 0), d.total());
+    try testing.expectEqual(@as(?Drop, null), d.single());
+    d.add(.repeated_name, 2);
+    try testing.expectEqual(@as(?Drop, .repeated_name), d.single());
+    var more: Dropped = .{};
+    more.add(.unnamed, 1);
+    d.merge(more);
+    try testing.expectEqual(@as(u32, 3), d.total());
+    try testing.expectEqual(@as(?Drop, null), d.single());
+
+    // A page's skips map to their reasons, one each.
+    const page = (Added{ .invalid = 1, .repeated_field = 8, .duplicate = 2, .bad_headers = 5, .header_limit = 1, .unreadable = 32 }).dropped();
+    try testing.expectEqual(@as(u32, 1), page.counts[@backingInt(Drop.unnamed)]);
+    try testing.expectEqual(@as(u32, 8), page.counts[@backingInt(Drop.repeated_field)]);
+    try testing.expectEqual(@as(u32, 2), page.counts[@backingInt(Drop.repeated_name)]);
+    // Of five tools the header check refused, one gave up for size: it is over a limit, and no tool counts twice.
+    try testing.expectEqual(@as(u32, 4), page.counts[@backingInt(Drop.bad_header)]);
+    try testing.expectEqual(@as(u32, 1), page.counts[@backingInt(Drop.over_limit)]);
+    try testing.expectEqual(@as(u32, 32), page.counts[@backingInt(Drop.unusable)]);
+    try testing.expectEqual(@as(u32, 48), page.total());
+
+    try testing.expectEqualStrings("a field is written twice", Drop.repeated_field.words());
+    try testing.expectEqualStrings("a name is used by two tools", Drop.repeated_name.words());
+    for (std.enums.values(Drop)) |why| try testing.expect(why.words().len > 0);
+}
+
+test "a tool nested past what the header check handles is over a limit, not wrong" {
+    const gpa = testing.allocator;
+    // Over HTTP and in the 2026 era the header check reads each schema, and gives up on one nested past its frames.
+    var schema: std.ArrayList(u8) = .empty;
+    defer schema.deinit(gpa);
+    try schema.appendSlice(gpa, "{\"tools\":[{\"name\":\"headers\",\"inputSchema\":");
+    for (0..70) |_| try schema.appendSlice(gpa, "{\"properties\":{\"a\":");
+    try schema.appendSlice(gpa, "{\"type\":\"string\"}");
+    for (0..70) |_| try schema.appendSlice(gpa, "}}");
+    try schema.appendSlice(gpa, "}]}");
+    var store: Store = .{ .check_headers = true };
+    defer store.deinit(gpa);
+    const added = try store.addPage(gpa, try parsePage(schema.items));
+    try testing.expectEqual(@as(u32, 1), added.bad_headers);
+    try testing.expectEqual(@as(u32, 1), added.header_limit);
+    try testing.expectEqual(@as(u32, 1), added.dropped().counts[@backingInt(Drop.over_limit)]);
+    try testing.expectEqual(@as(u32, 0), added.dropped().counts[@backingInt(Drop.bad_header)]);
 }

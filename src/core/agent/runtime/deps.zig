@@ -38,7 +38,12 @@ pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 /// Borrowed only for the call; a sink copies or serializes what it keeps.
 pub const TurnProgress = struct {
     user: types.UserTurn,
+    /// The turn as fx's history keeps it: after a compaction inside it,
+    /// only the part after the cut. A reload sends the model this again.
     execution: types.ExecutionMemory,
+    /// The whole turn, with the steps that compaction summarized, once one
+    /// cut some; null otherwise. Only the session log saves it (D87).
+    saved_execution: ?types.ExecutionMemory = null,
     /// Tool calls the model issued that have no result yet, in their saved
     /// form, so a crash while they run leaves them in the session (D28).
     running_calls: []const types.ToolCall = &.{},
@@ -201,6 +206,27 @@ pub const AgentRuntimeDeps = struct {
     /// The steps of `start_workspace_capture`.
     pub const WorkspaceCaptureStep = enum { begin, capture, settle };
 
+    /// How a turn held for an upgrade's restart ends.
+    pub const RestartHoldEnd = worker_runtime.WorkerRuntime.RestartHoldEnd;
+
+    /// What `wait_for_handoff_mail` ended on.
+    pub const HandoffMailWait = enum {
+        /// Nothing waits in the hand-off for this agent, so the call did not wait.
+        none,
+        /// The mail reached the worker's queue and joins the turn.
+        joined,
+        /// The mail does not join the turn, either because older work waits
+        /// ahead of it or because the hand-off no longer holds it, so it goes to
+        /// a later turn.
+        delivered,
+        /// The turn takes no more mail, so the call did not wait.
+        closed,
+        /// A stop, a shutdown, or a cancel ended the wait.
+        interrupted,
+        /// The time ran out with the mail still in the hand-off.
+        timed_out,
+    };
+
     ctx: *anyopaque,
     observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
@@ -230,6 +256,13 @@ pub const AgentRuntimeDeps = struct {
         turn_id: u64,
         kind: worker_runtime.SteeringBoundaryKind,
     ) anyerror!worker_runtime.SteeringBoundaryResult = null,
+    /// Set only by a host whose subagents' reports and messages reach this
+    /// agent's worker through a hand-off that the worker cannot see, as the
+    /// TUI's main loop is. Called as an empty reply's step ends, with no lock
+    /// held. When the hand-off holds mail for this agent, it waits at most
+    /// `bound_ms` for that mail to reach the worker's queue, so the check for
+    /// mail that follows finds it.
+    wait_for_handoff_mail: ?*const fn (ctx: *anyopaque, turn_id: u64, bound_ms: i64) HandoffMailWait = null,
     release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
     /// Whether turn `turn_id`, which ends interrupted, ends because the user
     /// cancelled it rather than because steering ended it. Asked before the
@@ -279,6 +312,15 @@ pub const AgentRuntimeDeps = struct {
     /// pieces on disk yet. Null on hosts that never resume a request, which
     /// keep no record.
     save_recovery_record: ?*const fn (ctx: *anyopaque, record: types.RecoveryRecordWrite) anyerror!bool = null,
+    /// Marks the open turn as one that stopped between steps for its host,
+    /// after its record was saved clean, so the next launch continues it as
+    /// the same turn (`tests/tla/recovery/Resume.tla` Hold). Null on
+    /// hosts that never stop a turn this way.
+    mark_turn_yielded: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    /// Holds a turn that stopped for an upgrade's restart until the restart
+    /// goes ahead or is cancelled (`WorkerRuntime.holdForRestart`). Null: the
+    /// turn returns `error.TurnYielded` at once.
+    hold_for_restart: ?*const fn (ctx: *anyopaque) RestartHoldEnd = null,
     /// Called once with each main-model completion's provider usage, as soon
     /// as it arrives, so a saved session keeps the usage of every reply even
     /// when the turn never ends. A failure is traced and never fails the turn.
@@ -345,6 +387,9 @@ pub const AgentRuntimeDeps = struct {
     /// A turn that can never recover hands the user's prompt back to the
     /// composer so nothing typed is lost. Null: host keeps the prompt as-is.
     restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
+    /// Records `input_withdrawn` when a failed turn hands a queued prompt back
+    /// to the composer so resume does not restore it a second time.
+    withdraw_accepted_input: ?*const fn (ctx: *anyopaque, input_id: u64) anyerror!void = null,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
     /// `rejected_token` is the access token the provider just answered 401
@@ -353,6 +398,10 @@ pub const AgentRuntimeDeps = struct {
     /// Asks the user what to do when the account is out of credits, and
     /// blocks until they answer. Only the TUI sets it.
     ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,
+    /// A request that waited for a sign-in found the login another fx
+    /// process stored, and sends again with no answer from the host. The TUI
+    /// marks the turn as working for Herdr. Null: nothing marks it.
+    stored_sign_in_resumed: ?*const fn (ctx: *anyopaque) void = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
     /// The failure that keeps the model catalog down, so capability drops are

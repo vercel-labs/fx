@@ -61,7 +61,7 @@ test("an older build beside this one: its login isn't taken, its writes never re
     // This build starts: the older login isn't taken, and nothing is written.
     const first = await run("get", ["mcp", "list", "--json"]);
     expect(first.code).toBe(0);
-    expect(JSON.parse(first.stdout).servers[0].status).not.toBe("signed_in");
+    expect(JSON.parse(first.stdout).servers[0].status).not.toBe("saved_login");
     expect(look()).toEqual({ v2kind: "v1", v2: true, v3: false });
     expect(bytes(olderStorePath(f))).toBe(olderText);
 
@@ -90,7 +90,7 @@ test("an older build beside this one: its login isn't taken, its writes never re
     // A new host still finds this build's login.
     const again = await run("get", ["mcp", "list", "--json"]);
     expect(again.code).toBe(0);
-    expect(JSON.parse(again.stdout).servers[0].status).toBe("signed_in");
+    expect(JSON.parse(again.stdout).servers[0].status).toBe("saved_login");
     expect(look()).toEqual({ v2kind: "v1", v2: false, v3: true });
 
     // Signing out empties this build's store, and leaves the older one alone.

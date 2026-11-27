@@ -64,5 +64,29 @@
     "old": "       ELSE IF st[f] = \"deep\"",
     "new": "       ELSE IF FALSE",
     "invariant": "NoWriteOfDeep"
+  },
+  {
+    "description": "The inspection fails the whole profile on one bad entry, and hides the project's servers with it, as fx status and fx doctor did",
+    "old": "InspectShown(f) == IF InspectFailed THEN {} ELSE LoadedNames(f)",
+    "new": "InspectShown(f) == IF InspectFailed \\/ SkippedNames(\"profile\") # {} THEN {} ELSE LoadedNames(f)",
+    "invariant": "InspectKeepsGood"
+  },
+  {
+    "description": "The inspection leaves out a skipped entry of the profile without a note",
+    "old": "InspectNoted(f) == IF InspectFailed THEN {} ELSE SkippedNames(f)",
+    "new": "InspectNoted(f) == IF InspectFailed \\/ f = \"profile\" THEN {} ELSE SkippedNames(f)",
+    "invariant": "InspectNotesSkipped"
+  },
+  {
+    "description": "An ACP session that asks for the profile's servers loses all of them when one entry is bad, as it did before it read the profile as the terminal app does",
+    "old": "AcpRuns(f) == HostLoads(f)",
+    "new": "AcpRuns(f) == IF SkippedNames(\"profile\") # {} THEN {} ELSE HostLoads(f)",
+    "invariant": "AcpKeepsGood"
+  },
+  {
+    "description": "An ACP session runs an entry the terminal app skips",
+    "old": "AcpRuns(f) == HostLoads(f)",
+    "new": "AcpRuns(f) == HostLoads(f) \\cup SkippedNames(f)",
+    "invariant": "AcpRunsWhatTheTerminalRuns"
   }
 ]

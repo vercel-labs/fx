@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host_target = @import("../hosts/target.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
@@ -823,9 +824,34 @@ pub const JsHostSessionStore = struct {
     }
 };
 
+/// How much of the in-flight turn a saved checkpoint holds: its finished tool
+/// steps, steering messages, and context notes.
+pub const SavedTurnKey = struct {
+    tool_steps: usize,
+    steering: usize,
+    context_notes: usize,
+
+    pub fn of(execution: types.ExecutionMemory) SavedTurnKey {
+        return .{
+            .tool_steps = execution.tool_steps.len,
+            .steering = execution.steering.len,
+            .context_notes = execution.context_notes.len,
+        };
+    }
+
+    pub fn eql(self: SavedTurnKey, other: SavedTurnKey) bool {
+        return self.tool_steps == other.tool_steps and
+            self.steering == other.steering and
+            self.context_notes == other.context_notes;
+    }
+};
+
 const JsHostSessionOwner = struct {
     state: session_codec.DurableSessionState,
     revision: ?[]u8,
+    /// The in-flight turn as the stored checkpoint holds it. Null when no
+    /// checkpoint is stored; a session change starts it null.
+    saved_turn: ?SavedTurnKey = null,
 
     pub fn deinit(self: *JsHostSessionOwner, alloc: Allocator) void {
         self.state.deinit(alloc);
@@ -1028,6 +1054,264 @@ pub const TranscriptArchiveRead = struct {
     }
 };
 
+/// Scans a resumed session's log for undelivered `input_accepted` records and
+/// verifies their snapshot files off the main thread; the main loop owns
+/// applying the result and withdrawing the records. Uses `std.heap.c_allocator`
+/// so either thread can free.
+pub const PendingInputRestore = struct {
+    pub const Queued = struct {
+        session_id: []u8,
+        reader: session_adapter.PendingInputsReader,
+
+        pub fn deinit(self: *Queued) void {
+            alloc.free(self.session_id);
+            self.reader.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub const Task = struct {
+        future: ?std.Io.Future(void) = null,
+        done: std.atomic.Value(bool) = .init(false),
+        cancel_requested: std.atomic.Value(bool) = .init(false),
+        session_id: []u8,
+        reader: session_adapter.PendingInputsReader,
+        pending: ?session_adapter.Session.PendingAcceptedInputs = null,
+        image_verified: [][]bool = &.{},
+        failure: ?anyerror = null,
+        next: ?*Task = null,
+
+        fn run(self: *Task) void {
+            defer self.done.store(true, .release);
+            var pending = self.reader.read(alloc, &self.cancel_requested) catch |err| {
+                self.failure = err;
+                return;
+            };
+            errdefer pending.deinit(alloc);
+            const verified = verifyAcceptedImages(pending.images, &self.cancel_requested) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.image_verified = verified;
+            self.pending = pending;
+        }
+
+        pub fn deinit(self: *Task) void {
+            freeVerifiedImages(self.image_verified);
+            if (self.pending) |*pending| pending.deinit(alloc);
+            self.reader.deinit();
+            alloc.free(self.session_id);
+            alloc.destroy(self);
+        }
+    };
+
+    pub const State = union(enum) {
+        idle,
+        queued: Queued,
+        running: *Task,
+    };
+
+    state: State = .idle,
+    retired_head: ?*Task = null,
+
+    const alloc = std.heap.c_allocator;
+
+    pub fn isActive(self: *const PendingInputRestore) bool {
+        if (comptime !runtime_profile.host.durable_sessions) return false;
+        return self.state != .idle;
+    }
+
+    pub fn needsFastPoll(self: *const PendingInputRestore) bool {
+        if (comptime !runtime_profile.host.durable_sessions) return false;
+        return switch (self.state) {
+            .idle => false,
+            .queued => true,
+            .running => |task| !task.done.load(.acquire),
+        };
+    }
+
+    pub fn readySessionId(self: *const PendingInputRestore) ?[]const u8 {
+        if (comptime !runtime_profile.host.durable_sessions) return null;
+        const task = switch (self.state) {
+            .running => |t| t,
+            .idle, .queued => return null,
+        };
+        if (!task.done.load(.acquire)) return null;
+        return task.session_id;
+    }
+
+    /// Takes ownership of `reader`, freeing it even on allocation error.
+    pub fn queue(
+        self: *PendingInputRestore,
+        session_id: []const u8,
+        reader: session_adapter.PendingInputsReader,
+    ) !void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
+        var owned_reader = reader;
+        self.abandonActive("session_changed");
+        const id_copy = alloc.dupe(u8, session_id) catch |err| {
+            owned_reader.deinit();
+            return err;
+        };
+        self.state = .{ .queued = .{ .session_id = id_copy, .reader = owned_reader } };
+    }
+
+    pub fn startQueued(self: *PendingInputRestore) !void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
+        var queued = switch (self.state) {
+            .queued => |q| q,
+            .idle, .running => return,
+        };
+        self.state = .idle;
+        const task = alloc.create(Task) catch |err| {
+            queued.deinit();
+            return err;
+        };
+        task.* = .{ .session_id = queued.session_id, .reader = queued.reader };
+        if (comptime builtin.single_threaded or host_target.is_wasm) {
+            task.run();
+        } else {
+            task.future = io_mod.getIo().concurrent(Task.run, .{task}) catch |err| {
+                task.deinit();
+                return err;
+            };
+        }
+        self.state = .{ .running = task };
+    }
+
+    pub fn onSessionClosed(self: *PendingInputRestore) void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
+        switch (self.state) {
+            .idle => {},
+            .queued => self.abandonActive("session_changed"),
+            .running => |task| task.cancel_requested.store(true, .release),
+        }
+    }
+
+    pub fn abandonActive(self: *PendingInputRestore, reason: []const u8) void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
+        switch (self.state) {
+            .idle => return,
+            .queued => |*queued| {
+                debug_trace.logf("session", "event=pending_input_restore_dropped reason={s} session={s}", .{ reason, queued.session_id });
+                queued.deinit();
+                self.state = .idle;
+            },
+            .running => |task| {
+                task.cancel_requested.store(true, .release);
+                task.next = self.retired_head;
+                self.retired_head = task;
+                self.state = .idle;
+                debug_trace.logf("session", "event=pending_input_restore_dropped reason={s} session={s}", .{ reason, task.session_id });
+            },
+        }
+    }
+
+    pub fn reapRetired(self: *PendingInputRestore) void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
+        var prev: ?*Task = null;
+        var curr = self.retired_head;
+        while (curr) |task| {
+            const next = task.next;
+            if (task.done.load(.acquire)) {
+                if (prev) |p| p.next = next else self.retired_head = next;
+                if (task.future) |*future| future.await(io_mod.getIo());
+                task.deinit();
+            } else {
+                prev = task;
+            }
+            curr = next;
+        }
+    }
+
+    /// Caller owns the returned `Task` and must call `task.deinit()`.
+    pub fn takeCompleted(self: *PendingInputRestore) ?*Task {
+        if (comptime !runtime_profile.host.durable_sessions) return null;
+        self.reapRetired();
+        const task = switch (self.state) {
+            .running => |t| t,
+            .idle, .queued => return null,
+        };
+        if (!task.done.load(.acquire)) return null;
+        if (task.future) |*future| future.await(io_mod.getIo());
+        task.future = null;
+        self.state = .idle;
+        return task;
+    }
+
+    pub fn deinit(self: *PendingInputRestore) void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
+        switch (self.state) {
+            .idle => {},
+            .queued => |*queued| {
+                debug_trace.logf("session", "event=pending_input_restore_dropped reason=deinit session={s}", .{queued.session_id});
+                queued.deinit();
+            },
+            .running => |task| {
+                if (!task.done.load(.acquire)) {
+                    debug_trace.logf("session", "event=pending_input_restore_dropped reason=deinit session={s}", .{task.session_id});
+                }
+                task.cancel_requested.store(true, .release);
+                if (task.future) |*future| future.await(io_mod.getIo());
+                task.deinit();
+            },
+        }
+        self.state = .idle;
+        while (self.retired_head) |task| {
+            self.retired_head = task.next;
+            task.cancel_requested.store(true, .release);
+            if (task.future) |*future| future.await(io_mod.getIo());
+            task.deinit();
+        }
+    }
+
+    fn verifyAcceptedImages(
+        images: []const []const session_adapter.Session.PendingAcceptedImage,
+        cancel_requested: *const std.atomic.Value(bool),
+    ) ![][]bool {
+        if (images.len == 0) return &.{};
+        const out = try alloc.alloc([]bool, images.len);
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |row| {
+                if (row.len > 0) alloc.free(row);
+            }
+            alloc.free(out);
+        }
+        for (images) |prompt_images| {
+            if (prompt_images.len == 0) {
+                out[built] = &.{};
+                built += 1;
+                continue;
+            }
+            const row = try alloc.alloc(bool, prompt_images.len);
+            out[built] = row;
+            built += 1;
+            for (prompt_images, row) |img, *ok| {
+                if (cancel_requested.load(.acquire)) return error.PendingInputRestoreCancelled;
+                const valid = image_attachments.verifySnapshotFile(
+                    img.snapshot_path,
+                    img.snapshot_sha256,
+                    img.media_type,
+                );
+                if (!valid) {
+                    debug_trace.logf("session", "event=accepted_image_restore_skipped id={d} reason=missing_or_mismatch", .{img.id});
+                }
+                ok.* = valid;
+            }
+        }
+        return out;
+    }
+
+    fn freeVerifiedImages(verified: [][]bool) void {
+        if (verified.len == 0) return;
+        for (verified) |row| {
+            if (row.len > 0) alloc.free(row);
+        }
+        alloc.free(verified);
+    }
+};
+
 pub const Persistence = struct {
     // Serializes event-log mutations with worker usage callbacks. Usage takes
     // its checkpoint mutex first, so callers must not checkpoint while held.
@@ -1063,6 +1347,9 @@ pub const Persistence = struct {
     /// How many subagent tasks the last switch stopped, for its notice in
     /// the session it opens (D97).
     switch_stopped_tasks: usize = 0,
+    /// How many accepted user prompts stayed queued in the previous session
+    /// across `/new` or session switch, for its notice in the opened session.
+    switch_kept_queued_prompts: usize = 0,
     title_generation: TitleGenerationLoad = .{},
     degraded_warning_emitted: bool = false,
     pending_cancelled_command: ?PendingCancelledCommand = null,
@@ -1071,6 +1358,8 @@ pub const Persistence = struct {
     transcript_archive_boundaries: TranscriptArchiveBoundaries = .{},
     /// The background read of the cycle Ctrl+O asked for.
     transcript_archive_read: TranscriptArchiveRead = .{},
+    /// The deferred, off-main-thread restore of undelivered accepted prompts.
+    pending_input_restore: PendingInputRestore = .{},
     image_snapshot_temp_dir: ?[]u8 = null,
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
@@ -1078,6 +1367,9 @@ pub const Persistence = struct {
     /// The request the resumed session's newest turn left unfinished, which
     /// `startPendingResume` sends again once the worker runs.
     pending_request_resume: ?types.RecoveryResume = null,
+    /// The noted request's turn stopped between steps for an upgrade's
+    /// restart: `startPendingResume` continues it as the same turn.
+    pending_resume_yielded: bool = false,
     /// Plain `fx` checks, once its first frame is on screen, whether the
     /// session `fx -c` opens left a turn unfinished.
     interrupted_turn_hint_pending: bool = false,
@@ -1095,7 +1387,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 37) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 40) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1122,16 +1414,19 @@ pub const Persistence = struct {
         storage.session_picker_cache = .{};
         storage.fork_menu = .{};
         storage.switch_stopped_tasks = 0;
+        storage.switch_kept_queued_prompts = 0;
         storage.title_generation = .{};
         storage.degraded_warning_emitted = false;
         storage.pending_cancelled_command = null;
         storage.transcript_archive_boundaries = .{};
         storage.transcript_archive_read = .{};
+        storage.pending_input_restore = .{};
         storage.image_snapshot_temp_dir = null;
         storage.resume_handoff_intent = .none;
         storage.pending_live_session_policy = null;
         storage.pending_live_session_wait = null;
         storage.pending_request_resume = null;
+        storage.pending_resume_yielded = false;
         storage.interrupted_turn_hint_pending = false;
         storage.shutdown_failure = null;
         storage.v2_store = null;
@@ -1206,8 +1501,9 @@ pub const Persistence = struct {
         if (catalog == .free) self.session_picker_cache.deinit();
         self.fork_menu.close(alloc);
         self.title_generation.deinit();
-        // Before the store, which the read's reader reads through.
+        // Before the store, which the readers read through.
         self.transcript_archive_read.cancel();
+        self.pending_input_restore.deinit();
         self.transcript_archive_boundaries.deinit(alloc);
         // After the picker thread, which lists through it, has joined.
         if (self.v2_store) |store| {

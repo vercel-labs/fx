@@ -59,6 +59,7 @@ const substitutions: Record<string, string[]> = {
   Connect: ["Std"],
   ConfigEdit: ["Names", "Classes", "Checked", "KeyScan", "GuardRemove", "Atomic", "Deep"],
   McpRules: ["Tools", "OwnRules"],
+  SubagentAccess: ["Servers", "MaxRuns", "MaxViews", "Bridge", "DeniedFirst"],
   WireDepth: ["Limit", "Capacity", "EngineLimit", "MaxDepth"],
 };
 

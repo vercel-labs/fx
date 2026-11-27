@@ -14,7 +14,14 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { FX_BIN, REPO_ROOT } from "../../evals/eval-helpers";
-import { fakeGatewayTitleDefault, isVolatileTokenStatusRow, TITLE_GENERATION_MARKER } from "../tmux-helpers";
+import {
+  DEFAULT_UNSET_ENV_KEYS,
+  fakeGatewayTitleDefault,
+  fxChildEnv,
+  isVolatileTokenStatusRow,
+  TITLE_GENERATION_MARKER,
+  TMUX_NO_CONFIG,
+} from "../tmux-helpers";
 import {
   ACTIVE_TOOL_MARKER,
   analyzeRun,
@@ -2088,6 +2095,28 @@ async function writeReplaySummary(manifest: RenderLabManifest): Promise<void> {
   }
 }
 
+/// The command that starts `shell` in a render-lab pane. A pane inherits the
+/// tmux server's environment, so `env` first drops every name TmuxSession
+/// drops, then sets `assignments`, which therefore keep their values.
+export function renderLabPaneCommand(shell: string, assignments: Record<string, string>): string {
+  return [
+    "env",
+    ...DEFAULT_UNSET_ENV_KEYS.flatMap((key) => ["-u", key]),
+    ...Object.entries(assignments).map(([key, value]) => `${key}=${shQuote(value)}`),
+    shQuote(shell),
+    // The fixture owns ZDOTDIR, so runner-global startup files must not run.
+    "-d",
+    "-i",
+  ].join(" ");
+}
+
+/// The tmux arguments that start a render-lab session running `command`. A
+/// server they start loads no config, so a developer's tmux.conf cannot
+/// change what render-lab records.
+export function renderLabSessionArgs(name: string, width: number, height: number, cwd: string, command: string): string[] {
+  return [...TMUX_NO_CONFIG, "new-session", "-d", "-s", name, "-x", String(width), "-y", String(height), "-c", cwd, command];
+}
+
 class RenderLabTmux {
   readonly name: string;
   readonly fixture: Fixture;
@@ -2106,45 +2135,21 @@ class RenderLabTmux {
   }): Promise<RenderLabTmux> {
     const name = `fx-render-lab-${process.pid}-${randomBytes(4).toString("hex")}`;
     const env = testEnv(opts.fixture, opts.manifest);
-    const command = [
-      "env",
-      "-u",
-      "AI_GATEWAY_API_KEY",
-      "-u",
-      "VERCEL_OIDC_TOKEN",
-      "FX_DISABLE_KEYCHAIN=1",
-      "FX_TEST_SKIP_ONBOARDING=1",
-      `HOME=${shQuote(opts.fixture.home)}`,
-      `ZDOTDIR=${shQuote(opts.fixture.zdotdir)}`,
-      `HISTFILE=${shQuote(opts.fixture.histfile)}`,
-      `SHELL=${shQuote(zshPath())}`,
-      `FX_TRACE_LOG=${shQuote(opts.manifest.traceLogPath)}`,
-      `FX_TRACE_SCOPES=${shQuote(TRACE_SCOPES)}`,
-      `SHELL_A_BEFORE_FIRST=${shQuote(opts.manifest.markers.shell[0] ?? "")}`,
-      `SHELL_A_BETWEEN_LAUNCHES=${shQuote(opts.manifest.markers.shell[1] ?? "")}`,
-      `SHELL_A_BEFORE_THIRD=${shQuote(opts.manifest.markers.shell[2] ?? "")}`,
-      shQuote(zshPath()),
-      // The fixture owns ZDOTDIR, so runner-global startup files must not run.
-      "-d",
-      "-i",
-    ].join(" ");
+    const command = renderLabPaneCommand(zshPath(), {
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
+      HOME: opts.fixture.home,
+      ZDOTDIR: opts.fixture.zdotdir,
+      HISTFILE: opts.fixture.histfile,
+      SHELL: zshPath(),
+      FX_TRACE_LOG: opts.manifest.traceLogPath,
+      FX_TRACE_SCOPES: TRACE_SCOPES,
+      SHELL_A_BEFORE_FIRST: opts.manifest.markers.shell[0] ?? "",
+      SHELL_A_BETWEEN_LAUNCHES: opts.manifest.markers.shell[1] ?? "",
+      SHELL_A_BEFORE_THIRD: opts.manifest.markers.shell[2] ?? "",
+    });
 
-    tmux(
-      [
-        "new-session",
-        "-d",
-        "-s",
-        name,
-        "-x",
-        String(opts.width),
-        "-y",
-        String(opts.height),
-        "-c",
-        opts.fixture.work,
-        command,
-      ],
-      env,
-    );
+    tmux(renderLabSessionArgs(name, opts.width, opts.height, opts.fixture.work, command), env);
     const session = new RenderLabTmux(name, opts.fixture);
     await sleep(800);
     await session.waitForPane((pane) => pane.includes(PROMPT_TEXT), 10_000);
@@ -2316,9 +2321,7 @@ function preflightBinaryOnly(): void {
 }
 
 function testEnv(fixture: Fixture, manifest: RenderLabManifest): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  delete env.AI_GATEWAY_API_KEY;
-  delete env.VERCEL_OIDC_TOKEN;
+  const env: NodeJS.ProcessEnv = fxChildEnv();
   env.FX_DISABLE_KEYCHAIN = "1";
   env.FX_TEST_SKIP_ONBOARDING = "1";
   env.HOME = fixture.home;
@@ -2623,7 +2626,7 @@ function tmux(args: string[], env?: NodeJS.ProcessEnv): string {
   return execFileSync("tmux", args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-    env: env ? { ...process.env, ...env } : process.env,
+    env: env ?? process.env,
   });
 }
 

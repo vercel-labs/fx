@@ -3,10 +3,10 @@ import { processAlive as isRunning } from "./process-alive";
 import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runFx } from "../evals/eval-helpers";
+import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
 import { logLines, onlySessionId } from "./saved-sessions";
-import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { fakeGatewayFinalText, fakeGatewayToolCall, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable, turnSettled } from "./tmux-helpers";
 
 // `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
@@ -277,6 +277,33 @@ describe("fx mcp", () => {
     }, 30_000);
   }
 
+  // The reply's id comes after what fx cannot read, so the line names no request. Nothing tells which list it answers: the
+  // list waits out the 30-second grace, as every request in flight does, and then fx says it could not read the list.
+  const unnamedLists: [string, string, "text" | "json"][] = [
+    ["not JSON before the id", '{"jsonrpc":"2.0","result":{"resultType":"complete","tools":[]},"extra":nope,"id":{id}}', "text"],
+    ["nested past the engine's limit before the id", `{"jsonrpc":"2.0","result":{"resultType":"complete","tools":[]},"extra":${"[".repeat(3000)}${"]".repeat(3000)},"id":{id}}`, "json"],
+  ];
+  const UNREADABLE = "the answer is not a readable tool list";
+
+  for (const [what, line, form] of unnamedLists) {
+    test(`show says the list was unreadable when no id could be read, after the grace: ${what}`, async () => {
+      const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_LINE: line } }) } });
+      const started = Date.now();
+      const shown = await runFx(["mcp", "show", "fixture", ...(form === "json" ? ["--json"] : [])], { cwd: root.workspace, env: root.env, timeoutMs: 60_000 });
+      const seconds = (Date.now() - started) / 1000;
+      expect(shown.stderr).toBe("");
+      expect(shown.code).toBe(0);
+      if (form === "json") {
+        expect(JSON.parse(shown.stdout)).toMatchObject({ name: "fixture", status: "ready", error: null, tools_error: UNREADABLE, tools: [] });
+      } else {
+        expect(shown.stdout).toStartWith(`fixture\n  status     ready, tool list refused\n  tool list  refused: ${UNREADABLE}\n`);
+        expect(shown.stdout).not.toContain("0 tools");
+      }
+      // The wait is the grace: not at once, as a line with an id would, and far short of the 5 minutes an operation waits.
+      expect({ late: seconds > 28, early: seconds < 55 }).toEqual({ late: true, early: true });
+    }, 90_000);
+  }
+
   test("show gives no refusal for a tool list it accepted, or for a tool it could not read", async () => {
     const good = createRoot({ mcpServers: { fixture: fixtureServer() } });
     const text = await mcp(good, "show", "fixture");
@@ -294,6 +321,40 @@ describe("fx mcp", () => {
     expect(shown).toMatchObject({ status: "ready", tools_error: null, tools: [] });
   }, 30_000);
 
+  // What fx leaves out of a list is told beside the status, not only traced: how many, and the one reason they share.
+  test("show says how many tools fx left out of a list and why, in text and in --json", async () => {
+    let deepSchema: unknown = { type: "string" };
+    for (let level = 0; level < 70; level += 1) deepSchema = { type: "object", properties: { a: deepSchema } };
+    const good = '{"name":"good","inputSchema":{"type":"object"}}';
+    const twice = '{"name":"twice","name":"again","inputSchema":{"type":"object"}}';
+    const sameName = '{"name":"good","description":"the second","inputSchema":{"type":"object"}}';
+    const tooDeep = JSON.stringify({ name: "deep", inputSchema: deepSchema });
+    // `odd` has a `description` that is no text: the engine keeps it, and the host's reading refuses it. The others the engine
+    // skips itself.
+    const odd = '{"name":"odd","description":7,"inputSchema":{"type":"object"}}';
+    const cases: { tools: string[]; listed: number; text: string | null; json: { count: number; reason: string } | null }[] = [
+      { tools: [good], listed: 1, text: null, json: null },
+      { tools: [good, twice], listed: 1, text: "1 tool: a field is written twice", json: { count: 1, reason: "a field is written twice" } },
+      { tools: [good, sameName], listed: 1, text: "1 tool: a name is used by two tools", json: { count: 1, reason: "a name is used by two tools" } },
+      { tools: [good, tooDeep], listed: 1, text: "1 tool: a limit on size or nesting is passed", json: { count: 1, reason: "a limit on size or nesting is passed" } },
+      { tools: [good, odd], listed: 2, text: "1 tool: a definition can't be used", json: { count: 1, reason: "a definition can't be used" } },
+      { tools: [good, twice, sameName, tooDeep, odd], listed: 2, text: "4 tools: more than one reason", json: { count: 4, reason: "more than one reason" } },
+    ];
+    for (const one of cases) {
+      const reply = `"result":{"resultType":"complete","tools":[${one.tools.join(",")}]}`;
+      const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: reply } }) } });
+      const text = await mcp(root, "show", "fixture");
+      expect(text.stderr).toBe("");
+      expect(text.code).toBe(0);
+      expect(text.stdout).toContain(`  status     ready, ${one.listed} tool${one.listed === 1 ? "" : "s"}\n`);
+      if (one.text === null) expect(text.stdout).not.toContain("left out");
+      else expect(text.stdout).toContain(`  left out   ${one.text}\n`);
+      const shown = JSON.parse((await mcp(root, "show", "fixture", "--json")).stdout);
+      expect(shown).toMatchObject({ status: "ready", tools_error: null, tools_left_out: one.json });
+      expect(JSON.parse((await mcp(root, "list", "--json")).stdout).servers[0]).toHaveProperty("tools_left_out");
+    }
+  }, 120_000);
+
   test("show says when fx refused the tool list of an HTTP server too", async () => {
     const upstream = startModernMcpHttpFixture("list_refused");
     try {
@@ -309,11 +370,163 @@ describe("fx mcp", () => {
     }
   }, 30_000);
 
+  // An HTTP server that answers `tools/list` with a status: 403 is refused, 429 and 503 are temporary and say so. The
+  // refusal's words are the same in `show`, its JSON, the `/mcp` screen and what the model is told. `list` never connects, so
+  // it has no list to say.
+  const listStatuses = [
+    { mode: "list_http_403", state: "tool list refused", detail: "refused", words: "the server answered the list with HTTP 403" },
+    { mode: "list_http_429", state: "tool list unavailable (HTTP 429)", detail: "unavailable", words: "the server answered the list with HTTP 429, which is temporary" },
+    { mode: "list_http_503", state: "tool list unavailable (HTTP 503)", detail: "unavailable", words: "the server answered the list with HTTP 503, which is temporary" },
+  ] as const;
+  for (const one of listStatuses) {
+    test(`says the same reason for a tool list answered with ${one.mode.replace("list_http_", "HTTP ")} in show, its JSON and what the model is told`, async () => {
+      const upstream = startModernMcpHttpFixture(one.mode);
+      try {
+        const root = createRoot({ mcpServers: { web: { type: "http", url: upstream.url } } });
+        const text = await mcp(root, "show", "web");
+        expect(text.stderr).toBe("");
+        expect(text.code).toBe(0);
+        expect(text.stdout).toStartWith(`web\n  status     ready, ${one.state}\n  tool list  ${one.detail}: ${one.words}\n`);
+        const shown = JSON.parse((await mcp(root, "show", "web", "--json")).stdout);
+        expect(shown).toMatchObject({ status: "ready", error: null, tools_error: one.words, tools: [] });
+
+        // The model is told the same words, not that the server is unavailable.
+        const activeGateway = startFakeGateway([
+          fakeGatewayToolCall("search_web", "toolbox", { search: "web tools", server: "web" }),
+          fakeGatewayToolCall("search_any", "toolbox", { search: "weather forecast" }),
+          fakeGatewayToolCall("list_web", "shell", { action: "run", command: `"${FX_BIN}" mcp call list web` }),
+          fakeGatewayFinalText("LIST_REASON_TOLD"),
+        ], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+        gateway = activeGateway;
+        const asked = await runFx(["ask", "--json", "--full-access", "--no-save", "Find the web tools."], {
+          cwd: root.workspace,
+          env: { ...root.env, FX_GATEWAY_BASE_URL: activeGateway.baseUrl, FX_GATEWAY_CHAT_URL: activeGateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+          timeoutMs: 60_000,
+        });
+        expect(asked.code).toBe(0);
+        // A search of the server, a search of every server and `fx mcp call list` each tell it the refusal's words.
+        const told = activeGateway.requests[3]?.body ?? "";
+        expect(told.split(`MCP server 'web' is unavailable: ${one.words}`).length - 1).toBeGreaterThanOrEqual(3);
+        expect(told).not.toContain("is unavailable: the server is unavailable");
+      } finally {
+        upstream.stop();
+      }
+    }, 90_000);
+
+    test.skipIf(!tmuxAvailable())(`the /mcp screen of a server whose tool list is answered with ${one.mode.replace("list_http_", "HTTP ")} says the same reason in both of its lines`, async () => {
+      const upstream = startModernMcpHttpFixture(one.mode);
+      try {
+        const root = createRoot({ mcpServers: { web: { type: "http", url: upstream.url } } });
+        gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+        tui = await TmuxSession.create({
+          isolated: true,
+          cwd: root.workspace,
+          width: 120,
+          height: 30,
+          env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+        });
+        await tui.waitForComposer(15_000);
+        await tui.sendText("/mcp");
+        await tui.waitForText("MCP servers  1", 10_000);
+        await tui.sendKeys("Enter");
+        const pane = await tui.waitForText(`Its tools couldn't load: ${one.words}`, 20_000);
+        expect(pane).toContain(`ready, ${one.state}`);
+        expect(pane).not.toContain("Its tools couldn't load: the server is unavailable");
+      } finally {
+        upstream.stop();
+      }
+    }, 90_000);
+  }
+
+  // A stdio server whose first process dies and whose second is ready and refuses its list. The engine keeps the crash
+  // after the server is back, but the server is not down: the model is told the refusal, as `show` says it.
+  test("tells the model the refusal of a server that crashed once and is ready again, not its old crash", async () => {
+    const root = createRoot();
+    const marker = join(root.workspace, "started");
+    const script = `if [ ! -e "${marker}" ]; then : > "${marker}"; echo "first start crashes" >&2; exit 3; fi; : > "${marker}.ready"; exec "$@"`;
+    writeFileSync(root.profilePath, JSON.stringify({
+      mcpServers: {
+        web: {
+          command: "sh",
+          args: ["-c", script, "sh", process.execPath, MODERN_FIXTURE],
+          env: { FX_MCP_LIST_REPLY: '"result":{"resultType":"complete","tools":[],"tools":[]}' },
+        },
+      },
+    }));
+    // Wait until the second process has started, then until `show` says the server is ready with its list refused. Each wait
+    // has a deadline and says which one ran out. The failure word is written in two pieces so that only the output has it,
+    // not this command, which the model's request carries too.
+    const wait = [
+      `for i in $(seq 1 150); do [ -e "${marker}.ready" ] && break; sleep 0.2; done`,
+      `[ -e "${marker}.ready" ] || { echo "WAIT_FAIL""ED the second process never started"; exit 1; }`,
+      `for i in $(seq 1 150); do "${FX_BIN}" mcp show web 2>&1 | grep -q "ready, tool list refused" && exit 0; sleep 0.2; done`,
+      `echo "WAIT_FAIL""ED show never said ready with its list refused"; exit 1`,
+    ].join("; ");
+    const activeGateway = startFakeGateway([
+      fakeGatewayToolCall("search_down", "toolbox", { search: "web tools", server: "web" }),
+      fakeGatewayToolCall("wait_back", "shell", { action: "run", command: wait }),
+      fakeGatewayToolCall("search_web", "toolbox", { search: "web tools", server: "web" }),
+      fakeGatewayToolCall("search_any", "toolbox", { search: "weather forecast" }),
+      fakeGatewayFinalText("REFUSAL_TOLD"),
+    ], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    gateway = activeGateway;
+    const asked = await runFx(["ask", "--json", "--full-access", "--no-save", "Find the web tools."], {
+      cwd: root.workspace,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: activeGateway.baseUrl, FX_GATEWAY_CHAT_URL: activeGateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+      timeoutMs: 90_000,
+    });
+    expect(asked.code).toBe(0);
+    expect(existsSync(`${marker}.ready`)).toBe(true);
+    const told = activeGateway.requests[4]?.body ?? "";
+    expect(told).not.toContain("WAIT_FAILED");
+    // The first search met the crash and says it. The two after the server is back say the refusal and not the crash.
+    expect(told.split("MCP server 'web' is unavailable: its process exited").length - 1).toBeLessThanOrEqual(1);
+    expect(told.split("MCP server 'web' is unavailable: a field is written twice").length - 1).toBeGreaterThanOrEqual(2);
+  }, 120_000);
+
+  // The `/mcp` list gives each row the words of its status that fit: under 33 columns the whole words of a refused list
+  // do not, so a row says its kind in fewer. At the widths this test uses, from 27 columns, no cut takes the word that says it.
+  test.skipIf(!tmuxAvailable())("the /mcp list says a refused and an unavailable tool list in rows that fit at 30, 33, 60 and 200 columns", async () => {
+    const refused = startModernMcpHttpFixture("list_http_403");
+    const waiting = startModernMcpHttpFixture("list_http_503");
+    try {
+      const root = createRoot({ mcpServers: { no403: { type: "http", url: refused.url }, wait503: { type: "http", url: waiting.url } } });
+      gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+      const grid = [
+        { width: 30, refused: "list refused", waiting: "unavailable" },
+        { width: 33, refused: "tool list refused", waiting: "unavailable (503)" },
+        { width: 60, refused: "ready, tool list refused", waiting: "ready, tool list unavailable (HTTP 503)" },
+        { width: 200, refused: "ready, tool list refused", waiting: "ready, tool list unavailable (HTTP 503)" },
+      ];
+      for (const one of grid) {
+        tui = await TmuxSession.create({
+          isolated: true,
+          cwd: root.workspace,
+          width: one.width,
+          height: 20,
+          env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+        });
+        await tui.waitForComposer(15_000);
+        await tui.sendText("/mcp");
+        const rowOf = (pane: string, name: string) => pane.split("\n").find((line) => line.replace(/^[› ]+/, "").startsWith(name)) ?? "";
+        const pane = await tui.waitForPane((text) => rowOf(text, "no403").includes(one.refused) && rowOf(text, "wait503").includes(one.waiting), 20_000);
+        for (const line of pane.split("\n")) {
+          expect({ width: one.width, line, wide: [...line].length > one.width }).toMatchObject({ wide: false });
+        }
+        expect(pane).not.toContain("…");
+        await tui.kill();
+        tui = null;
+      }
+    } finally {
+      refused.stop();
+      waiting.stop();
+    }
+  }, 180_000);
+
   // The server answered `tools/list`, but not with a JSON-RPC message: a status that no other flow reads, or a page
   // that is no JSON. That is an answer fx refuses, not a server that gave none.
   const httpAnswers = [
     ["list_http_500", "the server answered the list with HTTP 500"],
-    ["list_http_429", "the server answered the list with HTTP 429"],
     ["list_html_200", "the list is not valid JSON"],
   ] as const;
   for (const [mode, why] of httpAnswers) {
@@ -392,16 +605,14 @@ describe("fx mcp", () => {
     expect(gone.code).toBe(1);
     expect(gone.stderr).toBe("No MCP server named solo in ~/.fx/mcp.json or .mcp.json.\n");
 
-    // `--global` names ~/.fx/mcp.json; the older `--profile` still works.
+    // `--global` names ~/.fx/mcp.json.
     const global = await mcp(root, "remove", "--global", "twin");
     expect(global.code).toBe(0);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8"))).toEqual({ mcpServers: {}, other: 1 });
     const profile = await mcp(root, "remove", "--profile", "twin");
-    expect(profile.code).toBe(1);
-    // The older --profile still names the profile file, with a warning.
-    expect(profile.stderr).toBe(
-      "fx mcp remove: --profile is deprecated and stops working in fx 0.0.18; use --global\nNo MCP server named twin in ~/.fx/mcp.json.\n",
-    );
+    expect(profile.code).toBe(2);
+    expect(profile.stdout).toBe("");
+    expect(profile.stderr).toBe("fx mcp remove: --profile was removed; use --global\nusage: fx mcp remove [--global | --project] NAME\n");
   });
 
   test("approve and reject say exactly what they trust", async () => {
@@ -745,7 +956,7 @@ describe("/mcp in the shell", () => {
     expect((await mcp(root, "add", "outside", "--", process.execPath, MODERN_FIXTURE)).code).toBe(0);
     // The next prompt loads it first, so its own request tells the model.
     await tui.sendText("first prompt");
-    await tui.waitForText("first done", 15_000);
+    await tui.waitForPane((pane) => pane.includes("first done") && turnSettled(pane), 15_000);
     expect(gateway.requests).toHaveLength(1);
     const firstMenu = menu(gateway.requests[0]!.body);
     expect(firstMenu).toContain("- fixture");
@@ -874,7 +1085,7 @@ describe("/mcp in the shell", () => {
         await Bun.sleep(50);
       }
       held.release("first done");
-      await tui.waitForText("second done", 15_000);
+      await tui.waitForPane((pane) => pane.includes("second done") && turnSettled(pane), 15_000);
       // The next prompt, sent with no turn running, loads the change.
       await tui.sendText("third prompt");
       await tui.waitForText("third done", 15_000);

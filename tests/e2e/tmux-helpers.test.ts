@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdtempSync,
   mkdirSync,
+  readdirSync,
   realpathSync,
   readFileSync,
   rmSync,
@@ -16,20 +17,31 @@ import {
   buildEvalProcessEnv,
   cleanupIsolatedTestHome,
   createIsolatedTestHome,
+  DEFAULT_UNSET_ENV_KEYS,
   envWithoutFxHome,
   FX_BIN,
+  fxChildEnv,
   needsProcessSnapshot,
+  REPO_ROOT,
   runFx,
 } from "../evals/eval-helpers";
+import { savedSessionIds, storeRoot } from "./saved-sessions";
 import {
   buildObservedCommand,
+  FAKE_GATEWAY_MODEL,
+  fakeGatewayFinalText,
+  fakeGatewayToolCall,
   heldFakeGatewayFinalText,
   isVolatileTokenStatusRow,
   localCreditsEnv,
   paneExitMatches,
+  paneStatusFromTmux,
   parseSingleChildPid,
+  startDynamicFakeGateway,
+  TMUX_NO_CONFIG,
   TmuxSession,
   tmuxAvailable,
+  tmuxReportsServerGone,
 } from "./tmux-helpers";
 
 const tmuxTest = test.skipIf(!tmuxAvailable());
@@ -47,7 +59,40 @@ const ISOLATED_KEYS = [
   "FX_RECORD_INPUT",
   "FX_MCP_CALL_SOCKET",
   "FX_MCP_CALL_TOKEN",
+  // A terminal's program resume token must not reach a test's fx.
+  "OSC7577_TOKEN",
+  // A test hold left there would stop every test's fx at it.
+  "FX_TEST_REPORT_DELIVERY_HELD",
+  "FX_TEST_REPORT_DELIVERY_RELEASE",
+  "FX_TEST_SESSION_WRITE_HELD",
+  "FX_TEST_SESSION_WRITE_RELEASE",
+  "FX_TEST_SHELL_YIELD_HELD",
+  "FX_TEST_SHELL_YIELD_RELEASE",
+  "FX_TEST_SUBAGENT_CLOSE_HELD",
+  "FX_TEST_SUBAGENT_CLOSE_RELEASE",
+  "FX_TEST_SUBAGENT_END_HELD",
+  "FX_TEST_SUBAGENT_END_RELEASE",
+  "FX_TEST_SUBAGENT_PUBLISH_HELD",
+  "FX_TEST_SUBAGENT_PUBLISH_RELEASE",
+  "FX_TEST_SUBAGENT_SETTLE_HELD",
+  "FX_TEST_SUBAGENT_SETTLE_RELEASE",
+  "FX_TEST_SUBAGENT_START_HELD",
+  "FX_TEST_SUBAGENT_START_RELEASE",
+  "FX_TEST_WORKSPACE_CAPTURE_START_HELD",
+  "FX_TEST_WORKSPACE_CAPTURE_START_RELEASE",
+  "FX_TEST_WEB_FETCH_DNS_READY",
+  "FX_TEST_WEB_FETCH_DNS_RELEASE",
+  "FX_TEST_GREP_RELEASE",
+  "FX_TEST_ACP_PROMPT_TERMINAL_READY",
+  "FX_TEST_ACP_PROMPT_REAP_READY",
+  "FX_TEST_ACP_PROMPT_RELEASE",
+  "FX_TEST_ACP_PERMISSION_READY",
+  "FX_TEST_ACP_PERMISSION_RELEASE",
 ] as const;
+const tmuxFxTest = test.skipIf(!tmuxAvailable() || !existsSync(FX_BIN));
+const HELD_ENV_REPLY = "NO_HOLD_REACHED_FX";
+const HELD_ENV_WAIT_MS = 15_000;
+const HELD_ENV_TEST_TIMEOUT_MS = 60_000;
 
 test("pane exit matching requires the expected observed status", () => {
   expect(paneExitMatches({ dead: false, status: null }, 0)).toBe(false);
@@ -55,6 +100,51 @@ test("pane exit matching requires the expected observed status", () => {
   expect(paneExitMatches({ dead: true, status: 0 }, 0)).toBe(true);
   expect(paneExitMatches({ dead: true, status: 1 }, 0)).toBe(false);
   expect(paneExitMatches({ dead: true, status: 37 }, 37)).toBe(true);
+});
+
+test("only tmux's errors for a server that does not run count as a gone pane", () => {
+  // The messages tmux prints when the server was killed and when its socket
+  // was never made.
+  expect(tmuxReportsServerGone("no server running on /tmp/tmux-1000/fx-e2e")).toBe(true);
+  expect(tmuxReportsServerGone("error connecting to /tmp/tmux-1000/fx-e2e (No such file or directory)")).toBe(true);
+  expect(tmuxReportsServerGone("error connecting to /tmp/tmux-1000/fx-e2e (Connection refused)")).toBe(true);
+  expect(tmuxReportsServerGone("error connecting to /tmp/tmux-1000/fx-e2e (Permission denied)")).toBe(false);
+  expect(tmuxReportsServerGone("directory /tmp/fx-e2e/tmux-1000 has unsafe permissions")).toBe(false);
+  expect(tmuxReportsServerGone("protocol version mismatch (client 8, server 7)")).toBe(false);
+  expect(tmuxReportsServerGone("")).toBe(false);
+});
+
+test("a pane's status reads tmux's answer, and a tmux error that is not a gone server throws", () => {
+  const target = "fx-test-1:0.0";
+  const recorded = () => 7;
+  expect(paneStatusFromTmux(target, { output: "%3:0:\n" }, recorded)).toEqual({ dead: false, status: null });
+  expect(paneStatusFromTmux(target, { output: "%3:1:0\n" }, recorded)).toEqual({ dead: true, status: 0 });
+  // tmux marks the pane dead before it has the exit status.
+  expect(paneStatusFromTmux(target, { output: "%3:1:\n" }, recorded)).toEqual({ dead: true, status: 7 });
+  // The session is gone and the server still runs.
+  expect(paneStatusFromTmux(target, { output: "::\n" }, recorded)).toEqual({ dead: true, status: 7 });
+  expect(paneStatusFromTmux(target, { error: "no server running on /tmp/tmux-1000/fx" }, recorded))
+    .toEqual({ dead: true, status: 7 });
+  expect(() => paneStatusFromTmux(target, { error: "directory /tmp/fx/tmux-1000 has unsafe permissions" }, recorded))
+    .toThrow(`tmux could not report pane ${target}: directory /tmp/fx/tmux-1000 has unsafe permissions`);
+  expect(() => paneStatusFromTmux(target, { error: "spawnSync tmux ENOENT" }, recorded)).toThrow("spawnSync tmux ENOENT");
+});
+
+tmuxTest("a session that ended while its server still runs reads as dead with its exit status", async () => {
+  const socketName = `fx-pane-gone-${process.pid}-${Date.now().toString(36)}`;
+  const keeper = await TmuxSession.create({ cmd: "sleep 30", startupWaitMs: 0, socketName });
+  const ended = await TmuxSession.create({ cmd: "sh -c 'exit 3'", startupWaitMs: 0, socketName });
+  try {
+    expect(await ended.waitForSessionEnd()).toBe(true);
+    expect(keeper.isAlive()).toBe(true);
+    expect(ended.paneStatus()).toEqual({ dead: true, status: 3 });
+  } finally {
+    await ended.kill();
+    await keeper.kill();
+    try {
+      execFileSync("tmux", ["-L", socketName, "kill-server"], { stdio: "pipe" });
+    } catch {}
+  }
 });
 
 test("launched process PID parsing requires one direct child", () => {
@@ -106,6 +196,26 @@ tmuxTest("the launched process PID skips a shell that runs the pane command as a
   } finally {
     await session.kill();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+tmuxTest("reading the remain-on-exit format throws when tmux has no such pane or no server", async () => {
+  const socketName = `fx-roe-format-${process.pid}-${Date.now().toString(36)}`;
+  const first = await TmuxSession.create({ cmd: "sleep 30", startupWaitMs: 0, socketName });
+  const second = await TmuxSession.create({ cmd: "sleep 30", startupWaitMs: 0, socketName });
+  try {
+    expect(first.remainOnExitFormat().length).toBeGreaterThan(0);
+    // The server still runs, and tmux exits 0 for a target it cannot find.
+    await first.kill();
+    expect(() => first.remainOnExitFormat()).toThrow(`tmux found no pane ${first.name}:0.0`);
+    await second.kill();
+    expect(() => second.remainOnExitFormat()).toThrow(/no server running|error connecting/);
+  } finally {
+    await second.kill();
+    await first.kill();
+    try {
+      execFileSync("tmux", ["-L", socketName, "kill-server"], { stdio: "pipe" });
+    } catch {}
   }
 });
 
@@ -251,7 +361,7 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
   try {
     execFileSync(
       "tmux",
-      ["-L", socketName, "new-session", "-d", "-s", "fx-stale-env-seed", "sleep 60"],
+      ["-L", socketName, ...TMUX_NO_CONFIG, "new-session", "-d", "-s", "fx-stale-env-seed", "sleep 60"],
       { env: seedEnv, stdio: "pipe" },
     );
 
@@ -332,6 +442,115 @@ tmuxTest("tmux launch scrubs stale overrides without storing explicit credential
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("every test hold fx reads is in the tmux launch's isolated keys", () => {
+  const src = join(REPO_ROOT, "src");
+  const holds = new Set<string>();
+  for (const file of readdirSync(src, { recursive: true, encoding: "utf8" })) {
+    if (!file.endsWith(".zig")) continue;
+    const text = readFileSync(join(src, file), "utf8");
+    for (const match of text.matchAll(/"(FX_TEST_[A-Z0-9_]+_(?:HELD|RELEASE))"/g)) holds.add(match[1]!);
+  }
+  expect(holds).toContain("FX_TEST_REPORT_DELIVERY_HELD");
+  const isolated = new Set<string>(ISOLATED_KEYS);
+  expect([...holds].filter((name) => !isolated.has(name))).toEqual([]);
+});
+
+/// The phases of the `workspace_capture` items that the profile's sessions
+/// saved, from whole log lines only, so it can read a log fx still writes.
+function savedCapturePhases(home: string): string[] {
+  if (!existsSync(storeRoot(home))) return [];
+  return savedSessionIds(home).flatMap((id) => {
+    const log = join(storeRoot(home), id, "log.jsonl");
+    if (!existsSync(log)) return [];
+    return readFileSync(log, "utf8")
+      .split("\n")
+      .slice(0, -1)
+      .map((line) => JSON.parse(line))
+      .filter((line) => line.kind === "item" && line.type === "workspace_capture")
+      .map((line) => (typeof line.data === "string" ? JSON.parse(line.data) : line.data).phase);
+  });
+}
+
+// fx reads its holds in release builds. A start capture that sees its hold
+// writes the marker, and a search that sees FX_TEST_GREP_RELEASE waits for a
+// file that never comes, so the reply after it never shows.
+tmuxFxTest("test holds in the tmux server's environment never reach fx", async () => {
+  const socketName = `fx-held-env-${process.pid}-${Date.now().toString(36)}`;
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tmux-held-env-")));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const stderrPath = join(root, "fx.stderr");
+  const captureHeld = join(root, "capture-held");
+  // A start capture that saw its hold goes on at once after its marker.
+  const captureRelease = join(root, "capture-release");
+  const grepRelease = join(root, "grep-release");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace);
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ experimental: { workspace_capture: true } }));
+  writeFileSync(join(workspace, "notes.txt"), "needle\n");
+  writeFileSync(captureRelease, "");
+  for (const args of [["init", "-q", "-b", "main"], ["add", "notes.txt"], ["commit", "-q", "-m", "first"]]) {
+    execFileSync("git", ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", ...args], {
+      cwd: workspace,
+      env: { HOME: home, GIT_CONFIG_NOSYSTEM: "1", PATH: process.env.PATH ?? "/usr/bin:/bin" },
+      stdio: "pipe",
+    });
+  }
+  const gateway = startDynamicFakeGateway((body) =>
+    body.includes("held-env-grep")
+      ? fakeGatewayFinalText(HELD_ENV_REPLY)
+      : fakeGatewayToolCall("held-env-grep", "grep_files", { pattern: "needle" })
+  );
+
+  let session: TmuxSession | undefined;
+  try {
+    execFileSync(
+      "tmux",
+      ["-L", socketName, ...TMUX_NO_CONFIG, "new-session", "-d", "-s", "fx-held-env-seed", "sleep 60"],
+      {
+        env: {
+          ...process.env,
+          FX_TEST_WORKSPACE_CAPTURE_START_HELD: captureHeld,
+          FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: captureRelease,
+          FX_TEST_GREP_RELEASE: grepRelease,
+        },
+        stdio: "pipe",
+      },
+    );
+    session = await TmuxSession.create({
+      cwd: workspace,
+      socketName,
+      stderrPath,
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-held-env-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+      },
+    });
+    await session.waitForComposer();
+    await session.sendText("Find the needle.");
+    const replied = await session.waitForText(HELD_ENV_REPLY, HELD_ENV_WAIT_MS).then(() => true, () => false);
+    // The saved start capture shows that the capture passed its hold point.
+    await session.waitForPane(() => savedCapturePhases(home).includes("start"), HELD_ENV_WAIT_MS);
+    expect(savedCapturePhases(home)).toContain("start");
+
+    expect({ replied, captureHeld: existsSync(captureHeld) }).toEqual({ replied: true, captureHeld: false });
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally {
+    await session?.kill();
+    gateway.stop();
+    try {
+      execFileSync("tmux", ["-L", socketName, "kill-server"], { stdio: "pipe" });
+    } catch {}
+    rmSync(root, { recursive: true, force: true });
+  }
+}, HELD_ENV_TEST_TIMEOUT_MS);
 
 tmuxTest("pane environment does not poison a shared tmux server", async () => {
   const socketName = `fx-pe-${process.pid}-${Date.now().toString(36)}`;
@@ -433,6 +652,49 @@ tmuxTest("minimum history lines survive a fresh tmux server restart", async () =
   }
 });
 
+tmuxTest("a tmux server the harness starts ignores the developer's tmux config", async () => {
+  const socketName = `fx-no-config-${process.pid}-${Date.now().toString(36)}`;
+  const referenceSocket = `${socketName}-ref`;
+  const home = mkdtempSync(join(tmpdir(), "fx-tmux-hostile-home-"));
+  const hostileConfig = "set -g base-index 1\nset -g pane-base-index 1\nset -g remain-on-exit-format 'HOSTILE'\n";
+  writeFileSync(join(home, ".tmux.conf"), hostileConfig);
+  mkdirSync(join(home, ".config", "tmux"), { recursive: true });
+  writeFileSync(join(home, ".config", "tmux", "tmux.conf"), hostileConfig);
+  const savedHome = process.env.HOME;
+  const savedConfigHome = process.env.XDG_CONFIG_HOME;
+  const serverState = (socket: string, sessionName: string) => {
+    const tmux = (...args: string[]) => execFileSync("tmux", ["-L", socket, ...args], { encoding: "utf8" }).trim();
+    return {
+      indexes: tmux("display-message", "-p", "-t", sessionName, "#{window_index}.#{pane_index}"),
+      deadPaneFormat: tmux("show-options", "-gv", "remain-on-exit-format"),
+    };
+  };
+  let session: TmuxSession | undefined;
+  try {
+    process.env.HOME = home;
+    process.env.XDG_CONFIG_HOME = join(home, ".config");
+    try {
+      session = await TmuxSession.create({ cmd: "sleep 30", startupWaitMs: 0, socketName });
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = savedConfigHome;
+    }
+    // tmux's defaults, from a server that loads no config at all.
+    execFileSync("tmux", ["-L", referenceSocket, "-f", "/dev/null", "new-session", "-d", "-s", "reference", "sleep 30"]);
+    expect(serverState(socketName, session.name)).toEqual(serverState(referenceSocket, "reference"));
+  } finally {
+    await session?.kill();
+    for (const socket of [socketName, referenceSocket]) {
+      try {
+        execFileSync("tmux", ["-L", socket, "kill-server"], { stdio: "pipe" });
+      } catch {}
+    }
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 tmuxTest("tmux launch drops an inherited FX_HOME unless the test passes one", async () => {
   const socketName = `fx-fx-home-${process.pid}-${Date.now()}`;
   const root = mkdtempSync(join(tmpdir(), "fx-tmux-fx-home-"));
@@ -484,6 +746,25 @@ test("envWithoutFxHome drops FX_HOME and keeps the rest", () => {
 
   expect(envWithoutFxHome(env)).toEqual({ HOME: "/Users/example", PATH: "/usr/bin" });
   expect(env.FX_HOME).toBe("/Users/example/profile");
+});
+
+test("fxChildEnv drops every name on the unset list and keeps the caller's own", () => {
+  const inherited: Record<string, string> = { PATH: "/usr/bin" };
+  for (const key of DEFAULT_UNSET_ENV_KEYS) inherited[key] = `stale-${key.toLowerCase()}`;
+
+  expect(fxChildEnv({}, { inherited })).toEqual({ PATH: "/usr/bin" });
+  expect(fxChildEnv({ HOME: "/Users/example", FX_HOME: "/Users/example/profile", NO_COLOR: undefined }, { inherited })).toEqual({
+    PATH: "/usr/bin",
+    HOME: "/Users/example",
+    FX_HOME: "/Users/example/profile",
+    NO_COLOR: undefined,
+  });
+  expect(fxChildEnv({}, { inherited, keepCredentials: true })).toEqual({
+    PATH: "/usr/bin",
+    AI_GATEWAY_API_KEY: "stale-ai_gateway_api_key",
+    VERCEL_OIDC_TOKEN: "stale-vercel_oidc_token",
+  });
+  expect(inherited.FX_TEST_SHELL_YIELD_HELD).toBe("stale-fx_test_shell_yield_held");
 });
 
 test("buildEvalProcessEnv drops the inherited FX_HOME", () => {
