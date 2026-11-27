@@ -12,6 +12,7 @@ const file_mutation = @import("file_mutation.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
+const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const diff_mod = @import("../output/diff.zig");
 const pathing = @import("../workspace/pathing.zig");
@@ -2666,42 +2667,38 @@ const supported_shells_text = blk: {
     break :blk text;
 };
 
+fn shellResolutionFailureMessage(
+    arena: Allocator,
+    call: ToolCall,
+    err: anyerror,
+) !?[]const u8 {
+    const headline = switch (err) {
+        error.UnsupportedShell => "Unsupported shell",
+        error.RelativeShellPath => "Shell path must be absolute",
+        error.MissingLoginShell => return try arena.print(
+            "Missing login shell; supported shells: {s}",
+            .{supported_shells_text},
+        ),
+        else => return null,
+    };
+    if (try shellPathForFailureMessage(arena, call)) |shell_path| {
+        return try arena.print(
+            "{s} \"{f}\"; supported shells: {s}",
+            .{ headline, model_context_encoding.scalar(shell_path), supported_shells_text },
+        );
+    }
+    return try arena.print(
+        "{s}; supported shells: {s}",
+        .{ headline, supported_shells_text },
+    );
+}
+
 pub fn permissionTargetResolutionFailureMessage(
     arena: Allocator,
     call: ToolCall,
     err: anyerror,
 ) !?[]const u8 {
-    switch (err) {
-        error.UnsupportedShell => {
-            if (try shellPathForFailureMessage(arena, call)) |shell_path| {
-                return try arena.print(
-                    "Unsupported shell \"{s}\"; supported shells: {s}",
-                    .{ shell_path, supported_shells_text },
-                );
-            }
-            return try arena.print(
-                "Unsupported shell; supported shells: {s}",
-                .{supported_shells_text},
-            );
-        },
-        error.RelativeShellPath => {
-            if (try shellPathForFailureMessage(arena, call)) |shell_path| {
-                return try arena.print(
-                    "Shell path must be absolute \"{s}\"; supported shells: {s}",
-                    .{ shell_path, supported_shells_text },
-                );
-            }
-            return try arena.print(
-                "Shell path must be absolute; supported shells: {s}",
-                .{supported_shells_text},
-            );
-        },
-        error.MissingLoginShell => return try arena.print(
-            "Missing login shell; supported shells: {s}",
-            .{supported_shells_text},
-        ),
-        else => {},
-    }
+    if (try shellResolutionFailureMessage(arena, call, err)) |msg| return msg;
     const reason: ?[]const u8 = switch (err) {
         error.FileNotFound => "Path not found",
         error.NotDir => "Path is not a directory",
@@ -3019,6 +3016,34 @@ test "permission target resolution and outcome report unsupported tty shell to t
             failure,
         );
     }
+
+    const esc_call: ToolCall = .{
+        .id = "unsupported_shell_esc",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\",\"tty\":true,\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\\u001b]0;owned\\u0007\"}}",
+    };
+    const esc_msg = (try permissionTargetResolutionFailureMessage(arena, esc_call, error.UnsupportedShell)).?;
+    try std.testing.expect(std.mem.findScalar(u8, esc_msg, 0x1b) == null);
+    try std.testing.expectEqualStrings(
+        "Unsupported shell \"/bin/sh&#x1b;]0;owned&#x07;\"; supported shells: bash, zsh",
+        esc_msg,
+    );
+
+    const relative_call: ToolCall = .{
+        .id = "relative_shell",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\",\"tty\":true,\"shell\":{\"kind\":\"executable\",\"path\":\"bin/zsh\"}}",
+    };
+    const relative_msg = (try permissionTargetResolutionFailureMessage(arena, relative_call, error.RelativeShellPath)).?;
+    try std.testing.expectEqualStrings(
+        "Shell path must be absolute \"bin/zsh\"; supported shells: bash, zsh",
+        relative_msg,
+    );
+    const relative_outcome = try requestPermissionOutcome(input, arena, relative_call, .auto, &.{});
+    try std.testing.expectEqualStrings(
+        "Shell path must be absolute \"bin/zsh\"; supported shells: bash, zsh",
+        relative_outcome.tool_failure orelse return error.TestExpectedToolFailure,
+    );
 }
 
 test "interactive terminal exec approval permits command amendments" {
