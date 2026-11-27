@@ -12878,7 +12878,7 @@ test "waitForOpen returns when the open finishes, not at the next poll" {
     const Release = struct {
         fn run(lookup: *StuckLookupOpen) void {
             lookup.waitEntered();
-            // Only lets the old 2 ms poll start its wait, so the old code fails; any order passes on this code.
+            // Lets the waiter start its 60 s poll first, so code that waits for the next poll fails; any order passes on this code.
             io_mod.sleep(50 * std.time.ns_per_ms);
             lookup.release.store(true, .seq_cst);
         }
