@@ -146,6 +146,7 @@ test "queryTerminalBackground keeps waiting across SIGWINCH until reply arrives"
     var thread = try std.Thread.spawn(.{}, Peer.run, .{ pid, stdin_pipe[1] });
     defer thread.join();
 
-    const bg = readBackgroundReplyUntilDeadline(&terminal, io_mod.milliTimestamp() + 250) orelse return error.TestUnexpectedResult;
+    // A deadline well past the peer's 25 ms keeps a loaded CI machine from ending the wait first; the old code still fails, because it stopped at the wake.
+    const bg = readBackgroundReplyUntilDeadline(&terminal, io_mod.milliTimestamp() + 2_000) orelse return error.TestUnexpectedResult;
     try std.testing.expect(bg.light);
 }

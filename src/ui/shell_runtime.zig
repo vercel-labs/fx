@@ -899,7 +899,8 @@ test "queryCursorPosition keeps waiting across SIGWINCH until reply arrives" {
     var thread = try std.Thread.spawn(.{}, Peer.run, .{ pid, stdin_pipe[1] });
     defer thread.join();
 
-    const pos = try terminal.readCursorPositionUntilDeadline(io_mod.milliTimestamp() + 200);
+    // A deadline well past the peer's 25 ms keeps a loaded CI machine from ending the wait first; the old code still fails, because it stopped at the wake.
+    const pos = try terminal.readCursorPositionUntilDeadline(io_mod.milliTimestamp() + 2_000);
     try std.testing.expectEqual(@as(u16, 12), pos.row);
     try std.testing.expectEqual(@as(u16, 34), pos.col);
 }
