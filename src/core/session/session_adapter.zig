@@ -97,6 +97,9 @@ fn openHome(home: []const u8) !io_mod.VerifiedDir {
 
 /// Pieces larger than this go to a blob; the line keeps a reference.
 const max_inline_piece_bytes: usize = 256 * 1024;
+/// The most bytes of a child line's data the session keeps; a spawn line
+/// that is longer is refused (`sm.max_child_data_bytes`).
+pub const max_child_data_bytes = sm.max_child_data_bytes;
 /// A workspace capture always fits inline: one held for a turn not on disk
 /// yet could not go to a blob, which needs the turn on disk (D44, D98).
 const max_workspace_capture_bytes = max_inline_piece_bytes;

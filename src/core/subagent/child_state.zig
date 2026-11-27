@@ -866,54 +866,57 @@ fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, prof
         .by = if (by == .parent) null else @tagName(by),
         .purpose = purpose,
     });
-    const with_work = try withMembers(arena, base, try workMembers(arena, work));
-    const block = started orelse return with_work;
     // What the profile set goes in after the rest, only when there is any, so
     // a spawn of a child with none is written as before.
-    const text = try started_with_mod.encode(arena, block);
-    if (!started_with_mod.fits(text)) {
+    const block: ?[]const u8 = if (started) |value| block: {
+        const text = try started_with_mod.encode(arena, value);
+        if (started_with_mod.fits(text)) break :block text;
         debug_trace.logf("subagent", "saved profile left out of a spawn line profile={s} bytes={d} limit={d}", .{ profile orelse "", text.len, started_with_mod.max_bytes });
-        return with_work;
+        break :block null;
+    } else null;
+    // The session keeps at most `max_child_data_bytes` of a child line's
+    // data. The admission goes in only as far as the line still fits: whole,
+    // then without its root requests, then not at all. The child starts all
+    // the same; only a continuation of this work then runs on less evidence,
+    // or not at all (`savedAdmission`).
+    var line: []const u8 = undefined;
+    for (std.enums.values(AdmissionPart)) |part| {
+        line = try withBlock(arena, try withMembers(arena, base, try workMembers(arena, work, part)), block);
+        if (line.len <= session_adapter.max_child_data_bytes) {
+            if (part != .whole) debug_trace.logf("subagent", "admission cut from a spawn line kept={s} bytes={d} limit={d}", .{ @tagName(part), line.len, session_adapter.max_child_data_bytes });
+            return line;
+        }
     }
-    return std.mem.concat(arena, u8, &.{ with_work[0 .. with_work.len - 1], ",\"" ++ started_with_mod.key ++ "\":", text, "}" });
+    return line;
 }
 
-/// The admission and continuation fields of `work` as a JSON object. A field
-/// that is null or empty is left off, so a work without them adds nothing.
-fn workMembers(arena: Allocator, work: ?ActiveWork) ![]const u8 {
+/// How much of a work's admission a spawn line holds, most first.
+const AdmissionPart = enum { whole, without_root_requests, replaces_only };
+
+/// The admission and continuation fields of `work` as a JSON object, as far
+/// as `part` says. A field that is null or empty is left off, so a work
+/// without them adds nothing. The link to the work it replaces is always
+/// kept, since the report fold reads it (`reports.PendingFold`).
+fn workMembers(arena: Allocator, work: ?ActiveWork, part: AdmissionPart) ![]const u8 {
     const saved = work orelse return "{}";
-    const root_messages = savedRootMessages(saved.root_user_messages);
-    const cut = root_messages.len < saved.root_user_messages.len;
-    if (cut) debug_trace.logf("subagent", "root requests cut from a spawn line work_id={s} kept={d} of={d}", .{ saved.id, root_messages.len, saved.root_user_messages.len });
+    const replaces = nonEmptyText(saved.replaces);
+    if (part == .replaces_only) return stringifyOmittingNulls(arena, .{ .replaces = replaces });
+    const whole = part == .whole;
     return stringifyOmittingNulls(arena, .{
-        .replaces = nonEmptyText(saved.replaces),
+        .replaces = replaces,
         .permission_mode = @tagName(saved.permission_mode),
         .root_user_intent_context = nonEmptyText(saved.root_user_intent_context),
-        .root_user_messages = if (root_messages.len == 0) null else root_messages,
-        .root_user_evidence_complete = saved.root_user_evidence_complete and !cut,
+        .root_user_messages = if (!whole or saved.root_user_messages.len == 0) null else saved.root_user_messages,
+        // Requests left out leave the evidence incomplete, as a compacted
+        // conversation's is.
+        .root_user_evidence_complete = saved.root_user_evidence_complete and (whole or saved.root_user_messages.len == 0),
     });
 }
 
-/// The most root requests, and their bytes in all, that one spawn line
-/// saves for a continuation. The session log keeps each spawn line, and a
-/// long conversation has many requests.
-const max_saved_root_messages: usize = 32;
-const max_saved_root_bytes: usize = 32 * 1024;
-
-/// Pure: the newest of `messages` that a spawn line saves, at most
-/// `max_saved_root_messages` of them and `max_saved_root_bytes` in all,
-/// oldest first. A list cut here is saved as incomplete evidence
-/// (`workMembers`), as a compacted conversation's is.
-fn savedRootMessages(messages: []const []u8) []const []u8 {
-    var start = messages.len;
-    var bytes: usize = 0;
-    while (start > 0 and messages.len - start < max_saved_root_messages) {
-        const with_next = bytes + messages[start - 1].len;
-        if (with_next > max_saved_root_bytes) break;
-        bytes = with_next;
-        start -= 1;
-    }
-    return messages[start..];
+/// `json` with the saved profile block `block` added last, when there is one.
+fn withBlock(arena: Allocator, json: []const u8, block: ?[]const u8) ![]const u8 {
+    const text = block orelse return json;
+    return std.mem.concat(arena, u8, &.{ json[0 .. json.len - 1], ",\"" ++ started_with_mod.key ++ "\":", text, "}" });
 }
 
 fn nonEmptyText(text: ?[]const u8) ?[]const u8 {
@@ -1434,34 +1437,46 @@ test "a spawn line with a permission mode this fx does not know parses and folds
     try std.testing.expect(child.last_admission == null);
 }
 
-test "a spawn line saves only the newest root requests that fit, as incomplete evidence" {
+test "a spawn line that would not fit the session leaves out the root requests, then the admission, and keeps the profile" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var many: [max_saved_root_messages + 8][]u8 = undefined;
-    for (&many, 0..) |*message, index| message.* = try arena.print("request {d}", .{index});
-    var work: ActiveWork = .{ .id = @constCast("work-1"), .message = @constCast("m"), .root_user_messages = &many, .root_user_evidence_complete = true, .permission_mode = .ask, .created_at_ms = 1 };
-    const line = try spawnData(arena, "reviewer", "ab", null, .final, .parent, null, null, work);
-    const spawn = try std.json.parseFromSliceLeaky(SpawnData, arena, line, .{});
-    const saved = spawn.root_user_messages.?;
-    try std.testing.expectEqual(max_saved_root_messages, saved.len);
-    try std.testing.expectEqualStrings(many[8], saved[0]);
-    try std.testing.expectEqualStrings(many[many.len - 1], saved[saved.len - 1]);
-    try std.testing.expect(!spawn.root_user_evidence_complete.?);
+    // A saved profile block near its own limit, as a long tool list makes.
+    const tools: [58][]const u8 = @splat("a_tool_name_long_enough_to_fill_the_block_0123");
+    const started: started_with_mod.StartedWith = .{ .source = .home, .permission_mode = .auto, .tools = &tools };
+    try std.testing.expect(started_with_mod.fits(try started_with_mod.encode(arena, started)));
+    const fingerprint = text_utils.repeat("ab", 32);
+    var requests = [_][]u8{ try arena.dupe(u8, "first request"), try arena.dupe(u8, "second request") };
+    const long_context = try arena.alloc(u8, 1024);
+    @memset(long_context, 'c');
+    var work: ActiveWork = .{ .id = @constCast("work-2"), .message = @constCast("m"), .root_user_intent_context = long_context, .root_user_messages = &requests, .root_user_evidence_complete = true, .permission_mode = .ask, .created_at_ms = 1, .replaces = "work-1" };
 
-    // A request past the byte limit is left out, with every older one.
-    const big = try arena.alloc(u8, max_saved_root_bytes + 1);
-    @memset(big, 'x');
-    var two = [_][]u8{ big, try arena.dupe(u8, "latest") };
-    work.root_user_messages = &two;
-    const capped = try std.json.parseFromSliceLeaky(SpawnData, arena, try spawnData(arena, "reviewer", "ab", null, .final, .parent, null, null, work), .{});
-    try std.testing.expectEqual(@as(usize, 1), capped.root_user_messages.?.len);
-    try std.testing.expectEqualStrings("latest", capped.root_user_messages.?[0]);
-    try std.testing.expect(!capped.root_user_evidence_complete.?);
+    // The intent context alone does not fit beside the block: the line keeps
+    // the block and the replaced work, and no admission.
+    const bare = try spawnData(arena, "reviewer", fingerprint, "reviewer", .final, .parent, null, started, work);
+    try std.testing.expect(bare.len <= session_adapter.max_child_data_bytes);
+    const bare_spawn = try json_decode.parseFromSliceLeaky(SpawnData, arena, bare, .{ .ignore_unknown_fields = true });
+    try std.testing.expect(std.mem.find(u8, bare, "\"" ++ started_with_mod.key ++ "\":") != null);
+    try std.testing.expectEqualStrings("work-1", bare_spawn.replaces.?);
+    try std.testing.expect(bare_spawn.permission_mode == null);
+    try std.testing.expect(bare_spawn.root_user_intent_context == null);
 
-    // A list that fits is saved whole, and stays complete.
-    work.root_user_messages = many[0..2];
-    const whole = try std.json.parseFromSliceLeaky(SpawnData, arena, try spawnData(arena, "reviewer", "ab", null, .final, .parent, null, null, work), .{});
+    // A short context fits once the requests are left out, as incomplete
+    // evidence.
+    const long_requests = try arena.alloc(u8, 1200);
+    @memset(long_requests, 'r');
+    requests[1] = long_requests;
+    work.root_user_intent_context = @constCast("ship it");
+    const without_requests = try spawnData(arena, "reviewer", fingerprint, "reviewer", .final, .parent, null, started, work);
+    try std.testing.expect(without_requests.len <= session_adapter.max_child_data_bytes);
+    const cut = try json_decode.parseFromSliceLeaky(SpawnData, arena, without_requests, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("ask", cut.permission_mode.?);
+    try std.testing.expectEqualStrings("ship it", cut.root_user_intent_context.?);
+    try std.testing.expect(cut.root_user_messages == null);
+    try std.testing.expect(!cut.root_user_evidence_complete.?);
+
+    // With no profile block the whole admission fits, and stays complete.
+    const whole = try json_decode.parseFromSliceLeaky(SpawnData, arena, try spawnData(arena, "reviewer", fingerprint, null, .final, .parent, null, null, work), .{ .ignore_unknown_fields = true });
     try std.testing.expectEqual(@as(usize, 2), whole.root_user_messages.?.len);
     try std.testing.expect(whole.root_user_evidence_complete.?);
 }
@@ -1647,12 +1662,12 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
 }
 
 /// The admission a spawn line saved for its work, copied into `alloc` (see
-/// `Child.last_admission`). Null when the line names no
-/// permission mode, or one this fx does not know: a later fx wrote it, and
-/// a continuation never runs under a guessed mode. Null too when it lists
-/// more root requests than fx admits: no fx writes that many
-/// (`savedRootMessages`), and a continuation never runs on evidence fx did
-/// not read whole.
+/// `Child.last_admission`). Null when the line names no permission mode, or
+/// one this fx does not know: a later fx wrote it, and a continuation never
+/// runs under a guessed mode. Null too when it lists more root requests than
+/// fx admits, which no line that fits `max_child_data_bytes` holds: the child
+/// still loads, and a continuation never runs on evidence fx did not read
+/// whole.
 fn savedAdmission(alloc: Allocator, child_id: []const u8, spawn: SpawnData) !?Admission {
     const mode_name = spawn.permission_mode orelse return null;
     const permission_mode = std.meta.stringToEnum(types.PermissionMode, mode_name) orelse {
