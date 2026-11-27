@@ -49,11 +49,30 @@ pub const Inputs = web_search_provider.Inputs;
 /// snapshot (`src/core/auth/js_host_auth.zig` `max_session_bytes`), which the
 /// native auth file read shares (`src/core/auth/oauth_session.zig`
 /// `max_auth_file_bytes`). A team slug, a model ID and a gateway URL are far
-/// shorter.
-const max_api_key_bytes = js_host_auth.max_session_bytes;
-const max_gateway_team_bytes = 128;
-const max_worker_model_bytes = 128;
-const max_gateway_chat_url_bytes = 512;
+/// shorter. A value over its bound is refused, and the next search fails with
+/// the reason (`src/tools/web/search.zig` `configuredValueMessage`).
+pub const Caps = struct {
+    pub const api_key = js_host_auth.max_session_bytes;
+    pub const gateway_team: usize = 128;
+    pub const worker_model: usize = 128;
+    pub const gateway_chat_url: usize = 512;
+};
+const max_api_key_bytes = Caps.api_key;
+const max_gateway_team_bytes = Caps.gateway_team;
+const max_worker_model_bytes = Caps.worker_model;
+const max_gateway_chat_url_bytes = Caps.gateway_chat_url;
+
+/// The configured value a `configure` refused because it is over its cap.
+pub const Rejected = enum {
+    api_key,
+    gateway_team,
+    worker_model,
+    gateway_chat_url,
+
+    fn name(self: Rejected) []const u8 {
+        return @tagName(self);
+    }
+};
 
 /// A configured text the runtime owns. A caller's slice may be freed while
 /// another thread snapshots it, so `configure` copies what it sends
@@ -68,19 +87,21 @@ fn OwnedText(comptime capacity: usize) type {
             return self.bytes[0..self.len];
         }
 
-        /// Copies `value`. A value that does not fit clears the buffer, so the
-        /// request fails with no sign-in or no model instead of sending one
-        /// from earlier. Zeroes the whole buffer first either way, so no
-        /// earlier secret stays behind a shorter value.
-        fn set(self: *@This(), value: []const u8, name: []const u8) void {
+        /// Copies `value`, or clears the buffer and returns which value was
+        /// refused when it does not fit, so the runtime can fail the next
+        /// search with a message instead of sending none. Zeroes the whole
+        /// buffer either way, so no earlier secret stays behind a shorter
+        /// value.
+        fn set(self: *@This(), value: []const u8, which: Rejected) ?Rejected {
             if (value.len > capacity) {
                 self.clear();
-                debug_trace.logf("web_search", "configured {s} too long bytes={d} cleared", .{ name, value.len });
-                return;
+                debug_trace.logf("web_search", "configured {s} too long bytes={d} cleared", .{ which.name(), value.len });
+                return which;
             }
             std.crypto.secureZero(u8, &self.bytes);
             @memcpy(self.bytes[0..value.len], value);
             self.len = value.len;
+            return null;
         }
 
         fn clear(self: *@This()) void {
@@ -135,6 +156,9 @@ pub const Runtime = struct {
     gateway_team_text: OwnedText(max_gateway_team_bytes) = .{},
     worker_model_text: OwnedText(max_worker_model_bytes) = .{},
     gateway_chat_url_text: OwnedText(max_gateway_chat_url_bytes) = .{},
+    /// What the last `configure` refused, if any: a snapshot reports it as an
+    /// error instead of handing the provider no sign-in or no model.
+    rejected: ?Rejected = null,
 
     pub fn init(config: Config) Runtime {
         var runtime = Runtime{
@@ -145,10 +169,14 @@ pub const Runtime = struct {
             .gateway_retry_count = config.gateway_retry_count,
         };
         // No lock: nothing else can see the runtime before `init` returns.
-        runtime.api_key_text.set(config.api_key, "api_key");
-        if (config.gateway_team) |team| runtime.gateway_team_text.set(team, "gateway_team");
-        runtime.worker_model_text.set(config.worker_model, "worker_model");
-        runtime.gateway_chat_url_text.set(config.gateway_chat_url, "gateway_chat_url");
+        var rejected: ?Rejected = null;
+        if (runtime.api_key_text.set(config.api_key, .api_key)) |which| rejected = which;
+        if (config.gateway_team) |team| {
+            if (runtime.gateway_team_text.set(team, .gateway_team)) |which| rejected = which;
+        }
+        if (runtime.worker_model_text.set(config.worker_model, .worker_model)) |which| rejected = which;
+        if (runtime.gateway_chat_url_text.set(config.gateway_chat_url, .gateway_chat_url)) |which| rejected = which;
+        runtime.rejected = rejected;
         return runtime;
     }
 
@@ -165,12 +193,16 @@ pub const Runtime = struct {
     pub fn configure(self: *Runtime, inputs: Inputs) void {
         self.config_mutex.lockUncancelable(io_mod.getIo());
         defer self.config_mutex.unlock(io_mod.getIo());
-        self.api_key_text.set(inputs.api_key, "api_key");
+        var rejected: ?Rejected = null;
+        if (self.api_key_text.set(inputs.api_key, .api_key)) |which| rejected = which;
         self.credential_source = inputs.credential_source;
-        if (inputs.gateway_team) |team| self.gateway_team_text.set(team, "gateway_team") else self.gateway_team_text.clear();
-        self.worker_model_text.set(inputs.worker_model, "worker_model");
+        if (inputs.gateway_team) |team| {
+            if (self.gateway_team_text.set(team, .gateway_team)) |which| rejected = which;
+        } else self.gateway_team_text.clear();
+        if (self.worker_model_text.set(inputs.worker_model, .worker_model)) |which| rejected = which;
         self.gateway_retry_count = inputs.gateway_retry_count;
-        self.gateway_chat_url_text.set(inputs.gateway_chat_url, "gateway_chat_url");
+        if (self.gateway_chat_url_text.set(inputs.gateway_chat_url, .gateway_chat_url)) |which| rejected = which;
+        self.rejected = rejected;
     }
 
     pub fn dispatchBackend(self: *Runtime) tool_dispatch.WebSearchBackend {
@@ -271,6 +303,12 @@ pub const Runtime = struct {
     pub fn inputsSnapshot(self: *Runtime, alloc: Allocator) !OwnedInputs {
         self.config_mutex.lockUncancelable(io_mod.getIo());
         defer self.config_mutex.unlock(io_mod.getIo());
+        if (self.rejected) |which| return switch (which) {
+            .api_key => error.WebSearchSignInTooLong,
+            .gateway_team => error.WebSearchTeamTooLong,
+            .worker_model => error.WebSearchModelTooLong,
+            .gateway_chat_url => error.WebSearchChatUrlTooLong,
+        };
         const api_key = try alloc.dupe(u8, self.api_key_text.slice());
         errdefer alloc.free(api_key);
         const gateway_team = if (self.gateway_team_text.len == 0) null else try alloc.dupe(u8, self.gateway_team_text.slice());
@@ -577,6 +615,38 @@ test "runtime routes configured inputs and backend selection through provider" {
     try std.testing.expect(fake.configured_inputs_seen);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expect(test_secondary_backend.eql(fake.last_backend.?));
+}
+
+test "a refused configured value fails the search before the provider runs" {
+    const alloc = std.testing.allocator;
+    var fake = FakeProvider{};
+    var runtime = fakeRuntime(&fake);
+    defer runtime.deinit();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const request = web_search_contract.Request{ .query = "latest Zig release" };
+
+    const too_long = try alloc.alloc(u8, max_api_key_bytes + 1);
+    defer alloc.free(too_long);
+    @memset(too_long, 'k');
+    runtime.configure(.{
+        .api_key = too_long,
+        .worker_model = "provider/private-worker",
+        .gateway_retry_count = 3,
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+    try std.testing.expectError(error.WebSearchSignInTooLong, runtime.execute(alloc, request, &cancel_flag));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    // A valid value of the refused one clears the mark.
+    runtime.configure(.{
+        .api_key = "provider-key",
+        .worker_model = "provider/private-worker",
+        .gateway_retry_count = 3,
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+    var output = try runtime.execute(alloc, request, &cancel_flag);
+    defer output.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
 test "runtime invokes primary backend after allow" {
@@ -986,11 +1056,10 @@ test "a value too long for the runtime clears it instead of keeping the old one"
         .gateway_chat_url = "https://gateway.test/chat",
     });
 
-    var snapshot = try runtime.inputsSnapshot(alloc);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.api_key.len);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.worker_model.len);
-    try std.testing.expectEqualStrings("https://gateway.test/chat", snapshot.gateway_chat_url);
+    // The value is cleared, and the next snapshot says which one, so a search
+    // fails with a message instead of sending nothing (the model is the last
+    // refused value here, so it is the one named).
+    try std.testing.expectError(error.WebSearchModelTooLong, runtime.inputsSnapshot(alloc));
 
     const trace = try readTraceFileForTest(alloc, trace_path);
     defer alloc.free(trace);
@@ -1029,6 +1098,65 @@ test "a value exactly at the cap is kept, for the key and the model" {
     try std.testing.expectEqual(max_worker_model_bytes, live.worker_model.len);
     try std.testing.expectEqual(key_at_cap[0], live.api_key[0]);
     try std.testing.expectEqual(model_at_cap[0], live.worker_model[0]);
+}
+
+test "a team and a chat URL exactly at their caps are kept" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(.{});
+    defer runtime.deinit();
+    const team_at_cap = try alloc.alloc(u8, max_gateway_team_bytes);
+    defer alloc.free(team_at_cap);
+    @memset(team_at_cap, 't');
+    const url_at_cap = try alloc.alloc(u8, max_gateway_chat_url_bytes);
+    defer alloc.free(url_at_cap);
+    @memset(url_at_cap, 'u');
+
+    runtime.configure(.{
+        .api_key = "key",
+        .gateway_team = team_at_cap,
+        .worker_model = "m",
+        .gateway_retry_count = 3,
+        .gateway_chat_url = url_at_cap,
+    });
+
+    var live = try runtime.inputsSnapshot(alloc);
+    defer live.deinit(alloc);
+    try std.testing.expectEqual(max_gateway_team_bytes, live.gateway_team.?.len);
+    try std.testing.expectEqual(max_gateway_chat_url_bytes, live.gateway_chat_url.len);
+}
+
+test "a team and a chat URL one byte over their caps are cleared and named" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(.{
+        .api_key = "key",
+        .gateway_team = "team-a",
+        .worker_model = "m",
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+    defer runtime.deinit();
+    const team_too_long = try alloc.alloc(u8, max_gateway_team_bytes + 1);
+    defer alloc.free(team_too_long);
+    @memset(team_too_long, 't');
+
+    runtime.configure(.{
+        .api_key = "key",
+        .gateway_team = team_too_long,
+        .worker_model = "m",
+        .gateway_retry_count = 3,
+        .gateway_chat_url = "https://gateway.test/chat",
+    });
+    try std.testing.expectError(error.WebSearchTeamTooLong, runtime.inputsSnapshot(alloc));
+
+    const url_too_long = try alloc.alloc(u8, max_gateway_chat_url_bytes + 1);
+    defer alloc.free(url_too_long);
+    @memset(url_too_long, 'u');
+    runtime.configure(.{
+        .api_key = "key",
+        .worker_model = "m",
+        .gateway_retry_count = 3,
+        .gateway_chat_url = url_too_long,
+    });
+    try std.testing.expectError(error.WebSearchChatUrlTooLong, runtime.inputsSnapshot(alloc));
 }
 
 test "a configure with a null team leaves the runtime holding no team" {

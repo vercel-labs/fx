@@ -5,6 +5,7 @@ const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const web_search_contract = @import("../../core/tooling/web_search_contract.zig");
+const web_search_runtime = @import("../../core/tooling/web_search_runtime.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -41,6 +42,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
 }
 
 fn backendFailure(alloc: Allocator, err: anyerror) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    if (try configuredValueMessage(alloc, err)) |message| return .{ .failure = message };
     const details = [_]tool_result_errors.Detail{
         .{ .name = "error", .value = .{ .string = @errorName(err) } },
     };
@@ -49,6 +51,22 @@ fn backendFailure(alloc: Allocator, err: anyerror) tool_dispatch.DispatchError!t
         .message = "web_search failed",
         .details = &details,
     }) };
+}
+
+/// A search that cannot run because `configure` refused a value over its cap
+/// says which value and which cap, instead of leaving the provider to send
+/// nothing of it (`src/core/tooling/web_search_runtime.zig` "a refused
+/// configured value fails the search before the provider runs").
+fn configuredValueMessage(alloc: Allocator, err: anyerror) !?[]u8 {
+    const RefusedValue = struct { what: []const u8, cap: usize };
+    const refused: RefusedValue = switch (err) {
+        error.WebSearchSignInTooLong => .{ .what = "sign-in", .cap = web_search_runtime.Caps.api_key },
+        error.WebSearchTeamTooLong => .{ .what = "team", .cap = web_search_runtime.Caps.gateway_team },
+        error.WebSearchModelTooLong => .{ .what = "worker model", .cap = web_search_runtime.Caps.worker_model },
+        error.WebSearchChatUrlTooLong => .{ .what = "gateway chat URL", .cap = web_search_runtime.Caps.gateway_chat_url },
+        else => return null,
+    };
+    return try std.fmt.allocPrint(alloc, "web_search cannot run: its {s} is longer than {d} bytes", .{ refused.what, refused.cap });
 }
 
 pub fn formatOutput(alloc: Allocator, output: Output) ![]u8 {
@@ -292,6 +310,24 @@ test "invalid web_search fails before permission and backend invocation" {
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.failure, result.status);
     try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", result.body);
     try std.testing.expectEqual(@as(usize, 0), permission_calls);
+}
+
+test "a refused configured value names the value and its cap" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { err: anyerror, what: []const u8, cap: usize }{
+        .{ .err = error.WebSearchSignInTooLong, .what = "sign-in", .cap = web_search_runtime.Caps.api_key },
+        .{ .err = error.WebSearchTeamTooLong, .what = "team", .cap = web_search_runtime.Caps.gateway_team },
+        .{ .err = error.WebSearchModelTooLong, .what = "worker model", .cap = web_search_runtime.Caps.worker_model },
+        .{ .err = error.WebSearchChatUrlTooLong, .what = "gateway chat URL", .cap = web_search_runtime.Caps.gateway_chat_url },
+    };
+    for (cases) |case| {
+        const message = (try configuredValueMessage(alloc, case.err)).?;
+        defer alloc.free(message);
+        const want = try std.fmt.allocPrint(alloc, "web_search cannot run: its {s} is longer than {d} bytes", .{ case.what, case.cap });
+        defer alloc.free(want);
+        try std.testing.expectEqualStrings(want, message);
+    }
+    try std.testing.expect((try configuredValueMessage(alloc, error.ProviderFailed)) == null);
 }
 
 test "output preserves ordered commentary search and error entries" {

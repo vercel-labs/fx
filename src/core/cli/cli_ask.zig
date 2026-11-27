@@ -294,13 +294,19 @@ fn runAskChild(
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
-    // The child copies the sign-in its run owns: the parent's next refresh
-    // frees the token `ctx.toolContext()` points at
-    // (`src/core/cli/cli_ask.zig` "an ask subagent keeps the sign-in a refresh
-    // replaces").
-    var sign_in = ChildSignIn.capture(ctx.alloc, ctx) catch return error.OutOfMemory;
+    // The child copies the sign-in its run owns, and web search is configured
+    // from that copy, in one section: the parent's next refresh frees the
+    // token `ctx.api_key` points at (`src/core/cli/cli_ask.zig` "an ask
+    // subagent keeps the sign-in a refresh replaces").
+    const child_setup = blk: {
+        ctx.credential_mutex.lockUncancelable(io_mod.getIo());
+        defer ctx.credential_mutex.unlock(io_mod.getIo());
+        const captured = ChildSignIn.captureLocked(ctx.alloc, ctx) catch return error.OutOfMemory;
+        break :blk .{ .sign_in = captured, .tool_context = ctx.toolContext() };
+    };
+    var sign_in = child_setup.sign_in;
     defer sign_in.deinit(ctx.alloc);
-    var tool_context = ctx.toolContext();
+    var tool_context = child_setup.tool_context;
     sign_in.apply(&tool_context);
     return subagent_agent_adapter.run(.{
         .toolbox_behind = ctx.toolbox_behind.slice(),
@@ -638,6 +644,13 @@ const ChildSignIn = struct {
     fn capture(alloc: Allocator, ctx: *AskContext) !ChildSignIn {
         ctx.credential_mutex.lockUncancelable(io_mod.getIo());
         defer ctx.credential_mutex.unlock(io_mod.getIo());
+        return captureLocked(alloc, ctx);
+    }
+
+    /// The same copy with `credential_mutex` already held, for `runAskChild`,
+    /// which configures web search from the copy in the same section: a
+    /// refresh would otherwise free the bytes `OwnedText.set` reads.
+    fn captureLocked(alloc: Allocator, ctx: *AskContext) !ChildSignIn {
         const api_key = try alloc.dupe(u8, ctx.api_key);
         errdefer secret.zeroAndFree(alloc, api_key);
         const account_id = if (ctx.account_id) |value| try alloc.dupe(u8, value) else null;
@@ -5447,6 +5460,61 @@ test "fx ask publishes a complete refreshed credential before later consumers" {
         "fresh-token",
         ctx.model_catalog_access.authorizationCredential().?,
     );
+}
+
+test "an ask subagent keeps the sign-in a refresh replaces" {
+    const alloc = std.testing.allocator;
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.api_key = "first-token";
+    ctx.credential_source = .fx_login;
+    ctx.gateway_team = "team_123";
+
+    // What `runAskChild` does, unchanged: one locked section copies the
+    // sign-in and configures web search from it.
+    const child_setup = blk: {
+        ctx.credential_mutex.lockUncancelable(io_mod.getIo());
+        defer ctx.credential_mutex.unlock(io_mod.getIo());
+        break :blk .{
+            .sign_in = try ChildSignIn.captureLocked(alloc, &ctx),
+            .tool_context = ctx.toolContext(),
+        };
+    };
+    var sign_in = child_setup.sign_in;
+    defer sign_in.deinit(alloc);
+    var child_ctx = child_setup.tool_context;
+    sign_in.apply(&child_ctx);
+
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "second-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_123"),
+    };
+    defer refreshed.deinit(alloc);
+    const worker_token = try adoptRefreshedAskCredential(&ctx, alloc, &refreshed);
+    defer secret.zeroAndFree(alloc, worker_token);
+
+    // The refresh replaced the parent's key and freed the one it held; the
+    // child and the runtime it configured still hold their own copies.
+    try std.testing.expectEqualStrings("second-token", ctx.api_key);
+    try std.testing.expectEqualStrings("first-token", child_ctx.api_key);
+    try std.testing.expect(child_ctx.api_key.ptr != ctx.api_key.ptr);
+    try std.testing.expectEqualStrings("team_123", child_ctx.gateway_team.?);
+    {
+        var live = try ctx.web_search_runtime.inputsSnapshot(alloc);
+        defer live.deinit(alloc);
+        try std.testing.expectEqualStrings("first-token", live.api_key);
+        try std.testing.expect(live.api_key.ptr != ctx.api_key.ptr);
+    }
 }
 
 test "fx ask refuses a refreshed login on another team" {
