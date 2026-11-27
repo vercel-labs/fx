@@ -20,7 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { FX_BIN, HAS_API_KEY, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, HAS_API_KEY, providerVersionTestEnv, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import {
   AUTO_EXA_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
@@ -710,7 +710,8 @@ class AcpClient {
     omitHome?: boolean;
   }): Promise<AcpClient> {
     const args = opts?.args ?? ["acp"];
-    const inheritedEnv: Record<string, string | undefined> = { ...process.env };
+    // The model-backed tests below start fx on the developer's own key.
+    const inheritedEnv: Record<string, string | undefined> = fxChildEnv({}, { keepCredentials: true });
     if (opts?.omitHome) delete inheritedEnv.HOME;
     for (const [key, value] of Object.entries(opts?.env ?? {})) {
       if (value === undefined) {
@@ -2969,7 +2970,7 @@ describe("acp: model-independent", () => {
       ]);
       const proc = nodeSpawn(FX_BIN, ["acp"], {
         cwd: root.workspace,
-        env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+        env: fxChildEnv({ ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" }),
         stdio: ["pipe", "pipe", "pipe"],
       });
       try {
@@ -3094,7 +3095,7 @@ describe("acp: model-independent", () => {
       ]);
       const proc = nodeSpawn(FX_BIN, ["acp"], {
         cwd: root.workspace,
-        env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+        env: fxChildEnv({ ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" }),
         stdio: ["pipe", "pipe", "pipe"],
       });
       try {
@@ -8638,7 +8639,7 @@ describe("acp: model-independent", () => {
     });
     const proc = nodeSpawn(FX_BIN, ["acp"], {
       cwd: root.workspace,
-      env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+      env: fxChildEnv({ ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" }),
       stdio: ["pipe", "pipe", "pipe"],
     });
     try {
@@ -11769,7 +11770,7 @@ describe("acp: model-independent", () => {
       ]);
       const proc = nodeSpawn(FX_BIN, ["acp"], {
         cwd: root.workspace,
-        env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+        env: fxChildEnv({ ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" }),
         stdio: ["pipe", "pipe", "pipe"],
       });
       let client: AcpClient | undefined;
