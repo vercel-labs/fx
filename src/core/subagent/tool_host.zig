@@ -1171,7 +1171,7 @@ pub const Runtime = struct {
             if (std.mem.eql(u8, item.child_id, child_id)) waiting += 1;
         }
         if (waiting >= max_pending_per_child) return error.QueueFull;
-        try self.ensureManagedChildSession(child_id, operation_id, effectiveDefaults(options.defaults, request.override(), resolved_model));
+        try self.ensureManagedChildSeedIfMissing(child_id, operation_id, effectiveDefaults(options.defaults, request.override(), resolved_model));
         var work = try makeManagedWork(self.alloc, operation_id, fingerprint, request, options);
         errdefer work.deinit(self.alloc);
         const owned_child = try self.alloc.dupe(u8, child_id);
@@ -3288,7 +3288,7 @@ pub const Runtime = struct {
                     .operation_conflict,
                 );
             }
-            try self.ensureManagedChildSession(
+            try self.ensureManagedChildSeedIfMissing(
                 existing.id,
                 operation_id,
                 defaults,
@@ -3320,7 +3320,8 @@ pub const Runtime = struct {
                 if (registry.findPersistent(message.agent)) |child| {
                     // Closing, it takes nothing; once gone, the name starts a new one.
                     if (self.closingIndexLocked(child.id) != null) return managedAdmissionRejected(alloc, child.id, .child_closing);
-                    if (request.override().present()) {
+                    const override = request.override();
+                    if (override.present() and !try self.overrideMatchesChild(alloc, child.*, override, resolved_model)) {
                         debug_trace.logf(
                             "subagent",
                             "admission rejected operation={s} child_id={s} agent={s} code=override_after_create",
@@ -3363,7 +3364,7 @@ pub const Runtime = struct {
                     // slot is a child marked running that takes no message.
                     // A child lost before its first turn has no log to
                     // resume, so its next work starts it fresh (D33).
-                    try self.ensureManagedChildSession(started.id, active.id, defaults);
+                    try self.ensureManagedChildSeedIfMissing(started.id, active.id, defaults);
                     var ready = try managedAdmissionReady(alloc, started.id, false);
                     errdefer ready.deinit(alloc);
                     try self.managed.state_store.save(alloc, registry);
@@ -3447,6 +3448,25 @@ pub const Runtime = struct {
         );
     }
 
+    fn ensureManagedChildSeedIfMissing(
+        self: *Runtime,
+        child_id: []const u8,
+        work_id: []const u8,
+        defaults: Defaults,
+    ) !void {
+        try self.children.ensureSeed(child_id, .{
+            .preferences = .{
+                .provider = defaults.provider,
+                .model = @constCast(defaults.model),
+                .effort = defaults.effort,
+                .fast_mode = defaults.fast_mode,
+                .ultrafast_mode = defaults.ultrafast_mode,
+            },
+            .language = defaults.conversation_language,
+        });
+        _ = work_id;
+    }
+
     fn managedResultText(
         self: *Runtime,
         alloc: Allocator,
@@ -3461,7 +3481,39 @@ pub const Runtime = struct {
 
     /// A child's saved preferences, read without opening it. Caller owns.
     fn childPreferences(self: *Runtime, alloc: Allocator, child_id: []const u8) !session_codec.DurableSessionPreferences {
-        return self.children.parent.store.childPreferences(alloc, child_id);
+        return self.children.parent.store.childPreferences(alloc, child_id) catch |err| switch (err) {
+            error.NotFound => if (try self.children.seedFor(alloc, child_id)) |seed|
+                seed.preferences
+            else
+                self.children.parent.currentPreferences(alloc),
+            else => return err,
+        };
+    }
+
+    /// True when every override field set on `override` matches the existing
+    /// child's current profile, model, and effort.
+    fn overrideMatchesChild(
+        self: *Runtime,
+        alloc: Allocator,
+        child: child_state.Child,
+        override: model_contract.Override,
+        resolved_model: ?[]const u8,
+    ) !bool {
+        if (override.profile) |requested_profile| {
+            const current_profile = child.profile orelse profiles.main_name;
+            if (!std.mem.eql(u8, requested_profile, current_profile)) return false;
+        }
+        if (override.model == null and override.effort == null) return true;
+        var current = try self.childPreferences(alloc, child.id);
+        defer current.deinit(alloc);
+        if (override.model) |requested_model| {
+            const effective_model = resolved_model orelse requested_model;
+            if (!std.mem.eql(u8, effective_model, current.model)) return false;
+        }
+        if (override.effort) |requested_effort| {
+            if (!requested_effort.eql(current.effort)) return false;
+        }
+        return true;
     }
 
     fn encodeManaged(
@@ -8739,6 +8791,7 @@ const OverrideResolverFixture = struct {
         self.runs += 1;
         var preferences = turn.child.?.currentPreferences(std.testing.allocator) catch return error.ProviderFailed;
         defer preferences.deinit(std.testing.allocator);
+        if (self.observed_model) |prev| std.testing.allocator.free(prev);
         self.observed_model = std.testing.allocator.dupe(u8, preferences.model) catch return error.ProviderFailed;
         if (!turn.worker.beginDirectProcessing(1)) return error.ProviderFailed;
         turn.commit(turn.active_work_id.?, .{ .assistant = .{
@@ -8873,6 +8926,123 @@ test "model override passes through for non-gateway providers" {
     try waitUntilQuiet(runtime);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs);
     try std.testing.expectEqualStrings("unknown-model", fixture.observed_model.?);
+}
+
+test "a subagent message that repeats its model and effort is accepted, while a different effort is refused" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const first = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first", .model = "openai/gpt-5", .effort = "low" } }, "call-1", null);
+    try std.testing.expect(std.mem.find(u8, first, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+
+    const repeated = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second", .model = "openai/gpt-5", .effort = "low" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, repeated, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+
+    const different_effort = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "third", .model = "openai/gpt-5", .effort = "high" } }, "call-3", null);
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"result\":\"model, effort and profile are fixed when a subagent is created, so this one keeps its own: send the message again without them. To change them, close it and start a new one, which loses its conversation.\",\"error_code\":\"override_after_create\"}",
+        different_effort,
+    );
+
+    // An effort equal to the child's default (.auto) is also accepted.
+    const auto_first = try callTool(runtime, arena, .{ .message = .{ .agent = "default-kid", .message = "first", .model = "openai/gpt-5" } }, "call-4", null);
+    try std.testing.expect(std.mem.find(u8, auto_first, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+    const auto_repeated = try callTool(runtime, arena, .{ .message = .{ .agent = "default-kid", .message = "second", .model = "openai/gpt-5", .effort = "default" } }, "call-5", null);
+    try std.testing.expect(std.mem.find(u8, auto_repeated, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+}
+
+test "a subagent message that repeats its profile is accepted, while a different profile is refused" {
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    try parent.tmp.dir.createDirPath(io, ".fx/agents/session-reviewer");
+    var settings = try parent.tmp.dir.createFile(io, ".fx/agents/session-reviewer/profile.json", .{});
+    defer settings.close(io);
+    try settings.writeStreamingAll(io, "{\"description\": \"Reads the session workspace\", \"tools\": [\"read_file\"]}");
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const first = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "look", .profile = "session-reviewer" } }, "call-1", null);
+    try std.testing.expect(std.mem.find(u8, first, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+
+    const repeated = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again", .profile = "session-reviewer" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, repeated, "\"ok\":true") != null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+
+    const different = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "switch", .profile = "main" } }, "call-3", null);
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"result\":\"model, effort and profile are fixed when a subagent is created, so this one keeps its own: send the message again without them. To change them, close it and start a new one, which loses its conversation.\",\"error_code\":\"override_after_create\"}",
+        different,
+    );
+}
+
+test "a subagent message whose model query resolves to the child's model is accepted" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = OverrideResolverFixture{};
+    defer if (fixture.observed_model) |model| alloc.free(model);
+    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const options = ExecuteOptions{
+        .caller_id = parent.parent.id(),
+        .invocation_id = "override-repeat-1",
+        .defaults = .{ .provider = .gateway, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .model_override_resolver = .{ .context = &fixture, .resolve_fn = OverrideResolverFixture.resolveModel },
+    };
+
+    var first_req = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "first", .model = "openai/gpt-5.6-terra-fast" } });
+    defer first_req.deinit(alloc);
+    const first = try runtime.executeManaged(arena, &first_req, options);
+    try std.testing.expect(first.success);
+    try waitUntilQuiet(runtime);
+
+    var second_req = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "second", .model = "terra-fast" } });
+    defer second_req.deinit(alloc);
+    var second_opts = options;
+    second_opts.invocation_id = "override-repeat-2";
+    const second = try runtime.executeManaged(arena, &second_req, second_opts);
+    try std.testing.expect(second.success);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs);
+
+    var third_req = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "third", .model = "astra" } });
+    defer third_req.deinit(alloc);
+    var third_opts = options;
+    third_opts.invocation_id = "override-repeat-3";
+    const third = try runtime.executeManaged(arena, &third_req, third_opts);
+    try std.testing.expect(!third.success);
+    try std.testing.expect(std.mem.find(u8, third.body, "\"error_code\":\"override_after_create\"") != null);
 }
 
 fn formatFailedResult(alloc: Allocator, failure: ?[]const u8, partial: ?[]const u8) ![]u8 {

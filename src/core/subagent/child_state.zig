@@ -619,6 +619,19 @@ pub const V2Children = struct {
         try self.seeds.put(self.alloc, key, owned);
     }
 
+    /// Remembers `seed` for `child_id` only when no seed is recorded yet.
+    pub fn ensureSeed(self: *V2Children, child_id: []const u8, seed: ChildSeed) !void {
+        self.state.lockUncancelable(io_mod.getIo());
+        defer self.state.unlock(io_mod.getIo());
+        if (self.seeds.contains(child_id)) return;
+        var owned = seed;
+        owned.preferences.model = try self.alloc.dupe(u8, seed.preferences.model);
+        errdefer self.alloc.free(owned.preferences.model);
+        const key = try self.alloc.dupe(u8, child_id);
+        errdefer self.alloc.free(key);
+        try self.seeds.put(self.alloc, key, owned);
+    }
+
     /// A copy of the seed for `child_id`, or null. Free its model.
     pub fn seedFor(self: *V2Children, alloc: Allocator, child_id: []const u8) !?ChildSeed {
         self.state.lockUncancelable(io_mod.getIo());
