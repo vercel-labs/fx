@@ -18,8 +18,8 @@
 # random behaviors; SIM_RUNS sets how many (default 20000). The witness-*
 # configs show that an edit is applied, prompted, and refused as stale.
 #
-# AgentWait models `fx tool agent wait`. The subagent's wait has landed, and it
-# reads its cancel flag; the bridge's agent operations have not landed yet.
+# AgentWait models `fx tool agent wait`: the subagent's wait reads its cancel
+# flag, and the bridge's agent operations call it with each request's flag.
 # agent-design must pass. agent-mutant-ignore-cancel and
 # agent-mutant-ignore-cancel-hang plant a wait that ignores its cancel flag, so
 # a wait whose program is gone never ends and its bash call never returns.

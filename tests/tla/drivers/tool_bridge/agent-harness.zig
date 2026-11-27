@@ -7,7 +7,8 @@
 //! `waitOrYield`, both with the real `yield_hold` and the real steering yield.
 //! The subagent wait is the host's `waitForMail` with a cancel flag, and the
 //! child's mail goes through the host's real message path into the parent's
-//! worker queue. Three things are glue until the bridge handler lands: the hold
+//! worker queue. The harness drives the wait directly, not through the bridge
+//! handler, which unit and E2E tests cover, so three things are glue: the hold
 //! is raised and lowered where bridge.zig raises it for a request, the cancel
 //! flag is set as the bridge's watch sets it when the client is gone, and the
 //! parent's turn takes the queued mail (`join`).

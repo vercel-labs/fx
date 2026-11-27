@@ -1,9 +1,9 @@
 ----------------------------- MODULE AgentWait -----------------------------
 (***************************************************************************)
 (* `fx tool agent wait`, sent by a bash program through the tool bridge.   *)
-(* The subagent wait is in the code, and it reads its cancel flag          *)
-(* (`tool_host.zig` `waitForWake`, since commit 490ea89719). The bridge's   *)
-(* agent operations have not landed yet.                                   *)
+(* The subagent wait reads its cancel flag (`tool_host.zig`                *)
+(* `waitForWake`), and the bridge's agent operations call it with each     *)
+(* request's cancel flag (`tool_runtime.zig` `runBridgeAgentCall`).        *)
 (*                                                                         *)
 (* The wait works as the subagent tool's `wait` does: it ends when a child *)
 (* posts mail for the parent, when no child can still post, or when its    *)
