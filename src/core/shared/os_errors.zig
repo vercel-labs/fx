@@ -19,7 +19,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 /// Every fx build links libc, whose `errno` holds the code after the call.
-const supported = builtin.link_libc and switch (builtin.target.os.tag) {
+/// Elsewhere, such as the wasm builds, nothing is noted, and the functions
+/// below compile to nothing.
+pub const supported = builtin.link_libc and switch (builtin.target.os.tag) {
     .macos, .linux => true,
     else => false,
 };
@@ -50,6 +52,7 @@ pub const Note = struct {
     /// The errno's name without its `E`, such as `INVAL`, or null when it
     /// is 0 or has no name on this OS.
     pub fn errnoName(self: Note) ?[]const u8 {
+        if (comptime !supported) return null;
         if (self.errno == 0) return null;
         const err = std.enums.fromInt(std.posix.E, self.errno) orelse return null;
         // Linux's `E` is non-exhaustive, so `@tagName` would panic on a
@@ -67,6 +70,7 @@ var total: u64 = 0;
 
 /// Keeps a note of `call` failing with `errno`.
 pub fn note(io: std.Io, call: Call, errno: u16) void {
+    if (comptime !supported) return;
     const now = std.Io.Timestamp.now(io, .real);
     const entry: Note = .{
         .at_ms = @intCast(@divFloor(now.nanoseconds, std.time.ns_per_ms)),
@@ -83,6 +87,7 @@ pub fn note(io: std.Io, call: Call, errno: u16) void {
 
 /// Copies the newest kept notes into `out`, oldest first.
 pub fn snapshot(io: std.Io, out: []Note) usize {
+    if (comptime !supported) return 0;
     mutex.lockUncancelable(io);
     defer mutex.unlock(io);
     const n = @min(stored, out.len);
@@ -92,12 +97,14 @@ pub fn snapshot(io: std.Io, out: []Note) usize {
 
 /// Notes this session, including those no longer kept.
 pub fn count(io: std.Io) u64 {
+    if (comptime !supported) return 0;
     mutex.lockUncancelable(io);
     defer mutex.unlock(io);
     return total;
 }
 
 pub fn reset(io: std.Io) void {
+    if (comptime !supported) return;
     mutex.lockUncancelable(io);
     defer mutex.unlock(io);
     head = 0;
@@ -167,6 +174,7 @@ fn unexpectedCall(result: std.Io.Operation.Result) ?Call {
 }
 
 test "notes keep the call and errno and drop the oldest past capacity" {
+    if (comptime !supported) return error.SkipZigTest;
     const io = std.testing.io;
     reset(io);
     defer reset(io);

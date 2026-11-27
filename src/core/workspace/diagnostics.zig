@@ -95,6 +95,8 @@ pub fn networkLifetimeStats() NetworkLifetimeStats {
 
 pub const OsError = os_errors.Note;
 pub const os_error_capacity = os_errors.capacity;
+/// False where no OS error is ever kept, such as the wasm builds.
+pub const os_errors_kept = os_errors.supported;
 
 /// Copies the kept OS errors behind network `error.Unexpected` results,
 /// oldest first.

@@ -971,6 +971,7 @@ fn writeNetworkProblems(p: *Records) !void {
 
 /// The newest OS errors behind network calls that failed as `Unexpected`.
 fn writeOsErrorProblems(p: *Records) !void {
+    if (comptime !diagnostics.os_errors_kept) return;
     var notes: [diagnostics.os_error_capacity]diagnostics.OsError = undefined;
     const count = diagnostics.snapshotOsErrors(&notes);
     var index = count;
@@ -1695,6 +1696,7 @@ noinline fn writeNetwork(r: *Records) !void {
         try writeNetworkCallFields(r, call);
         try r.end();
     }
+    if (comptime !diagnostics.os_errors_kept) return;
     var notes: [diagnostics.os_error_capacity]diagnostics.OsError = undefined;
     for (notes[0..diagnostics.snapshotOsErrors(&notes)]) |note| {
         try r.begin("os_error");
