@@ -26,6 +26,26 @@ const assistant_presentation = @import("assistant_presentation.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
+/// The provider, effort, and speed a turn's requests use, copied from its
+/// queued prompt when the turn starts. The model is not copied: the turn context
+/// names it from the same prompt. It owns no memory, so a copy holds no reference
+/// into the worker.
+pub const ActiveTurnSelection = struct {
+    provider: model_provider.ProviderId,
+    effort: types.ReasoningEffort,
+    fast_mode: bool,
+    ultrafast_mode: bool,
+
+    pub fn init(provider: model_provider.ProviderId, settings: AgentTurnSettings) ActiveTurnSelection {
+        return .{
+            .provider = provider,
+            .effort = settings.effort,
+            .fast_mode = settings.fast_mode,
+            .ultrafast_mode = settings.ultrafast_mode,
+        };
+    }
+};
+
 pub const AgentTurnSettings = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     auto_compact_percent: u8 = compactor.default_percent,
@@ -809,6 +829,7 @@ pub const WorkerRuntime = struct {
     pending_question_response: QuestionResponse = .pending,
     agent_turn_settings: AgentTurnSettings = .{},
     active_agent_turn_settings: ?AgentTurnSettings = null,
+    active_turn_selection: ?ActiveTurnSelection = null,
     active_context_snapshot: ?*const context_contract.GatheredContextSnapshot = null,
     active_prompt_snapshot_ownership: ?*ActivePromptSnapshotOwnership = null,
     preserve_prompt_snapshot_turn_id: ?u64 = null,
@@ -3419,6 +3440,26 @@ pub const WorkerRuntime = struct {
         self.active_agent_turn_settings = null;
     }
 
+    pub fn setActiveTurnSelection(self: *WorkerRuntime, selection: ActiveTurnSelection) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.active_turn_selection = selection;
+    }
+
+    pub fn clearActiveTurnSelection(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.active_turn_selection = null;
+    }
+
+    /// A copy of the active turn's selection, or null between turns. The copy
+    /// owns no memory, so it stays valid after the turn ends.
+    pub fn activeTurnSelection(self: *WorkerRuntime) ?ActiveTurnSelection {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.active_turn_selection;
+    }
+
     pub fn effectiveAgentTurnSettings(self: *WorkerRuntime) AgentTurnSettings {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -4520,6 +4561,36 @@ test "session transfer preserves active and finished prompt snapshots" {
         try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
         try std.Io.Dir.deleteFileAbsolute(std.testing.io, path);
     }
+}
+
+test "the active turn selection is a copy that ends with its turn, so the next turn reads its own" {
+    var runtime: WorkerRuntime = .{};
+    defer runtime.deinit(std.testing.allocator);
+
+    const turn_a = ActiveTurnSelection.init(.gateway, .{
+        .effort = types.ReasoningEffort.literal("high"),
+        .fast_mode = true,
+    });
+    runtime.setActiveTurnSelection(turn_a);
+    const copy_a = runtime.activeTurnSelection().?;
+    try std.testing.expectEqualStrings("high", copy_a.effort.label());
+    try std.testing.expect(copy_a.fast_mode);
+    try std.testing.expect(!copy_a.ultrafast_mode);
+
+    runtime.clearActiveTurnSelection();
+    try std.testing.expect(runtime.activeTurnSelection() == null);
+    try std.testing.expectEqualStrings("high", copy_a.effort.label());
+
+    const turn_b = ActiveTurnSelection.init(.codex, .{
+        .effort = types.ReasoningEffort.literal("low"),
+        .ultrafast_mode = true,
+    });
+    runtime.setActiveTurnSelection(turn_b);
+    const next = runtime.activeTurnSelection().?;
+    try std.testing.expectEqualStrings("low", next.effort.label());
+    try std.testing.expect(next.ultrafast_mode);
+    try std.testing.expect(next.provider == .codex);
+    runtime.clearActiveTurnSelection();
 }
 
 test "wait card: the continue selection is taken once, then gone" {

@@ -21,6 +21,7 @@ import {
   fakeGatewayFinalText,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  fakeShellRun,
   hasEmptyComposer,
   heldFakeGatewayFinalText,
   isComposerLine,
@@ -936,6 +937,71 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await s.waitForText('already named "same"', 5_000);
 
       expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TEST_TIMEOUT,
+  );
+
+  // The turn context's `model:` line is followed by the turn's provider, effort, and speed.
+  const TURN_CATALOG = [
+    {
+      id: "private-team/current-fast",
+      type: "language",
+      released: 300,
+      tags: ["reasoning", "tool-use"],
+      reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+      fast_options: [{ type: "toggle" }],
+      context_window: 200_000,
+    },
+  ];
+
+  function turnContextOf(body: string): string {
+    const request = JSON.parse(body) as { prompt: Array<{ content: unknown }> };
+    return request.prompt.map((message) => nestedText(message.content)).find((text) => text.includes("<fx-turn-context>")) ?? "";
+  }
+
+  test(
+    "the turn context names the turn's provider, effort, and speed in every request of the turn",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      writeFileSync(fixture.settingsPath, `${JSON.stringify({ effort: "high", fast_mode: true })}\n`);
+      gateway = startFakeGateway(
+        [
+          fakeShellRun("turn-context-probe", "echo TURN_CONTEXT_PROBE"),
+          fakeGatewayFinalText("TURN_CONTEXT_COMPLETE"),
+        ],
+        { models: TURN_CATALOG },
+      );
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-turn-context-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: "private-team/current-fast",
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+        stderrPath: fixture.stderrPath,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("Review this change.");
+      await session.waitForPane((pane) => pane.includes("TURN_CONTEXT_COMPLETE") && turnSettled(pane), 15_000);
+
+      expect(gateway.requests).toHaveLength(2);
+      for (const request of gateway.requests) {
+        expect(turnContextOf(request.body)).toContain(
+          "model: private-team/current-fast\nprovider: gateway\neffort: high\nfast_mode: true\nultrafast_mode: false\nhome_directory: ",
+        );
+      }
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
     },
     TEST_TIMEOUT,
   );
