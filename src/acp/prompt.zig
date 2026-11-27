@@ -1430,12 +1430,7 @@ pub fn handlePromptWithInputId(
     if (prompt_input.continue_recovery and session.journal != null) {
         // A journaled libfx session resumes the turn its journal left open.
         const journal = &session.journal.?;
-        const pending = journal.pending_resume orelse return .{
-            .rpc_error = .{
-                .code = ErrorCode.invalid_params,
-                .message = "No interrupted turn to resume",
-            },
-        };
+        const pending = journal.pending_resume orelse return noInterruptedTurn();
         // Inputs the crashed turn accepted and never placed go to the model
         // with the resume, and its first progress places them.
         const inputs = journal.takePendingInputs();
@@ -1469,7 +1464,7 @@ pub fn handlePromptWithInputId(
         const found = (try v2.interruptedRequest()) orelse return noInterruptedTurn();
         if (prompt_input.rerun_call_ids.len > 0) {
             // A native log has no journal to answer a rerun from, so the ids are dropped.
-            debug_trace.logf("session", "event=acp_resume_rerun_ignored count={d}", .{prompt_input.rerun_call_ids.len});
+            debug_trace.logf("session", "event=acp_resume_rerun_ignored count={d} reason=native_log_has_no_journal", .{prompt_input.rerun_call_ids.len});
         }
         native_taken = session.session_rt.takeNewestTurn() orelse return noInterruptedTurn();
         const entry = switch (native_taken.?.turn) {
