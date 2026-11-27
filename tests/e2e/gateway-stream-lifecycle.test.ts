@@ -17335,3 +17335,46 @@ test("a subagent started with its own model names that child model in its turn c
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 45_000);
+
+test("fx ask --json encodes control bytes in permission target resolution failure messages", async () => {
+  const root = createFixtureRoot("encode-permission-paths");
+  const tracePath = join(root.root, "trace.log");
+  writeFileSync(
+    join(root.home, ".fx", "settings.json"),
+    JSON.stringify({ permission_mode: "full-access" }),
+  );
+  const badPath = "/nonexistent_eb47_dir/x\u001b]0;rd\u0007";
+  const responses = [
+    fakeGatewayToolCall("read_bad_path_1", "read_file", { path: badPath }),
+    fakeGatewayFinalText("Saw encoded missing-path error."),
+  ];
+  const gateway = startGateway(() =>
+    responses.shift() ?? new Response("unexpected request", { status: 500 })
+  );
+  try {
+    const result = await runFx(
+      ["ask", "--json", "Read the missing path."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 15_000,
+      },
+    );
+    expect(result.code, `stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(0);
+    const json = parseAskJson(result.stdout);
+    expect(json.exit_code).toBe(0);
+    expect(json.output).toBe("Saw encoded missing-path error.");
+    expect(gateway.requestCount()).toBe(2);
+    const nextRequestBody = gateway.requests[1]!.body;
+    const toolOutput = toolResultOutput(nextRequestBody, "read_bad_path_1");
+    expect(toolOutput).not.toContain("\u001b");
+    expect(toolOutput).not.toContain("\u0007");
+    expect(toolOutput).toContain("Path not found: /nonexistent_eb47_dir/x&#x1b;]0;rd&#x07;");
+    expect(json.tool_calls).toContainEqual(
+      expect.objectContaining({ name: "read_file", status: "error" }),
+    );
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+});

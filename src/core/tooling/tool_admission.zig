@@ -12,6 +12,7 @@ const file_mutation = @import("file_mutation.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
+const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const diff_mod = @import("../output/diff.zig");
 const pathing = @import("../workspace/pathing.zig");
@@ -2679,12 +2680,12 @@ pub fn permissionTargetResolutionFailureMessage(
     const path_arg = try targetPathForFailureMessage(arena, call);
     if (reason) |text| {
         return if (path_arg) |path|
-            try arena.print("{s}: {s}", .{ text, path })
+            try arena.print("{s}: {f}", .{ text, model_context_encoding.scalar(path) })
         else
             try arena.dupe(u8, text);
     }
     return if (path_arg) |path|
-        try arena.print("Cannot resolve path \"{s}\": {s}", .{ path, @errorName(err) })
+        try arena.print("Cannot resolve path \"{f}\": {s}", .{ model_context_encoding.scalar(path), @errorName(err) })
     else
         try arena.print("Cannot resolve tool target path: {s}", .{@errorName(err)});
 }
@@ -2920,6 +2921,45 @@ test "permission target failures name the unresolved path without hiding runtime
 
     for ([_]anyerror{ error.OutOfMemory, error.Cancelled, error.HostAuthorityUnavailable }) |err| {
         try std.testing.expectEqual(null, try permissionTargetResolutionFailureMessage(arena, call, err));
+    }
+}
+
+test "permission target resolution failures encode control bytes in model paths" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const file_call: ToolCall = .{
+        .id = "read_esc_bel",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"/nonexistent_eb47_dir/x\\u001b]0;rd\\u0007\"}",
+    };
+    const cmd_call: ToolCall = .{
+        .id = "shell_esc_bel",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"ls\",\"cwd\":\"/nonexistent_eb47_dir/x\\u001b]0;rd\\u0007\"}",
+    };
+
+    const cases = [_]struct { call: ToolCall, err: anyerror, expected: []const u8 }{
+        .{ .call = file_call, .err = error.FileNotFound, .expected = "Path not found: /nonexistent_eb47_dir/x&#x1b;]0;rd&#x07;" },
+        .{ .call = file_call, .err = error.NotDir, .expected = "Path is not a directory: /nonexistent_eb47_dir/x&#x1b;]0;rd&#x07;" },
+        .{ .call = file_call, .err = error.AccessDenied, .expected = "Access denied for path: /nonexistent_eb47_dir/x&#x1b;]0;rd&#x07;" },
+        .{ .call = file_call, .err = error.PermissionDenied, .expected = "Access denied for path: /nonexistent_eb47_dir/x&#x1b;]0;rd&#x07;" },
+        .{ .call = file_call, .err = error.PathOutsideWorkspace, .expected = "Path is outside the workspace: /nonexistent_eb47_dir/x&#x1b;]0;rd&#x07;" },
+        .{ .call = file_call, .err = error.SymLinkLoop, .expected = "Cannot resolve path \"/nonexistent_eb47_dir/x&#x1b;]0;rd&#x07;\": SymLinkLoop" },
+        .{ .call = cmd_call, .err = error.NameTooLong, .expected = "Cannot resolve path \"/nonexistent_eb47_dir/x&#x1b;]0;rd&#x07;\": NameTooLong" },
+        .{ .call = cmd_call, .err = error.BadPathName, .expected = "Cannot resolve path \"/nonexistent_eb47_dir/x&#x1b;]0;rd&#x07;\": BadPathName" },
+        .{ .call = cmd_call, .err = error.InputOutput, .expected = "Cannot resolve path \"/nonexistent_eb47_dir/x&#x1b;]0;rd&#x07;\": InputOutput" },
+        .{ .call = cmd_call, .err = error.HomeNotSet, .expected = "Cannot resolve path \"/nonexistent_eb47_dir/x&#x1b;]0;rd&#x07;\": HomeNotSet" },
+        .{ .call = cmd_call, .err = error.InvalidPath, .expected = "Cannot resolve path \"/nonexistent_eb47_dir/x&#x1b;]0;rd&#x07;\": InvalidPath" },
+        .{ .call = cmd_call, .err = error.WorkspaceUnavailable, .expected = "Cannot resolve path \"/nonexistent_eb47_dir/x&#x1b;]0;rd&#x07;\": WorkspaceUnavailable" },
+    };
+    for (cases) |case| {
+        const failure = (try permissionTargetResolutionFailureMessage(arena, case.call, case.err)) orelse
+            return error.TestExpectedToolFailure;
+        try std.testing.expect(std.mem.findScalar(u8, failure, 0x1b) == null);
+        try std.testing.expect(std.mem.findScalar(u8, failure, 0x07) == null);
+        try std.testing.expectEqualStrings(case.expected, failure);
     }
 }
 
