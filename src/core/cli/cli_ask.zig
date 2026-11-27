@@ -1234,9 +1234,41 @@ fn selectOutputMode(quiet: bool, json: bool, stdout_is_tty: bool, no_color: bool
     return if (no_color) .terminal_no_color else .terminal;
 }
 
-fn selectAskOutputMode(quiet: bool, json: bool, stream_events: bool, stdout_is_tty: bool, no_color: bool) OutputMode {
-    if (stream_events) return .stream_events;
-    return selectOutputMode(quiet, json, stdout_is_tty, no_color);
+const OutputModeOptions = struct {
+    quiet: bool = false,
+    json: bool = false,
+    stream_events: bool = false,
+    stdout_is_tty: bool = false,
+    no_color: bool = false,
+};
+
+fn selectAskOutputMode(opts: OutputModeOptions) OutputMode {
+    if (opts.stream_events) return .stream_events;
+    return selectOutputMode(opts.quiet, opts.json, opts.stdout_is_tty, opts.no_color);
+}
+
+fn interruptStreamResultExitCode(stream_events: bool) u8 {
+    const code = headless_interrupt.exitCode();
+    if (stream_events) {
+        debug_trace.logf("cli_ask", "stream result dropped reason=interrupted exit={d}", .{code});
+    }
+    return code;
+}
+
+fn writeErrorResultOutput(
+    alloc: Allocator,
+    deps: RunDeps,
+    stream_events: bool,
+    err_name: []const u8,
+    exit_code: u8,
+) !void {
+    const encoded = try renderResultObject(alloc, .{
+        .exit_code = exit_code,
+        .assistant_output = &.{},
+        .error_code = err_name,
+    }, stream_events);
+    defer alloc.free(encoded);
+    try deps.write_stdout(deps.stdout_ctx, encoded);
 }
 
 fn askElicitationCapabilities(
@@ -1282,92 +1314,88 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     defer interrupt_scope.restoreAndRedeliver();
 
     var problem: AskUsageProblem = .none;
-    var options = parseAskOptions(alloc, args, deps.stdin_source, &problem) catch |err| switch (err) {
-        error.MissingPrompt => {
-            if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err), output_contracts.usage_exit_code);
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
+    var options = parseAskOptions(alloc, args, deps.stdin_source, &problem) catch |err| {
+        const emit_json = hasJsonFlag(args);
+        const emit_stream = hasStandaloneStreamEventsFlag(args);
+        switch (err) {
+            error.MissingPrompt => {
+                if (!emit_json) {
+                    try deps.write_stderr(deps.stderr_ctx, "fx ask: missing prompt\n");
+                    try writeAskUsage(deps, cfg.command_usage);
+                }
+                if (emit_json or emit_stream) {
+                    try writeErrorResultOutput(alloc, deps, emit_stream, @errorName(err), output_contracts.usage_exit_code);
+                }
                 return output_contracts.usage_exit_code;
-            }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: missing prompt\n");
-            try writeAskUsage(deps, cfg.command_usage);
-            return output_contracts.usage_exit_code;
-        },
-        error.NoSaveResumeConflict => {
-            if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, "InvalidAskArgs", output_contracts.usage_exit_code);
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
+            },
+            error.NoSaveResumeConflict => {
+                if (!emit_json) {
+                    try deps.write_stderr(deps.stderr_ctx, "fx ask: --no-save cannot be used with --resume\n");
+                    try writeAskUsage(deps, cfg.command_usage);
+                }
+                if (emit_json or emit_stream) {
+                    try writeErrorResultOutput(alloc, deps, emit_stream, "InvalidAskArgs", output_contracts.usage_exit_code);
+                }
                 return output_contracts.usage_exit_code;
-            }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: --no-save cannot be used with --resume\n");
-            try writeAskUsage(deps, cfg.command_usage);
-            return output_contracts.usage_exit_code;
-        },
-        error.OutputModeConflict => {
-            if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, "InvalidAskArgs", output_contracts.usage_exit_code);
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
+            },
+            error.OutputModeConflict => {
+                if (emit_json) {
+                    try writeErrorResultOutput(alloc, deps, false, "InvalidAskArgs", output_contracts.usage_exit_code);
+                    return output_contracts.usage_exit_code;
+                }
+                try deps.write_stderr(deps.stderr_ctx, "fx ask: --stream-events cannot be used with --json or --quiet\n");
+                try writeAskUsage(deps, cfg.command_usage);
                 return output_contracts.usage_exit_code;
-            }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: --stream-events cannot be used with --json or --quiet\n");
-            try writeAskUsage(deps, cfg.command_usage);
-            return output_contracts.usage_exit_code;
-        },
-        error.PromptResourceLimitExceeded => {
-            if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err), 1);
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
+            },
+            error.PromptResourceLimitExceeded => {
+                if (!emit_json) {
+                    try deps.write_stderr(deps.stderr_ctx, "fx ask: prompt exceeds the local input safety limit\n");
+                }
+                if (emit_json or emit_stream) {
+                    try writeErrorResultOutput(alloc, deps, emit_stream, @errorName(err), 1);
+                }
                 return 1;
-            }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: prompt exceeds the local input safety limit\n");
-            return 1;
-        },
-        error.PromptInputReadFailed => {
-            if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err), 1);
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
+            },
+            error.PromptInputReadFailed => {
+                if (!emit_json) {
+                    try deps.write_stderr(deps.stderr_ctx, "fx ask: failed to read prompt from stdin\n");
+                }
+                if (emit_json or emit_stream) {
+                    try writeErrorResultOutput(alloc, deps, emit_stream, @errorName(err), 1);
+                }
                 return 1;
-            }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: failed to read prompt from stdin\n");
-            return 1;
-        },
-        error.InvalidAskArgs => {
-            if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err), output_contracts.usage_exit_code);
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
+            },
+            error.InvalidAskArgs => {
+                if (!emit_json) {
+                    try writeAskUsageProblem(alloc, deps, problem);
+                    try writeAskUsage(deps, cfg.command_usage);
+                }
+                if (emit_json or emit_stream) {
+                    try writeErrorResultOutput(alloc, deps, emit_stream, @errorName(err), output_contracts.usage_exit_code);
+                }
                 return output_contracts.usage_exit_code;
-            }
-            try writeAskUsageProblem(alloc, deps, problem);
-            try writeAskUsage(deps, cfg.command_usage);
-            return output_contracts.usage_exit_code;
-        },
-        error.InvalidPromptText => {
-            if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err), 1);
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
+            },
+            error.InvalidPromptText => {
+                if (!emit_json) {
+                    try deps.write_stderr(deps.stderr_ctx, "fx ask: prompt must be valid UTF-8 and contain no NUL bytes\n");
+                }
+                if (emit_json or emit_stream) {
+                    try writeErrorResultOutput(alloc, deps, emit_stream, @errorName(err), 1);
+                }
                 return 1;
-            }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: prompt must be valid UTF-8 and contain no NUL bytes\n");
-            return 1;
-        },
-        else => return err,
+            },
+            else => return err,
+        }
     };
     defer options.deinit(alloc);
 
-    if (interrupt_scope.requested()) return headless_interrupt.exitCode();
+    if (interrupt_scope.requested()) return interruptStreamResultExitCode(options.stream_events);
     if (options.image_paths.items.len > 0) {
         const workspace_root = try io_mod.realpathAlloc(alloc, ".");
         defer alloc.free(workspace_root);
         if (!try preflightAskImages(alloc, workspace_root, &options, deps)) return 1;
     }
-    if (interrupt_scope.requested()) return headless_interrupt.exitCode();
+    if (interrupt_scope.requested()) return interruptStreamResultExitCode(options.stream_events);
 
     var effective_cfg = cfg;
     if (options.system_prompt_override) |sp| {
@@ -1376,13 +1404,13 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
 
     // NO_COLOR and TERM=dumb turn color off, like --no-color.
     const no_color = options.no_color or terminal_env.colorDisabled();
-    const output_mode = selectAskOutputMode(
-        options.quiet,
-        options.json_output,
-        options.stream_events,
-        deps.stdout_is_tty(deps.stdout_ctx),
-        no_color,
-    );
+    const output_mode = selectAskOutputMode(.{
+        .quiet = options.quiet,
+        .json = options.json_output,
+        .stream_events = options.stream_events,
+        .stdout_is_tty = deps.stdout_is_tty(deps.stdout_ctx),
+        .no_color = no_color,
+    });
     const result = runPromptInternal(alloc, options.prompt, options.agent.permission, effective_cfg, .{
         .output_mode = output_mode,
         .prompt_permissions = options.prompt_permissions,
@@ -1401,7 +1429,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         .settings_overrides = options.settings_overrides.items,
         .deps = deps,
     }) catch |err| {
-        if (interrupt_scope.requested()) return headless_interrupt.exitCode();
+        if (interrupt_scope.requested()) return interruptStreamResultExitCode(options.stream_events);
         if (err == error.OutOfMemory or
             err == error.TerminalHungUp or
             err == error.TerminalInputClosed or
@@ -1411,14 +1439,8 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         }
         // The reason is on stderr already; JSON keeps the code it always had.
         if (err == error.SessionConversionRefused) {
-            if (options.json_output) {
-                const json = try renderErrorJsonResult(alloc, @errorName(error.InvalidSessionFormat), 1);
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
-            } else if (options.stream_events) {
-                const event = try renderErrorStreamEventResult(alloc, @errorName(error.InvalidSessionFormat), 1);
-                defer alloc.free(event);
-                try deps.write_stdout(deps.stdout_ctx, event);
+            if (options.json_output or options.stream_events) {
+                try writeErrorResultOutput(alloc, deps, options.stream_events, @errorName(error.InvalidSessionFormat), 1);
             }
             return 1;
         }
@@ -1428,9 +1450,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
                 "fx ask: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n",
             );
             if (options.stream_events) {
-                const event = try renderErrorStreamEventResult(alloc, @errorName(err), 1);
-                defer alloc.free(event);
-                try deps.write_stdout(deps.stdout_ctx, event);
+                try writeErrorResultOutput(alloc, deps, true, @errorName(err), 1);
             }
             return 1;
         }
@@ -1440,60 +1460,50 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
             const from_flag = options.agent.provider != null;
             const code: u8 = if (from_flag) output_contracts.usage_exit_code else 1;
             const name = if (options.agent.provider) |provider| provider.label() else config_runtime.providerEnvOverride() orelse "";
-            if (options.json_output) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err), code);
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
-                return code;
+            if (!options.json_output) {
+                const message = try config_runtime.unknownProviderMessage(alloc, name);
+                defer alloc.free(message);
+                try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
+                try deps.write_stderr(deps.stderr_ctx, message);
+                try deps.write_stderr(deps.stderr_ctx, "\n");
             }
-            const message = try config_runtime.unknownProviderMessage(alloc, name);
-            defer alloc.free(message);
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
-            try deps.write_stderr(deps.stderr_ctx, message);
-            try deps.write_stderr(deps.stderr_ctx, "\n");
-            if (options.stream_events) {
-                const event = try renderErrorStreamEventResult(alloc, @errorName(err), code);
-                defer alloc.free(event);
-                try deps.write_stdout(deps.stdout_ctx, event);
+            if (options.json_output or options.stream_events) {
+                try writeErrorResultOutput(alloc, deps, options.stream_events, @errorName(err), code);
             }
             return code;
         }
         if (!options.json_output) {
-            const notice = askErrorNotice(err) orelse return err;
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
-            try deps.write_stderr(deps.stderr_ctx, notice);
-            try deps.write_stderr(deps.stderr_ctx, "\n");
-            if (options.stream_events) {
-                const event = try renderErrorStreamEventResult(alloc, @errorName(err), 1);
-                defer alloc.free(event);
-                try deps.write_stdout(deps.stdout_ctx, event);
+            if (askErrorNotice(err)) |notice| {
+                try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
+                try deps.write_stderr(deps.stderr_ctx, notice);
+                try deps.write_stderr(deps.stderr_ctx, "\n");
+            } else if (options.stream_events) {
+                try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
+                try deps.write_stderr(deps.stderr_ctx, @errorName(err));
+                try deps.write_stderr(deps.stderr_ctx, "\n");
+            } else {
+                return err;
             }
-            return 1;
         }
-        const json = try renderErrorJsonResult(alloc, @errorName(err), 1);
-        defer alloc.free(json);
-        try deps.write_stdout(deps.stdout_ctx, json);
+        if (options.json_output or options.stream_events) {
+            try writeErrorResultOutput(alloc, deps, options.stream_events, @errorName(err), 1);
+        }
         return 1;
     };
     defer result.deinit(alloc);
 
     if (result.interrupted or interrupt_scope.requested()) {
-        return headless_interrupt.exitCode();
+        return interruptStreamResultExitCode(options.stream_events);
     }
     // The answer is in the saved session, but the reader never got it.
     if (result.output_reader_gone) return error.OutputReaderGone;
     if (result.output_write_failed) return error.OutputWriteFailed;
 
-    if (options.json_output) {
-        const json = try renderFinalJsonResult(alloc, result);
-        defer alloc.free(json);
-        if (interrupt_scope.requested()) return headless_interrupt.exitCode();
-        try deps.write_stdout(deps.stdout_ctx, json);
-    } else if (options.stream_events) {
-        const event = try renderFinalStreamEventResult(alloc, result);
-        defer alloc.free(event);
-        if (interrupt_scope.requested()) return headless_interrupt.exitCode();
-        try deps.write_stdout(deps.stdout_ctx, event);
+    if (options.json_output or options.stream_events) {
+        const encoded = try renderResultObject(alloc, result, options.stream_events);
+        defer alloc.free(encoded);
+        if (interrupt_scope.requested()) return interruptStreamResultExitCode(options.stream_events);
+        try deps.write_stdout(deps.stdout_ctx, encoded);
     }
 
     return if (interrupt_scope.requested())
@@ -1521,24 +1531,16 @@ fn preflightAskImages(
                 error.ImageTooLarge => image_attachments.image_too_large_notice,
                 else => @errorName(err),
             };
-            if (options.json_output) {
-                const detail = try alloc.print("{s}: {s}", .{ @errorName(err), image_path });
-                defer alloc.free(detail);
-                const json = try renderErrorJsonResult(alloc, detail, 1);
-                defer alloc.free(json);
-                try deps.write_stdout(deps.stdout_ctx, json);
-            } else {
+            if (!options.json_output) {
                 var message: std.Io.Writer.Allocating = .init(alloc);
                 defer message.deinit();
                 try message.writer.print("fx ask: failed to attach image \"{s}\": {s}\n", .{ image_path, reason });
                 try deps.write_stderr(deps.stderr_ctx, message.written());
-                if (options.stream_events) {
-                    const detail = try alloc.print("{s}: {s}", .{ @errorName(err), image_path });
-                    defer alloc.free(detail);
-                    const event = try renderErrorStreamEventResult(alloc, detail, 1);
-                    defer alloc.free(event);
-                    try deps.write_stdout(deps.stdout_ctx, event);
-                }
+            }
+            if (options.json_output or options.stream_events) {
+                const detail = try alloc.print("{s}: {s}", .{ @errorName(err), image_path });
+                defer alloc.free(detail);
+                try writeErrorResultOutput(alloc, deps, options.stream_events, detail, 1);
             }
             return false;
         };
@@ -3524,27 +3526,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
                 try beginPendingToolProgress(ctx, started.id.call_id, started.tool_name);
             }
             if (ctx.output_mode.streamsEvents()) {
-                var target_arena = std.heap.ArenaAllocator.init(ctx.alloc);
-                defer target_arena.deinit();
-                const target = try tool_presentation.formatShortSafeTarget(target_arena.allocator(), .{
-                    .tool_registry = ctx.toolRegistry(),
-                    .call = .{
-                        .id = started.id.call_id,
-                        .name = started.tool_name,
-                        .arguments_json = started.arguments_json orelse "{}",
-                        .resolved_display_target = started.resolved_display_target,
-                    },
-                    .workspace_root = ctx.workspace_root,
-                    .display_target = started.resolved_display_target,
-                });
-                const line = try renderToolStartEventJson(
-                    ctx.alloc,
-                    started.id.call_id,
-                    started.tool_name,
-                    target,
-                );
-                defer ctx.alloc.free(line);
-                try ctx.emitStreamEventLine(line);
+                try emitToolStartStreamEvent(ctx, started);
             }
             if (ctx.raw_has_output) ctx.raw_boundary_pending = true;
         },
@@ -3554,21 +3536,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
         .turn_finished => if (!ctx.output_mode.isTerminal()) clearPendingToolProgress(ctx),
         .terminal => |value| {
             if (ctx.output_mode.streamsEvents()) {
-                const tool_name = try pendingToolNameDup(ctx, value.id.call_id);
-                defer if (tool_name) |name| ctx.alloc.free(name);
-                const err_text: ?[]const u8 = if (value.outcome.kind != .completed and value.outcome.summary.len > 0)
-                    value.outcome.summary
-                else
-                    null;
-                const line = try renderToolEndEventJson(
-                    ctx.alloc,
-                    value.id.call_id,
-                    tool_name orelse "",
-                    @tagName(value.outcome.kind),
-                    err_text,
-                );
-                defer ctx.alloc.free(line);
-                try ctx.emitStreamEventLine(line);
+                try emitToolEndStreamEvent(ctx, value);
             }
             if (!ctx.output_mode.isTerminal()) {
                 try settlePendingToolProgress(ctx, value.id.call_id, value.outcome);
@@ -3578,6 +3546,48 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             writeShellSnapshotNotice(ctx);
         },
     }
+}
+
+fn emitToolStartStreamEvent(ctx: *AskContext, started: anytype) !void {
+    var target_arena = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer target_arena.deinit();
+    const target = try tool_presentation.formatShortSafeTarget(target_arena.allocator(), .{
+        .tool_registry = ctx.toolRegistry(),
+        .call = .{
+            .id = started.id.call_id,
+            .name = started.tool_name,
+            .arguments_json = started.arguments_json orelse "{}",
+            .resolved_display_target = started.resolved_display_target,
+        },
+        .workspace_root = ctx.workspace_root,
+        .display_target = started.resolved_display_target,
+    });
+    const line = try renderToolStartEventJson(
+        ctx.alloc,
+        started.id.call_id,
+        started.tool_name,
+        target,
+    );
+    defer ctx.alloc.free(line);
+    try ctx.emitStreamEventLine(line);
+}
+
+fn emitToolEndStreamEvent(ctx: *AskContext, value: anytype) !void {
+    const tool_name = try pendingToolNameDup(ctx, value.id.call_id);
+    defer if (tool_name) |name| ctx.alloc.free(name);
+    const err_text: ?[]const u8 = if (value.outcome.kind != .completed and value.outcome.summary.len > 0)
+        value.outcome.summary
+    else
+        null;
+    const line = try renderToolEndEventJson(
+        ctx.alloc,
+        value.id.call_id,
+        tool_name orelse "",
+        @tagName(value.outcome.kind),
+        err_text,
+    );
+    defer ctx.alloc.free(line);
+    try ctx.emitStreamEventLine(line);
 }
 
 fn pendingToolNameDup(ctx: *AskContext, call_id: []const u8) !?[]u8 {
@@ -4267,12 +4277,22 @@ fn persistYoloAcknowledgmentDefault(alloc: Allocator) config_runtime.CommitAttem
     );
 }
 
-fn hasJsonFlag(args: []const [:0]const u8) bool {
+fn hasFlagBeforeSeparator(args: []const [:0]const u8, flag: []const u8) bool {
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--")) return false;
-        if (std.mem.eql(u8, arg, "--json")) return true;
+        if (std.mem.eql(u8, arg, flag)) return true;
     }
     return false;
+}
+
+fn hasJsonFlag(args: []const [:0]const u8) bool {
+    return hasFlagBeforeSeparator(args, "--json");
+}
+
+fn hasStandaloneStreamEventsFlag(args: []const [:0]const u8) bool {
+    return hasFlagBeforeSeparator(args, "--stream-events") and
+        !hasFlagBeforeSeparator(args, "--json") and
+        !hasFlagBeforeSeparator(args, "--quiet");
 }
 
 fn parseTimeoutMs(raw: []const u8) ?usize {
@@ -4410,24 +4430,22 @@ fn renderToolEndEventJson(
     return try out.toOwnedSlice();
 }
 
-fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
+fn renderResultObject(alloc: Allocator, result: PromptRunResult, stream_events: bool) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
 
-    try out.writer.writeByte('{');
+    try out.writer.writeAll(if (stream_events) "{\"type\":\"result\"," else "{");
     try writeFinalJsonFields(&out.writer, result);
     try out.writer.writeAll("}\n");
     return try out.toOwnedSlice();
 }
 
-fn renderFinalStreamEventResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
+fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
+    return renderResultObject(alloc, result, false);
+}
 
-    try out.writer.writeAll("{\"type\":\"result\",");
-    try writeFinalJsonFields(&out.writer, result);
-    try out.writer.writeAll("}\n");
-    return try out.toOwnedSlice();
+fn renderFinalStreamEventResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
+    return renderResultObject(alloc, result, true);
 }
 
 fn writeFinalJsonFields(writer: *std.Io.Writer, result: PromptRunResult) !void {
@@ -4549,14 +4567,6 @@ fn writeUsageJson(writer: *std.Io.Writer, usage: types.Usage) !void {
 /// real exit status agree: 2 for a usage error, 1 otherwise.
 fn renderErrorJsonResult(alloc: Allocator, err_name: []const u8, exit_code: u8) ![]u8 {
     return renderFinalJsonResult(alloc, .{
-        .exit_code = exit_code,
-        .assistant_output = &.{},
-        .error_code = err_name,
-    });
-}
-
-fn renderErrorStreamEventResult(alloc: Allocator, err_name: []const u8, exit_code: u8) ![]u8 {
-    return renderFinalStreamEventResult(alloc, .{
         .exit_code = exit_code,
         .assistant_output = &.{},
         .error_code = err_name,
@@ -10006,7 +10016,11 @@ test "CLI nonterminal progress preserves distinct not-run labels without duplica
 
 test "CLI output mode selection preserves machine output precedence" {
     try std.testing.expectEqual(OutputMode.json, selectOutputMode(true, true, true, true));
-    try std.testing.expectEqual(OutputMode.stream_events, selectAskOutputMode(false, false, true, true, true));
+    try std.testing.expectEqual(OutputMode.stream_events, selectAskOutputMode(.{
+        .stream_events = true,
+        .stdout_is_tty = true,
+        .no_color = true,
+    }));
     try std.testing.expectEqual(OutputMode.quiet, selectOutputMode(true, false, true, false));
     try std.testing.expectEqual(OutputMode.raw, selectOutputMode(false, false, false, true));
     try std.testing.expectEqual(OutputMode.terminal, selectOutputMode(false, false, true, false));
@@ -10228,4 +10242,99 @@ test "pushToolLifecycle emits tool_start and tool_end in stream_events mode with
     try std.testing.expectEqualStrings("read_file", p2.value.object.get("name").?.string);
     try std.testing.expectEqualStrings("completed", p2.value.object.get("status").?.string);
     try std.testing.expect(p2.value.object.get("error") == null);
+}
+
+fn testFailStartupAccessDenied(
+    _: Allocator,
+    _: oauth_transport.Provider,
+    _: host.SecretStore,
+    _: []const u8,
+    _: usize,
+    _: ?model_provider.ProviderId,
+    _: ?[]const u8,
+    _: []const config_runtime.SettingOverride,
+) !app_lifecycle.StartupState {
+    return error.AccessDenied;
+}
+
+test "stream-events error exits emit result line on stdout with stderr diagnostics, while interrupts drop result" {
+    const alloc = std.testing.allocator;
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+
+    const usage_cases = [_]struct {
+        args: []const [:0]const u8,
+        expected_error: []const u8,
+    }{
+        .{ .args = &.{"--stream-events"}, .expected_error = "MissingPrompt" },
+        .{ .args = &.{ "--stream-events", "--unknown-flag", "hi" }, .expected_error = "InvalidAskArgs" },
+        .{ .args = &.{ "--stream-events", "--no-save", "--resume", "last", "hi" }, .expected_error = "InvalidAskArgs" },
+    };
+
+    for (usage_cases) |case| {
+        stdout_capture.bytes.clearRetainingCapacity();
+        stderr_capture.bytes.clearRetainingCapacity();
+        var usage_deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup);
+        usage_deps.stdin_source = .tty;
+        const code = try runWithDeps(
+            alloc,
+            case.args,
+            testConfig(),
+            usage_deps,
+        );
+        try std.testing.expectEqual(output_contracts.usage_exit_code, code);
+        try std.testing.expect(stderr_capture.bytes.items.len > 0);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, stdout_capture.bytes.items, "\n"));
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            std.mem.trimEnd(u8, stdout_capture.bytes.items, "\n"),
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("result", parsed.value.object.get("type").?.string);
+        try std.testing.expectEqual(@as(i64, output_contracts.usage_exit_code), parsed.value.object.get("exit_code").?.integer);
+        try std.testing.expectEqualStrings(case.expected_error, parsed.value.object.get("error").?.string);
+    }
+
+    stdout_capture.bytes.clearRetainingCapacity();
+    stderr_capture.bytes.clearRetainingCapacity();
+    var startup_fail_deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup);
+    startup_fail_deps.load_startup_state = testFailStartupAccessDenied;
+    const startup_code = try runWithDeps(alloc, &.{ "--stream-events", "hello" }, testConfig(), startup_fail_deps);
+    try std.testing.expectEqual(@as(u8, 1), startup_code);
+    try std.testing.expect(stderr_capture.bytes.items.len > 0);
+    var parsed_startup = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        std.mem.trimEnd(u8, stdout_capture.bytes.items, "\n"),
+        .{},
+    );
+    defer parsed_startup.deinit();
+    try std.testing.expectEqualStrings("result", parsed_startup.value.object.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 1), parsed_startup.value.object.get("exit_code").?.integer);
+    try std.testing.expectEqualStrings("AccessDenied", parsed_startup.value.object.get("error").?.string);
+
+    if (comptime supports_headless_interrupt) {
+        const previous_action: std.posix.Sigaction = .{
+            .handler = .{ .handler = testPreviousSigintHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var original_action: std.posix.Sigaction = undefined;
+        std.posix.sigaction(std.posix.SIG.INT, &previous_action, &original_action);
+        defer std.posix.sigaction(std.posix.SIG.INT, &original_action, null);
+        test_previous_sigint_count.store(0, .seq_cst);
+
+        stdout_capture.bytes.clearRetainingCapacity();
+        stderr_capture.bytes.clearRetainingCapacity();
+        var int_deps = testPromptRunDepsWithProcess(&stdout_capture, &stderr_capture, testProcessQueuedPromptRaisesSigintAndSucceeds);
+        int_deps.install_headless_interrupt = true;
+        const int_code = try runWithDeps(alloc, &.{ "--stream-events", "hello" }, testConfig(), int_deps);
+        try std.testing.expectEqual(@as(u8, 130), int_code);
+        try std.testing.expect(std.mem.find(u8, stdout_capture.bytes.items, "\"type\":\"turn_start\"") != null);
+        try std.testing.expect(std.mem.find(u8, stdout_capture.bytes.items, "\"type\":\"result\"") == null);
+    }
 }

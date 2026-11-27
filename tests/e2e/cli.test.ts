@@ -8418,4 +8418,61 @@ describe("fx login Token Pass status", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "fx ask --stream-events emits result line on error exits with diagnostics on stderr",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace, { recursive: true });
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+        };
+
+        // Usage error (--unknown-flag) exits 2 with stderr diagnostic and stream result line.
+        const unknownFlag = await runFx(["ask", "--stream-events", "--unknown-flag", "hi"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+        expect(unknownFlag.code).toBe(2);
+        expect(unknownFlag.stderr).toContain("--unknown-flag");
+        const unknownLines = unknownFlag.stdout.trim().split("\n").map((l) => JSON.parse(l));
+        expect(unknownLines).toHaveLength(1);
+        expect(unknownLines[0]).toMatchObject({ type: "result", exit_code: 2, error: "InvalidAskArgs" });
+
+        // Missing prompt exits 2 with stderr diagnostic and stream result line.
+        const missingPrompt = await runFx(["ask", "--stream-events"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+        expect(missingPrompt.code).toBe(2);
+        expect(missingPrompt.stderr).toContain("missing prompt");
+        const missingLines = missingPrompt.stdout.trim().split("\n").map((l) => JSON.parse(l));
+        expect(missingLines).toHaveLength(1);
+        expect(missingLines[0]).toMatchObject({ type: "result", exit_code: 2, error: "MissingPrompt" });
+
+        // Runtime failure (MissingCredentials) exits 1 with stderr diagnostic and stream result matching --json fields.
+        const noAuthStream = await runFx(
+          ["ask", "--stream-events", "--no-save", "--model", FAKE_GATEWAY_MODEL, "hello"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(noAuthStream.code).toBe(1);
+        expect(noAuthStream.stderr.length).toBeGreaterThan(0);
+        const noAuthLines = noAuthStream.stdout.trim().split("\n").map((l) => JSON.parse(l));
+        expect(noAuthLines).toHaveLength(1);
+        expect(noAuthLines[0]).toMatchObject({ type: "result", exit_code: 1, error: "MissingCredentials" });
+
+        const noAuthJson = await runFx(
+          ["ask", "--json", "--no-save", "--model", FAKE_GATEWAY_MODEL, "hello"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(noAuthJson.code).toBe(1);
+        const { type: t, ...streamRest } = noAuthLines[0];
+        expect(t).toBe("result");
+        expect(streamRest).toEqual(JSON.parse(noAuthJson.stdout));
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
 });
