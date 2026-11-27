@@ -7543,6 +7543,7 @@ async function captureCtrlGRelaunch(options: {
   label: string;
   reply: string | null;
   startupScrollback?: boolean;
+  prefillShellLines?: number;
   cols?: number;
   rows?: number;
 }): Promise<CtrlGScreens> {
@@ -7578,7 +7579,10 @@ async function captureCtrlGRelaunch(options: {
   try {
     writeFileSync(stderrPath, "");
     // fx waits for the gate, so the capture holds every byte it writes.
-    const gatedLaunch = `while [ ! -e ${shellQuote(launchGate)} ]; do sleep 0.02; done; exec ${shellQuote(installedFx)}`;
+    const prefill = options.prefillShellLines
+      ? `for i in $(seq 1 ${options.prefillShellLines}); do echo "SHELL_PREFILL_$i"; done; `
+      : "";
+    const gatedLaunch = `while [ ! -e ${shellQuote(launchGate)} ]; do sleep 0.02; done; ${prefill}exec ${shellQuote(installedFx)}`;
     active = await TmuxSession.create({
       cmd: `/bin/sh -c ${shellQuote(gatedLaunch)}`,
       cwd: workspaceRoot,
@@ -7714,6 +7718,105 @@ for (const startupScrollback of [undefined, false] as const) {
     UPGRADE_TIMEOUT * 2,
   );
 }
+
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g without a saved turn on a filled screen keeps the old screen in place until the new build redraws it",
+  async () => {
+    // Prefill leaves fx near the bottom of the terminal so the first init's
+    // SessionNotFound teardown (D81) must not wipe rows above the footer
+    // before the retry clears and redraws the screen.
+    const screens = await captureCtrlGRelaunch({
+      label: "fresh-filled-no-scrollback",
+      reply: null,
+      startupScrollback: false,
+      prefillShellLines: 25,
+    });
+    expectGapKeepsScreen(screens, "Run /help for commands");
+    expect(countOccurrences(screens.redrawn, "Run /help for commands")).toBe(1);
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "startup_scrollback off does not push ten blank lines when resuming at the bottom of the terminal",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-no-blank-block-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    const capturePath = join(root, "pane-output.bin");
+    const launchGate = join(root, "launch-gate");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(join(home, ".fx"), { mode: 0o700 });
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ startup_scrollback: false }) + "\n",
+      { mode: 0o600 },
+    );
+    const workspaceRoot = realpathSync(workspace);
+    const gateway = startFakeGateway([fakeGatewayFinalText("RESUME_NO_BLANK_REPLY")]);
+    let first: TmuxSession | null = null;
+    let resumed: TmuxSession | null = null;
+    try {
+      writeFileSync(stderrPath, "");
+      first = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await first.waitForComposer(TIMEOUT);
+      await first.sendText("seed saved session");
+      await first.waitForText("RESUME_NO_BLANK_REPLY", TIMEOUT);
+      await first.waitForStableComposer(TIMEOUT, 200);
+      await first.sendText("/quit");
+      expect(await first.waitForSessionEnd()).toBe(true);
+      await first.kill();
+      first = null;
+
+      const gatedResume = `while [ ! -e ${shellQuote(launchGate)} ]; do sleep 0.02; done; for i in $(seq 1 31); do echo "RESUME_PREFILL_$i"; done; exec ${shellQuote(FX_BIN)} -c`;
+      resumed = await TmuxSession.create({
+        cmd: `/bin/sh -c ${shellQuote(gatedResume)}`,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 110,
+        height: 32,
+        startupWaitMs: 0,
+      });
+      resumed.startPaneOutputCapture(capturePath);
+      writeFileSync(launchGate, "");
+      await resumed.waitForComposer(TIMEOUT);
+      await resumed.waitForStableComposer(TIMEOUT, 200);
+
+      const output = readFileSync(capturePath).toString("latin1");
+      const markerIdx = output.indexOf("RESUME_PREFILL_31");
+      expect(markerIdx).toBeGreaterThanOrEqual(0);
+      const startupBytes = output.slice(markerIdx);
+      const firstFrameIdx = startupBytes.indexOf("\x1b[?2026h");
+      expect(firstFrameIdx).toBeGreaterThan(0);
+      const beforeFirstFrame = startupBytes.slice(0, firstFrameIdx);
+      // Before the first frame, only the footer rows (4) plus RESUME_PREFILL_31's own
+      // newline may scroll — never an extra 10-line welcome reservation.
+      const startupNewlines = (beforeFirstFrame.match(/\n/g) ?? []).length;
+      expect(startupNewlines).toBeLessThanOrEqual(5);
+
+      await resumed.sendText("/quit");
+      expect(await resumed.waitForSessionEnd()).toBe(true);
+      await resumed.kill();
+      resumed = null;
+    } finally {
+      if (first) await first.kill();
+      if (resumed) await resumed.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
 
 test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g waits while a subagent works, then upgrades once it is done",
