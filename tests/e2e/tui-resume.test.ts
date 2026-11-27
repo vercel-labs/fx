@@ -11145,7 +11145,7 @@ test.skipIf(!tmuxAvailable())(
         "* session resumed: Plan the trip.",
         "┃ Plan the trip.",
         "● Ran echo · 3 calls",
-        "! system: fx stopped before this turn finished",
+        "⚠ fx stopped before this turn finished",
         "* session: Resuming the interrupted request",
         answer,
       ];
