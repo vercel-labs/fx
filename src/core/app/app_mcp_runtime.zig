@@ -1774,9 +1774,8 @@ test "hostMenuKey requires approval confirmation before turning on a project ser
     try state.hostMenuKey(.enter, "", home, root);
     try std.testing.expectEqual(mcp_menu.Screen.confirm, state.host_menu.screen);
     try state.hostMenuKey(.enter, "", home, root);
-    state.toggle_group.await(io_mod.getIo()) catch {};
-    var waited: usize = 0;
-    while (state.host_verbs.load(.acquire) > 0 and waited < 500) : (waited += 1) io_mod.sleep(10 * std.time.ns_per_ms);
+    try state.toggle_group.await(io_mod.getIo());
+    try std.testing.expectEqual(@as(usize, 0), state.host_verbs.load(.acquire));
     var after = try config_runtime.loadProjectMcpChoicesFromHome(alloc, home, root);
     defer after.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), after.choices.approved.len);
