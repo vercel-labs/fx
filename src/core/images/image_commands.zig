@@ -10,6 +10,7 @@ const registered_entities = @import("../input/registered_entities.zig");
 
 const clipboard_protocol = @import("../../ui/terminal/clipboard_protocol.zig");
 const io_mod = @import("../shared/io.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const InsertImageResult = enum { inserted, rejected, input_full };
 const ImageSourceLifetime = enum { retained, temporary };
@@ -133,6 +134,19 @@ pub fn Commands(comptime App: type) type {
                 .handled => .handled,
                 .missing_image => .no_image,
             };
+        }
+
+        /// An empty bracketed paste reads only a clipboard fx can read itself:
+        /// asking the terminal on every empty paste would show an error in
+        /// terminals without the clipboard protocol, such as VS Code over SSH.
+        pub fn attachClipboardForEmptyPaste(app: *App) !void {
+            if (comptime @hasDecl(App, "requestTerminalClipboardImage")) {
+                if (!image_attachments.nativeClipboardImageReadable()) {
+                    debug_trace.logf("images", "empty paste clipboard check skipped reason=no_local_clipboard", .{});
+                    return;
+                }
+            }
+            return attachClipboard(app);
         }
 
         /// The `/paste` command: image only, with a notice when the clipboard has none.
@@ -1113,6 +1127,19 @@ test "attachClipboard asks the terminal where fx cannot read the clipboard" {
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+}
+
+test "an empty paste never asks the terminal for the clipboard" {
+    if (image_attachments.nativeClipboardImageReadable()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try Commands(FakeApp).attachClipboardForEmptyPaste(&app);
+
+    try std.testing.expectEqual(@as(usize, 0), app.terminal_clipboard_requests);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
 test "a terminal clipboard image is inserted at the cursor as a snapshot" {

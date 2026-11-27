@@ -381,7 +381,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     return;
                 }
                 debug_trace.logf("input", "composer paste empty action=clipboard_image", .{});
-                try image_commands.Commands(App).attachClipboard(app);
+                try image_commands.Commands(App).attachClipboardForEmptyPaste(app);
                 return;
             }
 
