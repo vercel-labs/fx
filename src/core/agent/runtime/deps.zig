@@ -248,6 +248,7 @@ pub const AgentRuntimeDeps = struct {
     snapshot_root_permission_mode: ?*const fn (ctx: *anyopaque) PermissionMode = null,
     tool_activity_recorder: ?ToolActivityRecorder = null,
     finalize_turn: *const fn (ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) anyerror!void = acknowledgePromptFinalization,
+    record_turn_error_kind: ?*const fn (ctx: *anyopaque, kind: types.TurnErrorKind) void = null,
     /// Classifies one observed steering boundary. Continued text is arena-owned
     /// non-authoritative context; handoff leaves the prompt host-owned.
     take_steering_boundary: ?*const fn (

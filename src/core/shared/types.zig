@@ -212,6 +212,17 @@ pub const TurnPresentationOutcome = enum {
     paused,
 };
 
+pub const TurnErrorKind = enum {
+    content_filter,
+    provider_error,
+    invalid_completion,
+    step_limit,
+
+    pub fn label(self: TurnErrorKind) []const u8 {
+        return @tagName(self);
+    }
+};
+
 pub const TurnFinished = struct {
     turn_id: u64,
     outcome: TurnPresentationOutcome,

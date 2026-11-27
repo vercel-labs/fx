@@ -10147,6 +10147,7 @@ fn processQueuedPromptLoop(
                                 &finish_trace,
                                 malformed_tool_call_failed_notice,
                                 "malformed_tool_call",
+                                null,
                             );
                             return;
                         }
@@ -10294,6 +10295,7 @@ fn processQueuedPromptLoop(
                         diagnostic,
                     );
                 }
+                finalization.error_kind = if (finish_reason == .provider_error) .provider_error else .content_filter;
                 finish_trace.finish(if (finish_reason == .provider_error) "provider_error" else "content_filter");
                 return error.ModelError;
             }
@@ -10467,6 +10469,7 @@ fn processQueuedPromptLoop(
                     if (completion.content) |content| content.len else 0,
                     completion.tool_calls.len,
                 });
+                finalization.error_kind = if (finish_reason == .provider_error) .provider_error else .content_filter;
                 finish_trace.finish(if (finish_reason == .provider_error) "provider_error" else "content_filter");
                 return error.ModelError;
             },
@@ -10485,6 +10488,7 @@ fn processQueuedPromptLoop(
                 } else {
                     debug_trace.eventf("agent", "provider_tool_finish_missing_calls", step_ctx, "finish_reason={s}", .{finish_reason.label()});
                 }
+                finalization.error_kind = .invalid_completion;
                 finish_trace.finish("invalid_tool_finish");
                 return error.ModelError;
             },
@@ -10820,6 +10824,7 @@ fn processQueuedPromptLoop(
                     &finish_trace,
                     try emptyReplyNotice(arena, provider_reason, empty_reply_follow_up),
                     "empty_reply",
+                    null,
                 );
                 return;
             }
@@ -13534,6 +13539,7 @@ fn processQueuedPromptLoop(
                 &finish_trace,
                 repeated_malformed_arguments_notice,
                 "repeated_malformed_tool_arguments",
+                null,
             );
             return;
         }
@@ -13558,6 +13564,7 @@ fn processQueuedPromptLoop(
                 &finish_trace,
                 repeated_terminal_validation_notice,
                 "terminal_validation_retry",
+                null,
             );
             return;
         }
@@ -13587,6 +13594,7 @@ fn processQueuedPromptLoop(
                 &finish_trace,
                 repeated_shell_execution_failure_notice,
                 "repeated_shell_execution_failure",
+                null,
             );
             return;
         }
@@ -13759,6 +13767,7 @@ fn processQueuedPromptLoop(
         &finish_trace,
         config.step_limit_notice,
         "step_limit",
+        .step_limit,
     );
 }
 
@@ -13773,7 +13782,9 @@ fn finishFailedTurnWithNotice(
     finish_trace: *PromptFinishTrace,
     notice: []const u8,
     trace_outcome: []const u8,
+    error_kind: ?types.TurnErrorKind,
 ) !void {
+    finalization.error_kind = error_kind;
     try deps.push_text(deps.ctx, .{ .operational = notice });
     try deps.push_text(deps.ctx, .{ .operational = "\n" });
     if (stop_state.retained_candidate != null) {
@@ -14118,6 +14129,7 @@ test "eb03: UserTurn carries job.input_id in turn-piece writes, checkpoints, and
         &trace,
         "notice text",
         "failed_notice",
+        null,
     );
     try std.testing.expectEqual(@as(usize, 1), notice_fake.history_turns.items.len);
     try std.testing.expectEqual(@as(?u64, 64), notice_fake.history_turns.items[0].assistant.user.input_id);

@@ -717,6 +717,7 @@ function parseAskJson(stdout: string): {
   final_output: string;
   exit_code: number;
   error?: string;
+  error_kind?: string;
   session_id: string;
   tool_calls: Array<{ name: string; status: string }>;
   usage: { input_tokens: number | null; output_tokens: number | null; cache_read_tokens?: number; cache_write_tokens?: number };
@@ -17034,3 +17035,147 @@ test("main's own quiet command gets the notice and no relay, since main has no p
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 45_000);
+
+describe("fx ask --json error_kind", () => {
+  test("content_filter finish sets error_kind while preserving error and recovery", async () => {
+    const root = createFixtureRoot("error-kind-content-filter");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => contentFilterResponse());
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Trigger content filter."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBe("ModelError");
+      expect(json.error_kind).toBe("content_filter");
+      expect(json.recovery?.state).toBe("failed");
+      expect((json.recovery as { cause?: string } | undefined)?.cause).toBe("content_filter");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("non-retryable provider_error finish sets error_kind while preserving ModelError", async () => {
+    const root = createFixtureRoot("error-kind-provider-error");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() =>
+      sse(
+        `data: ${JSON.stringify({
+          type: "error",
+          error: { code: "invalid_request_error", message: "bad input" },
+        })}\n\n` +
+          'data: {"type":"finish","finishReason":{"unified":"error","raw":"provider_error"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":1}}}\n\n' +
+          "data: [DONE]\n\n",
+      )
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Trigger provider error."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBe("ModelError");
+      expect(json.error_kind).toBe("provider_error");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("invalid completion sets error_kind to invalid_completion", async () => {
+    const root = createFixtureRoot("error-kind-invalid-completion");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() =>
+      sse(
+        'data: {"type":"finish","finishReason":{"unified":"tool-calls","raw":"tool-calls"}}\n\n' +
+          "data: [DONE]\n\n",
+      )
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Trigger invalid completion."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBe("ModelError");
+      expect(json.error_kind).toBe("invalid_completion");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("step_limit sets error_kind without adding an error field", async () => {
+    const root = createFixtureRoot("error-kind-step-limit");
+    const tracePath = join(root.root, "trace.log");
+    let callCount = 0;
+    const gateway = startGateway(() =>
+      fakeGatewayToolCall(`step_limit_${++callCount}`, "glob_files", { pattern: "*" })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Trigger step limit."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MAX_AGENT_STEPS: "1",
+          },
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBeUndefined();
+      expect(json.error_kind).toBe("step_limit");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("successful turn omits error_kind", async () => {
+    const root = createFixtureRoot("error-kind-success");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => fakeGatewayFinalText("OK_NO_ERROR_KIND"));
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Say OK."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.error).toBeUndefined();
+      expect(Object.prototype.hasOwnProperty.call(json, "error_kind")).toBe(false);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+});

@@ -11823,3 +11823,86 @@ test "400 and 422 still end after one request" {
         try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     }
 }
+
+test "processQueuedPrompt records turn error_kind only for content_filter, provider_error, invalid_completion, and step_limit" {
+    const alloc = std.testing.allocator;
+    var fixture = PromptFixture{};
+
+    // content_filter
+    {
+        const blocked: FakeCompletion = .{ .finish_reason = .content_filter };
+        const completions = [_]FakeCompletion{ blocked, blocked, blocked, blocked };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        try std.testing.expectError(error.ModelError, runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()));
+        try std.testing.expectEqual(@as(?types.TurnErrorKind, .content_filter), hooks.recorded_error_kind);
+    }
+
+    // provider_error
+    {
+        const completions = [_]FakeCompletion{
+            .{
+                .finish_reason = .provider_error,
+                .provider_failure_cause = .non_retryable,
+                .provider_failure_detail = "invalid_request_error: bad input",
+            },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        try std.testing.expectError(error.ModelError, runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()));
+        try std.testing.expectEqual(@as(?types.TurnErrorKind, .provider_error), hooks.recorded_error_kind);
+    }
+
+    // invalid_completion
+    {
+        const completions = [_]FakeCompletion{
+            .{ .finish_reason = .tool_calls },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        try std.testing.expectError(error.ModelError, runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()));
+        try std.testing.expectEqual(@as(?types.TurnErrorKind, .invalid_completion), hooks.recorded_error_kind);
+    }
+
+    // step_limit
+    {
+        const call = [_]types.ToolCall{.{
+            .id = "tc_1",
+            .name = "read_file",
+            .arguments_json = "{}",
+        }};
+        const completions = [_]FakeCompletion{
+            .{ .finish_reason = .tool_calls, .tool_calls = &call },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var cfg = fixture.config();
+        cfg.agent_step_limit = 1;
+        try runFakePrompt(&gateway, &hooks, cfg, fixture.job());
+        try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+        try std.testing.expectEqual(@as(?types.TurnErrorKind, .step_limit), hooks.recorded_error_kind);
+    }
+
+    // empty_reply leaves error_kind absent
+    {
+        const completions = [_]FakeCompletion{
+            .{ .finish_reason = .other },
+            .{ .finish_reason = .other },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+        try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+        try std.testing.expectEqual(@as(?types.TurnErrorKind, null), hooks.recorded_error_kind);
+    }
+}

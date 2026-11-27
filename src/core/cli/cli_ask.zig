@@ -333,6 +333,7 @@ pub const PromptRunResult = struct {
     /// empty when the provider did not report routing metadata.
     resolved_provider: []u8 = &.{},
     error_code: ?[]const u8 = null,
+    error_kind: ?types.TurnErrorKind = null,
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     recovery: ?types.RouteRecoveryStatus = null,
     usage: types.Usage = .{},
@@ -691,6 +692,7 @@ const AskContext = struct {
     output_write_failed: bool = false,
     output_reader_gone: bool = false,
     typed_error_code: ?[]const u8 = null,
+    error_kind: ?types.TurnErrorKind = null,
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     output_mode: OutputMode = .raw,
     prompt_permissions: bool = false,
@@ -2188,6 +2190,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .tool_calls = tool_calls,
         .step_count = ctx.step_count,
         .error_code = ctx.typed_error_code,
+        .error_kind = ctx.error_kind,
         .auth_failure = ctx.auth_failure,
         .recovery = ctx.last_recovery_status,
         .usage = ctx.usage_total,
@@ -2225,6 +2228,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .context_enabled = ctx.context_enabled,
         .image_folder_rules = true,
         .finalize_turn = finalizeTurn,
+        .record_turn_error_kind = recordTurnErrorKind,
         .take_steering_boundary = takeSteeringBoundary,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
@@ -2411,6 +2415,11 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
         ctx.failed = true;
     }
     if (outcome == .completed) discard_restarted_json_preview(ctx);
+}
+
+fn recordTurnErrorKind(raw_ctx: *anyopaque, kind: types.TurnErrorKind) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.error_kind = kind;
 }
 
 /// Takes the subagent mail that joined the running turn at a model or final
@@ -4289,6 +4298,11 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     if (result.error_code) |error_code| {
         try out.writer.writeAll(",\"error\":");
         try std.json.Stringify.value(error_code, .{}, &out.writer);
+    }
+    if (result.error_kind) |error_kind| {
+        try out.writer.writeAll(",\"error_kind\":\"");
+        try out.writer.writeAll(error_kind.label());
+        try out.writer.writeByte('"');
     }
     if (result.auth_failure) |failure| {
         try out.writer.writeAll(",\"auth_failure\":");
@@ -8176,6 +8190,25 @@ test "render final JSON emits empty tool call array" {
 
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
+        json,
+    );
+}
+
+test "render final JSON writes error_kind only when set" {
+    const alloc = std.testing.allocator;
+    const result = PromptRunResult{
+        .exit_code = 1,
+        .assistant_output = try alloc.dupe(u8, ""),
+        .error_code = "ModelError",
+        .error_kind = .invalid_completion,
+    };
+    defer result.deinit(alloc);
+
+    const json = try renderFinalJsonResult(alloc, result);
+    defer alloc.free(json);
+
+    try std.testing.expectEqualStrings(
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ModelError\",\"error_kind\":\"invalid_completion\"}\n",
         json,
     );
 }
