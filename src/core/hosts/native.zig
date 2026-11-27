@@ -4,6 +4,7 @@ const host = @import("host.zig");
 const native_secret_store = @import("native_secret_store.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const child_wait = @import("../shared/child_wait.zig");
 
 pub const clipboard = host.Clipboard{
     .copy_fn = copyToClipboard,
@@ -82,18 +83,6 @@ fn collect_clipboard_process_output(
     return multi_reader.toOwnedSlice(1);
 }
 
-fn clipboard_process_term(status: c_int) std.process.Child.Term {
-    const raw_status: u32 = @bitCast(status);
-    return if (std.c.W.IFEXITED(raw_status))
-        .{ .exited = std.c.W.EXITSTATUS(raw_status) }
-    else if (std.c.W.IFSIGNALED(raw_status))
-        .{ .signal = std.c.W.TERMSIG(raw_status) }
-    else if (std.c.W.IFSTOPPED(raw_status))
-        .{ .stopped = std.c.W.STOPSIG(raw_status) }
-    else
-        .{ .unknown = raw_status };
-}
-
 fn close_clipboard_process_streams(child: *std.process.Child) void {
     const io = io_mod.getIo();
     if (child.stdin) |stdin| stdin.close(io);
@@ -104,41 +93,17 @@ fn close_clipboard_process_streams(child: *std.process.Child) void {
     child.stderr = null;
 }
 
-fn try_reap_clipboard_process(child: *std.process.Child) error{WaitFailed}!?std.process.Child.Term {
-    const pid = child.id orelse return error.WaitFailed;
-    var status: c_int = undefined;
-    const waited = std.c.waitpid(pid, &status, std.c.W.NOHANG);
-    if (waited == 0) return null;
-    if (waited != pid) return error.WaitFailed;
-
-    child.id = null;
-    return clipboard_process_term(status);
-}
-
-fn kill_and_wait_clipboard_process(child: *std.process.Child) !std.process.Child.Term {
-    const pid = child.id orelse return error.WaitFailed;
+/// Kills a child that is still running, then reaps it. A child that already
+/// exited has no id left, so it is left alone. Failures are traced under `label`.
+fn killAndReapClipboardChild(child: *std.process.Child, label: []const u8) void {
+    const pid = child.id orelse return;
     std.posix.kill(pid, .KILL) catch |err| switch (err) {
         error.ProcessNotFound => {},
-        else => |kill_err| return kill_err,
+        else => debug_trace.logf("host", "{s} cleanup failed err={s}", .{ label, @errorName(err) }),
     };
-    return child.wait(io_mod.getIo());
-}
-
-fn wait_for_clipboard_process(
-    child: *std.process.Child,
-    deadline: std.Io.Clock.Timestamp,
-) !std.process.Child.Term {
-    const io = io_mod.getIo();
-    while (true) {
-        if (try try_reap_clipboard_process(child)) |term| return term;
-
-        const now = std.Io.Clock.Timestamp.now(io, .awake);
-        if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline)) {
-            _ = try kill_and_wait_clipboard_process(child);
-            return error.Timeout;
-        }
-        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
-    }
+    _ = child.wait(io_mod.getIo()) catch |err| {
+        debug_trace.logf("host", "{s} cleanup failed err={s}", .{ label, @errorName(err) });
+    };
 }
 
 fn run_clipboard_process(
@@ -155,12 +120,8 @@ fn run_clipboard_process(
     defer child.kill(io_mod.getIo());
     defer close_clipboard_process_streams(&child);
 
-    const term = wait_for_clipboard_process(&child, deadline) catch |err| {
-        if (child.id != null) {
-            _ = kill_and_wait_clipboard_process(&child) catch |cleanup_err| {
-                debug_trace.logf("host", "clipboard file copy cleanup failed err={s}", .{@errorName(cleanup_err)});
-            };
-        }
+    const term = child_wait.waitWithDeadline(&child, deadline) catch |err| {
+        killAndReapClipboardChild(&child, "clipboard file copy");
         return err;
     };
     const stderr = try collect_clipboard_process_output(alloc, &child, deadline);
@@ -229,6 +190,8 @@ fn copy_file_to_clipboard(_: ?*anyopaque, alloc: std.mem.Allocator, path: []cons
 
 const max_clipboard_text_bytes: usize = 16 * 1024 * 1024;
 const clipboard_read_timeout_seconds = 2;
+/// Bytes the stdout reader asks for per wait, in bytes.
+const clipboard_stdout_fill_min_bytes: usize = 64;
 
 // Stdout is drained before the child is waited on: a child that fills the pipe
 // cannot exit until it is read, so waiting first would time out large text.
@@ -236,6 +199,7 @@ fn collect_clipboard_stdout(
     alloc: std.mem.Allocator,
     child: *std.process.Child,
     deadline: std.Io.Clock.Timestamp,
+    max_bytes: usize,
 ) ![]u8 {
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(1) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
@@ -243,8 +207,8 @@ fn collect_clipboard_stdout(
     defer multi_reader.deinit();
 
     const stdout_reader = multi_reader.reader(0);
-    while (multi_reader.fill(64, .{ .deadline = deadline })) |_| {
-        if (stdout_reader.buffered().len > max_clipboard_text_bytes) return error.StreamTooLong;
+    while (multi_reader.fill(clipboard_stdout_fill_min_bytes, .{ .deadline = deadline })) |_| {
+        if (stdout_reader.buffered().len > max_bytes) return error.StreamTooLong;
     } else |err| switch (err) {
         error.EndOfStream => {},
         else => |fill_err| return fill_err,
@@ -252,13 +216,6 @@ fn collect_clipboard_stdout(
     try multi_reader.checkAnyError();
 
     return multi_reader.toOwnedSlice(0);
-}
-
-fn kill_clipboard_read_child(child: *std.process.Child) void {
-    if (child.id == null) return;
-    _ = kill_and_wait_clipboard_process(child) catch |cleanup_err| {
-        debug_trace.logf("host", "clipboard text read cleanup failed err={s}", .{@errorName(cleanup_err)});
-    };
 }
 
 const ClipboardReadResult = struct {
@@ -270,6 +227,7 @@ fn run_clipboard_read(
     alloc: std.mem.Allocator,
     argv: []const []const u8,
     deadline: std.Io.Clock.Timestamp,
+    max_bytes: usize,
 ) !ClipboardReadResult {
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
@@ -280,36 +238,57 @@ fn run_clipboard_read(
     defer child.kill(io_mod.getIo());
     defer close_clipboard_process_streams(&child);
 
-    const text = collect_clipboard_stdout(alloc, &child, deadline) catch |err| {
-        kill_clipboard_read_child(&child);
+    const text = collect_clipboard_stdout(alloc, &child, deadline, max_bytes) catch |err| {
+        killAndReapClipboardChild(&child, "clipboard text read");
         return err;
     };
     errdefer alloc.free(text);
-    const term = wait_for_clipboard_process(&child, deadline) catch |err| {
-        kill_clipboard_read_child(&child);
+    const term = child_wait.waitWithDeadline(&child, deadline) catch |err| {
+        killAndReapClipboardChild(&child, "clipboard text read");
         return err;
     };
     return .{ .term = term, .text = text };
 }
 
-// Returns null on every failure: a clipboard without text, a missing tool, or a
-// timeout all leave the caller with the same choice, to tell the person.
+/// Runs a read command and returns its stdout, owned by the caller. Each
+/// failure maps to one host error, so a failed read is never an empty clipboard.
+fn runClipboardTextRead(
+    alloc: std.mem.Allocator,
+    argv: []const []const u8,
+    deadline: std.Io.Clock.Timestamp,
+    max_bytes: usize,
+) host.ClipboardError![]u8 {
+    const result = run_clipboard_read(alloc, argv, deadline, max_bytes) catch |err| {
+        debug_trace.logf("host", "clipboard text read failed err={s}", .{@errorName(err)});
+        return switch (err) {
+            error.Timeout => error.ReadTimedOut,
+            error.StreamTooLong => error.ReadTooLarge,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.ReadFailed,
+        };
+    };
+    if (!copySucceeded(result.term)) {
+        alloc.free(result.text);
+        logUnsuccessfulTerm("text read", result.term);
+        return error.ReadFailed;
+    }
+    return result.text;
+}
+
+// A clipboard that holds no text is a successful read, so it returns null, as a
+// host without a clipboard reader does.
 fn read_clipboard_text(_: ?*anyopaque, alloc: std.mem.Allocator) host.ClipboardError!?[]u8 {
     const argv = clipboardReadCommand(builtin.target.os.tag) orelse return null;
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromSeconds(clipboard_read_timeout_seconds),
     });
-    const result = run_clipboard_read(alloc, argv, deadline) catch |err| {
-        debug_trace.logf("host", "clipboard text read failed err={s}", .{@errorName(err)});
-        return null;
-    };
-    if (!copySucceeded(result.term)) {
-        alloc.free(result.text);
-        logUnsuccessfulTerm("text read", result.term);
+    const text = try runClipboardTextRead(alloc, argv, deadline, max_clipboard_text_bytes);
+    if (text.len == 0) {
+        alloc.free(text);
         return null;
     }
-    return result.text;
+    return text;
 }
 
 fn clipboardCommand(os_tag: std.Target.Os.Tag) ?[]const []const u8 {
@@ -353,6 +332,60 @@ test "native clipboard selects the platform read command" {
     );
     try std.testing.expect(clipboardReadCommand(.windows) == null);
     try std.testing.expect(clipboardReadCommand(.wasi) == null);
+}
+
+fn testReadDeadline(milliseconds: i64) std.Io.Clock.Timestamp {
+    return std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(milliseconds),
+    });
+}
+
+test "native clipboard read reports a command that outlives its deadline" {
+    try std.testing.expectError(error.ReadTimedOut, runClipboardTextRead(
+        std.testing.allocator,
+        &.{ "sh", "-c", "sleep 5" },
+        testReadDeadline(100),
+        max_clipboard_text_bytes,
+    ));
+}
+
+test "native clipboard read reports a command that exits non-zero" {
+    try std.testing.expectError(error.ReadFailed, runClipboardTextRead(
+        std.testing.allocator,
+        &.{ "sh", "-c", "exit 3" },
+        testReadDeadline(5000),
+        max_clipboard_text_bytes,
+    ));
+}
+
+test "native clipboard read reports output over the byte cap" {
+    try std.testing.expectError(error.ReadTooLarge, runClipboardTextRead(
+        std.testing.allocator,
+        &.{ "sh", "-c", "printf abcdef" },
+        testReadDeadline(5000),
+        3,
+    ));
+}
+
+test "native clipboard read returns stdout bytes unchanged" {
+    const text = try runClipboardTextRead(
+        std.testing.allocator,
+        &.{ "sh", "-c", "printf 'a\\r\\nb'" },
+        testReadDeadline(5000),
+        max_clipboard_text_bytes,
+    );
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("a\r\nb", text);
+}
+
+test "native clipboard read reports a program that cannot start" {
+    try std.testing.expectError(error.ReadFailed, runClipboardTextRead(
+        std.testing.allocator,
+        &.{"fx-no-such-clipboard-tool"},
+        testReadDeadline(5000),
+        max_clipboard_text_bytes,
+    ));
 }
 
 test "native clipboard selects the platform command" {

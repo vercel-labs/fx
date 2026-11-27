@@ -269,6 +269,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
 
             openPasteCapture(app, capture);
             app.input_runtime.paste.ingestDecodedSlice(app.alloc, text) catch |err| {
+                debug_trace.logf("input", "{s} paste dropped bytes={d} reason=alloc_failed", .{ @tagName(capture.owner), text.len });
                 if (capture.owner == .auth_code) {
                     app.input_runtime.paste.resetSecretWithTrace(.{ .finalize_failed = .{
                         .owner = .auth_code,
@@ -612,9 +613,11 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         /// Pastes clipboard text the way a composer paste lands, for Ctrl+V with no
-        /// clipboard image. A bracketed paste that is still open owns the buffer,
-        /// so the text is dropped instead.
+        /// clipboard image.
         pub fn insertClipboardText(app: *App, agent: *AppAgent, text: []const u8, max_input_len: usize) !void {
+            // Cannot happen from key input: routeActivePasteByte hands every byte to
+            // an open paste before handleByte runs, so Ctrl+V never arrives while one
+            // is open. Kept so a future caller cannot reset a live capture.
             if (app.input_runtime.paste.owner != .none) {
                 debug_trace.logf("input", "clipboard text dropped bytes={d} reason=paste_in_progress", .{text.len});
                 return;

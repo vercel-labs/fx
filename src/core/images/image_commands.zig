@@ -239,6 +239,12 @@ const FakeApp = struct {
     capture_error: ?anyerror = null,
     snapshot_dir: ?[]const u8 = null,
     clipboard_text_reads: usize = 0,
+    clipboard_unsupported: bool = false,
+
+    pub fn loadClipboardImageAttachment(self: *FakeApp) !image_attachments.ClipboardImageAttachment {
+        if (self.clipboard_unsupported) return error.Unsupported;
+        return error.NoClipboardImage;
+    }
 
     pub fn readClipboardText(self: *FakeApp, _: std.mem.Allocator) !?[]u8 {
         self.clipboard_text_reads += 1;
@@ -1029,10 +1035,8 @@ test "managePending reports empty lists populated lists and clear" {
 }
 
 test "attachClipboard is silent on unsupported platforms" {
-    if (@import("builtin").target.os.tag == .macos) return;
-
     const alloc = std.testing.allocator;
-    var app = FakeApp{ .alloc = alloc };
+    var app = FakeApp{ .alloc = alloc, .clipboard_unsupported = true };
     defer app.deinit();
 
     try Commands(FakeApp).attachClipboard(&app);
@@ -1042,8 +1046,6 @@ test "attachClipboard is silent on unsupported platforms" {
 }
 
 test "attachClipboard never reads clipboard text" {
-    if (@import("builtin").target.os.tag == .macos) return;
-
     const alloc = std.testing.allocator;
     var app = FakeApp{ .alloc = alloc };
     defer app.deinit();
