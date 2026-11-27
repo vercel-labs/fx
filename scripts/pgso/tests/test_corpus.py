@@ -96,6 +96,7 @@ VERIFICATION_E2E_TESTS = (
     "doctor.test.ts",
     "tui-custom-connection-errors.test.ts",
     "mcp-shared.test.ts",
+    "ask-events.test.ts",
 )
 
 EXCLUDED_E2E_TESTS = (
@@ -429,7 +430,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(37, len(corpus.scenarios))
-        self.assertEqual(78, len(corpus.candidate_scenarios))
+        self.assertEqual(79, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,
