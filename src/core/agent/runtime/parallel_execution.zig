@@ -73,6 +73,28 @@ fn subagentTarget(arena: Allocator, call: ToolCall) SubagentTarget {
     return if (agent.len == 0) .none else .{ .named = agent };
 }
 
+fn containsName(names: []const []const u8, target: []const u8) bool {
+    for (names) |name| {
+        if (std.mem.eql(u8, name, target)) return true;
+    }
+    return false;
+}
+
+fn appendUniqueNames(
+    arena: Allocator,
+    seen: *std.ArrayList([]const u8),
+    names: []const []const u8,
+) bool {
+    for (names) |name| {
+        if (containsName(seen.items, name)) return false;
+    }
+    for (names) |name| {
+        if (containsName(seen.items, name)) continue;
+        seen.append(arena, name) catch return false;
+    }
+    return true;
+}
+
 /// Leading subagent calls that may run together. Calls to one subagent run
 /// in the order written, so the group ends before a call to a subagent
 /// already in it, and a call whose subagent can't be read runs alone
@@ -88,21 +110,8 @@ fn parallelSubagentPrefixLen(alloc: Allocator, registry: tool_dispatch.Registry,
         switch (subagentTarget(arena, calls[len])) {
             .none => {},
             .unknown => return if (len == 0) 1 else len,
-            .named => |name| {
-                for (named.items) |seen| if (std.mem.eql(u8, seen, name)) return len;
-                named.append(arena, name) catch return if (len == 0) 1 else len;
-            },
-            .many => |names| {
-                for (names) |name| {
-                    for (named.items) |seen| if (std.mem.eql(u8, seen, name)) return len;
-                }
-                for (names) |name| {
-                    const already = for (named.items) |seen| {
-                        if (std.mem.eql(u8, seen, name)) break true;
-                    } else false;
-                    if (!already) named.append(arena, name) catch return if (len == 0) 1 else len;
-                }
-            },
+            .named => |name| if (!appendUniqueNames(arena, &named, &.{name})) return if (len == 0) 1 else len,
+            .many => |names| if (!appendUniqueNames(arena, &named, names)) return if (len == 0) 1 else len,
         }
     }
     return len;

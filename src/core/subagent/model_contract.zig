@@ -120,7 +120,7 @@ pub const MessageInput = struct {
     effort: ?[]const u8 = null,
     profile: ?[]const u8 = null,
 };
-pub const CloseInput = struct {
+const CloseInput = struct {
     agent: ?[]const u8 = null,
     agents: ?[]const []const u8 = null,
 };
@@ -320,27 +320,10 @@ pub fn validateRequest(
         .close => |value| blk: {
             if (value.agent != null and value.agents != null) return error.InvalidAgent;
             if (value.agents) |raw_agents| {
-                if (raw_agents.len == 0) return error.EmptyAgentList;
-                if (raw_agents.len > child_state.max_children) return error.TooManyAgents;
-                var unique: std.ArrayList([]u8) = .empty;
-                errdefer {
-                    for (unique.items) |item| alloc.free(item);
-                    unique.deinit(alloc);
-                }
-                for (raw_agents) |agent| {
-                    if (!domain.validAgentName(agent)) return error.InvalidAgent;
-                    if (std.mem.eql(u8, agent, parent_agent)) return error.InvalidParentTarget;
-                    const seen = for (unique.items) |existing| {
-                        if (std.mem.eql(u8, existing, agent)) break true;
-                    } else false;
-                    if (seen) continue;
-                    try unique.append(alloc, try alloc.dupe(u8, agent));
-                }
-                break :blk .{ .close = .{ .many = try unique.toOwnedSlice(alloc) } };
+                break :blk .{ .close = .{ .many = try validateUniqueCloseAgents(alloc, raw_agents) } };
             }
             const agent = value.agent orelse return error.EmptyAgentList;
-            if (!domain.validAgentName(agent)) return error.InvalidAgent;
-            if (std.mem.eql(u8, agent, parent_agent)) return error.InvalidParentTarget;
+            try validateChildTarget(agent);
             break :blk .{ .close = .{ .one = try alloc.dupe(u8, agent) } };
         },
         .approve => |value| blk: {
@@ -376,6 +359,34 @@ fn validateOverrideText(
 
 fn validateProfile(profile: ?[]const u8) ValidationError!void {
     if (profile) |name| if (!profiles.validName(name)) return error.InvalidProfile;
+}
+
+fn validateChildTarget(agent: []const u8) ValidationError!void {
+    if (!domain.validAgentName(agent)) return error.InvalidAgent;
+    if (std.mem.eql(u8, agent, parent_agent)) return error.InvalidParentTarget;
+}
+
+fn containsAgent(items: []const []const u8, agent: []const u8) bool {
+    for (items) |existing| {
+        if (std.mem.eql(u8, existing, agent)) return true;
+    }
+    return false;
+}
+
+fn validateUniqueCloseAgents(alloc: Allocator, raw_agents: []const []const u8) ValidationError![][]u8 {
+    if (raw_agents.len == 0) return error.EmptyAgentList;
+    if (raw_agents.len > child_state.max_children) return error.TooManyAgents;
+    var unique: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (unique.items) |item| alloc.free(item);
+        unique.deinit(alloc);
+    }
+    for (raw_agents) |agent| {
+        try validateChildTarget(agent);
+        if (containsAgent(unique.items, agent)) continue;
+        try unique.append(alloc, try alloc.dupe(u8, agent));
+    }
+    return try unique.toOwnedSlice(alloc);
 }
 
 /// Returns an owned copy the caller frees, or null. Never fails on null.
