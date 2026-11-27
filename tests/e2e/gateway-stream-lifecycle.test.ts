@@ -14057,6 +14057,38 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   }, 20_000);
 
 
+  test("fx ask --json hints the shell tool when a model calls bash", async () => {
+    const root = createFixtureRoot("bash-tool-hint");
+    const tracePath = join(root.root, "trace.log");
+    const responses = [
+      fakeGatewayToolCall("bash_1", "bash", { command: "printf ok" }),
+      fakeGatewayFinalText("Recovered after bash hint."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Run a command."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.final_output).toBe("Recovered after bash hint.");
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain("Unsupported tool: bash. Use shell instead.");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("model response recovery keeps retrying status failures past ten real requests", async () => {
     const root = createFixtureRoot("provider-attempt-budget");
     const tracePath = join(root.root, "trace.log");

@@ -860,7 +860,10 @@ fn resolveToolDispatchPrelude(
             try tool_mcp_runtime.notSelectedOutput(arena, call.name),
         ) },
         .unsupported => .{ .completed = semanticFailure(
-            try tool_mcp_registry.unsupportedOutput(arena, call.name, call.carried_by),
+            if (call.carried_by == null)
+                try tool_dispatch.unsupportedToolOutput(arena, ctx.tool_registry, call.name)
+            else
+                try tool_mcp_registry.unsupportedOutput(arena, call.name, call.carried_by),
         ) },
     };
 }
