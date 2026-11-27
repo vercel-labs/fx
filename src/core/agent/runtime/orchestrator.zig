@@ -8369,7 +8369,7 @@ fn processQueuedPromptLoop(
         // A changed runtime context joins this boundary before its steering,
         // as the notes above do (D93, D94).
         var current_runtime_context: std.ArrayList(ChatMessage) = .empty;
-        try deps.append_runtime_context(deps.ctx, overlay_arena, &current_runtime_context);
+        try deps.append_runtime_context(deps.ctx, overlay_arena, job.model, &current_runtime_context);
         const was_captured = runtime_context.captured != null;
         const runtime_update = try runtime_context.refresh(arena, overlay_arena, current_runtime_context.items);
         if (!was_captured and runtime_context.captured != null) {

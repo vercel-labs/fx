@@ -2730,7 +2730,7 @@ test "a tool call a finished turn left open reads as the turn's outcome" {
     try std.testing.expectEqualStrings("Cancelled", unfinishedToolCallText(.failed, true));
 }
 
-fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, model: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else unreachable;
     try ctx.state.cfg.context_registry.appendDefaultTransient(.{
@@ -2738,7 +2738,7 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.state.workspace_access.scope(ctx.state.workspace_root),
         .interactive = false,
         .permission_mode = ctx.captured_permission_mode orelse session.permission_mode,
-        .model = ctx.routeView(session).model,
+        .model = model,
         // ACP's turns have no id here, so its list is read afresh at each
         // step; its reports never join a turn, so a change shows at once.
         .subagents = if (ctx.state.subagent_host) |team_host| try team_host.teamNote(arena, 0) else null,
@@ -5880,7 +5880,7 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
     try messages.append(arena, .{ .role = .system, .content = "base system" });
 
     try deps.append_static_context.?(deps.ctx, arena, &messages);
-    try deps.append_runtime_context(deps.ctx, arena, &messages);
+    try deps.append_runtime_context(deps.ctx, arena, "", &messages);
 
     try std.testing.expectEqual(@as(usize, 3), messages.items.len);
     try std.testing.expectEqualStrings("base system", messages.items[0].content.?);
@@ -6046,7 +6046,7 @@ test "ACP prompt projection configures web search then blocks native execution" 
     const deps = agentRuntimeDeps(&ctx);
     const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
     try append_static(deps.ctx, arena, &messages);
-    try deps.append_runtime_context(deps.ctx, arena, &messages);
+    try deps.append_runtime_context(deps.ctx, arena, state.active_session.?.model, &messages);
 
     try std.testing.expectEqualStrings("stale-key", state.web_search_runtime.api_key);
 
