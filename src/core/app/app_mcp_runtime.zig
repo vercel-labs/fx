@@ -619,24 +619,26 @@ pub const State = struct {
     }
 
     fn buildCompletion(self: *State, a: Allocator) ![]const mod_registry.ArgumentCompletion {
+        const lease = self.leaseHost() orelse return completionsFor(a, &.{});
+        defer lease.deinit();
+        // Rebuilt twice a second on the UI thread, so it doesn't wait for saved credentials.
+        return completionsFor(a, try lease.host.runtime.statusesNow(a));
+    }
+
+    /// The verbs, then each verb's servers, every one described by the words the `/mcp` menu uses for its status.
+    fn completionsFor(a: Allocator, statuses: []const mcp_host.Status) ![]const mod_registry.ArgumentCompletion {
         var out: std.ArrayList(mod_registry.ArgumentCompletion) = .empty;
         try out.appendSlice(a, &verb_completions);
-        const lease = self.leaseHost() orelse return out.items;
-        defer lease.deinit();
-        // Rebuilt twice a second on the UI thread, so it doesn't wait for
-        // saved credentials: a description says "signed in" from the next
-        // rebuild after they are restored.
-        const statuses = try lease.host.runtime.statusesNow(a);
-        for (statuses, lease.host.runtime.servers()) |status, server| {
+        for (statuses) |status| {
             if (!mcp_verbs.isValidServerName(status.name)) continue;
-            const description = try mcp_verbs.statusText(a, status);
+            const description = try mcp_verbs.runStatusText(a, status);
             const applies = [_]struct { verb: []const u8, ok: bool }{
                 .{ .verb = "show", .ok = true },
                 .{ .verb = "remove", .ok = true },
-                .{ .verb = "login", .ok = server.transport != .stdio },
-                .{ .verb = "logout", .ok = server.transport != .stdio },
-                .{ .verb = "approve", .ok = server.source == .workspace },
-                .{ .verb = "reject", .ok = server.source == .workspace },
+                .{ .verb = "login", .ok = status.transport != .stdio },
+                .{ .verb = "logout", .ok = status.transport != .stdio },
+                .{ .verb = "approve", .ok = status.source == .workspace },
+                .{ .verb = "reject", .ok = status.source == .workspace },
             };
             for (applies) |verb| if (verb.ok) try out.append(a, .{
                 .full = try a.print("/mcp {s} {s}", .{ verb.verb, status.name }),
@@ -1211,6 +1213,39 @@ pub const State = struct {
         self.* = .{};
     }
 };
+
+test "the /mcp completions describe an idle server with a saved login as the menu does: not started" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const statuses = [_]mcp_host.Status{
+        .{ .name = "saved", .source = .profile, .transport = .http, .state = .idle, .signed_in = true },
+        .{ .name = "fresh", .source = .profile, .transport = .http, .state = .idle },
+        .{ .name = "up", .source = .profile, .transport = .http, .state = .ready, .tools = 1, .signed_in = true },
+        .{ .name = "proj", .source = .workspace, .transport = .stdio, .state = .idle },
+    };
+    const entries = try State.completionsFor(a, &statuses);
+    var described: usize = 0;
+    for (entries) |e| {
+        const server = if (std.mem.startsWith(u8, e.full, "/mcp show ")) e.full["/mcp show ".len..] else continue;
+        described += 1;
+        const want: []const u8 = if (std.mem.eql(u8, server, "up")) "ready, 1 tool" else "not started";
+        try std.testing.expectEqualStrings(want, e.description.?);
+    }
+    try std.testing.expectEqual(statuses.len, described);
+    // Every verb of the saved-login server says the same words about it, and stdio servers take no login verbs.
+    var saved_verbs: usize = 0;
+    var proj_login = false;
+    for (entries) |e| {
+        if (std.mem.endsWith(u8, e.full, " saved")) {
+            saved_verbs += 1;
+            try std.testing.expectEqualStrings("not started", e.description.?);
+        }
+        if (std.mem.eql(u8, e.full, "/mcp login proj")) proj_login = true;
+    }
+    try std.testing.expectEqual(@as(usize, 4), saved_verbs);
+    try std.testing.expect(!proj_login);
+}
 
 test "a typed /mcp login names its server wherever --no-browser goes" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);

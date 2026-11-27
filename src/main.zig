@@ -5704,6 +5704,7 @@ test {
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/shared/gateway_error_format.zig");
     _ = @import("core/shared/history_range.zig");
+    _ = @import("core/shared/hold_marker.zig");
     _ = @import("core/cli/doctor_runtime.zig");
     _ = @import("core/cli/doctor_probes.zig");
     _ = @import("core/cli/doctor_child_status.zig");
@@ -5747,6 +5748,8 @@ test {
     _ = @import("core/gateway/model_catalog.zig");
     _ = @import("core/gateway/gateway_provider.zig");
     _ = @import("gateway/chat_completions.zig");
+    _ = @import("gateway/configured_transport.zig");
+    _ = @import("gateway/catalog_fetch_failure.zig");
     _ = @import("core/github/git_context.zig");
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");
@@ -5886,7 +5889,7 @@ test {
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/host_stream_provider.zig");
-    _ = @import("gateway/open_job.zig");
+    _ = @import("core/shared/open_job.zig");
     _ = @import("gateway/vercel_failure_diagnostics.zig");
     _ = @import("gateway/host_model_catalog.zig");
     _ = @import("gateway/host_openai_codex.zig");
