@@ -229,6 +229,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_MCP_CALL_FOLLOW_WAIT_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_MCP_IDLE_MS": {
       "job": "test",
       "stability": "internal"

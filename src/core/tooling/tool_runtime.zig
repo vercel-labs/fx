@@ -1027,7 +1027,13 @@ const McpCallBridgeState = struct {
     runtime: Context,
 
     fn capability(self: *McpCallBridgeState) mcp_call_capability.Capability {
-        return .{ .context = @ptrCast(self), .authorize_fn = authorizeBridgeCall, .call_fn = runBridgeCall, .lookup_fn = lookupBridge };
+        return .{
+            .context = @ptrCast(self),
+            .agent = self.runtime.lifecycle_scope.subagent_id orelse 0,
+            .authorize_fn = authorizeBridgeCall,
+            .call_fn = runBridgeCall,
+            .lookup_fn = lookupBridge,
+        };
     }
 };
 

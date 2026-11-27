@@ -153,6 +153,7 @@ pub const Reason = enum {
     closed,
     unauthorized,
     unsupported_version,
+    not_followed,
     busy,
     /// The request line was not a request.
     malformed,
@@ -164,6 +165,7 @@ pub const Reason = enum {
             .closed => .closed,
             .unauthorized => .unauthorized,
             .unsupported_version => .unsupported_version,
+            .not_followed => .not_followed,
             .busy => .busy,
         };
     }
@@ -279,6 +281,7 @@ test "a reply header round-trips and rejects another version" {
     try std.testing.expectEqual(Status.refused, header.status);
     try std.testing.expectEqual(Reason.busy, header.reason.?);
     try std.testing.expectEqual(@as(u64, 12), header.bytes);
+    try std.testing.expectEqual(Reason.not_followed, Reason.fromRefusal(.not_followed));
     try std.testing.expectError(error.UnsupportedReply, parseHeader(arena, "{\"v\":2,\"status\":\"ok\",\"bytes\":0}"));
     try std.testing.expectError(error.MalformedReply, parseHeader(arena, "{\"v\":1,\"status\":\"maybe\",\"bytes\":0}"));
 }

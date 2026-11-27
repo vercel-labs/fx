@@ -3,11 +3,12 @@
 //! file named by its first argument and writes one JSON result per operation
 //! to the file named by its second.
 //!
-//! The lab plays `Runtime.wait`'s part and knows nothing about the model: it
-//! keeps one command's start, last output, and exit, opens and polls one wait
-//! at the times the driver names, and reports what the module decided. Like
-//! `Runtime.wait`, it ends a wait on a finished command before it asks the
-//! module.
+//! The lab plays `Runtime.waitOrYield`'s part and knows nothing about the
+//! model: it keeps one command's start, last output, exit, hold, and steering
+//! flag, opens and polls one wait at the times the driver names, and reports
+//! what the module decided. Like `Runtime.waitOrYield`, it checks a finished
+//! command first, then steering when not held, then `quiet_notice.poll`
+//! (keeping its new arm and ignoring its ceiling end while held).
 const std = @import("std");
 const quiet_notice = @import("quiet_notice");
 
@@ -22,6 +23,7 @@ const Result = struct {
     running: bool,
     waiting: bool,
     armed: bool,
+    held: bool,
     quiet_ms: u64,
     end: ?[]const u8 = null,
     crossed: ?bool = null,
@@ -35,6 +37,8 @@ const Lab = struct {
     started_ms: i64 = 0,
     last_output_ms: i64 = 0,
     running: bool = true,
+    held: bool = false,
+    steer_due: bool = false,
     wait: ?quiet_notice.Wait = null,
 };
 
@@ -50,9 +54,24 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         lab.last_output_ms = op.now;
     } else if (is(op.op, "finish")) {
         lab.running = false;
+    } else if (is(op.op, "hold")) {
+        if (lab.held) result.@"error" = "already held";
+        lab.held = true;
+    } else if (is(op.op, "release")) {
+        if (!lab.held) result.@"error" = "not held";
+        lab.held = false;
     } else if (is(op.op, "begin")) {
         if (lab.wait != null) result.@"error" = "a wait is already open";
+        lab.steer_due = false;
         lab.wait = quiet_notice.beginWait(op.now, lab.last_output_ms, op.ceiling, lab.limit_ms);
+    } else if (is(op.op, "steer")) {
+        if (lab.wait == null) {
+            result.@"error" = "no wait is open";
+            return;
+        }
+        if (!lab.running) result.@"error" = "steer after exit";
+        if (lab.steer_due) result.@"error" = "already steering";
+        lab.steer_due = true;
     } else if (is(op.op, "poll")) {
         const wait = lab.wait orelse {
             result.@"error" = "no wait is open";
@@ -63,33 +82,28 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         var crossed = false;
         if (!lab.running) {
             end = "done";
+        } else if (lab.steer_due and !lab.held) {
+            end = "steer";
+            crossed = quiet_notice.crossedAt(wait, op.now, lab.last_output_ms, lab.limit_ms);
         } else {
             const step = quiet_notice.poll(wait, op.now, lab.last_output_ms, lab.limit_ms);
             armed = step.wait.armed;
             lab.wait = step.wait;
-            if (step.end) |reason| {
-                end = @tagName(reason);
-                crossed = step.crossed;
+            if (!lab.held) {
+                if (step.end) |reason| {
+                    end = @tagName(reason);
+                    crossed = step.crossed;
+                }
             }
         }
         if (end) |reason| {
             lab.wait = null;
+            lab.steer_due = false;
             result.end = reason;
             result.crossed = crossed;
             result.ended_armed = armed;
             result.times = quiet_notice.timesFor(lab.running, op.now, lab.started_ms, lab.last_output_ms, lab.limit_ms);
         }
-    } else if (is(op.op, "steer")) {
-        const wait = lab.wait orelse {
-            result.@"error" = "no wait is open";
-            return;
-        };
-        const crossed = if (lab.running) quiet_notice.crossedAt(wait, op.now, lab.last_output_ms, lab.limit_ms) else false;
-        lab.wait = null;
-        result.end = "steer";
-        result.crossed = crossed;
-        result.ended_armed = wait.armed;
-        result.times = quiet_notice.timesFor(lab.running, op.now, lab.started_ms, lab.last_output_ms, lab.limit_ms);
     } else {
         result.@"error" = "unknown op";
     }
@@ -116,10 +130,11 @@ pub fn main(init: std.process.Init) !void {
         if (line.len == 0) continue;
         _ = scratch.reset(.retain_capacity);
         const op = try std.json.parseFromSliceLeaky(Op, scratch.allocator(), line, .{ .ignore_unknown_fields = true });
-        var result: Result = .{ .running = true, .waiting = false, .armed = false, .quiet_ms = 0 };
+        var result: Result = .{ .running = true, .waiting = false, .armed = false, .held = false, .quiet_ms = 0 };
         run(&lab, op, &result);
         result.running = lab.running;
         result.waiting = lab.wait != null;
+        result.held = lab.held;
         if (lab.wait) |wait| result.armed = wait.armed;
         result.quiet_ms = quiet_notice.quietMs(op.now, lab.last_output_ms);
         try std.json.Stringify.value(result, .{}, out);
