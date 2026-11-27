@@ -66,7 +66,7 @@ fn configuredValueMessage(alloc: Allocator, err: anyerror) !?[]u8 {
         error.WebSearchChatUrlTooLong => .{ .what = "gateway chat URL", .cap = web_search_runtime.Caps.gateway_chat_url },
         else => return null,
     };
-    return try std.fmt.allocPrint(alloc, "web_search cannot run: its {s} is longer than {d} bytes", .{ refused.what, refused.cap });
+    return try alloc.print("web_search cannot run: its {s} is longer than {d} bytes", .{ refused.what, refused.cap });
 }
 
 pub fn formatOutput(alloc: Allocator, output: Output) ![]u8 {
@@ -323,7 +323,7 @@ test "a refused configured value names the value and its cap" {
     for (cases) |case| {
         const message = (try configuredValueMessage(alloc, case.err)).?;
         defer alloc.free(message);
-        const want = try std.fmt.allocPrint(alloc, "web_search cannot run: its {s} is longer than {d} bytes", .{ case.what, case.cap });
+        const want = try alloc.print("web_search cannot run: its {s} is longer than {d} bytes", .{ case.what, case.cap });
         defer alloc.free(want);
         try std.testing.expectEqualStrings(want, message);
     }
