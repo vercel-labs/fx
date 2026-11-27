@@ -6257,6 +6257,82 @@ test("update runs the manual upgrade", async () => {
 }, UPGRADE_TIMEOUT);
 
 test.skipIf(!tmuxAvailable())(
+  "a newer dev release replaces the update that waits for ctrl+g",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-newer-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ update_channel: "dev" }));
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+    const firstRevision = "1111111111111111111111111111111111111111";
+    const newestRevision = "2222222222222222222222222222222222222222";
+
+    let active: TmuxSession | null = null;
+    const gateway = startFakeGateway([]);
+    const release = startUpgradeServer(root, argvLogPath, { revision: firstRevision });
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: realpathSync(workspace),
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      expect(readFileSync(installedFx, "utf8")).toContain(`# fake fx release ${firstRevision}`);
+
+      // A second dev release comes out while the first waits for Ctrl+G. The
+      // next check installs it over the waiting one, and the footer keeps
+      // offering the reload.
+      release.setRevision(newestRevision);
+      const deadline = Date.now() + UPGRADE_TIMEOUT;
+      while (!readFileSync(installedFx, "utf8").includes(`# fake fx release ${newestRevision}`)) {
+        if (Date.now() > deadline) {
+          throw new Error(`the newer dev release was never installed:\n${readFileSync(installedFx, "utf8").slice(0, 200)}`);
+        }
+        await Bun.sleep(100);
+      }
+      expect(await active.capturePane()).toContain("update ready: ctrl+g to reload");
+
+      await active.sendHexBytes(["07"]);
+      await active.waitForText("fx has been updated to", UPGRADE_TIMEOUT);
+      // One relaunch, of the file that holds the newest release.
+      const launches = readFileSync(argvLogPath, "utf8").trim().split("\n").map((line) => line.split("\t"));
+      expect(launches).toHaveLength(1);
+      expect(launches[0]![0]).toBe(installedFx);
+      expect(launches[0]).toContain("--upgrade-relaunch");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      release.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
   "TTY upgrade prints bold fx version header before output",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-upgrade-tty-header-")));
