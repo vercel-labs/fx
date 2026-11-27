@@ -1,4 +1,4 @@
-//! Saves each auto-mode safety review request and the reviewer's answer on this machine when FX_DEBUG_REVIEW_RECORD=1, so real reviews can be replayed. fx never reads or uploads these files. They hold the exact request, which can include the action's full text and the tool results the reviewer saw.
+//! Saves each auto-mode safety review request and the reviewer's answer on this machine when FX_DEBUG_REVIEW_RECORD=1, so real reviews can be replayed. WebAssembly builds never record, so this code is compiled out there. fx never reads or uploads these files. They hold the exact request, which can include the action's full text and the tool results the reviewer saw.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -49,6 +49,7 @@ var write_mutex: std.Io.Mutex = .init;
 
 /// Whether `FX_DEBUG_REVIEW_RECORD` turns recording on. Only the exact value `1` does.
 pub fn enabled() bool {
+    if (comptime host_target.is_wasm) return false;
     return isOn(io_mod.getenv("FX_DEBUG_REVIEW_RECORD"));
 }
 
@@ -61,6 +62,7 @@ fn isOn(value: ?[]const u8) bool {
 /// records folder. Does nothing unless recording is on. Never fails: a record
 /// that cannot be saved is dropped, and a trace line names what was dropped and why.
 pub fn append(send: Send) void {
+    if (comptime host_target.is_wasm) return;
     if (!enabled()) return;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
