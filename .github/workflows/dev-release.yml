@@ -9,8 +9,11 @@ on:
 permissions:
   contents: read
 
+# A run for a CI run that did not pass on a push to main skips every job (the
+# same condition as the jobs' `if`). It gets a group of its own, so it cannot
+# cancel a real run in progress.
 concurrency:
-  group: dev-release
+  group: ${{ (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository) && 'dev-release' || format('dev-release-skip-{0}', github.run_id) }}
   cancel-in-progress: true
 
 jobs:
