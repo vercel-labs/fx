@@ -5,6 +5,7 @@ const profiles = @import("../profiles/profiles.zig");
 const reports = @import("reports.zig");
 const child_state = @import("child_state.zig");
 const session_commands = @import("../session/session_commands.zig");
+const tool_projection = @import("../tooling/tool_projection.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -366,13 +367,6 @@ fn validateChildTarget(agent: []const u8) ValidationError!void {
     if (std.mem.eql(u8, agent, parent_agent)) return error.InvalidParentTarget;
 }
 
-fn containsAgent(items: []const []const u8, agent: []const u8) bool {
-    for (items) |existing| {
-        if (std.mem.eql(u8, existing, agent)) return true;
-    }
-    return false;
-}
-
 fn validateUniqueCloseAgents(alloc: Allocator, raw_agents: []const []const u8) ValidationError![][]u8 {
     if (raw_agents.len == 0) return error.EmptyAgentList;
     if (raw_agents.len > child_state.max_children) return error.TooManyAgents;
@@ -383,8 +377,10 @@ fn validateUniqueCloseAgents(alloc: Allocator, raw_agents: []const []const u8) V
     }
     for (raw_agents) |agent| {
         try validateChildTarget(agent);
-        if (containsAgent(unique.items, agent)) continue;
-        try unique.append(alloc, try alloc.dupe(u8, agent));
+        if (tool_projection.containsName(@ptrCast(unique.items), agent)) continue;
+        const copy = try alloc.dupe(u8, agent);
+        errdefer alloc.free(copy);
+        try unique.append(alloc, copy);
     }
     return try unique.toOwnedSlice(alloc);
 }
@@ -609,6 +605,14 @@ test "minimal request validation owns each action's intent" {
             .instructions = "",
             .message = "review this",
         } }),
+    );
+}
+
+test "validateRequest frees duplicated batch close names when list append fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        validateRequest(failing.allocator(), .{ .close = .{ .agents = &.{"alpha"} } }),
     );
 }
 

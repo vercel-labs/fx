@@ -3036,6 +3036,16 @@ pub const Runtime = struct {
         state.lines_written += 1;
     }
 
+    fn recordBatchNotOpen(
+        writer: *std.Io.Writer,
+        state: *BatchCloseState,
+        agent: []const u8,
+    ) !void {
+        try writer.print("No open subagent is named \"{s}\".\n", .{agent});
+        state.lines_written += 1;
+        state.any_not_open = true;
+    }
+
     fn closeManyAgent(
         self: *Runtime,
         a: Allocator,
@@ -3052,9 +3062,7 @@ pub const Runtime = struct {
             break :blk try a.dupe(u8, child.id);
         };
         const id = child_id orelse {
-            try writer.print("No open subagent is named \"{s}\".\n", .{agent});
-            state.lines_written += 1;
-            state.any_not_open = true;
+            try recordBatchNotOpen(writer, state, agent);
             return;
         };
         const closed_opt = close_fn(self, id, .parent) catch |err| switch (err) {
@@ -3070,17 +3078,16 @@ pub const Runtime = struct {
             },
         };
         const closed = closed_opt orelse {
-            try writer.print("No open subagent is named \"{s}\".\n", .{agent});
-            state.lines_written += 1;
-            state.any_not_open = true;
+            try recordBatchNotOpen(writer, state, agent);
             return;
         };
-        state.closed_count += 1;
         const dropped_text = switch (closed.dropped) {
             0 => "",
             1 => " The message waiting for it was dropped.",
-            else => try a.print(" The {d} messages waiting for it were dropped.", .{closed.dropped}),
+            // Child already closed; keep the closed line without the count suffix on OOM.
+            else => a.print(" The {d} messages waiting for it were dropped.", .{closed.dropped}) catch "",
         };
+        state.closed_count += 1;
         try writer.print("Closed {s}{s}.{s}\n", .{
             agent,
             if (closed.stopped) ", ending its turn" else "",
@@ -13006,4 +13013,60 @@ test "batch close reports per-name failure and closes remaining names when close
         error.OutOfMemory,
         runtime.closeManyWith(failing.allocator(), &.{"beta"}, FakeClose.close),
     );
+}
+
+test "batch close still reports a closed agent when dropped-count formatting fails with OOM" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "alpha", .message = "one" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+
+    const StubClose = struct {
+        var calls: usize = 0;
+        fn close(rt: *Runtime, child_id: []const u8, by: Runtime.CloseBy) anyerror!?Runtime.Closed {
+            _ = rt;
+            _ = child_id;
+            _ = by;
+            calls += 1;
+            return .{ .stopped = false, .dropped = 2 };
+        }
+    };
+
+    var saw_close_with_oom = false;
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        StubClose.calls = 0;
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var failing = std.testing.FailingAllocator.init(scratch.allocator(), .{ .fail_index = fail_index });
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        var state: Runtime.BatchCloseState = .{};
+        runtime.closeManyAgent(failing.allocator(), "alpha", &out.writer, &state, StubClose.close) catch |err| switch (err) {
+            error.OutOfMemory => {
+                // If close_fn already closed the child, returning OOM here means
+                // closeManyWith would report it as failed/still open!
+                if (StubClose.calls > 0) return error.TestUnexpectedResult;
+                continue;
+            },
+            else => return err,
+        };
+        if (StubClose.calls == 1) {
+            saw_close_with_oom = true;
+            try std.testing.expectEqual(@as(usize, 1), state.closed_count);
+            try expectBodyHas(out.written(), "Closed alpha.");
+            break;
+        }
+    }
+    try std.testing.expect(saw_close_with_oom);
 }

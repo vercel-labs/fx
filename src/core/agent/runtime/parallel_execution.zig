@@ -4,6 +4,7 @@ const testing_allocator = @import("../../shared/testing_allocator.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const types = @import("../../shared/types.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
+const tool_projection = @import("../../tooling/tool_projection.zig");
 const io_mod = @import("../../shared/io.zig");
 
 const runtime_deps = @import("deps.zig");
@@ -73,23 +74,16 @@ fn subagentTarget(arena: Allocator, call: ToolCall) SubagentTarget {
     return if (agent.len == 0) .none else .{ .named = agent };
 }
 
-fn containsName(names: []const []const u8, target: []const u8) bool {
-    for (names) |name| {
-        if (std.mem.eql(u8, name, target)) return true;
-    }
-    return false;
-}
-
 fn appendUniqueNames(
     arena: Allocator,
     seen: *std.ArrayList([]const u8),
     names: []const []const u8,
 ) bool {
     for (names) |name| {
-        if (containsName(seen.items, name)) return false;
+        if (tool_projection.containsName(seen.items, name)) return false;
     }
     for (names) |name| {
-        if (containsName(seen.items, name)) continue;
+        if (tool_projection.containsName(seen.items, name)) continue;
         seen.append(arena, name) catch return false;
     }
     return true;
