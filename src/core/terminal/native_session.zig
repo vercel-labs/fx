@@ -198,7 +198,11 @@ const LauncherControl = struct {
                     self.control_path,
                 ) catch {};
             }
-            try writeAllFd(stream.socket.handle, &.{1}, false);
+            writeAllFd(stream.socket.handle, &.{1}, false) catch |err| {
+                // The shell has ended, so nothing is left to read the answer.
+                if (self.done.load(.acquire)) return;
+                return err;
+            };
             if (finished) {
                 return;
             }
@@ -237,15 +241,15 @@ const LauncherControl = struct {
                     @intCast(self.child_pid),
                 );
                 while (!self.watchdog.command_released.load(.acquire)) {
+                    if (self.watchdog.host_closed.load(.acquire)) {
+                        return error.LauncherHostClosed;
+                    }
                     // `done` is set when the shell has ended: no release is
                     // coming, and the launcher joins this thread before it
                     // closes the PTY slave (`tests/tla/terminal/TerminalLifecycle.tla`
-                    // NoHolderAfterCleanExit).
-                    if (self.watchdog.host_closed.load(.acquire) or
-                        self.done.load(.acquire))
-                    {
-                        return error.LauncherHostClosed;
-                    }
+                    // NoHolderAfterCleanExit). The command did start, so the
+                    // launcher goes on to report how the shell ended.
+                    if (self.done.load(.acquire)) break;
                     io_mod.sleep(wait_poll_ns);
                 }
                 self.phase = .command_started;

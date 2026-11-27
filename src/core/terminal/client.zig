@@ -2043,6 +2043,45 @@ test "closing owned terminals for exit ends a launcher that still waits to relea
     try std.testing.expect(fixture.runtime.backend_drained);
 }
 
+test "a terminal whose shell ends while its release is held reports how it ended" {
+    try expectEndsWhileReleaseIsHeld(.shell_only);
+}
+
+test "a terminal whose shell and helper both end while its release is held reports how it ended" {
+    try expectEndsWhileReleaseIsHeld(.whole_group);
+}
+
+const EndedProcesses = enum { shell_only, whole_group };
+
+/// The shell has told the launcher that its command starts, and the host
+/// never releases it. The shell ends (the whole group, as a hangup of the
+/// terminal ends it, takes the helper that told the launcher with it), and
+/// the launcher must report that end, not a failed start.
+fn expectEndsWhileReleaseIsHeld(ended: EndedProcesses) !void {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    native_session.test_hold_release = true;
+    defer native_session.test_hold_release = false;
+    const session_id = try fixture.start("sleep 30");
+    defer alloc.free(session_id);
+    const shell = TestProcess.init(try fixture.shellPid(session_id));
+    defer shell.end();
+
+    // The shell leads its own process group, so its pid names the group.
+    const target = switch (ended) {
+        .shell_only => shell.pid,
+        .whole_group => -shell.pid,
+    };
+    try std.posix.kill(target, std.posix.SIG.KILL);
+    try std.testing.expectEqual(
+        contracts.ReturnOutcome{ .signal = @intCast(@backingInt(std.posix.SIG.KILL)) },
+        try fixture.waitForExit(session_id),
+    );
+}
+
 test "closing owned terminals for exit leaves a setsid program and another runtime's terminal running" {
     var fixture: LiveTerminalFixture = undefined;
     try fixture.init();
