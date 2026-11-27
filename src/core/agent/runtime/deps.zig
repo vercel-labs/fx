@@ -8,6 +8,7 @@ const session_codec = @import("../../session/session_codec.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const model_provider = @import("../../config/model_provider.zig");
 const model_catalog = @import("../../gateway/model_catalog.zig");
 const types = @import("../../shared/types.zig");
 const worker_runtime = @import("../worker_runtime.zig");
@@ -202,9 +203,19 @@ pub const RefreshedGatewayCredential = struct {
     gateway_team_label: ?[]u8 = null,
 };
 
+/// The provider and model a waiting request continues with, as the worker
+/// holds them: its own copy, set under that worker's lock.
+pub const CurrentSelection = struct {
+    provider: model_provider.ProviderId,
+    model: []u8,
+};
+
 pub const AgentRuntimeDeps = struct {
     /// The steps of `start_workspace_capture`.
     pub const WorkspaceCaptureStep = enum { begin, capture, settle };
+
+    /// How a turn held for an upgrade's restart ends.
+    pub const RestartHoldEnd = worker_runtime.WorkerRuntime.RestartHoldEnd;
 
     /// What `wait_for_handoff_mail` ended on.
     pub const HandoffMailWait = enum {
@@ -273,7 +284,7 @@ pub const AgentRuntimeDeps = struct {
     /// seconds to stop holds neither the turn's end nor the next prompt.
     /// Hosts without steering leave it unset.
     stop_steering_detached_commands: ?*const fn (ctx: *anyopaque, turn_id: u64) anyerror!void = null,
-    append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
+    append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8, messages: *std.ArrayList(ChatMessage)) anyerror!void,
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
     snapshot_mcp_definition: ?*const fn (*anyopaque, Allocator, []const u8, types.McpToolBinding) anyerror!@import("../../tooling/tool_mcp_runtime.zig").DefinitionSnapshot = null,
@@ -311,9 +322,13 @@ pub const AgentRuntimeDeps = struct {
     save_recovery_record: ?*const fn (ctx: *anyopaque, record: types.RecoveryRecordWrite) anyerror!bool = null,
     /// Marks the open turn as one that stopped between steps for its host,
     /// after its record was saved clean, so the next launch continues it as
-    /// the same turn (`tests/tla/recovery/Resume.tla` Relaunch). Null on
+    /// the same turn (`tests/tla/recovery/Resume.tla` Hold). Null on
     /// hosts that never stop a turn this way.
     mark_turn_yielded: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    /// Holds a turn that stopped for an upgrade's restart until the restart
+    /// goes ahead or is cancelled (`WorkerRuntime.holdForRestart`). Null: the
+    /// turn returns `error.TurnYielded` at once.
+    hold_for_restart: ?*const fn (ctx: *anyopaque) RestartHoldEnd = null,
     /// Called once with each main-model completion's provider usage, as soon
     /// as it arrives, so a saved session keeps the usage of every reply even
     /// when the turn never ends. A failure is traced and never fails the turn.
@@ -391,6 +406,10 @@ pub const AgentRuntimeDeps = struct {
     /// Asks the user what to do when the account is out of credits, and
     /// blocks until they answer. Only the TUI sets it.
     ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,
+    /// The provider and model a waiting request continues with, taken once
+    /// from the worker's own copy so the worker thread never touches the
+    /// view's strings. Null: the request keeps the job's model.
+    continue_selection: ?*const fn (ctx: *anyopaque, alloc: Allocator) anyerror!?CurrentSelection = null,
     /// A request that waited for a sign-in found the login another fx
     /// process stored, and sends again with no answer from the host. The TUI
     /// marks the turn as working for Herdr. Null: nothing marks it.
@@ -419,6 +438,12 @@ pub const AgentRuntimeDeps = struct {
 
     pub fn pushContextNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
         if (self.push_context_notice) |push| return push(self.ctx, text);
+        return self.push_system_notice(self.ctx, text);
+    }
+
+    /// A warning in the transcript where the host shows one, else the plain system notice.
+    pub fn pushWarningNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
+        if (self.push_interactive_notice) |push| return push(self.ctx, .{ .topic = "", .tone = .warning, .body = text });
         return self.push_system_notice(self.ctx, text);
     }
 

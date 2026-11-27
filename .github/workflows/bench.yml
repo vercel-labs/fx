@@ -165,6 +165,25 @@ jobs:
             ${{ runner.temp }}/shell-command-overhead/home/rc-loads.log
           if-no-files-found: warn
 
+      - name: Run shell command overhead benchmark (with MCP)
+        run: python3 benchmarks/shell_command_overhead.py --binary ./zig-out/bin/fx --output ${{ runner.temp }}/shell-command-overhead-with-mcp --calls 100 --timeout 480 --with-mcp
+
+      - name: Enforce shell command overhead budget (with MCP)
+        run: jq -e '.completed == true and .rc_loads == 1 and .per_call_ms.median <= 60 and .total_ms <= (.rc_delay_ms + 100*60 + 1000) and .bridge_registrations == (.calls + 1) and .mcp_owner_starts == 0' ${{ runner.temp }}/shell-command-overhead-with-mcp/measurements.json
+
+      - name: Upload shell command overhead evidence (with MCP)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shell-command-overhead-with-mcp-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/shell-command-overhead-with-mcp/measurements.json
+            ${{ runner.temp }}/shell-command-overhead-with-mcp/stderr.log
+            ${{ runner.temp }}/shell-command-overhead-with-mcp/stdout.json
+            ${{ runner.temp }}/shell-command-overhead-with-mcp/fx-trace.log
+            ${{ runner.temp }}/shell-command-overhead-with-mcp/home/rc-loads.log
+          if-no-files-found: warn
+
   libfx-ttft:
     if: github.event_name == 'workflow_dispatch' && inputs.libfx_runtime && inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
     name: libfx Runtime

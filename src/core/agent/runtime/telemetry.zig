@@ -43,8 +43,17 @@ pub const GatewayFailureDiagnostics = struct {
     error_message: []const u8 = "",
 };
 
+/// What a settled gateway call says about itself: the generation ID and the
+/// provider that served it, and the reasoning effort the request sent. An empty
+/// field is left out of the trace.
+pub const GatewayCallFacts = struct {
+    generation_id: []const u8 = "",
+    served_by: []const u8 = "",
+    effort: []const u8 = "",
+};
+
 pub fn recordGatewayCallMetric(model: []const u8, started_at_ms: i64, status: u16, response_bytes: u32, input_tokens: u32, output_tokens: u32, turn_id: u64, step_id: u64, subagent_id: u64, error_name: []const u8, terminal_stop_reason: []const u8) void {
-    recordGatewayCallMetricWithDiagnostics(model, started_at_ms, status, response_bytes, input_tokens, output_tokens, turn_id, step_id, subagent_id, error_name, terminal_stop_reason, .{});
+    recordGatewayCallMetricWithDiagnostics(model, started_at_ms, status, response_bytes, input_tokens, output_tokens, turn_id, step_id, subagent_id, error_name, terminal_stop_reason, .{}, .{});
 }
 
 pub fn recordGatewayCallMetricWithDiagnostics(
@@ -60,6 +69,7 @@ pub fn recordGatewayCallMetricWithDiagnostics(
     error_name: []const u8,
     terminal_stop_reason: []const u8,
     failure_diagnostics: GatewayFailureDiagnostics,
+    facts: GatewayCallFacts,
 ) void {
     const now_ms = io_mod.milliTimestamp();
     const elapsed = if (now_ms > started_at_ms) now_ms - started_at_ms else 0;
@@ -81,6 +91,9 @@ pub fn recordGatewayCallMetricWithDiagnostics(
     if (failure_diagnostics.schema.len > 0) call.setGatewaySchemaDiagnostic(failure_diagnostics.schema);
     if (failure_diagnostics.request_shape.len > 0) call.setGatewayRequestShape(failure_diagnostics.request_shape);
     if (failure_diagnostics.error_message.len > 0) call.setGatewayErrorMessage(failure_diagnostics.error_message);
+    if (facts.generation_id.len > 0) call.setGenerationId(facts.generation_id);
+    if (facts.served_by.len > 0) call.setServedBy(facts.served_by);
+    if (facts.effort.len > 0) call.setEffort(facts.effort);
     diagnostics.recordNetworkCall(call);
 }
 
