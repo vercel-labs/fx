@@ -1,0 +1,26 @@
+[
+  {
+    "id": "ignore-cancel",
+    "breaks": "The subagent wait ignores its cancel flag, so a wait whose bash program is gone never ends (tool_host.zig waitForWake).",
+    "file": "src/core/subagent/tool_host.zig",
+    "find": "            if (flag.load(.seq_cst)) return .stopped;",
+    "replace": "            _ = flag;",
+    "expect": "WaitEndsWhenGone"
+  },
+  {
+    "id": "yield-while-held",
+    "breaks": "The first call yields for steering while a bridge call holds it (managed_execution.zig startCaptured).",
+    "file": "src/core/execution/managed_execution.zig",
+    "find": "            if (!held and steerYieldDue(input.tool_yield_flag, started_ms, now_ms, yield_grace_ms)) {",
+    "replace": "            if (steerYieldDue(input.tool_yield_flag, started_ms, now_ms, yield_grace_ms)) {",
+    "expect": "NoYieldWhileHeld"
+  },
+  {
+    "id": "wait-takes-mail",
+    "breaks": "The wait removes the queued mail it saw, so the report reaches no one (tool_host.zig waitForMail).",
+    "file": "src/core/subagent/tool_host.zig",
+    "find": "        const read: MailRead = if (wake == .posted and worker.queuedMailJoinsTurn()) .this_turn else .next_turn;",
+    "replace": "        if (wake == .posted) if (worker.takeQueuedPrompt(alloc)) |taken| worker_runtime.freeQueuedPrompt(alloc, taken);\n        const read: MailRead = if (wake == .posted and worker.queuedMailJoinsTurn()) .this_turn else .next_turn;",
+    "expect": "NoMailLost"
+  }
+]

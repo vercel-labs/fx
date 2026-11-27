@@ -36,16 +36,16 @@ stateDiagram-v2
     end note
 
     note right of GoneWaiting
-        Rule NoMailLost breaks on the step "the wait ends" out of this state, and only in agent-mutant-takes-mail, the rejected design.
+        Rule NoMailLost breaks on the step "a subagent posts a report" out of this state, and only in agent-mutant-takes-mail, the rejected design.
         The wait takes the report, the program is gone, and the report is dropped.
-        TLC trace actions: Run, StartWait, Gone, Post, Wake.
-        Rule WaitEndsWhenGone breaks here, and only in agent-current-cancel, today's code.
+        TLC trace actions: Run, StartWait, Gone, Post.
+        Rule WaitEndsWhenGone breaks here, and only in agent-mutant-ignore-cancel, a planted bug.
         The cancel is ignored, so the wait never ends. It is the only failing config that checks this rule.
-        TLC trace actions: Post, Run, Yield, Post, Join, Join, StartWait, Gone, Run, StartWait, Gone, then a stutter.
-        Shorter path to this state: Run, StartWait, Gone.
-        Rule CallReturnsWhenGone breaks here, and only in agent-current-hang, today's code.
-        The bash call never returns, because the wait never ends.
         TLC trace actions: Run, Yield, Gone, Post, Join, Run, StartWait, Gone, then a stutter.
+        Shorter path to this state: Run, StartWait, Gone.
+        Rule CallReturnsWhenGone breaks here, and only in agent-mutant-ignore-cancel-hang, a planted bug.
+        The bash call never returns, because the wait never ends.
+        TLC trace actions: Post, Run, Yield, Join, StartWait, Post, Join, Gone, Run, StartWait, Gone, then a stutter.
         Shorter path to this state: Run, StartWait, Gone.
     end note
 

@@ -1,13 +1,16 @@
 ----------------------------- MODULE AgentWait -----------------------------
 (***************************************************************************)
 (* `fx tool agent wait`, sent by a bash program through the tool bridge.   *)
-(* The code has not landed yet.                                            *)
+(* The subagent wait is in the code, and it reads its cancel flag          *)
+(* (`tool_host.zig` `waitForWake`, since commit 490ea89719). The bridge's   *)
+(* agent operations have not landed yet.                                   *)
 (*                                                                         *)
-(* The wait works as the subagent tool's `wait` does: it ends when mail is *)
-(* queued for the parent, when no child can still post, or when its call   *)
-(* is canceled. It never takes the mail. The mail joins the parent's turn  *)
-(* only while fx is not inside the bash call, so the model reads it after  *)
-(* the call returns.                                                       *)
+(* The wait works as the subagent tool's `wait` does: it ends when a child *)
+(* posts mail for the parent, when no child can still post, or when its    *)
+(* call is canceled. It never takes the mail. The mail joins the parent's  *)
+(* turn only while fx is not inside the bash call, so the model reads it   *)
+(* after the call returns. A post or a child's end ends an open wait in    *)
+(* the same step, because the wait returns at once when it sees either.    *)
 (*                                                                         *)
 (* The bridge serves a program only during its first bash call. Once that  *)
 (* call yields, the bridge is gone, and a later wait is refused at once.   *)
@@ -76,6 +79,10 @@ WaitMore ==
 
 \* The yield time passes. A bridge call that runs holds the first call
 \* (`managed_execution.zig` `yield_hold`). After the yield the bridge is gone.
+\* A held first call waits `bridge_yield_grace_ms` (1,000 ms) after the last
+\* 10 ms poll that saw the hold, so a hold that no poll saw gives no grace.
+\* This model yields at once when no wait holds the call. The timed scenario
+\* in tests/tla/drivers/tool_bridge/agent-timing.ts checks the grace.
 Yield ==
     /\ Inside
     /\ prog = "running"
@@ -113,46 +120,45 @@ StartWait ==
        ELSE call' = "waiting" /\ told' = told
     /\ UNCHANGED <<prog, programs, bash, working, posted, queued, joined, lost>>
 
-\* The child posts a report or a message to the parent.
+\* The child posts a report or a message to the parent. A wait that is open
+\* ends at once, in this step, with the mail, and the mail stays queued for the
+\* parent's turn. The rejected design (wait-takes-mail) takes the mail instead:
+\* a gone program loses it, and a running program's turn reads it.
 Post ==
     /\ working
     /\ posted < MaxPosts
     /\ posted' = posted + 1
-    /\ queued' = queued + 1
-    /\ UNCHANGED <<prog, programs, call, waits, bash, working, joined, lost, told>>
+    /\ \/ /\ call = "waiting"
+          /\ call' = "none"
+          /\ told' = "mail"
+          /\ IF Mutation = "wait-takes-mail"
+             THEN /\ queued' = queued
+                  /\ IF prog = "running"
+                     THEN joined' = joined + 1 /\ lost' = lost
+                     ELSE lost' = lost + 1 /\ joined' = joined
+             ELSE /\ queued' = queued + 1
+                  /\ UNCHANGED <<joined, lost>>
+       \/ /\ call # "waiting"
+          /\ queued' = queued + 1
+          /\ UNCHANGED <<call, told, joined, lost>>
+    /\ UNCHANGED <<prog, programs, waits, bash, working>>
 
-\* The child's work ends. It posts before it stops counting as working.
+\* The child's work ends. It posts before it stops counting as working. A wait
+\* that is open ends at once, in this step, with quiet. No mail waits then,
+\* because a post would have ended the wait first.
 ChildEnds ==
     /\ working
     /\ working' = FALSE
-    /\ UNCHANGED <<prog, programs, call, waits, bash, posted, queued, joined, lost, told>>
-
-\* The wait sees queued mail and ends. It leaves the mail in the queue. The
-\* rejected design takes the mail and prints it, so a gone program loses it.
-Wake ==
-    /\ call = "waiting"
-    /\ queued > 0
-    /\ call' = "none"
-    /\ told' = "mail"
-    /\ IF Mutation = "wait-takes-mail"
-       THEN /\ queued' = queued - 1
-            /\ IF prog = "running"
-               THEN joined' = joined + 1 /\ lost' = lost
-               ELSE lost' = lost + 1 /\ joined' = joined
-       ELSE UNCHANGED <<queued, joined, lost>>
-    /\ UNCHANGED <<prog, programs, waits, bash, working, posted>>
-
-\* The wait sees that no child works and no mail waits, and ends.
-Quiet ==
-    /\ call = "waiting"
-    /\ ~working
-    /\ queued = 0
-    /\ call' = "none"
-    /\ told' = "quiet"
-    /\ UNCHANGED <<prog, programs, waits, bash, working, posted, queued, joined, lost>>
+    /\ \/ /\ call = "waiting"
+          /\ call' = "none"
+          /\ told' = "quiet"
+       \/ /\ call # "waiting"
+          /\ UNCHANGED <<call, told>>
+    /\ UNCHANGED <<prog, programs, waits, bash, posted, queued, joined, lost>>
 
 \* The bridge cancels the call of a program that is gone, and the wait ends.
-\* Today the subagent wait reads no cancel flag (`tool_host.zig` `waitForMail`).
+\* The subagent wait reads its cancel flag (`tool_host.zig` `waitForWake`). The
+\* planted bug ignore-cancel removes that read.
 Cancel ==
     /\ call = "waiting"
     /\ prog = "gone"
@@ -172,13 +178,14 @@ Join ==
 Next ==
     \/ Run \/ WaitMore \/ Yield \/ Return \/ Gone
     \/ StartWait \/ Post \/ ChildEnds
-    \/ Wake \/ Quiet \/ Cancel \/ Join
+    \/ Cancel \/ Join
 
-\* Only fx's own steps are fair. The child, the program, and the model may
-\* stop at any time, so no rule depends on them.
+\* Cancel and Return are fair: fx ends a canceled wait and returns a call whose
+\* program is gone. A post and a child's end are not forced, since the child,
+\* the program, and the model may stop at any time.
 Spec ==
     /\ Init /\ [][Next]_vars
-    /\ WF_vars(Wake) /\ WF_vars(Quiet) /\ WF_vars(Cancel) /\ WF_vars(Return)
+    /\ WF_vars(Cancel) /\ WF_vars(Return)
 
 -----------------------------------------------------------------------------
 \* Rules.
@@ -197,6 +204,9 @@ TypeOK ==
 \* A wait runs only for a program that sent it, and only inside the first
 \* bash call, which the bridge belongs to.
 WaitHasProgram == call = "waiting" => prog \in {"running", "gone"} /\ bash = "first"
+
+\* An open wait holds no mail: a post or a child's end ends it in the same step.
+OpenWaitHasNoMail == call = "waiting" => queued = 0
 
 \* Every posted mail is in one place: queued, or with the parent model.
 MailKept == posted = queued + joined + lost

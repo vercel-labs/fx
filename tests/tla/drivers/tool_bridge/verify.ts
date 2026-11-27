@@ -25,6 +25,7 @@ import { PINNED_TLC_VERSION, pinnedToolchain } from "../mcp_call/lib.ts";
 import { MODEL_DIR, buildHarness, loadGraph, type Graph } from "./lib.ts";
 import { aloneConfig, codeToSpec, type CodeToSpecResult } from "./traces.ts";
 import { specToCode, type WalkResult } from "./walk.ts";
+import { runAgentGate } from "./agent-gate.ts";
 
 type Mutation = { id: string; breaks: string; file: string; find: string; replace: string; expect: string };
 type Stage = { name: string; ok: boolean; summary: string };
@@ -142,6 +143,11 @@ export async function runGate(options: { quick: boolean }): Promise<GateReport> 
   } catch (error) {
     stage("gate", false, (error as Error).message);
   }
+
+  // AgentWait: the wait of `fx tool agent wait` on the real managed execution and subagent host.
+  const agent = await runAgentGate({ quick, seed, out: join(out, "agent") });
+  stages.push(...agent.stages);
+  details.agent = agent.details;
 
   const failures = stages.filter((s) => !s.ok).map((s) => s.name);
   details.durationMs = Math.round(performance.now() - started);

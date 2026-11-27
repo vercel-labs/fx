@@ -197,8 +197,8 @@ export class Harness {
     this.proc = proc;
   }
 
-  static async start(bin: string, root: string): Promise<Harness> {
-    const proc = Bun.spawn([bin, "--root", root], { stdin: "pipe", stdout: "pipe", stderr: "inherit" });
+  static async start(bin: string, root: string, env?: Record<string, string>): Promise<Harness> {
+    const proc = Bun.spawn([bin, "--root", root], { stdin: "pipe", stdout: "pipe", stderr: "inherit", env });
     const harness = new Harness(proc);
     harness.pump(proc.stdout as ReadableStream<Uint8Array>);
     harness.first = parse(await harness.nextLine());
