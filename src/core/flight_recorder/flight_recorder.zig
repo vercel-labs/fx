@@ -348,7 +348,7 @@ test "cap writes gap record before unlinking oldest sealed segment and never rem
         .io = testing.io,
         .instance = 0xDEF0,
         .segment_bytes = 4096,
-        .max_session_bytes = 8192,
+        .max_session_bytes = 3 * 4096,
         .sync_interval_ms = 10,
         .on_gap_written_for_test = Probe.onGap,
         .test_ctx = &probe,
@@ -681,6 +681,28 @@ test "failed seals do not grow the folder past max_session_bytes" {
     const totals = try totalSegments(tmp.dir);
     try testing.expect(totals.open_files <= cap_test_max_segments + 2);
     try testing.expectEqual(@as(u64, cap_test_events), totals.frames + totals.dropped);
+}
+
+test "a session cap below three segments is refused at start" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try testing.expectError(error.SessionCapTooSmall, Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x5109,
+        .segment_bytes = 4096,
+        .max_session_bytes = 3 * 4096 - 1,
+    }));
+
+    const rec = try Recorder.start(testing.allocator, .{
+        .folder = tmp.dir,
+        .io = testing.io,
+        .instance = 0x510A,
+        .segment_bytes = 4096,
+        .max_session_bytes = 3 * 4096,
+    });
+    rec.stop();
 }
 
 test "a recorder whose io cannot run concurrent tasks fails to start and frees its buffers" {

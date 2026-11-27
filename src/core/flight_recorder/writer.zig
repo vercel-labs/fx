@@ -14,6 +14,7 @@ comptime {
 }
 
 pub const segment_bytes: usize = format.segment_bytes;
+const min_session_segments: u64 = 3;
 pub const max_session_bytes: u64 = 1024 * 1024 * 1024;
 pub const sync_interval_ms: u32 = 1000;
 pub const startup_buffer_bytes: usize = 256 * 1024;
@@ -107,6 +108,9 @@ pub const Writer = struct {
 
     pub fn start(self: *Writer, gpa: std.mem.Allocator, options: Options) !void {
         if (options.segment_bytes <= format.segment_header_bytes) return error.CapacityTooSmall;
+        // The current and the next segment are always on disk, so eviction needs room for one more
+        // sealed segment, or the folder stays over the cap and recording stops after the first segment.
+        if (options.max_session_bytes < min_session_segments * options.segment_bytes) return error.SessionCapTooSmall;
 
         const startup_buf = try gpa.alloc(u8, startup_buffer_bytes);
         errdefer gpa.free(startup_buf);
