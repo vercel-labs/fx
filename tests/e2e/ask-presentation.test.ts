@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { spawn as nodeSpawn } from "node:child_process";
+import { processAlive } from "./process-alive";
 import {
   chmodSync,
   existsSync,
@@ -3139,4 +3141,687 @@ describe("slice 6: fx tool skill and agent bridge", () => {
     }
   }, TIMEOUT);
 });
+
+function walkAllFiles(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  const results: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) results.push(...walkAllFiles(full));
+    else if (entry.isFile()) results.push(full);
+  }
+  return results;
+}
+
+describe("slice 6 break-it", () => {
+  const BASH_SETTING = ["--config", "experimental.bash_tool=true"];
+
+  test("attack 1 (order): wait quiet, stop nobody, double close, message closed, missing skill", async () => {
+    const root = createRoot();
+    const tracePath = join(root.root, "order.trace.log");
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        return fakeGatewayFinalText("Child done.\n");
+      }
+      if (body.includes('"toolCallId":"ord_bash"')) {
+        return fakeGatewayFinalText("Order checks complete.\n");
+      }
+      return fakeGatewayToolCall("ord_bash", "bash", {
+        command: [
+          'w0=$(agent wait 2>&1); rc_w0=$?',
+          's0=$(agent stop nobody 2>&1); rc_s0=$?',
+          'sk0=$(skill open missing-skill 2>&1); rc_sk0=$?',
+          'm1=$(agent message helper "first" 2>&1); rc_m1=$?',
+          'w1=$(agent wait 2>&1); rc_w1=$?',
+          'c1=$(agent close helper 2>&1); rc_c1=$?',
+          'c2=$(agent close helper 2>&1); rc_c2=$?',
+          'm2=$(agent message helper "after-close" 2>&1); rc_m2=$?',
+          'w2=$(agent wait 2>&1); rc_w2=$?',
+          'c3=$(agent close helper 2>&1); rc_c3=$?',
+          'printf "rc:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d\\n" "$rc_w0" "$rc_s0" "$rc_sk0" "$rc_m1" "$rc_w1" "$rc_c1" "$rc_c2" "$rc_m2" "$rc_w2" "$rc_c3"',
+          'printf "W0=%s\\nS0=%s\\nSK0=%s\\nC1=%s\\nC2=%s\\nM2=%s\\n" "$w0" "$s0" "$sk0" "$c1" "$c2" "$m2"',
+        ].join("\n"),
+      });
+    });
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--quiet", "--yolo", ...BASH_SETTING, "Run order checks."],
+      {
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "mcp-call,mailbox,subagent" },
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic:");
+    const req = gateway.requests.find((r) => r.body.includes('"toolCallId":"ord_bash"') && r.body.includes('"role":"tool"'))!;
+    const out = (JSON.parse(toolResultText(req.body, "ord_bash")) as { value: string }).value;
+    expect(out).toContain("rc:0:6:6:0:0:0:6:0:0:0");
+    expect(out).toContain("No subagent is working");
+    expect(out).toContain("child_unavailable");
+    expect(out).toContain("missing-skill");
+    expect(out).toContain("Closed helper");
+    const trace = readFileSync(tracePath, "utf8");
+    expect(trace).toContain("wait_skipped");
+    expect(trace).toContain("reason=quiet");
+    expect(trace).toContain("wait_begin");
+    expect(trace).toContain("wait_end");
+  }, TIMEOUT);
+
+  test("attack 2b (cancel CLI): SIGINT on fx ask during held agent wait exits and leaves no process", async () => {
+    const root = createRoot();
+    const tracePath = join(root.root, "sigint.trace.log");
+    const readyPath = join(root.workspace, "wait-ready");
+    const pidFile = join(root.workspace, "bash-wait.pids");
+    let releaseChild!: (response: Response) => void;
+    const childReply = new Promise<Response>((resolve) => {
+      releaseChild = resolve;
+    });
+    let markChildSeen!: () => void;
+    const childSeen = new Promise<void>((resolve) => {
+      markChildSeen = resolve;
+    });
+
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        markChildSeen();
+        return await childReply;
+      }
+      return fakeGatewayToolCall("sigint_bash", "bash", {
+        command: [
+          `agent message helper "hold" > /dev/null`,
+          `agent wait &`,
+          `wpid=$!`,
+          `printf '%s %s\n' "$$" "$wpid" > ${JSON.stringify(pidFile)}`,
+          `touch ${JSON.stringify(readyPath)}`,
+          `wait "$wpid"`,
+        ].join("\n"),
+      });
+    });
+    gateways.push(gateway);
+
+    const child = nodeSpawn(
+      FX_BIN,
+      ["ask", "--json", "--yolo", ...BASH_SETTING, "Hold on agent wait."],
+      {
+        cwd: root.workspace,
+        env: {
+          ...gatewayEnv(root.home, gateway),
+          FX_SOUND: "0",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "mcp-call,mailbox,subagent,tool,shell",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
+      child.once("close", (code, signal) => resolve({ code, signal })),
+    );
+
+    try {
+      const deadline = Date.now() + TIMEOUT;
+      while ((!existsSync(readyPath) || !existsSync(pidFile)) && Date.now() < deadline) {
+        await Bun.sleep(20);
+      }
+      await childSeen;
+      expect(existsSync(readyPath)).toBe(true);
+
+      const pids = readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number);
+      expect(pids).toHaveLength(2);
+
+      expect(child.kill("SIGINT")).toBe(true);
+      const exitInfo = await Promise.race([
+        closed,
+        Bun.sleep(10_000).then(() => {
+          throw new Error("fx ask did not exit on SIGINT during agent wait");
+        }),
+      ]);
+      expect(exitInfo.code === 130 || exitInfo.signal === "SIGINT").toBe(true);
+
+      const waitGoneDeadline = Date.now() + 5_000;
+      while (pids.some((p) => processAlive(p)) && Date.now() < waitGoneDeadline) {
+        await Bun.sleep(20);
+      }
+      for (const p of pids) {
+        expect(processAlive(p)).toBe(false);
+      }
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("wait_begin");
+      expect(trace).toContain("wait_end");
+    } finally {
+      releaseChild(fakeGatewayFinalText("Cleanup.\n"));
+      markChildSeen();
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
+  }, TIMEOUT);
+
+  test("attack 3 (kill and resume): SIGKILL during child work and agent wait, then resume session", async () => {
+    const root = createRoot();
+    const tracePath = join(root.root, "kill-resume.trace.log");
+    const readyPath = join(root.workspace, "kill-ready");
+    const pidFile = join(root.workspace, "kill-wait.pids");
+    let releaseChild!: (response: Response) => void;
+    const childReply = new Promise<Response>((resolve) => {
+      releaseChild = resolve;
+    });
+    let markChildSeen!: () => void;
+    const childSeen = new Promise<void>((resolve) => {
+      markChildSeen = resolve;
+    });
+
+    let phase: "initial" | "resume" = "initial";
+    let resumeStep = 0;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        markChildSeen();
+        return await childReply;
+      }
+      if (phase === "initial") {
+        return fakeGatewayToolCall("kill_bash", "bash", {
+          command: [
+            `agent message helper "work before kill" > /dev/null`,
+            `agent wait &`,
+            `wpid=$!`,
+            `printf '%s %s\n' "$$" "$wpid" > ${JSON.stringify(pidFile)}`,
+            `touch ${JSON.stringify(readyPath)}`,
+            `wait "$wpid"`,
+          ].join("\n"),
+        });
+      }
+      resumeStep += 1;
+      if (resumeStep === 1) {
+        return fakeGatewayToolCall("resume_status", "bash", { command: "agent status" });
+      }
+      return fakeGatewayFinalText("Resumed after kill.\n");
+    });
+    gateways.push(gateway);
+
+    const child = nodeSpawn(
+      FX_BIN,
+      ["ask", "--json", "--yolo", ...BASH_SETTING, "Start helper and wait."],
+      {
+        cwd: root.workspace,
+        env: {
+          ...gatewayEnv(root.home, gateway),
+          FX_SOUND: "0",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "mcp-call,mailbox,subagent,session",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
+      child.once("close", (code, signal) => resolve({ code, signal })),
+    );
+
+    try {
+      const deadline = Date.now() + TIMEOUT;
+      while ((!existsSync(readyPath) || !existsSync(pidFile)) && Date.now() < deadline) {
+        await Bun.sleep(20);
+      }
+      await childSeen;
+      const pids = readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number);
+
+      child.kill("SIGKILL");
+      await closed;
+
+      // Clean up child wait/bash if OS didn't immediately reap before check, wait briefly
+      const waitGoneDeadline = Date.now() + 5_000;
+      while (pids.some((p) => processAlive(p)) && Date.now() < waitGoneDeadline) {
+        await Bun.sleep(20);
+      }
+      for (const p of pids) {
+        expect(processAlive(p)).toBe(false);
+      }
+
+      releaseChild(fakeGatewayFinalText("Child interrupted.\n"));
+      phase = "resume";
+
+      const latest = await runFx(["session", "last", "--json"], {
+        cwd: root.workspace,
+        env: { HOME: root.home, FX_SOUND: "0" },
+        timeoutMs: TIMEOUT,
+      });
+      expect(latest.code).toBe(0);
+      const sessionId = (JSON.parse(latest.stdout) as { id: string }).id;
+
+      const resumed = await runFx(
+        ["ask", "--json", "--yolo", "--resume", sessionId, ...BASH_SETTING, "Check status after kill."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root.home, gateway),
+            FX_TRACE_LOG: join(root.root, "resume.trace.log"),
+            FX_TRACE_SCOPES: "mcp-call,mailbox,subagent,session",
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(resumed.code).toBe(0);
+      const statusBody = gateway.requests.find((r) => r.body.includes('"toolCallId":"resume_status"') && r.body.includes('"role":"tool"'))?.body ?? "";
+      const statusOut = (JSON.parse(toolResultText(statusBody, "resume_status")) as { value: string }).value;
+      expect(statusOut).toContain("helper");
+      expect(statusOut).toContain("interrupted");
+    } finally {
+      releaseChild(fakeGatewayFinalText("Cleanup.\n"));
+      markChildSeen();
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
+  }, TIMEOUT);
+
+  test("attack 4 (input CLI): empty text, over wire limit, unicode, ESC in skill/agent, traversal & symlink", async () => {
+    const root = createRoot();
+    const tracePath = join(root.root, "input.trace.log");
+    const outsideSecret = join(root.root, "outside-secret.txt");
+    writeFileSync(outsideSecret, "TOP_SECRET_VALUE\n");
+
+    // Valid unicode skill + symlink resource inside skill
+    mkdirSync(join(root.workspace, ".fx", "skills", "café-skill"), { recursive: true });
+    writeFileSync(
+      join(root.workspace, ".fx", "skills", "café-skill", "SKILL.md"),
+      "---\nname: café-skill\ndescription: Café héllo 🚀\n---\n\nCAFÉ_BODY 🚀\n",
+    );
+    symlinkSync(outsideSecret, join(root.workspace, ".fx", "skills", "café-skill", "leak.txt"));
+
+    // Malformed skill with ESC in name / description
+    mkdirSync(join(root.workspace, ".fx", "skills", "esc-skill"), { recursive: true });
+    writeFileSync(
+      join(root.workspace, ".fx", "skills", "esc-skill", "SKILL.md"),
+      "---\nname: esc\x1b[31mname\ndescription: desc\x1b[31mred\n---\n\nESC_SKILL_BODY\n",
+    );
+
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        return fakeGatewayFinalText("Unicode child ok.\n");
+      }
+      if (body.includes('"toolCallId":"inp_bash"')) {
+        return fakeGatewayFinalText("Input attacks done.\n");
+      }
+      return fakeGatewayToolCall("inp_bash", "bash", {
+        command: [
+          'out_empty=$(agent message helper "" 2>&1); rc_empty=$?',
+          // Escaped control bytes expand 6x in JSON (\u0001) so 100 KiB x 2 exceeds wire.max_request_bytes (1048576) while each argv < 128 KiB
+          'chunk=$(python3 -c "import sys; sys.stdout.write(\'\\x01\' * 100000)")',
+          'out_big=$(agent message helper "$chunk" --instructions "$chunk" 2>&1); rc_big=$?',
+          'out_uni_name=$(agent message "héllo" "msg" 2>&1); rc_uni_name=$?',
+          'out_uni_msg=$(agent message helper "héllo 🚀 日本語" 2>&1); rc_uni_msg=$?',
+          'w_uni=$(agent wait 2>&1)',
+          'out_esc_name=$(agent message $\'bad\\x1b[31mname\' "hi" 2>&1); rc_esc_name=$?',
+          'out_esc_msg=$(agent message helper $\'hi\\x1b[31mred\' 2>&1); rc_esc_msg=$?',
+          'out_sk_list=$(skill list 2>&1); rc_sk_list=$?',
+          'out_sk_slash=$(skill open "a/b" 2>&1); rc_sk_slash=$?',
+          'out_sk_dotdot=$(skill open ".." 2>&1); rc_sk_dotdot=$?',
+          'out_sk_res_dotdot=$(skill open "café-skill" "../../etc/passwd" 2>&1); rc_sk_res_dotdot=$?',
+          'out_sk_sym=$(skill open "café-skill" "leak.txt" 2>&1); rc_sk_sym=$?',
+          'out_sk_uni=$(skill open "café-skill" 2>&1); rc_sk_uni=$?',
+          'printf "rcs:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d\\n" "$rc_empty" "$rc_big" "$rc_uni_name" "$rc_uni_msg" "$rc_esc_name" "$rc_esc_msg" "$rc_sk_list" "$rc_sk_slash" "$rc_sk_dotdot" "$rc_sk_res_dotdot" "$rc_sk_sym" "$rc_sk_uni"',
+          'printf "EMPTY=%s\\nBIG=%s\\nUNINAME=%s\\nESCNAME=%s\\nSKLIST=%s\\nSLASH=%s\\nDOTDOT=%s\\nRESDOT=%s\\nSYM=%s\\nUNI=%s\\n" "$out_empty" "$out_big" "$out_uni_name" "$out_esc_name" "$out_sk_list" "$out_sk_slash" "$out_sk_dotdot" "$out_sk_res_dotdot" "$out_sk_sym" "$out_sk_uni"',
+        ].join("\n"),
+      });
+    });
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--quiet", "--yolo", ...BASH_SETTING, "Run input attacks."],
+      {
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "mcp-call,skill,subagent" },
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic:");
+    const bashReq = gateway.requests.find((r) => r.body.includes('"toolCallId":"inp_bash"') && r.body.includes('"role":"tool"'))!;
+    const out = (JSON.parse(toolResultText(bashReq.body, "inp_bash")) as { value: string }).value;
+    // empty=2, big=2, uni_name=6, uni_msg=0, esc_name=6, esc_msg=0, sk_list=0, slash=6, dotdot=6, res_dotdot=6, sym=6, uni=0
+    expect(out).toContain("rcs:2:2:6:0:6:0:0:6:6:6:6:0");
+    expect(out).toContain("larger than 1048576 bytes");
+    expect(out).toContain("café-skill\tCafé héllo 🚀");
+    expect(out).toContain("CAFÉ_BODY 🚀");
+    expect(out).not.toContain("TOP_SECRET_VALUE");
+    expect(out).not.toContain("\x1b");
+    expect(result.stdout).not.toContain("\\u001b");
+    // Child request received exact unicode
+    const childReqs = gateway.requests.filter((r) => !r.body.includes('"name":"subagent"'));
+    expect(childReqs.some((r) => r.body.includes("héllo 🚀 日本語"))).toBe(true);
+  }, TIMEOUT);
+
+  test("attack 6 (two at once): concurrent agent wait & agent wait & wait with one report posted", async () => {
+    const root = createRoot();
+    const tracePath = join(root.root, "two-wait.trace.log");
+    const readyPath = join(root.workspace, "two-waits-started");
+    let releaseChild!: (response: Response) => void;
+    const childReply = new Promise<Response>((resolve) => {
+      releaseChild = resolve;
+    });
+    let markChildSeen!: () => void;
+    const childSeen = new Promise<void>((resolve) => {
+      markChildSeen = resolve;
+    });
+
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        markChildSeen();
+        return await childReply;
+      }
+      if (body.includes('"toolCallId":"two_wait_bash"')) {
+        return fakeGatewayFinalText("Both waits finished.\n");
+      }
+      return fakeGatewayToolCall("two_wait_bash", "bash", {
+        command: [
+          `agent message helper "slow work" > /dev/null`,
+          `agent wait > w1.out 2> w1.err & p1=$!`,
+          `agent wait > w2.out 2> w2.err & p2=$!`,
+          `touch ${JSON.stringify(readyPath)}`,
+          `wait $p1; e1=$?`,
+          `wait $p2; e2=$?`,
+          `echo "exits=$e1,$e2"`,
+          `echo "W1=$(cat w1.out w1.err)"`,
+          `echo "W2=$(cat w2.out w2.err)"`,
+        ].join("\n"),
+      });
+    });
+    gateways.push(gateway);
+
+    try {
+      const fxPromise = runFx(
+        ["ask", "--json", "--quiet", "--yolo", ...BASH_SETTING, "Run two waits at once."],
+        {
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root.home, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "mcp-call,mailbox,subagent" },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      const deadline = Date.now() + TIMEOUT;
+      while (!existsSync(readyPath) && Date.now() < deadline) {
+        await Bun.sleep(20);
+      }
+      await childSeen;
+      await Bun.sleep(200);
+      releaseChild(fakeGatewayFinalText("One report posted.\n"));
+
+      const result = await fxPromise;
+      expect(result.code).toBe(0);
+      const req = gateway.requests.find((r) => r.body.includes('"toolCallId":"two_wait_bash"') && r.body.includes('"role":"tool"'))!;
+      const out = (JSON.parse(toolResultText(req.body, "two_wait_bash")) as { value: string }).value;
+      expect(out).toContain("exits=0,0");
+      expect(out).toContain("W1=");
+      expect(out).toContain("W2=");
+      const trace = readFileSync(tracePath, "utf8");
+      expect((trace.match(/wait_begin/g) ?? []).length).toBeGreaterThanOrEqual(2);
+      expect((trace.match(/wait_end/g) ?? []).length).toBeGreaterThanOrEqual(2);
+    } finally {
+      releaseChild(fakeGatewayFinalText("Cleanup.\n"));
+      markChildSeen();
+    }
+  }, TIMEOUT);
+
+  test("attack 7 (threat R4.3): a child's bash program gets the non-root refusal, and an unknown model is refused", async () => {
+    const root = createRoot();
+    const tracePath = join(root.root, "r43.trace.log");
+    mkdirSync(join(root.home, ".fx"), { recursive: true });
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ permission: { bash: "allow" } }) + "\n",
+    );
+
+    writeFileSync(
+      join(root.workspace, "child-r43.sh"),
+      'm=$(agent message x hi 2>&1); echo "child_rc=$? msg=$m"\n',
+    );
+    writeFileSync(
+      join(root.workspace, "run-r43.sh"),
+      [
+        'agent message child1 "run child bash" > /dev/null',
+        'agent wait > /dev/null',
+        'p_model=$(agent message mod_esc "hi" --model disallowed/model-999 2>&1); rc_model=$?',
+        'agent wait > /dev/null',
+        'echo "model=$rc_model:$p_model"',
+      ].join("\n") + "\n",
+    );
+
+    let childStep = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      // Child requests don't have the "subagent" tool offered
+      if (!requestToolNames(body).includes("subagent")) {
+        childStep += 1;
+        if (childStep === 1) {
+          return fakeGatewayToolCall("child_bash", "bash", {
+            command: ". ./child-r43.sh",
+          });
+        }
+        return fakeGatewayFinalText("Child finished.\n");
+      }
+      if (body.includes('"toolCallId":"parent_bash"')) {
+        return fakeGatewayFinalText("R4.3 checks complete.\n");
+      }
+      return fakeGatewayToolCall("parent_bash", "bash", {
+        command: ". ./run-r43.sh",
+      });
+    });
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--quiet", "--ask", ...BASH_SETTING, "Run R4.3 checks."],
+      {
+        cwd: root.workspace,
+        env: {
+          ...gatewayEnv(root.home, gateway),
+          FX_PERMISSION_MODE: "ask",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "mcp-call,subagent,profile,permission",
+        },
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    const childToolResult = gateway.requests.find((r) => r.body.includes('"toolCallId":"child_bash"') && r.body.includes('"role":"tool"'))!;
+    const childOut = (JSON.parse(toolResultText(childToolResult.body, "child_bash")) as { value: string }).value;
+    expect(childOut).toContain("child_rc=6");
+    expect(childOut).toContain("caller_unavailable");
+    expect(childOut).toContain("Only the agent that started the subagents");
+
+    const parentToolResult = gateway.requests.find((r) => r.body.includes('"toolCallId":"parent_bash"') && r.body.includes('"role":"tool"'))!;
+    const parentOut = (JSON.parse(toolResultText(parentToolResult.body, "parent_bash")) as { value: string }).value;
+    expect(parentOut).toContain("model=6:");
+    expect(parentOut).toContain("unknown_model");
+  }, TIMEOUT);
+
+  test("attack 8 (threat R4.1 and R4.2 CLI): ask mode permission deny and auto mode unavailable review hold", async () => {
+    // Part A: ask mode with permission.subagent=ask (and bash=allow) -> denied without prompter, no child starts
+    const rootAsk = createRoot();
+    mkdirSync(join(rootAsk.home, ".fx"), { recursive: true });
+    writeFileSync(
+      join(rootAsk.home, ".fx", "settings.json"),
+      JSON.stringify({ permission: { bash: "allow", subagent: "ask" } }) + "\n",
+    );
+    writeFileSync(
+      join(rootAsk.workspace, "run-ask.sh"),
+      'out=$(agent message helper "must not start" 2>&1); echo "rc=$? out=$out"\n',
+    );
+    const askGateway = startFakeGateway([
+      fakeGatewayToolCall("ask_bash", "bash", {
+        command: ". ./run-ask.sh",
+      }),
+      fakeGatewayFinalText("Ask mode done.\n"),
+    ]);
+    gateways.push(askGateway);
+
+    const askRes = await runFx(
+      ["ask", "--json", "--quiet", "--ask", ...BASH_SETTING, "Try agent message in ask mode."],
+      {
+        cwd: rootAsk.workspace,
+        env: { ...gatewayEnv(rootAsk.home, askGateway), FX_PERMISSION_MODE: "ask" },
+        timeoutMs: TIMEOUT,
+      },
+    );
+    expect(askRes.code).toBe(0);
+    const askOut = (JSON.parse(toolResultText(askGateway.requests[1]!.body, "ask_bash")) as { value: string }).value;
+    expect(askOut).toContain("rc=5");
+    expect(askGateway.requests).toHaveLength(2); // No child request started
+
+    // Part B: auto mode with unavailable reviewer (HTTP 500) -> held, nothing runs
+    const rootAuto = createRoot();
+    const traceAuto = join(rootAuto.root, "auto-unavail.trace.log");
+    const autoGateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("auto_bash", "bash", {
+          command: 'agent message helper "must not start"',
+        }),
+        fakeGatewayFinalText("Auto held.\n"),
+      ],
+      {
+        classifierResponses: [
+          new Response("reviewer unavailable", { status: 500 }),
+          new Response("reviewer unavailable", { status: 500 }),
+        ],
+      },
+    );
+    gateways.push(autoGateway);
+
+    const autoRes = await runFx(
+      ["ask", "--json", "--auto", "--no-save", ...BASH_SETTING, "Try agent message with unavailable review."],
+      {
+        cwd: rootAuto.workspace,
+        env: {
+          ...gatewayEnv(rootAuto.home, autoGateway),
+          FX_PERMISSION_MODE: "auto",
+          FX_TRACE_LOG: traceAuto,
+          FX_TRACE_SCOPES: "permission,mcp-call,subagent",
+        },
+        timeoutMs: TIMEOUT,
+      },
+    );
+    expect(autoRes.code).toBe(0);
+    expect(autoGateway.classifierRequests.length).toBeGreaterThanOrEqual(1);
+    expect(autoGateway.requests).toHaveLength(2); // Only parent turn; no child request started
+    const trace = readFileSync(traceAuto, "utf8");
+    expect(trace).toContain("decision=unavailable");
+    expect(trace).toContain("execution_started=false");
+  }, TIMEOUT);
+
+  test("attack 9 (threat R4.8): bridge token value never appears in fx files, traces, logs, or stderr", async () => {
+    const root = createRoot();
+    const tracePath = join(root.root, "token-leak.trace.log");
+    const tokenHashFile = join(root.root, "token-sha256.txt");
+    mkdirSync(join(root.workspace, ".fx", "skills", "demo"), { recursive: true });
+    writeFileSync(
+      join(root.workspace, ".fx", "skills", "demo", "SKILL.md"),
+      "---\nname: demo\ndescription: Demo skill\n---\n\nBODY\n",
+    );
+
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        return fakeGatewayFinalText("Child ok.\n");
+      }
+      if (body.includes('"toolCallId":"tok_bash"')) {
+        return fakeGatewayFinalText("Token check done.\n");
+      }
+      return fakeGatewayToolCall("tok_bash", "bash", {
+        command: [
+          `python3 -c 'import hashlib,os; open(${JSON.stringify(tokenHashFile)},"w").write(hashlib.sha256(os.environ["FX_MCP_CALL_TOKEN"].encode()).hexdigest())'`,
+          `echo "MY_CALL_TOKEN=synthetic_user_token_value_123456"`,
+          `skill list > /dev/null`,
+          `agent status > /dev/null`,
+        ].join("\n"),
+      });
+    });
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--quiet", "--yolo", ...BASH_SETTING, "Check token leakage."],
+      {
+        cwd: root.workspace,
+        env: {
+          ...gatewayEnv(root.home, gateway),
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "mcp-call,bash,shell,session,tool,subagent,mailbox,permission",
+        },
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic:");
+    const tokenHash = readFileSync(tokenHashFile, "utf8").trim();
+    expect(tokenHash).toMatch(/^[0-9a-f]{64}$/);
+
+    const { createHash } = await import("node:crypto");
+    const hasTokenHash = (text: string) => {
+      for (const match of text.matchAll(/\b[0-9a-f]{64}\b/g)) {
+        if (createHash("sha256").update(match[0]).digest("hex") === tokenHash) return true;
+      }
+      return false;
+    };
+
+    expect(hasTokenHash(readFileSync(tracePath, "utf8"))).toBe(false);
+    expect(hasTokenHash(result.stderr)).toBe(false);
+    const leakedIn: string[] = [];
+    for (const file of walkAllFiles(root.home)) {
+      if (hasTokenHash(readFileSync(file, "utf8"))) leakedIn.push(file);
+    }
+    expect(leakedIn).toEqual([]);
+  }, TIMEOUT);
+
+  test("attack 10 (decision gaps): skill list escapes non-printing unicode, bash state omits agent function, and skill list honors deny", async () => {
+    const root = createRoot();
+    const tmp = join(root.root, "tmp");
+    mkdirSync(tmp);
+    mkdirSync(join(root.workspace, ".fx", "skills", "bidi-skill"), { recursive: true });
+    writeFileSync(
+      join(root.workspace, ".fx", "skills", "bidi-skill", "SKILL.md"),
+      "---\nname: bidi-skill\ndescription: \"Desc\u202ebidi\"\n---\n\nBODY\n",
+    );
+    mkdirSync(join(root.home, ".fx"), { recursive: true });
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ permission: { bash: "allow", capability_search: "deny" } }) + "\n",
+    );
+
+    // 1. Check skill list denial (gate) when capability_search=deny
+    writeFileSync(
+      join(root.workspace, "run-deny.sh"),
+      'out=$(skill list 2>&1); echo "sk_rc=$? $out"\n',
+    );
+    const denyGw = startFakeGateway([
+      fakeGatewayToolCall("deny_sk", "bash", { command: ". ./run-deny.sh" }),
+      fakeGatewayFinalText("Denied skill list.\n"),
+    ]);
+    gateways.push(denyGw);
+    const denyRes = await runFx(
+      ["ask", "--json", "--quiet", "--ask", ...BASH_SETTING, "List skills when denied."],
+      { cwd: root.workspace, env: { ...gatewayEnv(root.home, denyGw), FX_PERMISSION_MODE: "ask", TMPDIR: tmp }, timeoutMs: TIMEOUT },
+    );
+    expect(denyRes.code).toBe(0);
+    const denyOut = (JSON.parse(toolResultText(denyGw.requests[1]!.body, "deny_sk")) as { value: string }).value;
+    expect(denyOut).toContain("sk_rc=5");
+
+    // 2. Check non-printing unicode escaping in skill list AND that agent() stays out of saved state.sh
+    const okGw = startFakeGateway([
+      fakeGatewayToolCall("gap_1", "bash", { command: "x=1; skill list; agent status > /dev/null" }),
+      fakeGatewayToolCall("gap_2", "bash", {
+        command: `echo "x=$x"; grep -c 'agent ()' "$TMPDIR"/fx-bash-*/state.sh 2>/dev/null || echo "NO_AGENT_FN"`,
+      }),
+      fakeGatewayFinalText("Gap checks done.\n"),
+    ]);
+    gateways.push(okGw);
+    const okRes = await runFx(
+      ["ask", "--json", "--quiet", "--yolo", ...BASH_SETTING, "Check escaping and bash state."],
+      { cwd: root.workspace, env: { ...gatewayEnv(root.home, okGw), TMPDIR: tmp }, timeoutMs: TIMEOUT },
+    );
+    expect(okRes.code).toBe(0);
+    const out1 = (JSON.parse(toolResultText(okGw.requests[1]!.body, "gap_1")) as { value: string }).value;
+    expect(out1).toContain("bidi-skill\tDesc\\u{202e}bidi");
+    expect(out1).not.toContain("\u202e");
+    const out2 = (JSON.parse(toolResultText(okGw.requests[2]!.body, "gap_2")) as { value: string }).value;
+    expect(out2).toContain("x=1");
+    expect(out2).toContain("NO_AGENT_FN");
+  }, TIMEOUT);
+});
+
 

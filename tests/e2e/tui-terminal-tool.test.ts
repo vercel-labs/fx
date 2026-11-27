@@ -20,6 +20,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayToolCall,
+  startDynamicFakeGateway,
   startFakeGateway,
   terminalFixtureShell,
   TmuxSession,
@@ -214,6 +215,19 @@ async function waitUntilGone(pids: number[], timeoutMs: number): Promise<number>
     await Bun.sleep(10);
   }
   return Date.now() - started;
+}
+
+/** Pids of the direct children of `pid`; none when it has no children. */
+function childPidsOf(pid: number): number[] {
+  try {
+    return execFileSync("pgrep", ["-P", String(pid)], { encoding: "utf8" })
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .map(Number);
+  } catch {
+    return [];
+  }
 }
 
 function expectNoTerminalHostDaemon(fixture: ReturnType<typeof createFixture>): void {
@@ -1655,6 +1669,143 @@ test.skipIf(!tmuxAvailable())(
     expect(gateway.requests).toHaveLength(2);
     const output = JSON.parse(toolResultText(gateway.requests[1]!.body, "bash_skill_list")) as { value: string };
     expect(output.value).toContain("demo\tDemo skill description");
+
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI bash attack 2a & 5: Esc during a held agent wait whose child never answers ends the wait and the bash call",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-wait-esc-", { experimental: { bash_tool: true } });
+    let releaseChild!: (response: Response) => void;
+    const childReply = new Promise<Response>((resolve) => {
+      releaseChild = resolve;
+    });
+    let markChildSeen!: () => void;
+    const childSeen = new Promise<void>((resolve) => {
+      markChildSeen = resolve;
+    });
+    let sentWaitCall = false;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes('"toolCallId":"tui_wait_esc"')) {
+        return fakeGatewayFinalText("TUI_WAIT_CANCELED_DONE");
+      }
+      if (!sentWaitCall && body.includes("Wait on child.")) {
+        sentWaitCall = true;
+        return fakeGatewayToolCall("tui_wait_esc", "bash", {
+          command: 'agent message helper "never answers" > /dev/null; agent wait',
+        });
+      }
+      markChildSeen();
+      return await childReply;
+    });
+    gateways.push(gateway);
+
+    try {
+      const active = await launch(fixture, gateway, FX_BIN, {
+        FX_TRACE_SCOPES: "shell,terminal,terminal_client,terminal_host,tool,agent,mcp-call,mailbox,subagent",
+      });
+
+      await active.sendText("Wait on child.");
+      await childSeen;
+      await active.waitForPane(
+        () => readFileSync(fixture.tracePath, "utf8").includes("wait_begin"),
+        TIMEOUT,
+      );
+      const bashShellPids = terminalRecords(fixture.home).flatMap((record) => pidOf(record) ?? []);
+      const bashCallPids = bashShellPids.flatMap((pid) => childPidsOf(pid));
+      await active.sendInterruptEscapePair(TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("Cancelled"), TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await waitUntilGone(bashCallPids, TIMEOUT);
+
+      const traceDeadline = Date.now() + TIMEOUT;
+      const abortedBashCall = /aborted tool output persisted call_id=tui_wait_esc name=bash/;
+      while (!abortedBashCall.test(readFileSync(fixture.tracePath, "utf8")) && Date.now() < traceDeadline) {
+        await Bun.sleep(20);
+      }
+      const trace = readFileSync(fixture.tracePath, "utf8");
+      const waitBegin = trace.indexOf("wait_begin");
+      expect(waitBegin).toBeGreaterThanOrEqual(0);
+      expect(trace.slice(waitBegin)).toMatch(/wait_end[^\n]*reason=(stopped|canceled)/);
+      expect(trace).toMatch(abortedBashCall);
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await waitUntilGone(bashShellPids, TIMEOUT);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    } finally {
+      releaseChild(fakeGatewayFinalText("Child cleanup.\n"));
+      markChildSeen();
+    }
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI bash attack 4 (R4.6): ESC sequence in agent name and skill name never reaches screen",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-esc-seq-", { experimental: { bash_tool: true } });
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("tui_esc_seq", "bash", {
+        command: [
+          "agent message $'bad\\x1b[31mAGENT_ESC\\x1b[0m' hi || true",
+          "skill open $'bad\\x1b[31mSKILL_ESC\\x1b[0m' || true",
+        ].join("\n"),
+      }),
+      fakeGatewayFinalText("TUI_ESC_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Run ESC attack.");
+    await active.waitForText("TUI_ESC_DONE", TIMEOUT);
+
+    const escapes = await active.capturePaneEscapes();
+    // Raw ESC before AGENT_ESC / SKILL_ESC must not reach screen as an ANSI escape sequence
+    expect(escapes).not.toContain("\x1b[31mAGENT_ESC");
+    expect(escapes).not.toContain("\x1b[31mSKILL_ESC");
+
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI bash attack 8 (R4.1): agent message in ask mode prompts when configured and deny runs nothing",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-agent-ask-", {
+      permission_mode: "ask",
+      experimental: { bash_tool: true },
+      permission: { bash: "allow", subagent: "ask" },
+    });
+    writeFileSync(
+      join(fixture.workspace, "run-ask.sh"),
+      'out=$(agent message helper "must not start" 2>&1); echo "rc=$? out=$out"\n',
+    );
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("tui_agent_ask", "bash", {
+        command: ". ./run-ask.sh",
+      }),
+      fakeGatewayFinalText("TUI_AGENT_DENY_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway, FX_BIN, { FX_PERMISSION_MODE: "ask" });
+
+    await active.sendText("Message helper.");
+    await active.waitForText("1. Yes", TIMEOUT);
+    await active.sendKeys("3");
+    await active.waitForText("TUI_AGENT_DENY_DONE", TIMEOUT);
+
+    expect(gateway.requests).toHaveLength(2); // No child request reached gateway
+    const out = toolResultText(gateway.requests[1]!.body, "tui_agent_ask");
+    expect(out).toContain("rc=5");
 
     await active.sendText("/quit");
     expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
