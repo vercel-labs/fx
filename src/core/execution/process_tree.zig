@@ -845,13 +845,14 @@ fn endSessionWith(
     };
     var tracker = try Tracker.init(alloc);
     defer tracker.deinit();
-    var pass: usize = 0;
-    while (pass < session_end_passes) : (pass += 1) {
-        if (try tracker.trackSessionWith(session, Effects) == 0) break;
+    for (0..session_end_passes) |_| {
+        if (try tracker.trackSessionWith(session, Effects) == 0) return summary;
         const pass_summary = tracker.signalProcessesWith(std.posix.SIG.KILL, null, Effects);
         summary.delivered += pass_summary.delivered;
         summary.incomplete = summary.incomplete or pass_summary.incomplete;
     }
+    // Every pass found a member, so the last kill may have left new ones.
+    summary.incomplete = true;
     return summary;
 }
 
@@ -1768,6 +1769,7 @@ test "ending a session looks again for a member that starts while the kill runs"
     try std.testing.expectEqual(@as(usize, 2), summary.delivered);
     // Two passes that killed, and a third that found the session empty.
     try std.testing.expectEqual(@as(usize, 3), table.list_calls);
+    try std.testing.expect(!summary.incomplete);
 }
 
 test "ending a session stops looking after a bounded number of passes" {
@@ -1778,10 +1780,12 @@ test "ending a session stops looking after a bounded number of passes" {
     table.fork_into = 200;
     table.forks_left = 1000;
 
-    _ = try endSessionWith(std.testing.allocator, 200, table);
+    const summary = try endSessionWith(std.testing.allocator, 200, table);
     // Every kill started another member, and the loop still ended.
     try std.testing.expectEqual(session_end_passes, table.list_calls);
     try std.testing.expectEqual(session_end_passes, table.killed_count);
+    // No pass found the session empty, so the result says it may not be.
+    try std.testing.expect(summary.incomplete);
 }
 
 test "ending a session refuses the session this process belongs to unless it leads it" {
