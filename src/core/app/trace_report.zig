@@ -153,9 +153,9 @@
 //!   reports as `Unexpected`. Then an `os_error` per kept one, at most 16,
 //!   oldest first: `at`, `call` (`lookup`, `connect`, `read`, `write`,
 //!   `receive`, or `send`), and the code as `errno` and `errno_name`, such as
-//!   `EINVAL`, when the call left one. A request that failed with the error
-//!   `Unexpected` in one of those calls has an `os_error` near the time it
-//!   ended.
+//!   `EINVAL`, when the call left one; a `lookup` has none. A request that
+//!   failed with the error `Unexpected` in one of those calls has an
+//!   `os_error` near the time it ended.
 //! - `model_catalog`: `cache` {`state`, `entries`, `last_attempt_age_ms`, and
 //!   after a failure `failure`, `retryable`, `http_status`,
 //!   `anonymous_fallback`}; `selected_model` {`model`, `image_input`,

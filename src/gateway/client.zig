@@ -26,6 +26,8 @@ const text_utils = @import("../core/shared/text_utils.zig");
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
         err == error.ConnectionResetByPeer or
+        // ENOTCONN or EPIPE: the connection closed under the request.
+        err == error.SocketUnconnected or
         err == error.ConnectionTimedOut or
         err == error.LocalAddressGone;
 }
@@ -86,8 +88,6 @@ fn isRetryableAgentNetworkError(err: anyerror) bool {
         err == error.WouldBlock or
         err == error.WriteFailed or
         err == error.ReadFailed or
-        // ENOTCONN or EPIPE: the connection closed under the request.
-        err == error.SocketUnconnected or
         isRetryableGatewayError(err);
 }
 
@@ -133,6 +133,7 @@ test "connected request failures prefer cancellation" {
 test "isRetryableGatewayError matches active retryable transport errors" {
     try std.testing.expect(isRetryableGatewayError(error.HttpConnectionClosing));
     try std.testing.expect(isRetryableGatewayError(error.ConnectionResetByPeer));
+    try std.testing.expect(isRetryableGatewayError(error.SocketUnconnected));
     try std.testing.expect(isRetryableGatewayError(error.ConnectionTimedOut));
     try std.testing.expect(isRetryableGatewayError(error.LocalAddressGone));
     try std.testing.expect(!isRetryableGatewayError(error.AccessDenied));

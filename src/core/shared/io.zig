@@ -193,7 +193,10 @@ test "process I/O keeps the errno behind a network read that std reports as Unex
     try std.testing.expectEqual(@as(usize, 1), os_errors.snapshot(io, &notes));
     try std.testing.expectEqual(os_errors.Call.read, notes[0].call);
     if (std.options.unexpected_error_tracing) {
-        // std printed the code itself, and its stack trace may change errno.
+        // Debug builds cannot check the errno. Before std returns, it prints
+        // the code and a stack trace, which can change errno, so
+        // `errnoAfterUnexpected` gives 0 here on purpose. CI's unit tests
+        // build ReleaseSafe on Linux and macOS, where this checks NOTSOCK.
         try std.testing.expectEqual(@as(u16, 0), notes[0].errno);
     } else {
         try std.testing.expectEqualStrings("NOTSOCK", notes[0].errnoName().?);

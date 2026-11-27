@@ -6,8 +6,12 @@
 //! errno is lost there, so a model request that fails this way says only
 //! "Unexpected". `wrap` checks each network read, write, receive, send, and
 //! DNS lookup: when one returns `error.Unexpected`, it notes the errno that
-//! the call left in libc's `errno` on the same thread. fx's own connect in
-//! `net_connect.zig` notes its errno here itself.
+//! the call left in libc's `errno` on the same thread, or no errno for a
+//! lookup. fx's own connect in `net_connect.zig` notes its errno here itself.
+//!
+//! No open upstream issue asks std to keep this errno. The GitHub issue
+//! "Preserve platform error codes" (https://github.com/ziglang/zig/issues/2389)
+//! was closed in 2020, and Codeberg has no open issue for it.
 //!
 //! The newest `capacity` notes are kept, process-wide and lock-protected.
 //! `diagnostics.resetSession` clears them. Imports only the standard library.
@@ -25,9 +29,9 @@ pub const capacity = 16;
 
 /// The call that returned `error.Unexpected`.
 pub const Call = enum {
-    /// A DNS lookup. The errno is the one getaddrinfo left, which explains
-    /// an `EAI_SYSTEM` failure. After another resolver code that std has no
-    /// name for, it can be older than the lookup.
+    /// A DNS lookup, noted without an errno. getaddrinfo reports its own
+    /// codes and sets errno for only some of them, so the errno left after
+    /// a lookup can be older than the lookup.
     lookup,
     connect,
     read,
@@ -146,7 +150,7 @@ fn netLookup(
 ) std.Io.net.HostName.LookupError!void {
     const inner = wrapped_inner.?;
     return inner.netLookup(userdata, host_name, resolved, options) catch |err| {
-        if (err == error.Unexpected) note(.{ .userdata = userdata, .vtable = inner }, .lookup, errnoAfterUnexpected());
+        if (err == error.Unexpected) note(.{ .userdata = userdata, .vtable = inner }, .lookup, 0);
         return err;
     };
 }
