@@ -1950,9 +1950,9 @@ fn planExecutionReplay(
     }
     // Entries past the last step still replay, in order, rather than vanish.
     _ = try appendSteeringReplay(arena, &frames, execution.steering, steering_index, null);
-    // `execution.context_notes` and `execution.runtime_context` never replay:
-    // they are fx's context for the model, not messages of the conversation
-    // (D93, D94).
+    // `execution.context_notes`, `execution.runtime_context` and the toolbox
+    // records never replay: they are fx's context for the model, not
+    // messages of the conversation (D93, D94, D103).
     return frames.toOwnedSlice(arena);
 }
 

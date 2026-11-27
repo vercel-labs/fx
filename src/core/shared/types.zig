@@ -1720,6 +1720,23 @@ pub const FileEvidence = struct {
     stale: bool = false,
 };
 
+/// The toolbox menu a conversation sends on every request (D103).
+pub const SavedToolboxMenu = struct {
+    /// The lead and the menu, as the requests send them.
+    text: []u8,
+    /// `toolbox.entriesHash` of what the menu lists.
+    entries_hash: u64,
+};
+
+/// What a toolbox change note told the conversation the toolbox holds (D103).
+pub const ToolboxNoted = struct {
+    /// `toolbox.entriesHash` of what the toolbox held.
+    entries_hash: u64,
+    /// How many compactions the conversation had when the note was added. A
+    /// later compaction's summary replaces the note.
+    compaction_count: usize,
+};
+
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
@@ -1733,6 +1750,11 @@ pub const ExecutionMemory = struct {
     /// that captured it saves it; later turns send the newest saved copy
     /// unchanged (D94).
     runtime_context: ?[][]u8 = null,
+    /// The toolbox menu this turn sent first for the conversation. Later
+    /// turns, resumed ones included, send these bytes unchanged (D103).
+    toolbox_menu: ?SavedToolboxMenu = null,
+    /// What this turn's toolbox change note told the conversation (D103).
+    toolbox_noted: ?ToolboxNoted = null,
     turn_summary: ?TurnSummary = null,
     /// The turn's settled model calls, in order, for Ctrl+O. Display data:
     /// never part of what the model is sent.
@@ -3557,6 +3579,11 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     errdefer freePersistedContextNotes(alloc, context_notes);
     const runtime_context = if (memory.runtime_context) |texts| try dupeRuntimeContext(alloc, texts) else null;
     errdefer if (runtime_context) |texts| freeRuntimeContext(alloc, texts);
+    const toolbox_menu: ?SavedToolboxMenu = if (memory.toolbox_menu) |menu|
+        .{ .text = try alloc.dupe(u8, menu.text), .entries_hash = menu.entries_hash }
+    else
+        null;
+    errdefer if (toolbox_menu) |menu| alloc.free(menu.text);
     const model_calls = try dupeModelCallRecords(alloc, memory.model_calls);
     errdefer freeModelCallRecords(alloc, model_calls);
     const bridge_calls = try dupeBridgeCallRecords(alloc, memory.bridge_calls);
@@ -3566,6 +3593,8 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
         .steering = steering,
         .context_notes = context_notes,
         .runtime_context = runtime_context,
+        .toolbox_menu = toolbox_menu,
+        .toolbox_noted = memory.toolbox_noted,
         .turn_summary = memory.turn_summary,
         .model_calls = model_calls,
         .bridge_calls = bridge_calls,
@@ -3580,6 +3609,7 @@ pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) vo
     freePersistedSteering(alloc, memory.steering);
     freePersistedContextNotes(alloc, memory.context_notes);
     if (memory.runtime_context) |texts| freeRuntimeContext(alloc, texts);
+    if (memory.toolbox_menu) |menu| alloc.free(menu.text);
 }
 
 /// Caller owns the result; free it with `freeRuntimeContext`.

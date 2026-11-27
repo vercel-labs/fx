@@ -7,6 +7,7 @@ const runtime_prompt_context = @import("prompt_context.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const toolbox = @import("../../tooling/toolbox.zig");
+const compactor = @import("../../compactor/compactor.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -38,7 +39,47 @@ pub const ToolboxMenu = struct {
         self.entries_hash = entries_hash;
         self.noted_hash = entries_hash;
     }
+
+    /// Keeps `text`, a lead and a menu as `get` returned them, listing
+    /// entries whose hash is `entries_hash`. Text larger than any menu fx
+    /// renders, which only a damaged session holds, is left out and the menu
+    /// stays unset.
+    fn keepSaved(self: *ToolboxMenu, text: []const u8, entries_hash: u64) void {
+        if (text.len > self.bytes.len) {
+            debug_trace.logf("toolbox", "saved menu dropped bytes={d}: larger than any menu; the next request renders one", .{text.len});
+            self.* = .{};
+            return;
+        }
+        @memcpy(self.bytes[0..text.len], text);
+        self.len = text.len;
+        self.set = true;
+        self.entries_hash = entries_hash;
+        self.noted_hash = entries_hash;
+    }
+
+    /// Applies what one saved turn recorded, with `compactions` compactions
+    /// in the history before it (D103).
+    fn restoreTurn(self: *ToolboxMenu, execution: types.ExecutionMemory, compactions: usize) void {
+        if (!self.set) if (execution.toolbox_menu) |menu| self.keepSaved(menu.text, menu.entries_hash);
+        const noted = execution.toolbox_noted orelse return;
+        // A note added before the newest compaction went with its summary.
+        if (self.set and noted.compaction_count >= compactions) self.noted_hash = noted.entries_hash;
+    }
 };
+
+/// The compaction count of the newest summary in `history` that stands for
+/// the turns before it, or 0 when there is none. A toolbox change note
+/// records it, so a resume knows a later summary replaced the note (D103).
+pub fn compactionCount(history: []const types.HistoryTurn) usize {
+    var count: usize = 0;
+    for (history) |turn| switch (turn) {
+        .compacted_summary => |entry| if (compactor.replacesPriorContext(entry.summary)) {
+            count = entry.compaction_count;
+        },
+        .assistant, .interrupted => {},
+    };
+    return count;
+}
 
 /// The provider-neutral state for one conversation. Product session metadata,
 /// persistence, permissions, credentials, and host effects live outside it.
@@ -158,6 +199,49 @@ pub const Agent = struct {
         // gone with the turns, so the next request notes any difference
         // from the menu again (`Toolbox.tla` Informed).
         self.toolbox_menu.noted_hash = self.toolbox_menu.entries_hash;
+    }
+
+    /// Restores the toolbox menu `history` saved when this conversation has
+    /// none in memory, as after a resume: oldest to newest, a checkpoint sets
+    /// the menu it kept, or none, and the notes before it went with its
+    /// summary, as `dropHistory` has it; a turn that kept a menu sets it when
+    /// none is set; and a turn's change note sets what the conversation was
+    /// told, unless a compaction came after it (D103,
+    /// `tests/tla/toolbox/Toolbox.tla` Resume). `attempt` is this turn's own
+    /// earlier attempt, when it is being recovered. Checkpoints parse in
+    /// `arena`.
+    pub fn restoreToolboxMenu(
+        self: *Agent,
+        arena: Allocator,
+        history: []const types.HistoryTurn,
+        attempt: ?types.ExecutionMemory,
+    ) Allocator.Error!void {
+        if (self.toolbox_menu.set) return;
+        var compactions: usize = 0;
+        for (history) |turn| switch (turn) {
+            .compacted_summary => |entry| {
+                // An older summary that leaves the turns before it in place
+                // changes nothing.
+                if (!compactor.replacesPriorContext(entry.summary)) continue;
+                self.toolbox_menu = .{};
+                compactions = entry.compaction_count;
+                const kept = (try compactor.toolboxMenu(arena, entry.summary)) orelse continue;
+                self.toolbox_menu.keepSaved(kept.text, kept.entries_hash);
+            },
+            .assistant => |entry| self.toolbox_menu.restoreTurn(entry.execution, compactions),
+            .interrupted => |entry| self.toolbox_menu.restoreTurn(entry.execution, compactions),
+        };
+        if (attempt) |execution| self.toolbox_menu.restoreTurn(execution, compactions);
+        if (self.toolbox_menu.set) debug_trace.logf("toolbox", "menu restored bytes={d} noted_changed={}", .{ self.toolbox_menu.len, self.toolbox_menu.noted_hash != self.toolbox_menu.entries_hash });
+    }
+
+    /// The menu a compaction of `history` keeps with its summary (D103): this
+    /// conversation's, restored first when this process has sent none.
+    /// Borrows the agent's bytes.
+    pub fn compactionToolboxMenu(self: *Agent, arena: Allocator, history: []const types.HistoryTurn) Allocator.Error!?compactor.ToolboxMenu {
+        try self.restoreToolboxMenu(arena, history, null);
+        const text = self.toolbox_menu.get() orelse return null;
+        return .{ .text = text, .entries_hash = self.toolbox_menu.entries_hash };
     }
 
     /// Returns the learned request size limit for `model`, if any.
@@ -315,6 +399,108 @@ test "Agent keeps its toolbox menu when compaction drops the history and loses i
     try std.testing.expectEqual(@as(u64, 7), agent.toolbox_menu.noted_hash);
 
     agent.clearHistory(alloc);
+    try std.testing.expectEqual(@as(?[]const u8, null), agent.toolbox_menu.get());
+}
+
+fn menuTurn(execution: types.ExecutionMemory) types.HistoryTurn {
+    return .{ .assistant = .{ .user = .{ .text = @constCast("question") }, .assistant = @constCast("answer"), .execution = execution } };
+}
+
+fn checkpointTurn(summary: []const u8, compaction_count: usize) types.HistoryTurn {
+    return .{ .compacted_summary = .{ .summary = @constCast(summary), .removed_turn_count = 1, .compaction_count = compaction_count } };
+}
+
+test "a resumed conversation sends the menu its history saved, and the newest change note counts as told (D103)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const history = [_]types.HistoryTurn{
+        menuTurn(.{ .toolbox_menu = .{ .text = @constCast("lead\n- review"), .entries_hash = 7 } }),
+        menuTurn(.{ .toolbox_noted = .{ .entries_hash = 11, .compaction_count = 0 } }),
+        menuTurn(.{ .toolbox_noted = .{ .entries_hash = 13, .compaction_count = 0 } }),
+        menuTurn(.{}),
+    };
+    var agent: Agent = .{};
+    try agent.restoreToolboxMenu(arena, &history, null);
+    try std.testing.expectEqualStrings("lead\n- review", agent.toolbox_menu.get().?);
+    try std.testing.expectEqual(@as(u64, 7), agent.toolbox_menu.entries_hash);
+    try std.testing.expectEqual(@as(u64, 13), agent.toolbox_menu.noted_hash);
+
+    // Without a note the menu itself is what the conversation was told.
+    var unnoted: Agent = .{};
+    try unnoted.restoreToolboxMenu(arena, history[0..1], null);
+    try std.testing.expectEqual(@as(u64, 7), unnoted.toolbox_menu.noted_hash);
+}
+
+test "after a compaction the menu it saved is sent, and only the notes added after it count as told (D103)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const saved = "fx-compactor-v1\n{\"toolbox_menu\":{\"text\":\"- review\\n- fixture\",\"entries_hash\":7}}";
+    // The turn the compaction kept noted 11 before the compaction, whose
+    // summary took that note; the turn after it noted 13.
+    const history = [_]types.HistoryTurn{
+        checkpointTurn(saved, 1),
+        menuTurn(.{ .toolbox_noted = .{ .entries_hash = 11, .compaction_count = 0 } }),
+        menuTurn(.{ .toolbox_noted = .{ .entries_hash = 13, .compaction_count = 1 } }),
+    };
+    var agent: Agent = .{};
+    try agent.restoreToolboxMenu(arena, &history, null);
+    try std.testing.expectEqualStrings("- review\n- fixture", agent.toolbox_menu.get().?);
+    try std.testing.expectEqual(@as(u64, 13), agent.toolbox_menu.noted_hash);
+
+    // As one process does after compacting (`dropHistory`): the menu's own
+    // entries are all the conversation is known to have been told.
+    var kept_only: Agent = .{};
+    try kept_only.restoreToolboxMenu(arena, history[0..2], null);
+    try std.testing.expectEqual(@as(u64, 7), kept_only.toolbox_menu.noted_hash);
+}
+
+test "a checkpoint that saved no menu leaves the next request to render one (D103)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const before = menuTurn(.{ .toolbox_menu = .{ .text = @constCast("- review"), .entries_hash = 7 } });
+    // An fx from before D103 wrote these: a payload without the field, and
+    // the plain summary of an older compactor.
+    for ([_][]const u8{ "fx-compactor-v1\n{\"earlier\":\"e\"}", "<context_handoff>summary</context_handoff>" }) |summary| {
+        const history = [_]types.HistoryTurn{ before, checkpointTurn(summary, 1), menuTurn(.{}) };
+        var agent: Agent = .{};
+        try agent.restoreToolboxMenu(arena, &history, null);
+        try std.testing.expectEqual(@as(?[]const u8, null), agent.toolbox_menu.get());
+    }
+}
+
+test "a recovered turn's first attempt is the newest saved turn, and a kept menu is never replaced (D103)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const history = [_]types.HistoryTurn{menuTurn(.{ .toolbox_menu = .{ .text = @constCast("- review"), .entries_hash = 7 } })};
+
+    var recovered: Agent = .{};
+    try recovered.restoreToolboxMenu(arena, &history, .{ .toolbox_noted = .{ .entries_hash = 5, .compaction_count = 0 } });
+    try std.testing.expectEqual(@as(u64, 5), recovered.toolbox_menu.noted_hash);
+    var first: Agent = .{};
+    try first.restoreToolboxMenu(arena, &.{}, .{ .toolbox_menu = .{ .text = @constCast("- attempt"), .entries_hash = 3 } });
+    try std.testing.expectEqualStrings("- attempt", first.toolbox_menu.get().?);
+
+    var live: Agent = .{};
+    live.toolbox_menu.keep("", "- live", 9);
+    live.toolbox_menu.noted_hash = 10;
+    try live.restoreToolboxMenu(arena, &history, null);
+    try std.testing.expectEqualStrings("- live", live.toolbox_menu.get().?);
+    try std.testing.expectEqual(@as(u64, 10), live.toolbox_menu.noted_hash);
+}
+
+test "a saved menu larger than any menu fx renders is left out (D103)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const oversized = try arena.alloc(u8, toolbox.max_lead_bytes + toolbox.max_menu_bytes + 1);
+    @memset(oversized, 'x');
+    const history = [_]types.HistoryTurn{menuTurn(.{ .toolbox_menu = .{ .text = oversized, .entries_hash = 7 } })};
+    var agent: Agent = .{};
+    try agent.restoreToolboxMenu(arena, &history, null);
     try std.testing.expectEqual(@as(?[]const u8, null), agent.toolbox_menu.get());
 }
 

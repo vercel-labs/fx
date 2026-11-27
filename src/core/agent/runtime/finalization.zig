@@ -46,6 +46,11 @@ pub const TurnFinalizationGuard = struct {
     /// Every save of the turn carries it, so a streamed turn keeps one prefix
     /// (D94). Borrowed from the turn's arena.
     captured_runtime_context: ?[][]u8 = null,
+    /// The toolbox menu this turn sent first for the conversation, and what
+    /// its change note told it, if it did. Every save of the turn carries
+    /// them (D103). Borrowed from the turn's arena.
+    saved_toolbox_menu: ?types.SavedToolboxMenu = null,
+    toolbox_noted: ?types.ToolboxNoted = null,
     lease_allocator: Allocator = std.heap.c_allocator,
     agent_terminal_leases: std.ArrayList([]u8) = .empty,
     /// The turn's settled model calls, in the order they settled, for
@@ -98,6 +103,8 @@ pub const TurnFinalizationGuard = struct {
         var with_records = execution;
         with_records.model_calls = self.model_calls.items;
         with_records.runtime_context = self.captured_runtime_context;
+        with_records.toolbox_menu = self.saved_toolbox_menu;
+        with_records.toolbox_noted = self.toolbox_noted;
         return with_records;
     }
 

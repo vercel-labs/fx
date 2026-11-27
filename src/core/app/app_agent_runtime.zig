@@ -1446,6 +1446,7 @@ pub fn Runtime(comptime App: type) type {
                     .records = if (app_session_runtime.Runtime(App).childCapability(agent)) |capability| result_store.compactorStore(capability) else null,
                     .cancel_flag = &agent.worker.worker_cancel_requested,
                     .trace_ctx = .{ .turn_id = job.turn_id },
+                    .toolbox_menu = try agent.session.agent.compactionToolboxMenu(arena, job.history),
                 },
             }) catch |err| {
                 if (err == error.Cancelled and agent.worker.worker_cancel_requested.load(.seq_cst)) return;

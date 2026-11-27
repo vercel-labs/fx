@@ -1213,6 +1213,76 @@ test("ACP shell completed and replayed updates show the command output", async (
   }
 }, 45000);
 
+// A loaded session sends the toolbox menu its first request sent, so each
+// request still starts with the whole request before it, and a skill added
+// since arrives as a change note at the end of the turn
+// (tests/tla/toolbox/Toolbox.tla MenuFixed and Informed).
+test("ACP session/load sends the toolbox menu the session sent first and notes a skill added since", async () => {
+  const root = createIsolatedRoot("fx-acp-toolbox-menu-");
+  const changeNote = "The toolbox now holds something other than the toolbox menu above lists.";
+  const writeSkill = (name: string) => {
+    const dir = join(root.home, ".fx", "skills", name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: The ${name} steps.\n---\n\n# ${name}\n`);
+  };
+  const withoutProviderOptions = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutProviderOptions);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "providerOptions").map(([key, item]) => [key, withoutProviderOptions(item)]));
+    }
+    return value;
+  };
+  writeSkill("menu-first");
+  const answers = ["ACP_MENU_FIRST", "ACP_MENU_SECOND", "ACP_MENU_THIRD"];
+  let turn = 0;
+  const gateway = startDynamicFakeGateway(() => finalText(answers[turn]!));
+  let client: AcpClient | undefined;
+  try {
+    let sessionId = "";
+    for (const [index, prompt] of ["First question.", "Second question.", "Third question."].entries()) {
+      turn = index;
+      if (index === 1) writeSkill("menu-added");
+      client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+      await client.request("initialize", { protocolVersion: 1 }, 1);
+      if (index === 0) {
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+        if (created.error) throw new Error(JSON.stringify(created));
+        sessionId = created.result.sessionId;
+      } else {
+        const loaded = await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 2) as any;
+        if (loaded.error) throw new Error(JSON.stringify(loaded));
+      }
+      const answered = await runPrompt(client, prompt, TIMEOUT);
+      expect(answered.promptResult.result.stopReason).toBe("end_turn");
+      expect(client.stderr).toBe("");
+      client.endStdin();
+      expect(await client.waitForExit()).toBe(0);
+      await client.close();
+      client = undefined;
+    }
+
+    const requests = gateway.requests
+      .map((request) => JSON.parse(request.body))
+      .filter((request) => (request.tools ?? []).length > 0);
+    expect(requests.length).toBe(3);
+    for (let i = 1; i < requests.length; i++) {
+      expect(JSON.stringify(requests[i].tools)).toBe(JSON.stringify(requests[i - 1].tools));
+      const earlier = requests[i - 1].prompt.map((message: unknown) => JSON.stringify(withoutProviderOptions(message)));
+      const later = requests[i].prompt.slice(0, earlier.length).map((message: unknown) => JSON.stringify(withoutProviderOptions(message)));
+      expect(later).toEqual(earlier);
+    }
+    expect(JSON.stringify(requests[0].prompt)).not.toContain("menu-added");
+    const noted = JSON.stringify(requests[1].prompt.at(-1));
+    expect(noted).toContain(changeNote);
+    expect(noted).toContain("menu-added");
+    expect(JSON.stringify(requests[2].prompt).split(changeNote).length - 1).toBe(1);
+  } finally {
+    await client?.close();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 90000);
+
 test("ACP finishes tool calls that a cancel stopped before they ran", async () => {
   const root = createIsolatedRoot("fx-acp-cancel-cards-");
   const gateway = startFakeGateway([

@@ -1215,6 +1215,91 @@ test.skipIf(!tmuxAvailable())(
   TIMEOUT * 2,
 );
 
+// How a toolbox change note opens (src/core/tooling/toolbox.zig renderChangeNote).
+const TOOLBOX_CHANGE_NOTE = "The toolbox now holds something other than the toolbox menu above lists.";
+
+function writeProfileSkill(home: string, name: string): void {
+  const dir = join(home, ".fx", "skills", name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: The ${name} steps.\n---\n\n# ${name}\n`);
+}
+
+// Cache markers move to the newest message on purpose; everything else a
+// request sent must start the next one.
+function withoutProviderOptions(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutProviderOptions);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "providerOptions").map(([key, item]) => [key, withoutProviderOptions(item)]));
+  }
+  return value;
+}
+
+test.skipIf(!tmuxAvailable())(
+  "a TUI resume sends the toolbox menu the session sent first and notes a skill added since",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-toolbox-menu-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }));
+    writeProfileSkill(home, "menu-first");
+    const answers = ["TUI_MENU_FIRST", "TUI_MENU_SECOND", "TUI_MENU_THIRD"];
+    let turn = 0;
+    const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText(answers[turn]!));
+    let active: TmuxSession | null = null;
+    try {
+      let sessionId = "";
+      for (const [index, prompt] of ["First question.", "Second question.", "Third question."].entries()) {
+        turn = index;
+        if (index === 1) {
+          sessionId = sessionIdFromHome(home);
+          writeProfileSkill(home, "menu-added");
+        }
+        const stderrPath = join(root, `turn-${turn}.stderr`);
+        writeFileSync(stderrPath, "");
+        active = await TmuxSession.create({
+          cmd: index === 0 ? FX_BIN : `${FX_BIN} --resume ${sessionId}`,
+          cwd: realpathSync(workspace),
+          env: gatewayEnv(home, gateway),
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+        await active.waitForComposer(TIMEOUT);
+        await active.sendText(prompt);
+        await active.waitForText(answers[turn]!, TIMEOUT);
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+        await active.kill();
+        active = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      }
+
+      const requests = gateway.requests
+        .map((request) => JSON.parse(request.body))
+        .filter((request) => (request.tools ?? []).length > 0);
+      expect(requests.length).toBe(3);
+      for (let i = 1; i < requests.length; i++) {
+        expect(JSON.stringify(requests[i].tools)).toBe(JSON.stringify(requests[i - 1].tools));
+        const earlier = requests[i - 1].prompt.map((message: unknown) => JSON.stringify(withoutProviderOptions(message)));
+        const later = requests[i].prompt.slice(0, earlier.length).map((message: unknown) => JSON.stringify(withoutProviderOptions(message)));
+        expect(later).toEqual(earlier);
+      }
+      expect(JSON.stringify(requests[0].prompt)).not.toContain("menu-added");
+      const noted = JSON.stringify(requests[1].prompt.at(-1));
+      expect(noted).toContain(TOOLBOX_CHANGE_NOTE);
+      expect(noted).toContain("menu-added");
+      expect(JSON.stringify(requests[2].prompt).split(TOOLBOX_CHANGE_NOTE).length - 1).toBe(1);
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
+);
+
 function expectAltExitToPreserveNormalViewport(tapePath: string): void {
   const tape = readFileSync(tapePath);
   const leaveAlternate = Buffer.from("\x1b[?1049l");

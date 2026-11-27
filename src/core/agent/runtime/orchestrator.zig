@@ -6769,19 +6769,30 @@ fn prepareSkillCatalog(
 }
 
 /// The toolbox menu for this request: the one this conversation sent first,
-/// or, on its first request, one rendered from the visible skills, the
-/// configured MCP servers, and the built-in tools behind toolbox. Null when
-/// toolbox isn't advertised. The result lives in `agent`.
+/// saved with the turn that sent it so a resume sends it too, or, on its
+/// first request, one rendered from the visible skills, the configured MCP
+/// servers, and the built-in tools behind toolbox. Null when toolbox isn't
+/// advertised. The result lives in `agent`; what the turn keeps or notes
+/// goes in `finalization`, so every save of the turn records it (D103).
 fn toolboxMenu(
     arena: Allocator,
     deps: *const AgentRuntimeDeps,
     config: Config,
     agent: *runtime_agent.Agent,
+    job: QueuedPrompt,
+    finalization: *TurnFinalizationGuard,
     skill_section: ?*const skill_runtime.BoundedPromptSection,
     context_window: ?u32,
     turn_notes: *std.ArrayList(ChatMessage),
 ) !?[]const u8 {
+    const attempt = if (job.recovery_checkpoint) |checkpoint| checkpoint.execution else null;
+    // A recovered turn keeps what its first attempt saved.
+    if (attempt) |execution| {
+        if (execution.toolbox_menu) |menu| finalization.saved_toolbox_menu = .{ .text = try arena.dupe(u8, menu.text), .entries_hash = menu.entries_hash };
+        finalization.toolbox_noted = execution.toolbox_noted;
+    }
     if (!toolbox.isAdvertised(config.advertised_tool_names)) return null;
+    try agent.restoreToolboxMenu(arena, job.history, attempt);
     // Once the conversation keeps its menu, each entry's kind and name are
     // all a request needs: the change hash and the change note read only
     // those, so the descriptions and the shared-name scan are skipped.
@@ -6811,7 +6822,9 @@ fn toolboxMenu(
         skill_runtime.writeListShortened(&notice.writer, config.context_limits, context_window) catch return error.OutOfMemory;
         try deps.pushContextNotice(notice.written());
     }
+    if (!kept) finalization.saved_toolbox_menu = .{ .text = try arena.dupe(u8, decided.menu), .entries_hash = agent.toolbox_menu.entries_hash };
     if (decided.note) |note| {
+        finalization.toolbox_noted = .{ .entries_hash = agent.toolbox_menu.noted_hash, .compaction_count = runtime_agent.compactionCount(job.history) };
         // A note in the turn, saved with it, so the model learns of the
         // change while the menu and everything earlier requests sent stay as
         // they were (D93).
@@ -7218,7 +7231,7 @@ fn processQueuedPromptInner(
             debug_trace.logf("skills", "explicit skill note queued index={d} bytes={d}", .{ explicit_note_index.?, section.text.len });
         }
     }
-    const toolbox_menu = try toolboxMenu(arena, deps, config, agent, if (skill_section) |*section| section else null, request_capabilities.context_window, &within_turn_suffix);
+    const toolbox_menu = try toolboxMenu(arena, deps, config, agent, job, finalization, if (skill_section) |*section| section else null, request_capabilities.context_window, &within_turn_suffix);
     try appendStablePromptContext(arena, deps, config, toolbox_menu orelse if (skill_section) |section| section.text else null, &stable_prefix);
     const active_history = job.history;
     const history_messages_before = stable_prefix.items.len;
@@ -9385,6 +9398,7 @@ fn processQueuedPromptLoop(
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
                             .runtime_context = try runtimeContextTexts(arena, runtime_context.messages()),
+                            .toolbox_menu = try agent.compactionToolboxMenu(arena, compaction_history),
                         },
                     });
                     // The turn's duration leaves out the compaction, as its

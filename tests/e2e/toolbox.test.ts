@@ -36,6 +36,8 @@ const NO_SAVE_TOOLS = [
   "vision",
 ];
 const REPLACED_TOOLS = ["capability_search", "mcp_select_tool", "skill", "install_skill"];
+// How a toolbox change note opens (src/core/tooling/toolbox.zig renderChangeNote).
+const TOOLBOX_CHANGE_NOTE = "The toolbox now holds something other than the toolbox menu above lists.";
 
 type Root = { root: string; home: string; workspace: string; wireLogPath: string };
 
@@ -799,4 +801,42 @@ describe("toolbox", () => {
     expect(childTools).not.toContain("glob_files");
     expect(resultValue(body(childBodies[1]!), "child_glob")).toContain("FINDER_NOTES.md");
   }, 60_000);
+
+  // A resumed session sends the menu its first request sent, whatever the
+  // config holds now, so each request still starts with the whole request
+  // before it; a server added since arrives as a change note at the end of
+  // the turn (tests/tla/toolbox/Toolbox.tla MenuFixed and Informed).
+  test("fx ask --resume sends the menu the session sent first and notes a server added since", async () => {
+    const root = createRoot();
+    const answers = ["RESUMED_MENU_FIRST", "RESUMED_MENU_SECOND", "RESUMED_MENU_THIRD"];
+    let turn = 0;
+    gateway = startDynamicFakeGateway(() => fakeGatewayFinalText(answers[turn]!), {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const ask = async (args: string[]) => {
+      const result = await runFx(["ask", "--json", "--auto", ...args], { cwd: root.workspace, env: env(root, gateway!), timeoutMs: 30_000 });
+      expect(result.code).toBe(0);
+      const answer = JSON.parse(result.stdout);
+      expect(answer.output).toBe(answers[turn]);
+      return answer;
+    };
+    const first = await ask(["Say hi."]);
+    const config = JSON.parse(readFileSync(join(root.home, ".fx", "mcp.json"), "utf8"));
+    config.mcp.fixture_b = { ...config.mcp.fixture, environment: { FX_MCP_MODE: "normal" } };
+    writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify(config));
+    turn = 1;
+    await ask(["--resume", first.session_id, "Say hi again."]);
+    turn = 2;
+    await ask(["--resume", first.session_id, "Once more."]);
+
+    const raws = modelRequests(gateway);
+    expect(raws.length).toBe(3);
+    expectEveryRequestExtendsThePrevious(raws);
+    expect(JSON.stringify(body(raws[0]!).prompt)).not.toContain("fixture_b");
+    const noted = JSON.stringify(body(raws[1]!).prompt.at(-1));
+    expect(noted).toContain(TOOLBOX_CHANGE_NOTE);
+    expect(noted).toContain("fixture_b");
+    // Nothing changed before the third turn, so it adds no note.
+    expect(JSON.stringify(body(raws[2]!).prompt).split(TOOLBOX_CHANGE_NOTE).length - 1).toBe(1);
+  }, 120_000);
 });

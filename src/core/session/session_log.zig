@@ -43,7 +43,7 @@ pub const ConversationProgress = struct {
             const standalone = switch (event) {
                 .assistant, .context_checkpoint, .interrupted => true,
                 // A note counts no step, as steering does (D93, D94).
-                .steering, .context_note, .runtime_context, .model_call => assistant.has_replay,
+                .steering, .context_note, .runtime_context, .toolbox_menu, .toolbox_noted, .model_call => assistant.has_replay,
                 else => false,
             };
             if (standalone) {
@@ -162,7 +162,7 @@ const ReplayState = struct {
             .interrupted => self.clearPendingToolCalls(),
             .user, .assistant, .steering, .turn_completed => {},
             // Only a v2 session saves a context note or runtime context (D93, D94).
-            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .toolbox_menu, .toolbox_noted, .model_call => return error.InvalidConversationFrame,
         }
         self.last_seq = seq;
         self.turn_open = turn_open;
@@ -177,7 +177,7 @@ fn nextConversationTurnOpen(open: bool, event: session_event.ConversationEvent) 
         .context_checkpoint => open,
         // v1 logs never hold a context note or runtime context; only a v2
         // session saves them (D93, D94). Every v1 reader below refuses both.
-        .context_note, .runtime_context, .model_call => error.InvalidConversationFrame,
+        .context_note, .runtime_context, .toolbox_menu, .toolbox_noted, .model_call => error.InvalidConversationFrame,
     };
 }
 
@@ -898,7 +898,7 @@ fn replayConversationHistory(
             .tool_call => |value| try turn.appendToolCall(value),
             .tool_result => |value| try turn.appendToolResult(value),
             .steering => |value| try turn.appendSteering(value.text),
-            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .toolbox_menu, .toolbox_noted, .model_call => return error.InvalidConversationFrame,
             .turn_completed => |value| {
                 const completed = try turn.finishAssistant(value);
                 checkpoint_turn_open = false;
@@ -990,7 +990,7 @@ const ConversationHistoryReader = struct {
                     try self.builder.appendSteering(value.text);
                     break :blk null;
                 },
-                .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+                .context_note, .runtime_context, .toolbox_menu, .toolbox_noted, .model_call => return error.InvalidConversationFrame,
                 .turn_completed => |value| try self.builder.finishAssistant(value),
                 .interrupted => |value| try self.builder.finishInterrupted(value),
                 .context_checkpoint => blk: {
@@ -1095,7 +1095,7 @@ fn load_conversation_archive_from_source(
                 try builder.appendSteering(value.text);
                 break :blk null;
             },
-            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .toolbox_menu, .toolbox_noted, .model_call => return error.InvalidConversationFrame,
             .turn_completed => |value| try builder.finishAssistant(value),
             .interrupted => |value| try builder.finishInterrupted(value),
             .context_checkpoint => |value| blk: {
@@ -1170,7 +1170,7 @@ const ConversationReplayScan = struct {
                     .coverage = checkpoint.covers_through_seq,
                 };
             },
-            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .toolbox_menu, .toolbox_noted, .model_call => return error.InvalidConversationFrame,
             else => {},
         }
     }
@@ -1235,6 +1235,8 @@ pub const ConversationTurnBuilder = struct {
     steering: std.ArrayList(types.PersistedSteering) = .empty,
     context_notes: std.ArrayList(types.PersistedContextNote) = .empty,
     runtime_context: ?[][]u8 = null,
+    toolbox_menu: ?types.SavedToolboxMenu = null,
+    toolbox_noted: ?types.ToolboxNoted = null,
     model_calls: std.ArrayList(types.ModelCallRecord) = .empty,
     bridge_calls: std.ArrayList(types.BridgeCallRecord) = .empty,
     /// The call a `cancelled_command` item names: the turn's command that
@@ -1282,6 +1284,7 @@ pub const ConversationTurnBuilder = struct {
         for (self.context_notes.items) |item| types.freePersistedContextNote(self.alloc, item);
         self.context_notes.deinit(self.alloc);
         if (self.runtime_context) |texts| types.freeRuntimeContext(self.alloc, texts);
+        if (self.toolbox_menu) |menu| self.alloc.free(menu.text);
         for (self.model_calls.items) |record| types.freeModelCallRecordStrings(self.alloc, record);
         self.model_calls.deinit(self.alloc);
         for (self.bridge_calls.items) |record| types.freeBridgeCallRecordStrings(self.alloc, record);
@@ -1354,7 +1357,9 @@ pub const ConversationTurnBuilder = struct {
             self.steps.items.len == 0 and
             self.steering.items.len == 0 and
             self.context_notes.items.len == 0 and
-            self.runtime_context == null;
+            self.runtime_context == null and
+            self.toolbox_menu == null and
+            self.toolbox_noted == null;
     }
 
     pub fn begin(
@@ -1547,6 +1552,28 @@ pub const ConversationTurnBuilder = struct {
         self.runtime_context = try types.dupeRuntimeContext(self.alloc, messages);
     }
 
+    /// The toolbox menu a turn kept comes right after its user message, once
+    /// (D103).
+    pub fn setToolboxMenu(self: *ConversationTurnBuilder, text: []const u8, entries_hash: u64) !void {
+        if (!self.holdsOnlyTurnStart() or self.toolbox_menu != null) return error.InvalidConversationFrame;
+        self.toolbox_menu = .{ .text = try self.alloc.dupe(u8, text), .entries_hash = entries_hash };
+    }
+
+    /// What the turn's toolbox change note told comes right after its user
+    /// message, once (D103).
+    pub fn setToolboxNoted(self: *ConversationTurnBuilder, noted: types.ToolboxNoted) !void {
+        if (!self.holdsOnlyTurnStart() or self.toolbox_noted != null) return error.InvalidConversationFrame;
+        self.toolbox_noted = noted;
+    }
+
+    /// The turn holds its user message, and at most the records saved right
+    /// after it.
+    fn holdsOnlyTurnStart(self: *const ConversationTurnBuilder) bool {
+        return self.user != null and self.steps.items.len == 0 and self.calls.items.len == 0 and
+            self.results.items.len == 0 and self.pending_assistant == null and self.pending_replay == null and
+            self.steering.items.len == 0 and self.context_notes.items.len == 0;
+    }
+
     /// A note sits at a step boundary: after the user's message or a step's
     /// last result, and before any steering or assistant text there (D93).
     pub fn appendContextNote(self: *ConversationTurnBuilder, text: []const u8, sources: []const types.ContextNoteSource) !void {
@@ -1702,12 +1729,18 @@ pub const ConversationTurnBuilder = struct {
         const bridge_calls = try self.bridge_calls.toOwnedSlice(self.alloc);
         const runtime_context = self.runtime_context;
         self.runtime_context = null;
+        const toolbox_menu = self.toolbox_menu;
+        self.toolbox_menu = null;
+        const toolbox_noted = self.toolbox_noted;
+        self.toolbox_noted = null;
         return .{
             .tool_steps = steps,
             .files = files,
             .steering = steering,
             .context_notes = context_notes,
             .runtime_context = runtime_context,
+            .toolbox_menu = toolbox_menu,
+            .toolbox_noted = toolbox_noted,
             .turn_summary = turn_summary,
             .model_calls = model_calls,
             .bridge_calls = bridge_calls,
