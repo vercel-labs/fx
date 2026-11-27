@@ -713,7 +713,8 @@ export function startDynamicFakeGateway(
 // logs its argv to argvLogPath and execs the real FX_BIN, so upgrade relaunch
 // tests can drive the handoff without shipping a second binary. The relaunched
 // fx, which the fake upgrade installs, runs with `relaunchEnv`'s variables,
-// such as its own FX_RECORD tape.
+// such as its own FX_RECORD tape. Each dev revision's wrapper names its
+// revision in a comment, and `setRevision` publishes a newer dev build.
 export function startUpgradeServer(
   root: string,
   argvLogPath: string,
@@ -721,18 +722,22 @@ export function startUpgradeServer(
     revision?: string;
     relaunchEnv?: Record<string, string>;
   } = {},
-): { baseUrl: string; stop: () => void } {
-  const artifactDir = join(root, "release-artifact");
-  const wrapperPath = join(artifactDir, "fx");
-  const archivePath = join(root, "fx.tar.gz");
+): { baseUrl: string; setRevision: (revision: string) => void; stop: () => void } {
   const relaunchExports = Object.entries(options.relaunchEnv ?? {})
     .map(([name, value]) => {
       if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) throw new Error(`relaunchEnv name ${name} is not a shell variable name`);
       return `export ${name}=${shellQuote(value)}\n`;
     })
     .join("");
-  mkdirSync(artifactDir);
-  const script = `#!/bin/sh
+  const archives = new Map<string, { archive: Buffer; checksum: string }>();
+  const archiveFor = (revision: string) => {
+    const built = archives.get(revision);
+    if (built) return built;
+    const artifactDir = join(root, `release-artifact-${revision}`);
+    const archivePath = join(root, `fx-${revision}.tar.gz`);
+    mkdirSync(artifactDir);
+    const script = `#!/bin/sh
+# fake fx release ${revision}
 {
   printf '%s' "$0"
   for arg in "$@"; do
@@ -742,37 +747,44 @@ export function startUpgradeServer(
 } >> ${shellQuote(argvLogPath)}
 ${relaunchExports}exec ${shellQuote(FX_BIN)} "$@"
 `;
-  writeFileSync(wrapperPath, script);
-  chmodSync(wrapperPath, 0o755);
-  const tar = Bun.spawnSync(["tar", "-czf", archivePath, "-C", artifactDir, "fx"]);
-  if (tar.exitCode !== 0) throw new Error(tar.stderr.toString());
+    writeFileSync(join(artifactDir, "fx"), script);
+    chmodSync(join(artifactDir, "fx"), 0o755);
+    const tar = Bun.spawnSync(["tar", "-czf", archivePath, "-C", artifactDir, "fx"]);
+    if (tar.exitCode !== 0) throw new Error(tar.stderr.toString());
+    const archive = readFileSync(archivePath);
+    const entry = { archive, checksum: createHash("sha256").update(archive).digest("hex") };
+    archives.set(revision, entry);
+    return entry;
+  };
 
-  const archive = readFileSync(archivePath);
-  const checksum = createHash("sha256").update(archive).digest("hex");
   const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
-  const revision = options.revision ?? "abcdef0123456789abcdef0123456789abcdef01";
+  let revision = options.revision ?? "abcdef0123456789abcdef0123456789abcdef01";
+  const stableRevision = revision;
+  archiveFor(revision);
   const stableArchiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
-  const devArchiveRoute = `/dev/${revision}/fx-${platform}.tar.gz`;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(request) {
       const path = new URL(request.url).pathname;
+      const devArchiveRoute = `/dev/${revision}/fx-${platform}.tar.gz`;
       if (path === "/latest.txt") return new Response("v9.9.9\n");
       if (path === "/dev.json") {
         return Response.json({ version: "9.9.9", commit: revision });
       }
-      if (path === stableArchiveRoute || path === devArchiveRoute) {
-        return new Response(archive);
-      }
-      if (path === `${stableArchiveRoute}.sha256` || path === `${devArchiveRoute}.sha256`) {
-        return new Response(`${checksum}\n`);
-      }
+      if (path === stableArchiveRoute) return new Response(archiveFor(stableRevision).archive);
+      if (path === devArchiveRoute) return new Response(archiveFor(revision).archive);
+      if (path === `${stableArchiveRoute}.sha256`) return new Response(`${archiveFor(stableRevision).checksum}\n`);
+      if (path === `${devArchiveRoute}.sha256`) return new Response(`${archiveFor(revision).checksum}\n`);
       return new Response("not found", { status: 404 });
     },
   });
   return {
     baseUrl: `http://127.0.0.1:${server.port}`,
+    setRevision: (next: string) => {
+      archiveFor(next);
+      revision = next;
+    },
     stop: () => server.stop(true),
   };
 }
