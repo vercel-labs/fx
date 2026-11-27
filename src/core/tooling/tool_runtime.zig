@@ -1155,7 +1155,7 @@ fn bridgeBashToolCall(
                 try std.json.Stringify.value(resource, .{}, &out.writer);
             }
             try out.writer.writeByte('}');
-            const target_name = resolvedSkillPermissionTarget(ctx, arena, req.name) catch req.name;
+            const target_name = (try toolbox.skillNamed(arena, ctx.skill_locations, req.name)) orelse req.name;
             return .{
                 .id = request_id,
                 .name = "toolbox",
@@ -1214,16 +1214,6 @@ fn bridgeBashToolCall(
             return .{ .id = request_id, .name = "subagent", .arguments_json = out.written() };
         },
     }
-}
-
-fn resolvedSkillPermissionTarget(ctx: Context, arena: Allocator, name_or_location: []const u8) ![]const u8 {
-    if (ctx.skill_locations) |locations| {
-        const resolved = try locations.resolve(arena, name_or_location);
-        for (locations.skills) |skill| {
-            if (std.mem.eql(u8, skill.path, resolved)) return skill.name;
-        }
-    }
-    return name_or_location;
 }
 
 const BridgeAuthority = union(enum) {
@@ -1529,11 +1519,15 @@ fn runBridgeBashToolCall(
     const row = BridgeCallRow.startAction(ctx, arena, request_id, info.tool, tool_call.arguments_json, info.action);
     if (cancel.load(.acquire)) {
         if (row) |value| value.finishAction(arena, .cancelled);
+        debug_trace.logf("mcp-call", "request={s} dropped {s} before it started: canceled", .{ request_id, @tagName(operation) });
         return .{ .status = .failed, .bytes = "Cancelled before starting." };
     }
     const outcome = executeBridgeBashToolOperation(ctx, arena, operation, tool_call, cancel) catch |err| {
         if (row) |value| value.finishAction(arena, if (err == error.Cancelled or cancel.load(.acquire)) .cancelled else .failed);
-        if (err == error.Cancelled) return .{ .status = .failed, .bytes = "Cancelled." };
+        if (err == error.Cancelled) {
+            debug_trace.logf("mcp-call", "request={s} dropped {s} while it ran: canceled", .{ request_id, @tagName(operation) });
+            return .{ .status = .failed, .bytes = "Cancelled." };
+        }
         return err;
     };
     if (row) |value| value.finishAction(arena, if (cancel.load(.acquire)) .cancelled else switch (outcome.status) {
@@ -1730,7 +1724,7 @@ fn runBridgeSkillOpen(
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Cancelled => return error.Cancelled,
-                else => return .{ .status = .tool_error, .bytes = try arena.print("skill failed: {s}", .{@errorName(err)}) },
+                else => return .{ .status = .tool_error, .bytes = try skillOpenFailureText(arena, req.name, req.resource, err) },
             };
             return switch (result) {
                 .loaded => |loaded| .{ .status = .ok, .bytes = loaded.model_output },
@@ -1738,6 +1732,25 @@ fn runBridgeSkillOpen(
             };
         },
     }
+}
+
+/// The model-facing text for a skill read that failed after the skill was
+/// chosen. Each named error says what is wrong and what to do next. The last
+/// arm names an unexpected error, so no failure is shown as a bare error name.
+fn skillOpenFailureText(arena: Allocator, name: []const u8, resource: ?[]const u8, err: anyerror) Allocator.Error![]const u8 {
+    const shown = resource orelse "SKILL.md";
+    return switch (err) {
+        error.FileNotFound => if (resource) |path|
+            arena.print("fx tool skill open: resource {s} was not found in skill {s}; check the path, which is relative to the skill folder.", .{ path, name })
+        else
+            arena.print("fx tool skill open: no skill named {s}; run skill list to see the names.", .{name}),
+        error.InvalidSkillResourcePath => arena.print("fx tool skill open: resource {s} is not a valid path in skill {s}; use a relative path inside the skill folder with no .. parts.", .{ shown, name }),
+        error.IsDir => arena.print("fx tool skill open: resource {s} is a folder, not a file, in skill {s}; name a file inside it.", .{ shown, name }),
+        error.AccessDenied => arena.print("fx tool skill open: resource {s} in skill {s} cannot be read: permission denied; check the file's permissions.", .{ shown, name }),
+        error.SkillFileLimitExceeded => arena.print("fx tool skill open: resource {s} in skill {s} is larger than the skill_file_bytes limit; raise skill_file_bytes to read it.", .{ shown, name }),
+        error.SkillResourceChanged, error.ChangedSkillWasLoaded => arena.print("fx tool skill open: resource {s} in skill {s} changed while fx read it; open it again.", .{ shown, name }),
+        else => arena.print("fx tool skill open: could not read {s} in skill {s} ({s}); open it again, and report it if this repeats.", .{ shown, name, @errorName(err) }),
+    };
 }
 
 fn runBridgeAgentCall(
@@ -3558,6 +3571,117 @@ test "bridged skill open reads whole files, enforces skill_file_bytes, and repor
         const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-46", "alpha", "", allowed, &cancel);
         try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
         try std.testing.expect(std.mem.find(u8, outcome.bytes, "skill_file_bytes") != null);
+    }
+}
+
+test "bridged skill open target lookup propagates OutOfMemory from a location's resolve" {
+    var name_buf: [16 * 1024]u8 = undefined;
+    @memset(&name_buf, 'a');
+    name_buf[0] = '/';
+    const locations = skill_contract.Locations{};
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo, .skill_locations = &locations };
+    defer rt.deinit(std.testing.allocator);
+    const ctx = rt.context();
+    const operation: mcp_call_capability.BashToolRequest = .{ .skill_open = .{ .name = &name_buf } };
+
+    var saw_out_of_memory = false;
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = fail_index });
+        var arena_state = std.heap.ArenaAllocator.init(failing.allocator());
+        defer arena_state.deinit();
+        const result = bridgeBashToolCall(ctx, arena_state.allocator(), "fx-mcp-call-47", operation);
+        if (!failing.has_induced_failure) {
+            _ = try result;
+            try std.testing.expect(saw_out_of_memory);
+            return;
+        }
+        if (result) |_| {
+            return error.TestInducedFailureWasSwallowed;
+        } else |err| {
+            const name = @errorName(err);
+            if (std.mem.eql(u8, name, "OutOfMemory")) {
+                saw_out_of_memory = true;
+            } else if (!std.mem.eql(u8, name, "WriteFailed")) {
+                // The arguments writer reports its own allocation failure as WriteFailed.
+                return err;
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "bridged skill open names a missing skill and the command that lists names" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const text = try skillOpenFailureText(arena_state.allocator(), "alpha", null, error.FileNotFound);
+    try std.testing.expectEqualStrings("fx tool skill open: no skill named alpha; run skill list to see the names.", text);
+}
+
+test "bridged skill open names a bad resource path, a missing resource, and a folder, with the next step" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace/.fx/skills/alpha/nested");
+    try writeBridgeTestFile(tmp, "home/workspace/.fx/skills/alpha/SKILL.md", "---\nname: alpha\ndescription: alpha skill\n---\n\nALPHA BODY\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace);
+    const skills_dir = try std.Io.Dir.path.join(arena, &.{ workspace, ".fx", "skills" });
+    try setTestHome(null);
+    defer io_mod.resetEnvironForTest();
+
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = workspace, .skills_dir = skills_dir, .permission_mode = .yolo };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    const cases = [_]struct { resource: []const u8, expected: []const u8 }{
+        .{ .resource = "../outside.txt", .expected = "fx tool skill open: resource ../outside.txt is not a valid path in skill alpha; use a relative path inside the skill folder with no .. parts." },
+        .{ .resource = "missing.md", .expected = "fx tool skill open: resource missing.md was not found in skill alpha; check the path, which is relative to the skill folder." },
+        .{ .resource = "nested", .expected = "fx tool skill open: resource nested is a folder, not a file, in skill alpha; name a file inside it." },
+    };
+    for (cases) |case| {
+        const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-47", .{ .skill_open = .{ .name = "alpha", .resource = case.resource } })) {
+            .allow => |value| value,
+            .deny => return error.TestExpectedAllow,
+        };
+        const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-47", "alpha", "", allowed, &cancel);
+        try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+        try std.testing.expectEqualStrings(case.expected, outcome.bytes);
+    }
+}
+
+test "bridged skill open read failures name the file, what is wrong, and the next step" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { err: anyerror, resource: ?[]const u8, expected: []const u8 }{
+        .{
+            .err = error.AccessDenied,
+            .resource = null,
+            .expected = "fx tool skill open: resource SKILL.md in skill alpha cannot be read: permission denied; check the file's permissions.",
+        },
+        .{
+            .err = error.SkillFileLimitExceeded,
+            .resource = "big.txt",
+            .expected = "fx tool skill open: resource big.txt in skill alpha is larger than the skill_file_bytes limit; raise skill_file_bytes to read it.",
+        },
+        .{
+            .err = error.SkillResourceChanged,
+            .resource = "big.txt",
+            .expected = "fx tool skill open: resource big.txt in skill alpha changed while fx read it; open it again.",
+        },
+        .{
+            .err = error.NoSpaceLeft,
+            .resource = null,
+            .expected = "fx tool skill open: could not read SKILL.md in skill alpha (NoSpaceLeft); open it again, and report it if this repeats.",
+        },
+    };
+    for (cases) |case| {
+        const text = try skillOpenFailureText(arena, "alpha", case.resource, case.err);
+        try std.testing.expectEqualStrings(case.expected, text);
     }
 }
 

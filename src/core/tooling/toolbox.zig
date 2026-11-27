@@ -84,7 +84,7 @@ pub fn lookupOf(
 /// The name of the skill `target` opens, a name or a location, or null when
 /// it names no skill. A location fx can't resolve keeps its own text, so a
 /// rule for every skill still holds.
-fn skillNamed(arena: Allocator, locations: ?*const skill_contract.Locations, target: []const u8) Allocator.Error!?[]const u8 {
+pub fn skillNamed(arena: Allocator, locations: ?*const skill_contract.Locations, target: []const u8) Allocator.Error!?[]const u8 {
     const catalog = if (locations) |value| value.* else skill_contract.Locations{};
     const is_location = std.mem.startsWith(u8, target, "skill:") or std.Io.Dir.path.isAbsolute(target);
     if (!is_location) {
