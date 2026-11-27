@@ -51,6 +51,7 @@ const ISOLATED_KEYS = [
   "FX_TEST_GATEWAY_CHAT_URL",
   "FX_TEST_GATEWAY_MODELS_URL",
   "FX_TEST_GATEWAY_CREDITS_URL",
+  "FX_PROVIDER",
   // A developer's terminal recording and the bridge of the fx session that
   // started their tmux server must not reach a test's fx.
   "FX_DEBUG_RECORD",
