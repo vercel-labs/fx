@@ -25,6 +25,7 @@ const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -108,6 +109,40 @@ test "a hosted run's turn context leaves saving to the child's own agent" {
     try std.testing.expectError(error.SessionCommitFailed, turn.commit("work-1", saved));
     try std.testing.expect(!turn.committed);
 }
+
+test "out of memory while a subagent asks for approval is out of memory, not an unavailable approval" {
+    var turn = TurnContext.initHosted(std.testing.allocator, 8);
+    defer turn.deinit();
+    var phase_context: u8 = 0;
+    turn.child_id = "child_a";
+    turn.phase_context = &phase_context;
+    turn.phase_fn = acceptPhase;
+    var host_context: u8 = 0;
+    turn.host_prompter = .{ .context = &host_context, .request_fn = AllocatingHostPrompter.request };
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
+    const call: types.ToolCall = .{ .id = "call_1", .name = "shell", .arguments_json = "{}" };
+    const request: permission_request.PermissionRequest = .{ .label = "run a command" };
+    try std.testing.expectError(error.OutOfMemory, turn.askHost(failing.allocator(), request, call, null, null, "child_a", "work_1"));
+}
+
+fn acceptPhase(_: *anyopaque, _: []const u8, _: []const u8, _: child_state.Phase) anyerror!void {}
+
+/// A host prompter that allocates its answer, as a real one may, so an
+/// allocator that is out of memory fails it.
+const AllocatingHostPrompter = struct {
+    fn request(
+        _: *anyopaque,
+        alloc: Allocator,
+        _: permission_request.PermissionRequest,
+        _: types.ToolCall,
+        _: ?*const @import("../output/diff.zig").FileReview,
+        _: ?[]const types.PermissionGrant,
+    ) anyerror!permission_request.OwnedPermissionResponse {
+        const scratch = try alloc.alloc(u8, 1);
+        alloc.free(scratch);
+        return permission_request.OwnedPermissionResponse.init(alloc, .once, null);
+    }
+};
 
 test "child compaction preserves work identity and permits final commit" {
     const alloc = std.testing.allocator;
@@ -549,6 +584,8 @@ pub const TurnContext = struct {
     /// client cannot be reached. Admission turns each into an outcome that
     /// says approval was required and could not be asked, where a denial
     /// would say the person refused. Nothing runs, and the trace says why.
+    /// Out of memory is no refusal: it comes out as `error.OutOfMemory`, and
+    /// the turn fails as any allocation failure does.
     ///
     /// The request is already one wait for the subagent's observer: the
     /// admission prompter that called this began it. The host's prompter is a
@@ -578,9 +615,10 @@ pub const TurnContext = struct {
         };
         return host.request(alloc, request, call, review, grant_offer) catch |err| {
             debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=host err={s}", .{ child_id, work_id, @errorName(err) });
-            // The error that names the cause passes through; any other
-            // failure of the host's prompter names none.
-            return if (permission_prompter.unavailableCause(err) != null) err else error.PermissionPromptUnavailable;
+            // The error that names the cause passes through, and so does out
+            // of memory, which names no cause but is no refusal either. Any
+            // other failure of the host's prompter names none.
+            return if (err == error.OutOfMemory or permission_prompter.unavailableCause(err) != null) err else error.PermissionPromptUnavailable;
         };
     }
 
