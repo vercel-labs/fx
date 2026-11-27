@@ -1474,6 +1474,50 @@ describe("fx ask presentation", () => {
     },
     TIMEOUT,
   );
+
+  // `fx ask` shows no question, so the prose before one ends its line as it
+  // does before any other tool.
+  const ASK_QUESTION = { questions: [{ question: "Choose next step?", options: [{ label: "Run tests" }, { label: "Stop" }] }] };
+  for (const [placement, settings, call] of [
+    ["direct", {}, { name: "ask_user_question", input: ASK_QUESTION }],
+    ["toolbox", { tool_placement: { ask_user_question: "toolbox" } }, { name: "toolbox", input: { run: "ask_user_question", arguments: ASK_QUESTION } }],
+  ] as const) {
+    test.skipIf(!tmuxAvailable())(
+      `ask in a terminal ends the prose line before a ${placement} question`,
+      async () => {
+        const root = createShortRoot();
+        mkdirSync(join(root.home, ".fx"), { recursive: true });
+        writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify(settings));
+        const gateway = startFakeGateway([
+          fakeGatewaySse([
+            { type: "text-delta", id: "prose_1", delta: "One question first." },
+            { type: "tool-call", toolCallId: "ask_1", toolName: call.name, input: call.input },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]),
+          fakeGatewayFinalText("Done after the question."),
+        ]);
+        gateways.push(gateway);
+
+        const session = await TmuxSession.create({
+          isolated: true,
+          cmd: terminalCommand(["ask", "--no-save", "Ask me, then finish."]),
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root.home, gateway), NO_COLOR: "1" },
+          width: 100,
+          height: 30,
+          remainOnExit: true,
+        });
+        sessions.push(session);
+
+        await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+        const rows = (await session.captureFullScrollback()).split("\n").map((row) => row.trimEnd());
+        const prose = rows.indexOf("  One question first.");
+        expect(prose, rows.join("\n")).toBeGreaterThan(0);
+        expect(rows[prose + 1]).toBe("  Done after the question.");
+      },
+      TIMEOUT,
+    );
+  }
 });
 
 // Both login shells read these files, so the tests hold for zsh and bash.

@@ -2227,6 +2227,143 @@ test "two standalone compaction cuts retain matching request and finalization hi
     try expectBodyNotContains(&follow_gateway, 0, "COMPACTED_PRIVATE_REPLAY");
 }
 
+test "a turn a compaction cut keeps its summarized step in the session log, and resume sends what fx sends live (D87)" {
+    const session_adapter = @import("../../../session/session_adapter.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const folded_call = toolCall("folded_call", "read_file", "{\"path\":\"a.txt\"}");
+    const kept_call = toolCall("kept_call", "read_file", "{\"path\":\"b.txt\"}");
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{folded_call} },
+        .{ .role = .tool, .content = "FOLDED_RESULT", .tool_call_id = folded_call.id, .tool_name = folded_call.name, .tool_result_status = .success },
+        .{ .role = .assistant, .tool_calls = &.{kept_call} },
+        .{ .role = .tool, .content = "KEPT_RESULT", .tool_call_id = kept_call.id, .tool_name = kept_call.name, .tool_result_status = .success },
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    const runtime_deps = deps.deps();
+    var finalization = TurnFinalizationGuard.init(&runtime_deps, 1, testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, "/tmp/workspace"));
+    defer finalization.deinit();
+    // A compaction inside the turn summarized its first step.
+    finalization.compacted_execution = .{ .tool_steps = 1 };
+    var fixture = PromptFixture{};
+    var summary = TurnSummaryAccumulator{ .turn_started_at_ms = io_mod.milliTimestamp() };
+    var finish_trace = PromptFinishTrace{ .ctx = .{ .turn_id = 1 } };
+    try finishCommonAssistantTerminal(&runtime_deps, &finalization, arena.allocator(), fixture.job(), &messages, &summary, .{ .history = "final answer" }, .completed, .completed, &finish_trace, "completed", null);
+    const live = deps.history_turns.items[0];
+    try std.testing.expectEqual(@as(usize, 1), live.assistant.execution.tool_steps.len);
+
+    // Saved as a host saves it: the turn is open, the compaction's line
+    // names the cut, and the finished turn commits.
+    var store = try session_adapter.Store.open(alloc, home);
+    defer store.deinit(alloc);
+    var model = "test-model".*;
+    const saved = try session_adapter.Session.create(alloc, &store, fixture.workspace_root, .ask, .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+    var summary_text = "SUMMARY_OF_FIRST_STEP".*;
+    try saved.beginTurn();
+    try saved.commitCompaction(.{ .summary = &summary_text, .removed_turn_count = 0, .compaction_count = 1 }, true, .{ .turns = 0, .tool_steps = 1 });
+    var prepared = try types.dupeHistoryTurn(alloc, live);
+    defer types.freeHistoryTurn(alloc, prepared);
+    try saved.prepareTurn(&prepared);
+    try saved.commitTurn(prepared, types.ConversationLanguage.default());
+    const id = try alloc.dupe(u8, saved.id());
+    defer alloc.free(id);
+    saved.close();
+
+    const resumed = try session_adapter.Session.resumeSession(alloc, &store, .{ .id = id }, fixture.workspace_root, .ask);
+    defer resumed.close();
+    const ShownCalls = struct {
+        ids: std.ArrayList([]u8) = .empty,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            for (turn.assistant.execution.tool_steps) |step| for (step.tool_calls) |call| {
+                try self.ids.append(std.testing.allocator, try std.testing.allocator.dupe(u8, call.id));
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.ids.items) |call_id| std.testing.allocator.free(call_id);
+            self.ids.deinit(std.testing.allocator);
+        }
+    };
+    // The transcript a resume draws, Ctrl+O's too, shows the summarized step.
+    var shown: ShownCalls = .{};
+    defer shown.deinit();
+    try resumed.visitHistory(alloc, &shown);
+    try std.testing.expectEqual(@as(usize, 2), shown.ids.items.len);
+    try std.testing.expectEqualStrings(folded_call.id, shown.ids.items[0]);
+    try std.testing.expectEqualStrings(kept_call.id, shown.ids.items[1]);
+
+    // The model gets the same next request either way: the summary, then the
+    // turn from the cut, as fx's history keeps it once the host saved it.
+    var restored = try resumed.restore(alloc);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), restored.history.len);
+    var live_history = [_]types.HistoryTurn{ restored.history[0], prepared };
+    var live_gateway = FakeGateway.init(alloc, &.{.{ .content = "next" }});
+    defer live_gateway.deinit();
+    var live_deps = FakeAgentRuntimeDeps.init(alloc);
+    defer live_deps.deinit();
+    var live_job = fixture.job();
+    live_job.history = &live_history;
+    try runFakePrompt(&live_gateway, &live_deps, fixture.config(), live_job);
+    var resumed_gateway = FakeGateway.init(alloc, &.{.{ .content = "next" }});
+    defer resumed_gateway.deinit();
+    var resumed_deps = FakeAgentRuntimeDeps.init(alloc);
+    defer resumed_deps.deinit();
+    var resumed_job = fixture.job();
+    resumed_job.history = restored.history;
+    try runFakePrompt(&resumed_gateway, &resumed_deps, fixture.config(), resumed_job);
+    try expectBodyContains(&resumed_gateway, 0, "KEPT_RESULT");
+    try expectBodyNotContains(&resumed_gateway, 0, "FOLDED_RESULT");
+    try std.testing.expectEqualStrings(live_gateway.request_bodies.items[0], resumed_gateway.request_bodies.items[0]);
+}
+
+test "a cancelled or failed turn a compaction cut hands the session its whole turn (D87)" {
+    const runtime_interruption = @import("../interruption.zig");
+    const alloc = std.testing.allocator;
+    const folded_call = toolCall("folded_call", "read_file", "{\"path\":\"a.txt\"}");
+    const kept_call = toolCall("kept_call", "read_file", "{\"path\":\"b.txt\"}");
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{folded_call} },
+        .{ .role = .tool, .content = "FOLDED_RESULT", .tool_call_id = folded_call.id, .tool_name = folded_call.name, .tool_result_status = .success },
+        .{ .role = .assistant, .tool_calls = &.{kept_call} },
+        .{ .role = .tool, .content = "KEPT_RESULT", .tool_call_id = kept_call.id, .tool_name = kept_call.name, .tool_result_status = .success },
+    };
+    const Ending = enum { cancelled, cancelled_after_candidate, failed_partial };
+    for ([_]Ending{ .cancelled, .cancelled_after_candidate, .failed_partial }) |ending| {
+        var deps = FakeAgentRuntimeDeps.init(alloc);
+        defer deps.deinit();
+        const runtime_deps = deps.deps();
+        var finalization = TurnFinalizationGuard.init(&runtime_deps, 1, testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, "/tmp/workspace"));
+        defer finalization.deinit();
+        finalization.compacted_execution = .{ .tool_steps = 1 };
+        var fixture = PromptFixture{};
+        var completed_tool_names = [_][]u8{};
+        var persisted = false;
+        var materializing = false;
+        switch (ending) {
+            .cancelled, .cancelled_after_candidate => try runtime_interruption.persistInterruptedTurnOnce(&runtime_deps, &finalization, fixture.job(), null, null, &completed_tool_names, &persisted, .{ .turn_id = 1 }, &messages, if (ending == .cancelled_after_candidate) "candidate reply" else null, &materializing),
+            .failed_partial => try runtime_interruption.persistFailedPartialTurnOnce(&runtime_deps, &finalization, fixture.job(), "partial reply", &persisted, .{ .turn_id = 1 }, &messages, &materializing),
+        }
+        const turn = deps.history_turns.items[0].interrupted;
+        try std.testing.expectEqual(@as(usize, 1), turn.execution.tool_steps.len);
+        const whole = turn.saved_execution orelse return error.TestExpectedSavedExecution;
+        try std.testing.expectEqual(@as(usize, 2), whole.tool_steps.len);
+        try std.testing.expectEqualStrings(folded_call.id, whole.tool_steps[0].tool_calls[0].id);
+        try std.testing.expectEqualStrings(kept_call.id, whole.tool_steps[1].tool_calls[0].id);
+    }
+}
+
 test "common Stop parallel cancellation preserves ordinary cancelled peer as completed failure" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
