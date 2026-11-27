@@ -1478,10 +1478,9 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
     return listV2Sessions(state, alloc, msg, v2_store, params);
 }
 
-/// The v1 roots of the paged listing in progress, kept for the page its
-/// last cursor names, so one listing reads v1's folder once.
-/// A connection keeps at most one, freed by its next `session/list` or when the
-/// connection ends. It is a snapshot: a v1 session deleted during a listing still shows on its later pages.
+/// Every v1 root of one listing, read once for all its pages. A connection keeps at most one.
+/// The next `session/list` that reaches it reuses or replaces it, and the connection's end frees it.
+/// It is a snapshot, so a v1 session deleted during a listing still shows on its later pages.
 pub const SessionListing = struct {
     v1_roots: session_adapter.V1Roots,
     next_updated_at_ms: i64,
@@ -3800,34 +3799,15 @@ test "a paged session/list reads v1's sessions once for the whole listing" {
     var listed_ids: std.ArrayList([]const u8) = .empty;
     while (pages < max_list_pages) {
         pages += 1;
-        var params_raw: ?[]const u8 = null;
-        if (cursor) |value| {
-            var params_out: std.Io.Writer.Allocating = .init(arena);
-            try std.json.Stringify.value(.{ .cursor = value }, .{}, &params_out.writer);
-            params_raw = params_out.written();
-        }
-        var msg = jsonrpc.Message{ .id = .{ .integer = next_id }, .method = "session/list", .params_raw = params_raw };
+        const page = try listOnePage(&state, arena, &capture, next_id, cursor);
         next_id += 1;
-        try handleListSessions(&state, arena, &msg);
-
-        const captured = try readCaptured(&capture, arena);
-        var lines = std.mem.splitScalar(u8, captured, '\n');
-        var last_line: []const u8 = "";
-        while (lines.next()) |raw| {
-            const text = std.mem.trim(u8, raw, " \r\t");
-            if (text.len > 0) last_line = text;
-        }
-        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, last_line, .{});
-        const result = parsed.object.get("result") orelse return error.TestUnexpectedResult;
-        const sessions = result.object.get("sessions") orelse return error.TestUnexpectedResult;
-        for (sessions.array.items) |item| {
-            const id = (item.object.get("sessionId") orelse return error.TestUnexpectedResult).string;
+        for (page.ids) |id| {
             total_ids += 1;
             if (std.mem.eql(u8, id, v1_id)) v1_hits += 1;
             try seen.put(id, {});
             try listed_ids.append(arena, id);
         }
-        cursor = if (result.object.get("nextCursor")) |value| value.string else null;
+        cursor = page.next_cursor;
         if (cursor == null) break;
     }
     try std.testing.expect(cursor == null);
