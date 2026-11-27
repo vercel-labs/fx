@@ -1696,6 +1696,43 @@ describe("remote setup in a terminal (AC-25)", () => {
     });
   }, TIMEOUT * 3);
 
+  test.skipIf(!tmuxAvailable())("AC-25: the team and project menus list one number per option, and the review names the team", async () => {
+    await withSetup({ teams: [fakeTeam, fakeSecondTeam] }, async (setup) => {
+      await withSandboxFixture(
+        shellCall({ command: "printf 'tui%s\\n' ok-42", runner: "remote" }),
+        async (fixture) => {
+          const session = await TmuxSession.create({
+            cmd: `${FX_BIN} ask --permission-mode full-access "Run it."`,
+            cwd: fixture.workspace,
+            width: 200,
+            env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
+          });
+          sessions.push(session);
+          await session.waitForText("Which Vercel team should remote commands use?", TIMEOUT);
+          const teamMenu = await session.captureFullScrollback();
+          expect(teamMenu).toMatch(/^ {2}1\. fx test team/m);
+          expect(teamMenu).not.toContain("[1]");
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          // The team is reviewed before it is sent. Submit: option 1.
+          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
+          const review = await session.captureFullScrollback();
+          expect(review).toContain("- team: fx test team (fx-test-team)");
+          expect(review).not.toContain(fakeTeam.id);
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          await session.waitForText("Pick a project in fx-test-team", TIMEOUT);
+          const projectMenu = await session.captureFullScrollback();
+          expect(projectMenu).toMatch(/^ {2}1\. fx-test-project$/m);
+          expect(projectMenu).not.toContain("[1]");
+        },
+        NO_REMOTE,
+        true,
+        setup,
+      );
+    });
+  }, TIMEOUT * 3);
+
   test.skipIf(!tmuxAvailable())("fx ask --no-save: a decline holds for the second remote call in the same process (U4)", async () => {
     await withSetup({}, async (setup) => {
       await withSandboxFixture(
