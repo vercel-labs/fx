@@ -2454,13 +2454,14 @@ fn takeSteeringBoundary(
     return ctx.worker.takeSteeringBoundaryInto(std.heap.c_allocator, arena, turn_id, kind);
 }
 
-fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, model: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     try ctx.deps.context_registry.appendDefaultTransient(.{
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .interactive = false,
         .permission_mode = ctx.permission_mode,
+        .model = model,
         .subagents = if (ctx.subagent_host) |team_host| try team_host.teamNote(arena, ctx.active_turn_id) else null,
     }, arena, messages);
 }
@@ -3586,7 +3587,7 @@ fn onWebFetchProgress(raw_ctx: *anyopaque, _: []const u8, progress: types.WebFet
 fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.presenter) |presenter| return presenter.pushNotice(.{
-        .topic = "system",
+        .topic = "",
         .tone = .neutral,
         .body = text,
     });
@@ -5106,7 +5107,7 @@ const TestContextRegistryFixture = struct {
 
         const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
         try append_static(deps.ctx, arena, &messages);
-        try deps.append_runtime_context(deps.ctx, arena, &messages);
+        try deps.append_runtime_context(deps.ctx, arena, ctx.model, &messages);
         try std.testing.expectEqual(
             ctx.permission_mode,
             transient_permission_mode orelse return error.TestExpectedEqual,
@@ -5302,7 +5303,7 @@ test "CLI prompt projection configures web search then blocks native execution" 
     const deps = agentRuntimeDeps(&ctx);
     const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
     try append_static(deps.ctx, arena, &messages);
-    try deps.append_runtime_context(deps.ctx, arena, &messages);
+    try deps.append_runtime_context(deps.ctx, arena, ctx.model, &messages);
 
     try std.testing.expectEqualStrings("stale-key", ctx.web_search_runtime.api_key);
 

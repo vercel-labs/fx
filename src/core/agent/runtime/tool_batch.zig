@@ -501,10 +501,7 @@ pub fn processCommittedFileResult(
         }
     }
     if (reporting_degraded) {
-        hooks.push_system_notice(
-            hooks.ctx,
-            "File change committed, but some secondary reporting failed.",
-        ) catch |err| {
+        hooks.pushWarningNotice("fx saved the file change, but could not report all of it.") catch |err| {
             debug_trace.eventf(
                 "tool",
                 "committed_reporting_warning_failed",
