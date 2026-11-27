@@ -537,6 +537,11 @@ export const DEFAULT_UNSET_ENV_KEYS = [
   // A terminal that supports program resume, such as Rex, gives each shell a
   // token, and every test's fx would then send resume reports with it.
   "OSC7577_TOKEN",
+  // A Rex tab gives each shell these, and a test's fx must never reach the
+  // developer's Rex through them.
+  "REX_BIN_DIR",
+  "REX_BLOCK",
+  "REX_SERVER",
   // fx reads its test holds in release builds, so a hold left there would
   // stop every test's fx at it. A test that sets one passes it itself.
   "FX_TEST_REPORT_DELIVERY_HELD",

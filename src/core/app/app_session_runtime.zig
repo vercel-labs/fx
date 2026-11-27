@@ -29,6 +29,8 @@ const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
+const self_exe = @import("../shared/self_exe.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -1512,6 +1514,8 @@ pub fn Runtime(comptime App: type) type {
                 // The manager records the session each host last opened.
                 .remembered => .last_opened,
                 .id => |session_id| .{ .id = session_id },
+                // The launch turns a folder into its ID before the app starts.
+                .folder => return error.ResumeFolderUnresolved,
             };
             // A refusal's reason is the launch's exit message
             // (`conversionRefusal`).
@@ -1567,6 +1571,7 @@ pub fn Runtime(comptime App: type) type {
             const session_id = switch (target) {
                 .pick => unreachable,
                 .id => |id| id,
+                .folder => return error.ResumeFolderUnresolved,
                 .remembered, .last => latest: {
                     const entries = agent.session_persistence.js_host_store.list(app.alloc) catch |err| {
                         traceJsHostRestoreFailure("list", null, err);
@@ -3350,25 +3355,133 @@ pub fn Runtime(comptime App: type) type {
         /// when the main chat's saved session changes. It runs only when the
         /// terminal gave fx a token. The main chat, not a subagent on screen, is
         /// what a restart brings back.
+        /// A resume report that names the session folder also starts the Rex
+        /// resume rule, once per process.
         pub fn reportProgramResume(app: *App) void {
             if (comptime (!@hasField(App, "program_resume") or !@hasDecl(App, "programResumeToken"))) return;
             const token = App.programResumeToken() orelse return;
             const session_id = savedSessionId(&app.main_agent) orelse return;
             if (!app.program_resume.changed(session_id)) return;
+            const folder = sessionFolderRealPath(app.alloc, &app.main_agent) catch |err| blk: {
+                debug_trace.logf("program_resume", "reason=folder_unavailable err={s}", .{@errorName(err)});
+                break :blk null;
+            };
+            defer if (folder) |path| app.alloc.free(path);
+            const report = programResumeBytes(app, token, session_id, folder) orelse return;
+            const resumed = app.program_resume.reported;
+            const kind: []const u8 = if (resumed) "resume" else "clear";
+            debug_trace.logf("program_resume", "report kind={s} bytes={d}", .{ kind, report.bytes.len });
+            app.writeProgramResume(report.bytes);
+            if (resumed and report.names_folder) {
+                if (folder) |path| startRexRule(app, path);
+            }
+        }
+
+        /// Shows one notice when the Rex resume rule was added. Every other
+        /// outcome is only traced.
+        pub fn noticeRexRule(app: *App) void {
+            if (comptime !@hasField(App, "rex_rule")) return;
+            const outcome = app.rex_rule.takeOutcome() orelse return;
+            if (outcome != .added) {
+                debug_trace.logf("rex_rule", "outcome={s}", .{@tagName(outcome)});
+                return;
+            }
+            app_worker_runtime.Runtime(App).pushSemanticNotice(app, &app.main_agent, .{
+                .topic = "rex",
+                .tone = .information,
+                .body = "fx added its Rex resume rule",
+            }) catch |err| debug_trace.logf("rex_rule", "notice dropped err={s}", .{@errorName(err)});
+        }
+
+        const ProgramResumeReport = struct {
+            bytes: []const u8,
+            /// True when the report names the session folder, not the session ID.
+            names_folder: bool,
+        };
+
+        /// The report for the main chat's session. It names `folder` when the
+        /// folder is known and fits, and the session ID otherwise. The caller
+        /// keeps ownership of `folder`.
+        fn programResumeBytes(app: *App, token: []const u8, session_id: []const u8, folder: ?[]const u8) ?ProgramResumeReport {
+            const Reporter = @TypeOf(app.program_resume);
             // pathForPeerReexec allocates two copies of the path, so twice the path size fits any path fx can hold.
             var path_buffer: [2 * std.Io.Dir.max_path_bytes]u8 = undefined;
             const executable: []const u8 = App.programResumeExecutable(&path_buffer) orelse "fx";
-            const pid: u32 = @intCast(std.c.getpid());
-            const time_s = @divFloor(io_mod.milliTimestamp(), std.time.ms_per_s);
-            const bytes = app.program_resume.update(token, .{
-                .pid = pid,
-                .time_s = time_s,
+            const process = Reporter.Process{
+                .pid = @intCast(std.c.getpid()),
+                .time_s = @divFloor(io_mod.milliTimestamp(), std.time.ms_per_s),
                 .executable = executable,
                 .cwd = app.workspace_root,
-            }, session_id) orelse return;
-            const kind: []const u8 = if (app.program_resume.reported) "resume" else "clear";
-            debug_trace.logf("program_resume", "report kind={s} bytes={d}", .{ kind, bytes.len });
-            app.writeProgramResume(bytes);
+            };
+            if (folder) |path| {
+                // `update` records the session before it encodes, so a folder that does not fit is checked here, not by a second call.
+                if (Reporter.resumeValueFits(token, process, path)) {
+                    const bytes = app.program_resume.update(token, process, session_id, path) orelse return null;
+                    return .{ .bytes = bytes, .names_folder = true };
+                }
+                debug_trace.logf("program_resume", "reason=folder_does_not_fit", .{});
+            }
+            const bytes = app.program_resume.update(token, process, session_id, session_id) orelse return null;
+            return .{ .bytes = bytes, .names_folder = false };
+        }
+
+        /// Starts the Rex resume rule for the session folder that a resume report
+        /// named. The Installer runs it once per process and ignores later calls,
+        /// and it copies what it keeps, so the arguments live in a scratch arena.
+        fn startRexRule(app: *App, session_folder: []const u8) void {
+            if (comptime !@hasField(App, "rex_rule")) return;
+            const sessions_dir = std.Io.Dir.path.dirname(session_folder) orelse return;
+            var scratch = std.heap.ArenaAllocator.init(app.alloc);
+            defer scratch.deinit();
+            const alloc = scratch.allocator();
+            const state_dir = rexStateDir(alloc, &app.main_agent) catch |err| {
+                debug_trace.logf("rex_rule", "state dir unavailable err={s}", .{@errorName(err)});
+                return;
+            };
+            app.rex_rule.start(app.alloc, .{
+                .env = .{
+                    .rex_bin_dir = io_mod.getenv("REX_BIN_DIR"),
+                    .rex_block = io_mod.getenv("REX_BLOCK"),
+                    .rex_server = io_mod.getenv("REX_SERVER"),
+                    .xdg_config_home = io_mod.getenv("XDG_CONFIG_HOME"),
+                    .home = io_mod.getenv("HOME"),
+                    .token_ok = true,
+                },
+                .workspace_root = app.workspace_root,
+                .state_dir = state_dir,
+                .sessions_dir = sessions_dir,
+                .exe_path = ownExePath(alloc),
+                .setting_on = app.rex_resume_rule_enabled,
+                .pid = @intCast(std.c.getpid()),
+            });
+        }
+
+        /// fx's own absolute path for the Rex rule. The Linux fallback is
+        /// `/proc/<pid>/exe`, which names one process, so a rule written with it
+        /// would never match again; that path counts as unknown.
+        fn ownExePath(alloc: Allocator) ?[]const u8 {
+            const path = self_exe.pathForPeerReexec(alloc) catch return null;
+            if (std.mem.startsWith(u8, path, "/proc/")) {
+                alloc.free(path);
+                return null;
+            }
+            return path;
+        }
+
+        const rex_state_dir_name = "rex";
+
+        /// `<profile root>/rex`, the folder the Rex resume rule keeps its state in.
+        fn rexStateDir(alloc: Allocator, agent: *AppAgent) ![]u8 {
+            const v2 = agent.session_persistence.v2 orelse return error.NoActiveSession;
+            return profile_paths.rootPath(alloc, v2.store.home, &.{rex_state_dir_name});
+        }
+
+        /// The real path of the main chat's saved session folder. Caller owns it.
+        fn sessionFolderRealPath(alloc: Allocator, agent: *AppAgent) ![]u8 {
+            const v2 = agent.session_persistence.v2 orelse return error.NoActiveSession;
+            const folder = try v2.folderPath(alloc);
+            defer alloc.free(folder);
+            return io_mod.realpathAlloc(alloc, folder);
         }
 
         /// Writes the report that removes this terminal's resume record, when fx
@@ -6613,11 +6726,12 @@ const TestResumeTarget = union(enum) {
     pick,
     last,
     id: []u8,
+    folder: []u8,
 
     fn deinit(self: *TestResumeTarget, alloc: Allocator) void {
         switch (self.*) {
             .remembered, .pick, .last => {},
-            .id => |id| alloc.free(id),
+            .id, .folder => |id| alloc.free(id),
         }
         self.* = .last;
     }

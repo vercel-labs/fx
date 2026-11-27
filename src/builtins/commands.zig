@@ -103,7 +103,7 @@ const config_options = [_]command_specs.OptionDoc{
 
 const session_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "last", .description = "Inspect the current workspace session" },
-    .{ .usage = "resume [last|<id>]", .description = "Resume the latest workspace session or a session by id" },
+    .{ .usage = "resume [last|<id>|<folder>]", .description = "Resume the latest workspace session or a session by id" },
     .{ .usage = "fork <last|id>", .description = "Copy a saved or live session into a new session", .options = &session_fork_options },
     .{ .usage = "recover <id>", .description = "Copy a recoverable corrupt session into a new session" },
 };
@@ -241,7 +241,7 @@ pub const ask_options = agentRunOptions("this request", .with_provider_order) ++
     .{ .flag = "--config <key=value>", .description = "Override a setting for this request, with the keys fx config set takes; repeatable" },
     .{ .flag = "--no-save", .description = "Do not save the session; incompatible with --resume" },
     .{ .flag = "--no-color", .description = "Render TTY output without colors or hyperlinks; NO_COLOR or TERM=dumb also turns color off" },
-    .{ .flag = "--resume <last|<id>>", .description = "Continue the last session or a session by id" },
+    .{ .flag = "--resume <last|<id>|<folder>>", .description = "Continue the last session, a session by id, or a session's folder" },
     .{ .flag = "--resume-id <id>", .description = "Continue a session by exact id", .replacement = "use --resume <id>" },
     .{ .flag = "--", .description = "Treat every following argument as prompt text" },
 };
@@ -257,7 +257,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask " ++ agent_run_usage ++ " [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--] <prompt>",
+        .usage = "ask " ++ agent_run_usage ++ " [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>|<folder>>] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &ask_options,
         .details = &.{
@@ -370,7 +370,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .session,
         .token = "session",
-        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session resume [last|<id>] | session fork <last|id>|--id <id> [--json] | session recover <id>|--id <id> [--json]",
+        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session resume [last|<id>|<folder>] | session fork <last|id>|--id <id> [--json] | session recover <id>|--id <id> [--json]",
         .summary = "Inspect, resume, fork, or recover saved sessions",
         .subcommands = &session_subcommands,
         .options = &session_options,
@@ -396,12 +396,13 @@ pub const top_level_specs = [_]TopLevelSpec{
         .aliases = &.{ "--resume", "--continue", "-c", "-r" },
         .help_title = "--resume",
         .hidden_from_top_level_help = true,
-        .usage = "session resume [last|<id>] | -r, --resume [last|<id>] | --continue | -c",
+        .usage = "session resume [last|<id>|<folder>] | -r, --resume [last|<id>|<folder>] | --continue | -c",
         .summary = "Continue a saved interactive session",
         .options = &.{
             .{ .flag = "-r", .description = "Short for --resume; with no value, choose a session from a picker" },
             .{ .flag = "last", .description = "Resume the most recent session" },
             .{ .flag = "<id>", .description = "Resume a session by id" },
+            .{ .flag = "<folder>", .description = "Resume a session by its folder" },
         },
     },
     .{
@@ -500,7 +501,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .sessions, .usage = "sessions" },
         .{ .kind = .session, .usage = "session <last|id>" },
-        .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },
+        .{ .usage = "session resume [last|id|folder]", .summary = "Resume the latest workspace session or a session by id" },
         .{ .usage = "session fork <last|id>", .summary = "Copy a saved or live session into a new session" },
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
     } },
@@ -651,8 +652,8 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Resume the remembered workspace session",
     },
     .{
-        .usage = "-r, --resume [last|<id>]",
-        .description = "Pick a saved session, or resume the latest or an exact ID",
+        .usage = "-r, --resume [last|<id>|<folder>]",
+        .description = "Pick a saved session, or resume the latest or an exact ID. A session's folder works too.",
     },
     .{
         .usage = "-h, --help",

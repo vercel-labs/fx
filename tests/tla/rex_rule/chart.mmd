@@ -1,0 +1,48 @@
+---
+title: One fx attempt for the Rex resume rule
+---
+stateDiagram-v2
+    %% One fx process runs one attempt. Source: tests/tla/rex_rule/RexRule.tla, which follows src/core/rex_rule/.
+    %% The branch (setting on or off) is read when the attempt takes the lock, and the attempt keeps it.
+    %% Every write to init.lua is one atomic step that first compares init.lua with what the attempt observed.
+    %% A change since the observation stops the attempt at once: no rollback, added and fx.lua stay as they are
+    %% (fx.lua this attempt created is deleted on the add path).
+    %% Rules checked on this chart: all five invariants hold (design and design-three, crashes and faults on).
+    %% Events left out: the user's own rule text, a foreign line, a missing init.lua, a config check that fails before the
+    %% attempt starts, a Rex restart, a user text edit that is not after the observation, cancellation of a record wait,
+    %% other fx processes waiting on the lock, and a setting flip during an attempt (it affects only attempts that start later).
+    %% A user removal does not reopen adds: only an off attempt that finds the line present clears added, so after a
+    %% removal nothing clears it. The flip does not change this.
+    [*] --> Working : lock free
+    [*] --> Busy : lock held by another fx
+    Busy --> [*]
+    Working --> Crashed : process killed at any step (lock dropped, files stay as they are)
+    Crashed --> [*]
+    state Working {
+        [*] --> Start
+        state Start <<choice>>
+        Start --> Asking : setting on
+        Start --> OffBackingUp : setting off, and fx's line is in init.lua
+        Start --> Done : setting off and no line, or gave up before
+        Asking --> WritingFxLua : Rex has no rule, fx.lua is not foreign, and not (added and line gone)
+        Asking --> Done : Rex trusts fx, or no answer, or fx.lua foreign, or added and line gone
+        WritingFxLua --> BackingUp : fx.lua written as ours
+        BackingUp --> Comparing : init.lua copied
+        Comparing --> Done : init.lua changed since the observation; delete fx.lua if this attempt created it
+        Comparing --> Checking : unchanged; fx's line written (one atomic step)
+        Checking --> Reloading : check passes
+        Checking --> UndoingLine : check fails
+        Reloading --> Verifying : reload done
+        Reloading --> UndoingLine : reload fails
+        Verifying --> Done : Rex trusts fx; added set
+        Verifying --> UndoingLine : Rex untrusted or no_rule (gave up), or no answer
+        UndoingLine --> DeletingFxLua : take out only the line this attempt wrote, never put one back
+        DeletingFxLua --> UndoingReload : delete fx.lua if this attempt created it
+        UndoingReload --> Done : reload (failure ignored)
+        OffBackingUp --> OffComparing : init.lua copied
+        OffComparing --> Done : init.lua changed since the observation; nothing else changes
+        OffComparing --> OffChecking : unchanged; fx's line removed (one atomic step)
+        OffChecking --> OffDeletingFxLua : check result is only logged
+        OffDeletingFxLua --> OffReloadClear : delete fx.lua if the observation had it as ours
+        OffReloadClear --> Done : reload (failure ignored), then added cleared
+    }

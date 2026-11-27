@@ -67,6 +67,8 @@ pub const Settings = struct {
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
     auto_upgrade: ?bool = null,
+    /// Whether fx adds its resume command to Rex. Profile-only.
+    rex_resume_rule: ?bool = null,
     update_channel: ?update_target.Channel = null,
     theme: ?[]const u8 = null,
     startup_scrollback: ?bool = null,
@@ -1975,6 +1977,11 @@ fn parseProfileOnlyFields(
         settings.auto_upgrade = value.bool;
     }
 
+    if (root.object.get("rex_resume_rule")) |value| {
+        if (value != .bool) return error.InvalidRexResumeRuleType;
+        settings.rex_resume_rule = value.bool;
+    }
+
     if (root.object.get("update_channel")) |update_channel_value| {
         const value = update_channel_value;
         if (value != .string) return error.InvalidUpdateChannelType;
@@ -2204,6 +2211,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.session_titles) |value| target.session_titles = value;
     if (incoming.cache_warming) |value| target.cache_warming = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
+    if (incoming.rex_resume_rule) |value| target.rex_resume_rule = value;
     if (incoming.update_channel) |value| target.update_channel = value;
     if (incoming.theme) |value| {
         if (target.theme) |old| alloc.free(old);
@@ -3988,12 +3996,12 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try writeFixtureFile(
         tmp.dir,
         "home/.fx/settings.json",
-        "{\"model\":\"profile/model\",\"permission_mode\":\"auto\",\"permission\":{\"bash\":{\"profile *\":\"allow\"}},\"prompt_history\":{\"enabled\":true},\"status_line\":{\"sandbox\":true,\"context\":false},\"first_call_tool_choice\":\"none\",\"review_model\":\"profile/review\",\"auto_upgrade\":false,\"update_channel\":\"dev\",\"fast_mode\":false,\"input_appearance\":\"tint\",\"maxxing_mode\":\"minimal\",\"slash_menu_categories\":false,\"effort\":\"high\",\"output_level\":\"quiet\",\"startup_scrollback\":false}\n",
+        "{\"model\":\"profile/model\",\"permission_mode\":\"auto\",\"permission\":{\"bash\":{\"profile *\":\"allow\"}},\"prompt_history\":{\"enabled\":true},\"status_line\":{\"sandbox\":true,\"context\":false},\"first_call_tool_choice\":\"none\",\"review_model\":\"profile/review\",\"auto_upgrade\":false,\"rex_resume_rule\":false,\"update_channel\":\"dev\",\"fast_mode\":false,\"input_appearance\":\"tint\",\"maxxing_mode\":\"minimal\",\"slash_menu_categories\":false,\"effort\":\"high\",\"output_level\":\"quiet\",\"startup_scrollback\":false}\n",
     );
     try writeFixtureFile(
         tmp.dir,
         "workspace/.fx.json",
-        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"status_line\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"review_model\":\"project/review\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"max_agent_steps\":17}\n",
+        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"status_line\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"review_model\":\"project/review\",\"auto_upgrade\":true,\"rex_resume_rule\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"max_agent_steps\":17}\n",
     );
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -4012,6 +4020,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try std.testing.expectEqual(types.ToolChoice.none, result.settings.first_call_tool_choice.?);
     try std.testing.expectEqualStrings("profile/review", result.settings.review_model.?);
     try std.testing.expectEqual(false, result.settings.auto_upgrade.?);
+    try std.testing.expectEqual(false, result.settings.rex_resume_rule.?);
     try std.testing.expectEqual(update_target.Channel.dev, result.settings.update_channel.?);
     try std.testing.expectEqual(false, result.settings.fast_mode.?);
     try std.testing.expectEqual(false, result.settings.slash_menu_categories.?);
@@ -4020,7 +4029,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try std.testing.expectEqual(@as(usize, 1), result.settings.permission_rules.rules.len);
     try expectPermissionRule(result.settings.permission_rules.rules[0], "bash", "profile *", .allow);
 
-    try std.testing.expectEqual(@as(usize, 14), result.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 15), result.diagnostics.len);
     inline for (&.{
         "model",
         "permission_mode",
@@ -4031,6 +4040,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
         "first_call_tool_choice",
         "review_model",
         "auto_upgrade",
+        "rex_resume_rule",
         "update_channel",
         "fast_mode",
         "slash_menu_categories",
@@ -4764,6 +4774,23 @@ test "all currently parsed read-only settings survive detailed loading" {
     try std.testing.expectEqual(false, parsed.context.?);
     try std.testing.expectEqual(false, parsed.auto_upgrade.?);
     try std.testing.expectEqual(update_target.Channel.dev, parsed.update_channel.?);
+}
+
+test "rex_resume_rule reads true and false from the profile" {
+    var on = try parseSettingsJson(std.testing.allocator, "{\"rex_resume_rule\":true}");
+    defer on.deinit(std.testing.allocator);
+    try std.testing.expectEqual(true, on.rex_resume_rule.?);
+
+    var off = try parseSettingsJson(std.testing.allocator, "{\"rex_resume_rule\":false}");
+    defer off.deinit(std.testing.allocator);
+    try std.testing.expectEqual(false, off.rex_resume_rule.?);
+}
+
+test "rex_resume_rule rejects a value that is not a bool" {
+    try std.testing.expectError(
+        error.InvalidRexResumeRuleType,
+        parseSettingsJson(std.testing.allocator, "{\"rex_resume_rule\":\"no\"}"),
+    );
 }
 
 test "additional directories load only from the current profile workspace" {

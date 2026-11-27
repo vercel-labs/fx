@@ -171,6 +171,7 @@ const ui_terminal = @import("ui/terminal/terminal.zig");
 const cursor_probe = @import("ui/terminal/cursor_probe.zig");
 const ui_program_status = @import("ui/terminal/program_status.zig");
 const ui_program_resume = @import("ui/terminal/program_resume.zig");
+const rex_rule = @import("core/rex_rule/rex_rule.zig");
 const transcript_runtime = @import("ui/transcript/runtime.zig");
 const resume_projection = @import("ui/transcript/resume_projection.zig");
 const assistant_pacer = @import("ui/assistant/pacer.zig");
@@ -640,6 +641,7 @@ const App = struct {
     herdr: builtin_hooks.Client = .{},
     program_status: ui_program_status.Reporter = .{},
     program_resume: ui_program_resume.Reporter = .{},
+    rex_rule: rex_rule.Installer = .{},
 
     prompt_history: PromptHistoryRuntime = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
@@ -709,6 +711,7 @@ const App = struct {
     toolbox_behind: config_runtime.tool_placement.Behind = config_runtime.tool_placement.behindToolbox(.{}, &.{}),
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
+    rex_resume_rule_enabled: bool = true,
     /// Resolved review-model override for automatic permission review
     /// (`review_model` setting or FX_REVIEW_MODEL). Owned; empty keeps the
     /// reviewer's compiled default.
@@ -1120,6 +1123,7 @@ const App = struct {
         main_agent.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(main_agent);
         self.upgrader.stopForProcessExit();
+        self.rex_rule.stopForProcessExit();
         self.file_index.requestStop();
         WorkspaceAppRuntime.requestStop(self);
         main_agent.managed_executions.terminateForProcessExit();
@@ -1205,6 +1209,7 @@ const App = struct {
         main_agent.managed_executions.shutdown();
         self.terminal_client.closeOwnedTerminals();
         self.upgrader.stop();
+        self.rex_rule.deinit();
         self.file_index.requestStop();
         WorkspaceAppRuntime.requestStop(self);
         shutdown_trace.mark("background_stops_requested");
@@ -3652,6 +3657,7 @@ const App = struct {
         AgentsAppRuntime.lendPrompt(self);
         HerdrAppRuntime.reconcile(self);
         SessionAppRuntime.reportProgramResume(self);
+        SessionAppRuntime.noticeRexRule(self);
     }
 
     /// Gives a subagent's question lent to main's prompt back to it, before
@@ -4111,6 +4117,9 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
         },
     };
     defer launch.deinit(alloc);
+    if (launch.requested_resume) |*target| {
+        if (try cli_surface.resolveResumeFolder(alloc, target)) |_| return error.WasmTerminalResumeFolderRefused;
+    }
     const outcome = try app_entry_runtime.runInteractiveCooperative(App, alloc, &launch, .local);
     switch (outcome) {
         .returned => {},

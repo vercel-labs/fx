@@ -761,7 +761,7 @@ test "a flag's fixed values come from its list or its placeholder" {
     try std.testing.expectEqualStrings("auto", listed[1]);
     try std.testing.expectEqual(@as(usize, 0), (try fixedValues(arena, .{ .flag = "--limit <1-100>", .description = "" })).len);
     try std.testing.expectEqual(@as(usize, 0), (try fixedValues(arena, .{ .flag = "--model <id>", .description = "" })).len);
-    const resume_values = try placeholderValues(arena, "--resume [last|<id>]");
+    const resume_values = try placeholderValues(arena, "--resume [last|<id>|<folder>]");
     try std.testing.expectEqual(@as(usize, 1), resume_values.len);
     try std.testing.expectEqualStrings("last", resume_values[0]);
 }

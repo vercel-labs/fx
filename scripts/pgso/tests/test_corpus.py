@@ -85,6 +85,7 @@ VERIFICATION_E2E_TESTS = (
     "tui-render-replay.test.ts",
     "tui-resume.test.ts",
     "tui-program-resume.test.ts",
+    "tui-rex-resume-rule.test.ts",
     "tui-slash-commands.test.ts",
     "tui-slash-extra.test.ts",
     "tui-slash-menu.test.ts",
@@ -430,7 +431,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(37, len(corpus.scenarios))
-        self.assertEqual(79, len(corpus.candidate_scenarios))
+        self.assertEqual(80, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

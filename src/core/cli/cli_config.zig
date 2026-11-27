@@ -133,6 +133,7 @@ const Writable = enum {
     max_tool_result_bytes,
     @"prompt_history.enabled",
     provider_strict,
+    rex_resume_rule,
     session_titles,
     slash_menu_categories,
     @"sound.attention_required",
@@ -233,6 +234,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .fast_mode => patch.fast_mode = enabled,
         .@"prompt_history.enabled" => patch.prompt_history_enabled = enabled,
         .provider_strict => patch.provider_strict = enabled,
+        .rex_resume_rule => patch.rex_resume_rule = enabled,
         .session_titles => patch.session_titles = enabled,
         .slash_menu_categories => patch.slash_menu_categories = enabled,
         .@"sound.attention_required" => patch.notification_attention_required = enabled,
@@ -449,16 +451,16 @@ pub const Effective = union(enum) {
 /// The keys `fx config` reads from the resolved state instead of the files.
 /// A test checks that each plain key is here or in `files_only_keys`.
 pub const resolved_keys = [_][]const u8{
-    "auto_compact_percent",           "auto_upgrade",             "cache_warming",
-    "collapse_tool_calls",            "context",                  "effort",
-    "experimental.workspace_capture", "fast_mode",                "first_call_tool_choice",
-    "max_agent_steps",                "max_tool_result_bytes",    "permission_mode",
-    "prompt_history.enabled",         "provider",                 "provider_order",
-    "provider_strict",                "review_model",             "session_titles",
-    "slash_menu_categories",          "sound.attention_required", "sound.max",
-    "sound.turn_end",                 "startup_scrollback",       "status_line.context",
-    "status_line.session",            "status_line.workspace",    "theme",
-    "ultrafast_mode",                 "update_channel",
+    "auto_compact_percent",           "auto_upgrade",          "cache_warming",
+    "collapse_tool_calls",            "context",               "effort",
+    "experimental.workspace_capture", "fast_mode",             "first_call_tool_choice",
+    "max_agent_steps",                "max_tool_result_bytes", "permission_mode",
+    "prompt_history.enabled",         "provider",              "provider_order",
+    "provider_strict",                "review_model",          "rex_resume_rule",
+    "session_titles",                 "slash_menu_categories", "sound.attention_required",
+    "sound.max",                      "sound.turn_end",        "startup_scrollback",
+    "status_line.context",            "status_line.session",   "status_line.workspace",
+    "theme",                          "ultrafast_mode",        "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -504,6 +506,7 @@ pub fn effectiveValue(
     }
     if (eql(u8, key, "provider_strict")) return boolean(state.provider_strict);
     if (eql(u8, key, "review_model")) return if (state.review_model.len == 0) .none else string(state.review_model);
+    if (eql(u8, key, "rex_resume_rule")) return boolean(state.rex_resume_rule);
     if (eql(u8, key, "session_titles")) return boolean(state.session_title_generation);
     if (eql(u8, key, "cache_warming")) return boolean(state.cache_warming);
     if (eql(u8, key, "slash_menu_categories")) return boolean(state.slash_menu_categories);
@@ -764,6 +767,23 @@ test "config set turns each value into the patch the save path writes" {
     const removed = try changeForTest(&.{ "unset", "sound.max" }, &problem);
     try std.testing.expectEqualStrings("sound.max", removed.patch.remove.?);
     try std.testing.expect(removed.value == null);
+}
+
+test "rex_resume_rule set writes the profile and get reads the value in use" {
+    var problem: WriteProblem = .none;
+    const off = try changeForTest(&.{ "set", "rex_resume_rule", "false" }, &problem);
+    try std.testing.expectEqual(false, off.patch.rex_resume_rule.?);
+    try std.testing.expectEqual(false, off.value.?.bool);
+
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    var state = app_lifecycle.StartupState{ .agent_step_limit = 25 };
+    state.rex_resume_rule = false;
+    const effective = try effectiveValue(arena_state.allocator(), &state, .gateway, "rex_resume_rule");
+    switch (effective) {
+        .value => |value| try std.testing.expectEqual(false, value.bool),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "config set explains a bad value or a key it doesn't change" {

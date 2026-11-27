@@ -124,6 +124,7 @@ pub const UserSettingsPatch = struct {
     /// `light`, `dark`, or a theme file name under ~/.fx/themes.
     theme: ?[]const u8 = null,
     auto_upgrade: ?bool = null,
+    rex_resume_rule: ?bool = null,
     max_agent_steps: ?u32 = null,
     max_tool_result_bytes: ?u32 = null,
     auto_compact_percent: ?u8 = null,
@@ -159,6 +160,7 @@ pub const UserSettingsPatch = struct {
             self.notification_max == null and
             self.theme == null and
             self.auto_upgrade == null and
+            self.rex_resume_rule == null and
             self.max_agent_steps == null and
             self.max_tool_result_bytes == null and
             self.auto_compact_percent == null and
@@ -1080,6 +1082,7 @@ test "plain preference patches write their keys and report no change when equal"
     const patch: UserSettingsPatch = .{
         .theme = "dark",
         .auto_upgrade = false,
+        .rex_resume_rule = false,
         .max_agent_steps = 40,
         .max_tool_result_bytes = 4096,
         .auto_compact_percent = 70,
@@ -1091,6 +1094,7 @@ test "plain preference patches write their keys and report no change when equal"
     try std.testing.expect(first.changed);
     try std.testing.expect(!root.object.get("cache_warming").?.bool);
     try std.testing.expectEqual(false, root.object.get("auto_upgrade").?.bool);
+    try std.testing.expectEqual(false, root.object.get("rex_resume_rule").?.bool);
     try std.testing.expectEqual(@as(i64, 40), root.object.get("max_agent_steps").?.integer);
     try std.testing.expectEqual(@as(i64, 4096), root.object.get("max_tool_result_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, 70), root.object.get("auto_compact_percent").?.integer);
@@ -1321,6 +1325,7 @@ fn applyUserPatchToRoot(
     }
     if (patch.theme) |value| application.changed = try putString(arena, &root.object, "theme", value) or application.changed;
     if (patch.auto_upgrade) |value| application.changed = try putBool(arena, &root.object, "auto_upgrade", value) or application.changed;
+    if (patch.rex_resume_rule) |value| application.changed = try putBool(arena, &root.object, "rex_resume_rule", value) or application.changed;
     if (patch.max_agent_steps) |value| application.changed = try putInteger(arena, &root.object, "max_agent_steps", value) or application.changed;
     if (patch.max_tool_result_bytes) |value| application.changed = try putInteger(arena, &root.object, "max_tool_result_bytes", value) or application.changed;
     if (patch.auto_compact_percent) |value| application.changed = try putInteger(arena, &root.object, "auto_compact_percent", value) or application.changed;
@@ -1509,10 +1514,11 @@ fn cleanupLegacyWorkspacePreferences(
 
 /// The settings paths a patch from `fx config set` or `unset` writes that the
 /// `/settings` cleanup above doesn't already cover.
-fn configWrittenPaths(patch: UserSettingsPatch) [9]?[]const u8 {
+fn configWrittenPaths(patch: UserSettingsPatch) [10]?[]const u8 {
     return .{
         if (patch.theme != null) "theme" else null,
         if (patch.auto_upgrade != null) "auto_upgrade" else null,
+        if (patch.rex_resume_rule != null) "rex_resume_rule" else null,
         if (patch.max_agent_steps != null) "max_agent_steps" else null,
         if (patch.max_tool_result_bytes != null) "max_tool_result_bytes" else null,
         if (patch.auto_compact_percent != null) "auto_compact_percent" else null,
@@ -2259,7 +2265,7 @@ fn validateKnownSettingsObject(
             }
         }
     }
-    inline for (&.{ "context", "fast_mode", "ultrafast_mode", "auto_upgrade", "slash_menu_categories", "startup_scrollback", "yolo_acknowledged", "provider_strict" }) |key| {
+    inline for (&.{ "context", "fast_mode", "ultrafast_mode", "auto_upgrade", "rex_resume_rule", "slash_menu_categories", "startup_scrollback", "yolo_acknowledged", "provider_strict" }) |key| {
         if (object.get(key)) |value| {
             if (value != .bool) return error.InvalidSettingsFormat;
         }

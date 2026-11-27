@@ -5826,6 +5826,83 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "a session folder resumes its session, and a folder outside the profile exits two",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-folder-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const outside = join(root, "outside", "session-789");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(outside, { recursive: true });
+    const workspaceRoot = realpathSync(workspace);
+    let active: TmuxSession | null = null;
+    const gateways: Array<ReturnType<typeof startFakeGateway>> = [];
+
+    try {
+      const savedMarker = "folder resume saved history";
+      const savedGateway = startFakeGateway([fakeGatewayFinalText(savedMarker)]);
+      gateways.push(savedGateway);
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, savedGateway),
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Save a turn for folder resume.");
+      await active.waitForText(savedMarker, TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+
+      const sessionId = sessionIdFromHome(home);
+      const folder = sessionDir(home, sessionId);
+      const invocations = [["--resume", folder], ["session", "resume", folder]];
+      for (const [index, args] of invocations.entries()) {
+        const followUp = `folder follow-up ${index}`;
+        const gateway = startFakeGateway([fakeGatewayFinalText(followUp)]);
+        gateways.push(gateway);
+        writeFileSync(stderrPath, "");
+        active = await TmuxSession.create({
+          cmd: `${FX_BIN} ${args.map(shellQuote).join(" ")}`,
+          cwd: workspaceRoot,
+          env: gatewayEnv(home, gateway),
+          stderrPath,
+        });
+        await active.waitForComposer(TIMEOUT);
+        expect(await waitForScrollback(active, savedMarker)).toContain(savedMarker);
+        await active.sendText(`Continue folder ${index}.`);
+        await active.waitForText(followUp, TIMEOUT);
+        expect(sessionIdFromHome(home)).toBe(sessionId);
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd()).toBe(true);
+        await active.kill();
+        active = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      }
+
+      for (const args of [["--resume", outside], ["session", "resume", outside]]) {
+        const refused = await runFx(args, { cwd: workspaceRoot, env: { HOME: home } });
+        expect(refused.code).toBe(2);
+        expect(refused.stdout).toBe("");
+        expect(refused.stderr).toBe(`fx: ${outside} is not a session folder in this profile\n`);
+      }
+    } finally {
+      if (active) await active.kill();
+      for (const gateway of gateways) gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
   "interactive resume aliases restore history and return to a live composer",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-")));

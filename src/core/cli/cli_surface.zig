@@ -145,11 +145,14 @@ pub const ResumeTarget = union(enum) {
     pick,
     last,
     id: []u8,
+    /// A session's folder, a value that starts with `/`. It becomes `id`
+    /// before the launch runs (`resolveResumeFolder`).
+    folder: []u8,
 
     pub fn deinit(self: *ResumeTarget, alloc: Allocator) void {
         switch (self.*) {
             .remembered, .pick, .last => {},
-            .id => |value| alloc.free(value),
+            .id, .folder => |value| alloc.free(value),
         }
         self.* = undefined;
     }
@@ -1646,7 +1649,7 @@ fn activateProviderSelectionFallible(
 }
 
 fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
-    const parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
+    var parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
         if (err == error.InvalidResumeArgs) {
             try writeTopLevelUsage(cfg.command_catalog, deps, .@"resume");
             return usage_failure;
@@ -1680,18 +1683,28 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         return usage_failure;
     };
     switch (parsed_launch) {
-        .interactive => |launch| {
+        .interactive => |*launch| {
+            if (launch.requested_resume) |*target| {
+                if (try resolveResumeFolder(alloc, target)) |folder| {
+                    var message: std.Io.Writer.Allocating = .init(alloc);
+                    defer message.deinit();
+                    try message.writer.print("fx: {f} is not a session folder in this profile\n", .{text_utils.terminalSafe(folder)});
+                    try writeStderr(deps, message.written());
+                    launch.deinit(alloc);
+                    return usage_failure;
+                }
+            }
             if (launch.modifiers.profile_name) |name| {
                 if (try app_profile_runtime.launchFailure(alloc, name)) |message| {
                     defer alloc.free(message);
                     try writeStderr(deps, message);
-                    var rejected = launch;
+                    var rejected = launch.*;
                     rejected.deinit(alloc);
                     return .handled_failure;
                 }
             }
             try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
-            return .{ .interactive = launch };
+            return .{ .interactive = launch.* };
         },
         .noninteractive => |value| {
             var noninteractive = value;
@@ -5387,12 +5400,12 @@ fn parseResumeArgs(
         const flag = args[0];
         if (std.mem.startsWith(u8, flag, resume_inline_prefix)) {
             if (args.len != 1) return error.InvalidResumeArgs;
-            return resumeFlagTarget(alloc, flag[resume_inline_prefix.len..]);
+            return resumeValueTarget(alloc, flag[resume_inline_prefix.len..]);
         }
         if (std.mem.eql(u8, flag, "--resume") or std.mem.eql(u8, flag, resume_short_flag)) {
             return switch (args.len) {
                 1 => .pick,
-                2 => resumeFlagTarget(alloc, args[1]),
+                2 => resumeValueTarget(alloc, args[1]),
                 else => error.InvalidResumeArgs,
             };
         }
@@ -5406,19 +5419,35 @@ fn parseResumeArgs(
     if (std.mem.eql(u8, args[0], "--resume")) return error.RemovedResumeLastFlag;
     if (std.mem.eql(u8, args[0], "--id")) return error.RemovedResumeIdFlag;
     if (args.len != 1) return error.InvalidResumeArgs;
+    return resumeValueTarget(alloc, args[0]);
+}
 
-    const trimmed = std.mem.trim(u8, args[0], " \t\r\n");
+/// The session a resume value names: `last`, a session's folder (a value
+/// that starts with `/`), or an exact ID. `--resume`, `-r`, and
+/// `session resume` all read their value here.
+fn resumeValueTarget(alloc: Allocator, value: []const u8) !ResumeTarget {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (trimmed.len == 0) return error.InvalidResumeArgs;
     if (std.mem.eql(u8, trimmed, "last")) return .last;
+    if (std.mem.startsWith(u8, trimmed, "/")) return .{ .folder = try alloc.dupe(u8, trimmed) };
     return .{ .id = try alloc.dupe(u8, trimmed) };
 }
 
-/// The session a `--resume` or `-r` value names: `last`, or an exact ID.
-fn resumeFlagTarget(alloc: Allocator, value: []const u8) !ResumeTarget {
-    const id = std.mem.trim(u8, value, " \t\r\n");
-    if (id.len == 0) return error.InvalidResumeArgs;
-    if (std.mem.eql(u8, id, "last")) return .last;
-    return .{ .id = try alloc.dupe(u8, id) };
+/// Replaces a `--resume <folder>` target with the ID of the session the
+/// folder names. A folder that names no session in this profile is returned
+/// instead, and the target stays as it was.
+pub fn resolveResumeFolder(alloc: Allocator, target: *ResumeTarget) !?[]const u8 {
+    const folder = switch (target.*) {
+        .folder => |value| value,
+        else => return null,
+    };
+    const id = session_adapter.sessionIdFromProfileFolder(alloc, io_mod.homeDir(), folder) catch |err| switch (err) {
+        error.NotSessionFolder => return folder,
+        error.OutOfMemory => return err,
+    };
+    alloc.free(folder);
+    target.* = .{ .id = id };
+    return null;
 }
 
 /// The hint for a removed spelling, such as `fx resume`, or null for any other error.
@@ -6381,7 +6410,7 @@ test "parse resume args accepts an operand on the top-level resume flag" {
     defer target.deinit(std.testing.allocator);
 
     switch (target) {
-        .remembered, .pick, .last => return error.TestExpectedExactResumeId,
+        .remembered, .pick, .last, .folder => return error.TestExpectedExactResumeId,
         .id => |id| try std.testing.expectEqualStrings("session-123", id),
     }
 
@@ -6390,6 +6419,65 @@ test "parse resume args accepts an operand on the top-level resume flag" {
         @constCast("last"),
     }, true);
     try std.testing.expectEqual(ResumeTarget.last, latest);
+}
+
+test "parse resume args reads a value that starts with a slash as a folder" {
+    const alloc = std.testing.allocator;
+    var flag = try parseResumeArgs(alloc, &.{ @constCast("--resume"), @constCast("/abs/path") }, true);
+    defer flag.deinit(alloc);
+    try std.testing.expectEqualStrings("/abs/path", flag.folder);
+
+    var inline_flag = try parseResumeArgs(alloc, &.{@constCast("--resume=/abs/path")}, true);
+    defer inline_flag.deinit(alloc);
+    try std.testing.expectEqualStrings("/abs/path", inline_flag.folder);
+
+    var session_form = try parseResumeArgs(alloc, &.{@constCast("/abs/path")}, false);
+    defer session_form.deinit(alloc);
+    try std.testing.expectEqualStrings("/abs/path", session_form.folder);
+
+    var id_form = try parseResumeArgs(alloc, &.{@constCast("session-123")}, false);
+    defer id_form.deinit(alloc);
+    try std.testing.expectEqualStrings("session-123", id_form.id);
+}
+
+test "parseInteractiveLaunch takes a folder after --resume and session resume" {
+    const alloc = std.testing.allocator;
+    const command_catalog = testCommandCatalog();
+    const cases = [_][]const [:0]const u8{
+        &.{ "--resume", "/abs/path" },
+        &.{ "session", "resume", "/abs/path" },
+    };
+    for (cases) |args| {
+        var parsed = try parseInteractiveLaunch(alloc, args, command_catalog);
+        switch (parsed) {
+            .interactive => |*launch| {
+                defer launch.deinit(alloc);
+                try std.testing.expectEqualStrings("/abs/path", launch.requested_resume.?.folder);
+            },
+            .noninteractive => |*value| {
+                value.deinit(alloc);
+                return error.TestExpectedInteractiveLaunch;
+            },
+        }
+    }
+}
+
+test "runIfRequested refuses a resume folder outside the profile with a usage error" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("--resume"), @constCast("/Users/example/outside/session-789") },
+        testConfig(),
+        capture.deps(),
+    );
+    try std.testing.expectEqual(usage_failure, result);
+    try std.testing.expectEqualStrings(
+        "fx: /Users/example/outside/session-789 is not a session folder in this profile\n",
+        capture.stderr.written(),
+    );
+    try std.testing.expectEqualStrings("", capture.stdout.written());
 }
 
 test "parseInteractiveLaunch accepts legacy and revision-bearing upgrade relaunches" {
@@ -6465,7 +6553,7 @@ test "parseInteractiveLaunch shares native resume grammar" {
                 const target = launch.requested_resume orelse return error.TestExpectedResumeTarget;
                 if (case.expected_id) |expected_id| switch (target) {
                     .id => |id| try std.testing.expectEqualStrings(expected_id, id),
-                    .remembered, .pick, .last => return error.TestExpectedExactResumeId,
+                    .remembered, .pick, .last, .folder => return error.TestExpectedExactResumeId,
                 } else try std.testing.expectEqual(ResumeTarget.last, target);
             },
             .noninteractive => |value| {
@@ -7149,7 +7237,7 @@ test "runIfRequested top-level resume aliases return the existing target" {
             defer launch.deinit(std.testing.allocator);
             switch (launch.requested_resume.?) {
                 .id => |id| try std.testing.expectEqualStrings("session.123", id),
-                .remembered, .pick, .last => return error.TestExpectedExactResumeId,
+                .remembered, .pick, .last, .folder => return error.TestExpectedExactResumeId,
             }
         },
         else => return error.TestExpectedEqual,
@@ -7192,7 +7280,7 @@ test "runIfRequested rejects malformed resume aliases with canonical usage" {
         );
         try std.testing.expectEqual(usage_failure, result);
         try std.testing.expectEqualStrings(
-            "usage: fx session resume [last|<id>] | -r, --resume [last|<id>] | --continue | -c\n",
+            "usage: fx session resume [last|<id>|<folder>] | -r, --resume [last|<id>|<folder>] | --continue | -c\n",
             capture.stderr.written(),
         );
     }
@@ -7223,7 +7311,7 @@ test "runIfRequested invalid resume writes usage" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("--resume"), @constCast("a"), @constCast("b"), @constCast("c") }, testConfig(), capture.deps());
     try std.testing.expectEqual(usage_failure, result);
     try std.testing.expectEqualStrings(
-        "usage: fx session resume [last|<id>] | -r, --resume [last|<id>] | --continue | -c\n",
+        "usage: fx session resume [last|<id>|<folder>] | -r, --resume [last|<id>|<folder>] | --continue | -c\n",
         capture.stderr.written(),
     );
 }

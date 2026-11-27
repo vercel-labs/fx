@@ -61,6 +61,11 @@ const ISOLATED_KEYS = [
   "FX_MCP_CALL_TOKEN",
   // A terminal's program resume token must not reach a test's fx.
   "OSC7577_TOKEN",
+  // A Rex tab gives each shell these, and a test's fx must never reach the
+  // developer's Rex through them.
+  "REX_BIN_DIR",
+  "REX_BLOCK",
+  "REX_SERVER",
   // A test hold left there would stop every test's fx at it.
   "FX_TEST_REPORT_DELIVERY_HELD",
   "FX_TEST_REPORT_DELIVERY_RELEASE",

@@ -152,7 +152,7 @@ test.skipIf(!tmuxAvailable())(
       expect(start.argv!.split(",").map(decodeBase64)).toEqual([
         realpathSync(FX_BIN),
         "--resume",
-        sessionIds[0],
+        realpathSync(join(fixture.home, ".fx", "sessions", "v2", sessionIds[0]!)),
       ]);
       expect(decodeBase64(start.cwd!)).toBe(fixture.workspace);
 

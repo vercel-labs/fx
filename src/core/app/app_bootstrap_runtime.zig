@@ -609,6 +609,7 @@ pub fn Runtime(comptime App: type) type {
             app.shell.collapse_tool_calls = startup.collapse_tool_calls;
             app.shell.file_link_root = app.workspace_root;
             app.auto_upgrade_enabled = startup.auto_upgrade;
+            app.rex_resume_rule_enabled = startup.rex_resume_rule;
             app.upgrader.configure_channel(startup.update_channel);
             agent.effort = startup.effort;
             if (comptime @hasField(App, "instances")) {
@@ -867,6 +868,7 @@ const TestApp = struct {
     context_enabled: bool = true,
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
+    rex_resume_rule_enabled: bool = true,
     upgrader: auto_upgrade.AutoUpgrade = .{},
     main_agent: struct {
         effort: types.ReasoningEffort = .auto,

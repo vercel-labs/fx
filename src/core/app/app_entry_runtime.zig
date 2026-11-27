@@ -926,6 +926,7 @@ fn appendInitEvent(launch: *const cli_surface.InteractiveLaunch) void {
             .last => appendTestEvent("init:last"),
             .remembered => appendTestEvent("init:remembered"),
             .id => |id| appendTestEvent(std.mem.print(&test_init_event_buf, "init:{s}", .{id}) catch "init:<invalid>"),
+            .folder => appendTestEvent("init:folder"),
         }
     } else {
         appendTestEvent("init:none");

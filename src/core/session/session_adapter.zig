@@ -492,6 +492,16 @@ pub const CommandError = error{
     OutOfMemory,
 };
 
+/// The ID of the session a `--resume <folder>` value names in the profile at
+/// `home`. Null `home` has no sessions folder, so every folder is refused.
+/// The caller owns the ID.
+pub fn sessionIdFromProfileFolder(alloc: Allocator, home: ?[]const u8, folder: []const u8) error{ NotSessionFolder, OutOfMemory }![]u8 {
+    const profile = home orelse return error.NotSessionFolder;
+    const sessions_v2 = try profile_paths.rootPath(alloc, profile, &.{ profile_paths.sessions_dir_name, session_layout.sessions_v2_dir });
+    defer alloc.free(sessions_v2);
+    return session_layout.sessionIdFromFolder(alloc, sessions_v2, folder);
+}
+
 /// Maps an error from `Store.openFromEnv`, `listPage`, `readSession`,
 /// `recover` or `doctor` onto `CommandError`: a storage fault leaves the
 /// store unavailable, and anything else a record fails with is damage.

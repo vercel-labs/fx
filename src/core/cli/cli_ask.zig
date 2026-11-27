@@ -392,6 +392,7 @@ const AskOptions = struct {
 
     fn deinit(self: *AskOptions, alloc: Allocator) void {
         self.settings_overrides.deinit(alloc);
+        if (self.resume_target) |*target| freeAskResumeTarget(alloc, target);
         alloc.free(self.prompt);
         for (self.image_paths.items) |p| alloc.free(p);
         self.image_paths.deinit(alloc);
@@ -3969,6 +3970,7 @@ const AskUsageProblem = union(enum) {
     flag: cli_flags.Failure,
     invalid_value: struct { flag: []const u8, value: []const u8 },
     config: cli_config.OverrideProblem,
+    resume_folder: []const u8,
 };
 
 const AskFlag = enum {
@@ -4056,7 +4058,9 @@ fn parseAskOptions(alloc: Allocator, args: []const [:0]const u8, stdin: StdinSou
             .@"resume" => {
                 const target = std.mem.trim(u8, value, " \t\r\n");
                 if (target.len == 0) return invalidAskValue(problem, match, value);
-                opts.resume_target = if (std.mem.eql(u8, target, "last")) .last else .{ .id = target };
+                const next = try parseAskResumeTarget(alloc, problem, target);
+                if (opts.resume_target) |*previous| freeAskResumeTarget(alloc, previous);
+                opts.resume_target = next;
             },
             // The parser rejects removed spellings before they get here.
             .resume_id => unreachable,
@@ -4098,9 +4102,32 @@ fn writeAskUsageProblem(alloc: Allocator, deps: RunDeps, problem: AskUsageProble
             defer alloc.free(message);
             try out.writer.print("fx ask: {s}", .{message});
         },
+        .resume_folder => |folder| try out.writer.print("fx ask: {f} is not a session folder in this profile", .{text_utils.terminalSafe(folder)}),
     }
     try out.writer.writeByte('\n');
     try deps.write_stderr(deps.stderr_ctx, out.written());
+}
+
+/// The resume target `fx ask --resume` names. A folder becomes the ID of the
+/// session it holds, and any other value is an ID. The caller owns an ID.
+fn parseAskResumeTarget(alloc: Allocator, problem: *AskUsageProblem, target: []const u8) !ResumeTarget {
+    if (std.mem.eql(u8, target, "last")) return .last;
+    if (!std.mem.startsWith(u8, target, "/")) return .{ .id = try alloc.dupe(u8, target) };
+    const id = session_adapter.sessionIdFromProfileFolder(alloc, io_mod.homeDir(), target) catch |err| switch (err) {
+        error.NotSessionFolder => {
+            problem.* = .{ .resume_folder = target };
+            return error.InvalidAskArgs;
+        },
+        error.OutOfMemory => return err,
+    };
+    return .{ .id = id };
+}
+
+fn freeAskResumeTarget(alloc: Allocator, target: *ResumeTarget) void {
+    switch (target.*) {
+        .last => {},
+        .id => |id| alloc.free(@constCast(id)),
+    }
 }
 
 fn invalidAskValue(problem: *AskUsageProblem, match: cli_flags.Match, value: []const u8) error{InvalidAskArgs} {
@@ -7904,6 +7931,15 @@ test "parse options rejects model-unsafe prompt text from arguments and stdin" {
         error.InvalidPromptText,
         parseOptionsWithStdin(std.testing.allocator, &.{}, .{ .bytes = "bad\xffprompt" }),
     );
+}
+
+test "fx ask --resume refuses a folder that is not a session folder in the profile" {
+    var problem: AskUsageProblem = .none;
+    try std.testing.expectError(
+        error.InvalidAskArgs,
+        parseAskOptions(std.testing.allocator, &.{ "--resume", "/Users/example/outside/session-789", "continue" }, .tty, &problem),
+    );
+    try std.testing.expectEqualStrings("/Users/example/outside/session-789", problem.resume_folder);
 }
 
 test "the removed --resume-id spelling fails with a hint" {

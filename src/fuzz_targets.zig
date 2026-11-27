@@ -48,6 +48,8 @@ test {
     _ = @import("core/session/session_adapter.zig");
     _ = @import("core/profiles/profiles.zig");
     _ = @import("core/profiles/started_with.zig");
+    _ = @import("core/rex_rule/plan.zig");
+    _ = @import("core/rex_rule/records.zig");
     _ = @import("core/session/session_codec.zig");
     _ = @import("core/session/session_event.zig");
     _ = @import("core/shell_command/safe_git.zig");

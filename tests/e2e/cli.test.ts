@@ -378,13 +378,13 @@ describe("cli: help", () => {
       expect(stdout).toContain("Set name=bytes|off; repeatable");
       expect(stdout).toContain("--add-dir <path>");
       expect(stdout).toContain("-c, --continue");
-      expect(stdout).toContain("-r, --resume [last|<id>]");
+      expect(stdout).toContain("-r, --resume [last|<id>|<folder>]");
       expect(stdout).toContain("Pick a saved session, or resume");
       expect(stdout).not.toContain("-c, -r, --continue");
       expect(stdout).toContain('fx [flags] "<prompt>"');
       expect(stdout).not.toContain("--resume-last");
       expect(stdout).not.toContain("--resume-<id>");
-      expect(stdout).toContain("session resume [last|id]");
+      expect(stdout).toContain("session resume [last|id|folder]");
       expect(stdout).toContain("-v, --version");
       expect(stdout).toContain("Print the fx version and exit");
       expect(stdout).not.toContain("Must appear before the command");
@@ -413,35 +413,35 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--] <prompt>
+  fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>|<folder>>] [--] <prompt>
 
 Options:
-  --permission-mode <mode>    Set the permission mode for this request: ask, auto, or full-access
-  --ask                       Ask before each action that needs permission
-  --auto                      Automatically review unresolved permission requests
-  --full-access               Disable fx permission checks
-  --yolo                      Alias for --full-access
-  --provider <name>           Override the model provider for this request (gateway, codex, grok, or a configured name)
-  --model <id>                Override the model for this request
-  --effort <level>            Override the reasoning effort for this request
-  --fast                      Enable Fast mode for this request when the model supports it
-  --no-fast                   Disable Fast mode for this request
-  --ultrafast                 Request Ultrafast mode for this request when the model supports it
-  --no-ultrafast              Disable Ultrafast mode for this request
-  --provider-order <a,b,...>  Prefer these gateway providers in order for this request
-  --provider-strict           Restrict this request to only the providers in --provider-order
-  --no-provider-strict        Clear the provider restriction for this request
-  --image PATH                Attach an image file; repeat for multiple images
-  --system TEXT               Replace the built-in system prompt for this request
-  --json                      Emit machine-readable JSON instead of text
-  --quiet                     Suppress assistant output
-  --prompt-permissions        Prompt for Y/N permission approval when stdin is a TTY
-  --timeout <seconds>         Time limit for each shell command the agent runs
-  --config <key=value>        Override a setting for this request, with the keys fx config set takes; repeatable
-  --no-save                   Do not save the session; incompatible with --resume
-  --no-color                  Render TTY output without colors or hyperlinks; NO_COLOR or TERM=dumb also turns color off
-  --resume <last|<id>>        Continue the last session or a session by id
-  --                          Treat every following argument as prompt text
+  --permission-mode <mode>       Set the permission mode for this request: ask, auto, or full-access
+  --ask                          Ask before each action that needs permission
+  --auto                         Automatically review unresolved permission requests
+  --full-access                  Disable fx permission checks
+  --yolo                         Alias for --full-access
+  --provider <name>              Override the model provider for this request (gateway, codex, grok, or a configured name)
+  --model <id>                   Override the model for this request
+  --effort <level>               Override the reasoning effort for this request
+  --fast                         Enable Fast mode for this request when the model supports it
+  --no-fast                      Disable Fast mode for this request
+  --ultrafast                    Request Ultrafast mode for this request when the model supports it
+  --no-ultrafast                 Disable Ultrafast mode for this request
+  --provider-order <a,b,...>     Prefer these gateway providers in order for this request
+  --provider-strict              Restrict this request to only the providers in --provider-order
+  --no-provider-strict           Clear the provider restriction for this request
+  --image PATH                   Attach an image file; repeat for multiple images
+  --system TEXT                  Replace the built-in system prompt for this request
+  --json                         Emit machine-readable JSON instead of text
+  --quiet                        Suppress assistant output
+  --prompt-permissions           Prompt for Y/N permission approval when stdin is a TTY
+  --timeout <seconds>            Time limit for each shell command the agent runs
+  --config <key=value>           Override a setting for this request, with the keys fx config set takes; repeatable
+  --no-save                      Do not save the session; incompatible with --resume
+  --no-color                     Render TTY output without colors or hyperlinks; NO_COLOR or TERM=dumb also turns color off
+  --resume <last|<id>|<folder>>  Continue the last session, a session by id, or a session's folder
+  --                             Treat every following argument as prompt text
 
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
@@ -474,7 +474,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain("Inspect, resume, fork, or recover saved sessions");
         expect(r.stdout).toContain("session <last|id|id/agent>|--id <id> [--tail <1-1000>]");
-        expect(r.stdout).toContain("session resume [last|<id>]");
+        expect(r.stdout).toContain("session resume [last|<id>|<folder>]");
         expect(r.stdout).toContain("session fork <last|id>|--id <id>");
         expect(r.stdout).toContain("session recover <id>|--id <id>");
         // Sessions convert on open; there is nothing to migrate by hand.
