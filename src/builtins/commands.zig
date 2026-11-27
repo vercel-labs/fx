@@ -266,7 +266,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             "Operational progress and diagnostics are written to stderr. JSON `output` keeps accumulated assistant Markdown; `final_output` contains only the completed final response, or an empty string when absent.",
             "JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Subagent usage and dollar spend are excluded.",
             "JSON subagents appears only when a subagent did work in this request. It lists each one in the order it first ran, with its name, id, and usage in the same shape, counted for this request alone. fx session <session_id>/<name> reads one and prints the same id.",
-            "JSON `steps` counts the tool calls the agent started. JSON `model_steps` counts its model requests, the unit that the `max_agent_steps` limit counts.",
+            "JSON `steps` counts the tool calls the agent started. JSON `model_steps` counts the agent's loop steps, the unit that the `max_agent_steps` limit counts; a resend within a step does not add one.",
             "--system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.",
             "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
         },

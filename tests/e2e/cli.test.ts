@@ -31,6 +31,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySse,
+  fakeShellRun,
   startDynamicFakeGateway,
   startFakeGateway,
   tokenPassCatalog,
@@ -448,7 +449,7 @@ TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw
 Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
 JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Subagent usage and dollar spend are excluded.
 JSON subagents appears only when a subagent did work in this request. It lists each one in the order it first ran, with its name, id, and usage in the same shape, counted for this request alone. fx session <session_id>/<name> reads one and prints the same id.
-JSON \`steps\` counts the tool calls the agent started. JSON \`model_steps\` counts its model requests, the unit that the \`max_agent_steps\` limit counts.
+JSON \`steps\` counts the tool calls the agent started. JSON \`model_steps\` counts the agent's loop steps, the unit that the \`max_agent_steps\` limit counts; a resend within a step does not add one.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
@@ -6570,12 +6571,27 @@ describe("cli: ask model_steps", () => {
     ]);
   }
 
-  async function askJson(reply: (completion: number) => Response, extraEnv: Record<string, string> = {}) {
+  function unavailableReply() {
+    return new Response(JSON.stringify({ error: { message: "provider temporarily unavailable" } }), {
+      status: 503,
+      headers: { "content-type": "application/json", "retry-after": "0" },
+    });
+  }
+
+  async function askJson(
+    reply: (completion: number) => Response,
+    extraEnv: Record<string, string> = {},
+    settings?: Record<string, unknown>,
+  ) {
     const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-model-steps-"));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
     mkdirSync(home);
     mkdirSync(workspace);
+    if (settings) {
+      mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify(settings));
+    }
     for (const file of READ_FILES) writeFileSync(join(workspace, file), `${file} body\n`);
     let completions = 0;
     const gateway = startDynamicFakeGateway(() => reply(++completions), {
@@ -6610,7 +6626,7 @@ describe("cli: ask model_steps", () => {
   }
 
   test(
-    "steps counts tool starts and model_steps counts model requests",
+    "steps counts tool starts and model_steps counts the agent's loop steps",
     async () => {
       const run = await askJson((completion) =>
         completion === 1 ? parallelReads("read", READ_FILES) : fakeGatewayFinalText("DONE"),
@@ -6643,6 +6659,35 @@ describe("cli: ask model_steps", () => {
       const run = await askJson(() => fakeGatewayFinalText("hello"));
       expect(run.code).toBe(0);
       expect(run.json.steps).toBe(0);
+      expect(run.json.model_steps).toBe(1);
+    },
+    60_000,
+  );
+
+  test(
+    "model_steps keeps the step that stopped for a permission a headless ask cannot grant",
+    async () => {
+      const run = await askJson(
+        () => fakeShellRun("perm_1", "touch must-not-run.txt"),
+        { FX_PERMISSION_MODE: "ask" },
+        { permission_mode: "ask", sandbox: "none" },
+      );
+      expect(run.code).toBe(1);
+      expect(run.json.error).toBe("NonInteractivePermissionRequired");
+      expect(run.requests).toBe(1);
+      expect(run.json.model_steps).toBe(1);
+    },
+    60_000,
+  );
+
+  test(
+    "model_steps counts a loop step once when its model request is resent after a 503",
+    async () => {
+      const run = await askJson((completion) =>
+        completion === 1 ? unavailableReply() : fakeGatewayFinalText("DONE"),
+      );
+      expect(run.code).toBe(0);
+      expect(run.requests).toBe(2);
       expect(run.json.model_steps).toBe(1);
     },
     60_000,

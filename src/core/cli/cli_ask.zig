@@ -2048,6 +2048,7 @@ fn runAskTurn(
                 .assistant_output = assistant_output,
                 .interrupted = ctx.processInterruptRequested(),
                 .tool_calls = tool_calls,
+                .model_steps = ctx.model_step_count,
                 .error_code = "NonInteractivePermissionRequired",
                 .usage = ctx.usage_total,
                 .subagents = subagents,
