@@ -2963,6 +2963,23 @@ test "permission target resolution failures encode control bytes in model paths"
     }
 }
 
+test "permission target resolution failures encode ampersand in model paths" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const file_call: ToolCall = .{
+        .id = "read_amp",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"/nonexistent_dir/R&D/x\"}",
+    };
+    const not_found = (try permissionTargetResolutionFailureMessage(arena, file_call, error.FileNotFound)).?;
+    try std.testing.expectEqualStrings("Path not found: /nonexistent_dir/R&amp;D/x", not_found);
+
+    const sym_loop = (try permissionTargetResolutionFailureMessage(arena, file_call, error.SymLinkLoop)).?;
+    try std.testing.expectEqualStrings("Cannot resolve path \"/nonexistent_dir/R&amp;D/x\": SymLinkLoop", sym_loop);
+}
+
 test "interactive terminal exec approval permits command amendments" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
