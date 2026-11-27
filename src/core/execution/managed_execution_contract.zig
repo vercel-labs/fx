@@ -7,6 +7,11 @@ pub const default_yield_time_ms: u32 = 30_000;
 pub const max_yield_time_ms: u32 = 30_000;
 pub const default_wait_ceiling_ms: u32 = 5_000;
 pub const max_wait_ceiling_ms: u32 = 300_000;
+/// After a bridge call has held a command's first wait, the wait keeps going
+/// this long past the last poll that saw the hold, before it may yield. A
+/// script's next `fx tool` call needs a moment to start, so a yield must not
+/// land between two of its calls.
+pub const bridge_yield_grace_ms: i64 = 1_000;
 
 pub const Backend = enum {
     captured,
