@@ -943,6 +943,72 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
   }
 }, TIMEOUT * 3);
 
+test("a v2 session saved before model identity existed emits one <fx-context-update> with the model on first resume and none on the next", async () => {
+  const fixture = createFixture("fx-v2-pre-model-resume-");
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("PRE_MODEL_SEED"),
+    fakeGatewayFinalText("PRE_MODEL_RESUME_1"),
+    fakeGatewayFinalText("PRE_MODEL_RESUME_2"),
+  ]);
+  try {
+    const seeded = await ask(fixture, gateway, ["Seed pre-model session."]);
+    expect(seeded.code, seeded.stderr).toBe(0);
+    const id = JSON.parse(seeded.stdout).session_id;
+
+    // Strip any `model: ...` line from the saved `item:runtime_context` so the
+    // log matches a v2 session saved before fx named the model in turn context.
+    const logPath = join(storeRoot(fixture.home), id, "log.jsonl");
+    let stripped = false;
+    const rewritten = readFileSync(logPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        if (line.includes('"type":"runtime_context"') && line.includes(`\\nmodel: ${FAKE_GATEWAY_MODEL}\\n`)) {
+          const crcIdx = line.lastIndexOf(',"crc":"');
+          expect(crcIdx).toBeGreaterThan(0);
+          const prefix = line.slice(0, crcIdx).replace(`\\nmodel: ${FAKE_GATEWAY_MODEL}\\n`, "\\n");
+          const crc = crc32c(Buffer.from(prefix)).toString(16).padStart(8, "0");
+          stripped = true;
+          return `${prefix},"crc":"${crc}"}`;
+        }
+        return line;
+      })
+      .join("\n") + "\n";
+    expect(stripped).toBe(true);
+    writeFileSync(logPath, rewritten, { mode: 0o600 });
+    expectWholeLog(fixture, id);
+
+    const resumed1 = await ask(fixture, gateway, ["--resume", id, "First resumed question."]);
+    expect(resumed1.code, resumed1.stderr).toBe(0);
+    const resumed2 = await ask(fixture, gateway, ["--resume", id, "Second resumed question."]);
+    expect(resumed2.code, resumed2.stderr).toBe(0);
+
+    expect(gateway.requests).toHaveLength(3);
+    const contentText = (content: unknown): string => {
+      if (typeof content === "string") return content;
+      if (Array.isArray(content)) return content.map(contentText).join("");
+      if (content && typeof content === "object") {
+        const value = content as Record<string, unknown>;
+        return [contentText(value.text), contentText(value.value), contentText(value.content)].join("");
+      }
+      return "";
+    };
+    const userMsg = (body: string) => {
+      const prompt = JSON.parse(body).prompt as Array<{ role: string; content: unknown }>;
+      return contentText(prompt.filter((m) => m.role === "user").at(-1)?.content);
+    };
+    const req1User = userMsg(gateway.requests[1]!.body);
+    expect(req1User).toContain("<fx-context-update>");
+    expect(req1User).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${FAKE_GATEWAY_MODEL}\\n`));
+
+    const req2User = userMsg(gateway.requests[2]!.body);
+    expect(req2User).not.toContain("<fx-context-update>");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
 test("an ask saves only to the store, and --no-save writes nothing", async () => {
   const fixture = createFixture("fx-v2-flag-");
   const gateway = startFakeGateway([
@@ -6456,7 +6522,7 @@ test.skipIf(!tmuxAvailable())("an app whose disk fills keeps running, and the se
     const whole = readFileSync(log);
     let app2 = await launch(id, Math.floor(whole.length / SH_LIMIT_BLOCK));
     await app2.sendText("The disk is already full.");
-    await app2.waitForText("request failed: a file-size limit was reached", TIMEOUT);
+    await app2.waitForText("Request failed: a file-size limit was reached", TIMEOUT);
     await app2.waitForComposer(TIMEOUT);
     await quit();
     expect(gateway.requests.length).toBe(asked);

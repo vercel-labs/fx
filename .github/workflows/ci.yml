@@ -99,6 +99,9 @@ jobs:
       - name: Model-check CLI hang-up
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/cli_hangup/check.sh design-a design-b
 
+      - name: Model-check the terminal lifecycle
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/terminal/check.sh TerminalLifecycle
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -118,6 +121,9 @@ jobs:
 
       - name: Test CI and release scripts
         run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_dev_channel_forward scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape scripts.tests.test_check_provider_versions
+
+      - name: Test benchmark scripts
+        run: python3 -m unittest benchmarks.shell_command_overhead_test
 
       - name: Test the zig skill's scripts and examples
         run: python3 -m unittest discover -s .fx/skills/zig/scripts

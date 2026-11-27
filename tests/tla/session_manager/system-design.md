@@ -493,8 +493,10 @@ reused as ideas; no v1 code is shared.
 ## Concurrency And Ordering
 
 - **Between processes (native):** one exclusive `flock` on `{id}/lock`, held
-  from open to close. A contender retries for up to 2 s, then gets Busy; a
+  from open to close. A contender retries for up to 2 s on the monotonic
+  clock, however long each sleep between tries lasts, then gets Busy; a
   resume may set its own wait, and fx's session picker sets none (D38). The
+  wait for `index.lock` is measured the same way (`lock_wait.zig`). The
   kernel releases the lock on process death (`WriterLock.tla`).
 - **Between writers (wasm):** single-writer is optimistic. Every commit
   carries the expected revision, and a conflict makes that Session fail with
