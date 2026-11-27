@@ -368,12 +368,23 @@ pub const CapabilityResolver = struct {
                     .failure = .{ .category = .transport },
                 } });
             }
-            io_mod.sleep(load_poll_ns);
+            waitLoadPoll(load);
         }
         self.pending_load = null;
         const requested = model_catalog.AccessMetadata.init(load.input.access);
         const started_ms = load.started_ms;
         try self.adopt(alloc, provider, requested, started_ms, load.finish(alloc));
+    }
+
+    /// Waits up to one load poll for `load` to finish. While the task stays
+    /// cancelled, every wait can return `Canceled` at once, so that case sleeps
+    /// the poll as before instead of spinning.
+    fn waitLoadPoll(load: *CatalogLoad) void {
+        const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromNanoseconds(@intCast(loadPollNs())), .clock = .awake } };
+        load.done.waitTimeout(io_mod.getIo(), timeout) catch |err| switch (err) {
+            error.Timeout => {},
+            error.Canceled => io_mod.sleep(loadPollNs()),
+        };
     }
 
     fn freeEndedAbandonedLoads(self: *CapabilityResolver, alloc: Allocator) void {
@@ -486,8 +497,17 @@ fn publishTokenPassModels(provider: model_catalog.Provider, entries: []const mod
 /// go on.
 pub const catalog_connect_wait_ms: i64 = 2_000;
 
-/// How often `CapabilityResolver.loadWithin` checks on a load.
+/// How often `CapabilityResolver.loadWithin` checks its cancel flag and connect
+/// wait while a load runs.
 const load_poll_ns = 2 * std.time.ns_per_ms;
+var test_load_poll_ns: ?u64 = null;
+
+fn loadPollNs() u64 {
+    if (builtin.is_test) {
+        if (test_load_poll_ns) |ns| return ns;
+    }
+    return load_poll_ns;
+}
 
 /// A catalog load on a thread of its own. It owns copies of the access and
 /// endpoint, because the caller's credential can be replaced while the load
@@ -500,6 +520,8 @@ const CatalogLoad = struct {
     /// Set by the provider once the load's request has a connection.
     connected: std.atomic.Value(bool) = .init(false),
     finished: std.atomic.Value(bool) = .init(false),
+    /// Set after `finished`, to wake `CapabilityResolver.loadWithin`.
+    done: std.Io.Event = .unset,
     /// Set before `finished`; owns any loaded catalog.
     result: model_catalog.FetchResult = undefined,
     thread: std.Thread = undefined,
@@ -531,6 +553,8 @@ const CatalogLoad = struct {
     fn run(self: *CatalogLoad, alloc: Allocator) void {
         self.result = model_catalog.fetchWithPublicFallback(self.provider, alloc, self.input);
         self.finished.store(true, .release);
+        // Safe: the waiter frees the load only after joining this thread.
+        self.done.set(io_mod.getIo());
     }
 
     /// Joins a finished load, frees it, and returns its result.
@@ -1143,6 +1167,25 @@ test "a cancelled wait for a first catalog load leaves the load for the next loo
     try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
     try std.testing.expectEqual(@as(usize, 1), gated.calls.load(.seq_cst));
     try std.testing.expect(!gated.saw_cancel.load(.seq_cst));
+}
+
+test "loadWithin returns when the catalog load finishes, not at the next poll" {
+    const alloc = std.testing.allocator;
+    const zio = io_mod.getIo();
+    test_load_poll_ns = 60 * std.time.ns_per_s;
+    defer test_load_poll_ns = null;
+    var gated: GatedCatalog = .{ .connects = true };
+    var resolver: CapabilityResolver = .{};
+    defer resolver.deinit(alloc);
+
+    const releaser = try gated.releaseAfter(50);
+    defer releaser.join();
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    const capabilities = try resolver.resolveWithin(alloc, gated.provider(), .{ .endpoint = "/v1/models" }, "provider/model", .{}, 60_000);
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+    try std.testing.expect(elapsed_ms < 5_000);
+    try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
+    try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
 }
 
 /// Loads `gated`'s catalog once through a provider with a refresh interval,
