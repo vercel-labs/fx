@@ -6,8 +6,6 @@ const tool_result_cut_marker = @import("../shared/tool_result_cut_marker.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const server_json_depth = @import("server_json_depth.zig");
-const mcp_json = @import("mcp_json.zig");
-const mrtr = @import("mrtr.zig");
 const tools_feature = @import("features/tools.zig");
 
 const tool_content = @import("../tooling/tool_content.zig");
@@ -87,34 +85,6 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
                 options.max_tool_result_bytes,
             ),
             .status = .protocol_failure,
-        },
-        .input_required => |required| blk: {
-            const input_requests_json = try mrtr.renderRequests(alloc, required.requests);
-            errdefer mem_utils.free(alloc, input_requests_json);
-            const request_state_json = if (required.request_state_json) |state|
-                try alloc.dupe(u8, state)
-            else
-                null;
-            errdefer if (request_state_json) |state| mem_utils.free(alloc, state);
-            const raw = try render_input_required(
-                alloc,
-                input_requests_json,
-                request_state_json,
-            );
-            defer alloc.free(raw);
-            break :blk .{
-                .model_output = try tool_result_limits.prepareModelOutput(
-                    alloc,
-                    options.tool_name,
-                    raw,
-                    options.max_tool_result_bytes,
-                ),
-                .status = .input_required,
-                .input_required = .{
-                    .input_requests_json = input_requests_json,
-                    .request_state_json = request_state_json,
-                },
-            };
         },
     };
 }
@@ -370,35 +340,6 @@ fn typeWithArticle(json_type: []const u8) []const u8 {
     };
     for (names) |name| if (std.mem.eql(u8, name[0], json_type)) return name[1];
     return json_type;
-}
-
-fn render_input_required(
-    alloc: Allocator,
-    input_requests_json: []const u8,
-    request_state_json: ?[]const u8,
-) error{OutOfMemory}![]u8 {
-    return render_input_required_fallible(
-        alloc,
-        input_requests_json,
-        request_state_json,
-    ) catch error.OutOfMemory;
-}
-
-fn render_input_required_fallible(
-    alloc: Allocator,
-    input_requests_json: []const u8,
-    request_state_json: ?[]const u8,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"resultType\":\"input_required\",\"inputRequests\":");
-    try out.writer.writeAll(input_requests_json);
-    if (request_state_json) |state| {
-        try out.writer.writeAll(",\"requestState\":");
-        try mcp_json.write_compact(&out.writer, state);
-    }
-    try out.writer.writeByte('}');
-    return try out.toOwnedSlice();
 }
 
 fn serialize_capped(
@@ -680,26 +621,6 @@ test "modern tool results validate result type and retain typed error data" {
     });
     defer missing.deinit(alloc);
     try std.testing.expectEqual(tool_mcp_runtime.CallStatus.success, missing.status);
-}
-
-fn check_input_required_allocation_failures(alloc: Allocator) !void {
-    var result = try extract(alloc, .{
-        .server_name = "server",
-        .tool_name = "mcp_server_confirm",
-        .response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"input_required\",\"inputRequests\":{\"confirm\":{\"method\":\"elicitation/create\",\"params\":{\"message\":\"Continue?\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"confirmed\":{\"type\":\"boolean\"}}}}}},\"requestState\":{\"opaque\":true}}}",
-        .max_tool_result_bytes = 64 * 1024,
-        .protocol = .modern,
-    });
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(tool_mcp_runtime.CallStatus.input_required, result.status);
-}
-
-test "input-required result releases every allocation failure path" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        check_input_required_allocation_failures,
-        .{},
-    );
 }
 
 test "a -32042 answer reaches the model as a protocol error, as the host hands it over" {

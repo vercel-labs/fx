@@ -883,7 +883,7 @@ const Asking = struct {
         };
         self.origin = origin;
         const signal = question.url_wait orelse {
-            const answer = try self.respond(alloc, origin, .{ .input_requests_json = question.input_requests_json }, question.server);
+            const answer = try self.respond(alloc, origin, .{ .input_requests_json = question.input_requests_json, .requests = question.requests }, question.server);
             return @constCast(answer);
         };
         // A surface with no Retry control (ACP) waits for the server alone.

@@ -24,8 +24,10 @@ const kept_sign_outs = @import("kept_sign_outs.zig");
 const login_words = @import("login_words.zig");
 const loopback = @import("login.zig");
 const elicitation = @import("../mcp/elicitation.zig");
+const core_mrtr = @import("../mcp/mrtr.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const json_depth = @import("../shared/json_depth.zig");
 const shared_servers = @import("shared_servers.zig");
 const dropped_tools = @import("dropped_tools.zig");
@@ -186,8 +188,11 @@ pub const CallResult = union(enum) {
 pub const Question = struct {
     server: []const u8,
     /// MCP's `inputRequests` object: each key with its `elicitation/create`
-    /// request.
+    /// request. Empty for a 2026 round, which gives `requests`.
     input_requests_json: []const u8,
+    /// A 2026 round's requests as the engine read them, in order: slices of the
+    /// server's own bytes, valid while the question is asked.
+    requests: []const core_mrtr.RawRequest = &.{},
     /// The version the server speaks, which decides how a form's schema reads.
     version: ?[]const u8,
     /// Set while the user waits for a 2025 server to complete the URLs they
@@ -391,8 +396,9 @@ const Pending = struct {
     json: []u8,
     version: ?[]u8,
     reply: union(enum) {
-        /// 2026: the call's input requests, answered in this key order.
-        input: struct { call: engine.Handle, keys: [][]u8 },
+        /// 2026: the call's input requests, answered in this order. The slices
+        /// point into `bytes`, a copy of what the engine read.
+        input: struct { call: engine.Handle, requests: []core_mrtr.RawRequest, bytes: []u8 },
         /// 2025: the server's elicitation, by slot and number, so an answer
         /// to one it withdrew never reaches the next in that slot.
         elicit: mcp.core.elicitation.Id,
@@ -407,8 +413,8 @@ const Pending = struct {
         if (p.version) |v| gpa.free(v);
         switch (p.reply) {
             .input => |input| {
-                for (input.keys) |k| gpa.free(k);
-                gpa.free(input.keys);
+                gpa.free(input.requests);
+                gpa.free(input.bytes);
             },
             .elicit, .url_consent, .url_wait => {},
         }
@@ -961,6 +967,10 @@ pub const Runtime = struct {
         const answer = asker.ask(asker.context, scratch.allocator(), .{
             .server = pending.name,
             .input_requests_json = pending.json,
+            .requests = switch (pending.reply) {
+                .input => |input| input.requests,
+                else => &.{},
+            },
             .version = pending.version,
             .url_wait = if (pending.reply == .url_wait) &req.url_signal else null,
         }) catch |err| answer: {
@@ -1188,7 +1198,7 @@ pub const Runtime = struct {
                 defer scratch.deinit();
                 switch (a.pending.reply) {
                     .input => |input| {
-                        const values = if (a.json) |json| inputValues(scratch.allocator(), json, input.keys) else null;
+                        const values = if (a.json) |json| inputValuesOf(scratch.allocator(), json, input.requests) else null;
                         if (values) |v| r.respondCall(input.call, v) catch |err| {
                             debug_trace.logf("mcp", "MCP answer not sent server={s} err={s}", .{ name, @errorName(err) });
                         } else {
@@ -2533,26 +2543,12 @@ pub const Runtime = struct {
         return null;
     }
 
+    /// Keeps the round's requests for the question UI and the answer, as copies of the slices the engine read.
     fn inputQuestion(r: *Runtime, i: usize, call_handle: engine.Handle, requests: []const mcp.mrtr.Request) Allocator.Error!Pending {
-        const keys = try r.gpa.alloc([]u8, requests.len);
-        var made: usize = 0;
-        errdefer {
-            for (keys[0..made]) |k| r.gpa.free(k);
-            r.gpa.free(keys);
-        }
-        var out: std.Io.Writer.Allocating = .init(r.gpa);
-        defer out.deinit();
-        // An allocating writer fails only when allocation does.
-        out.writer.writeByte('{') catch return error.OutOfMemory;
-        for (requests, keys, 0..) |request, *key, n| {
-            key.* = try r.gpa.dupe(u8, request.key);
-            made += 1;
-            if (n > 0) out.writer.writeByte(',') catch return error.OutOfMemory;
-            out.writer.print("{s}:{s}", .{ request.key, request.raw }) catch return error.OutOfMemory;
-        }
-        out.writer.writeByte('}') catch return error.OutOfMemory;
-        const json = try out.toOwnedSlice();
-        return .{ .name = r.resolved.servers[i].name, .server = r.ids[i], .json = json, .version = r.versionCopy(i), .reply = .{ .input = .{ .call = call_handle, .keys = keys } } };
+        const kept = try keepRequests(r.gpa, requests);
+        errdefer kept.free(r.gpa);
+        const json = try r.gpa.alloc(u8, 0);
+        return .{ .name = r.resolved.servers[i].name, .server = r.ids[i], .json = json, .version = r.versionCopy(i), .reply = .{ .input = .{ .call = call_handle, .requests = kept.requests, .bytes = kept.bytes } } };
     }
 
     fn versionCopy(r: *Runtime, i: usize) ?[]u8 {
@@ -3167,18 +3163,76 @@ fn describeFailure(why: []const u8) []const u8 {
     return why;
 }
 
-/// The answers to a call's input requests, in the order of `keys` (JSON
-/// string tokens); null when one is missing or the answers aren't an object.
+/// The answers to a call's input requests, in the order of `requests`.
+fn inputValuesOf(a: Allocator, json: []const u8, requests: []const core_mrtr.RawRequest) ?[]const []const u8 {
+    const keys = a.alloc([]const u8, requests.len) catch return null;
+    for (requests, keys) |request, *key| key.* = request.key;
+    return inputValues(a, json, keys);
+}
+
+/// The answers to a call's input requests, in the order of `keys` (JSON string tokens as the server wrote them), as
+/// the slices of `json` that hold them: each is given back as it was written, and the engine writes it under its own
+/// key. A key matches whichever way its name is spelled. Null when one is missing or the answers aren't an object.
 fn inputValues(a: Allocator, json: []const u8, keys: []const []const u8) ?[]const []const u8 {
-    const answers = std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }) catch return null;
-    if (answers != .object) return null;
     const values = a.alloc([]const u8, keys.len) catch return null;
-    for (keys, values) |token, *value| {
-        const key = json_decode.parseFromSliceLeaky([]const u8, a, token, .{}) catch return null;
-        const answer = answers.object.get(key) orelse return null;
-        value.* = std.json.Stringify.valueAlloc(a, answer, .{}) catch return null;
+    const found = a.alloc(bool, keys.len) catch return null;
+    @memset(found, false);
+    var fields: mcp.wire.Fields = undefined;
+    fields.init(json) catch return null;
+    while (fields.next() catch return null) |field| {
+        for (keys, values, found) |token, *value, *seen| {
+            if (seen.* or !mcp.wire.sameString(token, field.key)) continue;
+            value.* = field.value;
+            seen.* = true;
+            break;
+        }
     }
+    for (found) |seen| if (!seen) return null;
     return values;
+}
+
+/// A round's requests copied out of the call's memory, which the engine frees with the call: the engine's bytes, kept
+/// as they are. The slices of `requests` point into `bytes`.
+const KeptRequests = struct {
+    requests: []core_mrtr.RawRequest,
+    bytes: []u8,
+
+    fn free(kept: KeptRequests, gpa: Allocator) void {
+        gpa.free(kept.requests);
+        gpa.free(kept.bytes);
+    }
+};
+
+fn keepRequests(gpa: Allocator, requests: []const mcp.mrtr.Request) Allocator.Error!KeptRequests {
+    var total: usize = 0;
+    for (requests) |request| {
+        const params: []const u8 = request.params orelse "";
+        total += request.key.len + request.raw.len + params.len;
+    }
+    const bytes = try gpa.alloc(u8, total);
+    errdefer gpa.free(bytes);
+    const kept = try gpa.alloc(core_mrtr.RawRequest, requests.len);
+    var at: usize = 0;
+    for (requests, kept) |request, *out| {
+        out.* = .{
+            .key = copyInto(bytes, &at, request.key),
+            .kind = switch (request.kind) {
+                .elicitation => .elicitation,
+                .sampling => .sampling,
+                .roots => .roots,
+            },
+            .raw = copyInto(bytes, &at, request.raw),
+            .params = if (request.params) |params| copyInto(bytes, &at, params) else null,
+        };
+    }
+    return .{ .requests = kept, .bytes = bytes };
+}
+
+fn copyInto(bytes: []u8, at: *usize, from: []const u8) []const u8 {
+    const out = bytes[at.*..][0..from.len];
+    @memcpy(out, from);
+    at.* += from.len;
+    return out;
 }
 
 /// A held call that ended with its -32042 answer because fx failed at `step`.
@@ -4394,6 +4448,127 @@ test "answers go back under the server's keys, and an answer that can't be read 
     try testing.expectEqualStrings("{}", declaredCapabilities(.{}));
     try testing.expectEqualStrings("{\"elicitation\":{\"form\":{}}}", declaredCapabilities(.{ .form = true }));
     try testing.expectEqualStrings("{\"elicitation\":{\"form\":{},\"url\":{}}}", declaredCapabilities(.{ .form = true, .url = true }));
+}
+
+test "a round's answers are found by each key however its name is spelled, and given back as written" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The round's keys as the server wrote them: an escape, a non-ASCII character with an astral pair, a quote, a
+    // backslash and a slash.
+    const keys = [_][]const u8{ "\"\\u0061b\"", "\"caf\\u00e9 \\ud83d\\ude00 é\"", "\"q\\\"u\\\\o\\/te\"" };
+    // The answer spells each name another way, in another order. Its values keep their own bytes, spaces included.
+    const json =
+        \\{ "q\"u\\o/te" : {"action":"cancel"} , "café 😀 é":{ "action":"accept","content":{"n": 1.50}},"ab":{"action":"decline"}}
+    ;
+    const values = inputValues(a, json, &keys).?;
+    try testing.expectEqualStrings("{\"action\":\"decline\"}", values[0]);
+    try testing.expectEqualStrings("{ \"action\":\"accept\",\"content\":{\"n\": 1.50}}", values[1]);
+    try testing.expectEqualStrings("{\"action\":\"cancel\"}", values[2]);
+
+    // A name that only starts like a key, a key left out, a repeat standing for another key, and text after the
+    // answers are each an answer that can't be read.
+    try testing.expect(inputValues(a, "{\"abc\":{},\"x\":{}}", &.{ "\"ab\"", "\"x\"" }) == null);
+    try testing.expect(inputValues(a, "{\"ab\":{}}", &.{ "\"ab\"", "\"x\"" }) == null);
+    try testing.expect(inputValues(a, "{\"ab\":{},\"a\\u0062\":{}}", &.{ "\"ab\"", "\"x\"" }) == null);
+    try testing.expect(inputValues(a, "{\"ab\":{}} {}", &.{"\"ab\""}) == null);
+    try testing.expect(inputValues(a, "{\"ab\":", &.{"\"ab\""}) == null);
+}
+
+/// What `inputValues` did before it read the answers' slices: every key decoded through std.json and the answers
+/// parsed into a tree and written out again. It is the oracle of the test below.
+fn inputValuesByDecoding(a: Allocator, json: []const u8, keys: []const []const u8) ?[]const []const u8 {
+    const answers = std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }) catch return null;
+    if (answers != .object) return null;
+    const values = a.alloc([]const u8, keys.len) catch return null;
+    for (keys, values) |token, *value| {
+        const key = json_decode.parseFromSliceLeaky([]const u8, a, token, .{}) catch return null;
+        const answer = answers.object.get(key) orelse return null;
+        value.* = std.json.Stringify.valueAlloc(a, answer, .{}) catch return null;
+    }
+    return values;
+}
+
+test "a round's answers are the ones std.json finds by each decoded key, on hostile keys and answers" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const key_sets = [_][]const []const u8{
+        &.{"\"k\""},
+        &.{ "\"\\u0061b\"", "\"ab2\"" },
+        &.{ "\"caf\\u00e9 \\ud83d\\ude00\"", "\"\\u00e9\"", "\"e\"" },
+        &.{ "\"q\\\"u\\\\o\\/te\"", "\"a\\u0000b\"" },
+        &.{ "\"\\u0131\"", "\"i\"" },
+        &.{"\"\\ud800\""},
+        &.{"\"\""},
+    };
+    const answer_texts = [_][]const u8{
+        "{\"k\":{\"action\":\"accept\"}}",
+        "{ \"k\" : { \"action\" : \"decline\" } }",
+        "{\"ab\":{\"action\":\"accept\",\"content\":{\"n\":1.50}},\"ab2\":{\"action\":\"cancel\"}}",
+        "{\"a\\u0062\":{\"action\":\"accept\"},\"ab2\":{}}",
+        "{\"café 😀\":{\"action\":\"accept\"},\"é\":{\"action\":\"decline\"},\"e\":{\"action\":\"cancel\"}}",
+        "{\"caf\\u00e9 \\ud83d\\ude00\":{},\"\\u00e9\":{},\"e\":{}}",
+        "{\"q\\\"u\\\\o/te\":{\"action\":\"accept\"},\"a\\u0000b\":{\"action\":\"accept\"}}",
+        "{\"\\u0131\":{\"action\":\"accept\"},\"i\":{\"action\":\"decline\"}}",
+        "{\"\":{\"action\":\"accept\"}}",
+        "{\"k\":{\"action\":\"accept\"},\"extra\":[1,2,{\"x\":null}]}",
+        "{\"k\":1e400}",
+        "{\"k\":",
+        "{\"k\":{}} tail",
+        "[]",
+        "\"k\"",
+        "",
+    };
+    for (key_sets) |keys| for (answer_texts) |text| {
+        const raw = inputValues(a, text, keys);
+        const decoded = inputValuesByDecoding(a, text, keys);
+        try testing.expectEqual(decoded == null, raw == null);
+        const found = raw orelse continue;
+        for (found, decoded.?) |slice, canonical| {
+            // The slice is the answer as written; read as JSON it is the value the decoding path wrote out.
+            const tree = try std.json.parseFromSliceLeaky(std.json.Value, a, slice, .{ .parse_numbers = false });
+            try testing.expectEqualStrings(canonical, try std.json.Stringify.valueAlloc(a, tree, .{}));
+        }
+    };
+}
+
+test "a round's requests are kept as the engine read them, and freed with the question" {
+    const engine_requests = [_]mcp.mrtr.Request{
+        .{ .key = "\"\\u0061b\"", .kind = .elicitation, .raw = "{\"method\":\"elicitation/create\",\"params\":{ \"message\":\"m\" }}", .params = "{ \"message\":\"m\" }" },
+        .{ .key = "\"caf\\u00e9 😀\"", .kind = .roots, .raw = "{\"method\":\"roots/list\"}", .params = null },
+        .{ .key = "\"s\"", .kind = .sampling, .raw = "{\"method\":\"sampling/createMessage\",\"params\":{}}", .params = "{}" },
+    };
+    const kept = try keepRequests(testing.allocator, &engine_requests);
+    defer kept.free(testing.allocator);
+    try testing.expectEqual(engine_requests.len, kept.requests.len);
+    for (engine_requests, kept.requests) |engine_request, request| {
+        try testing.expectEqualStrings(engine_request.key, request.key);
+        try testing.expectEqualStrings(engine_request.raw, request.raw);
+        try testing.expect(request.key.ptr != engine_request.key.ptr);
+        try testing.expectEqual(engine_request.params == null, request.params == null);
+        if (engine_request.params) |params| try testing.expectEqualStrings(params, request.params.?);
+    }
+    try testing.expectEqual(core_mrtr.RawRequest.Kind.elicitation, kept.requests[0].kind);
+    try testing.expectEqual(core_mrtr.RawRequest.Kind.roots, kept.requests[1].kind);
+    try testing.expectEqual(core_mrtr.RawRequest.Kind.sampling, kept.requests[2].kind);
+    const none = try keepRequests(testing.allocator, &.{});
+    none.free(testing.allocator);
+}
+
+test "keeping a round's requests releases memory when an allocation fails" {
+    try testing.checkAllAllocationFailures(testing_allocator.no_resize, keepAllocationFailures, .{});
+}
+
+fn keepAllocationFailures(gpa: Allocator) !void {
+    const requests = [_]mcp.mrtr.Request{
+        .{ .key = "\"k\"", .kind = .elicitation, .raw = "{\"method\":\"elicitation/create\",\"params\":{}}", .params = "{}" },
+        .{ .key = "\"r\"", .kind = .roots, .raw = "{\"method\":\"roots/list\"}", .params = null },
+    };
+    const kept = try keepRequests(gpa, &requests);
+    kept.free(gpa);
 }
 
 /// What the engine gives the host when a call ends with a protocol error.

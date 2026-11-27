@@ -4081,8 +4081,9 @@ fn respondToAcpMcpInput(
     required: tool_mcp_runtime.InputRequired,
 ) anyerror![]const u8 {
     const responder: *AcpElicitationResponderContext = @ptrCast(@alignCast(raw_ctx));
-    const requests = try mrtr.parseRequestJsonForWire(
+    const requests = try mrtr.readRequests(
         alloc,
+        required.requests,
         required.input_requests_json,
         origin.wire,
         .{},
@@ -4130,7 +4131,7 @@ fn respondToAcpMcpInput(
     try out.writer.writeByte('{');
     for (responses, 0..) |response, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(response.key, .{}, &out.writer);
+        try out.writer.writeAll(response.key);
         try out.writer.writeByte(':');
         try out.writer.writeAll(response.json);
     }

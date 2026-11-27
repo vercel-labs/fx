@@ -5,6 +5,7 @@ const types = @import("../shared/types.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const context_limits = @import("../config/context_limits.zig");
 const elicitation = @import("../mcp/elicitation.zig");
+const mrtr = @import("../mcp/mrtr.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const access_policy = @import("../mcp/access_policy.zig");
 
@@ -71,6 +72,10 @@ pub const CallOptions = struct {
 };
 
 pub const InputRequired = struct {
+    /// A 2026 round as the engine read it: the question's requests, in order, as slices of the server's own bytes
+    /// that stay valid while the question is asked. Empty for a 2025 question and a test, which give the text form.
+    requests: []const mrtr.RawRequest = &.{},
+    /// `{key: request, ...}` as text, read when `requests` is empty.
     input_requests_json: []const u8,
     request_state_json: ?[]const u8 = null,
     legacy_retry_without_responses: bool = false,

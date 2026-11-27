@@ -16,7 +16,8 @@
 \*   - At most MaxRequests requests per chain.
 \*
 \* A requestState is identified by the round that brought it; strings, keys,
-\* and the backoff times are data, checked by the Zig tests.
+\* and the backoff times are data, checked by the Zig tests of `src/mcp/protocol/mrtr.zig`
+\* and by the raw-round tests of `tests/e2e/mcp-stdio.test.ts`, `mcp-http.test.ts` and `acp.test.ts`.
 EXTENDS Naturals
 
 CONSTANTS

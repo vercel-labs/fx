@@ -254,3 +254,50 @@ test "a retry answers each key as written and echoes the state, or leaves both o
     try bare.end();
     try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{}}", out.written());
 }
+
+test "a retry gives back hostile keys and a requestState exactly as the server wrote them" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // An escape, a non-ASCII character with an astral pair, a quote, a backslash and a slash, and a name of 255 bytes.
+    const long_key = try a.alloc(u8, 257);
+    @memset(long_key, 'k');
+    long_key[0] = '"';
+    long_key[256] = '"';
+    const keys = [_][]const u8{ "\"\\u0061b\"", "\"caf\\u00e9 \\ud83d\\ude00 é 😀\"", "\"q\\\"u\\\\o\\/te\"", long_key };
+    // Whitespace, a JSON text a normalizing writer would change, escapes, and non-ASCII bytes.
+    const state = "\"{\\\"b\\\": 1,  \\\"a\\\":[2 , 3]}\\t \\u0061 é \\ud83d\\ude00 \\n  \"";
+
+    var result: std.Io.Writer.Allocating = .init(a);
+    try result.writer.writeAll("{\"resultType\":\"input_required\", \"inputRequests\" : {");
+    for (keys, 0..) |key, index| {
+        if (index > 0) try result.writer.writeAll(" ,\n");
+        try result.writer.print("{s}:{{\"method\":\"roots/list\"}}", .{key});
+    }
+    try result.writer.print("}}, \"requestState\" : {s} }}", .{state});
+
+    var round: Round = .{};
+    try parse(result.written(), &round);
+    try testing.expectEqual(@as(u8, keys.len), round.count);
+    const values = [_][]const u8{ "{\"roots\":[]}", "{\"roots\":[]}", "{\"roots\":[]}", "{\"roots\":[]}" };
+    var out: std.Io.Writer.Allocating = .init(a);
+    var w: wire.Writer = try .request(&out.writer, 9, "tools/call", .{});
+    try writeRetry(&w, .{ .requests = round.slice(), .values = &values, .state = round.state });
+    try w.end();
+    var expected: std.Io.Writer.Allocating = .init(a);
+    try expected.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"inputResponses\":{");
+    for (keys, values, 0..) |key, value, index| {
+        if (index > 0) try expected.writer.writeByte(',');
+        try expected.writer.print("{s}:{s}", .{ key, value });
+    }
+    try expected.writer.print("}},\"requestState\":{s}}}}}", .{state});
+    try testing.expectEqualStrings(expected.written(), out.written());
+}
+
+test "a round keeps its requests in the order the server wrote them" {
+    var round: Round = .{};
+    try parse("{\"inputRequests\":{\"z\":{\"method\":\"roots/list\"},\"a\":{\"method\":\"roots/list\"},\"m\":{\"method\":\"roots/list\"}}}", &round);
+    try testing.expectEqualStrings("\"z\"", round.requests[0].key);
+    try testing.expectEqualStrings("\"a\"", round.requests[1].key);
+    try testing.expectEqualStrings("\"m\"", round.requests[2].key);
+}

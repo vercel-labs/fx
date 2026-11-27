@@ -1,9 +1,15 @@
-//! Multi Round-Trip Requests (MRTR): bounded parsing and validation for
-//! stateless client-input requests carried by modern MCP operation results.
+//! Multi Round-Trip Requests (MRTR): reading the input requests of a 2026 round
+//! for the question UI. The engine (`src/mcp/protocol/mrtr.zig`) is the one
+//! reader of the round: it splits it into keys, requests and state. Here each
+//! request's form is read from the slices it found, and the key stays the raw
+//! JSON string token the server wrote, so the answer goes back under it as it
+//! came.
 
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const elicitation = @import("elicitation.zig");
+const json_decode = @import("../shared/json_decode.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -50,6 +56,7 @@ const RequestPayload = union(enum) {
 };
 
 pub const InputRequest = struct {
+    /// A JSON string token, as the answer writes it.
     key: []u8,
     payload: RequestPayload,
 
@@ -60,42 +67,77 @@ pub const InputRequest = struct {
     }
 };
 
-pub const InputRequired = struct {
-    requests: []InputRequest,
-    request_state_json: ?[]u8 = null,
+/// One input request of a round as the engine read it, slices of the server's
+/// own bytes that the caller keeps valid. `key` is a JSON string token, quotes
+/// and escapes as written. `raw` is the request object and `params` its
+/// `params`, null when it has none.
+pub const RawRequest = struct {
+    pub const Kind = enum { elicitation, sampling, roots };
 
-    pub fn deinit(self: *InputRequired, alloc: Allocator) void {
-        for (self.requests) |*request| request.deinit(alloc);
-        alloc.free(self.requests);
-        if (self.request_state_json) |value| alloc.free(value);
-        self.* = undefined;
-    }
+    key: []const u8,
+    kind: Kind,
+    raw: []const u8,
+    params: ?[]const u8,
 };
 
-pub fn parseInputRequired(
+/// The requests of a question: `raw` when the engine's round gave them, else
+/// `json`, the text form a 2025 question and a test give.
+pub fn readRequests(
     alloc: Allocator,
-    result: std.json.Value,
+    raw: []const RawRequest,
+    json: []const u8,
+    wire: elicitation.Wire,
     limits: Limits,
-) Error!InputRequired {
-    if (result != .object) return error.InvalidInputRequired;
-    try validateJsonBounds(result, limits, 0);
-    const requests_value = result.object.get("inputRequests");
-    const state_value = result.object.get("requestState");
-    if (requests_value == null and state_value == null) return error.InvalidInputRequired;
+) Error![]InputRequest {
+    if (raw.len == 0) return parseRequestJsonForWire(alloc, json, wire, limits);
+    return readRawRequests(alloc, raw, wire, limits);
+}
 
-    const requests = if (requests_value) |value|
-        try parseRequestMap(alloc, value, limits, .modern_mcp)
-    else
-        try alloc.alloc(InputRequest, 0);
+/// Reads the form of each request in `raw`, and nothing else of the round. The
+/// size limit is on the round as the text form writes it: `{key:request,...}`.
+fn readRawRequests(
+    alloc: Allocator,
+    raw: []const RawRequest,
+    wire: elicitation.Wire,
+    limits: Limits,
+) Error![]InputRequest {
+    var bytes: usize = 2 + raw.len - 1;
+    for (raw) |request| bytes += request.key.len + 1 + request.raw.len;
+    if (bytes > limits.max_json_bytes) return error.MetadataLimitExceeded;
+    if (raw.len > limits.max_requests) return error.InvalidInputRequired;
+
+    const requests = try alloc.alloc(InputRequest, raw.len);
+    var parsed_count: usize = 0;
     errdefer {
-        for (requests) |*request| request.deinit(alloc);
+        for (requests[0..parsed_count]) |*request| request.deinit(alloc);
         alloc.free(requests);
     }
-    const request_state_json = if (state_value) |state|
-        try stringifyBounded(alloc, state, limits.max_json_bytes)
-    else
-        null;
-    return .{ .requests = requests, .request_state_json = request_state_json };
+    for (raw) |request| {
+        try checkKeyToken(alloc, request.key, limits);
+        const key = try alloc.dupe(u8, request.key);
+        errdefer alloc.free(key);
+        const payload: RequestPayload = switch (request.kind) {
+            .sampling => .{ .unsupported = .sampling },
+            .roots => .{ .unsupported = .roots },
+            .elicitation => try parseElicitationParams(alloc, request.params orelse return error.InvalidInputRequired, wire, limits),
+        };
+        requests[parsed_count] = .{ .key = key, .payload = payload };
+        parsed_count += 1;
+    }
+    return requests;
+}
+
+/// A key that reads as a name of one to `max_name_bytes` bytes. The token is
+/// only decoded to be checked; nothing keeps the decoded name.
+fn checkKeyToken(alloc: Allocator, token: []const u8, limits: Limits) Error!void {
+    var scratch: std.heap.ArenaAllocator = .init(alloc);
+    defer scratch.deinit();
+    const name = json_decode.parseFromSliceLeaky([]const u8, scratch.allocator(), token, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidInputRequired,
+    };
+    if (name.len > limits.max_name_bytes) return error.MetadataLimitExceeded;
+    if (name.len == 0) return error.InvalidInputRequired;
 }
 
 pub fn parseRequestJsonForWire(
@@ -142,7 +184,7 @@ fn parseRequestMap(
         const method = request.object.get("method") orelse return error.InvalidInputRequired;
         if (method != .string) return error.InvalidInputRequired;
 
-        const key = try alloc.dupe(u8, entry.key_ptr.*);
+        const key = try std.json.Stringify.valueAlloc(alloc, entry.key_ptr.*, .{});
         errdefer alloc.free(key);
         const payload: RequestPayload = if (std.mem.eql(u8, method.string, "sampling/createMessage"))
             .{ .unsupported = .sampling }
@@ -168,6 +210,15 @@ fn parseElicitationRequest(
     if (params != .object) return error.InvalidInputRequired;
     const params_json = try stringifyBounded(alloc, params, limits.max_json_bytes);
     defer alloc.free(params_json);
+    return parseElicitationParams(alloc, params_json, wire, limits);
+}
+
+fn parseElicitationParams(
+    alloc: Allocator,
+    params_json: []const u8,
+    wire: elicitation.Wire,
+    limits: Limits,
+) Error!RequestPayload {
     return .{ .elicitation_create = elicitation.parseRequest(
         alloc,
         wire,
@@ -188,41 +239,6 @@ fn parseElicitationRequest(
         error.LimitExceeded => return error.MetadataLimitExceeded,
         else => return error.InvalidInputRequired,
     } };
-}
-
-pub fn renderRequests(
-    alloc: Allocator,
-    requests: []const InputRequest,
-) Error![]u8 {
-    return renderRequestsFallible(alloc, requests) catch |err| switch (err) {
-        error.WriteFailed => error.OutOfMemory,
-        else => err,
-    };
-}
-
-fn renderRequestsFallible(
-    alloc: Allocator,
-    requests: []const InputRequest,
-) Error![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeByte('{');
-    for (requests, 0..) |request, index| {
-        if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(request.key, .{}, &out.writer);
-        try out.writer.writeAll(":{\"method\":");
-        try std.json.Stringify.value(request.payload.method(), .{}, &out.writer);
-        switch (request.payload) {
-            .unsupported => {},
-            .elicitation_create => |value| {
-                try out.writer.writeAll(",\"params\":");
-                try out.writer.writeAll(value.raw_params_json);
-            },
-        }
-        try out.writer.writeByte('}');
-    }
-    try out.writer.writeByte('}');
-    return try out.toOwnedSlice();
 }
 
 fn validateJsonBounds(value: std.json.Value, limits: Limits, depth: usize) Error!void {
@@ -260,36 +276,96 @@ fn stringifyBounded(
     return try out.toOwnedSlice();
 }
 
-test "MRTR parses the closed request union and rejects unknown methods" {
-    const alloc = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        \\{"inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8}},"roots":{"method":"roots/list"},"form":{"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{"confirmed":{"type":"boolean"}},"required":["confirmed"]}}}},"requestState":"opaque"}
-    ,
-        .{},
-    );
-    defer parsed.deinit();
-    var required = try parseInputRequired(alloc, parsed.value, .{});
-    defer required.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), required.requests.len);
-    try std.testing.expectEqualStrings("\"opaque\"", required.request_state_json.?);
+const form_params = "{\"message\":\"Continue?\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"confirmed\":{\"type\":\"boolean\"}},\"required\":[\"confirmed\"]}}";
+const form_request = "{\"method\":\"elicitation/create\",\"params\":" ++ form_params ++ "}";
 
-    var invalid = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        \\{"inputRequests":{"bad":{"method":"custom/request","params":{}}}}
-    ,
-        .{},
-    );
-    defer invalid.deinit();
-    try std.testing.expectError(
-        error.InvalidInputRequired,
-        parseInputRequired(alloc, invalid.value, .{}),
-    );
+fn formRaw(key: []const u8) RawRequest {
+    return .{ .key = key, .kind = .elicitation, .raw = form_request, .params = form_params };
 }
 
-test "MRTR parser and response validation release allocation failures" {
+fn freeRequests(alloc: Allocator, requests: []InputRequest) void {
+    for (requests) |*request| request.deinit(alloc);
+    alloc.free(requests);
+}
+
+test "the keys of a round the engine read stay the tokens the server wrote, in order" {
+    const alloc = std.testing.allocator;
+    // An escape, a non-ASCII character, an astral code point as a surrogate pair, a quote, a backslash and a slash.
+    const keys = [_][]const u8{
+        "\"\\u0061b\"",
+        "\"caf\\u00e9 \\ud83d\\ude00 é 😀\"",
+        "\"q\\\"u\\\\o\\/te\"",
+        "\"plain\"",
+    };
+    var raw: [keys.len]RawRequest = undefined;
+    for (keys, &raw) |key, *request| request.* = formRaw(key);
+    const requests = try readRequests(alloc, &raw, "", .modern_mcp, .{});
+    defer freeRequests(alloc, requests);
+    try std.testing.expectEqual(keys.len, requests.len);
+    for (keys, requests) |key, request| {
+        try std.testing.expectEqualStrings(key, request.key);
+        try std.testing.expectEqualStrings("elicitation/create", request.payload.method());
+        try std.testing.expectEqualStrings(form_params, request.payload.elicitation_create.raw_params_json);
+    }
+}
+
+test "a request that is no form is kept as the kind the engine read, with its key" {
+    const alloc = std.testing.allocator;
+    const raw = [_]RawRequest{
+        .{ .key = "\"s\\u0061mple\"", .kind = .sampling, .raw = "{\"method\":\"sampling/createMessage\",\"params\":{}}", .params = "{}" },
+        .{ .key = "\"roots\"", .kind = .roots, .raw = "{\"method\":\"roots/list\"}", .params = null },
+    };
+    const requests = try readRequests(alloc, &raw, "", .modern_mcp, .{});
+    defer freeRequests(alloc, requests);
+    try std.testing.expectEqualStrings("\"s\\u0061mple\"", requests[0].key);
+    try std.testing.expectEqualStrings("sampling/createMessage", requests[0].payload.method());
+    try std.testing.expectEqualStrings("roots/list", requests[1].payload.method());
+}
+
+test "a round the engine read is refused when a key or a form is not one fx can show" {
+    const alloc = std.testing.allocator;
+    const long_key = "\"" ++ text_utils.repeat("k", 257) ++ "\"";
+    const ok_key = "\"" ++ text_utils.repeat("k", 256) ++ "\"";
+    try std.testing.expectError(error.MetadataLimitExceeded, readRequests(alloc, &.{formRaw(long_key)}, "", .modern_mcp, .{}));
+    const kept = try readRequests(alloc, &.{formRaw(ok_key)}, "", .modern_mcp, .{});
+    freeRequests(alloc, kept);
+    // The name counts once decoded: 256 bytes written as escapes are 256 bytes of name, and 257 are too many.
+    try std.testing.expectError(error.MetadataLimitExceeded, readRequests(alloc, &.{formRaw("\"" ++ text_utils.repeat("\\u006b", 257) ++ "\"")}, "", .modern_mcp, .{}));
+    for ([_][]const u8{ "\"\"", "\"\\ud800\"", "\"\\u00\"", "k" }) |key| {
+        try std.testing.expectError(error.InvalidInputRequired, readRequests(alloc, &.{formRaw(key)}, "", .modern_mcp, .{}));
+    }
+    const no_params: RawRequest = .{ .key = "\"k\"", .kind = .elicitation, .raw = "{\"method\":\"elicitation/create\"}", .params = null };
+    try std.testing.expectError(error.InvalidInputRequired, readRequests(alloc, &.{no_params}, "", .modern_mcp, .{}));
+    const not_object: RawRequest = .{ .key = "\"k\"", .kind = .elicitation, .raw = "{\"method\":\"elicitation/create\",\"params\":[]}", .params = "[]" };
+    try std.testing.expectError(error.InvalidInputRequired, readRequests(alloc, &.{not_object}, "", .modern_mcp, .{}));
+}
+
+test "a round larger than the text form allows is refused whatever its requests are" {
+    const alloc = std.testing.allocator;
+    const padded = "{\"method\":\"roots/list\",\"pad\":\"" ++ text_utils.repeat("p", 4096) ++ "\"}";
+    var raw: [32]RawRequest = undefined;
+    var keys: [32][8]u8 = undefined;
+    for (&raw, &keys, 0..) |*request, *key, index| {
+        key.* = "\"k000\"  ".*;
+        _ = std.mem.print(key[2..5], "{d:0>3}", .{index}) catch unreachable;
+        request.* = .{ .key = key[0..6], .kind = .roots, .raw = padded, .params = null };
+    }
+    try std.testing.expectError(error.MetadataLimitExceeded, readRequests(alloc, &raw, "", .modern_mcp, .{}));
+    const few = try readRequests(alloc, raw[0..16], "", .modern_mcp, .{});
+    freeRequests(alloc, few);
+}
+
+test "the text form still answers as it did: its keys are written back as tokens" {
+    const alloc = std.testing.allocator;
+    const requests = try readRequests(alloc, &.{}, "{\"a\\u0062\":{\"method\":\"roots/list\"},\"c\":{\"method\":\"sampling/createMessage\",\"params\":{}}}", .modern_mcp, .{});
+    defer freeRequests(alloc, requests);
+    // A key is read once and written as std.json writes it, so an escape in the text form comes back as the character.
+    try std.testing.expectEqualStrings("\"ab\"", requests[0].key);
+    try std.testing.expectEqualStrings("\"c\"", requests[1].key);
+    try std.testing.expectError(error.InvalidInputRequired, readRequests(alloc, &.{}, "{\"bad\":{\"method\":\"custom/request\",\"params\":{}}}", .modern_mcp, .{}));
+}
+
+test "reading a round releases memory when an allocation fails" {
     try std.testing.checkAllAllocationFailures(
         testing_allocator.no_resize,
         checkAllocationFailures,
@@ -297,32 +373,13 @@ test "MRTR parser and response validation release allocation failures" {
     );
 }
 
-test "MRTR bounds opaque request state depth before retention" {
-    const alloc = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        "{\"inputRequests\":{},\"requestState\":[[[[true]]]]}",
-        .{},
-    );
-    defer parsed.deinit();
-    try std.testing.expectError(
-        error.MetadataLimitExceeded,
-        parseInputRequired(alloc, parsed.value, .{ .max_depth = 3 }),
-    );
-}
-
 fn checkAllocationFailures(alloc: Allocator) !void {
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        \\{"inputRequests":{"form":{"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{"confirmed":{"type":"boolean"}}}}}},"requestState":"opaque"}
-    ,
-        .{},
-    );
-    defer parsed.deinit();
-    var required = try parseInputRequired(alloc, parsed.value, .{});
-    defer required.deinit(alloc);
-    const rendered = try renderRequests(alloc, required.requests);
-    defer alloc.free(rendered);
+    const raw = [_]RawRequest{ formRaw("\"form\""), formRaw("\"caf\\u00e9\"") };
+    const requests = readRequests(alloc, &raw, "", .modern_mcp, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return err,
+    };
+    freeRequests(alloc, requests);
+    const from_text = try readRequests(alloc, &.{}, "{\"form\":" ++ form_request ++ "}", .modern_mcp, .{});
+    freeRequests(alloc, from_text);
 }
