@@ -841,6 +841,10 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await reopened.sendKeys("C-o");
         await reopened.waitForComposer(5000);
         expect(await reopened.captureFullScrollbackEscapes()).not.toMatch(COMPACTION_OUTPUT);
+        // Typing /quit while the resumed history is still being written grows
+        // the footer, so fx writes the rest at once, and the quit waits until
+        // the terminal takes it. That can outlast close's wait on a slow runner.
+        await f.waitForResumeHandoff();
         await f.close();
         expect(f.counts()).toEqual(cancelledCounts);
         expect(f.savedEvents().startsWith(cancelledEvents)).toBe(true);
