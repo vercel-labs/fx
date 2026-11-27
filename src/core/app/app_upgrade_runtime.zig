@@ -91,6 +91,7 @@ pub fn Runtime(comptime App: type) type {
                     debug_trace.logf("upgrade", "event=restart_releases_held_turns", .{});
                 },
                 .releasing => {},
+                .when_idle => if (!idleForRestart(app)) return,
             }
             if (app.anyTurnRunning() or draftPending(app)) return;
             app.upgrader.restart = .none;
@@ -98,6 +99,40 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.logf("upgrade", "event=restart_after_yield", .{});
             if (comptime @hasField(App, "should_exit")) app.should_exit = true;
             requestFooterRender(app);
+        }
+
+        /// A prompt sent while the restart waits goes out at once, so a
+        /// pending restart never holds it: the held turns go on, and fx
+        /// restarts at the next idle moment (`finishWaitingRestart`) with the
+        /// relaunch and handoffs Ctrl+G prepared. Returns false only once the
+        /// held turns were let go, since they stopped for the relaunch
+        /// (`tests/tla/recovery/RestartWait.tla` Submit).
+        pub fn restartWhenIdleForPrompt(app: *App) bool {
+            switch (app.upgrader.restart) {
+                .none, .when_idle => return true,
+                .releasing => return false,
+                .waiting => {
+                    if (comptime @hasDecl(App, "cancelTurnYields")) app.cancelTurnYields();
+                    app.upgrader.restart = .when_idle;
+                    debug_trace.logf("upgrade", "event=restart_waits_for_idle reason=prompt_sent", .{});
+                    requestFooterRender(app);
+                    return true;
+                },
+            }
+        }
+
+        /// Whether a restart put off by a prompt can run now: nothing Ctrl+G
+        /// refuses for is there, so it loses nothing and asks for no answer.
+        fn idleForRestart(app: *App) bool {
+            if (upgradeUnavailableNotice(app, agents.screenAgentOf(app)) != null) return false;
+            var name_buf: [32]u8 = undefined;
+            if (comptime @hasDecl(App, "needsUserElsewhere")) {
+                if (app.needsUserElsewhere(&name_buf) != null) return false;
+            }
+            if (comptime @hasDecl(App, "queuedWorkElsewhere")) {
+                if (app.queuedWorkElsewhere(&name_buf) != null) return false;
+            }
+            return true;
         }
 
         /// What the composer holds that exiting would lose, as the notice
@@ -157,7 +192,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime supportsYield(App)) {
                 switch (app.upgrader.restart) {
                     .none => {},
-                    .waiting => {
+                    .waiting, .when_idle => {
                         try cancelWaitingRestart(app);
                         return .restart_cancelled;
                     },
@@ -1065,4 +1100,75 @@ test "app_upgrade_runtime rejects mid key sequence before reload" {
     try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
     try std.testing.expectEqual(@as(usize, 0), deps.path_count);
     try std.testing.expect(std.mem.find(u8, app.notices.items, "finish the key sequence") != null);
+}
+
+test "app_upgrade_runtime lets a prompt sent while the restart waits go on, and restarts at the next idle moment" {
+    const alloc = std.testing.allocator;
+    var app = TestApp{ .alloc = alloc };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    var deps_state = TestDepsState{};
+    _ = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(auto_upgrade.RestartWait.waiting, app.upgrader.restart);
+
+    // The prompt goes out: the held turns go on, and the relaunch and the
+    // handoff Ctrl+G prepared stay.
+    try std.testing.expect(Runtime(TestApp).restartWhenIdleForPrompt(&app));
+    try std.testing.expectEqual(auto_upgrade.RestartWait.when_idle, app.upgrader.restart);
+    try std.testing.expectEqual(@as(usize, 1), app.cancel_yield_count);
+    try std.testing.expectEqual(@as(usize, 0), app.cancel_handoff_count);
+    try std.testing.expect(app.agent().upgrade_handoff);
+    try std.testing.expect(Runtime(TestApp).restartWhenIdleForPrompt(&app));
+    try std.testing.expectEqual(@as(usize, 1), app.cancel_yield_count);
+
+    // Nothing is released while it waits for idle, and each thing Ctrl+G
+    // refuses for holds the restart.
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(@as(usize, 0), app.release_count);
+    app.turn_running = false;
+    app.agent().submission.pending = 1;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.agent().submission.pending = null;
+    app.agent().worker.queued_count = 1;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.agent().worker.queued_count = 0;
+    app.queued_elsewhere = "fx 2";
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.queued_elsewhere = null;
+    app.needs_user_elsewhere = .{ .name = "fx 2", .doing = .needs_approval };
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.needs_user_elsewhere = null;
+
+    // Idle: fx exits for the relaunch.
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(app.should_exit);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
+}
+
+test "app_upgrade_runtime cancels a restart put off until idle on Ctrl+G, and keeps a prompt only once the held turns were let go" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    var deps_state = TestDepsState{};
+    _ = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expect(Runtime(TestApp).restartWhenIdleForPrompt(&app));
+
+    const cancelled = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.restart_cancelled, cancelled);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
+    try std.testing.expect(!app.agent().upgrade_handoff);
+    app.turn_running = false;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+
+    app.upgrader.restart = .releasing;
+    try std.testing.expect(!Runtime(TestApp).restartWhenIdleForPrompt(&app));
+    try std.testing.expectEqual(auto_upgrade.RestartWait.releasing, app.upgrader.restart);
 }

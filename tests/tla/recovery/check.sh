@@ -121,6 +121,8 @@ RestartWait restart-wait -
 RestartWait restart-wait-current NoStopWhileCancellable
 RestartWait restart-wait-mutation-hold-ignores-flag HeldOnlyWhileRestartWaits
 RestartWait restart-wait-mutation-cancel-while-releasing NoStopWhileCancellable
+RestartWait restart-wait-idle -
+RestartWait restart-wait-mutation-submit-keeps-asks IdleWaitHoldsNothing
 RestartWait restart-wait-mutation-release-early NoUncancellableWait
 RestartWait restart-wait-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
 RestartWait restart-wait-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1

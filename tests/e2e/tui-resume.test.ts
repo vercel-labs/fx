@@ -6180,6 +6180,118 @@ test.skipIf(!tmuxAvailable())(
   TIMEOUT * 5,
 );
 
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g sends a prompt typed while a subagent works at once, and restarts only when idle",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-send-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    let active: TmuxSession | null = null;
+    let soloAsked = false;
+    let releaseSolo = () => {};
+    const soloReleased = new Promise<void>((resolve) => { releaseSolo = resolve; });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      // The subagent's own request carries its task but not main's call.
+      if (body.includes("SOLO_TASK") && !body.includes('"main_solo"')) {
+        soloAsked = true;
+        await soloReleased;
+        return fakeGatewayFinalText("SOLO_DONE");
+      }
+      if (body.includes("SOLO_DONE")) return fakeGatewayFinalText("MAIN_SAW_REPORT");
+      if (body.includes("SEND_NOW_PROMPT")) return fakeGatewayFinalText("SENT_AT_ONCE");
+      if (!body.includes('"main_solo"')) {
+        return fakeGatewayToolCall("main_solo", "subagent", { request: { action: "message", agent: "solo", message: "SOLO_TASK" } });
+      }
+      return fakeGatewayFinalText("MAIN_DONE");
+    });
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    const promptRequests = () => gateway.requests.filter((request) => request.body.includes("SEND_NOW_PROMPT") && !request.body.includes("SOLO_DONE")).length;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_PERMISSION_MODE: "full-access",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+
+      // Main's turn ends while its subagent still works, so Ctrl+G waits.
+      await active.sendText("UPGRADE_MAIN start solo");
+      await active.waitForPane((pane) => pane.includes("MAIN_DONE") && turnSettled(pane), TIMEOUT);
+      for (const deadline = Date.now() + TIMEOUT; !soloAsked; await Bun.sleep(50)) {
+        if (Date.now() > deadline) throw new Error("the subagent never asked the model");
+      }
+      await active.waitForComposer(TIMEOUT);
+      await active.sendHexBytes(["07"]);
+      await active.waitForPane((pane) => /restart (?:waits|pending)/.test(pane), TIMEOUT);
+
+      // A prompt sent now goes out at once: the pending restart never holds it.
+      await active.sendText("SEND_NOW_PROMPT");
+      const answered = await active.waitForPane(
+        (pane) => pane.includes("SENT_AT_ONCE") || pane.includes("send this after"),
+        TIMEOUT,
+      );
+      expect(answered).not.toContain("send this after");
+      await active.waitForPane((pane) => pane.includes("SENT_AT_ONCE") && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
+      expect(promptRequests()).toBe(1);
+
+      // The footer shows the pending restart, and the subagent still works,
+      // so fx does not restart yet.
+      await active.waitForText("update ready · restarts when idle · ctrl+g cancels", TIMEOUT);
+      expect(relaunched()).toBe(false);
+
+      // Once the subagent finishes and main reads its report, fx is idle and
+      // restarts on its own. The prompt is not sent again.
+      const version = (await runFx(["--version"])).stdout.trim();
+      releaseSolo();
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, TIMEOUT);
+      expect(relaunched()).toBe(true);
+      expect(promptRequests()).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).not.toContain("relaunch failed");
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      releaseSolo();
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
 test("manual upgrade output links stable notes and dev changes", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-upgrade-links-")));
   const argvLogPath = join(root, "upgrade-argv.log");

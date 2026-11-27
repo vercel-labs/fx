@@ -13482,29 +13482,35 @@ test "app_input_runtime submit resolves slash completion through core command sp
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
-test "app_input_runtime submit holds a prompt while the upgrade restart waits, and names Ctrl+G only while it cancels" {
+test "app_input_runtime submit sends a prompt at once while the upgrade restart waits, and puts the restart off until idle" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "send me now");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    app.upgrader.restart = .waiting;
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+    try std.testing.expect(app.last_prompt != null or app.agent().submission.pending != null);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.when_idle, app.upgrader.restart);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_count);
+}
+
+test "app_input_runtime submit keeps a prompt in the composer only once the held turns were let go for the restart" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
     try app.input_runtime.edit_state.input.appendSlice(alloc, "after the restart");
     app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
 
-    app.upgrader.restart = .waiting;
-    try Runtime(FakeSubmitApp).submit(&app, 100);
-    try std.testing.expect(app.last_prompt == null);
-    try std.testing.expect(app.agent().submission.pending == null);
-    try std.testing.expectEqualStrings("after the restart", app.input_runtime.edit_state.input.items);
-    try std.testing.expect(std.mem.endsWith(u8, app.notice_body.items, "; send this after the restart, or press Ctrl+G to cancel it"));
-
-    // Once the held turns are let go, Ctrl+G no longer cancels the restart.
     app.upgrader.restart = .releasing;
     try Runtime(FakeSubmitApp).submit(&app, 100);
     try std.testing.expect(app.last_prompt == null);
     try std.testing.expect(app.agent().submission.pending == null);
     try std.testing.expectEqualStrings("after the restart", app.input_runtime.edit_state.input.items);
-    try std.testing.expect(std.mem.endsWith(u8, app.notice_body.items, "; send this after the restart"));
-    try std.testing.expect(std.mem.find(u8, app.notice_body.items, "Ctrl+G") == null);
-    try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+    try std.testing.expectEqualStrings("fx is restarting for the upgrade now; send this after the restart", app.notice_body.items);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.releasing, app.upgrader.restart);
 }
 
 test "app_input_runtime idle submit commits its frame before credential preflight" {

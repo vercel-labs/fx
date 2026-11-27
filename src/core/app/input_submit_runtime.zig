@@ -14,6 +14,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
+const app_upgrade_runtime = @import("app_upgrade_runtime.zig");
 
 const submission_state = @import("submission_state.zig");
 pub const PendingPhase = submission_state.PendingPhase;
@@ -71,14 +72,10 @@ fn buildPendingPromptDraft(
     };
 }
 
-const restart_held_submit_notice = "fx restarts for the upgrade once the running turns stop and the prompt is empty; send this after the restart";
-
-/// What a prompt sent while fx waits to restart for an upgrade gets. Ctrl+G
-/// cancels a restart only while it waits for its turns, not once the held
-/// turns are let go (`app_upgrade_runtime.zig` `applyReadyUpgradeWithDeps`).
-fn restartHeldSubmitNotice(cancellable: bool) []const u8 {
-    return if (cancellable) restart_held_submit_notice ++ ", or press Ctrl+G to cancel it" else restart_held_submit_notice;
-}
+/// What a prompt sent in the moment after the held turns were let go for an
+/// upgrade's restart gets: they stopped for the relaunch, which comes once the
+/// composer is empty.
+const restart_held_submit_notice = "fx is restarting for the upgrade now; send this after the restart";
 
 pub fn SubmitRuntime(comptime App: type) type {
     return struct {
@@ -636,18 +633,18 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn submit(app: *App, max_prompt_history: usize) !void {
-            // While fx waits to restart for an upgrade, a prompt sent now
-            // would be lost with the process, and the restart waits for an
-            // empty composer, so the text stays where it is. `/quit` still
-            // quits.
+            // A pending upgrade restart never holds a prompt: it goes out at
+            // once, and the restart waits for the next idle moment. Only in
+            // the moment after the held turns were let go for the relaunch
+            // does the text stay in the composer. `/quit` still quits.
             // A host that never upgrades itself has no restart to wait for.
             if (comptime runtime_profile.allows(App, .auto_upgrade) and @hasField(App, "upgrader") and @hasField(@FieldType(App, "upgrader"), "restart")) {
-                if (app.upgrader.restart != .none and !submitsQuit(app)) {
-                    debug_trace.logf("input", "submit held reason=upgrade_restart_waits input_bytes={d}", .{app.input_runtime.edit_state.input.items.len});
+                if (!submitsQuit(app) and !app_upgrade_runtime.Runtime(App).restartWhenIdleForPrompt(app)) {
+                    debug_trace.logf("input", "submit held reason=upgrade_restart_releasing input_bytes={d}", .{app.input_runtime.edit_state.input.items.len});
                     try app.writeDomainNotice(.{
                         .topic = "upgrade",
                         .tone = .neutral,
-                        .body = restartHeldSubmitNotice(app.upgrader.restart == .waiting),
+                        .body = restart_held_submit_notice,
                     }, true);
                     return;
                 }
