@@ -3,7 +3,7 @@ stateDiagram-v2
     [*] --> ImageDroppedToday: Today's code never turns on paste events [breaks PasteWithImageAttaches]
 
     IdleWithPasteModeOn --> ReadingMimeList: You paste (terminal sends OK with password)
-    ReadingMimeList --> WaitingForReply: Listing finishes; fx requests image (composer) or text (composer or modal)
+    ReadingMimeList --> WaitingForReply: Listing finishes (records owner); fx requests image (composer) or text (composer or modal)
     ReadingMimeList --> IdleWithPasteModeOn: Decision prompt or empty/unknown list (no read; notice or drop)
 
     WaitingForReply --> ReceivingPayload: Terminal starts reply with OK
@@ -26,7 +26,7 @@ stateDiagram-v2
 
     note right of WrongOwnerText
         Shortest broken path (paste_uses_current_owner):
-        IdleWithPasteModeOn -> ReadingMimeList (recorded composer) -> key switches to modal -> ReceivingPayload -> WrongOwnerText
+        IdleWithPasteModeOn -> ReadingMimeList -> WaitingForReply (recorded composer at DONE) -> key switches to modal -> ReceivingPayload -> WrongOwnerText
     end note
 
     note right of ModeLeftOnAfterExit

@@ -7,9 +7,9 @@
 (* path (normal exit, signal/hangup, Ctrl+Z suspend; set again on resume). *)
 (* When the person pastes with mode 5522 on, the terminal sends an         *)
 (* unsolicited listing: OK(pw) -> DATA(mime list) -> DONE. fx records the  *)
-(* input owner at the listing's OK, picks image/png only when the recorded *)
-(* owner is composer and image/png is listed (else a text MIME, else       *)
-(* notice/drop), and sends one read with pw.                               *)
+(* input owner when the listing finishes (DONE), picks image/png only when *)
+(* that recorded owner is composer and image/png is listed (else a text    *)
+(* MIME, else notice/drop), and sends one read with pw.                    *)
 (*                                                                         *)
 (* Keys the person types can arrive between any two packets and may change *)
 (* the current owner; they are never mistaken for reply bytes, and listing *)
@@ -20,7 +20,7 @@
 (*                                                                         *)
 (* `Mutation` enables one deliberately broken rule (or `current_today`):   *)
 (*   "current_today"               mode 5522 never set, listings dropped   *)
-(*   "paste_uses_current_owner"    routes text to current owner at DONE    *)
+(*   "paste_uses_current_owner"    routes text to current owner at reply   *)
 (*   "no_exit_mode_reset"          exit/suspend leaves mode 5522 on        *)
 (*   "paste_attach_in_modal"       allows image/png when owner is modal    *)
 (*   "listing_while_busy_accepted" accepts listing while read is open      *)
@@ -45,7 +45,7 @@ VARIABLES
     mode5522,         \* "off" or "on"
     lifecycle,        \* "running", "suspended", "exited"
     activeOwner,      \* current UI input owner: "composer", "modal", "decision"
-    pasteOwner,       \* owner recorded at listing OK, or "none"
+    pasteOwner,       \* owner recorded at listing DONE, or "none"
     recordedOwner,    \* [1..MaxPastes -> Owners \cup {"none"}]: recorded owner per paste
     phase,            \* "idle", "listing", "await_reply", "receiving"
     discardListing,   \* TRUE while consuming a busy-dropped listing's DATA/DONE
@@ -340,14 +340,11 @@ Read ==
                        ELSE
                             /\ phase' = "listing"
                             /\ activePaste' = p
-                            /\ pasteOwner' = activeOwner
-                            /\ recordedOwner' = [recordedOwner EXCEPT ![p] = activeOwner]
                             /\ listingMimes' = m
                             /\ openReads' = openReads + 1
-                            /\ IF activeOwner # "composer"
-                               THEN imgCompPaste' = [imgCompPaste EXCEPT ![p] = FALSE]
-                               ELSE UNCHANGED imgCompPaste
-                            /\ UNCHANGED <<discardListing, readKind, settledCount,
+                            /\ UNCHANGED <<pasteOwner, recordedOwner,
+                                           discardListing, readKind,
+                                           settledCount, imgCompPaste,
                                            attachedPaste, failedPaste,
                                            lastSettlement, textOwner,
                                            lastAttachOwner>>)
@@ -367,34 +364,36 @@ Read ==
                                         failedPaste, lastSettlement, textOwner,
                                         lastAttachOwner>>
                     ELSE IF phase = "listing"
-                    THEN LET targetOwner == IF Mutation = "paste_uses_current_owner"
-                                            THEN activeOwner ELSE pasteOwner
-                             canAttach == (targetOwner = "composer")
+                    THEN LET owner == activeOwner
+                             canAttach == (owner = "composer")
                                           \/ (Mutation = "paste_attach_in_modal"
-                                              /\ targetOwner = "modal")
-                         IN IF targetOwner = "decision"
-                               \/ listingMimes \in {"empty", "unknown"}
-                            THEN /\ phase' = "idle"
-                                 /\ pasteOwner' = "none"
-                                 /\ listingMimes' = "none"
-                                 /\ readKind' = "none"
-                                 /\ openReads' = IF openReads > 0 THEN openReads - 1 ELSE 0
-                                 /\ Settle(activePaste, "notice", targetOwner)
-                                 /\ activePaste' = 0
-                                 /\ UNCHANGED <<discardListing, recordedOwner,
-                                                imgCompPaste, failedPaste>>
-                            ELSE LET chosen == IF canAttach /\ listingMimes = "png_text"
-                                               THEN "image" ELSE "text"
-                                 IN /\ phase' = "await_reply"
-                                    /\ readKind' = chosen
+                                              /\ owner = "modal")
+                         IN /\ recordedOwner' = [recordedOwner EXCEPT ![activePaste] = owner]
+                            /\ IF owner # "composer"
+                               THEN imgCompPaste' = [imgCompPaste EXCEPT ![activePaste] = FALSE]
+                               ELSE UNCHANGED imgCompPaste
+                            /\ IF owner = "decision"
+                                  \/ listingMimes \in {"empty", "unknown"}
+                               THEN /\ phase' = "idle"
+                                    /\ pasteOwner' = "none"
                                     /\ listingMimes' = "none"
-                                    /\ pasteOwner' = targetOwner
-                                    /\ UNCHANGED <<recordedOwner, discardListing,
-                                                   openReads, activePaste,
-                                                   settledCount, imgCompPaste,
-                                                   attachedPaste, failedPaste,
-                                                   lastSettlement, textOwner,
-                                                   lastAttachOwner>>
+                                    /\ readKind' = "none"
+                                    /\ openReads' = IF openReads > 0 THEN openReads - 1 ELSE 0
+                                    /\ Settle(activePaste, "notice", owner)
+                                    /\ activePaste' = 0
+                                    /\ UNCHANGED <<discardListing, failedPaste>>
+                               ELSE LET chosen == IF canAttach /\ listingMimes = "png_text"
+                                                  THEN "image" ELSE "text"
+                                    IN /\ phase' = "await_reply"
+                                       /\ readKind' = chosen
+                                       /\ listingMimes' = "none"
+                                       /\ pasteOwner' = owner
+                                       /\ UNCHANGED <<discardListing,
+                                                      openReads, activePaste,
+                                                      settledCount,
+                                                      attachedPaste, failedPaste,
+                                                      lastSettlement, textOwner,
+                                                      lastAttachOwner>>
                     ELSE UNCHANGED <<pasteOwner, recordedOwner, phase, discardListing,
                                    openReads, listingMimes, readKind, activePaste,
                                    settledCount, imgCompPaste, attachedPaste,
