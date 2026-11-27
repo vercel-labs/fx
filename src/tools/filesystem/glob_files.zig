@@ -148,10 +148,11 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
         );
         const hidden: ?tool_files.FileFilter = if (search_deny) |*deny| deny.filter() else null;
         var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var target_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
 
         for (candidate_files) |candidate| {
             if (!compiled_pattern.matchesPath(candidate)) continue;
-            if (hidden) |filter| if (candidateHidden(filter, &path_buffer, root.absolute, candidate)) continue;
+            if (hidden) |filter| if (candidateHidden(filter, &path_buffer, &target_buffer, root.absolute, candidate)) continue;
 
             match_count += 1;
             if (input.mode == .count) continue;
@@ -222,12 +223,17 @@ fn formatMatches(
     return try out.toOwnedSlice();
 }
 
-/// Whether `filter` hides `candidate`, a path below `root`. A path too long to name is hidden, as
-/// it could not be read either.
-fn candidateHidden(filter: tool_files.FileFilter, buffer: []u8, root: []const u8, candidate: []const u8) bool {
-    var fba = std.heap.FixedBufferAllocator.init(buffer);
-    const absolute = std.Io.Dir.path.join(fba.allocator(), &.{ root, candidate }) catch return true;
-    return filter.hides(absolute);
+fn candidateHidden(filter: tool_files.FileFilter, path_buffer: []u8, target_buffer: []u8, root: []const u8, candidate: []const u8) bool {
+    var path_scratch = std.heap.FixedBufferAllocator.init(path_buffer);
+    const absolute = std.Io.Dir.path.join(path_scratch.allocator(), &.{ root, candidate }) catch return true;
+    if (filter.hides(absolute)) return true;
+
+    // The index lists links as files. Under deny rules, omit candidates whose identity cannot be checked.
+    const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), absolute, .{ .follow_symlinks = false }) catch return true;
+    if (stat.kind != .sym_link) return false;
+    var target_scratch = std.heap.FixedBufferAllocator.init(target_buffer);
+    const target = io_mod.realpathAlloc(target_scratch.allocator(), absolute) catch return true;
+    return filter.hides(target);
 }
 
 const SearchRoot = struct {
@@ -1020,5 +1026,54 @@ test "glob_files leaves out files a deny rule covers when the search starts abov
         const body = result.success;
         try std.testing.expect(std.mem.find(u8, body, "secret/k.txt") == null);
         if (std.mem.eql(u8, pattern, "**/*.txt")) try std.testing.expect(std.mem.find(u8, body, "src/a.txt") != null);
+    }
+}
+
+test "glob_files applies symlink target denies to names and counts" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const denied = try writeTempFile(alloc, &tmp, "private/record.txt", "private\n");
+    defer alloc.free(denied);
+    const visible = try writeTempFile(alloc, &tmp, "public/record.txt", "public\n");
+    defer alloc.free(visible);
+    try tmp.dir.symLink(std.testing.io, "private/record.txt", "private-link.txt", .{ .is_directory = false });
+    try tmp.dir.symLink(std.testing.io, "public/record.txt", "public-link.txt", .{ .is_directory = false });
+    try tmp.dir.symLink(std.testing.io, "missing.txt", "dangling-link.txt", .{ .is_directory = false });
+
+    var rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("glob"), .pattern = @constCast("private/**"), .action = .deny },
+    };
+    var ctx = tool_dispatch.DispatchContext{
+        .allocator = alloc,
+        .scratch_allocator = alloc,
+        .workspace_root = workspace,
+    };
+    var input = Input{
+        .pattern = try alloc.dupe(u8, "*-link.txt"),
+        .path = try alloc.dupe(u8, "."),
+    };
+    defer input.deinit(alloc);
+
+    for ([_]bool{ false, true }) |filtered| {
+        ctx.permission_rules = if (filtered) .{ .rules = &rules } else .{};
+        input.mode = .matches;
+        var matches = try call(ctx, .{ .ptr = &input, .deinit_fn = noopInputDeinit });
+        defer matches.deinit(alloc);
+        try std.testing.expectEqualStrings(if (filtered)
+            "[glob] 1 matches for *-link.txt\n - public-link.txt\n"
+        else
+            "[glob] 3 matches for *-link.txt\n - dangling-link.txt\n - private-link.txt\n - public-link.txt\n", matches.success);
+
+        input.mode = .count;
+        var count = try call(ctx, .{ .ptr = &input, .deinit_fn = noopInputDeinit });
+        defer count.deinit(alloc);
+        try std.testing.expectEqualStrings(if (filtered)
+            "[glob] count 1 matches for *-link.txt\n"
+        else
+            "[glob] count 3 matches for *-link.txt\n", count.success);
     }
 }
