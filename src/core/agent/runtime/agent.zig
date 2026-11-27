@@ -8,6 +8,7 @@ const debug_trace = @import("../../shared/debug_trace.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const toolbox = @import("../../tooling/toolbox.zig");
 const compactor = @import("../../compactor/compactor.zig");
+const io_mod = @import("../../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -225,7 +226,10 @@ pub const Agent = struct {
                 if (!compactor.replacesPriorContext(entry.summary)) continue;
                 self.toolbox_menu = .{};
                 compactions = entry.compaction_count;
-                const kept = (try compactor.toolboxMenu(arena, entry.summary)) orelse continue;
+                const kept = (try compactor.toolboxMenu(arena, entry.summary)) orelse {
+                    debug_trace.logf("toolbox", "checkpoint without a saved menu compaction={d}: the next request renders one unless a later turn saved one", .{entry.compaction_count});
+                    continue;
+                };
                 self.toolbox_menu.keepSaved(kept.text, kept.entries_hash);
             },
             .assistant => |entry| self.toolbox_menu.restoreTurn(entry.execution, compactions),
@@ -457,9 +461,17 @@ test "after a compaction the menu it saved is sent, and only the notes added aft
 }
 
 test "a checkpoint that saved no menu leaves the next request to render one (D103)" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
+    const trace_path = try std.Io.Dir.path.join(arena, &.{ root, "trace.log" });
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
     const before = menuTurn(.{ .toolbox_menu = .{ .text = @constCast("- review"), .entries_hash = 7 } });
     // An fx from before D103 wrote these: a payload without the field, and
     // the plain summary of an older compactor.
@@ -469,6 +481,9 @@ test "a checkpoint that saved no menu leaves the next request to render one (D10
         try agent.restoreToolboxMenu(arena, &history, null);
         try std.testing.expectEqual(@as(?[]const u8, null), agent.toolbox_menu.get());
     }
+    debug_trace.shutdown();
+    const trace = try tmp.dir.readFileAlloc(io_mod.getIo(), "trace.log", arena, .limited(1 << 16));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, trace, "[toolbox] checkpoint without a saved menu compaction=1: the next request renders one unless a later turn saved one"));
 }
 
 test "a recovered turn's first attempt is the newest saved turn, and a kept menu is never replaced (D103)" {
