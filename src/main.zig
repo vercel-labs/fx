@@ -5674,7 +5674,6 @@ test {
     _ = @import("core/session/session_title_generation.zig");
     _ = @import("ui/footer/agents_menu_presentation.zig");
     _ = @import("ui/footer/compact_command_menu_presentation.zig");
-    _ = @import("ui/footer/mcp_host_menu_presentation.zig");
     _ = @import("ui/footer/settings_menu_presentation.zig");
     _ = @import("builtins/context.zig");
     _ = @import("builtins/gateway.zig");
