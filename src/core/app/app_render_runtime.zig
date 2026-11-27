@@ -1,6 +1,7 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
+const wait_card = @import("../agent/wait_card.zig");
 const workspace_trust = @import("../workspace_trust/workspace_trust.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const app_commands = @import("app_commands.zig");
@@ -895,6 +896,7 @@ pub fn Runtime(comptime App: type) type {
                 .esc_interrupt_armed = app.input_runtime.gestures.escapeInterruptArmed(),
                 .trust_prompt = shownTrustPrompt(app),
                 .question = shownQuestion(app, agent),
+                .wait_card = shownWaitCard(app, agent),
                 .statusline = statusline,
                 .activity = activityProjection(app),
                 .input = &app.input_runtime,
@@ -2096,6 +2098,15 @@ pub fn Runtime(comptime App: type) type {
         fn shownQuestion(app: *const App, agent: *AppAgent) ?question_prompt.Projection {
             if (agentsMenuActive(app)) return null;
             return agent.question_prompt.projection();
+        }
+
+        /// The wait card the agent on screen holds. The open agent list takes
+        /// the footer, and `waitCardFor` holds it under the alternate screen,
+        /// so the card returns when either closes. The Folder access screen
+        /// takes the footer ahead of it and the card returns when it closes.
+        fn shownWaitCard(app: *const App, agent: *const AppAgent) ?*const wait_card.WaitCardPrompt {
+            if (agentsMenuActive(app)) return null;
+            return @import("app_agents_runtime.zig").Runtime(App).waitCardFor(app, agent);
         }
 
         fn shownTrustPrompt(app: *const App) ?*const workspace_trust.prompt.Prompt {

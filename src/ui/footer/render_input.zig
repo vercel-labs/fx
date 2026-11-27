@@ -1,5 +1,6 @@
 const std = @import("std");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
+const wait_card = @import("../../core/agent/wait_card.zig");
 const approval_prompt = @import("../../core/permissions/approval_prompt.zig");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
 const activity_status = @import("../../core/output/activity_status.zig");
@@ -514,6 +515,10 @@ pub const RenderContext = struct {
     /// Shown while the startup folder-access gate asks for trust.
     trust_prompt: ?*const workspace_trust.prompt.Prompt = null,
     question: ?question_prompt.Projection = null,
+    /// The wait a view shows as a card for a subagent's item that only the
+    /// person can continue. It takes the block the question panel takes, and
+    /// never shows beside one.
+    wait_card: ?*const wait_card.WaitCardPrompt = null,
     statusline: ui_render.StatuslineItems = .{},
     activity: ActivityProjection = .none,
     transcript_depth: transcript_presentation.Depth = .inline_mode,

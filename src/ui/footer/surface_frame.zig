@@ -25,6 +25,7 @@ const effort_menu_presentation = @import("effort_menu_presentation.zig");
 const fork_menu_presentation = @import("fork_menu_presentation.zig");
 const agents_menu_presentation = @import("agents_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
+const wait_card_ui = @import("wait_card_ui.zig");
 const trust_prompt_ui = @import("trust_prompt_ui.zig");
 const render_input = @import("render_input.zig");
 const surface_invalidation = @import("surface_invalidation.zig");
@@ -389,14 +390,20 @@ fn buildFooterSurfaceProjection(
         .reservation => null,
         .measurement, .frame => if (!viewer_active and !trust_active and !approval_active) ctx.question else null,
     };
-    const compact_command_menu = if (!viewer_active and !trust_active and !approval_active and question_projection == null)
+    // The wait card takes the block the question panel takes, and only when
+    // no approval, question, or Folder access screen has it.
+    const wait_card_projection = switch (mode) {
+        .reservation => null,
+        .measurement, .frame => if (!viewer_active and !trust_active and !approval_active and question_projection == null) ctx.wait_card else null,
+    };
+    const compact_command_menu = if (!viewer_active and !trust_active and !approval_active and question_projection == null and wait_card_projection == null)
         render_input.activeCompactCommandMenu(ctx)
     else
         null;
     const compact_command_active = compact_command_menu != null;
     const modal_active = !viewer_active and (trust_active or switch (mode) {
         .reservation => approval_active or compact_command_active,
-        .measurement, .frame => approval_active or question_projection != null or compact_command_active,
+        .measurement, .frame => approval_active or question_projection != null or wait_card_projection != null or compact_command_active,
     });
     const input_visible = ctx.composer_visible and !modal_active and !viewer_active;
     const composer_top_chrome_rows = footer_paint_plan.composerTopChromeRows();
@@ -632,6 +639,8 @@ fn buildFooterSurfaceProjection(
             shell.layout.cols,
             question_ui.questionPanelRowBudget(shell.layout.rows, banner_rows),
         )
+    else if (wait_card_projection) |card|
+        wait_card_ui.rowCount(card, question_ui.questionPanelRowBudget(shell.layout.rows, banner_rows))
     else if (compact_command_menu) |menu|
         compact_command_menu_presentation.footerRowCount(menu, shell.layout.cols, shell.layout.rows)
     else if (show_auth_picker)
