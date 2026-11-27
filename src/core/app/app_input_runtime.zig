@@ -2402,7 +2402,7 @@ pub fn Runtime(comptime App: type) type {
         /// catalog, then the inline effort and fast stages. Once neither owns
         /// it (a model was applied, Esc dismissed a stage, or an edit left the
         /// `/model` query), the stashed draft comes back.
-        fn settleModelPickerDraft(app: *App) void {
+        pub fn settleModelPickerDraft(app: *App) void {
             if (app.input_runtime.model_picker_draft == null) return;
             if (modelMenuActive(app) or completion_rt.hasModelQuery(app)) return;
             const leftover_bytes = app.input_runtime.edit_state.input.items.len;
@@ -2986,7 +2986,7 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        fn syncCatalogMenus(app: *App, agent: *AppAgent) void {
+        pub fn syncCatalogMenus(app: *App, agent: *AppAgent) void {
             syncAgentsMenu(app);
             syncSettingsMenu(app);
             syncHelpMenu(app);

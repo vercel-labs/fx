@@ -7,10 +7,13 @@ const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
+const app_input_runtime = @import("app_input_runtime.zig");
+const app_trust_runtime = @import("app_trust_runtime.zig");
 const clipboard_protocol = @import("../../ui/terminal/clipboard_protocol.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_commands = @import("../images/image_commands.zig");
+const input_action = @import("../input/input_action.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 const input_paste_runtime = @import("input_paste_runtime.zig");
 const io_mod = @import("../shared/io.zig");
@@ -110,20 +113,23 @@ pub fn Runtime(comptime App: type) type {
                 .paste_event_text => |target| target,
                 else => return,
             };
-            const target: input_paste_runtime.PasteTarget = .{ .capture = .{
+            const capture: input_paste_runtime.PasteCaptureTarget = .{
                 .owner = kept.owner,
                 .buffer_limit = kept.buffer_limit,
-            } };
+            };
 
             switch (outcome) {
                 .text => |bytes| {
+                    const agent = agents.screenAgentOf(app);
                     try input_paste_runtime.PasteEditRuntime(App).pasteDecodedText(
                         app,
-                        agents.screenAgentOf(app),
-                        target,
+                        agent,
+                        capture,
                         bytes.items,
                         kept.max_input_len,
                     );
+                    app_input_runtime.Runtime(App).syncCatalogMenus(app, agent);
+                    app_input_runtime.Runtime(App).settleModelPickerDraft(app);
                 },
                 .no_text => try app.writeDomainNotice(.{
                     .topic = "input",
@@ -132,11 +138,7 @@ pub fn Runtime(comptime App: type) type {
                 }, true),
                 .denied => try disablePasteEventsAfterDenial(app),
                 .too_large => try reportTextTooLarge(app, kept),
-                .busy => try app.writeDomainNotice(.{
-                    .topic = "input",
-                    .tone = .@"error",
-                    .body = "terminal clipboard is busy; paste again",
-                }, true),
+                .busy => try writeClipboardBusyNotice(app),
                 .timed_out => try app.writeDomainNotice(.{
                     .topic = "input",
                     .tone = .@"error",
@@ -204,23 +206,28 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "openAgentsMenu")) {
                 _ = app_agents_runtime.Runtime(App).closeMenu(app);
             }
+            if (comptime @hasField(App, "trust") and @hasDecl(@TypeOf(app.trust), "asking")) {
+                const paste_start_ingress: input_action.TerminalInputIngress = .{
+                    .event = .{ .action = .{ .action = .paste_start } },
+                };
+                if (try app_trust_runtime.Runtime(App).routeIngress(app, paste_start_ingress)) {
+                    try dropPasteEvent(app, "trust_screen");
+                    return;
+                }
+            }
             if (comptime @hasField(App, "auth") and @hasDecl(@TypeOf(app.auth), "signInEntryActive")) {
-                _ = app_auth_runtime.Runtime(App).routeAuthPickerEscapeAction(app, .paste_start);
+                if (app_auth_runtime.Runtime(App).routeAuthPickerEscapeAction(app, .paste_start)) {
+                    try dropPasteEvent(app, "auth_screen");
+                    return;
+                }
             }
 
             const paste_rt = input_paste_runtime.PasteEditRuntime(App);
             const agent = agents.screenAgentOf(app);
             const limits = inputLimitsForApp(App);
-            const target = paste_rt.resolvePasteTarget(app, agent, limits.composer_bytes);
-            const capture = switch (target) {
-                .capture => |capture| capture,
-                .drop => |reason| {
-                    debug_trace.logf("clipboard", "paste event dropped reason={s}", .{@tagName(reason)});
-                    return;
-                },
-            };
+            const capture = paste_rt.pasteCaptureTarget(app, agent, limits.composer_bytes);
             if (capture.owner == .decision_prompt) {
-                debug_trace.logf("clipboard", "paste event dropped reason=decision_prompt", .{});
+                try dropPasteEvent(app, "decision_prompt");
                 return;
             }
 
@@ -283,11 +290,20 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        fn dropPasteEvent(app: *App, reason: []const u8) !void {
+            debug_trace.logf("clipboard", "paste event dropped reason={s}", .{reason});
+            try app.writeDomainNotice(.{
+                .topic = "input",
+                .tone = .neutral,
+                .body = "this prompt doesn't take pasted text",
+            }, true);
+        }
+
         fn writeClipboardBusyNotice(app: *App) !void {
             try app.writeDomainNotice(.{
                 .topic = "input",
                 .tone = .@"error",
-                .body = "terminal clipboard is busy; paste again",
+                .body = image_commands.terminal_clipboard_busy_notice,
             }, true);
         }
 
@@ -315,6 +331,7 @@ const TestShellRuntime = @import("../../ui/shell_runtime.zig");
 const TestTranscriptRuntime = @import("../../ui/transcript/runtime.zig");
 const TestTypes = @import("../shared/types.zig");
 const TestUiInput = @import("../../ui/input/runtime.zig");
+const TestWorkspaceTrust = @import("../workspace_trust/workspace_trust.zig");
 
 const ClipboardTestFakeApp = struct {
     pub const input_byte_limit: usize = 4096;
@@ -325,6 +342,7 @@ const ClipboardTestFakeApp = struct {
     input_runtime: TestCoreInputRuntime.Runtime = .{},
     shell: TestTranscriptRuntime.TranscriptRuntime = .{},
     terminal: TestShellRuntime.TerminalState = .{},
+    trust: TestWorkspaceTrust.gate.Gate = .{},
     auth: TestAuthRuntime.Runtime = .{},
     main_agent: struct {
         pending_images: TestStd.ArrayList(TestTypes.ImageAttachment) = .empty,
@@ -351,6 +369,7 @@ const ClipboardTestFakeApp = struct {
         self.terminal_input_runtime.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
+        self.trust.deinit(self.alloc);
         self.auth.deinit(self.alloc);
         self.main_agent.question_prompt.deinit(self.alloc);
         self.main_agent.approval_prompt.deinit(self.alloc);
@@ -498,7 +517,7 @@ test "terminal clipboard paste event while Ctrl+V read is open writes busy notic
     try TestStd.testing.expectEqualStrings("", app.writtenBytes());
     try TestStd.testing.expectEqual(@as(usize, 1), app.notice_count);
     try TestStd.testing.expectEqual(TestTypes.NoticeTone.@"error", app.notice_tone.?);
-    try TestStd.testing.expectEqualStrings("terminal clipboard is busy; paste again", app.notice_body.items);
+    try TestStd.testing.expectEqualStrings(image_commands.terminal_clipboard_busy_notice, app.notice_body.items);
     try TestStd.testing.expectEqual(TestUiInput.PendingClipboardRead.ctrl_v_image, app.terminal_input_runtime.pending_clipboard_read);
 }
 
@@ -536,7 +555,7 @@ test "terminal clipboard listing with image/png while question is open requests 
     );
 }
 
-test "terminal clipboard listing while decision prompt is open sends no request" {
+test "terminal clipboard listing while decision prompt is open sends no request and writes notice" {
     const alloc = TestStd.testing.allocator;
     var app = ClipboardTestFakeApp{ .alloc = alloc };
     defer app.deinit();
@@ -555,6 +574,145 @@ test "terminal clipboard listing while decision prompt is open sends no request"
 
     try TestStd.testing.expectEqualStrings("", app.writtenBytes());
     try TestStd.testing.expect(!app.terminal_input_runtime.terminal_clipboard_reader.pending());
+    try TestStd.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try TestStd.testing.expectEqual(TestTypes.NoticeTone.neutral, app.notice_tone.?);
+    try TestStd.testing.expectEqualStrings("this prompt doesn't take pasted text", app.notice_body.items);
+}
+
+test "terminal clipboard listing while trust, API key, or non-code sign-in is open drops with notice" {
+    const alloc = TestStd.testing.allocator;
+
+    // Trust screen active.
+    {
+        var app = ClipboardTestFakeApp{ .alloc = alloc };
+        defer app.deinit();
+        app.attachWriteSink();
+        app.trust = try TestWorkspaceTrust.gate.Gate.open(alloc, "/", null, false);
+
+        try deliverTestListing(&app, ":pw=c2VjcmV0MTIz", "text/plain");
+        try Runtime(ClipboardTestFakeApp).collectFacts(&app);
+
+        try TestStd.testing.expectEqualStrings("", app.writtenBytes());
+        try TestStd.testing.expectEqual(@as(usize, 1), app.notice_count);
+        try TestStd.testing.expectEqual(TestTypes.NoticeTone.neutral, app.notice_tone.?);
+        try TestStd.testing.expectEqualStrings("this prompt doesn't take pasted text", app.notice_body.items);
+    }
+
+    // API key entry active.
+    {
+        var app = ClipboardTestFakeApp{ .alloc = alloc };
+        defer app.deinit();
+        app.attachWriteSink();
+        app.auth.picker_active = true;
+        app.auth.picker_stage = .api_key;
+
+        try deliverTestListing(&app, ":pw=c2VjcmV0MTIz", "text/plain");
+        try Runtime(ClipboardTestFakeApp).collectFacts(&app);
+
+        try TestStd.testing.expectEqualStrings("", app.writtenBytes());
+        try TestStd.testing.expectEqual(@as(usize, 1), app.notice_count);
+        try TestStd.testing.expectEqual(TestTypes.NoticeTone.neutral, app.notice_tone.?);
+        try TestStd.testing.expectEqualStrings("this prompt doesn't take pasted text", app.notice_body.items);
+    }
+
+    // Sign-in screen without manual code entry support.
+    {
+        var app = ClipboardTestFakeApp{ .alloc = alloc };
+        defer app.deinit();
+        app.attachWriteSink();
+        app.auth.picker_active = true;
+        app.auth.picker_stage = .sign_in;
+
+        try deliverTestListing(&app, ":pw=c2VjcmV0MTIz", "text/plain");
+        try Runtime(ClipboardTestFakeApp).collectFacts(&app);
+
+        try TestStd.testing.expectEqualStrings("", app.writtenBytes());
+        try TestStd.testing.expectEqual(@as(usize, 1), app.notice_count);
+        try TestStd.testing.expectEqual(TestTypes.NoticeTone.neutral, app.notice_tone.?);
+        try TestStd.testing.expectEqualStrings("this prompt doesn't take pasted text", app.notice_body.items);
+    }
+}
+
+test "terminal clipboard listing on sign-in toggles code entry and syncs catalog menus after paste" {
+    const alloc = TestStd.testing.allocator;
+    const login_flow = @import("../auth/login_flow.zig");
+    const oauth_transport = @import("../auth/oauth_transport.zig");
+    const oauth = @import("../auth/oauth.zig");
+    const hooks = struct {
+        fn poll(
+            _: ?*anyopaque,
+            _: TestStd.mem.Allocator,
+            _: oauth_transport.Provider,
+            _: oauth.Metadata,
+            _: []const u8,
+            _: []const u8,
+            _: *TestStd.atomic.Value(bool),
+            _: TestStd.Io.Clock.Timestamp,
+        ) !oauth.PollResult {
+            return .pending;
+        }
+        fn accept(_: ?*anyopaque, _: TestStd.mem.Allocator, _: []const u8) !void {}
+    };
+
+    var app = ClipboardTestFakeApp{ .alloc = alloc };
+    defer app.deinit();
+    app.attachWriteSink();
+
+    const prepared: login_flow.PreparedLogin = .{
+        .metadata = .{
+            .issuer = try alloc.dupe(u8, "https://issuer.test"),
+            .device_authorization_endpoint = try alloc.dupe(u8, "https://issuer.test/authorize"),
+            .token_endpoint = try alloc.dupe(u8, "https://issuer.test/token"),
+        },
+        .device = .{
+            .device_code = try alloc.dupe(u8, "device-code"),
+            .user_code = try alloc.dupe(u8, ""),
+            .verification_uri = try alloc.dupe(u8, "https://issuer.test/authorize"),
+            .expires_in = 300,
+            .interval = 1,
+        },
+        .client_id = try alloc.dupe(u8, "client-id"),
+    };
+    try TestStd.testing.expect(try app.auth.sign_in_flow.startPrepared(alloc, prepared, .{
+        .poll = .{ .poll_device_token = hooks.poll },
+        .submit_manual_code = hooks.accept,
+    }));
+    app.auth.picker_active = true;
+    app.auth.picker_stage = .sign_in;
+    app.auth.sign_in_source = .grok_subscription;
+
+    try deliverTestListing(&app, ":pw=c2VjcmV0MTIz", "text/plain");
+    try Runtime(ClipboardTestFakeApp).collectFacts(&app);
+
+    try TestStd.testing.expect(app.auth.signInCodeEntryActive());
+    try TestStd.testing.expectEqualStrings(
+        "\x1b]5522;type=read:pw=c2VjcmV0MTIz:name=UGFzdGUgZXZlbnQ=;dGV4dC9wbGFpbg==\x1b\\",
+        app.writtenBytes(),
+    );
+
+    deliverTestClipboardPacket(&app, "type=read:status=OK");
+    try deliverTestDataChunk(&app, "dGV4dC9wbGFpbg==", "auth-code-123");
+    deliverTestClipboardPacket(&app, "type=read:status=DONE");
+    try Runtime(ClipboardTestFakeApp).collectFacts(&app);
+
+    try TestStd.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+
+    // Also verify syncCatalogMenus runs after composer paste.
+    var sync_app = ClipboardTestFakeApp{ .alloc = alloc };
+    defer sync_app.deinit();
+    sync_app.attachWriteSink();
+    sync_app.input_runtime.settings_menu.open();
+    sync_app.input_runtime.settings_menu.selected_index = 3;
+
+    try deliverTestListing(&sync_app, ":pw=c2VjcmV0MTIz", "text/plain");
+    try Runtime(ClipboardTestFakeApp).collectFacts(&sync_app);
+    deliverTestClipboardPacket(&sync_app, "type=read:status=OK");
+    try deliverTestDataChunk(&sync_app, "dGV4dC9wbGFpbg==", "theme");
+    deliverTestClipboardPacket(&sync_app, "type=read:status=DONE");
+    try Runtime(ClipboardTestFakeApp).collectFacts(&sync_app);
+
+    try TestStd.testing.expectEqualStrings("theme", sync_app.input_runtime.edit_state.input.items);
+    try TestStd.testing.expectEqual(@as(usize, 0), sync_app.input_runtime.settings_menu.selected_index);
 }
 
 test "terminal clipboard empty listing shows notice and sends no request" {
@@ -636,7 +794,7 @@ test "terminal clipboard paste-event image denial disables mode 5522 while Ctrl+
         try TestStd.testing.expect(app.terminal_input_runtime.paste_events_enabled);
         try TestStd.testing.expectEqualStrings("", app.writtenBytes());
         try TestStd.testing.expectEqualStrings(
-            "clipboard access denied; allow it in the terminal and paste again",
+            image_commands.terminal_clipboard_denied_notice,
             app.notice_body.items,
         );
     }

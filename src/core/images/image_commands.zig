@@ -16,6 +16,8 @@ const InsertImageResult = enum { inserted, rejected, input_full };
 const ImageSourceLifetime = enum { retained, temporary };
 
 pub const no_clipboard_image_notice = "no image found on clipboard";
+pub const terminal_clipboard_busy_notice = "terminal clipboard is busy; paste again";
+pub const terminal_clipboard_denied_notice = "clipboard access denied; allow it in the terminal and paste again";
 
 /// `no_image` covers an empty clipboard and an unsupported platform alike, so a
 /// caller can try text next. `handled` means a notice was already shown or the
@@ -175,8 +177,8 @@ pub fn Commands(comptime App: type) type {
                     else
                         "this terminal can't send clipboard images; use kitty or Ghostty 1.4+, or attach a file with /image <path>",
                 },
-                .denied => .{ .topic = "images", .tone = .@"error", .body = "clipboard access denied; allow it in the terminal and paste again" },
-                .busy => .{ .topic = "images", .tone = .@"error", .body = "terminal clipboard is busy; paste again" },
+                .denied => .{ .topic = "images", .tone = .@"error", .body = terminal_clipboard_denied_notice },
+                .busy => .{ .topic = "images", .tone = .@"error", .body = terminal_clipboard_busy_notice },
                 .timed_out => .{ .topic = "images", .tone = .@"error", .body = "terminal didn't send the clipboard image; paste again" },
                 .too_large => return writeImageTooLargeNotice(app),
                 .malformed => .{ .topic = "images", .tone = .@"error", .body = "terminal sent an unreadable clipboard image; paste again" },
