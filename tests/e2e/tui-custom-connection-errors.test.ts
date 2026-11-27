@@ -96,6 +96,13 @@ describe("TUI custom connection errors", () => {
       tui = await TmuxSession.create({ cwd: f.workspace, env: f.env, width: 220, height: 30 });
       await tui.waitForComposer(15000);
       await tui.sendText("/resume");
+      await tui.waitForPane(
+        (pane) =>
+          pane.includes("Sessions 1") &&
+          pane.includes("first turn") &&
+          pane.includes("enter resume"),
+        15000,
+      );
       // The only saved session is selected, so Enter opens it.
       await tui.sendKeys("Enter");
       await tui.waitForText("This session's custom connection changed in ~/.fx/settings.json after the session was saved", 15000);
