@@ -290,6 +290,7 @@ fn ownerHint(key: []const u8) []const u8 {
         .{ .keys = &.{"sound"}, .hint = "set sound.turn_end, sound.attention_required, or sound.max" },
         .{ .keys = &.{"prompt_history"}, .hint = "set prompt_history.enabled" },
         .{ .keys = &.{"tool_placement"}, .hint = "set tool_placement.<tool> to toolbox or direct, for one of " ++ config_runtime.tool_placement.movable_list },
+        .{ .keys = &.{"trusted"}, .hint = profile_paths.displayText("fx sets it when you allow a folder; remove it from the folder's entry in ~/.fx/settings.json to be asked again") },
     };
     for (hints) |entry| {
         for (entry.keys) |name| {
@@ -468,7 +469,8 @@ const files_only_keys = [_][]const u8{
     "enableAllProjectMcpServers", "enabledMcpjsonServers",  "fast_mode_model_bound",
     "grok_model",                 "model",                  "models",
     "permission",                 "providers",              "skill_symlink_authorities",
-    "tool_placement",             "workspaces",             "yolo_acknowledged",
+    "tool_placement",             "trusted",                "workspaces",
+    "yolo_acknowledged",
 };
 
 /// The value a run uses for `key`, read from a state that

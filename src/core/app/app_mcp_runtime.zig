@@ -147,6 +147,7 @@ pub const State = struct {
     /// Set by process-exit teardown before it joins a pending reload, so the
     /// reload discards its candidate runtime without grace or session DELETEs.
     process_exiting: std.atomic.Value(bool) = .init(false),
+    held_for_trust: bool = false,
 
     /// Loads the host at startup with `load`, which reloads use too. The host's
     /// lifecycle is modeled in `tests/tla/mcp_host/HostLifecycle.tla`.
@@ -286,10 +287,21 @@ pub const State = struct {
         self.host_status_at_ms = 0;
     }
 
+    pub fn holdForTrust(self: *State) void {
+        self.held_for_trust = true;
+    }
+
+    pub fn releaseTrustHold(self: *State) void {
+        self.held_for_trust = false;
+        self.startHostServers();
+    }
+
     /// Starts every server in the background, so each is ready before it's
     /// needed. Nothing waits: the host's own thread connects them, and quitting
     /// still signals them all at once.
     pub fn startHostServers(self: *State) void {
+        // Servers wait for the folder access answer (`tests/tla/workspace_trust/WorkspaceTrust.tla` ConsentBeforeSession).
+        if (self.held_for_trust) return;
         const lease = self.leaseHost() orelse return;
         defer lease.deinit();
         self.host_started_ms = io_mod.milliTimestamp();
