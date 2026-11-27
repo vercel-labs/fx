@@ -1391,7 +1391,7 @@ const StoryTally = struct {
         try list.append(scratch, value);
     }
 
-    fn observe(
+    noinline fn observe(
         self: *StoryTally,
         scratch: std.mem.Allocator,
         entry: TranscriptEntry,
@@ -5876,6 +5876,15 @@ pub const TurnRecapTally = struct {
     commands: usize = 0,
     subagent_calls: usize = 0,
 
+    pub const DropRollback = struct {
+        changed_len: usize = 0,
+        read_len: usize = 0,
+        change_calls: usize = 0,
+        diff: DiffTotals = .{},
+        commands: usize = 0,
+        subagent_calls: usize = 0,
+    };
+
     pub fn deinit(self: *TurnRecapTally, alloc: std.mem.Allocator) void {
         for (self.changed_paths.items) |path| alloc.free(path);
         self.changed_paths.deinit(alloc);
@@ -5888,96 +5897,70 @@ pub const TurnRecapTally = struct {
         self.deinit(alloc);
     }
 
-    pub fn observeEntries(
+    pub fn rollback(self: *TurnRecapTally, alloc: std.mem.Allocator, saved: DropRollback) void {
+        for (self.changed_paths.items[saved.changed_len..]) |path| alloc.free(path);
+        self.changed_paths.shrinkRetainingCapacity(saved.changed_len);
+        for (self.read_paths.items[saved.read_len..]) |path| alloc.free(path);
+        self.read_paths.shrinkRetainingCapacity(saved.read_len);
+        self.change_calls = saved.change_calls;
+        self.diff = saved.diff;
+        self.commands = saved.commands;
+        self.subagent_calls = saved.subagent_calls;
+    }
+
+    pub noinline fn stageOpenTurnDrops(
         self: *TurnRecapTally,
         alloc: std.mem.Allocator,
         entries: []const TranscriptEntry,
         details: []const ToolDetailRecord,
-    ) !void {
-        if (entries.len == 0) return;
+        going: *const std.AutoHashMapUnmanaged(u32, void),
+    ) !DropRollback {
+        const saved: DropRollback = .{
+            .changed_len = self.changed_paths.items.len,
+            .read_len = self.read_paths.items.len,
+            .change_calls = self.change_calls,
+            .diff = self.diff,
+            .commands = self.commands,
+            .subagent_calls = self.subagent_calls,
+        };
+        var active_start: usize = 0;
+        var idx = entries.len;
+        while (idx > 0) {
+            idx -= 1;
+            switch (entries[idx]) {
+                .raw_bytes => |raw| if (raw.class == .turn_summary or raw.class == .turn_cancellation) {
+                    active_start = idx + 1;
+                    break;
+                },
+                else => {},
+            }
+        }
         var scratch_state = std.heap.ArenaAllocator.init(alloc);
         defer mem_utils.deinit_arena(scratch_state);
         const scratch = scratch_state.allocator();
 
-        var detail_indices: std.AutoHashMapUnmanaged(u32, usize) = .empty;
-        for (details, 0..) |detail, detail_index| {
-            const result = try detail_indices.getOrPut(scratch, detail.entry_id);
-            if (!result.found_existing) result.value_ptr.* = detail_index;
-        }
+        var detail_indices = try buildDetailIndexMap(scratch, details);
         var tally: StoryTally = .{};
-        for (entries) |entry| {
+        var any = false;
+        for (entries[active_start..]) |entry| {
+            if (entry == .raw_bytes and entry.raw_bytes.lifecycle_pinned) continue;
+            if (!going.contains(entry.id())) continue;
             const entry_id = toolStatusEntryId(entry) orelse continue;
             const detail = detailForEntry(details, &detail_indices, entry_id, null);
             if (statusNamesAsk(entry, detail)) continue;
             try tally.observe(scratch, entry, detail);
+            any = true;
         }
-        try self.reserveAndAdd(alloc, tally);
-    }
-
-    fn reserveAndAdd(self: *TurnRecapTally, alloc: std.mem.Allocator, tally: StoryTally) !void {
-        var new_changed: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (new_changed.items) |path| alloc.free(path);
-            new_changed.deinit(alloc);
-        }
-        for (tally.changed_paths.items) |path| {
-            if (!containsPath(self.changed_paths.items, path) and !containsOwnedPath(new_changed.items, path)) {
-                try new_changed.append(alloc, try alloc.dupe(u8, path));
-            }
-        }
-        var new_reads: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (new_reads.items) |path| alloc.free(path);
-            new_reads.deinit(alloc);
-        }
-        for (tally.read_paths.items) |path| {
-            if (!containsPath(self.read_paths.items, path) and !containsOwnedPath(new_reads.items, path)) {
-                try new_reads.append(alloc, try alloc.dupe(u8, path));
-            }
-        }
-        try self.changed_paths.ensureUnusedCapacity(alloc, new_changed.items.len);
-        try self.read_paths.ensureUnusedCapacity(alloc, new_reads.items.len);
-        self.changed_paths.appendSliceAssumeCapacity(new_changed.items);
-        self.read_paths.appendSliceAssumeCapacity(new_reads.items);
-        new_changed.deinit(alloc);
-        new_reads.deinit(alloc);
+        if (!any) return saved;
+        errdefer self.rollback(alloc, saved);
+        try appendDistinctOwned(&self.changed_paths, alloc, tally.changed_paths.items);
+        try appendDistinctOwned(&self.read_paths, alloc, tally.read_paths.items);
         self.change_calls += tally.change_calls;
         self.diff.added += tally.diff.added;
         self.diff.removed += tally.diff.removed;
         self.commands += tally.commands;
         self.subagent_calls += tally.subagent_calls;
-    }
-
-    pub fn reserveMerge(self: *TurnRecapTally, alloc: std.mem.Allocator, other: TurnRecapTally) !void {
-        try self.changed_paths.ensureUnusedCapacity(alloc, other.changed_paths.items.len);
-        try self.read_paths.ensureUnusedCapacity(alloc, other.read_paths.items.len);
-    }
-
-    /// Merges `other` into `self` without allocating; caller must call
-    /// `reserveMerge` beforehand and `other` is left empty.
-    pub fn mergeAssumeCapacity(self: *TurnRecapTally, alloc: std.mem.Allocator, other: *TurnRecapTally) void {
-        for (other.changed_paths.items) |path| {
-            if (containsOwnedPath(self.changed_paths.items, path)) {
-                alloc.free(path);
-            } else {
-                self.changed_paths.appendAssumeCapacity(path);
-            }
-        }
-        other.changed_paths.clearRetainingCapacity();
-        for (other.read_paths.items) |path| {
-            if (containsOwnedPath(self.read_paths.items, path)) {
-                alloc.free(path);
-            } else {
-                self.read_paths.appendAssumeCapacity(path);
-            }
-        }
-        other.read_paths.clearRetainingCapacity();
-        self.change_calls += other.change_calls;
-        self.diff.added += other.diff.added;
-        self.diff.removed += other.diff.removed;
-        self.commands += other.commands;
-        self.subagent_calls += other.subagent_calls;
-        other.deinit(alloc);
+        return saved;
     }
 
     fn seedInto(self: TurnRecapTally, scratch: std.mem.Allocator, tally: *StoryTally) !void {
@@ -5990,16 +5973,31 @@ pub const TurnRecapTally = struct {
         tally.subagent_calls += self.subagent_calls;
     }
 
-    fn containsPath(list: []const []u8, needle: []const u8) bool {
-        for (list) |item| if (std.mem.eql(u8, item, needle)) return true;
-        return false;
-    }
-
-    fn containsOwnedPath(list: []const []u8, needle: []const u8) bool {
-        for (list) |item| if (std.mem.eql(u8, item, needle)) return true;
-        return false;
+    fn appendDistinctOwned(list: *std.ArrayList([]u8), alloc: std.mem.Allocator, paths: []const []const u8) !void {
+        for (paths) |path| {
+            var found = false;
+            for (list.items) |item| {
+                if (std.mem.eql(u8, item, path)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try list.append(alloc, try alloc.dupe(u8, path));
+        }
     }
 };
+
+fn buildDetailIndexMap(
+    scratch: std.mem.Allocator,
+    details: []const ToolDetailRecord,
+) !std.AutoHashMapUnmanaged(u32, usize) {
+    var detail_indices: std.AutoHashMapUnmanaged(u32, usize) = .empty;
+    for (details, 0..) |detail, detail_index| {
+        const result = try detail_indices.getOrPut(scratch, detail.entry_id);
+        if (!result.found_existing) result.value_ptr.* = detail_index;
+    }
+    return detail_indices;
+}
 
 fn computeTurnRecapText(
     scratch: std.mem.Allocator,
@@ -6034,11 +6032,7 @@ pub fn computeTurnRecapWithSeed(
     defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
-    var detail_indices: std.AutoHashMapUnmanaged(u32, usize) = .empty;
-    for (details, 0..) |detail, detail_index| {
-        const result = try detail_indices.getOrPut(scratch, detail.entry_id);
-        if (!result.found_existing) result.value_ptr.* = detail_index;
-    }
+    var detail_indices = try buildDetailIndexMap(scratch, details);
     const recap = try computeTurnRecapText(scratch, seed, entries, details, &detail_indices, entries.len);
     if (recap.len == 0) return .empty;
     return .{ .text = try alloc.dupe(u8, recap) };

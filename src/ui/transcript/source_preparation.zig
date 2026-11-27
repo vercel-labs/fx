@@ -1181,7 +1181,7 @@ fn prepareTranscriptSourceInternal(
         // prefix for this preparation; it neither uses nor replaces the shared prefix.
         const leading_banner: ?[]u8 = if (comptime @hasField(@TypeOf(self.notebook), "mid_turn_reprint_banner_active"))
             if (self.notebook.mid_turn_reprint_banner_active)
-                try alloc.print("{s}Earlier in this turn: Ctrl+O{s}", .{ ui_render.dim_style, ui_render.reset_style })
+                try std.mem.concat(alloc, u8, &.{ ui_render.dim_style, "Earlier in this turn: Ctrl+O", ui_render.reset_style })
             else
                 null
         else

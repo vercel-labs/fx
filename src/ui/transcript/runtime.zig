@@ -7855,37 +7855,20 @@ pub const TranscriptRuntime = struct {
         if (kept > 0) debug_trace.logf("transcript_window", "drop held entries={d} on screen", .{kept});
         if (ready.items.len == 0) return 0;
 
-        var dropped_tally: tool_group_projection.TurnRecapTally = .{};
-        defer dropped_tally.deinit(alloc);
         var going: transcript_store.EntryIdSet = .empty;
         defer going.deinit(alloc);
         try going.ensureTotalCapacity(alloc, @intCast(ready.items.len));
         for (ready.items) |id| going.putAssumeCapacity(id, {});
 
-        if (window.state.turn_open) {
-            var active_start: usize = 0;
-            var idx = self.notebook.entries.items.len;
-            while (idx > 0) {
-                idx -= 1;
-                switch (self.notebook.entries.items[idx]) {
-                    .raw_bytes => |raw| if (raw.class == .turn_summary or raw.class == .turn_cancellation) {
-                        active_start = idx + 1;
-                        break;
-                    },
-                    else => {},
-                }
-            }
-            var active_dropped: std.ArrayList(TranscriptEntry) = .empty;
-            defer active_dropped.deinit(alloc);
-            for (self.notebook.entries.items[active_start..]) |entry| {
-                const pinned = entry == .raw_bytes and entry.raw_bytes.lifecycle_pinned;
-                if (!pinned and going.contains(entry.id())) try active_dropped.append(alloc, entry);
-            }
-            if (active_dropped.items.len > 0) {
-                try dropped_tally.observeEntries(alloc, active_dropped.items, self.notebook.tool_details.items);
-                try self.notebook.running_turn_recap.reserveMerge(alloc, dropped_tally);
-            }
-        }
+        const recap_rollback: ?tool_group_projection.TurnRecapTally.DropRollback = if (window.state.turn_open)
+            try self.notebook.running_turn_recap.stageOpenTurnDrops(
+                alloc,
+                self.notebook.entries.items,
+                self.notebook.tool_details.items,
+                &going,
+            )
+        else
+            null;
 
         var still_pending: usize = 0;
         for (window.pending_drops.items) |id| {
@@ -7896,6 +7879,7 @@ pub const TranscriptRuntime = struct {
         window.pending_drops.shrinkRetainingCapacity(still_pending);
 
         const changed = transcript_store.dropEntriesAtomic(self, alloc, ready.items) catch |err| {
+            if (recap_rollback) |saved| self.notebook.running_turn_recap.rollback(alloc, saved);
             // Only ids still in the notebook go back, and since a failed drop leaves the notebook as it was, that is every id that left the list.
             var restored: usize = 0;
             for (self.notebook.entries.items) |entry| {
@@ -7906,7 +7890,9 @@ pub const TranscriptRuntime = struct {
             debug_trace.logf("transcript_window", "drop failed: kind={s} kept entries={d} pending reason={s}", .{ kind, restored, @errorName(err) });
             return err;
         };
-        if (changed) self.notebook.running_turn_recap.mergeAssumeCapacity(alloc, &dropped_tally);
+        if (!changed) {
+            if (recap_rollback) |saved| self.notebook.running_turn_recap.rollback(alloc, saved);
+        }
         return ready.items.len;
     }
 

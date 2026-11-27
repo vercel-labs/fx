@@ -968,10 +968,12 @@ pub const TranscriptArchiveRead = struct {
                 }
             };
             var visitor = Visitor{ .task = self };
-            self.damaged = (if (self.request.include_split_prefix)
-                self.reader.visitHistoryCycleWithSplitPrefix(alloc, self.request.start, &visitor)
-            else
-                self.reader.visitHistoryCycle(alloc, self.request.start, &visitor)) catch |err| blk: {
+            self.damaged = self.reader.visitHistoryCycleWithMode(
+                alloc,
+                self.request.start,
+                self.request.include_split_prefix,
+                &visitor,
+            ) catch |err| blk: {
                 self.failure = err;
                 break :blk false;
             };

@@ -425,46 +425,55 @@ pub const ToolActivityState = struct {
         );
     }
 
-    pub fn cleanupEntryIds(
+    const EntryFilter = union(enum) {
+        cleanup_watermark: u64,
+        terminal_unreleased,
+        paused_turn: u64,
+
+        fn matches(self: EntryFilter, entry: *const ToolPresentationRecord) bool {
+            if (entry.pin_released) return false;
+            return switch (self) {
+                .cleanup_watermark => |watermark| entry.id.turn_id <= watermark,
+                .terminal_unreleased => entry.phase == .terminal,
+                .paused_turn => |turn_id| entry.id.turn_id == turn_id,
+            };
+        }
+    };
+
+    fn collectEntryIds(
         self: *const ToolActivityState,
         alloc: std.mem.Allocator,
-        watermark: u64,
+        filter: EntryFilter,
     ) ![]u32 {
         var count: usize = 0;
         var count_iterator = self.records.valueIterator();
         while (count_iterator.next()) |record_ptr| {
-            if (record_ptr.id.turn_id <= watermark and !record_ptr.pin_released) count += 1;
+            if (filter.matches(record_ptr)) count += 1;
         }
-
         const result = try alloc.alloc(u32, count);
         var index: usize = 0;
         var iterator = self.records.valueIterator();
         while (iterator.next()) |record_ptr| {
-            if (record_ptr.id.turn_id > watermark or record_ptr.pin_released) continue;
+            if (!filter.matches(record_ptr)) continue;
             result[index] = record_ptr.entry_id;
             index += 1;
         }
         return result;
     }
 
+    pub fn cleanupEntryIds(
+        self: *const ToolActivityState,
+        alloc: std.mem.Allocator,
+        watermark: u64,
+    ) ![]u32 {
+        return self.collectEntryIds(alloc, .{ .cleanup_watermark = watermark });
+    }
+
     pub fn terminalPinEntryIds(
         self: *const ToolActivityState,
         alloc: std.mem.Allocator,
     ) ![]u32 {
-        var count: usize = 0;
-        var count_iterator = self.records.valueIterator();
-        while (count_iterator.next()) |record_ptr| {
-            if (record_ptr.phase == .terminal and !record_ptr.pin_released) count += 1;
-        }
-        const result = try alloc.alloc(u32, count);
-        var index: usize = 0;
-        var iterator = self.records.valueIterator();
-        while (iterator.next()) |record_ptr| {
-            if (record_ptr.phase != .terminal or record_ptr.pin_released) continue;
-            result[index] = record_ptr.entry_id;
-            index += 1;
-        }
-        return result;
+        return self.collectEntryIds(alloc, .terminal_unreleased);
     }
 
     pub fn markTerminalPinsReleased(self: *ToolActivityState) void {
@@ -479,21 +488,7 @@ pub const ToolActivityState = struct {
         alloc: std.mem.Allocator,
         turn_id: u64,
     ) ![]u32 {
-        var count: usize = 0;
-        var count_iterator = self.records.valueIterator();
-        while (count_iterator.next()) |record_ptr| {
-            if (record_ptr.id.turn_id == turn_id and !record_ptr.pin_released) count += 1;
-        }
-
-        const result = try alloc.alloc(u32, count);
-        var index: usize = 0;
-        var iterator = self.records.valueIterator();
-        while (iterator.next()) |record_ptr| {
-            if (record_ptr.id.turn_id != turn_id or record_ptr.pin_released) continue;
-            result[index] = record_ptr.entry_id;
-            index += 1;
-        }
-        return result;
+        return self.collectEntryIds(alloc, .{ .paused_turn = turn_id });
     }
 
     pub fn releasePausedTurn(

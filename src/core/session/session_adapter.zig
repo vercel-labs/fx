@@ -5011,14 +5011,30 @@ pub const CycleReader = struct {
     /// visited; the next cycle shows it whole (`cycleStart`). Returns true
     /// when reading stopped at a damaged line, so turns are missing.
     pub fn visitHistoryCycle(self: *const CycleReader, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
-        return visitCycle(self.source(), alloc, start, .end_cycle, visitor);
+        return self.visitHistoryCycleWithMode(alloc, start, false, visitor);
     }
 
     /// Like `visitHistoryCycle`, and also hands `visitor` the pre-compaction
     /// pieces of a turn still open at the ending compaction line (for live
     /// Ctrl+O after a mid-turn drop freed them from memory).
     pub fn visitHistoryCycleWithSplitPrefix(self: *const CycleReader, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
-        return visitCycle(self.source(), alloc, start, .end_cycle_with_split_prefix, visitor);
+        return self.visitHistoryCycleWithMode(alloc, start, true, visitor);
+    }
+
+    pub fn visitHistoryCycleWithMode(
+        self: *const CycleReader,
+        alloc: Allocator,
+        start: ?sm.Cursor,
+        include_split_prefix: bool,
+        visitor: anytype,
+    ) !bool {
+        return visitCycle(
+            self.source(),
+            alloc,
+            start,
+            if (include_split_prefix) .end_cycle_with_split_prefix else .end_cycle,
+            visitor,
+        );
     }
 };
 
@@ -11633,6 +11649,64 @@ test "a compaction inside an open turn starts its display cycle at that turn's p
     try visitor.expectPrompts(&.{ "split", "after" });
     try testing.expect(!try cycles.visitHistoryCycleWithSplitPrefix(testing.allocator, null, &visitor));
     try visitor.expectPrompts(&.{ "first", "split" });
+}
+
+test "visitHistoryCycleWithSplitPrefix includes pre-compaction tool calls and results in an open split turn" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const turn_end = try encodePiece(a, .{ .turn_completed = .{} });
+    const id = "1786460757754-split-tools";
+    const imported = try t.store.manager.openImport(.{ .id = id, .workspace = "/w", .host = .ask, .created_ms = 1000 });
+    _ = try imported.appendAt(&.{
+        .turn_started,
+        .{ .item = .{ .type = "user", .data = try encodePiece(a, .{ .user = .{ .text = "before" } }) } },
+        .{ .item = .{ .type = "assistant", .data = try encodePiece(a, .{ .assistant = .{ .text = "before answer" } }) } },
+        .{ .item = .{ .type = "turn_end", .data = turn_end } },
+        .turn_committed,
+        .turn_started,
+        .{ .item = .{ .type = "user", .data = try encodePiece(a, .{ .user = .{ .text = "split_tools_prompt" } }) } },
+        .{ .item = .{ .type = "assistant", .data = try encodePiece(a, .{ .assistant = .{ .text = "pre tool text" } }) } },
+        .{ .item = .{ .type = "tool_call", .data = try encodePiece(a, .{ .tool_call = .{ .call_id = "call_pre_1", .tool_name = "read_file", .arguments_json = "{\"path\":\"pre.txt\"}" } }) } },
+        .{ .item = .{ .type = "tool_result", .data = try encodePiece(a, resultEvent("call_pre_1", "pre contents\n", 100)) } },
+        .{ .compacted = try jsonValue(a, CompactedData{ .summary = "mid-turn summary", .removed_turn_count = 1, .compaction_count = 1 }) },
+        .{ .item = .{ .type = "assistant", .data = try encodePiece(a, .{ .assistant = .{ .text = "post tool text" } }) } },
+        .{ .item = .{ .type = "tool_call", .data = try encodePiece(a, .{ .tool_call = .{ .call_id = "call_post_1", .tool_name = "read_file", .arguments_json = "{\"path\":\"post.txt\"}" } }) } },
+        .{ .item = .{ .type = "tool_result", .data = try encodePiece(a, resultEvent("call_post_1", "post contents\n", 200)) } },
+    }, 2000);
+    try imported.publishImport();
+    imported.release();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    const Visitor = struct {
+        turns: std.ArrayList(types.HistoryTurn) = .empty,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            try self.turns.append(testing.allocator, try types.dupeHistoryTurn(testing.allocator, turn));
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.turns.items) |turn| types.freeHistoryTurn(testing.allocator, turn);
+            self.turns.deinit(testing.allocator);
+        }
+    };
+    var cycles = try r.cycleReader(testing.allocator);
+    defer cycles.deinit();
+    var visitor: Visitor = .{};
+    defer visitor.deinit();
+    try testing.expect(!try cycles.visitHistoryCycleWithSplitPrefix(testing.allocator, null, &visitor));
+    try testing.expectEqual(@as(usize, 2), visitor.turns.items.len);
+    try testing.expectEqualStrings("before", visitor.turns.items[0].assistant.user.text);
+    const split = visitor.turns.items[1].assistant;
+    try testing.expectEqualStrings("split_tools_prompt", split.user.text);
+    try testing.expectEqual(@as(usize, 1), split.execution.tool_steps.len);
+    try testing.expectEqualStrings("pre tool text", split.execution.tool_steps[0].assistant.?);
+    try testing.expectEqualStrings("call_pre_1", split.execution.tool_steps[0].tool_calls[0].id);
+    try testing.expectEqualStrings("pre contents\n", split.execution.tool_steps[0].tool_results[0].output);
 }
 
 test "the history visit shows every turn, even those a compaction summarized" {

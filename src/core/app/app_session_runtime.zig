@@ -3055,6 +3055,11 @@ pub fn Runtime(comptime App: type) type {
                 agent.session.prepareHistoryEntry(app.alloc, turn)
             else
                 types.dupeHistoryTurn(app.alloc, turn)) catch |err| {
+                if (comptime agents.hasAgentField(App, "session_persistence")) {
+                    if (mode == .visual_epoch and agent.session_persistence.v2 != null) {
+                        agent.session_persistence.turn_piece_save_failed = true;
+                    }
+                }
                 return switch (mode) {
                     // In-memory preparation failure (out of memory) cannot be
                     // degraded: the in-memory commit needs the prepared copy.
@@ -3137,6 +3142,7 @@ pub fn Runtime(comptime App: type) type {
                 agent.session_persistence.turn_piece_save_failed = false;
                 return null;
             };
+            agent.session_persistence.turn_piece_save_failed = true;
             switch (mode) {
                 .strict => return failure,
                 .visual_epoch => {
@@ -3144,7 +3150,6 @@ pub fn Runtime(comptime App: type) type {
                     return .uncommitted;
                 },
                 .finished_prompt => {
-                    agent.session_persistence.turn_piece_save_failed = true;
                     recordShutdownFailure(agent, failure);
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
                         var plain_buf: [96]u8 = undefined;
@@ -14595,7 +14600,9 @@ const ArchiveTestApp = struct {
     }
 
     fn describeToolActionCompletedWithAdvertised(_: *ArchiveTestApp, _: anytype, arena: Allocator, call: types.ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
-        return if (display_target) |target| arena.print("● Read {s}", .{target}) else arena.print("● {s}", .{call.name});
+        if (display_target) |target| return arena.print("● Read {s}", .{target});
+        if (std.mem.find(u8, call.arguments_json, "pre_compact.txt") != null) return arena.dupe(u8, "● Read pre_compact.txt");
+        return arena.print("● {s}", .{call.name});
     }
 
     fn describeToolActionDeniedWithAdvertised(_: *ArchiveTestApp, _: anytype, arena: Allocator, call: types.ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
@@ -14705,22 +14712,102 @@ test "Ctrl+O after a mid-turn drop shows the split turn's pre-compaction rows fr
     defer page.deinit(std.heap.c_allocator);
 
     var saw_split_prompt = false;
-    var saw_pre_step = false;
+    var saw_pre_text = false;
+    var saw_pre_tool = false;
     var saw_post_step = false;
     for (page.entries.items) |entry| switch (entry) {
         .user_turn => |u| if (std.mem.find(u8, u.turn.text, "SPLIT_MID_PROMPT") != null) {
             saw_split_prompt = true;
         },
         .assistant_turn => |a| if (std.mem.find(u8, a.segments.text.items, "EARLY_STEP_TEXT") != null) {
-            saw_pre_step = true;
+            saw_pre_text = true;
         },
         .raw_bytes => |r| {
-            if (std.mem.find(u8, r.bytes, "pre_compact.txt") != null) saw_pre_step = true;
+            if (std.mem.find(u8, r.bytes, "pre_compact.txt") != null) saw_pre_tool = true;
             if (std.mem.find(u8, r.bytes, "post_compact.txt") != null) saw_post_step = true;
         },
         else => {},
     };
     try std.testing.expect(saw_split_prompt);
-    try std.testing.expect(saw_pre_step);
+    try std.testing.expect(saw_pre_text);
+    try std.testing.expect(saw_pre_tool);
     try std.testing.expect(saw_post_step);
+}
+
+test "failed strict or visual_epoch history write marks turn_piece_save_failed so mid-turn compaction holds" {
+    const alloc = testing_allocator.no_resize;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    // 1. .visual_epoch failure leaves turn_piece_save_failed = true and prevents mid-turn drop.
+    {
+        var app = try ArchiveTestApp.init(alloc, paths.workspace);
+        defer app.deinit();
+        try configureTestPreferences(&app);
+        try Runtime(ArchiveTestApp).initializePersistence(&app, app.agent(), true);
+        try Runtime(ArchiveTestApp).beginFresh(&app, app.agent(), .later, null);
+        defer Runtime(ArchiveTestApp).closeWritableSession(&app, app.agent());
+
+        try app.shell.enableTranscriptWindow(alloc, true);
+        var metrics: types.Metrics = .{};
+        const prompt = try alloc.dupe(u8, "VE_FAIL_PROMPT");
+        defer alloc.free(prompt);
+        _ = try app.shell.writeUserPromptCard(alloc, &metrics, .{ .text = prompt }, false, &.{});
+        try app.shell.syncTranscriptWindow(alloc);
+
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        app.alloc = failing.allocator();
+        const outcome = try Runtime(ArchiveTestApp).appendFinishedPromptForVisualEpoch(&app, app.agent(), .{
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("VE_FAIL_PROMPT") },
+                .assistant = @constCast("ve answer"),
+            } },
+        });
+        app.alloc = alloc;
+        try std.testing.expectEqual(HistoryAppendOutcome.uncommitted, outcome);
+        try std.testing.expect(app.agent().session_persistence.turn_piece_save_failed);
+
+        const pre_compaction_saved = app.agent().session_persistence.v2 != null and !app.agent().session_persistence.turn_piece_save_failed;
+        try std.testing.expect(!pre_compaction_saved);
+        try app.shell.transcriptWindowCompacted(alloc, pre_compaction_saved);
+        try std.testing.expect(app.shell.notebook.entries.items.len > 0);
+    }
+
+    // 2. .strict commit failure marks turn_piece_save_failed = true and prevents mid-turn drop.
+    {
+        var app = try ArchiveTestApp.init(alloc, paths.workspace);
+        defer app.deinit();
+        try configureTestPreferences(&app);
+        try Runtime(ArchiveTestApp).initializePersistence(&app, app.agent(), true);
+        try Runtime(ArchiveTestApp).beginFresh(&app, app.agent(), .later, null);
+        defer Runtime(ArchiveTestApp).closeWritableSession(&app, app.agent());
+
+        try app.shell.enableTranscriptWindow(alloc, true);
+        var metrics: types.Metrics = .{};
+        const prompt = try alloc.dupe(u8, "STRICT_FAIL_PROMPT");
+        defer alloc.free(prompt);
+        _ = try app.shell.writeUserPromptCard(alloc, &metrics, .{ .text = prompt }, false, &.{});
+        try app.shell.syncTranscriptWindow(alloc);
+
+        // A compacted_summary turn cannot commit via v2.commitTurn (`InvalidConversationFrame`),
+        // exercising the `.strict` error path in `commitV2HistoryTurn`.
+        try std.testing.expectError(
+            error.ConversationCheckpointRequiresSequence,
+            Runtime(ArchiveTestApp).appendHistoryTurn(&app, app.agent(), .{
+                .compacted_summary = .{ .summary = @constCast("invalid strict"), .removed_turn_count = 0, .compaction_count = 1 },
+            }),
+        );
+        try std.testing.expect(app.agent().session_persistence.turn_piece_save_failed);
+        const pre_compaction_saved = app.agent().session_persistence.v2 != null and !app.agent().session_persistence.turn_piece_save_failed;
+        try std.testing.expect(!pre_compaction_saved);
+        try app.shell.transcriptWindowCompacted(alloc, pre_compaction_saved);
+        try std.testing.expect(app.shell.notebook.entries.items.len > 0);
+    }
 }
