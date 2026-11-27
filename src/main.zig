@@ -960,6 +960,21 @@ const App = struct {
         AgentsAppRuntime.requestYields(self);
     }
 
+    /// Lets the turns held for an upgrade's restart return.
+    pub fn releaseTurnYields(self: *App) void {
+        AgentsAppRuntime.releaseYields(self);
+    }
+
+    /// Takes back `requestTurnYields` when the upgrade's restart is cancelled.
+    pub fn cancelTurnYields(self: *App) void {
+        AgentsAppRuntime.cancelYields(self);
+    }
+
+    /// Whether a turn runs that the restart has not already held at its step boundary.
+    pub fn anyTurnUnheld(self: *App) bool {
+        return AgentsAppRuntime.anyTurnUnheld(self);
+    }
+
     /// Whether any agent's turn still runs, which an upgrade's restart waits for.
     pub fn anyTurnRunning(self: *App) bool {
         return AgentsAppRuntime.anyTurnRunning(self);
@@ -1017,6 +1032,10 @@ const App = struct {
 
     pub fn requestResumeHandoffForUpgrade(_: *App, agent: *agents.Agent) void {
         SessionAppRuntime.requestUpgradeResumeHandoff(agent);
+    }
+
+    pub fn cancelResumeHandoffForUpgrade(_: *App, agent: *agents.Agent) void {
+        SessionAppRuntime.cancelUpgradeResumeHandoff(agent);
     }
 
     pub fn takeUpgradeRelaunchRequest(
@@ -5711,7 +5730,7 @@ test {
     _ = @import("core/auth/grok_oauth.zig");
     _ = @import("core/auth/subscription_logout.zig");
     _ = @import("gateway/xai_grok_models.zig");
-    _ = @import("gateway/provider_versions.zig");
+    _ = @import("core/gateway/provider_versions.zig");
     _ = @import("gateway/xai_grok.zig");
     _ = @import("gateway/xai_grok_permission_reviewer.zig");
     _ = credentials;
@@ -5979,6 +5998,24 @@ test "an upgrade waits for agents that need the user, stops instances between st
     try std.testing.expect(!runtime.anySubagentWorking(&app));
     try std.testing.expect(!runtime.anyTurnRunning(&app));
 
+    // A turn held at its step boundary for the restart counts as stopped
+    // for the release, and still runs until it returns.
+    app.main_agent.worker.worker_processing = true;
+    second.agent.worker.worker_processing = true;
+    app.main_agent.worker.yield_held = true;
+    try std.testing.expect(runtime.anyTurnUnheld(&app));
+    second.agent.worker.yield_held = true;
+    try std.testing.expect(!runtime.anyTurnUnheld(&app));
+    try std.testing.expect(runtime.anyTurnRunning(&app));
+    // A subagent is never held, so its work keeps the release waiting.
+    reviewer.agent.worker.worker_processing = true;
+    try std.testing.expect(runtime.anyTurnUnheld(&app));
+    reviewer.agent.worker.worker_processing = false;
+    app.main_agent.worker.yield_held = false;
+    second.agent.worker.yield_held = false;
+    app.main_agent.worker.worker_processing = false;
+    second.agent.worker.worker_processing = false;
+
     // One that waits for the user does, by name.
     try std.testing.expect(try reviewer.agent.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     const waiting = runtime.needsUserElsewhere(&app, &buf).?;
@@ -6005,6 +6042,9 @@ test "an upgrade waits for agents that need the user, stops instances between st
     try std.testing.expect(app.main_agent.worker.yield_requested.load(.seq_cst));
     try std.testing.expect(second.agent.worker.yield_requested.load(.seq_cst));
     try std.testing.expect(!reviewer.agent.worker.yield_requested.load(.seq_cst));
+    runtime.cancelYields(&app);
+    try std.testing.expect(!app.main_agent.worker.yield_requested.load(.seq_cst));
+    try std.testing.expect(!second.agent.worker.yield_requested.load(.seq_cst));
 }
 
 test "an upgrade refuses for queued work of main or another instance, not of a subagent" {

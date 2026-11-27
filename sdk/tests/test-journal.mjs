@@ -2245,6 +2245,53 @@ test("a yielded turn resumed in place after its checkpoint reopens from any cut"
     await reopened.close();
   }
 });
+
+test("a turn the host asks to yield stops before its next model request, and resume() continues it", async () => {
+  let turn;
+  // Asked while its tool runs: the turn's first request is out, so the save
+  // before its next one is its first safe point.
+  const asking = { ...lookup, execute: async (input) => { await turn.yield(); return lookup.execute(input); } };
+  const agent = await createFxEngine(options(sourceBackend, undefined, { persistence: createMemoryPersistence(), tools: [asking] }));
+  const before = requests.length;
+  turn = agent.prompt("use the tool");
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "yielded");
+  assert.equal(requests.length - before, 1, "the request after the tool never went out");
+  const resumed = agent.resume();
+  let text = "";
+  for await (const update of resumed) if (update.type === "text_delta") text += update.delta;
+  assert.equal((await resumed.result).stopReason, "end_turn");
+  assert.equal(text, "tool said beta");
+  assert.equal(requests.length - before, 2, "the resumed turn sent its next request once");
+  assert.equal(toolResults(requests.at(-1)).length, 1, "the model sees the tool's result once");
+  assert.equal(lastUserText(requests.at(-1)), "use the tool", "the model is not told the turn stopped");
+  await agent.close();
+});
+
+test("a yield asked before a turn's first model request lets that request out", async () => {
+  const agent = await createFxEngine(options(sourceBackend, undefined, { persistence: createMemoryPersistence() }));
+  const before = requests.length;
+  // A turn whose only request is its first ends as usual.
+  const answer = agent.prompt("hello there");
+  await answer.yield();
+  for await (const _ of answer) {}
+  assert.equal((await answer.result).stopReason, "end_turn");
+  const tool = agent.prompt("use the tool");
+  await tool.yield();
+  for await (const _ of tool) {}
+  assert.equal((await tool.result).stopReason, "yielded");
+  assert.equal(requests.length - before, 2, "each turn sent its first request, and nothing after the tool");
+  await agent.close();
+});
+
+test("a yield needs persistence to keep the turn in", async () => {
+  const agent = await createFxEngine(options(sourceBackend, undefined));
+  const turn = agent.prompt("hello there");
+  assert.throws(() => turn.yield(), { name: "TypeError", message: "a yield needs persistence to keep the turn in" });
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await agent.close();
+});
 try {
   for (const { name, body } of cases) {
     await body();

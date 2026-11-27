@@ -1725,9 +1725,37 @@ pub fn Runtime(comptime App: type) type {
         /// keep working: the restart waits until they finish
         /// (`anyTurnRunning`), so an upgrade loses none of their work.
         pub fn requestYields(app: *App) void {
-            app.main_agent.worker.requestYield();
+            yieldStepOnRestartAgents(app, .request);
+        }
+
+        /// Lets the turns held for the restart return (`WorkerRuntime.releaseYield`),
+        /// on the agents `requestYields` asked.
+        pub fn releaseYields(app: *App) void {
+            yieldStepOnRestartAgents(app, .release);
+        }
+
+        /// Takes back `requestYields` when the restart is cancelled
+        /// (`WorkerRuntime.cancelYield`).
+        pub fn cancelYields(app: *App) void {
+            yieldStepOnRestartAgents(app, .cancel);
+        }
+
+        const YieldStep = enum { request, release, cancel };
+
+        /// Takes `step` on the workers an upgrade's restart stops between
+        /// steps: main's and the other instances'.
+        fn yieldStepOnRestartAgents(app: *App, comptime step: YieldStep) void {
+            yieldStep(&app.main_agent.worker, step);
             for (app.child_agents.items) |child| {
-                if (child.agent.role == .instance) child.agent.worker.requestYield();
+                if (child.agent.role == .instance) yieldStep(&child.agent.worker, step);
+            }
+        }
+
+        fn yieldStep(worker: anytype, comptime step: YieldStep) void {
+            switch (step) {
+                .request => worker.requestYield(),
+                .release => worker.releaseYield(),
+                .cancel => worker.cancelYield(),
             }
         }
 
@@ -1737,14 +1765,30 @@ pub fn Runtime(comptime App: type) type {
         /// for the main loop to deliver it. An upgrade's restart waits until
         /// none does.
         pub fn anyTurnRunning(app: *App) bool {
-            if (app.main_agent.worker.isProcessing() or app.main_agent.worker.hasPendingEvents()) return true;
+            return anyTurnBusy(app, false);
+        }
+
+        /// As `anyTurnRunning`, with a turn held at its step boundary for the
+        /// restart counted as stopped: the restart lets the held turns return
+        /// once this is false (`tests/tla/recovery/RestartWait.tla` Release).
+        pub fn anyTurnUnheld(app: *App) bool {
+            return anyTurnBusy(app, true);
+        }
+
+        fn anyTurnBusy(app: *App, comptime held_counts_as_stopped: bool) bool {
+            if (workerBusy(&app.main_agent.worker, held_counts_as_stopped)) return true;
             for (app.child_agents.items) |child| {
                 const worker = &child.agent.worker;
-                if (worker.isProcessing() or worker.hasPendingEvents()) return true;
+                if (workerBusy(worker, held_counts_as_stopped)) return true;
                 // Only instances hold their queued work, so a subagent's runs.
                 if (child.agent.role == .subagent and worker.queuedPromptCount() > 0) return true;
             }
             return deliveriesPending(app, null);
+        }
+
+        fn workerBusy(worker: anytype, comptime held_counts_as_stopped: bool) bool {
+            const runs = if (held_counts_as_stopped) worker.turnActivity() == .running else worker.isProcessing();
+            return runs or worker.hasPendingEvents();
         }
 
         /// Whether a subagent runs work, has work queued, or holds events

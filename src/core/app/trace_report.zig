@@ -32,6 +32,7 @@
 //! ## Records
 //!
 //! - `fx_trace`: `format_version` (1), `fx_version`, `git_commit`,
+//!   `update_channel` (`stable` or `dev`, the build's update channel),
 //!   `written_at`, and `notice`, the privacy warning.
 //! - `fatal_error`: only in a crash report, right after the header: `error`,
 //!   the error's name, `message`, the same plain words fx shows, and `at`, the
@@ -141,7 +142,12 @@
 //!   `kind`, `source`, `error`, `status`, `duration_ms`, `response_bytes`,
 //!   `input_tokens`, `output_tokens`, `web_search_requests` (web search calls
 //!   only), `stop_reason`, `provider_stop_reason`, `turn_id`, `step_id`, and
-//!   the masked `gateway_error`, `gateway_schema`, and `request_shape`.
+//!   the masked `gateway_error`, `gateway_schema`, and `request_shape`. A
+//!   gateway call that got a provider result also has `generation_id` (the
+//!   gateway's ID for the generation), `served_by` (the provider that served
+//!   it), and `effort` (the reasoning effort the request sent). The first two
+//!   are cut to 256 bytes and `effort` to 64; each is left out when unknown or
+//!   unsent.
 //!   The `network` record also has `kept_failures`, the failed calls kept
 //!   apart from the ring, at most 32, which later successful calls never
 //!   push out (0 when none failed); `session.errors` counts every failed
@@ -611,6 +617,7 @@ fn writeHeader(r: *Records, fx_version: []const u8, now_ms: i64) !void {
     try r.number("format_version", format_version);
     try r.text("fx_version", fx_version);
     try r.text("git_commit", build_options.git_commit);
+    try r.text("update_channel", build_options.update_channel);
     try r.time("written_at", now_ms);
     try r.text("notice", notice_text);
     try r.end();
@@ -1618,6 +1625,9 @@ fn writeNetworkCallFields(r: *Records, call: *const diagnostics.NetworkCall) !vo
     try r.optionalText("provider_stop_reason", call.providerStopReason());
     if (call.turn_id != 0) try r.number("turn_id", call.turn_id);
     if (call.step_id != 0) try r.number("step_id", call.step_id);
+    try r.optionalText("generation_id", call.generationId());
+    try r.optionalText("served_by", call.servedBy());
+    try r.optionalText("effort", call.effort());
     // Gateway text comes from outside fx, so it is masked like tool output.
     try r.optionalMasked("gateway_error", call.gatewayErrorMessage());
     try r.optionalMasked("gateway_schema", call.gatewaySchemaDiagnostic());
@@ -3233,6 +3243,52 @@ test "trace header and end records frame the file" {
     const last = trace.records[trace.records.len - 1];
     try std.testing.expectEqualStrings("end", try testString(last, "type"));
     try std.testing.expectEqual(@as(i64, 2), try testInt(last, "records"));
+}
+
+test "trace header names the build's update channel" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeHeader(&w.records, "9.9.9", 1_700_000_000_123);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings(build_options.update_channel, try testString(trace.records[0], "update_channel"));
+}
+
+test "network call record writes the generation, served-by, and effort the request sent" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var call: diagnostics.NetworkCall = .{ .started_at_ms = 1_700_000_000_123, .status = 200 };
+    call.setModel("provider/model-a");
+    call.setGenerationId("gen_01JC7P5XQ2M8VZ");
+    call.setServedBy("bedrock");
+    call.setEffort("high");
+    try w.records.begin("network_call");
+    try writeNetworkCallFields(&w.records, &call);
+    try w.records.end();
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    const record = try trace.one("network_call");
+    try std.testing.expectEqualStrings("gen_01JC7P5XQ2M8VZ", try testString(record, "generation_id"));
+    try std.testing.expectEqualStrings("bedrock", try testString(record, "served_by"));
+    try std.testing.expectEqualStrings("high", try testString(record, "effort"));
+}
+
+test "network call record leaves out the generation, served-by, and effort when none were sent" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var call: diagnostics.NetworkCall = .{ .started_at_ms = 1_700_000_000_123, .status = 200 };
+    call.setModel("provider/model-a");
+    try w.records.begin("network_call");
+    try writeNetworkCallFields(&w.records, &call);
+    try w.records.end();
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    const record = try trace.one("network_call");
+    try expectAbsent(record, "generation_id");
+    try expectAbsent(record, "served_by");
+    try expectAbsent(record, "effort");
 }
 
 test "fatal error record names the error and the words fx shows" {
