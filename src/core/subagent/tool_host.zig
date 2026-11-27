@@ -1298,6 +1298,7 @@ pub const Runtime = struct {
             if (worker.waitForPostOrNudgeTimeout(recheck)) |wake| return wake;
         }
         if (self.nothingCanArrive(worker)) return null;
+        end_test_controls.noteWaitBlocking();
         return worker.waitForPostOrNudge();
     }
 
@@ -7613,8 +7614,8 @@ const SettleGap = struct {
     }
 };
 
-/// A trace file for the `mailbox` scope, which a test reads to see that a
-/// `wait` has looked and is about to block (`wait_begin`).
+/// A trace file for the `mailbox` scope, which the host's trace lines go to in
+/// these tests.
 const GapTrace = struct {
     tmp: std.testing.TmpDir,
     path: []u8,
@@ -7634,15 +7635,6 @@ const GapTrace = struct {
         debug_trace.resetForTest();
         alloc.free(self.path);
         self.tmp.cleanup();
-    }
-
-    fn waitFor(self: *const GapTrace, needle: []const u8) !void {
-        for (0..5000) |_| {
-            if (self.has(needle)) return;
-            io_mod.sleep(std.time.ns_per_ms);
-        }
-        std.debug.print("gap trace never showed {s}\n", .{needle});
-        return error.Timeout;
     }
 
     /// Reads the first 64 KiB, which holds every line a test of this scope
@@ -7751,6 +7743,25 @@ const GapFixture = struct {
     }
 };
 
+/// Set once a `wait` has found that something can still arrive and is about
+/// to block (`end_test_controls.noteWaitBlocking`).
+const WaitBlocking = struct {
+    var blocked: std.Io.Event = .unset;
+
+    fn arm() void {
+        blocked = .unset;
+        end_test_controls.test_wait_blocking = note;
+    }
+
+    fn disarm() void {
+        end_test_controls.test_wait_blocking = null;
+    }
+
+    fn note() void {
+        blocked.set(io_mod.getIo());
+    }
+};
+
 /// One `wait` call on its own thread, as main's worker makes it.
 const GapWait = struct {
     runtime: *Runtime,
@@ -7777,15 +7788,21 @@ const GapWait = struct {
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
-    /// Starts the wait, then waits for its trace line, which it writes once it
-    /// has read that a child works and before it blocks.
-    fn startBlocked(self: *GapWait, trace: *const GapTrace) !void {
+    /// Starts the wait, and returns once it is about to block: the host has
+    /// found that something can still arrive and sends `noteWaitBlocking`
+    /// right before it blocks. The wait's thread is joined on failure.
+    fn startBlocked(self: *GapWait) !void {
+        WaitBlocking.arm();
+        errdefer WaitBlocking.disarm();
         try self.start();
-        trace.waitFor("wait_begin") catch {
+        WaitBlocking.blocked.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
+            WaitBlocking.disarm();
             self.worker.requestCancel();
             self.thread.join();
-            return error.WaitNeverBegan;
+            std.debug.print("wait never blocked\n", .{});
+            return error.WaitNeverBlocked;
         };
+        WaitBlocking.disarm();
     }
 
     /// Joins the wait's thread and returns what it said, which the caller
@@ -7826,7 +7843,7 @@ fn waitInSettleGap(gap: *GapFixture) ![]u8 {
         return error.HostNeverReachedTheGap;
     };
     var waiting = GapWait{ .runtime = gap.runtime, .worker = &gap.worker };
-    try waiting.startBlocked(&gap.trace);
+    try waiting.startBlocked();
     SettleGap.go.set(io_mod.getIo());
     return waiting.finish();
 }
@@ -7942,7 +7959,7 @@ test "a wait that starts before and after the user's turn on a closing subagent 
     defer std.testing.allocator.free(work_id);
     // The user's turn keeps the subagent working, so this wait blocks.
     var waiting = GapWait{ .runtime = gap.runtime, .worker = &gap.worker, .child_id = child_id };
-    try waiting.startBlocked(&gap.trace);
+    try waiting.startBlocked();
     // The parent closes the subagent meanwhile, and the turn then ends.
     const closed = (try gap.runtime.closeChild(child_id, .parent)).?;
     try std.testing.expect(closed.stopped);

@@ -32,6 +32,10 @@
 //! A fourth hold sits in the host, after it has finished a turn that ended
 //! before its work opened, with the lock released, and before it settles the
 //! child again (`holdInSettle`). Test builds only: no file control sets it.
+//!
+//! A note, not a hold, reaches a test from the host's `wait` once it has found
+//! that something can still arrive and is about to block (`noteWaitBlocking`).
+//! Test builds only: no file control sets it.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -147,6 +151,20 @@ pub fn holdBeforeCloseSettle(child_id: []const u8) void {
     }
 }
 
+/// Test builds only: an inline test sets it to learn when a `wait` has found
+/// that something can still arrive and is about to block. No file control
+/// sets it.
+pub var test_wait_blocking: if (builtin.is_test) ?*const fn () void else void = if (builtin.is_test) null else {};
+
+/// Called by the host when a `wait` has found that something can still
+/// arrive, right before it blocks.
+pub fn noteWaitBlocking() void {
+    if (comptime build_options.libfx) return;
+    if (builtin.is_test) {
+        if (test_wait_blocking) |note| note();
+    }
+}
+
 /// Test builds only: an inline test sets it to hold the host after it has
 /// finished a turn that ended before its work opened, with the lock released
 /// and before it settles the child again, so a close or a turn can land in
@@ -253,4 +271,10 @@ test "a test build holds the end of a user's turn before it settles a close only
     // Without a hook the host's call returns at once.
     try std.testing.expect(test_hold_close_settle == null);
     holdBeforeCloseSettle("child");
+}
+
+test "a test build notes a blocking wait only through its hook" {
+    // Without a hook the host's call returns at once.
+    try std.testing.expect(test_wait_blocking == null);
+    noteWaitBlocking();
 }
