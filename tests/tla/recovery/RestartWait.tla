@@ -205,6 +205,25 @@ IdleExitEarly ==
     /\ wait' = "exited"
     /\ UNCHANGED <<st, asked, released>>
 
+\* Ctrl+G while stopping now would lose or cut off work: queued prompts, a
+\* draft, a sent prompt, an answer an agent waits for, or an open view. It
+\* never refuses: no turn is asked to stop, and fx restarts at the next idle
+\* moment (app_upgrade_runtime.zig restartBlocked). Which work is in the way
+\* is outside this model, so the action can happen at any time.
+CtrlGBusy ==
+    /\ wait = "none"
+    /\ wait' = "when_idle"
+    /\ UNCHANGED <<st, asked, released>>
+
+\* Planted defect: a busy Ctrl+G still asks the turns to stop, so queued or
+\* typed work waits behind held turns. A config plants it with
+\* CtrlGBusy <- CtrlGBusyAsks.
+CtrlGBusyAsks ==
+    /\ wait = "none"
+    /\ wait' = "when_idle"
+    /\ asked' = All
+    /\ UNCHANGED <<st, released>>
+
 \* Ctrl+G while the restart waits for idle cancels it.
 CancelWhenIdle ==
     /\ wait = "when_idle"
@@ -216,7 +235,7 @@ Next ==
           \/ Start(a) \/ End(a) \/ Boundary(a) \/ Hold(a) \/ SaveFails(a)
           \/ Return(a) \/ Esc(a)
     \/ CtrlG \/ Release \/ Exit \/ Cancel \/ Done
-    \/ Submit \/ IdleExit \/ CancelWhenIdle
+    \/ Submit \/ IdleExit \/ CancelWhenIdle \/ CtrlGBusy
 
 \* fx's own steps happen; the person's (Start, Esc, CtrlG, Cancel) and a
 \* turn's own end may not.
