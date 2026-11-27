@@ -14366,13 +14366,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.recovery?.message).toStartWith(
         "\u26a0 Blocked by the provider's cyber policy \u00b7 cyber_policy: This content was flagged",
       );
-      expect(gateway.requestCount()).toBe(1);
+      expect(gateway.requestCount()).toBe(4);
+      for (const count of [1, 2, 3]) {
+        expect(result.stderr).toContain(`[notice] Blocked by the content filter · retrying (${count}/3)\n`);
+      }
       // The whole provider message, with its guidance and link, reaches the person once.
       expect(result.stderr).toContain(
         `[notice] Blocked by the provider's cyber policy \u00b7 cyber_policy: ${cyberPolicyMessage}\n`,
       );
       expect(result.stderr.split("cyber permissive safeguards").length - 1).toBe(1);
-      expect(trace).not.toContain("event=content_filter_resend");
+      expect(trace.split("event=content_filter_resend").length - 1).toBe(3);
       expect(trace).not.toContain("event=before_tool_execution");
       expect(existsSync(join(root.workspace, "blocked.py"))).toBe(false);
     } finally {
@@ -14403,7 +14406,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.recovery?.message).toStartWith(
         "\u26a0 Blocked by the provider's cyber policy \u00b7 HTTP 400 \u00b7 cyber_policy: This content was flagged",
       );
-      expect(gateway.requestCount()).toBe(1);
+      expect(gateway.requestCount()).toBe(4);
+      for (const count of [1, 2, 3]) {
+        expect(result.stderr).toContain(`[notice] Blocked by the content filter · retrying (${count}/3)\n`);
+      }
       expect(result.stderr).toContain(cyberPolicyMessage);
     } finally {
       gateway.stop();
@@ -14416,13 +14422,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const root = createFixtureRoot(`post-tool-cyber-policy-${path}`);
       const tracePath = join(root.root, "trace.log");
       writeFileSync(join(root.workspace, "notes.txt"), "notes\n");
-      const responses = [
-        () => fakeGatewayToolCall("notes_1", "read_file", { path: "notes.txt" }),
-        () => path === "HTTP"
+      let requests = 0;
+      const gateway = startGateway(() => {
+        requests += 1;
+        if (requests === 1) {
+          return fakeGatewayToolCall("notes_1", "read_file", { path: "notes.txt" });
+        }
+        return path === "HTTP"
           ? cyberPolicyHttpResponse()
-          : streamedErrorAfterPartialToolResponse({ type: "cyber_policy", message: cyberPolicyMessage }),
-      ];
-      const gateway = startGateway(() => (responses.shift() ?? (() => new Response("unexpected request", { status: 500 })))());
+          : streamedErrorAfterPartialToolResponse({ type: "cyber_policy", message: cyberPolicyMessage });
+      });
       try {
         const result = await runFx(
           ["ask", "--json", "--auto", "--no-save", "Read the notes."],
@@ -14433,9 +14442,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
         expect(result.code).toBe(1);
         expect(json.recovery?.cause).toBe("cyber_policy");
-        expect(gateway.requestCount()).toBe(2);
+        expect(gateway.requestCount()).toBe(5);
         expect(trace).not.toContain("assistant_prefill_recovery");
-        expect(trace).not.toContain("event=content_filter_resend");
+        expect(trace.split("event=content_filter_resend").length - 1).toBe(3);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -14449,14 +14458,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     writeFileSync(join(root.workspace, "notes.txt"), "notes\n");
     const message = "This content was flagged for possible cybersecurity risk. " +
       "This model does not support assistant message prefill. The conversation must end with a user message.";
-    const responses = [
-      () => fakeGatewayToolCall("notes_1", "read_file", { path: "notes.txt" }),
-      () => new Response(JSON.stringify({ error: { type: "cyber_policy", message } }), {
+    let requests = 0;
+    const gateway = startGateway(() => {
+      requests += 1;
+      if (requests === 1) {
+        return fakeGatewayToolCall("notes_1", "read_file", { path: "notes.txt" });
+      }
+      return new Response(JSON.stringify({ error: { type: "cyber_policy", message } }), {
         status: 400,
         headers: { "content-type": "application/json" },
-      }),
-    ];
-    const gateway = startGateway(() => (responses.shift() ?? (() => new Response("unexpected request", { status: 500 })))());
+      });
+    });
     try {
       const result = await runFx(
         ["ask", "--json", "--auto", "--no-save", "Read the notes."],
@@ -14466,7 +14478,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
       expect(result.code).toBe(1);
       expect(json.recovery?.cause).toBe("cyber_policy");
-      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requestCount()).toBe(5);
       expect(readFileSync(tracePath, "utf8")).not.toContain("assistant_prefill_recovery");
     } finally {
       gateway.stop();
@@ -14493,7 +14505,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
       expect(result.code).toBe(1);
       expect(json.recovery?.cause).toBe("cyber_policy");
-      expect(gateway.requestCount()).toBe(1);
+      expect(gateway.requestCount()).toBe(4);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -14518,8 +14530,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
       expect(result.code).toBe(1);
       expect(json.recovery?.cause).toBe("cyber_policy");
-      expect(gateway.requestCount()).toBe(1);
-      expect(readFileSync(tracePath, "utf8")).not.toContain("event=content_filter_resend");
+      expect(gateway.requestCount()).toBe(4);
+      expect(readFileSync(tracePath, "utf8").split("event=content_filter_resend").length - 1).toBe(3);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

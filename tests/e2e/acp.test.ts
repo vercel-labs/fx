@@ -14744,7 +14744,7 @@ for (const variant of ["post-tool HTTP", "post-tool stream", "first stream"] as 
       if (created.error) throw new Error(JSON.stringify(created));
       sendPrompt(client, 3, "inspect the notes");
       const messages = await readUntilResponses(client, [3]);
-      const blockedRequests = variant === "first stream" ? 1 : 2;
+      const blockedRequests = variant === "first stream" ? 4 : 5;
       expect(gateway.requests).toHaveLength(blockedRequests);
       expect(JSON.stringify(messages)).toContain('"cause":"cyber_policy"');
       const trace = readFileSync(tracePath, "utf8");
