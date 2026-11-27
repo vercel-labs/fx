@@ -1,5 +1,6 @@
 const std = @import("std");
 const input_action = @import("../../core/input/input_action.zig");
+const key_chord = @import("../../core/input/key_chord.zig");
 
 const InputEscapeAction = input_action.Action;
 const MousePointerKind = input_action.MousePointerKind;
@@ -489,6 +490,19 @@ pub fn consumeInputEscapeByteWithMouse(
     mouse: *MouseInput,
     byte: u8,
 ) ?InputEscapeAction {
+    var chord: ?key_chord.Chord = null;
+    return consumeKeyReport(stage, param, param2, mouse, byte, &chord);
+}
+
+pub fn consumeKeyReport(
+    stage: *u8,
+    param: *u16,
+    param2: *u16,
+    mouse: *MouseInput,
+    byte: u8,
+    chord: *?key_chord.Chord,
+) ?InputEscapeAction {
+    chord.* = null;
     const base_stage = baseEscapeStage(stage.*);
     if (base_stage == 0) return null;
     if (byte == 0x1b and base_stage != 1 and !isLegacyX10PayloadStage(stage.*)) {
@@ -501,6 +515,7 @@ pub fn consumeInputEscapeByteWithMouse(
 
     switch (base_stage) {
         1 => {
+            chord.* = if (hasMetaPrefix(stage.*)) null else key_chord.fromLegacyAlt(byte);
             if (byte == '[') {
                 setBaseEscapeStage(stage, 2);
                 param.* = 0;
@@ -561,6 +576,7 @@ pub fn consumeInputEscapeByteWithMouse(
             return .ignore;
         },
         2 => {
+            chord.* = key_chord.fromNavigationFinal(byte, 0, hasMetaPrefix(stage.*));
             const meta_prefixed = hasMetaPrefix(stage.*);
             const action: ?InputEscapeAction = switch (byte) {
                 'A', 'B', 'C', 'D' => if (meta_prefixed)
@@ -623,6 +639,7 @@ pub fn consumeInputEscapeByteWithMouse(
 
             const value = param.*;
             const digit_count = param2.*;
+            chord.* = key_chord.fromTildeCode(value, 0, hasMetaPrefix(stage.*));
             resetMouseEscapeDecode(stage, param, param2, mouse);
             if (digit_count == 3 and value == 200) return .paste_start;
             if (digit_count == 3 and value == 201) return .paste_end;
@@ -637,6 +654,7 @@ pub fn consumeInputEscapeByteWithMouse(
             };
         },
         4 => {
+            chord.* = key_chord.fromSs3Final(byte, hasMetaPrefix(stage.*));
             const meta_prefixed = hasMetaPrefix(stage.*);
             const action: InputEscapeAction = switch (byte) {
                 'A', 'B', 'C', 'D' => if (meta_prefixed)
@@ -689,6 +707,7 @@ pub fn consumeInputEscapeByteWithMouse(
                 const meta_prefixed = hasMetaPrefix(stage.*);
                 const keycode = param2.*;
                 const modifiers = if (param.* > 0) param.* - 1 else 0;
+                chord.* = key_chord.fromKitty(keycode, modifiers, meta_prefixed);
                 resetMouseEscapeDecode(stage, param, param2, mouse);
                 return kittyUnicodeKeyAction(keycode, modifiers, meta_prefixed);
             }
@@ -696,6 +715,7 @@ pub fn consumeInputEscapeByteWithMouse(
             if (byte == '~') {
                 const keycode = param2.*;
                 const modifiers = if (param.* > 0) param.* - 1 else 0;
+                chord.* = key_chord.fromTildeCode(keycode, modifiers, hasMetaPrefix(stage.*));
                 resetMouseEscapeDecode(stage, param, param2, mouse);
                 if (keycode == 3) return forwardDeleteKeyAction(modifiers);
                 if (modifiers != 0) return switch (keycode) {
@@ -722,6 +742,7 @@ pub fn consumeInputEscapeByteWithMouse(
 
             const meta_prefixed = hasMetaPrefix(stage.*);
             const modifiers = if (param.* > 0) param.* - 1 else 0;
+            chord.* = key_chord.fromNavigationFinal(byte, modifiers, meta_prefixed);
             if (byte == 'Z' and modifiers != 0) {
                 resetMouseEscapeDecode(stage, param, param2, mouse);
                 return .toggle_permission_mode;
@@ -749,6 +770,7 @@ pub fn consumeInputEscapeByteWithMouse(
                 const meta_prefixed = hasMetaPrefix(stage.*);
                 const keycode = param.*;
                 const modifiers = if (param2.* > 0) param2.* - 1 else 0;
+                chord.* = key_chord.fromKitty(keycode, modifiers, meta_prefixed);
                 resetMouseEscapeDecode(stage, param, param2, mouse);
                 return kittyUnicodeKeyAction(keycode, modifiers, meta_prefixed);
             }
@@ -774,6 +796,7 @@ pub fn consumeInputEscapeByteWithMouse(
                 const event_type = param.* & 0x0F;
                 resetMouseEscapeDecode(stage, param, param2, mouse);
                 if (event_type == 1 or event_type == 2) {
+                    chord.* = key_chord.fromKitty(keycode, modifiers, meta_prefixed);
                     return kittyUnicodeKeyAction(keycode, modifiers, meta_prefixed);
                 }
                 return .ignore;

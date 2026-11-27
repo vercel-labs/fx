@@ -360,6 +360,16 @@ pub const HostWorkspaceContext = struct {
     home: []const u8,
 };
 
+/// The selection this turn's requests use. Names only: a provider's name and a
+/// model id, never a provider binding, endpoint, or credential.
+pub const EffectiveSelection = struct {
+    provider: []const u8,
+    model: []const u8,
+    effort: []const u8,
+    fast_mode: bool,
+    ultrafast_mode: bool,
+};
+
 pub const TransientContextInput = struct {
     workspace_root: []const u8,
     host_workspace: ?HostWorkspaceContext = null,
@@ -370,6 +380,9 @@ pub const TransientContextInput = struct {
     /// host (`Runtime.teamNote` in src/core/subagent/tool_host.zig); null
     /// when it has none.
     subagents: ?[]const u8 = null,
+    /// The provider, model, and speed this turn's requests use. Null when the
+    /// host cannot name them, in which case no selection block is written.
+    effective_selection: ?EffectiveSelection = null,
 };
 
 pub const Provider = struct {

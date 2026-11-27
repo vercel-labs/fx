@@ -1151,6 +1151,9 @@ pub fn Runtime(comptime App: type) type {
                 if (app_session_runtime.Runtime(App).ownSubagentHost(agent)) |team_host| try team_host.teamNote(arena, agent.worker.activeTurnId()) else null
             else
                 null;
+            // The turn's own selection, copied from its queued prompt when the turn
+            // started, so the note names what its requests use. Null between turns.
+            const turn_selection = agent.worker.activeTurnSelection();
             try app.contextRegistry().appendDefaultTransient(.{
                 .workspace_root = workspace.root,
                 .host_workspace = if (host_workspace) |info| .{
@@ -1162,6 +1165,13 @@ pub fn Runtime(comptime App: type) type {
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
                 .subagents = subagents,
+                .effective_selection = if (turn_selection) |*selection| .{
+                    .provider = selection.provider.label(),
+                    .model = selection.model(),
+                    .effort = selection.effort.label(),
+                    .fast_mode = selection.fast_mode,
+                    .ultrafast_mode = selection.ultrafast_mode,
+                } else null,
             }, arena, messages);
         }
 
@@ -1261,6 +1271,12 @@ pub fn Runtime(comptime App: type) type {
             defer agent.worker.active_context_snapshot = null;
             agent.worker.setActiveAgentTurnSettings(job.agent_settings);
             defer agent.worker.clearActiveAgentTurnSettings();
+            // Optional context: a selection the copy cannot hold leaves the note
+            // out for this turn, and the turn runs exactly as before.
+            if (worker_runtime.ActiveTurnSelection.init(job.provider, job.model, job.agent_settings)) |selection| {
+                agent.worker.setActiveTurnSelection(selection);
+            } else |_| {}
+            defer agent.worker.clearActiveTurnSelection();
             var preflight_context_notices: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
             defer preflight_context_notices.deinit();
             for (job.context_snapshot.notices) |notice| {

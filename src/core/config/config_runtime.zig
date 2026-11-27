@@ -16,6 +16,7 @@ const configured_provider = @import("configured_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
 pub const tool_placement = @import("tool_placement.zig");
+const shortcut_map = @import("shortcut_map.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -55,6 +56,12 @@ pub const Settings = struct {
     context_limits: context_limits.Overrides = .{},
     /// Where built-in tools are offered, by tool. Profile-only.
     tool_placement: tool_placement.Overrides = .{},
+    /// Personal key shortcuts, heap-owned and freed in deinit. Profile-only;
+    /// null when the profile sets none, so an unset profile costs one pointer.
+    shortcuts: ?*shortcut_map.Map = null,
+    /// The `shortcuts` entry that failed to parse, such as `shortcuts.ctrl+2.model`,
+    /// owned. The rest of the profile still loads; the detailed loader reports it.
+    shortcut_problem: ?[]u8 = null,
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
     fast_mode: ?bool = null,
@@ -92,7 +99,16 @@ pub const Settings = struct {
     /// into. Profile-only; a later layer replaces the whole list. Freed in deinit.
     skill_symlink_authorities: ?[][]u8 = null,
 
+    /// Hands a parse problem to the caller, who then owns its key.
+    fn takeShortcutProblem(self: *Settings) ?[]u8 {
+        const key = self.shortcut_problem;
+        self.shortcut_problem = null;
+        return key;
+    }
+
     pub fn deinit(self: *Settings, alloc: Allocator) void {
+        if (self.shortcuts) |map| alloc.destroy(map);
+        if (self.shortcut_problem) |key| alloc.free(key);
         if (self.skill_symlink_authorities) |paths| freeStringSlice(alloc, paths);
         self.models.deinit(alloc);
         if (self.providers) |*providers| providers.deinit(alloc);
@@ -224,6 +240,7 @@ pub const ConfigDiagnosticCause = enum {
     retired_skill_match_fuzzy,
     invalid_context_limits,
     invalid_tool_placement,
+    invalid_shortcuts,
     invalid_additional_directories,
     invalid_skill_symlink_authorities,
     invalid_ultrafast_mode_override,
@@ -266,6 +283,9 @@ pub fn writeDiagnosticMetadata(writer: *std.Io.Writer, diagnostic: ConfigDiagnos
     }
     if (diagnostic.cause == .invalid_tool_placement) {
         try writer.writeAll("; tool_placement keys must be built-in tools that can move (" ++ tool_placement.movable_list ++ ") with the value \"toolbox\" or \"direct\"");
+    }
+    if (diagnostic.cause == .invalid_shortcuts) {
+        try writer.print("; the shortcuts map is ignored; other settings still load; bind each key to a command or a model preset (see fx config schema); at most {d} shortcuts", .{shortcut_map.max_entries});
     }
     if (diagnostic.cause == .invalid_additional_directories) {
         try writer.print(
@@ -1096,6 +1116,14 @@ fn mergeDetailedSettingsLayer(
                 },
             }
         }
+        if (incoming.takeShortcutProblem()) |key| {
+            errdefer alloc.free(key);
+            try state.diagnostics.append(alloc, .{
+                .layer = diagnostic_layer,
+                .cause = .invalid_shortcuts,
+                .setting_key = key,
+            });
+        }
         try mergeSettings(state.settings, &incoming, alloc);
     } else |err| {
         if (err == error.OutOfMemory) return err;
@@ -1819,6 +1847,7 @@ fn parseSettingsValueForLayer(
 
     if (layer == .profile) {
         if (root.object.get("providers")) |value| settings.providers = try configured_provider.Registry.parse(alloc, value);
+        if (root.object.get("shortcuts")) |value| try parseShortcutsSetting(alloc, &settings, value);
     }
     if (layer != .project) try parseProfileOnlyFields(
         &settings,
@@ -2112,6 +2141,40 @@ fn pathHasDotDotComponent(path: []const u8) bool {
     return false;
 }
 
+const max_shortcut_problem_bytes = 48;
+
+/// Parses the profile's `shortcuts`. A bad entry leaves the map unset and
+/// records the field that failed; the rest of the profile still loads.
+fn parseShortcutsSetting(alloc: Allocator, settings: *Settings, value: std.json.Value) !void {
+    var problem: shortcut_map.Problem = .{};
+    const map = shortcut_map.parseJsonObjectChecked(value, &problem) catch {
+        settings.shortcut_problem = try shortcutProblemKey(alloc, problem);
+        return;
+    };
+    const stored = try alloc.create(shortcut_map.Map);
+    errdefer alloc.destroy(stored);
+    stored.* = map;
+    settings.shortcuts = stored;
+}
+
+/// `shortcuts`, `shortcuts.<chord>`, or `shortcuts.<chord>.<field>`, with the
+/// user's text bounded and made printable so it can't write control bytes.
+fn shortcutProblemKey(alloc: Allocator, problem: shortcut_map.Problem) ![]u8 {
+    var chord_buffer: [max_shortcut_problem_bytes]u8 = undefined;
+    var field_buffer: [max_shortcut_problem_bytes]u8 = undefined;
+    const chord = printableInto(&chord_buffer, problem.chord);
+    const field = printableInto(&field_buffer, problem.field);
+    if (chord.len == 0) return alloc.dupe(u8, "shortcuts");
+    if (field.len == 0) return alloc.print("shortcuts.{s}", .{chord});
+    return alloc.print("shortcuts.{s}.{s}", .{ chord, field });
+}
+
+fn printableInto(buffer: []u8, text: []const u8) []u8 {
+    const len = @min(buffer.len, text.len);
+    for (text[0..len], buffer[0..len]) |byte, *out| out.* = if (std.ascii.isPrint(byte)) byte else '?';
+    return buffer[0..len];
+}
+
 fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.Value) !void {
     if (root.object.get("provider_order")) |order_value| {
         if (order_value != .array) return error.InvalidProviderOrderType;
@@ -2185,6 +2248,11 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
     target.context_limits.merge(incoming.context_limits);
     target.tool_placement.merge(incoming.tool_placement);
+    if (incoming.shortcuts) |value| {
+        if (target.shortcuts) |old| alloc.destroy(old);
+        target.shortcuts = value;
+        incoming.shortcuts = null;
+    }
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
     if (incoming.context) |value| target.context = value;
     if (incoming.fast_mode) |value| target.fast_mode = value;
@@ -5082,6 +5150,9 @@ test "the settings list gives the types, values, and bounds the settings parser 
         // fx reads these elsewhere or not at all: one workspace's own keys,
         // the workspace map, retired keys, and `$schema`, which editors read.
         if (key.workspace_only or key.kind == .workspaces or key.where == .retired or key.where == .editor) continue;
+        // A bad `shortcuts` value is reported and skipped, not refused: the
+        // shortcut tests check that, so the whole-file refusal below doesn't apply.
+        if (key.kind == .shortcuts) continue;
         const layer: SettingsLayer = if (key.where == .project_safe) .project else .profile;
         const wrong = switch (key.kind) {
             .string, .string_or_null => try alloc.dupe(u8, "5"),
@@ -5183,4 +5254,56 @@ test "experimental.workspace_capture is read from the profile only and stays off
     try std.testing.expectEqual(@as(?bool, null), project.experimental_workspace_capture);
     // A value of another type is refused, as for every other switch.
     try std.testing.expectError(error.InvalidExperimentalWorkspaceCaptureType, parseSettingsJson(alloc, "{\"experimental\":{\"workspace_capture\":\"yes\"}}"));
+}
+
+test "shortcuts are read from the profile top level only" {
+    const alloc = std.testing.allocator;
+    const valid = "{\"shortcuts\":{\"alt+m\":{\"action\":\"open_model_picker\"}}}";
+    var profile = try parseSettingsJson(alloc, valid);
+    defer profile.deinit(alloc);
+    try std.testing.expect(profile.shortcuts != null);
+    try std.testing.expect(profile.shortcut_problem == null);
+
+    var project = try parseSettingsJsonForLayer(alloc, valid, .project);
+    defer project.deinit(alloc);
+    try std.testing.expect(project.shortcuts == null);
+
+    var workspace = try parseSettingsJsonForLayer(alloc, valid, .profile_workspace);
+    defer workspace.deinit(alloc);
+    try std.testing.expect(workspace.shortcuts == null);
+}
+
+test "a bad shortcut is named by its field and leaves theme and permission_mode loaded" {
+    const alloc = std.testing.allocator;
+    var settings = try parseSettingsJson(alloc,
+        \\{"theme":"light","permission_mode":"ask","shortcuts":{"ctrl+1":{"action":"select_model","provider":"gateway","model":"openai/gpt-5","effort":"high"}}}
+    );
+    defer settings.deinit(alloc);
+    try std.testing.expectEqualStrings("light", settings.theme.?);
+    try std.testing.expect(settings.permission_mode != null);
+    try std.testing.expect(settings.shortcuts == null);
+    try std.testing.expectEqualStrings("shortcuts.ctrl+1.fast_mode", settings.shortcut_problem.?);
+}
+
+test "a shortcuts value that is not an object is named as the whole key" {
+    const alloc = std.testing.allocator;
+    var settings = try parseSettingsJson(alloc, "{\"theme\":\"dark\",\"shortcuts\":[]}");
+    defer settings.deinit(alloc);
+    try std.testing.expectEqualStrings("dark", settings.theme.?);
+    try std.testing.expect(settings.shortcuts == null);
+    try std.testing.expectEqualStrings("shortcuts", settings.shortcut_problem.?);
+}
+
+test "a shortcut problem key stays printable and bounded" {
+    const alloc = std.testing.allocator;
+    const escaped = try shortcutProblemKey(alloc, .{ .chord = "ctrl+\x1b[31m", .field = "model" });
+    defer alloc.free(escaped);
+    try std.testing.expectEqualStrings("shortcuts.ctrl+?[31m.model", escaped);
+
+    const long = try alloc.alloc(u8, 100);
+    defer alloc.free(long);
+    @memset(long, 'x');
+    const bounded = try shortcutProblemKey(alloc, .{ .chord = long });
+    defer alloc.free(bounded);
+    try std.testing.expectEqual("shortcuts.".len + max_shortcut_problem_bytes, bounded.len);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const key_chord = @import("key_chord.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
 const approval_decision = @import("../permissions/approval_decision.zig");
 
@@ -147,6 +148,9 @@ pub const TerminalDecodeContext = struct {
 /// admission and cancellation context are captured at the original boundary.
 pub const TerminalInputIngress = struct {
     event: ?TerminalInputEvent = null,
+    /// The chord this report names, set only with the event it came with. The
+    /// event itself is unchanged, so an unassigned chord behaves as before.
+    chord: ?key_chord.Chord = null,
     interrupts_pending_text: bool = false,
     replay_byte_after_routing: ?u8 = null,
 

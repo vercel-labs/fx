@@ -14,6 +14,7 @@ const settings_entries = @import("../config/settings_entries.zig");
 const settings_keys = @import("../config/settings_keys.zig");
 const settings_messages = @import("settings_messages.zig");
 const settings_store = @import("../config/settings_store.zig");
+const shortcut_map = @import("../config/shortcut_map.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const theme = @import("../shared/theme.zig");
 const types = @import("../shared/types.zig");
@@ -166,6 +167,7 @@ pub const WriteProblem = union(enum) {
 /// fails for a key `fx config` doesn't change or a value the key can't take.
 pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSetting, InvalidConfigValue }!Change {
     const key = options.key.?;
+    if (shortcutKeyOf(key)) |chord_key| return shortcutChange(options, chord_key, problem);
     if (config_runtime.tool_placement.toolOfKey(key)) |tool| {
         if (options.action == .unset) return .{ .patch = .{ .remove = key }, .value = null };
         const placement = config_runtime.tool_placement.Placement.parse(options.value.?) orelse return invalid(problem, "toolbox or direct");
@@ -268,7 +270,62 @@ fn wordsProblem(problem: *?[]const u8, text: []const u8) error{InvalidConfigArgs
 
 /// Whether `fx config set` and `unset` change `key`.
 pub fn settable(key: []const u8) bool {
-    return std.meta.stringToEnum(Writable, key) != null or config_runtime.tool_placement.toolOfKey(key) != null;
+    return std.meta.stringToEnum(Writable, key) != null or
+        config_runtime.tool_placement.toolOfKey(key) != null or
+        shortcutKeyOf(key) != null;
+}
+
+const shortcut_prefix = "shortcuts.";
+const shortcut_json_buffer_bytes = 16 * 1024;
+const shortcut_action_expected = "a JSON action: {\"action\":\"select_model\",\"provider\",\"model\",\"effort\",\"fast_mode\"} or {\"action\":\"command\",\"command\":\"/name arguments\"}";
+
+/// The entry key a `shortcuts.<key>` setting names, or null for any other key.
+/// `shortcuts` alone is not an entry, so the whole object can't be replaced.
+fn shortcutKeyOf(key: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, key, shortcut_prefix)) return null;
+    const rest = key[shortcut_prefix.len..];
+    return if (rest.len == 0) null else rest;
+}
+
+/// A chord travels in the patch as a value, and the store spells it when it
+/// writes, so no slice points at a buffer that this function is about to lose.
+/// A key that is no chord, such as a malformed entry, is removed as written.
+fn shortcutChange(options: Options, entry: []const u8, problem: *WriteProblem) error{InvalidConfigValue}!Change {
+    if (options.action == .unset) {
+        const patch: settings_store.ShortcutPatch = if (shortcut_map.Chord.parse(entry)) |chord|
+            .{ .chord = chord, .action_json = null, .check = checkShortcutMap }
+        else
+            .{ .key = entry, .action_json = null, .check = checkShortcutMap };
+        return .{ .patch = .{ .shortcut = patch }, .value = null };
+    }
+    const chord = shortcut_map.Chord.parse(entry) orelse return invalid(problem, "a key chord such as ctrl+1 or alt+m");
+    const raw = options.value.?;
+    var buffer: [shortcut_json_buffer_bytes]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
+    const value = std.json.parseFromSliceLeaky(std.json.Value, fixed.allocator(), raw, .{}) catch
+        return invalid(problem, shortcut_action_expected);
+    _ = shortcut_map.parseAction(value) catch return invalid(problem, shortcut_action_expected);
+    const text = canonicalShortcutText(value, raw);
+    return .{
+        .patch = .{ .shortcut = .{ .chord = chord, .action_json = text, .check = checkShortcutMap } },
+        .value = .{ .string = text },
+    };
+}
+
+/// What gets written for a validated action: a legacy alias is written as its
+/// canonical `command` form, and every other action is written as given.
+fn canonicalShortcutText(value: std.json.Value, raw: []const u8) []const u8 {
+    if (value != .object) return raw;
+    const name = value.object.get("action") orelse return raw;
+    if (name != .string) return raw;
+    return shortcut_map.canonicalActionJson(name.string) orelse raw;
+}
+
+/// The check the settings store runs on the whole `shortcuts` object after a
+/// write: the same grammar `parseJsonObject` applies at load time.
+fn checkShortcutMap(shortcuts: std.json.Value) bool {
+    _ = shortcut_map.parseJsonObject(shortcuts) catch return false;
+    return true;
 }
 
 /// What to use instead of `fx config` for a setting it doesn't change.
@@ -290,6 +347,7 @@ fn ownerHint(key: []const u8) []const u8 {
         .{ .keys = &.{"sound"}, .hint = "set sound.turn_end, sound.attention_required, or sound.max" },
         .{ .keys = &.{"prompt_history"}, .hint = "set prompt_history.enabled" },
         .{ .keys = &.{"tool_placement"}, .hint = "set tool_placement.<tool> to toolbox or direct, for one of " ++ config_runtime.tool_placement.movable_list },
+        .{ .keys = &.{"shortcuts"}, .hint = "set shortcuts.<chord> to a JSON action, or unset it" },
         .{ .keys = &.{"trusted"}, .hint = profile_paths.displayText("fx sets it when you allow a folder; remove it from the folder's entry in ~/.fx/settings.json to be asked again") },
     };
     for (hints) |entry| {
@@ -328,6 +386,13 @@ pub fn parseOverride(text: []const u8, problem: *OverrideProblem) error{InvalidC
     const value = text[at + 1 ..];
     if (key.len == 0) return overrideProblem(problem, .malformed);
     if (settings_keys.unknownPart(key)) |part| return overrideProblem(problem, .{ .unknown = part });
+    if (shortcutKeyOf(key) != null) {
+        return overrideProblem(problem, .{ .write = .{
+            .key = key,
+            .value = value,
+            .problem = .{ .refused = "shortcuts are saved with fx config set, never for one run" },
+        } });
+    }
     var write_problem: WriteProblem = .none;
     const planned = change(.{ .action = .set, .key = key, .value = value }, &write_problem) catch
         return overrideProblem(problem, .{ .write = .{ .key = key, .value = value, .problem = write_problem } });
@@ -523,7 +588,74 @@ pub fn effectiveValue(
     if (config_runtime.tool_placement.toolOfKey(key)) |tool| {
         return string(@tagName(config_runtime.tool_placement.placementOf(state.tool_placement, tool)));
     }
+    if (shortcutKeyOf(key)) |entry| {
+        // The file's lines show only for a chord a run uses; an entry fx ignores
+        // shows nothing, and `fx doctor` names it.
+        const split = splitShortcutEntry(entry) orelse return .none;
+        return if (state.personal_shortcuts.find(split.chord) != null) .unresolved else .none;
+    }
     return .unresolved;
+}
+
+/// A `shortcuts.` entry split into its chord and the field after it. A chord
+/// may end in a dot, so the whole text is tried as a chord first; otherwise the
+/// field starts at the last dot, as in `ctrl+..action`. `suffix` is "" or
+/// ".field", borrowed from the text.
+const ShortcutEntry = struct {
+    chord: shortcut_map.Chord,
+    suffix: []const u8,
+};
+
+fn splitShortcutEntry(entry: []const u8) ?ShortcutEntry {
+    if (shortcut_map.Chord.parse(entry)) |chord| return .{ .chord = chord, .suffix = "" };
+    const dot = std.mem.findScalarLast(u8, entry, '.') orelse return null;
+    const chord = shortcut_map.Chord.parse(entry[0..dot]) orelse return null;
+    return .{ .chord = chord, .suffix = entry[dot..] };
+}
+
+/// The text after `shortcuts.` in `key`, or null when `key` isn't under it.
+fn shortcutRest(key: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, key, shortcut_prefix)) return null;
+    return key[shortcut_prefix.len..];
+}
+
+pub fn sameEntryKey(entry_key: []const u8, requested_key: []const u8) bool {
+    if (std.mem.eql(u8, entry_key, requested_key)) return true;
+    const entry = splitShortcutEntry(shortcutRest(entry_key) orelse return false) orelse return false;
+    const query = splitShortcutEntry(shortcutRest(requested_key) orelse return false) orelse return false;
+    return entry.chord.eql(query.chord) and std.mem.eql(u8, entry.suffix, query.suffix);
+}
+
+/// The entries `fx config get <key>` shows. A shortcut key matches by its chord
+/// in any spelling, such as `ALT+ctrl+k`, and by its field; the file's own
+/// keys are shown as written. Any other key uses the plain dotted lookup.
+pub fn lookupEntries(alloc: Allocator, entries: []const settings_entries.Entry, key: []const u8) ![]settings_entries.Entry {
+    const rest = shortcutRest(key) orelse return settings_entries.lookup(alloc, entries, key);
+    const query = splitShortcutEntry(rest) orelse return settings_entries.lookup(alloc, entries, key);
+    var found: std.ArrayList(settings_entries.Entry) = .empty;
+    errdefer found.deinit(alloc);
+    for (entries, 0..) |entry, index| {
+        if (!shortcutEntryMatches(entry.key, query)) continue;
+        if (overriddenByLater(entries[index + 1 ..], entry.key)) continue;
+        try found.append(alloc, entry);
+    }
+    return found.toOwnedSlice(alloc);
+}
+
+fn shortcutEntryMatches(entry_key: []const u8, query: ShortcutEntry) bool {
+    const rest = shortcutRest(entry_key) orelse return false;
+    const split = splitShortcutEntry(rest) orelse return false;
+    if (!split.chord.eql(query.chord)) return false;
+    if (query.suffix.len == 0) return true;
+    if (!std.mem.startsWith(u8, split.suffix, query.suffix)) return false;
+    return split.suffix.len == query.suffix.len or split.suffix[query.suffix.len] == '.';
+}
+
+fn overriddenByLater(later: []const settings_entries.Entry, key: []const u8) bool {
+    for (later) |entry| {
+        if (sameEntryKey(entry.key, key)) return true;
+    }
+    return false;
 }
 
 fn boolean(value: bool) Effective {
@@ -675,6 +807,9 @@ pub fn saveFailureReason(err: anyerror) []const u8 {
         error.NotDir => "a folder in its path is a file",
         error.PrivateStatePermissionsUnsupported => "the file system can't keep the file private",
         error.InvalidSettingsFormat => "it isn't valid JSON; fix it or move it aside",
+        error.ShortcutOccupied => "that key already has a shortcut; unset it first",
+        error.ShortcutsMalformed => "shortcuts isn't an object; edit ~/.fx/settings.json",
+        error.ShortcutInvalid => "the shortcuts would not load; fix or unset the invalid entry first",
         else => @errorName(err),
     };
 }
@@ -1051,4 +1186,98 @@ test "a step count past a JSON integer is shown, not cast" {
     defer arena_state.deinit();
     const effective = try integer(arena_state.allocator(), std.math.maxInt(usize));
     try std.testing.expectEqualStrings("18446744073709551615", effective.value.number_string);
+}
+
+/// The entry name a shortcut patch writes, spelled canonically in `buffer`.
+fn keyTextOf(patch: settings_store.ShortcutPatch, buffer: *[shortcut_map.max_key_bytes]u8) []const u8 {
+    if (patch.chord) |chord| return chord.format(buffer).?;
+    return patch.key;
+}
+
+test "a shortcut set or unset names one entry, with the chord spelled canonically" {
+    var problem: WriteProblem = .none;
+    var buffer: [shortcut_map.max_key_bytes]u8 = undefined;
+    const set = try change(.{ .action = .set, .key = "shortcuts.CTRL+2", .value = "{\"action\":\"open_model_picker\"}" }, &problem);
+    try std.testing.expectEqualStrings("ctrl+2", keyTextOf(set.patch.shortcut.?, &buffer));
+    try std.testing.expectEqualStrings("{\"action\":\"command\",\"command\":\"/model\"}", set.patch.shortcut.?.action_json.?);
+    try std.testing.expectEqualStrings("{\"action\":\"command\",\"command\":\"/model\"}", set.value.?.string);
+
+    const command = try change(.{ .action = .set, .key = "shortcuts.ctrl+3", .value = "{\"action\":\"command\",\"command\":\"/status\"}" }, &problem);
+    try std.testing.expectEqualStrings("{\"action\":\"command\",\"command\":\"/status\"}", command.patch.shortcut.?.action_json.?);
+
+    const unset = try change(.{ .action = .unset, .key = "shortcuts.ctrl+2" }, &problem);
+    try std.testing.expectEqualStrings("ctrl+2", keyTextOf(unset.patch.shortcut.?, &buffer));
+    try std.testing.expect(unset.patch.shortcut.?.action_json == null);
+    try std.testing.expect(unset.value == null);
+}
+
+test "an unset of a key that is no chord removes it as written" {
+    var problem: WriteProblem = .none;
+    var buffer: [shortcut_map.max_key_bytes]u8 = undefined;
+    const unset = try change(.{ .action = .unset, .key = "shortcuts.ctrl+p+" }, &problem);
+    try std.testing.expectEqualStrings("ctrl+p+", keyTextOf(unset.patch.shortcut.?, &buffer));
+    try std.testing.expect(unset.patch.shortcut.?.chord == null);
+}
+
+test "a dotted chord and its command spell out the whole entry, not a field" {
+    var problem: WriteProblem = .none;
+    var buffer: [shortcut_map.max_key_bytes]u8 = undefined;
+    const set = try change(.{ .action = .set, .key = "shortcuts.ctrl+.", .value = "{\"action\":\"toggle_fast_mode\"}" }, &problem);
+    try std.testing.expectEqualStrings("ctrl+.", keyTextOf(set.patch.shortcut.?, &buffer));
+    try std.testing.expectEqualStrings("{\"action\":\"command\",\"command\":\"/fast\"}", set.patch.shortcut.?.action_json.?);
+    const unset = try change(.{ .action = .unset, .key = "shortcuts.ctrl+alt+k" }, &problem);
+    try std.testing.expectEqualStrings("ctrl+alt+k", keyTextOf(unset.patch.shortcut.?, &buffer));
+}
+
+test "a shortcut set refuses plain typing as a chord, a bad action, and the whole object" {
+    var problem: WriteProblem = .none;
+    const picker = "{\"action\":\"open_model_picker\"}";
+    try std.testing.expectError(error.InvalidConfigValue, change(.{ .action = .set, .key = "shortcuts.1", .value = picker }, &problem));
+    try std.testing.expectError(error.InvalidConfigValue, change(.{ .action = .set, .key = "shortcuts.ctrl+", .value = picker }, &problem));
+    try std.testing.expectError(error.InvalidConfigValue, change(.{ .action = .set, .key = "shortcuts.alt+m", .value = "not json" }, &problem));
+    try std.testing.expectError(error.InvalidConfigValue, change(.{ .action = .set, .key = "shortcuts.alt+m", .value = "{\"action\":\"run_shell\"}" }, &problem));
+    try std.testing.expectError(error.InvalidConfigValue, change(.{ .action = .set, .key = "shortcuts.ctrl+1", .value = "{\"action\":\"select_model\",\"provider\":\"gateway\",\"model\":\"m\",\"effort\":\"high\",\"fast_mode\":true,\"ultrafast_mode\":true}" }, &problem));
+    try std.testing.expectError(error.RefusedConfigSetting, change(.{ .action = .set, .key = "shortcuts", .value = "{}" }, &problem));
+    try std.testing.expect(settable("shortcuts.ctrl+2"));
+    try std.testing.expect(!settable("shortcuts"));
+}
+
+test "a run's --config never saves a shortcut" {
+    var problem: OverrideProblem = .none;
+    try std.testing.expectError(error.InvalidConfigOverride, parseOverride("shortcuts.ctrl+2={\"action\":\"open_model_picker\"}", &problem));
+    try std.testing.expect(problem == .write);
+}
+
+test "the shortcuts check accepts an object fx loads and refuses one it would drop" {
+    const alloc = std.testing.allocator;
+    var good = try std.json.parseFromSlice(std.json.Value, alloc, "{\"ctrl+1\":{\"action\":\"open_model_picker\"}}", .{});
+    defer good.deinit();
+    try std.testing.expect(checkShortcutMap(good.value));
+    var bad = try std.json.parseFromSlice(std.json.Value, alloc, "{\"ctrl+1\":{\"action\":\"open_model_picker\"},\"ctrl+0\":{}}", .{});
+    defer bad.deinit();
+    try std.testing.expect(!checkShortcutMap(bad.value));
+}
+
+test "get matches a shortcut by its chord in any spelling and shows the file's spelling" {
+    const alloc = std.testing.allocator;
+    const entries = [_]settings_entries.Entry{
+        .{ .key = "shortcuts.Alt+Ctrl+K.action", .value = .{ .string = "open_model_picker" }, .origin = .global },
+        .{ .key = "shortcuts.F8.action", .value = .{ .string = "open_model_picker" }, .origin = .global },
+    };
+    const alias = try lookupEntries(alloc, &entries, "shortcuts.ALT+ctrl+k");
+    defer alloc.free(alias);
+    try std.testing.expectEqual(@as(usize, 1), alias.len);
+    try std.testing.expectEqualStrings("shortcuts.Alt+Ctrl+K.action", alias[0].key);
+
+    const field = try lookupEntries(alloc, &entries, "shortcuts.ctrl+alt+k.action");
+    defer alloc.free(field);
+    try std.testing.expectEqual(@as(usize, 1), field.len);
+
+    const other_field = try lookupEntries(alloc, &entries, "shortcuts.ctrl+alt+k.command");
+    defer alloc.free(other_field);
+    try std.testing.expectEqual(@as(usize, 0), other_field.len);
+
+    const bare = try lookupEntries(alloc, &entries, "shortcuts.F8");
+    defer alloc.free(bare);
+    try std.testing.expectEqual(@as(usize, 1), bare.len);
 }

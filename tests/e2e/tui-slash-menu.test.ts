@@ -21,9 +21,11 @@ import {
   fakeGatewayFinalText,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  fakeShellRun,
   hasEmptyComposer,
   heldFakeGatewayFinalText,
   isComposerLine,
+  startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -4843,6 +4845,399 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
+    },
+    TEST_TIMEOUT,
+  );
+});
+
+// Profile shortcuts (`shortcuts` in settings.json) act on the active provider:
+// a chord selects a model with its effort and Fast mode, or opens the picker.
+// Ctrl+2 arrives as the CSI u sequence that a terminal in kitty keyboard mode
+// sends. Legacy terminals that send NUL for it are not covered here.
+describe.skipIf(SKIP)("tui: custom shortcuts", () => {
+  const ACTIVE_MODEL = "private-team/active-model";
+  const TARGET_MODEL = "private-team/target-model";
+  const CTRL_2 = ["1b", "5b", "35", "30", "3b", "35", "75"];
+  const CTRL_3 = ["1b", "5b", "35", "31", "3b", "35", "75"];
+  const ALT_M = ["1b", "6d"];
+  const TARGET_PRESET = { action: "select_model", provider: "gateway", model: TARGET_MODEL, effort: "high", fast_mode: true };
+  const SHORTCUTS = {
+    "ctrl+2": TARGET_PRESET,
+    "alt+m": { action: "open_model_picker" },
+  };
+  // Shell-quotes one argument for the fake shell tool call.
+  const quote = (text: string) => `'${text.replace(/'/g, `'\\''`)}'`;
+  // Runs the worktree's own binary through `fx config set`, with HOME and FX_HOME
+  // both pinned to the fixture profile, so no mutation reaches the developer's ~/.fx.
+  function setterCommand(fixture: { home: string }, json: string): string {
+    const profileDir = join(fixture.home, ".fx");
+    return `HOME=${quote(fixture.home)} FX_HOME=${quote(profileDir)} ${quote(FX_BIN)} ` +
+      `config set shortcuts.ctrl+2 ${quote(json)} && printf 'SETTER_%s\\n' OK`;
+  }
+
+  const CATALOG = [
+    { id: ACTIVE_MODEL, type: "language", released: 200, tags: ["tool-use"], context_window: 128_000 },
+    {
+      id: TARGET_MODEL,
+      type: "language",
+      released: 100,
+      tags: ["reasoning", "tool-use"],
+      reasoning_options: [{ type: "effort", values: ["low", "high", "xhigh"] }],
+      fast_options: [{ type: "toggle" }],
+      context_window: 1_000_000,
+    },
+  ];
+
+  // Seeds the fixture profile before fx starts. The setter tests save shortcuts
+  // through `fx config set` instead, so they never call this for a shortcut.
+  function writeProfile(settingsPath: string, extra: Record<string, unknown> = {}) {
+    writeFileSync(settingsPath, `${JSON.stringify({ session_titles: false, ...extra })}\n`);
+  }
+
+  // The gateway is stopped, the session killed, and the fixture removed by the
+  // file's afterEach, so a failing test cleans up with no extra hook.
+  async function openShell(
+    fixture: ReturnType<typeof createModelsMenuFixture>,
+    fake: ReturnType<typeof startDynamicFakeGateway>,
+    model = ACTIVE_MODEL,
+  ): Promise<TmuxSession> {
+    gateway = fake;
+    const shell = await TmuxSession.create({
+      cwd: fixture.workspace,
+      stderrPath: fixture.stderrPath,
+      env: {
+        HOME: fixture.home,
+        FX_HOME: join(fixture.home, ".fx"),
+        AI_GATEWAY_API_KEY: "custom-shortcut-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_PROVIDER: "gateway",
+        FX_MODEL: model,
+        FX_GATEWAY_BASE_URL: fake.baseUrl,
+        FX_GATEWAY_CHAT_URL: fake.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${fake.baseUrl}/coding-agent/v1/models`,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+      },
+      width: 120,
+      height: 32,
+    });
+    await shell.waitForComposer(10_000);
+    return shell;
+  }
+
+  const replySettled = (text: string) => (pane: string) =>
+    pane.includes(text) && turnSettled(pane) && hasEmptyComposer(pane);
+
+  test(
+    "custom shortcut saved by the config setter during a turn applies on the key press after that turn",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      writeProfile(fixture.settingsPath);
+      // The shell tool runs the worktree's own binary on the fixture profile.
+      const setCommand = setterCommand(fixture, JSON.stringify(TARGET_PRESET));
+      let replies = 0;
+      const fake = startDynamicFakeGateway(
+        () => {
+          replies += 1;
+          if (replies === 1) return fakeShellRun("set-ctrl-2", setCommand);
+          return fakeGatewayFinalText(`REPLY_${replies}`);
+        },
+        { models: CATALOG },
+      );
+      session = await openShell(fixture, fake);
+
+      await session.sendText("configura Ctrl+2");
+      await session.waitForPane(replySettled("REPLY_2"), TIMEOUT);
+      expect(fake.requests.length).toBeGreaterThanOrEqual(2);
+
+      // Saved during the turn, and the turn still ran on the active model.
+      expect(fake.requests[1]!.body).toContain("SETTER_OK");
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).shortcuts).toEqual({ "ctrl+2": TARGET_PRESET });
+      expect(chatModelOf(fake.requests[1]!)).toBe(ACTIVE_MODEL);
+
+      // After the turn ends the saved map is in use, but the active model is unchanged.
+      await session.sendText("segundo pedido");
+      await session.waitForPane(replySettled("REPLY_3"), TIMEOUT);
+      expect(fake.requests.length).toBeGreaterThanOrEqual(3);
+      expect(chatModelOf(fake.requests[2]!)).toBe(ACTIVE_MODEL);
+      expect(JSON.parse(fake.requests[2]!.body)).not.toHaveProperty("reasoning");
+
+      // The footer shows the switch, which proves the key was handled. The draft
+      // stays in the composer, and the key itself sends no turn.
+      await session.sendLiteralText("borrador en curso");
+      await session.waitForPane((pane) => composerContains(pane, "borrador en curso"), 5_000);
+      await session.sendHexBytes(CTRL_2);
+      await session.waitForPane(
+        (pane) => pane.includes("target-model") && composerContains(pane, "borrador en curso"),
+        TIMEOUT,
+      );
+      expect(fake.requests).toHaveLength(3);
+
+      await session.sendKeys("Enter");
+      await session.waitForPane(replySettled("REPLY_4"), TIMEOUT);
+      expect(fake.requests.length).toBeGreaterThanOrEqual(4);
+      const preset = fake.requests[3]!;
+      expect(chatModelOf(preset)).toBe(TARGET_MODEL);
+      expect(preset.body).toContain("borrador en curso");
+      expect(JSON.parse(preset.body)).toMatchObject({
+        reasoning: "high",
+        providerOptions: { gateway: { speed: "fast" } },
+      });
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "custom shortcut alt+m opens the model picker and returns the draft",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      writeProfile(fixture.settingsPath, { shortcuts: SHORTCUTS });
+      const fake = startFakeGateway([], { models: CATALOG });
+      session = await openShell(fixture, fake);
+
+      await session.sendLiteralText("borrador");
+      await session.waitForPane((pane) => composerContains(pane, "borrador"), 5_000);
+      await session.sendHexBytes(ALT_M);
+      const pane = (await waitForModelsMenu(session, 2)).join("\n");
+      expect(pane).toContain("[All]");
+      expect(hasEmptyComposer(pane)).toBe(true);
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => composerContains(current, "borrador") && !current.includes("tab provider"),
+        5_000,
+      );
+      expect(fake.requests).toHaveLength(0);
+      expect(session.isAlive()).toBe(true);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "custom shortcut leaves a plain digit and an unassigned chord as composer text",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      writeProfile(fixture.settingsPath, { shortcuts: SHORTCUTS });
+      const fake = startFakeGateway([fakeGatewayFinalText("DIGIT_REPLY")], { models: CATALOG });
+      session = await openShell(fixture, fake);
+
+      await session.sendLiteralText("pedido v2");
+      await session.sendHexBytes(CTRL_3);
+      await session.waitForPane((pane) => composerContains(pane, "pedido v2"), 5_000);
+
+      // The next payload is the signal: the digit and the unbound chord stayed text on the active model.
+      await session.sendKeys("Enter");
+      await session.waitForPane(replySettled("DIGIT_REPLY"), TIMEOUT);
+      expect(fake.requests.length).toBeGreaterThanOrEqual(1);
+      expect(fake.requests).toHaveLength(1);
+      expect(chatModelOf(fake.requests[0]!)).toBe(ACTIVE_MODEL);
+      expect(fake.requests[0]!.body).toContain("pedido v2");
+    },
+    TEST_TIMEOUT,
+  );
+
+  // The turn's own selection, read from the system block fx puts in the request.
+  function turnSelectionOf(raw: string): Record<string, string> {
+    const messages: Array<{ content?: unknown }> = JSON.parse(raw).prompt ?? [];
+    const text = messages
+      .map((message) => (typeof message.content === "string" ? message.content : ""))
+      .find((content) => content.includes("<fx-turn-selection>")) ?? "";
+    const block = /<fx-turn-selection>\n([\s\S]*?)\n<\/fx-turn-selection>/.exec(text);
+    if (!block) throw new Error("the request has no <fx-turn-selection> block");
+    // Only the named fields: the block may carry other lines, such as notes.
+    const field = (name: string) => new RegExp(`^${name}: (.*)$`, "m").exec(block[1]!)?.[1] ?? "";
+    return Object.fromEntries(
+      ["provider", "model", "effort", "fast_mode", "ultrafast_mode"].map((name) => [name, field(name)]),
+    );
+  }
+
+  const CURRENT_CATALOG = ["private-team/current-fast", "private-team/current-plain"].map((id) => ({
+    id,
+    type: "language",
+    released: 300,
+    tags: ["reasoning", "tool-use"],
+    reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+    fast_options: [{ type: "toggle" }],
+    context_window: 200_000,
+  }));
+
+  // Two sessions on different models, with different effort and Fast settings.
+  const CURRENT_SESSIONS = [
+    { model: "private-team/current-fast", effort: "high", fast: true },
+    { model: "private-team/current-plain", effort: "low", fast: false },
+  ];
+
+  test.each(CURRENT_SESSIONS)(
+    "custom shortcut 'mi modelo actual' saves the session's own selection for $model",
+    async (config) => {
+      const fixture = createModelsMenuFixture();
+      writeProfile(fixture.settingsPath, { effort: config.effort, fast_mode: config.fast });
+      let selection: Record<string, string> | null = null;
+      let replies = 0;
+      const fake = startDynamicFakeGateway(
+        (raw) => {
+          replies += 1;
+          if (replies > 1) return fakeGatewayFinalText(`REPLY_${replies}`);
+          // The preset is built from the values fx reports for this turn, not from the test's config.
+          selection = turnSelectionOf(raw);
+          const preset = {
+            action: "select_model",
+            provider: selection.provider,
+            model: selection.model,
+            effort: selection.effort,
+            fast_mode: selection.fast_mode === "true",
+          };
+          return fakeShellRun("set-current", setterCommand(fixture, JSON.stringify(preset)));
+        },
+        { models: CURRENT_CATALOG },
+      );
+      session = await openShell(fixture, fake, config.model);
+
+      await session.sendText("mi modelo actual");
+      await session.waitForPane(replySettled("REPLY_2"), TIMEOUT);
+      expect(fake.requests.length).toBeGreaterThanOrEqual(2);
+
+      // The block names this session's values, and the request really used that model.
+      expect(selection).toEqual({
+        provider: "gateway",
+        model: config.model,
+        effort: config.effort,
+        fast_mode: String(config.fast),
+        ultrafast_mode: "false",
+      });
+      expect(chatModelOf(fake.requests[0]!)).toBe(config.model);
+      expect(fake.requests[1]!.body).toContain("SETTER_OK");
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).shortcuts).toEqual({
+        "ctrl+2": {
+          action: "select_model",
+          provider: "gateway",
+          model: config.model,
+          effort: config.effort,
+          fast_mode: config.fast,
+        },
+      });
+    },
+    TEST_TIMEOUT,
+  );
+
+  // Ctrl+F moves the cursor right by default (raw 0x06). A profile binding that
+  // runs a fx command takes the key instead, and the draft and effort stay.
+  const CURRENT_FAST = "private-team/current-fast";
+  const CTRL_B = ["02"];
+  const hexOf = (text: string) => [...Buffer.from(text)].map((byte) => byte.toString(16).padStart(2, "0"));
+  const CTRL_F_ENCODINGS = [
+    { name: "raw byte", keys: ["06"] },
+    { name: "CSI u", keys: hexOf("\x1b[102;5u") },
+  ];
+
+  test.each([
+    ...CTRL_F_ENCODINGS.map((encoding) => ({ ...encoding, shortcuts: {} })),
+    {
+      name: "Ctrl+Super+F with only Ctrl+F bound",
+      keys: hexOf("\x1b[102;13u"),
+      shortcuts: { "ctrl+f": { action: "command", command: "/fast" } },
+    },
+  ])(
+    "custom shortcut keeps the cursor fallback for an unbound report, $name",
+    async (encoding) => {
+      const fixture = createModelsMenuFixture();
+      writeProfile(fixture.settingsPath, { effort: "high", fast_mode: false, shortcuts: encoding.shortcuts });
+      const fake = startFakeGateway([fakeGatewayFinalText("ANSWER_PLAIN")], { models: CURRENT_CATALOG });
+      session = await openShell(fixture, fake, CURRENT_FAST);
+
+      await session.sendLiteralText("abcd");
+      await session.sendHexBytes(CTRL_B);
+      await session.sendHexBytes(CTRL_B);
+      await session.sendHexBytes(encoding.keys);
+      await session.sendLiteralText("X");
+      await session.waitForPane((pane) => composerContains(pane, "abcXd"), 5_000);
+
+      await session.sendKeys("Enter");
+      await session.waitForPane(replySettled("ANSWER_PLAIN"), TIMEOUT);
+      expect(fake.requests.length).toBeGreaterThanOrEqual(1);
+      const request = JSON.parse(fake.requests[0]!.body);
+      expect(fake.requests[0]!.body).toContain("abcXd");
+      expect(request).toMatchObject({ reasoning: "high" });
+      expect(request).not.toHaveProperty("providerOptions.gateway.speed");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test.each(CTRL_F_ENCODINGS)(
+    "custom shortcut ctrl+f runs /fast for the next request, keeping the draft and effort, $name",
+    async (encoding) => {
+      const fixture = createModelsMenuFixture();
+      writeProfile(fixture.settingsPath, {
+        effort: "high",
+        fast_mode: false,
+        shortcuts: { "ctrl+f": { action: "command", command: "/fast" } },
+      });
+      const fake = startFakeGateway(
+        [fakeGatewayFinalText("ANSWER_ONE"), fakeGatewayFinalText("ANSWER_TWO")],
+        { models: CURRENT_CATALOG },
+      );
+      session = await openShell(fixture, fake, CURRENT_FAST);
+
+      // First press: the next request is Fast.
+      await session.sendLiteralText("primer borrador");
+      await session.sendHexBytes(encoding.keys);
+      await session.waitForPane((pane) => composerContains(pane, "primer borrador"), 5_000);
+      expect(fake.requests).toHaveLength(0);
+      await session.sendKeys("Enter");
+      await session.waitForPane(replySettled("ANSWER_ONE"), TIMEOUT);
+      expect(fake.requests.length).toBeGreaterThanOrEqual(1);
+
+      // Second press: the next request is normal again.
+      await session.sendLiteralText("segundo borrador");
+      await session.sendHexBytes(encoding.keys);
+      await session.waitForPane((pane) => composerContains(pane, "segundo borrador"), 5_000);
+      expect(fake.requests).toHaveLength(1);
+      await session.sendKeys("Enter");
+      await session.waitForPane(replySettled("ANSWER_TWO"), TIMEOUT);
+      expect(fake.requests.length).toBeGreaterThanOrEqual(2);
+
+      expect(chatModelOf(fake.requests[0]!)).toBe(CURRENT_FAST);
+      expect(chatModelOf(fake.requests[1]!)).toBe(CURRENT_FAST);
+      expect(fake.requests[0]!.body).toContain("primer borrador");
+      expect(fake.requests[1]!.body).toContain("segundo borrador");
+      expect(JSON.parse(fake.requests[0]!.body)).toMatchObject({
+        reasoning: "high",
+        providerOptions: { gateway: { speed: "fast" } },
+      });
+      expect(JSON.parse(fake.requests[1]!.body)).toMatchObject({ reasoning: "high" });
+      expect(JSON.parse(fake.requests[1]!.body)).not.toHaveProperty("providerOptions.gateway.speed");
+      expect(session.isAlive()).toBe(true);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "custom shortcut ctrl+alt+k runs '/effort low' with its argument and keeps the draft",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      writeProfile(fixture.settingsPath, {
+        effort: "high",
+        fast_mode: false,
+        shortcuts: { "ctrl+alt+k": { action: "command", command: "/effort low" } },
+      });
+      const fake = startFakeGateway([fakeGatewayFinalText("ANSWER_LOW")], { models: CURRENT_CATALOG });
+      session = await openShell(fixture, fake, CURRENT_FAST);
+
+      // CSI u for Ctrl+Alt+K: keycode 107 with modifiers 1 + alt(2) + ctrl(4) = 7.
+      await session.sendLiteralText("borrador");
+      await session.sendHexBytes(hexOf("\x1b[107;7u"));
+      await session.waitForPane((pane) => composerContains(pane, "borrador"), 5_000);
+      expect(fake.requests).toHaveLength(0);
+
+      await session.sendKeys("Enter");
+      await session.waitForPane(replySettled("ANSWER_LOW"), TIMEOUT);
+      expect(fake.requests.length).toBeGreaterThanOrEqual(1);
+      expect(chatModelOf(fake.requests[0]!)).toBe(CURRENT_FAST);
+      expect(fake.requests[0]!.body).toContain("borrador");
+      expect(JSON.parse(fake.requests[0]!.body)).toMatchObject({ reasoning: "low" });
+      expect(session.isAlive()).toBe(true);
     },
     TEST_TIMEOUT,
   );
