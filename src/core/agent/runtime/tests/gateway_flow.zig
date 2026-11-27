@@ -4382,11 +4382,11 @@ test "a turn whose step a compaction summarized hands the session its whole turn
     const cut_off: FakeCompletion = .{ .tool_calls = &later_calls, .finish_reason = .length };
     const Ending = struct { name: []const u8, completions: []const FakeCompletion };
     // A reply, two empty replies (`finishFailedTurnWithNotice`), and a reply
-    // cut off again after its resend.
+    // cut off three times in a row, which ends the turn at the output limit.
     const endings = [_]Ending{
         .{ .name = "completed", .completions = &.{ first, summary, .{ .content = "Continued from the observed results." } } },
         .{ .name = "empty", .completions = &.{ first, summary, .{}, .{} } },
-        .{ .name = "length", .completions = &.{ first, summary, cut_off, cut_off } },
+        .{ .name = "length", .completions = &.{ first, summary, cut_off, cut_off, cut_off } },
     };
     for (endings) |ending| {
         var tmp = std.testing.tmpDir(.{});
