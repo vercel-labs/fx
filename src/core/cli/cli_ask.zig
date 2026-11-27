@@ -3272,12 +3272,12 @@ fn saveRecoveryRecord(raw_ctx: *anyopaque, record: types.RecoveryRecordWrite) !b
 
 /// `AgentRuntimeDeps.record_usage` on v2: each reply's usage reaches the
 /// log as it arrives, so a killed run keeps it (D92).
-fn recordUsage(raw_ctx: *anyopaque, usage: types.Usage) !void {
+fn recordUsage(raw_ctx: *anyopaque, step: types.StepUsage) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const v2 = ctx.v2 orelse return;
-    try v2.recordUsage(usage);
+    try v2.recordUsage(step);
 }
 
 /// `AgentRuntimeDeps.save_route_recovery_status` on v2: a recovery status

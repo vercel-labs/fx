@@ -623,6 +623,9 @@ pub fn Runtime(comptime App: type) type {
             app_permission_runtime.Runtime(App).initializeYoloWarning(app);
             app.statusline_context = startup.statusline_context;
             app.statusline_session = startup.statusline_session;
+            if (comptime @hasField(App, "statusline_session_usage")) {
+                app.statusline_session_usage = startup.statusline_session_usage;
+            }
             if (comptime @hasField(App, "session_title_generation")) {
                 app.session_title_generation = startup.session_title_generation;
                 if (comptime @hasField(App, "cache_warming")) app.cache_warming = startup.cache_warming;

@@ -5,7 +5,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { FX_BIN } from "../evals/eval-helpers";
+import { fakeGatewaySse, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 import { rotateFxLogin, startFakeIssuer, writeFxLogin } from "./fx-login-fakes";
 import {
   codexBreakdownBody,
@@ -210,5 +211,130 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       }
     },
     TIMEOUT,
+  );
+
+  test(
+    "API key /usage shows This session tokens and cost, status line shows them when enabled, and missing cost shows unknown across resume",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-tui-session-usage-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      const clock = join(root, "clock");
+      writeUsageClock(clock, USAGE_NOW_MS);
+      const fake = usageFake({ report: (from) => rows(from) });
+      let step = 0;
+      const gateway = startDynamicFakeGateway(
+        async () => {
+          step += 1;
+          if (step === 1) {
+            return fakeGatewaySse([
+              { type: "text-delta", id: "t1", delta: "STEP_ONE_OK" },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: {
+                  inputTokens: { total: 1200, cacheRead: 300, cacheWrite: 100 },
+                  outputTokens: { total: 400 },
+                },
+                providerMetadata: { gateway: { cost: "0.0012" } },
+              },
+            ]);
+          }
+          if (step === 2) {
+            return fakeGatewaySse([
+              { type: "text-delta", id: "t2", delta: "STEP_TWO_OK" },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: {
+                  inputTokens: { total: 800, cacheRead: 200 },
+                  outputTokens: { total: 100 },
+                },
+                providerMetadata: { gateway: { cost: "0.0008" } },
+              },
+            ]);
+          }
+          return fakeGatewaySse([
+            { type: "text-delta", id: "t3", delta: "STEP_THREE_NO_COST" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: {
+                inputTokens: { total: 500, cacheRead: 100 },
+                outputTokens: { total: 100 },
+              },
+            },
+          ]);
+        },
+        { usage: fake.handler },
+      );
+      stop = () => {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      };
+      const env = {
+        ...usageEnv(gateway.baseUrl, clock),
+        HOME: realpathSync(home),
+        AI_GATEWAY_API_KEY: "e2e-usage-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_AUTO_UPGRADE: "0",
+      };
+
+      session = await TmuxSession.create({ cwd: realpathSync(workspace), env });
+      await session.waitForComposer(TIMEOUT);
+
+      await session.sendText("first prompt");
+      await session.waitForText("STEP_ONE_OK", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("second prompt");
+      await session.waitForText("STEP_TWO_OK", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+
+      // Off by default: status line does not show session usage yet.
+      const beforeEnable = await session.capturePane();
+      expect(beforeEnable).not.toContain("3.1k tok");
+      expect(beforeEnable).not.toContain("$0.0020");
+
+      // /usage shows "This session" at the top above the account period table.
+      await session.sendText("/usage");
+      const usagePane = await session.waitForText("This session", TIMEOUT);
+      expect(usagePane).toContain("model (month)");
+      expect(usagePane.indexOf("This session")).toBeLessThan(usagePane.indexOf("period"));
+      expect(usagePane).toMatch(/total\s+2\.0K\s+500\s+600\s+\$0\.0020/);
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("This session"), TIMEOUT);
+
+      // Enable the status line segment via /statusline session_usage.
+      await session.sendText("/statusline session_usage");
+      await session.waitForText("session_usage: on", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("3.1k tok") && pane.includes("$0.0020"), TIMEOUT);
+
+      // Quit and resume: totals and cost survive resume.
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd()).toBe(true);
+      await session.kill();
+      session = null;
+
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        cmd: `${FX_BIN} -c`,
+        env,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("3.1k tok") && pane.includes("$0.0020"), TIMEOUT);
+
+      // Next step has no gateway cost: cost becomes unknown, never 0.
+      await session.sendText("third prompt without cost");
+      await session.waitForText("STEP_THREE_NO_COST", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("3.8k tok") && pane.includes("cost unknown"), TIMEOUT);
+      await session.sendText("/usage");
+      const unknownPane = await session.waitForText("This session", TIMEOUT);
+      expect(unknownPane).toMatch(/total\s+2\.5K\s+600\s+700\s+cost unknown/);
+    },
+    TIMEOUT * 2,
   );
 });

@@ -1008,14 +1008,14 @@ fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
 
 /// Saves each reply's usage in the child's own log, as the root saves its
 /// own (D92). The parent's total leaves the child's out.
-fn recordUsage(raw: *anyopaque, usage: types.Usage) !void {
+fn recordUsage(raw: *anyopaque, step: types.StepUsage) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     // The reply was billed whether or not it is saved, so the run's result
     // counts it first (`usage_ledger.zig`).
-    if (context.turn.child_id) |child_id| context.config.host.noteChildUsage(child_id, usage);
+    if (context.turn.child_id) |child_id| context.config.host.noteChildUsage(child_id, step.tokens);
     // A hosted run has no session here; its own agent saves its usage.
     const child = context.turn.child orelse return;
-    try child.recordUsage(usage);
+    try child.recordUsage(step);
 }
 
 /// Saves a recovery status in the child's own log, as the root saves its

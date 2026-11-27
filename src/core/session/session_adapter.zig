@@ -1582,6 +1582,7 @@ pub const Restored = struct {
     permission_state: ?session_permission_state.State = null,
     /// The stored title, generated or chosen by the user.
     title: ?[]u8 = null,
+    session_usage: types.SessionUsage = .{},
     created_at_ms: i64,
     updated_at_ms: i64 = 0,
 
@@ -2038,9 +2039,10 @@ pub const Session = struct {
     /// A conversion's import: the original time of the batches it writes
     /// next (D59). Null for every other session.
     import_ts: ?u64 = null,
-    /// The session's token totals as its newest `set usage` holds them
-    /// (D92), read from the log on the first reply this process records.
-    usage: ?types.Usage = null,
+    /// The session's cumulative token and gateway cost totals as its newest
+    /// `set usage` holds them (D92), read from the log on the first reply or
+    /// restore this process performs.
+    usage: ?types.SessionUsage = null,
     /// Next accepted-input id candidate on this session handle.
     next_input_id: u64 = 1,
     /// Highest log seq known on this session, guarded by `host.write_lock`.
@@ -4133,35 +4135,92 @@ pub const Session = struct {
         _ = try self.write(&.{.{ .set = .{ .key = key, .value = value } }});
     }
 
-    /// Adds one model reply's provider usage to the session's totals and
-    /// writes them as `set usage`, so a run that is killed or times out
-    /// keeps the usage of every reply it received (D92). A reply with no
-    /// counts writes nothing.
-    pub fn recordUsage(self: *Session, reply: types.Usage) !void {
-        if (std.meta.eql(reply, types.Usage{})) return;
+    const SavedUsage = struct {
+        input_tokens: ?u64 = null,
+        output_tokens: ?u64 = null,
+        cache_read_tokens: ?u64 = null,
+        cache_write_tokens: ?u64 = null,
+        reasoning_tokens: ?u64 = null,
+        step_count: ?u64 = null,
+        cost_usd: ?f64 = null,
+        cost_unknown: ?bool = null,
+    };
+
+    fn decodeSavedUsage(sa: Allocator, session_id: []const u8, raw: ?[]const u8) types.SessionUsage {
+        const text = raw orelse return .{};
+        const decoded = json_decode.parseFromSliceLeaky(SavedUsage, sa, text, .{ .ignore_unknown_fields = true }) catch |err| {
+            debug_trace.logf("session", "event=sessions_v2_usage_reset session={s} reason={s} dropped=saved_usage", .{ session_id, @errorName(err) });
+            return .{};
+        };
+        const has_tokens = decoded.input_tokens != null or
+            decoded.output_tokens != null or
+            decoded.cache_read_tokens != null or
+            decoded.cache_write_tokens != null or
+            decoded.reasoning_tokens != null;
+        const step_count = decoded.step_count orelse if (has_tokens) @as(u64, 1) else 0;
+        var out: types.SessionUsage = .{
+            .input_tokens = decoded.input_tokens orelse 0,
+            .output_tokens = decoded.output_tokens orelse 0,
+            .cache_read_tokens = decoded.cache_read_tokens orelse 0,
+            .cache_write_tokens = decoded.cache_write_tokens orelse 0,
+            .step_count = step_count,
+        };
+        if (decoded.cost_unknown == true) {
+            out.cost_status = .unknown;
+        } else if (decoded.cost_usd) |cost| {
+            if (std.math.isFinite(cost) and cost >= 0) {
+                out.cost_status = .known;
+                out.cost_usd = cost;
+            } else {
+                out.cost_status = .unknown;
+            }
+        } else if (step_count > 0) {
+            // An older session log saved before gateway cost tracking has no cost field.
+            out.cost_status = .unknown;
+        }
+        return out;
+    }
+
+    /// Adds one model reply's provider usage and optional gateway cost to the
+    /// session's totals and writes them as `set usage`, so a run that is killed
+    /// or times out keeps every reply it received (D92). A reply with no counts
+    /// or cost writes nothing.
+    pub fn recordUsage(self: *Session, step: types.StepUsage) !void {
+        const before_check: types.SessionUsage = .{};
+        var probe = before_check;
+        probe.observe(step);
+        if (probe.step_count == 0) return;
+
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
         const sa = scratch.allocator();
         var total = self.usage orelse try self.savedUsage(sa);
-        total.add(reply);
-        const value = try std.json.Stringify.valueAlloc(sa, total, .{});
+        total.observe(step);
+        const encoded: SavedUsage = .{
+            .input_tokens = total.input_tokens,
+            .output_tokens = total.output_tokens,
+            .cache_read_tokens = total.cache_read_tokens,
+            .cache_write_tokens = total.cache_write_tokens,
+            .step_count = total.step_count,
+            .cost_usd = if (total.cost_status == .known) total.cost_usd else null,
+            .cost_unknown = switch (total.cost_status) {
+                .none => null,
+                .known => false,
+                .unknown => true,
+            },
+        };
+        const value = try std.json.Stringify.valueAlloc(sa, encoded, .{});
         _ = try self.write(&.{.{ .set = .{ .key = .usage, .value = value } }});
         self.usage = total;
     }
 
     /// The totals the log's newest `set usage` holds. A value written
     /// before D92, or one fx cannot read, counts from zero.
-    fn savedUsage(self: *Session, sa: Allocator) !types.Usage {
-        const raw = (try self.handle.state(sa)).usage orelse return .{};
-        return json_decode.parseFromSliceLeaky(types.Usage, sa, raw, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                debug_trace.logf("session", "event=sessions_v2_usage_reset session={s} reason={s} dropped=saved_usage", .{ self.id(), @errorName(err) });
-                return .{};
-            },
-        };
+    fn savedUsage(self: *Session, sa: Allocator) !types.SessionUsage {
+        const state = try self.handle.state(sa);
+        return decodeSavedUsage(sa, self.id(), state.usage);
     }
 
     /// A title the user chose. It differs from the derived one, so a
@@ -4215,6 +4274,7 @@ pub const Session = struct {
         self.turn_numbers.clearRetainingCapacity();
         var restored = try restoreFrom(self.source(), alloc, sa, state, .{ .alloc = self.alloc, .list = &self.turn_numbers, .trim = &self.trim });
         errdefer restored.deinit(alloc);
+        self.usage = restored.session_usage;
         if (self.first_title) |value| self.alloc.free(value);
         self.first_title = null;
         if (self.root and state.title == null) {
@@ -6301,6 +6361,7 @@ fn settingsFrom(alloc: Allocator, sa: Allocator, state: sm.State) !Restored {
     if (state.title) |raw| restored.title = try alloc.dupe(u8, try json_decode.parseFromSliceLeaky([]const u8, sa, raw, .{}));
     if (state.prefs) |raw| restored.preferences = try decodePreferences(alloc, raw);
     if (state.permissions) |raw| restored.permission_state = try session_codec.decodePermissionState(alloc, raw);
+    restored.session_usage = Session.decodeSavedUsage(sa, "restore", state.usage);
     return restored;
 }
 
@@ -6396,6 +6457,7 @@ fn resumedOf(alloc: Allocator, restored: *Restored, id: []const u8, workspace: [
             // v1 reloads its totals as zero as well.
             .total_input_tokens = 0,
             .total_output_tokens = 0,
+            .session_usage = restored.session_usage,
             .permission_state = restored.permission_state orelse .{},
         },
         .title = restored.title,
@@ -17245,4 +17307,61 @@ test "eb03: fork copies lines 2..S byte-for-byte and appends input_withdrawn for
             try testing.expectEqualSlices(u64, &.{ pending1, pending2 }, tail_withdrawn.items);
         }
     }
+}
+
+test "Session.recordUsage persists summed tokens and gateway cost across resume, and marks missing step cost unknown" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("ok"),
+    } }, types.ConversationLanguage.default());
+    try s.recordUsage(.{
+        .tokens = .{ .input_tokens = 120, .output_tokens = 30, .cache_read_tokens = 40, .cache_write_tokens = 10 },
+        .gateway_cost_usd = 0.0012,
+    });
+    try s.recordUsage(.{
+        .tokens = .{ .input_tokens = 80, .output_tokens = 20, .cache_read_tokens = 15 },
+        .gateway_cost_usd = 0.0008,
+    });
+    s.close();
+
+    // Resume and verify summed tokens + summed cost.
+    const resumed = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    var restored = try resumed.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 200), restored.session_usage.input_tokens);
+    try testing.expectEqual(@as(u64, 50), restored.session_usage.output_tokens);
+    try testing.expectEqual(@as(u64, 65), restored.session_usage.cachedTokens());
+    try testing.expectEqual(@as(u64, 2), restored.session_usage.step_count);
+    try testing.expectEqual(types.SessionCostStatus.known, restored.session_usage.cost_status);
+    try testing.expectApproxEqAbs(@as(f64, 0.0020), restored.session_usage.cost_usd, 1e-12);
+
+    // A step without gateway cost flips session cost to unknown and survives resume.
+    try resumed.recordUsage(.{
+        .tokens = .{ .input_tokens = 50, .output_tokens = 10 },
+        .gateway_cost_usd = null,
+    });
+    resumed.close();
+
+    const reopened = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer reopened.close();
+    var after_unknown = try reopened.restore(testing.allocator);
+    defer after_unknown.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 250), after_unknown.session_usage.input_tokens);
+    try testing.expectEqual(@as(u64, 60), after_unknown.session_usage.output_tokens);
+    try testing.expectEqual(@as(u64, 3), after_unknown.session_usage.step_count);
+    try testing.expectEqual(types.SessionCostStatus.unknown, after_unknown.session_usage.cost_status);
+
+    // An older set-usage snapshot without cost fields decodes as unknown, never 0.
+    const legacy = Session.decodeSavedUsage(testing.allocator, "legacy", "{\"input_tokens\":500,\"output_tokens\":25}");
+    try testing.expectEqual(@as(u64, 500), legacy.input_tokens);
+    try testing.expectEqual(types.SessionCostStatus.unknown, legacy.cost_status);
 }

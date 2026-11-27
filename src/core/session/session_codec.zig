@@ -213,6 +213,7 @@ pub const DurableSessionState = struct {
     context_history_start: usize = 0,
     total_input_tokens: u64,
     total_output_tokens: u64,
+    session_usage: types.SessionUsage = .{},
     permission_state: session_permission_state.State = .{},
     /// Last ordinary history commit correlated to durable subagent work. This
     /// control-only marker is not included in model history.

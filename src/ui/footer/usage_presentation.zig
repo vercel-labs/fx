@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const usage = @import("../../usage/usage.zig");
+const types = @import("../../core/shared/types.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const row_text = @import("row_text.zig");
@@ -26,11 +27,14 @@ pub const Projection = struct {
     /// The selected model's detail screen instead of the tables.
     detail: bool = false,
     snapshot: ?*const usage.Snapshot = null,
+    session_usage: types.SessionUsage = .{},
 };
 
 const Line = union(enum) {
     heading,
     blank,
+    session_header,
+    session_row,
     /// One line of guidance when there is nothing to tabulate.
     message,
     period_header,
@@ -129,19 +133,28 @@ pub fn showsTables(p: Projection) bool {
     return !messageOnly(p);
 }
 
+fn hasSessionUsage(p: Projection) bool {
+    return p.session_usage.step_count > 0;
+}
+
+fn sessionRows(p: Projection) usize {
+    return if (!p.detail and hasSessionUsage(p)) 3 else 0;
+}
+
 /// Rows of the main view above the model rows.
 fn tableRows(p: Projection) usize {
-    // heading, blank, period header + 3 rows, blank, [budget header + row,
-    // blank], model header.
-    return 2 + 4 + 1 + (if (hasBudget(p)) @as(usize, 3) else 0) + 1;
+    // heading, blank, [session header + row, blank], period header + 3 rows,
+    // blank, [budget header + row, blank], model header.
+    return 2 + sessionRows(p) + 4 + 1 + (if (hasBudget(p)) @as(usize, 3) else 0) + 1;
 }
 
 const detail_rows: usize = 2 + 4 + 1 + 4 + 1 + 4;
 
 pub fn desiredRowCount(p: Projection) usize {
-    if (messageOnly(p)) return 3;
-    if (isCodex(p)) return codexRows(p, codexSections(p, max_lines));
-    if (isGrok(p)) return grokRows(grokSections(p, max_lines));
+    const extra = sessionRows(p);
+    if (messageOnly(p)) return 3 + extra;
+    if (isCodex(p)) return codexRows(p, codexSections(p, max_lines)) + extra;
+    if (isGrok(p)) return grokRows(grokSections(p, max_lines)) + extra;
     if (p.detail) return detail_rows;
     const models = listedModels(p).len;
     if (models == 0) return tableRows(p) + 1;
@@ -170,6 +183,11 @@ fn layout(p: Projection, visible_rows: usize, buf: *[max_lines]Line) []const Lin
     }.f;
     push(buf, &n, .heading);
     push(buf, &n, .blank);
+    if (!p.detail and hasSessionUsage(p)) {
+        push(buf, &n, .session_header);
+        push(buf, &n, .session_row);
+        push(buf, &n, .blank);
+    }
     if (messageOnly(p)) {
         push(buf, &n, .message);
         return buf[0..n];
@@ -272,6 +290,8 @@ pub fn composeRow(alloc: Allocator, p: Projection, row_index: u16, visible_rows:
     return switch (lines[row_index]) {
         .heading => composeHeading(alloc, p, limit),
         .blank => .empty,
+        .session_header => composeSessionHeader(alloc, limit),
+        .session_row => composeSessionRow(alloc, p, limit),
         .message => composeMessage(alloc, p, limit),
         .period_header => composeCells(alloc, &period_header, .header, "", limit),
         .period_row => |period| composePeriodRow(alloc, p, period, limit),
@@ -509,6 +529,64 @@ fn noModelsText(period: Period) []const u8 {
         .days_7 => "no usage in the last 7 days",
         .month => "no usage this month",
     };
+}
+
+// ------------------------------------------------------------ this session
+
+const session_header_wide = [_]Cell{
+    .{ .text = "This session", .width = 12, .left = true },
+    .{ .text = "input", .width = 8 },
+    .{ .text = "output", .width = 8 },
+    .{ .text = "cached", .width = 8 },
+    .{ .text = "cost", .width = 14 },
+};
+
+const session_header_narrow = [_]Cell{
+    .{ .text = "This session", .width = 12, .left = true },
+    .{ .text = "in", .width = 6 },
+    .{ .text = "out", .width = 6 },
+    .{ .text = "cost", .width = 14 },
+};
+
+fn composeSessionHeader(alloc: Allocator, limit: usize) !std.ArrayList(u8) {
+    const header: []const Cell = if (limit >= cellsWidth(&session_header_wide))
+        &session_header_wide
+    else
+        &session_header_narrow;
+    return composeCells(alloc, header, .header, "", limit);
+}
+
+fn sessionCostLabel(buf: *[32]u8, u: types.SessionUsage) []const u8 {
+    return switch (u.cost_status) {
+        .none => "-",
+        .unknown => "cost unknown",
+        .known => money(buf, u.cost_usd),
+    };
+}
+
+fn composeSessionRow(alloc: Allocator, p: Projection, limit: usize) !std.ArrayList(u8) {
+    const u = p.session_usage;
+    var input_buf: [16]u8 = undefined;
+    var output_buf: [16]u8 = undefined;
+    var cached_buf: [16]u8 = undefined;
+    var cost_buf: [32]u8 = undefined;
+    if (limit >= cellsWidth(&session_header_wide)) {
+        const cells = [_]Cell{
+            .{ .text = "total", .width = 12, .left = true },
+            .{ .text = compact(&input_buf, u.input_tokens), .width = 8 },
+            .{ .text = compact(&output_buf, u.output_tokens), .width = 8 },
+            .{ .text = compact(&cached_buf, u.cachedTokens()), .width = 8 },
+            .{ .text = sessionCostLabel(&cost_buf, u), .width = 14 },
+        };
+        return composeCells(alloc, &cells, .data, "", limit);
+    }
+    const cells = [_]Cell{
+        .{ .text = "total", .width = 12, .left = true },
+        .{ .text = compact(&input_buf, u.input_tokens), .width = 6 },
+        .{ .text = compact(&output_buf, u.output_tokens), .width = 6 },
+        .{ .text = sessionCostLabel(&cost_buf, u), .width = 14 },
+    };
+    return composeCells(alloc, &cells, .data, "", limit);
 }
 
 // ---------------------------------------------------------------- period
@@ -2449,4 +2527,52 @@ test "Codex states name ChatGPT, not AI Gateway" {
     defer expired_screen.deinit();
     try testing.expectEqualStrings("usage: the sign-in needs a refresh", expired_screen.row(0));
     try testing.expectEqualStrings("  (send a message to renew it, then reopen /usage)", expired_screen.row(2));
+}
+
+test "This session section renders at the top with tokens and gateway cost or cost unknown" {
+    var snapshot = try testSnapshot(.ready, false, &month_models);
+    defer snapshot.deinit();
+
+    const p_cost: Projection = .{
+        .active = true,
+        .snapshot = &snapshot,
+        .session_usage = .{
+            .input_tokens = 2_000,
+            .output_tokens = 500,
+            .cache_read_tokens = 600,
+            .step_count = 2,
+            .cost_status = .known,
+            .cost_usd = 0.0020,
+        },
+    };
+    for (test_widths) |width| {
+        var screen = try draw(p_cost, width, 40);
+        defer screen.deinit();
+        try testing.expect(std.mem.startsWith(u8, screen.row(2), "This session"));
+        try testing.expect(std.mem.startsWith(u8, screen.row(3), "total"));
+        try testing.expect(std.mem.find(u8, screen.row(3), "2.0K") != null);
+        try testing.expect(std.mem.find(u8, screen.row(3), "500") != null);
+        try testing.expect(std.mem.find(u8, screen.row(3), "$0.0020") != null);
+        if (width >= 50) try testing.expect(std.mem.find(u8, screen.row(3), "600") != null);
+        try testing.expectEqual(endColumn(screen.row(2), "cost").?, endColumn(screen.row(3), "$0.0020").?);
+        try testing.expect(std.mem.startsWith(u8, screen.row(5), "period"));
+        try testing.expect(screen.widest() <= width);
+    }
+
+    var unavailable = try testSnapshot(.{ .unavailable = .no_gateway_sign_in }, false, &.{});
+    defer unavailable.deinit();
+    var unknown_screen = try draw(.{
+        .active = true,
+        .snapshot = &unavailable,
+        .session_usage = .{
+            .input_tokens = 150,
+            .output_tokens = 40,
+            .step_count = 1,
+            .cost_status = .unknown,
+        },
+    }, 80, 40);
+    defer unknown_screen.deinit();
+    try testing.expect(std.mem.startsWith(u8, unknown_screen.row(2), "This session"));
+    try testing.expect(std.mem.find(u8, unknown_screen.row(3), "cost unknown") != null);
+    try testing.expect(std.mem.find(u8, unknown_screen.row(5), "(use /login, or set AI_GATEWAY_API_KEY)") != null);
 }

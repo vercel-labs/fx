@@ -716,6 +716,7 @@ const App = struct {
 
     statusline_context: bool = false,
     statusline_session: bool = false,
+    statusline_session_usage: bool = false,
     /// Resolved `session_titles` preference: generate a model-written session
     /// title from the first prompt of a fresh session.
     session_title_generation: bool = true,

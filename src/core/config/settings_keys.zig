@@ -93,10 +93,11 @@ const sound_child_descriptions = [_][]const u8{
     "Play extra interaction sounds when sound is on",
     "Play a sound when a turn finishes",
 };
-const status_line_children = [_][]const u8{ "context", "session", "workspace" };
+const status_line_children = [_][]const u8{ "context", "session", "session_usage", "workspace" };
 const status_line_child_descriptions = [_][]const u8{
     "Show context usage in the footer",
     "Show the session title in the footer",
+    "Show this session's tokens and cost in the footer",
     "Show the workspace path and Git branch in the footer",
 };
 const experimental_children = [_][]const u8{"workspace_capture"};
@@ -372,7 +373,7 @@ test "dotted paths name listed keys, fixed children, and paths into maps" {
     const child = unknownPart("status_line.contxt").?;
     try std.testing.expectEqualStrings("contxt", child.name);
     try std.testing.expectEqualStrings("status_line", child.parent.?);
-    try std.testing.expectEqual(@as(usize, 3), child.known.len);
+    try std.testing.expectEqual(@as(usize, 4), child.known.len);
 
     const under_value = unknownPart("fast_mode.on").?;
     try std.testing.expectEqualStrings("on", under_value.name);

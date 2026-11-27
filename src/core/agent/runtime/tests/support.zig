@@ -1794,9 +1794,9 @@ pub const FakeAgentRuntimeDeps = struct {
         self.inner_usages.append(self.alloc, usage) catch return;
     }
 
-    fn recordUsage(ctx: *anyopaque, usage: types.Usage) anyerror!void {
+    fn recordUsage(ctx: *anyopaque, step: types.StepUsage) anyerror!void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(ctx));
-        try self.recorded_usages.append(self.alloc, usage);
+        try self.recorded_usages.append(self.alloc, step.tokens);
     }
 
     fn recordRejected(raw: *anyopaque, _: Allocator, call: ToolCall, _: []const u8, _: ?[]const u8) !void {

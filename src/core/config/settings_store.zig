@@ -37,6 +37,7 @@ pub const Availability = union(enum) {
 pub const StatuslineItem = enum {
     context,
     session,
+    session_usage,
     workspace,
 };
 
@@ -266,6 +267,7 @@ const UserPreferenceField = enum(u4) {
     prompt_history_enabled,
     statusline_context,
     statusline_session,
+    statusline_session_usage,
     session_titles,
 
     fn mask(self: UserPreferenceField) u16 {
@@ -286,6 +288,7 @@ const UserPreferenceField = enum(u4) {
             .prompt_history_enabled => "settings.json.preference-migration.prompt_history_enabled.json",
             .statusline_context => "settings.json.preference-migration.statusline_context.json",
             .statusline_session => "settings.json.preference-migration.statusline_session.json",
+            .statusline_session_usage => "settings.json.preference-migration.statusline_session_usage.json",
             .session_titles => "settings.json.preference-migration.session_titles.json",
         };
     }
@@ -304,6 +307,7 @@ const user_preference_fields = [_]UserPreferenceField{
     .prompt_history_enabled,
     .statusline_context,
     .statusline_session,
+    .statusline_session_usage,
     .session_titles,
 };
 
@@ -1470,6 +1474,7 @@ fn cleanupLegacyWorkspacePreferences(
             const legacy_field: ?UserPreferenceField = switch (item_patch.item) {
                 .context => .statusline_context,
                 .session => .statusline_session,
+                .session_usage => .statusline_session_usage,
                 .workspace => null,
             };
             if (legacy_field) |field| {

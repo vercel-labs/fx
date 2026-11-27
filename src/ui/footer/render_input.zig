@@ -300,6 +300,7 @@ pub const usageCodexHasPeriods = usage_presentation.codexHasPeriods;
 
 pub fn usageMenuProjection(
     menu: *const usage_menu.State,
+    session_usage: types.SessionUsage,
 ) UsageMenuProjection {
     return .{
         .active = menu.active,
@@ -308,6 +309,7 @@ pub fn usageMenuProjection(
         .model_window_start = menu.model_window_start,
         .detail = menu.detail,
         .snapshot = if (menu.snapshot) |*snapshot| snapshot else null,
+        .session_usage = session_usage,
     };
 }
 

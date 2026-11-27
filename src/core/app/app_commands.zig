@@ -1773,6 +1773,7 @@ fn statuslineItemForSetting(setting: settings_catalog.SettingId) ?config_runtime
     return switch (setting) {
         .statusline_context => .context,
         .statusline_session => .session,
+        .statusline_session_usage => .session_usage,
         .statusline_workspace => .workspace,
         else => null,
     };
@@ -1783,6 +1784,10 @@ fn statuslineItemEnabled(app: anytype, item: config_runtime.StatuslineItem) bool
     return switch (item) {
         .context => app.statusline_context,
         .session => app.statusline_session,
+        .session_usage => if (comptime @hasField(App, "statusline_session_usage"))
+            app.statusline_session_usage
+        else
+            false,
         .workspace => if (comptime @hasField(App, "workspace_identity"))
             app.workspace_identity.enabled
         else
@@ -1796,6 +1801,9 @@ fn assignStatuslineItem(app: anytype, item: config_runtime.StatuslineItem, enabl
     switch (item) {
         .context => app.statusline_context = enabled,
         .session => app.statusline_session = enabled,
+        .session_usage => if (comptime @hasField(App, "statusline_session_usage")) {
+            app.statusline_session_usage = enabled;
+        },
         .workspace => if (comptime @hasField(App, "workspace_identity")) {
             app.workspace_identity.enabled = enabled;
         },
@@ -1833,7 +1841,7 @@ fn handleStatuslineCommand(app: anytype, rest: []const u8) !void {
         try app.writeDomainNotice(.{
             .topic = "",
             .tone = .@"error",
-            .body = "usage: /statusline [context|session|workspace]",
+            .body = "usage: /statusline [context|session|session_usage|workspace]",
         }, true);
         return;
     };
@@ -1957,6 +1965,7 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     }
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
+    if (comptime @hasField(App, "statusline_session_usage")) snapshot.statusline_session_usage = app.statusline_session_usage;
     if (comptime @hasField(App, "session_title_generation")) snapshot.session_titles = app.session_title_generation;
     if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
     if (comptime @hasField(App, "prompt_history")) snapshot.prompt_history = app.prompt_history.enabled;
@@ -1973,7 +1982,7 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
 
 pub fn applySettingsCatalogMenuChange(app: anytype, change: settings_catalog.Change) !void {
     switch (change.setting) {
-        .statusline_context, .statusline_session, .statusline_workspace => {
+        .statusline_context, .statusline_session, .statusline_session_usage, .statusline_workspace => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
             try applyStatuslineItem(
                 app,
@@ -2010,7 +2019,7 @@ fn persistUserPreferencesSilently(
 pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change) !void {
     switch (change.setting) {
         .model => unreachable,
-        .statusline_context, .statusline_session, .statusline_workspace => {
+        .statusline_context, .statusline_session, .statusline_session_usage, .statusline_workspace => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
             const item = statuslineItemForSetting(change.setting).?;
             if (enabled != statuslineItemEnabled(app, item)) {

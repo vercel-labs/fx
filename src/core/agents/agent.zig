@@ -2,6 +2,7 @@
 //! the terminal, and every shared service; an agent holds none of them.
 
 const std = @import("std");
+const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
@@ -20,6 +21,34 @@ const tool_set = @import("../tooling/tool_set.zig");
 
 /// How many history turns an agent's session keeps in memory.
 pub const max_history_turns: usize = 8;
+
+/// Thread-safe accumulator of one session's token and gateway cost totals.
+/// Written by the worker on each completed step and read by the main loop.
+pub const SessionUsageTracker = struct {
+    mutex: std.Io.Mutex = .init,
+    value: types.SessionUsage = .{},
+
+    pub fn observe(self: *SessionUsageTracker, step: types.StepUsage) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.value.observe(step);
+    }
+
+    pub fn restore(self: *SessionUsageTracker, restored: types.SessionUsage) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.value = restored;
+    }
+
+    pub fn snapshot(self: *SessionUsageTracker) types.SessionUsage {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.value;
+    }
+};
 
 /// What an agent is to its host: a top-level fx instance, or a subagent an
 /// instance or another subagent started.
@@ -73,6 +102,7 @@ pub const Agent = struct {
     total_input_tokens: u64 = 0,
     total_output_tokens: u64 = 0,
     total_web_search_requests: u64 = 0,
+    session_usage: SessionUsageTracker = .{},
     /// A top-level instance, every one alike, or a subagent.
     role: Role = .instance,
     /// Whether one of its turns was going when the host last looked, so the

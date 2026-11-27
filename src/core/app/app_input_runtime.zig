@@ -2638,6 +2638,7 @@ pub fn Runtime(comptime App: type) type {
         fn usageMenuVisibleModelItems(app: *App) u16 {
             const projection = render_input.usageMenuProjection(
                 &app.input_runtime.usage_menu,
+                agents.loadSessionUsage(agents.screenAgentOf(app)),
             );
             const menu: render_input.CompactCommandMenuProjection = .{
                 .usage = projection,

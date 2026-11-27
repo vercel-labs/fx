@@ -332,7 +332,7 @@ pub const AgentRuntimeDeps = struct {
     /// Called once with each main-model completion's provider usage, as soon
     /// as it arrives, so a saved session keeps the usage of every reply even
     /// when the turn never ends. A failure is traced and never fails the turn.
-    record_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) anyerror!void = null,
+    record_usage: ?*const fn (ctx: *anyopaque, step: types.StepUsage) anyerror!void = null,
     /// Keeps the conversation's Claude prompt cache warm between requests.
     /// Owned by the conversation's `SessionRuntime`; null where no one waits
     /// on the conversation, as in `fx ask` and subagents.

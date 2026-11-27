@@ -77,6 +77,7 @@ pub const Settings = struct {
     review_model: ?[]const u8 = null,
     statusline_context: ?bool = null,
     statusline_session: ?bool = null,
+    statusline_session_usage: ?bool = null,
     statusline_workspace: ?bool = null,
     session_titles: ?bool = null,
     /// Ping a waiting Claude conversation's prompt cache so it stays alive.
@@ -159,6 +160,7 @@ pub const ConfigSources = struct {
     prompt_history_enabled: ConfigSource = .compiled_default,
     statusline_context: ConfigSource = .compiled_default,
     statusline_session: ConfigSource = .compiled_default,
+    statusline_session_usage: ConfigSource = .compiled_default,
     session_titles: ConfigSource = .compiled_default,
     cache_warming: ConfigSource = .compiled_default,
     notification_turn_end: ConfigSource = .compiled_default,
@@ -1037,6 +1039,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
     if (settings.statusline_context != null) sources.statusline_context = source;
     if (settings.statusline_session != null) sources.statusline_session = source;
+    if (settings.statusline_session_usage != null) sources.statusline_session_usage = source;
     if (settings.notification_turn_end != null) sources.notification_turn_end = source;
     if (settings.notification_attention_required != null) sources.notification_attention_required = source;
     if (settings.notification_max != null) sources.notification_max = source;
@@ -2031,6 +2034,10 @@ fn parseProfileOnlyFields(
                 if (v != .bool) return error.InvalidStatusLineSessionType;
                 settings.statusline_session = v.bool;
             }
+            if (value.object.get("session_usage")) |v| {
+                if (v != .bool) return error.InvalidStatusLineSessionUsageType;
+                settings.statusline_session_usage = v.bool;
+            }
             if (parse_workspace_statusline) {
                 if (value.object.get("workspace")) |v| {
                     if (v != .bool) return error.InvalidStatusLineWorkspaceType;
@@ -2226,6 +2233,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
 
     if (incoming.statusline_context) |value| target.statusline_context = value;
     if (incoming.statusline_session) |value| target.statusline_session = value;
+    if (incoming.statusline_session_usage) |value| target.statusline_session_usage = value;
     if (incoming.statusline_workspace) |value| target.statusline_workspace = value;
     if (incoming.notification_turn_end) |value| target.notification_turn_end = value;
     if (incoming.notification_attention_required) |value| target.notification_attention_required = value;
@@ -4152,6 +4160,30 @@ test "global statusline rejects malformed fields and ignores a non-object group"
         parseSettingsJson(
             std.testing.allocator,
             "{\"status_line\":{\"workspace\":1}}",
+        ),
+    );
+}
+
+test "status_line.session_usage is registered in settings_keys" {
+    const status_line = settings_keys.find("status_line").?;
+    var found = false;
+    for (status_line.children) |child| {
+        if (std.mem.eql(u8, child, "session_usage")) found = true;
+    }
+    try std.testing.expect(found);
+
+    var settings = try parseSettingsJson(
+        std.testing.allocator,
+        "{\"status_line\":{\"session_usage\":true}}",
+    );
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expectEqual(true, settings.statusline_session_usage.?);
+
+    try std.testing.expectError(
+        error.InvalidStatusLineSessionUsageType,
+        parseSettingsJson(
+            std.testing.allocator,
+            "{\"status_line\":{\"session_usage\":1}}",
         ),
     );
 }

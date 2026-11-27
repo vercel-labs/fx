@@ -3,8 +3,10 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const types = @import("../shared/types.zig");
 
 pub const Agent = @import("agent.zig").Agent;
+pub const SessionUsageTracker = @import("agent.zig").SessionUsageTracker;
 pub const Role = @import("agent.zig").Role;
 pub const max_history_turns = @import("agent.zig").max_history_turns;
 pub const ChildRun = @import("child_run.zig").ChildRun;
@@ -54,6 +56,28 @@ pub fn addTotal(total: *u64, value: u64) void {
 pub fn loadTotal(total: *const u64) u64 {
     if (comptime builtin.single_threaded) return total.*;
     return @atomicLoad(u64, total, .monotonic);
+}
+
+pub fn recordSessionStepUsage(app_agent: anytype, step: types.StepUsage) void {
+    const HostAgent = @TypeOf(app_agent.*);
+    if (comptime @hasField(HostAgent, "session_usage")) {
+        app_agent.session_usage.observe(step);
+    }
+}
+
+pub fn restoreSessionUsage(app_agent: anytype, restored: types.SessionUsage) void {
+    const HostAgent = @TypeOf(app_agent.*);
+    if (comptime @hasField(HostAgent, "session_usage")) {
+        app_agent.session_usage.restore(restored);
+    }
+}
+
+pub fn loadSessionUsage(app_agent: anytype) types.SessionUsage {
+    const HostAgent = @TypeOf(app_agent.*);
+    if (comptime @hasField(HostAgent, "session_usage")) {
+        return app_agent.session_usage.snapshot();
+    }
+    return .{};
 }
 
 /// Asserts, in debug and test builds, that the main loop's own thread is

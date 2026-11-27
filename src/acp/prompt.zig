@@ -3367,13 +3367,13 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
 
 /// `AgentRuntimeDeps.record_usage` on v2: each reply's usage reaches the
 /// log as it arrives (D92).
-fn recordUsage(raw_ctx: *anyopaque, usage: types.Usage) !void {
+fn recordUsage(raw_ctx: *anyopaque, step: types.StepUsage) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*value| value else return;
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const v2 = session.v2 orelse return;
-    try v2.recordUsage(usage);
+    try v2.recordUsage(step);
 }
 
 /// `AgentRuntimeDeps.save_route_recovery_status` on v2: a recovery status

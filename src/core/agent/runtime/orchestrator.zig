@@ -4672,7 +4672,7 @@ fn disarmCacheWarming(deps: *const AgentRuntimeDeps) void {
         });
         return;
     };
-    record(deps.ctx, usage) catch |err| {
+    record(deps.ctx, .{ .tokens = usage }) catch |err| {
         debug_trace.logf("cache_warming", "event=usage_not_saved err={s}", .{@errorName(err)});
     };
 }
@@ -9946,7 +9946,10 @@ fn processQueuedPromptLoop(
                     }
                 }
                 agent.observeUsage(completion.usage);
-                if (deps.record_usage) |record| record(deps.ctx, completion.usage) catch |err| {
+                if (deps.record_usage) |record| record(deps.ctx, .{
+                    .tokens = completion.usage,
+                    .gateway_cost_usd = completion.gateway_cost_usd,
+                }) catch |err| {
                     debug_trace.logf("agent", "event=usage_not_saved err={s}", .{@errorName(err)});
                 };
                 armCacheWarming(deps, .{

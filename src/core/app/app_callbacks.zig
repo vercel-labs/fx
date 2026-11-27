@@ -389,8 +389,8 @@ pub fn Bindings(comptime App: type) type {
                         null
                 else
                     null,
-                .record_usage = if (comptime agents.hasAgentField(App, "session_persistence"))
-                    if (agent.session_persistence.v2 != null) agentRecordUsage else null
+                .record_usage = if (comptime agents.hasAgentField(App, "session_usage") or agents.hasAgentField(App, "session_persistence"))
+                    agentRecordUsage
                 else
                     null,
                 .save_prompt_images = if (comptime agents.hasAgentField(App, "session_persistence"))
@@ -1403,9 +1403,14 @@ pub fn Bindings(comptime App: type) type {
             return agent.worker.holdForRestart();
         }
 
-        fn agentRecordUsage(ctx: *anyopaque, usage: types.Usage) anyerror!void {
+        fn agentRecordUsage(ctx: *anyopaque, step: types.StepUsage) anyerror!void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).recordUsage(agent, usage);
+            agents.recordSessionStepUsage(agent, step);
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
+                if (agent.session_persistence.v2 != null) {
+                    try app_session_runtime.Runtime(App).recordUsage(agent, step);
+                }
+            }
         }
 
         fn agentSavePromptImages(ctx: *anyopaque, alloc: std.mem.Allocator, images: []types.ImageAttachment) anyerror!void {

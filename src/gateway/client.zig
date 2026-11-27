@@ -5083,6 +5083,7 @@ const SseFinishEvent = struct {
     finish_reason: types.ProviderFinishReason,
     raw: types.ProviderFinishRaw = .{},
     usage: types.Usage = .{},
+    gateway_cost_usd: ?f64 = null,
 };
 
 const SseFinishParseError = error{
@@ -5103,6 +5104,7 @@ fn parseSseFinishEvent(
         .finish_reason = finish_reason,
         .raw = parseSseFinishRaw(root),
         .usage = parseSseUsage(root),
+        .gateway_cost_usd = parseSseGatewayCost(root),
     };
 }
 
@@ -5193,6 +5195,24 @@ fn parseSseServiceTier(root: std.json.Value) ?types.ProviderServiceTier {
     const service_tier = gateway.object.get("serviceTier") orelse return null;
     if (service_tier != .string) return null;
     return types.ProviderServiceTier.parse(service_tier.string);
+}
+
+fn parseSseGatewayCost(root: std.json.Value) ?f64 {
+    if (root != .object) return null;
+    const provider_metadata = root.object.get("providerMetadata") orelse
+        root.object.get("provider_metadata") orelse return null;
+    if (provider_metadata != .object) return null;
+    const gateway = provider_metadata.object.get("gateway") orelse return null;
+    if (gateway != .object) return null;
+    const cost_value = gateway.object.get("cost") orelse return null;
+    const parsed: f64 = switch (cost_value) {
+        .float => |v| v,
+        .integer => |v| @floatFromInt(v),
+        .string => |s| std.fmt.parseFloat(f64, s) catch return null,
+        else => return null,
+    };
+    if (!std.math.isFinite(parsed) or parsed < 0) return null;
+    return parsed;
 }
 
 fn captureGenerationMetadata(
@@ -5311,6 +5331,7 @@ fn consumeSseStreamTraced(
     var finish_reason_holder: ?types.ProviderFinishReason = null;
     var finish_raw: types.ProviderFinishRaw = .{};
     var finish_usage: types.Usage = .{};
+    var finish_gateway_cost: ?f64 = null;
     var finish_resolved_provider: ?[]const u8 = null;
     defer if (finish_resolved_provider) |provider| alloc.free(@constCast(provider));
     var finish_service_tier: ?types.ProviderServiceTier = null;
@@ -5753,6 +5774,7 @@ fn consumeSseStreamTraced(
             finish_reason_holder = finish_event.finish_reason;
             finish_raw = finish_event.raw;
             finish_usage = finish_event.usage;
+            finish_gateway_cost = finish_event.gateway_cost_usd;
             finish_resolved_provider = parseSseResolvedProvider(alloc, root);
             finish_service_tier = parseSseServiceTier(root);
             traceSseTermination(resolved_model_trace, "valid_finish", finish_reason_holder);
@@ -5806,6 +5828,7 @@ fn consumeSseStreamTraced(
     completion.finish_reason = finish_reason_holder;
     completion.finish_reason_raw = finish_raw;
     completion.usage = finish_usage;
+    completion.gateway_cost_usd = finish_gateway_cost;
 
     debug_trace.logf(
         "stream",
@@ -6225,6 +6248,26 @@ test "consumeSseStream surfaces finish cache and reasoning tokens in turn usage"
     );
     defer deinitGatewayCompletion(std.testing.allocator, &malformed_completion);
     try std.testing.expectEqual(@as(?u64, null), malformed_completion.usage.reasoning_tokens);
+}
+
+test "consumeSseStream extracts gateway cost from finish metadata and ignores invalid values" {
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    const with_cost =
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":10},\"outputTokens\":{\"total\":5}},\"providerMetadata\":{\"gateway\":{\"cost\":\"0.000618\"}}}\n\n";
+    var reader = std.Io.Reader.fixed(with_cost);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.000618), completion.gateway_cost_usd.?, 1e-12);
+
+    const invalid_cost =
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"providerMetadata\":{\"gateway\":{\"cost\":\"-1.5\"}}}\n\n";
+    var bad_reader = std.Io.Reader.fixed(invalid_cost);
+    var bad_completion = try consumeSseStream(std.testing.allocator, &bad_reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &bad_completion);
+    try std.testing.expect(bad_completion.gateway_cost_usd == null);
 }
 
 test "consumeSseStream ignores malformed finish usage totals" {

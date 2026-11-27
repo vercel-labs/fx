@@ -2218,6 +2218,68 @@ pub const Usage = struct {
     }
 };
 
+pub const SessionCostStatus = enum {
+    /// No steps have been recorded in this session yet.
+    none,
+    /// Every recorded step reported a gateway cost.
+    known,
+    /// At least one recorded step had no gateway cost or came from a session
+    /// saved before cost tracking.
+    unknown,
+};
+
+pub const StepUsage = struct {
+    tokens: Usage = .{},
+    gateway_cost_usd: ?f64 = null,
+};
+
+pub const SessionUsage = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    cache_read_tokens: u64 = 0,
+    cache_write_tokens: u64 = 0,
+    step_count: u64 = 0,
+    cost_status: SessionCostStatus = .none,
+    cost_usd: f64 = 0,
+
+    pub fn cachedTokens(self: SessionUsage) u64 {
+        return self.cache_read_tokens +| self.cache_write_tokens;
+    }
+
+    pub fn totalTokens(self: SessionUsage) u64 {
+        return self.input_tokens +| self.output_tokens +| self.cachedTokens();
+    }
+
+    pub fn observe(self: *SessionUsage, step: StepUsage) void {
+        const has_tokens = step.tokens.input_tokens != null or
+            step.tokens.output_tokens != null or
+            step.tokens.cache_read_tokens != null or
+            step.tokens.cache_write_tokens != null or
+            step.tokens.reasoning_tokens != null;
+        if (!has_tokens and step.gateway_cost_usd == null) return;
+        self.input_tokens +|= step.tokens.input_tokens orelse 0;
+        self.output_tokens +|= step.tokens.output_tokens orelse 0;
+        self.cache_read_tokens +|= step.tokens.cache_read_tokens orelse 0;
+        self.cache_write_tokens +|= step.tokens.cache_write_tokens orelse 0;
+        self.step_count +|= 1;
+        if (step.gateway_cost_usd) |cost| {
+            if (std.math.isFinite(cost) and cost >= 0) {
+                switch (self.cost_status) {
+                    .none => {
+                        self.cost_status = .known;
+                        self.cost_usd = cost;
+                    },
+                    .known => self.cost_usd += cost,
+                    .unknown => {},
+                }
+                return;
+            }
+        }
+        self.cost_status = .unknown;
+        self.cost_usd = 0;
+    }
+};
+
 /// Absolute per-turn token totals. Input covers only user-submitted prompt text
 /// and stays estimated; output may become exact from provider usage.
 pub const TurnTokenProgress = struct {
@@ -2437,6 +2499,8 @@ pub const ModelCompletion = struct {
     /// The provider's own reason for `finish_reason`, for notices and traces.
     finish_reason_raw: ProviderFinishRaw = .{},
     usage: Usage = .{},
+    /// Gateway-reported cost in USD for this completion, when present.
+    gateway_cost_usd: ?f64 = null,
 };
 
 pub fn validGatewayGenerationId(id: []const u8) bool {
@@ -4848,4 +4912,42 @@ test "dupePersistedContextNotes leaves nothing behind when a later note fails to
         dupeThenFreeContextNotes,
         .{@as([]const PersistedContextNote, &notes)},
     );
+}
+
+test "SessionUsage sums tokens and gateway cost only when every step reports one" {
+    var total: SessionUsage = .{};
+    try std.testing.expectEqual(SessionCostStatus.none, total.cost_status);
+
+    total.observe(.{
+        .tokens = .{ .input_tokens = 100, .output_tokens = 25, .cache_read_tokens = 40, .cache_write_tokens = 10 },
+        .gateway_cost_usd = 0.0012,
+    });
+    total.observe(.{
+        .tokens = .{ .input_tokens = 200, .output_tokens = 50, .cache_read_tokens = 30 },
+        .gateway_cost_usd = 0.0008,
+    });
+    try std.testing.expectEqual(@as(u64, 300), total.input_tokens);
+    try std.testing.expectEqual(@as(u64, 75), total.output_tokens);
+    try std.testing.expectEqual(@as(u64, 80), total.cachedTokens());
+    try std.testing.expectEqual(@as(u64, 455), total.totalTokens());
+    try std.testing.expectEqual(@as(u64, 2), total.step_count);
+    try std.testing.expectEqual(SessionCostStatus.known, total.cost_status);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0020), total.cost_usd, 1e-12);
+
+    // A step without cost turns the session cost unknown, never 0 or partial.
+    total.observe(.{
+        .tokens = .{ .input_tokens = 50, .output_tokens = 10 },
+        .gateway_cost_usd = null,
+    });
+    try std.testing.expectEqual(@as(u64, 350), total.input_tokens);
+    try std.testing.expectEqual(@as(u64, 85), total.output_tokens);
+    try std.testing.expectEqual(SessionCostStatus.unknown, total.cost_status);
+    try std.testing.expectEqual(@as(f64, 0), total.cost_usd);
+
+    // A later step with cost stays unknown.
+    total.observe(.{
+        .tokens = .{ .input_tokens = 10 },
+        .gateway_cost_usd = 0.0005,
+    });
+    try std.testing.expectEqual(SessionCostStatus.unknown, total.cost_status);
 }

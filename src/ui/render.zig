@@ -259,6 +259,7 @@ pub const StatuslineItems = struct {
     context_used: u64 = 0,
     context_total: ?u32 = null,
     session_title: ?[]const u8 = null,
+    session_usage: ?types.SessionUsage = null,
 };
 
 /// Cell budget for the session title segment. The title is capped at 8 words
@@ -439,6 +440,34 @@ fn appendWorkspaceIdentity(
     appendStatusSegment(out, end, identity);
 }
 
+fn formatStatuslineTokens(buf: *[32]u8, total: u64) []const u8 {
+    if (total < 1_000) return std.mem.print(buf, "{d} tok", .{total}) catch "";
+    if (total < 1_000_000) {
+        const k = @as(f64, @floatFromInt(total)) / 1000.0;
+        return if (k < 10)
+            std.mem.print(buf, "{d:.1}k tok", .{k}) catch ""
+        else
+            std.mem.print(buf, "{d:.0}k tok", .{k}) catch "";
+    }
+    const m = @as(f64, @floatFromInt(total)) / 1_000_000.0;
+    return if (m < 10)
+        std.mem.print(buf, "{d:.1}m tok", .{m}) catch ""
+    else
+        std.mem.print(buf, "{d:.0}m tok", .{m}) catch "";
+}
+
+fn formatStatuslineCost(buf: *[32]u8, session_usage: types.SessionUsage) []const u8 {
+    return switch (session_usage.cost_status) {
+        .none => "",
+        .unknown => "cost unknown",
+        .known => blk: {
+            const value = session_usage.cost_usd;
+            if (value < 1) break :blk std.mem.print(buf, "${d:.4}", .{value}) catch "";
+            break :blk std.mem.print(buf, "${d:.2}", .{value}) catch "";
+        },
+    };
+}
+
 fn appendSessionStatusSegments(
     out: []u8,
     end: *usize,
@@ -476,6 +505,14 @@ fn appendSessionStatusSegments(
             const used_k = statusline.context_used / 1000;
             var ctx_buf: [32]u8 = undefined;
             appendStatusSegment(out, end, std.mem.print(&ctx_buf, "{d}k", .{used_k}) catch "");
+        }
+    }
+    if (statusline.session_usage) |session_usage| {
+        if (session_usage.step_count > 0) {
+            var tok_buf: [32]u8 = undefined;
+            var cost_buf: [32]u8 = undefined;
+            appendStatusSegment(out, end, formatStatuslineTokens(&tok_buf, session_usage.totalTokens()));
+            appendStatusSegment(out, end, formatStatuslineCost(&cost_buf, session_usage));
         }
     }
     appendWorkspaceIdentity(out, end, status_limit, statusline);
@@ -1364,4 +1401,34 @@ test "buildSessionStatusLine reuses model effort and context formatting" {
         &buf,
     );
     try std.testing.expectEqualStrings("gemini-3.8-flash · high · 12k/100k 12%", line);
+}
+
+test "buildSessionStatusLine formats session tokens and gateway cost or cost unknown when enabled" {
+    var off_buf: [160]u8 = undefined;
+    const off_line = buildSessionStatusLine("openai/gpt-5", .auto, false, .{}, 100, &off_buf);
+    try std.testing.expectEqualStrings("gpt-5", off_line);
+
+    var known_buf: [160]u8 = undefined;
+    const known_line = buildSessionStatusLine("openai/gpt-5", .auto, false, .{
+        .session_usage = .{
+            .input_tokens = 2_000,
+            .output_tokens = 500,
+            .cache_read_tokens = 600,
+            .step_count = 2,
+            .cost_status = .known,
+            .cost_usd = 0.0020,
+        },
+    }, 100, &known_buf);
+    try std.testing.expectEqualStrings("gpt-5 · 3.1k tok · $0.0020", known_line);
+
+    var unknown_buf: [160]u8 = undefined;
+    const unknown_line = buildSessionStatusLine("openai/gpt-5", .auto, false, .{
+        .session_usage = .{
+            .input_tokens = 150,
+            .output_tokens = 40,
+            .step_count = 1,
+            .cost_status = .unknown,
+        },
+    }, 100, &unknown_buf);
+    try std.testing.expectEqualStrings("gpt-5 · 190 tok · cost unknown", unknown_line);
 }

@@ -868,6 +868,7 @@ pub fn Runtime(comptime App: type) type {
                 ),
                 .usage_menu = render_input.usageMenuProjection(
                     &app.input_runtime.usage_menu,
+                    agents.loadSessionUsage(agent),
                 ),
                 .workspace_menu = if (comptime @hasDecl(App, "workspaceAccess"))
                     render_input.workspaceMenuProjection(
@@ -939,6 +940,12 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "statusline_session")) {
                 if (app.statusline_session) {
                     items.session_title = app_session_runtime.Runtime(App).cachedSessionTitle(agent);
+                }
+            }
+            if (comptime @hasField(App, "statusline_session_usage")) {
+                if (app.statusline_session_usage) {
+                    const session_usage = agents.loadSessionUsage(agent);
+                    if (session_usage.step_count > 0) items.session_usage = session_usage;
                 }
             }
             return items;
@@ -3965,6 +3972,7 @@ const CoordinatorTestApp = struct {
         pending_images: std.ArrayList(types.ImageAttachment) = .empty,
         effort: types.ReasoningEffort = .auto,
         total_input_tokens: u64 = 0,
+        session_usage: agents.SessionUsageTracker = .{},
         approval_prompt: approval_prompt.ApprovalPrompt = .{},
         question_prompt: question_prompt.QuestionPrompt = .{},
         submission: @import("input_submit_runtime.zig").State = .{},
@@ -3977,6 +3985,7 @@ const CoordinatorTestApp = struct {
     model_cache_loading: bool = false,
     fast_mode: bool = false,
     statusline_context: bool = false,
+    statusline_session_usage: bool = false,
     intrinsic_fast_model: ?[]const u8 = null,
     gateway_metadata_model: ?[]const u8 = null,
     gateway_metadata: model_capabilities.GatewayMetadata = .{},
@@ -4500,6 +4509,29 @@ test "core.app_render_runtime uses Gateway context window from resolved capabili
     );
     try std.testing.expectEqual(@as(u64, 12_000), statusline.context_used);
     try std.testing.expectEqual(@as(?u32, 750_000), statusline.context_total);
+}
+
+test "core.app_render_runtime projects session usage to status line only when enabled" {
+    const alloc = std.testing.allocator;
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{},
+        .statusline_session_usage = false,
+    };
+    defer app.deinit();
+    app.main_agent.session_usage.observe(.{
+        .tokens = .{ .input_tokens = 200, .output_tokens = 50, .cache_read_tokens = 100 },
+        .gateway_cost_usd = 0.0015,
+    });
+
+    const disabled = Runtime(CoordinatorTestApp).buildStatuslineItems(&app, (&app).agent(), "openai/gpt-5");
+    try std.testing.expect(disabled.session_usage == null);
+
+    app.statusline_session_usage = true;
+    const enabled = Runtime(CoordinatorTestApp).buildStatuslineItems(&app, (&app).agent(), "openai/gpt-5");
+    try std.testing.expect(enabled.session_usage != null);
+    try std.testing.expectEqual(@as(u64, 350), enabled.session_usage.?.totalTokens());
+    try std.testing.expectEqual(types.SessionCostStatus.known, enabled.session_usage.?.cost_status);
 }
 
 test "core.app_render_runtime request owner authorizes explicit frame causes" {

@@ -257,6 +257,7 @@ pub const StartupState = struct {
     first_call_tool_choice: types.ToolChoice = .auto,
     statusline_context: bool = false,
     statusline_session: bool = false,
+    statusline_session_usage: bool = false,
     statusline_workspace: bool = false,
     session_title_generation: bool = true,
     /// Resolved `cache_warming` preference.
@@ -940,6 +941,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     }
     state.statusline_context = settings.statusline_context orelse false;
     state.statusline_session = settings.statusline_session orelse false;
+    state.statusline_session_usage = settings.statusline_session_usage orelse false;
     state.statusline_workspace = settings.statusline_workspace orelse false;
     state.session_title_generation = settings.session_titles orelse true;
     state.cache_warming = settings.cache_warming orelse true;
