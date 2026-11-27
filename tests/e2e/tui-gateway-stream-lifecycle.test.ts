@@ -4753,7 +4753,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session!.sendText("First model turn.");
-      await session!.waitForPane((pane) => pane.includes("TUI_MODEL_TURN_1") && turnSettled(pane), TIMEOUT);
+      await session!.waitForReplyAndTurnEnd("TUI_MODEL_TURN_1", TIMEOUT);
       await session!.waitForStableComposer(TIMEOUT);
 
       await session!.sendText(`/model ${modelB}`);
@@ -4761,11 +4761,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session!.waitForStableComposer(TIMEOUT);
 
       await session!.sendText("Second model turn.");
-      await session!.waitForPane((pane) => pane.includes("TUI_MODEL_TURN_2") && turnSettled(pane), TIMEOUT);
+      await session!.waitForReplyAndTurnEnd("TUI_MODEL_TURN_2", TIMEOUT);
       await session!.waitForStableComposer(TIMEOUT);
 
       await session!.sendText("Third model turn.");
-      await session!.waitForPane((pane) => pane.includes("TUI_MODEL_TURN_3") && turnSettled(pane), TIMEOUT);
+      await session!.waitForReplyAndTurnEnd("TUI_MODEL_TURN_3", TIMEOUT);
       await session!.waitForStableComposer(TIMEOUT);
 
       expect(queuedGateway.requests).toHaveLength(3);
