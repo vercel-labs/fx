@@ -4060,11 +4060,14 @@ test "a wait that the upgrade's restart ends says the reports still arrive" {
     );
 }
 
+/// Release test builds turn error tracing off (`build.zig`), so without these
+/// prints a failed test says only "failed without output".
 fn waitForRuns(fixture: *MailboxFixture, count: usize) !void {
     for (0..5000) |_| {
         if (fixture.runs.load(.seq_cst) >= count) return;
         io_mod.sleep(std.time.ns_per_ms);
     }
+    std.debug.print("waitForRuns: {d} runs did not start in time\n", .{count});
     return error.Timeout;
 }
 
@@ -7638,6 +7641,7 @@ const GapTrace = struct {
             if (self.has(needle)) return;
             io_mod.sleep(std.time.ns_per_ms);
         }
+        std.debug.print("gap trace never showed {s}\n", .{needle});
         return error.Timeout;
     }
 
@@ -7792,6 +7796,7 @@ const GapWait = struct {
         self.done.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
             self.worker.requestCancel();
             self.thread.join();
+            std.debug.print("wait stayed blocked after the end settled\n", .{});
             return error.WaitBlockedWhileNothingWorks;
         };
         self.thread.join();
@@ -7816,11 +7821,22 @@ const gap_wait_limit: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5),
 /// (`tests/tla/subagent/WaitNudge.tla`: `wait` always returns).
 fn waitInSettleGap(gap: *GapFixture) ![]u8 {
     defer SettleGap.go.set(io_mod.getIo());
-    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
+    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch {
+        std.debug.print("host never reached the gap\n", .{});
+        return error.HostNeverReachedTheGap;
+    };
     var waiting = GapWait{ .runtime = gap.runtime, .worker = &gap.worker };
     try waiting.startBlocked(&gap.trace);
     SettleGap.go.set(io_mod.getIo());
     return waiting.finish();
+}
+
+/// Checks that `wait` said the end left no report, and prints what it said
+/// when it did not.
+fn expectEndedWithoutReport(said: []const u8) !void {
+    if (std.mem.find(u8, said, "ended without a report") != null) return;
+    std.debug.print("wait said: {s}\n", .{said});
+    return error.TestUnexpectedResult;
 }
 
 /// One `wait` call with nothing held, returning what it said, which the
@@ -7840,7 +7856,7 @@ test "a wait that starts as a subagent's work ends with nothing to report still 
     _ = try gap.call(.{ .message = .{ .agent = "quiet", .message = "go", .report = "never" } }, "call-1");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
 }
@@ -7856,7 +7872,7 @@ test "a wait that starts as the parent's stop ends a subagent's turn still retur
     _ = try gap.call(.{ .stop = .{ .agent = "reviewer" } }, "call-2");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
 }
@@ -7870,7 +7886,7 @@ test "a wait that starts as a report its owner's sink refuses is held still retu
     _ = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "go" } }, "call-1");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
     try std.testing.expectEqual(@as(usize, 0), gap.worker.queuedPromptCount());
@@ -7886,7 +7902,7 @@ test "a wait that starts as the parent's close ends a subagent's turn still retu
     _ = try gap.call(.{ .close = .{ .agent = "reviewer" } }, "call-2");
     const said = try waitInSettleGap(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "ended without a report") != null);
+    try expectEndedWithoutReport(said);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 0), gap.fixture.reportCount());
 }
@@ -7907,7 +7923,7 @@ test "a wait that starts as the user's turn on a subagent ends with nothing to r
     ender.join();
     const text = try said;
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.find(u8, text, "ended without a report") != null);
+    try expectEndedWithoutReport(text);
     try waitUntilQuiet(gap.runtime);
     try std.testing.expectEqual(@as(usize, 1), gap.fixture.reportCount());
 }
@@ -8548,6 +8564,7 @@ fn waitUntilQuiet(runtime: *Runtime) !void {
         if (runtime.quiet()) return;
         io_mod.sleep(std.time.ns_per_ms);
     }
+    std.debug.print("runtime did not go quiet in time\n", .{});
     return error.Timeout;
 }
 
