@@ -114,7 +114,7 @@ pub fn prepare(state: *const server.ServerState, alloc: Allocator, params_raw: ?
 }
 
 fn loadSettings(state: *const server.ServerState, alloc: Allocator, root: []const u8) PrepareError!config_runtime.DetailedSettings {
-    return (if (state.cfg.home_override) |home|
+    var detailed = (if (state.cfg.home_override) |home|
         config_runtime.loadMergedSettingsDetailedFromHome(alloc, home, root)
     else
         config_runtime.loadMergedSettingsDetailed(alloc, root)) catch |err| switch (err) {
@@ -124,6 +124,34 @@ fn loadSettings(state: *const server.ServerState, alloc: Allocator, root: []cons
             return error.WorkspaceSettingsUnavailable;
         },
     };
+    errdefer detailed.deinit(alloc);
+    for (detailed.diagnostics) |diagnostic| {
+        if (diagnostic.layer != .user) continue;
+        // A missing profile is valid; a rejected profile layer can hide configured denies.
+        switch (diagnostic.cause) {
+            .malformed_settings,
+            .settings_too_large,
+            .durable_path_unsafe,
+            .private_state_permissions_unsupported,
+            .invalid_model_id,
+            .retired_skill_match_fuzzy,
+            .invalid_context_limits,
+            .invalid_tool_placement,
+            .invalid_skill_symlink_authorities,
+            => {
+                debug_trace.logf("acp", "session workspace profile unavailable cause={s}", .{@tagName(diagnostic.cause)});
+                return error.WorkspaceSettingsUnavailable;
+            },
+            .private_state_permissions_tightened,
+            .ignored_project_user_only_setting,
+            .legacy_workspace_preferences,
+            .manual_backup_available,
+            .invalid_additional_directories,
+            .invalid_ultrafast_mode_override,
+            => {},
+        }
+    }
+    return detailed;
 }
 
 /// Saved directories come from the profile entry for the new root; command

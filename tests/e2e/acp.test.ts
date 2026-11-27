@@ -11863,6 +11863,37 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP rejects a workspace switch when profile permissions cannot be loaded",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-workspace-profile-invalid-");
+      const target = join(root.external, "denied.txt");
+      const profile = join(root.home, ".fx", "settings.json");
+      writeFileSync(profile, JSON.stringify({ permission: { edit: { [target]: "deny" } } }));
+      const gateway = startFakeGateway([fileToolCall("denied_write", target, "denied\n"), finalText("Write checked.")]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        client.setPermissionOption("allow_once");
+        writeFileSync(profile, "{");
+
+        const rejected = await client.request("session/new", { cwd: root.external, mcpServers: [] }, 4) as any;
+        expect(rejected.error).toMatchObject({ code: -32602, message: "Workspace settings for cwd could not be loaded" });
+
+        const result = await runPrompt(client, "Try the configured write.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(result.messages.some((message: any) => message.method === "session/request_permission")).toBe(false);
+        expect(existsSync(target)).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "permission requests reuse tool ids and session grants",
     async () => {
       const root = createIsolatedRoot("fx-acp-permission-parity-");
