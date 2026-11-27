@@ -813,7 +813,35 @@ fn fetchCredits(
         input.tenant,
         input.cancel_flag orelse &local_cancel,
         gateway_client.fetchGatewayGetResultCancellable,
+        gateway_client.sleepGatewayRetry,
     );
+}
+
+/// Waits `delay_ns` before the next try, or ends early with `error.Cancelled`.
+const CreditsRetryWaitFn = *const fn (delay_ns: u64, cancel_flag: *std.atomic.Value(bool)) (std.Io.Cancelable || error{Cancelled})!void;
+
+/// Fetches the credits answer. After each failed try, the plan in
+/// `catalog_fetch_failure.retryWaitNs` says whether to wait and try again;
+/// `retried` records that a retry ran.
+fn fetchCreditsAnswer(
+    alloc: Allocator,
+    api_key: ?[]const u8,
+    path: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+    fetch_fn: FetchGatewayGetResultFn,
+    wait_fn: CreditsRetryWaitFn,
+    retried: *bool,
+) !gateway_client.GetResult {
+    var tries_made: u32 = 0;
+    while (true) {
+        tries_made += 1;
+        const err = if (fetch_fn(alloc, api_key, path, cancel_flag)) |result| return result else |fetch_err| fetch_err;
+        const wait_ns = catalog_fetch_failure.retryWaitNs(err, tries_made) orelse return err;
+        if (cancel_flag.load(.seq_cst)) return err;
+        debug_trace.logf("credits", "retrying cut-off answer err={s}", .{@errorName(err)});
+        retried.* = true;
+        try wait_fn(wait_ns, cancel_flag);
+    }
 }
 
 /// An fx login can reach several teams, so `/v1/credits` rejects it outright
@@ -827,6 +855,7 @@ fn fetchCreditsWithFetch(
     gateway_team: ?[]const u8,
     cancel_flag: *std.atomic.Value(bool),
     fetch_fn: FetchGatewayGetResultFn,
+    wait_fn: CreditsRetryWaitFn,
 ) output_contracts.CreditsSnapshot {
     var team_path: ?[]u8 = null;
     defer if (team_path) |path| alloc.free(path);
@@ -840,8 +869,11 @@ fn fetchCreditsWithFetch(
         }
     }
 
-    var result = fetch_fn(alloc, api_key, team_path orelse credits_path, cancel_flag) catch {
-        return creditsErrorSnapshot(alloc, "failed to fetch credits from gateway");
+    var retried = false;
+    var result = fetchCreditsAnswer(alloc, api_key, team_path orelse credits_path, cancel_flag, fetch_fn, wait_fn, &retried) catch |err| {
+        const malformed = catalog_fetch_failure.classify(err).category == .malformed_response;
+        debug_trace.logf("credits", "fetch failed err={s} retried={}", .{ @errorName(err), retried });
+        return creditsErrorSnapshot(alloc, if (malformed) "unexpected response from gateway" else "failed to fetch credits from gateway");
     };
     defer result.deinit(alloc);
 
@@ -2266,6 +2298,7 @@ test "built-in credits provider names the team query only when valid" {
             case.team,
             &test_credits_never_cancelled,
             stubCaptureCreditsPath,
+            stubRecordCreditsWait,
         );
         defer snapshot.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings(
@@ -2282,6 +2315,7 @@ test "built-in credits provider maps fetch failure" {
         null,
         &test_credits_never_cancelled,
         stubFetchCreditsError,
+        stubRecordCreditsWait,
     );
     defer snapshot.deinit(std.testing.allocator);
 
@@ -2294,6 +2328,133 @@ test "built-in credits provider maps fetch failure" {
     );
 }
 
+var test_credits_calls: usize = 0;
+var test_credits_waits: usize = 0;
+var test_credits_wait_ns: u64 = 0;
+
+fn stubRecordCreditsWait(delay_ns: u64, _: *std.atomic.Value(bool)) (std.Io.Cancelable || error{Cancelled})!void {
+    test_credits_waits += 1;
+    test_credits_wait_ns = delay_ns;
+}
+
+fn stubFetchCutOffOnceThenCredits(
+    alloc: Allocator,
+    _: ?[]const u8,
+    _: []const u8,
+    _: *std.atomic.Value(bool),
+) anyerror!gateway_client.GetResult {
+    test_credits_calls += 1;
+    if (test_credits_calls == 1) return error.HttpBodyCutOff;
+    return .{
+        .status = .ok,
+        .body = try alloc.dupe(u8, "{\"balance\":\"12.50\",\"total_used\":\"1.25\",\"plan\":\"pro\"}"),
+    };
+}
+
+fn stubFetchAlwaysCutOff(
+    _: Allocator,
+    _: ?[]const u8,
+    _: []const u8,
+    _: *std.atomic.Value(bool),
+) anyerror!gateway_client.GetResult {
+    test_credits_calls += 1;
+    return error.HttpBodyCutOff;
+}
+
+fn stubFetchBrokenAnswer(
+    _: Allocator,
+    _: ?[]const u8,
+    _: []const u8,
+    _: *std.atomic.Value(bool),
+) anyerror!gateway_client.GetResult {
+    test_credits_calls += 1;
+    return error.BadGzipHeader;
+}
+
+fn stubFetchRefusedConnection(
+    _: Allocator,
+    _: ?[]const u8,
+    _: []const u8,
+    _: *std.atomic.Value(bool),
+) anyerror!gateway_client.GetResult {
+    test_credits_calls += 1;
+    return error.ConnectionRefused;
+}
+
+fn stubFetchCutOffThenCancel(
+    _: Allocator,
+    _: ?[]const u8,
+    _: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+) anyerror!gateway_client.GetResult {
+    test_credits_calls += 1;
+    cancel_flag.store(true, .seq_cst);
+    return error.HttpBodyCutOff;
+}
+
+test "built-in credits provider retries a cut-off answer once and shows the whole answer" {
+    test_credits_calls = 0;
+    test_credits_waits = 0;
+    var cancel = std.atomic.Value(bool).init(false);
+    var snapshot = fetchCreditsWithFetch(std.testing.allocator, null, null, &cancel, stubFetchCutOffOnceThenCredits, stubRecordCreditsWait);
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), test_credits_calls);
+    try std.testing.expectEqual(@as(usize, 1), test_credits_waits);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), test_credits_wait_ns);
+    try std.testing.expect(snapshot.err_message == null);
+    try std.testing.expectEqualStrings("12.50", snapshot.balance.?);
+    try std.testing.expectEqualStrings("1.25", snapshot.used.?);
+}
+
+test "built-in credits provider reports a cut-off answer that fails again as an unexpected response" {
+    test_credits_calls = 0;
+    test_credits_waits = 0;
+    var cancel = std.atomic.Value(bool).init(false);
+    var snapshot = fetchCreditsWithFetch(std.testing.allocator, null, null, &cancel, stubFetchAlwaysCutOff, stubRecordCreditsWait);
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), test_credits_calls);
+    try std.testing.expectEqual(@as(usize, 1), test_credits_waits);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), test_credits_wait_ns);
+    try std.testing.expectEqualStrings("unexpected response from gateway", snapshot.err_message.?);
+}
+
+test "built-in credits provider reports a broken answer as an unexpected response without retrying" {
+    test_credits_calls = 0;
+    test_credits_waits = 0;
+    var cancel = std.atomic.Value(bool).init(false);
+    var snapshot = fetchCreditsWithFetch(std.testing.allocator, null, null, &cancel, stubFetchBrokenAnswer, stubRecordCreditsWait);
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), test_credits_calls);
+    try std.testing.expectEqual(@as(usize, 0), test_credits_waits);
+    try std.testing.expectEqualStrings("unexpected response from gateway", snapshot.err_message.?);
+}
+
+test "built-in credits provider does not retry a refused connection" {
+    test_credits_calls = 0;
+    test_credits_waits = 0;
+    var cancel = std.atomic.Value(bool).init(false);
+    var snapshot = fetchCreditsWithFetch(std.testing.allocator, null, null, &cancel, stubFetchRefusedConnection, stubRecordCreditsWait);
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), test_credits_calls);
+    try std.testing.expectEqual(@as(usize, 0), test_credits_waits);
+    try std.testing.expectEqualStrings("failed to fetch credits from gateway", snapshot.err_message.?);
+}
+
+test "built-in credits provider does not retry a cut-off answer after cancellation" {
+    test_credits_calls = 0;
+    test_credits_waits = 0;
+    var cancel = std.atomic.Value(bool).init(false);
+    var snapshot = fetchCreditsWithFetch(std.testing.allocator, null, null, &cancel, stubFetchCutOffThenCancel, stubRecordCreditsWait);
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), test_credits_calls);
+    try std.testing.expectEqual(@as(usize, 0), test_credits_waits);
+}
+
 test "built-in credits provider maps Gateway HTTP denial" {
     var snapshot = fetchCreditsWithFetch(
         std.testing.allocator,
@@ -2301,6 +2462,7 @@ test "built-in credits provider maps Gateway HTTP denial" {
         null,
         &test_credits_never_cancelled,
         stubFetchForbiddenCredits,
+        stubRecordCreditsWait,
     );
     defer snapshot.deinit(std.testing.allocator);
 
@@ -2320,6 +2482,7 @@ test "built-in credits provider rejects malformed JSON" {
         null,
         &test_credits_never_cancelled,
         stubFetchInvalidCreditsJson,
+        stubRecordCreditsWait,
     );
     defer snapshot.deinit(std.testing.allocator);
 
@@ -2351,6 +2514,7 @@ test "built-in credits provider returns owned string fields" {
         null,
         &test_credits_never_cancelled,
         stubFetchCreditsObject,
+        stubRecordCreditsWait,
     );
     defer snapshot.deinit(std.testing.allocator);
 

@@ -456,13 +456,16 @@ const UsageGetOperation = struct {
 pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8) !GetResult {
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
-    return fetchGatewayGet(alloc, api_key, path, &client, false);
+    return fetchGatewayGet(alloc, api_key, path, &client, .any_length);
 }
 
+/// How an open-job GET checks its body against Content-Length.
+const GatewayGetBodyCheck = enum { any_length, whole_body };
+
 /// The GET of `fetchGatewayGetResult`, on `client`, or with no client on an
-/// open job (`fetchOnOpenJob`, or `fetchWholeBodyOnOpenJob` when
-/// `require_whole_body` is set). The flag applies to an open job only.
-fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8, client: ?*std.http.Client, require_whole_body: bool) !GetResult {
+/// open job (`fetchOnOpenJob`, or `fetchWholeBodyOnOpenJob` for `.whole_body`).
+/// The check applies to an open job only.
+fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8, client: ?*std.http.Client, body_check: GatewayGetBodyCheck) !GetResult {
     const default_url = try alloc.print("{s}{s}", .{ gatewayBaseUrl(), path });
     defer alloc.free(default_url);
     const url = try resolveE2eGatewayUrl(e2e_gateway_credits_url_env, default_url);
@@ -487,10 +490,10 @@ fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const
         .response_writer = &out.writer,
         .redirect_behavior = .unhandled,
     };
-    std.debug.assert(client == null or !require_whole_body);
+    std.debug.assert(client == null or body_check == .any_length);
     const result = if (client) |own|
         try fetchWithClient(own, options)
-    else if (require_whole_body)
+    else if (body_check == .whole_body)
         try fetchWholeBodyOnOpenJob(options)
     else
         try fetchOnOpenJob(options);
@@ -524,7 +527,7 @@ const GatewayGetOperation = struct {
     path: []const u8,
 
     fn run(self: *@This()) !GetResult {
-        return fetchGatewayGet(self.alloc, self.api_key, self.path, null, true);
+        return fetchGatewayGet(self.alloc, self.api_key, self.path, null, .whole_body);
     }
 };
 
@@ -2622,7 +2625,8 @@ fn headerValue(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
     return null;
 }
 
-fn sleepGatewayRetry(delay_ns: u64, cancel_flag: *std.atomic.Value(bool)) (std.Io.Cancelable || error{Cancelled})!void {
+/// Sleeps `delay_ns`, ending early with `error.Cancelled` once `cancel_flag` is set.
+pub fn sleepGatewayRetry(delay_ns: u64, cancel_flag: *std.atomic.Value(bool)) (std.Io.Cancelable || error{Cancelled})!void {
     var remaining_ns = delay_ns;
     while (remaining_ns > 0) {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
