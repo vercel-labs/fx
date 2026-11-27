@@ -462,16 +462,25 @@ const Run = struct {
         const first_deadline = setupDeadline(started, self.deadline, first);
         self.outcome.index = .persisted;
         if (index_missing) {
-            // Progress describes the index that is gone, such as one
-            // retention dropped, so the new index starts without it.
-            self.endCatchUp();
             const user_index = try std.Io.Dir.path.join(arena, &.{ self.canonical.git_dir, "index" });
-            if (self.facts.split_index or try hasSharedIndex(io, self.canonical.git_dir) or !copyableIndex(io, user_index)) {
-                if (try runStore(arena, self.store_ready, self.store, .{ .read_tree = self.facts.head }, .{ .deadline = first_deadline, .cancel = self.request.cancel })) |failure| return self.gitFail(failure);
-                self.outcome.index = .rebuilt;
-            } else {
-                copyPreservingTime(arena, io, user_index, self.store.index_file) catch |err| return self.ioFail("index_copy", user_index, err);
-                self.outcome.index = .copied;
+            if (try self.seedCaptureIndex(user_index, null, first_deadline)) |done| return done;
+        } else {
+            const catch_up_pending = isPresent(io, self.progress_file) catch |err| blk: {
+                keepCancel(io, err);
+                logIoError("progress_check", self.progress_file, err);
+                break :blk false;
+            };
+            if (catch_up_pending) {
+                if (statFileAbsolute(io, self.store.index_file)) |capture_stat| {
+                    const user_index = try std.Io.Dir.path.join(arena, &.{ self.canonical.git_dir, "index" });
+                    if (try self.seedCaptureIndex(user_index, capture_stat.mtime.nanoseconds, null)) |done| return done;
+                    if (self.outcome.index == .copied) {
+                        debug_trace.logf("workspace", "event=workspace_capture_index_reseeded ms={d}", .{started.durationTo(.now(io, clock)).raw.toMilliseconds()});
+                    }
+                } else |err| {
+                    keepCancel(io, err);
+                    logIoError("index_stat", self.store.index_file, err);
+                }
             }
         }
         if (first) {
@@ -482,6 +491,41 @@ const Run = struct {
             const took = started.durationTo(.now(io, clock));
             debug_trace.logf("workspace", "event=workspace_capture_setup store_created={} index={s} captures={d} ms={d} budget_ms={d}", .{ store_missing, @tagName(self.outcome.index.?), self.copy_base.len, took.raw.toMilliseconds(), first_capture_budget_ms });
         }
+        return null;
+    }
+
+    /// Starts or reseeds the capture index from `user_index` when it is not a
+    /// split or shared index and is copyable (`copyableIndexStat`); when
+    /// `capture_mtime_ns` is given, only if `user_index` is strictly newer.
+    /// Ends any pending catch-up once the replacement index is in place. With
+    /// `rebuild_deadline` (`index_missing`), an uncopyable index is rebuilt from
+    /// HEAD; on a catch-up reseed it leaves the persisted index and progress
+    /// untouched.
+    fn seedCaptureIndex(
+        self: *Run,
+        user_index: []const u8,
+        capture_mtime_ns: ?i96,
+        rebuild_deadline: ?std.Io.Clock.Timestamp,
+    ) Allocator.Error!?Outcome {
+        const io = self.io;
+        const can_copy = blk: {
+            if (self.facts.split_index or try hasSharedIndex(io, self.canonical.git_dir)) break :blk false;
+            const stat = copyableIndexStat(io, user_index) orelse break :blk false;
+            if (capture_mtime_ns) |existing_ns| {
+                if (stat.mtime.nanoseconds <= existing_ns) break :blk false;
+            }
+            break :blk true;
+        };
+        if (can_copy) {
+            copyPreservingTime(self.arena, io, user_index, self.store.index_file) catch |err| return self.ioFail("index_copy", user_index, err);
+            self.endCatchUp();
+            self.outcome.index = .copied;
+            return null;
+        }
+        const deadline = rebuild_deadline orelse return null;
+        if (try runStore(self.arena, self.store_ready, self.store, .{ .read_tree = self.facts.head }, .{ .deadline = deadline, .cancel = self.request.cancel })) |failure| return self.gitFail(failure);
+        self.endCatchUp();
+        self.outcome.index = .rebuilt;
         return null;
     }
 
@@ -923,18 +967,28 @@ fn readSmallRegularFile(arena: Allocator, io: std.Io, path: []const u8, max_byte
     };
 }
 
-/// Whether the user's index at `path` can be copied: a regular file no larger
-/// than `max_index_bytes`. Anything else is rebuilt from HEAD, which is
-/// always correct.
-fn copyableIndex(io: std.Io, path: []const u8) bool {
-    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| {
+/// Stats a path without following symlinks, honoring `test_hooks.access_denied_suffix`
+/// in tests.
+fn statFileAbsolute(io: std.Io, path: []const u8) std.Io.Dir.StatFileError!std.Io.File.Stat {
+    if (builtin.is_test) if (test_hooks.access_denied_suffix) |suffix| {
+        if (std.mem.endsWith(u8, path, suffix)) return error.AccessDenied;
+    };
+    return std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+}
+
+/// Stats the user's index at `path` when it can be copied: a regular file no
+/// larger than `max_index_bytes`. Anything else, including a stat error,
+/// returns null so a missing capture index is rebuilt from HEAD (which is
+/// always correct) and a catch-up reseed skips copying.
+fn copyableIndexStat(io: std.Io, path: []const u8) ?std.Io.File.Stat {
+    const stat = statFileAbsolute(io, path) catch |err| {
         keepCancel(io, err);
         if (err != error.FileNotFound) logIoError("index_stat", path, err);
-        return false;
+        return null;
     };
-    if (stat.kind == .file and stat.size <= max_index_bytes) return true;
+    if (stat.kind == .file and stat.size <= max_index_bytes) return stat;
     debug_trace.logf("workspace", "event=workspace_capture_index_rebuilt path={s} kind={s} bytes={d}", .{ path, @tagName(stat.kind), stat.size });
-    return false;
+    return null;
 }
 
 /// Logs a failure outside git that a capture reports as `io_error`.
@@ -5325,6 +5379,212 @@ test "capture store: a progress file that is a symlink is replaced, and the file
     defer worktree.close(testing.io);
     var entries = worktree.iterate();
     while (try entries.next(testing.io)) |entry| try testing.expect(!std.mem.startsWith(u8, entry.name, "index.progress.tmp-"));
+}
+
+test "capture store: a catching-up index copies a newer user index and ends catch-up without batching" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    defer resetIndexHooks();
+    try repos.initRepo("repo");
+    var file: usize = 0;
+    while (file < 8) : (file += 1) {
+        try repos.write(try repos.arena.print("repo/f{d}.txt", .{file}), try repos.arena.print("file {d}\n", .{file}));
+    }
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commit("repo", "base");
+    const past: std.Io.Timestamp = .{ .nanoseconds = @as(i96, test_unix_seconds) * std.time.ns_per_s };
+    try std.Io.Dir.cwd().setTimestamps(testing.io, try repos.path("repo/.git/index"), .{ .access_timestamp = .{ .new = past }, .modify_timestamp = .{ .new = past } });
+    const repo = try repos.repository("repo");
+    const first = try repos.captureRepo(repo, "s");
+    _ = try expectComplete(first);
+
+    try repos.write("repo/new_committed.txt", "committed\n");
+    _ = try repos.gitIn("repo", &.{ "add", "new_committed.txt" });
+    try repos.commit("repo", "second");
+
+    test_hooks.index_batch_paths = 4;
+    test_hooks.index_pass_timeouts = 1;
+    try expectNotStored(try repos.captureRepo(repo, "s"));
+    try testing.expectEqual(@as(?usize, 0), try catchUpCount(repos, repo));
+
+    const landed = try repos.captureRepo(repo, "s");
+    const tree = try expectComplete(landed);
+    try testing.expectEqual(@as(?IndexStart, .copied), landed.index);
+    try testing.expectEqual(@as(usize, 0), test_hooks.index_batched_paths);
+    try testing.expect((try catchUpCount(repos, repo)) == null);
+    try testing.expectEqualStrings(try repos.expectedTree(repo, &.{}), tree);
+    try testing.expect(try repos.treeHas(repo, tree, "new_committed.txt"));
+}
+
+test "capture store: a catching-up index does not copy a user index that is not newer" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    defer resetIndexHooks();
+    try repos.initRepo("repo");
+    var file: usize = 0;
+    while (file < 8) : (file += 1) {
+        try repos.write(try repos.arena.print("repo/f{d}.txt", .{file}), try repos.arena.print("file {d}\n", .{file}));
+    }
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commit("repo", "base");
+    const repo = try repos.repository("repo");
+    _ = try expectComplete(try repos.captureRepo(repo, "s"));
+
+    try repos.append("repo/f0.txt", "changed\n");
+    test_hooks.index_batch_paths = 4;
+    test_hooks.index_pass_timeouts = 1;
+    try expectNotStored(try repos.captureRepo(repo, "s"));
+    try testing.expectEqual(@as(?usize, 0), try catchUpCount(repos, repo));
+
+    const landed = try repos.captureRepo(repo, "s");
+    const tree = try expectComplete(landed);
+    try testing.expectEqual(@as(?IndexStart, .persisted), landed.index);
+    try testing.expectEqual(@as(usize, 8), test_hooks.index_batched_paths);
+    try testing.expect((try catchUpCount(repos, repo)) == null);
+    try testing.expectEqualStrings(try repos.expectedTree(repo, &.{}), tree);
+}
+
+test "capture store: a catching-up split-index repository does not copy the user index" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    defer resetIndexHooks();
+    try repos.initRepo("repo");
+    _ = try repos.gitIn("repo", &.{ "config", "core.splitIndex", "true" });
+    var file: usize = 0;
+    while (file < 8) : (file += 1) {
+        try repos.write(try repos.arena.print("repo/f{d}.txt", .{file}), try repos.arena.print("file {d}\n", .{file}));
+    }
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commit("repo", "base");
+    const past: std.Io.Timestamp = .{ .nanoseconds = @as(i96, test_unix_seconds) * std.time.ns_per_s };
+    try std.Io.Dir.cwd().setTimestamps(testing.io, try repos.path("repo/.git/index"), .{ .access_timestamp = .{ .new = past }, .modify_timestamp = .{ .new = past } });
+    const repo = try repos.repository("repo");
+    const first = try repos.captureRepo(repo, "s");
+    _ = try expectComplete(first);
+    try testing.expectEqual(@as(?IndexStart, .rebuilt), first.index);
+
+    try repos.write("repo/new_committed.txt", "committed\n");
+    _ = try repos.gitIn("repo", &.{ "add", "new_committed.txt" });
+    try repos.commit("repo", "second");
+
+    test_hooks.index_batch_paths = 4;
+    test_hooks.index_pass_timeouts = 1;
+    try expectNotStored(try repos.captureRepo(repo, "s"));
+    try testing.expectEqual(@as(?usize, 0), try catchUpCount(repos, repo));
+
+    const landed = try repos.captureRepo(repo, "s");
+    const tree = try expectComplete(landed);
+    try testing.expectEqual(@as(?IndexStart, .persisted), landed.index);
+    try testing.expectEqual(@as(usize, 9), test_hooks.index_batched_paths);
+    try testing.expect((try catchUpCount(repos, repo)) == null);
+    try testing.expectEqualStrings(try repos.expectedTree(repo, &.{}), tree);
+}
+
+test "capture store: a stat error during the catch-up check skips the copy and keeps progress" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    defer {
+        resetIndexHooks();
+        test_hooks.access_denied_suffix = null;
+    }
+    try repos.initRepo("repo");
+    var file: usize = 0;
+    while (file < 8) : (file += 1) {
+        try repos.write(try repos.arena.print("repo/f{d}.txt", .{file}), try repos.arena.print("file {d}\n", .{file}));
+    }
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commit("repo", "base");
+    const past: std.Io.Timestamp = .{ .nanoseconds = @as(i96, test_unix_seconds) * std.time.ns_per_s };
+    try std.Io.Dir.cwd().setTimestamps(testing.io, try repos.path("repo/.git/index"), .{ .access_timestamp = .{ .new = past }, .modify_timestamp = .{ .new = past } });
+    const repo = try repos.repository("repo");
+    const first = try repos.captureRepo(repo, "s");
+    _ = try expectComplete(first);
+    const ref = try repos.sessionRef(repo, "s");
+
+    try repos.write("repo/new_committed.txt", "committed\n");
+    _ = try repos.gitIn("repo", &.{ "add", "new_committed.txt" });
+    try repos.commit("repo", "second");
+
+    test_hooks.index_batch_paths = 4;
+    test_hooks.index_pass_timeouts = 1;
+    try expectNotStored(try repos.captureRepo(repo, "s"));
+    try testing.expectEqual(@as(?usize, 0), try catchUpCount(repos, repo));
+
+    const store_dir = try storeDir(repos.arena, repos.profile, repo.common_dir);
+    const capture_index = try std.Io.Dir.path.join(repos.arena, &.{ try worktreeDir(repos.arena, store_dir, try worktreeIdentity(repos.arena, repo)), worktree_index_name });
+    const user_index = try std.Io.Dir.path.join(repos.arena, &.{ repo.git_dir, "index" });
+    const progress = try progressPath(repos, repo);
+    const index_before = try TestRepos.readAbsolute(repos.arena, capture_index);
+    const progress_before = try TestRepos.readAbsolute(repos.arena, progress);
+
+    // A stat or presence error on the catch-up check skips copying and keeps
+    // both `index.progress` and the capture index intact, as on main.
+    test_hooks.index_time_left_ms = min_judged_run_ms - 1;
+    test_hooks.index_batches_before_timeout = 0;
+    for ([_][]const u8{ progress, user_index }) |suffix| {
+        test_hooks.access_denied_suffix = suffix;
+        const skipped = try repos.captureRepo(repo, "s");
+        test_hooks.access_denied_suffix = null;
+        try expectNotStored(skipped);
+        try testing.expectEqual(Status.unavailable, skipped.status);
+        try testing.expectEqual(policy.Reason.timeout, skipped.reason.?);
+        try testing.expectEqual(@as(?IndexStart, .persisted), skipped.index);
+        try testing.expectEqualStrings(progress_before, try TestRepos.readAbsolute(repos.arena, progress));
+        try testing.expectEqualStrings(index_before, try TestRepos.readAbsolute(repos.arena, capture_index));
+        try testing.expectEqualStrings(first.commit.?, (try repos.storeRef(repo, ref)).?);
+    }
+
+    // With budget again, a stat error on `.git/index` still falls back to
+    // batching instead of copying or failing.
+    test_hooks.index_time_left_ms = null;
+    test_hooks.index_batches_before_timeout = null;
+    test_hooks.access_denied_suffix = user_index;
+    const landed = try repos.captureRepo(repo, "s");
+    test_hooks.access_denied_suffix = null;
+    const tree = try expectComplete(landed);
+    try testing.expectEqual(@as(?IndexStart, .persisted), landed.index);
+    try testing.expectEqual(@as(usize, 9), test_hooks.index_batched_paths);
+    try testing.expect((try catchUpCount(repos, repo)) == null);
+    try testing.expectEqualStrings(try repos.expectedTree(repo, &.{}), tree);
+}
+
+test "capture store: a stat error on the user index in the first capture still rebuilds from HEAD" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repos = try TestRepos.init(arena_state.allocator(), tmp.dir);
+    defer repos.deinit();
+    defer test_hooks.access_denied_suffix = null;
+    try repos.initRepo("repo");
+    try repos.write("repo/f0.txt", "file 0\n");
+    _ = try repos.gitIn("repo", &.{ "add", "-A" });
+    try repos.commit("repo", "base");
+    const repo = try repos.repository("repo");
+    const user_index = try std.Io.Dir.path.join(repos.arena, &.{ repo.git_dir, "index" });
+
+    test_hooks.access_denied_suffix = user_index;
+    const outcome = try repos.captureRepo(repo, "s");
+    test_hooks.access_denied_suffix = null;
+    const tree = try expectComplete(outcome);
+    try testing.expectEqual(@as(?IndexStart, .rebuilt), outcome.index);
+    try testing.expectEqualStrings(try repos.expectedTree(repo, &.{}), tree);
 }
 
 test "capture store: the temporary files of a pack a killed git left are removed once stale" {
