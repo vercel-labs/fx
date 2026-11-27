@@ -1086,7 +1086,7 @@ fn suffixStartStep(value: []const u8, start: usize) usize {
     const window = start -| max_secret_lookback;
     var at = if (std.mem.findScalarLast(u8, value[window..start], '\n')) |line_break| window + line_break + 1 else window;
     while (at < start) {
-        if (at > 0 and isAssignmentKeyChar(value[at - 1]) and !std.mem.startsWith(u8, value[at..], "https://")) {
+        if (at > 0 and isAssignmentKeyChar(value[at - 1]) and urlSchemeLen(value[at..]) == null) {
             at += 1;
             continue;
         }
@@ -1492,9 +1492,8 @@ fn matchesAwsAccessKey(text: []const u8, start: usize) ?SecretSpan {
 }
 
 fn matchesBasicAuthUrl(text: []const u8, start: usize) ?SecretSpan {
-    const prefix = "https://";
-    if (!std.mem.startsWith(u8, text[start..], prefix)) return null;
-    const credential_start = start + prefix.len;
+    const prefix_len = urlSchemeLen(text[start..]) orelse return null;
+    const credential_start = start + prefix_len;
     var i = credential_start;
     var colon: ?usize = null;
     while (i < text.len and text[i] != '\n' and text[i] != '\r' and !std.ascii.isWhitespace(text[i])) : (i += 1) {
@@ -1508,6 +1507,21 @@ fn matchesBasicAuthUrl(text: []const u8, start: usize) ?SecretSpan {
         }
     }
     return null;
+}
+
+/// The most bytes of a URL scheme that `urlSchemeLen` reads.
+const max_url_scheme_len = 32;
+
+/// The length of the `scheme://` that `text` starts with, or null: a letter, then
+/// letters, digits, `+`, `-`, and `.`.
+fn urlSchemeLen(text: []const u8) ?usize {
+    if (text.len == 0 or !std.ascii.isAlphabetic(text[0])) return null;
+    var i: usize = 1;
+    while (i < text.len and i < max_url_scheme_len and
+        (std.ascii.isAlphanumeric(text[i]) or text[i] == '+' or text[i] == '-' or text[i] == '.')) : (i += 1)
+    {}
+    if (!std.mem.startsWith(u8, text[i..], "://")) return null;
+    return i + 3;
 }
 
 fn matchesSensitiveAssignment(text: []const u8, start: usize) ?SecretSpan {
@@ -1862,6 +1876,29 @@ test "maskSecrets preserves non-sensitive quoted assignments" {
     defer if (masked.ptr != input.ptr) alloc.free(masked);
 
     try std.testing.expectEqualStrings(input, masked);
+}
+
+/// Each of `cases` is an input and what `maskSecrets` makes of it.
+fn expectMasked(cases: []const [2][]const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case[1], try maskSecrets(arena_state.allocator(), case[0]));
+    }
+}
+
+test "maskSecrets masks the credentials of a URL with any scheme" {
+    try expectMasked(&.{
+        .{ "base_url http://user:hunter2pass@localhost:8000/v1", "base_url http://[redacted]@localhost:8000/v1" },
+        .{ "conn postgres://admin:hunter2pass@db.internal:5432/app", "conn postgres://[redacted]@db.internal:5432/app" },
+        .{ "redis://:hunter2pass@cache:6379", "redis://[redacted]@cache:6379" },
+        .{ "git+ssh://u:hunter2pass@h/x.git", "git+ssh://[redacted]@h/x.git" },
+        .{ "https://user:hunter2pass@host/v1", "https://[redacted]@host/v1" },
+        // No password, or no credentials at all.
+        .{ "ssh://git@github.com/x.git", "ssh://git@github.com/x.git" },
+        .{ "http://localhost:8000/v1", "http://localhost:8000/v1" },
+        .{ "postgres://db:5432/app", "postgres://db:5432/app" },
+    });
 }
 
 test "maskSecrets masks inline tokens" {
