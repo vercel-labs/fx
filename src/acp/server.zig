@@ -1217,21 +1217,25 @@ pub const Audience = struct {
         client_gone,
     };
 
-    /// Writes one notification to `member`. A follower whose write fails, or whose writer has
-    /// stopped (its client closed), is dropped from the audience: it loses this update, and the
-    /// turn goes on. When the main client's write fails, the main client leaves, the oldest
-    /// remaining member becomes the main, and the update is sent to it. With no member left,
-    /// the error reaches the turn.
+    /// Writes one notification to `member`, with the params that `need` picks for it. A follower
+    /// whose write fails, or whose writer has stopped (its client closed), is dropped from the
+    /// audience: it loses this update, and the turn goes on. When the main client's write fails,
+    /// the main client leaves, the oldest remaining member becomes the main, and the update is
+    /// sent to it with the params that `need` picks for it. With no member left, the error
+    /// reaches the turn.
     pub fn writeNotification(
         self: *Audience,
         member: *Member,
         alloc: Allocator,
         method: []const u8,
-        params_json: []const u8,
+        need: RunningCopy.Need,
+        with: []const u8,
+        without: ?[]const u8,
     ) !void {
-        member.writer.writeNotification(alloc, method, params_json) catch |err| {
+        const params = if (memberTakes(member, need)) with else (without orelse return);
+        member.writer.writeNotification(alloc, method, params) catch |err| {
             if (member == mainLocked(self.session).?) {
-                if (removeMemberLocked(self.session, member.connection_id)) return self.writeNotification(mainLocked(self.session).?, alloc, method, params_json);
+                if (removeMemberLocked(self.session, member.connection_id)) return self.writeNotification(mainLocked(self.session).?, alloc, method, need, with, without);
                 return err;
             }
             self.dropMember(member, method, .{ .write_failed = err });
@@ -1277,8 +1281,7 @@ pub const Audience = struct {
             return;
         }
         while (self.next()) |member| {
-            const params = if (memberTakes(member, need)) with else (without orelse continue);
-            try self.writeNotification(member, alloc, method, params);
+            try self.writeNotification(member, alloc, method, need, with, without);
         }
     }
 
@@ -1427,6 +1430,8 @@ pub const RunningCopy = struct {
         extension: sh_fx.Extension,
         /// A member takes `with` when its client shows ACP notices.
         notices,
+        /// A member takes `with` when it lists ACP's `session.compaction` capability.
+        compaction,
         /// A prompt chunk: a member takes `with` when its listing of `sh.fx/sessionClients` is
         /// `listed`, and it is not `sender`, the connection that sent the prompt.
         prompt_chunk: struct { listed: bool, sender: ?ConnectionId },
@@ -1709,11 +1714,21 @@ fn memberTakes(member: *const Member, need: RunningCopy.Need) bool {
         .none => true,
         .extension => |extension| member.extensions.contains(extension),
         .notices => member.client_notices,
+        .compaction => member.client_compaction,
         .prompt_chunk => |chunk| member.extensions.contains(.session_clients) == chunk.listed and takesPromptFrom(member, chunk.sender),
         .steer_chunk => |chunk| member.extensions.contains(.session_clients) == chunk.listed and
             member.sendsSteerInput() == chunk.steer_input,
         .except_sender => |sender| !connection.sameConnection(member.connection_id, sender),
     };
+}
+
+/// Whether the owner or a member of `session` does not take `need`. The caller holds the audience lock.
+pub fn someMemberLacks(session: *ActiveSessionState, need: RunningCopy.Need) bool {
+    if (!memberTakes(mainLocked(session).?, need)) return true;
+    for (session.members.items) |member| {
+        if (!memberTakes(member, need)) return true;
+    }
+    return false;
 }
 
 /// Frees `session`'s running copy under its audience lock. The save that commits
@@ -9777,6 +9792,107 @@ test "a member whose write fails is dropped, and the list goes out again without
     try std.testing.expectEqual(@as(usize, 1), session.members.items.len);
     try std.testing.expectEqual(@as(usize, 2), owner_wire.updates());
     try std.testing.expect(std.mem.find(u8, owner_wire.lastUpdate(), "\"clients\":[{\"clientId\":\"c1\",\"main\":true}]") != null);
+}
+
+const with_params_json = "{\"marker\":\"with\"}";
+const without_params_json = "{\"marker\":\"without\"}";
+
+/// The owner and the follower of the model-calls tests, both writing to the caller's wires. The
+/// owner lists `model_calls`. The caller opens the session once the pair is in its final place,
+/// because the session keeps a pointer to the owner.
+const ModelCallsPair = struct {
+    owner: ServerState,
+    follower: ServerState,
+};
+
+fn initModelCallsPair(alloc: Allocator, test_host: *Host, owner_wire: *ClientsWire, follower_wire: *ClientsWire) !ModelCallsPair {
+    return .{
+        .owner = .{
+            .alloc = alloc,
+            .host = test_host,
+            .writer = jsonrpc.Writer.initCallback(owner_wire, ClientsWire.write),
+            .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+            .connection_id = 1,
+            .extensions = .initMany(&.{.model_calls}),
+        },
+        .follower = .{
+            .alloc = alloc,
+            .host = test_host,
+            .writer = jsonrpc.Writer.initCallback(follower_wire, ClientsWire.write),
+            .connection_id = 2,
+        },
+    };
+}
+
+test "a main whose write fails hands its update to the next client with the params that client's need picks, once" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = ClientsWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    var listing_wire = ClientsWire{ .alloc = alloc };
+    defer listing_wire.deinit();
+    var pair = try initModelCallsPair(alloc, &test_host, &owner_wire, &follower_wire);
+    defer pair.owner.deinit();
+    defer pair.follower.deinit();
+    var listing = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&listing_wire, ClientsWire.write),
+        .connection_id = 3,
+        .extensions = .initMany(&.{.model_calls}),
+    };
+    defer listing.deinit();
+    const session = try openAnswerSession(alloc, &pair.owner, &pair.follower);
+    try joinMemberForTest(session, &listing);
+    releaseOpenerListHold(&pair.owner, session);
+    owner_wire.fail = true;
+    {
+        var audience = lockAudience(session);
+        defer audience.unlock();
+        try audience.deliver(alloc, "session/update", .{ .extension = .model_calls }, with_params_json, without_params_json);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), session.members.items.len);
+    try std.testing.expectEqual(@as(usize, 1), framesContaining(&follower_wire, without_params_json));
+    try std.testing.expectEqual(@as(usize, 0), framesContaining(&follower_wire, with_params_json));
+    try std.testing.expectEqual(@as(usize, 1), framesContaining(&listing_wire, with_params_json));
+    try std.testing.expectEqual(@as(usize, 0), framesContaining(&listing_wire, without_params_json));
+}
+
+test "a main whose write fails sends the next client nothing for an update whose need takes no params" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = ClientsWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    var pair = try initModelCallsPair(alloc, &test_host, &owner_wire, &follower_wire);
+    defer pair.owner.deinit();
+    defer pair.follower.deinit();
+    const session = try openAnswerSession(alloc, &pair.owner, &pair.follower);
+    releaseOpenerListHold(&pair.owner, session);
+    owner_wire.fail = true;
+    {
+        var audience = lockAudience(session);
+        defer audience.unlock();
+        try audience.deliver(alloc, "session/update", .{ .extension = .model_calls }, with_params_json, null);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), session.members.items.len);
+    try std.testing.expectEqual(@as(usize, 0), framesContaining(&follower_wire, with_params_json));
+}
+
+/// How many frames `wire` got that contain `needle`.
+fn framesContaining(wire: *const ClientsWire, needle: []const u8) usize {
+    var count: usize = 0;
+    for (wire.frames.items) |frame| {
+        if (std.mem.find(u8, frame, needle) != null) count += 1;
+    }
+    return count;
 }
 
 /// The first frame of `wire` that contains `needle`, or an empty slice.
