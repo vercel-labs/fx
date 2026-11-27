@@ -1252,6 +1252,17 @@ pub fn attemptProjectMcpMutation(
     action: project_config.ProjectMcpAction,
 ) CommitAttempt {
     const home = io_mod.homeDir() orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    return attemptProjectMcpMutationInHome(alloc, home, workspace_root, action);
+}
+
+/// Applies a project MCP choice (`enabledMcpjsonServers` / `disabledMcpjsonServers`)
+/// under `home`'s `.fx/settings.json` without touching `.mcp.json`.
+pub fn attemptProjectMcpMutationInHome(
+    alloc: Allocator,
+    home: []const u8,
+    workspace_root: []const u8,
+    action: project_config.ProjectMcpAction,
+) CommitAttempt {
     var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
         return .{ .failure = .{ .err = err } };
     };

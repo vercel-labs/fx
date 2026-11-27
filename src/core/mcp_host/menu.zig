@@ -18,6 +18,8 @@ pub const Choice = enum {
     logout,
     approve,
     reject,
+    turn_off,
+    turn_on,
     remove,
 
     pub fn label(c: Choice) []const u8 {
@@ -26,20 +28,25 @@ pub const Choice = enum {
             .logout => "Log out",
             .approve => "Approve",
             .reject => "Reject",
+            .turn_off => "Turn off",
+            .turn_on => "Turn on",
             .remove => "Remove",
         };
     }
 
-    /// The `/mcp` verb it runs.
-    pub fn verb(c: Choice) []const u8 {
-        return @tagName(c);
+    /// The `/mcp` verb it runs, or null for menu-only actions.
+    pub fn verb(c: Choice) ?[]const u8 {
+        return switch (c) {
+            .turn_off, .turn_on => null,
+            else => @tagName(c),
+        };
     }
 
-    /// Remove, approve, and reject ask first; login and logout are quick to undo.
+    /// Remove, approve, and reject ask first; login, logout, and toggles are quick to undo.
     pub fn asks(c: Choice) bool {
         return switch (c) {
             .remove, .approve, .reject => true,
-            .login, .logout => false,
+            .login, .logout, .turn_off, .turn_on => false,
         };
     }
 
@@ -57,15 +64,21 @@ pub const Row = struct {
     target: ?[]const u8 = null,
 };
 
-pub const max_choices = 4;
+pub const max_choices = 5;
 
 /// The choices a server offers: its next step first, Remove last.
 pub fn choices(row: Row, out: *[max_choices]Choice) []const Choice {
     const s = row.status;
     const project = s.source == .workspace;
     var n: usize = 0;
-    if (s.state == .waiting_for_approval or s.state == .rejected) {
+    if (s.state == .waiting_for_approval) {
         out[n] = .approve;
+        n += 1;
+    } else if (project and s.state == .rejected) {
+        out[n] = .turn_on;
+        n += 1;
+    } else if (!project and s.state == .disabled) {
+        out[n] = .turn_on;
         n += 1;
     } else if (s.needs_login) {
         out[n] = .login;
@@ -75,8 +88,12 @@ pub fn choices(row: Row, out: *[max_choices]Choice) []const Choice {
         out[n] = .logout;
         n += 1;
     }
-    if (project and s.state != .rejected) {
+    if (project and s.state != .rejected and s.state != .disabled) {
         out[n] = .reject;
+        n += 1;
+    }
+    if (s.state != .disabled and s.state != .rejected and s.state != .waiting_for_approval) {
+        out[n] = .turn_off;
         n += 1;
     }
     out[n] = .remove;
@@ -98,6 +115,7 @@ const ServerMatches = struct {
 /// What the menu knows of the open server's tools.
 pub const Tools = union(enum) {
     loading,
+    disabled,
     needs_login,
     needs_approval,
     failed: []const u8,
@@ -180,22 +198,27 @@ pub fn showsError(row: Row) bool {
 /// approval says so, rather than as a failure, even while a load is still on
 /// its way.
 pub fn toolsFor(row: Row, tools: Tools) Tools {
-    if (tools == .ready) return tools;
     if (row.status.state == .waiting_for_approval) return .needs_approval;
+    if (row.status.state == .disabled or row.status.state == .rejected) return .disabled;
+    if (tools == .ready) return tools;
     return if (row.status.needs_login) .needs_login else tools;
 }
 
 /// A server's screen with `filter` typed, which narrows its tools.
 pub fn serverLayout(row: Row, tools: Tools, filter: []const u8, window: usize) Layout {
+    return serverLayoutWithError(row, tools, filter, window, false);
+}
+
+pub fn serverLayoutWithError(row: Row, tools: Tools, filter: []const u8, window: usize, has_error: bool) Layout {
     var buf: [max_choices]Choice = undefined;
     return .{
-        // http or runs, file, status, protocol when known, and error when
-        // there is one; then a blank.
-        .lead = 3 + @as(usize, @intFromBool(row.status.version != null)) + @intFromBool(row.status.dropped.total() > 0) + @intFromBool(showsError(row)) + 1,
+        // http or runs, file, status, protocol when known, error when there
+        // is one, and any menu action error; then a blank.
+        .lead = 3 + @as(usize, @intFromBool(row.status.version != null)) + @intFromBool(row.status.dropped.total() > 0) + @intFromBool(showsError(row)) + @intFromBool(has_error) + 1,
         .choices = choices(row, &buf).len,
         // A blank, then the heading or the reason there are no tools.
         .gap = 2,
-        .tools = toolCount(tools, filter),
+        .tools = toolCount(toolsFor(row, tools), filter),
         .window = window,
     };
 }
@@ -217,10 +240,29 @@ pub const State = struct {
     /// The list's filter, kept while a server's screen filters its tools.
     list_filter_len: usize = 0,
     list_filter_buf: [name_capacity]u8 = undefined,
+    /// Error from the last menu toggle that failed to save, shown on the
+    /// server's screen until cleared.
+    error_len: usize = 0,
+    error_buf: [name_capacity]u8 = undefined,
 
     /// The selected server, kept by name so a reload doesn't move it.
     pub fn selectedName(s: *const State) []const u8 {
         return s.selected_buf[0..s.selected_len];
+    }
+
+    pub fn errorText(s: *const State) ?[]const u8 {
+        return if (s.error_len == 0) null else s.error_buf[0..s.error_len];
+    }
+
+    pub fn setError(s: *State, msg: []const u8) void {
+        var n = @min(msg.len, name_capacity);
+        while (n > 0 and n < msg.len and msg[n] & 0xC0 == 0x80) n -= 1;
+        s.error_len = n;
+        @memcpy(s.error_buf[0..n], msg[0..n]);
+    }
+
+    pub fn clearError(s: *State) void {
+        s.error_len = 0;
     }
 
     pub fn listFilter(s: *const State) []const u8 {
@@ -302,7 +344,7 @@ pub fn viewOf(s: *const State, rows: []const Row, filter: []const u8, tools: Too
         std.sort.insertion(Row, buf[group_start..n], {}, byName);
     }
     var v: View = .{ .rows = buf[0..n], .attention_start = if (attention_start < n) attention_start else null, .open = open_row };
-    if (open_row) |r| v.layout = serverLayout(r, tools, filter, server_window);
+    if (open_row) |r| v.layout = serverLayoutWithError(r, tools, filter, server_window, s.errorText() != null);
     return v;
 }
 
@@ -335,6 +377,7 @@ pub fn settle(s: *State, view: View) Effect {
         s.confirm = null;
         s.cursor = 0;
         s.top = 0;
+        s.clearError();
         return .back;
     }
     const l = view.layout;
@@ -357,6 +400,7 @@ pub fn press(s: *State, view: View, key: Key) Effect {
                     s.screen = .server;
                     s.cursor = 0;
                     s.top = 0;
+                    s.clearError();
                     return .{ .open = name };
                 },
                 .escape => return .close,
@@ -377,7 +421,10 @@ pub fn press(s: *State, view: View, key: Key) Effect {
                     const cs = choices(r, &buf);
                     if (s.cursor >= cs.len) return .none;
                     const c = cs[s.cursor];
-                    if (!c.asks()) return .{ .run = .{ .choice = c, .server = r.status.name } };
+                    if (!c.asks()) {
+                        s.clearError();
+                        return .{ .run = .{ .choice = c, .server = r.status.name } };
+                    }
                     s.screen = .confirm;
                     s.confirm = c;
                     s.answer_no = false;
@@ -387,6 +434,7 @@ pub fn press(s: *State, view: View, key: Key) Effect {
                     s.screen = .list;
                     s.cursor = 0;
                     s.top = 0;
+                    s.clearError();
                     return .back;
                 },
             }
@@ -669,15 +717,22 @@ fn choiceList(r: Row, buf: *[max_choices]Choice) []const Choice {
 
 test "a server's choices start with its next step and end with Remove" {
     var b: [max_choices]Choice = undefined;
-    try testing.expectEqualSlices(Choice, &.{ .login, .remove }, choiceList(testRow("a", .failed, .{ .needs_login = true }), &b));
-    try testing.expectEqualSlices(Choice, &.{ .logout, .remove }, choiceList(testRow("a", .ready, .{ .signed_in = true }), &b));
-    try testing.expectEqualSlices(Choice, &.{.remove}, choiceList(testRow("a", .ready, .{}), &b));
+    try testing.expectEqualSlices(Choice, &.{ .login, .turn_off, .remove }, choiceList(testRow("a", .failed, .{ .needs_login = true }), &b));
+    try testing.expectEqualSlices(Choice, &.{ .logout, .turn_off, .remove }, choiceList(testRow("a", .ready, .{ .signed_in = true }), &b));
+    try testing.expectEqualSlices(Choice, &.{ .turn_off, .remove }, choiceList(testRow("a", .ready, .{}), &b));
+    try testing.expectEqualSlices(Choice, &.{ .turn_on, .remove }, choiceList(testRow("a", .disabled, .{}), &b));
+    try testing.expectEqualSlices(Choice, &.{ .turn_on, .logout, .remove }, choiceList(testRow("a", .disabled, .{ .signed_in = true }), &b));
     try testing.expectEqualSlices(Choice, &.{ .approve, .reject, .remove }, choiceList(testRow("a", .waiting_for_approval, .{ .source = .workspace }), &b));
-    try testing.expectEqualSlices(Choice, &.{ .approve, .remove }, choiceList(testRow("a", .rejected, .{ .source = .workspace }), &b));
-    try testing.expectEqualSlices(Choice, &.{ .reject, .remove }, choiceList(testRow("a", .idle, .{ .source = .workspace, .transport = .stdio }), &b));
-    try testing.expectEqualSlices(Choice, &.{ .login, .logout, .reject, .remove }, choiceList(testRow("a", .retrying, .{ .source = .workspace, .needs_login = true, .signed_in = true }), &b));
+    try testing.expectEqualSlices(Choice, &.{ .turn_on, .remove }, choiceList(testRow("a", .rejected, .{ .source = .workspace }), &b));
+    try testing.expectEqualSlices(Choice, &.{.remove}, choiceList(testRow("a", .disabled, .{ .source = .workspace }), &b));
+    try testing.expectEqualSlices(Choice, &.{ .reject, .turn_off, .remove }, choiceList(testRow("a", .idle, .{ .source = .workspace, .transport = .stdio }), &b));
+    try testing.expectEqualSlices(Choice, &.{ .login, .logout, .reject, .turn_off, .remove }, choiceList(testRow("a", .retrying, .{ .source = .workspace, .needs_login = true, .signed_in = true }), &b));
     try testing.expect(Choice.remove.asks() and Choice.approve.asks() and Choice.reject.asks());
-    try testing.expect(!Choice.login.asks() and !Choice.logout.asks());
+    try testing.expect(!Choice.login.asks() and !Choice.logout.asks() and !Choice.turn_off.asks() and !Choice.turn_on.asks());
+    try testing.expectEqual(@as(?[]const u8, null), Choice.turn_off.verb());
+    try testing.expectEqual(@as(?[]const u8, null), Choice.turn_on.verb());
+    try testing.expectEqualStrings("Turn off", Choice.turn_off.label());
+    try testing.expectEqualStrings("Turn on", Choice.turn_on.label());
 }
 
 test "the filter matches server names and tools as every menu does" {
@@ -767,11 +822,12 @@ test "on a server, the next step is selected, and asking actions confirm first" 
     try testing.expectEqualStrings("linear", run.run.server);
 
     _ = press(&s, view, .down);
+    _ = press(&s, view, .down);
     try testing.expectEqual(Effect.none, press(&s, view, .enter));
     try testing.expectEqual(Screen.confirm, s.screen);
     // Nothing moves while the confirmation is open, and Esc cancels it.
     _ = press(&s, view, .up);
-    try testing.expectEqual(@as(usize, 1), s.cursor);
+    try testing.expectEqual(@as(usize, 2), s.cursor);
     _ = press(&s, view, .escape);
     try testing.expectEqual(Screen.server, s.screen);
     _ = press(&s, view, .enter);
@@ -785,7 +841,7 @@ test "on a server, the next step is selected, and asking actions confirm first" 
 
 test "a question on its row chooses yes or no with left and right" {
     const r = testRow("linear", .failed, .{ .needs_login = true });
-    var s: State = .{ .active = true, .screen = .server, .cursor = 1 };
+    var s: State = .{ .active = true, .screen = .server, .cursor = 2 };
     const view: View = .{ .rows = &.{}, .open = r, .layout = serverLayout(r, .needs_login, "", 9) };
     _ = press(&s, view, .enter);
     try testing.expectEqual(Screen.confirm, s.screen);
@@ -818,8 +874,8 @@ test "the selection moves on from the choices through the tools, and the screen 
     const layout = serverLayout(r, .{ .ready = &tools }, "", 8);
     // http, file, status, and a blank.
     try testing.expectEqual(@as(usize, 4), layout.lead);
-    try testing.expectEqual(@as(usize, 2), layout.choices);
-    try testing.expectEqual(@as(usize, 38), layout.lines());
+    try testing.expectEqual(@as(usize, 3), layout.choices);
+    try testing.expectEqual(@as(usize, 39), layout.lines());
     var s: State = .{ .active = true, .screen = .server };
     const view: View = .{ .rows = &.{}, .open = r, .layout = layout };
     for (0..10) |_| _ = press(&s, view, .down);
@@ -830,7 +886,7 @@ test "the selection moves on from the choices through the tools, and the screen 
     // Enter on a tool does nothing.
     try testing.expectEqual(Effect.none, press(&s, view, .enter));
     for (0..40) |_| _ = press(&s, view, .down);
-    try testing.expectEqual(@as(usize, 31), s.cursor);
+    try testing.expectEqual(@as(usize, 32), s.cursor);
     try testing.expectEqual(layout.lines() - layout.shown(), s.top);
     for (0..40) |_| _ = press(&s, view, .up);
     try testing.expectEqual(@as(usize, 0), s.top);
@@ -884,5 +940,5 @@ test "a server that goes away takes its screen back to the list" {
     const r = testRow("linear", .ready, .{});
     s = .{ .active = true, .screen = .server, .cursor = 3 };
     _ = settle(&s, .{ .rows = &.{}, .open = r, .layout = serverLayout(r, .loading, "", 9) });
-    try testing.expectEqual(@as(usize, 0), s.cursor);
+    try testing.expectEqual(@as(usize, 1), s.cursor);
 }

@@ -1267,7 +1267,7 @@ describe("/mcp in the shell", () => {
     await tui.waitForText("MCP servers  1 of 3", 5_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("Echo text through the modern MCP fixture", 15_000);
-    await tui.waitForText("› Remove        /mcp remove fixture", 5_000);
+    await tui.waitForText("  Remove        /mcp remove fixture", 5_000);
     // Typing filters its tools, by name or description; the list's filter waits.
     await tui.sendLiteral("zz");
     await tui.waitForText("No tools match.", 5_000);
@@ -1326,8 +1326,8 @@ describe("/mcp in the shell", () => {
     await tui.waitForText("MCP servers  3", 5_000);
     // Approved, proj works and sorts between fixture and web.
     await tui.sendKeys("Down Enter");
-    await tui.waitForText("› Remove        /mcp remove web", 5_000);
-    await tui.sendKeys("Enter");
+    await tui.waitForText("  Remove        /mcp remove web", 5_000);
+    await tui.sendKeys("Down Enter");
     // It asks on Remove's own row, with its answers; the hint line stays.
     await tui.waitForText("› Remove web from ~/.fx/mcp.json?   yes  no", 5_000);
     expect(await tui.capturePane()).toContain("↑↓ navigate     enter run     esc back");
@@ -1903,5 +1903,200 @@ describe("fx mcp add and remove refuse what fx would skip", () => {
     expect(readFileSync(root.profilePath, "utf8")).toBe(before);
     await tui.sendText("/mcp add --no-login --project web https://x.example/mcp");
     await tui.waitForText("Added web to .mcp.json.", 10_000);
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp toggles a user server off and back on, persisting enabled and reloading tools", async () => {
+    const root = createRoot({ mcpServers: { fixture: fixtureServer() } });
+    const strings = (value: unknown): string[] =>
+      typeof value === "string" ? [value]
+        : Array.isArray(value) ? value.flatMap(strings)
+        : value !== null && typeof value === "object" ? Object.values(value).flatMap(strings)
+        : [];
+    const text = (body: string) => strings(JSON.parse(body)).join("\n");
+    const menu = (body: string) => {
+      const all = text(body);
+      return all.slice(all.indexOf("<toolbox>"), all.indexOf("</toolbox>"));
+    };
+    const lastToolboxNote = (body: string) => {
+      const notes = [...text(body).matchAll(/The toolbox now holds[\s\S]*?(?=\n\n|$)/g)].map((m) => m[0]);
+      return notes.at(-1) ?? "";
+    };
+
+    let step = 0;
+    gateway = startDynamicFakeGateway((body) => {
+      step += 1;
+      if (step === 1) {
+        expect(menu(body)).toContain("- fixture");
+        return fakeGatewayFinalText("TURN1_WITH_MCP");
+      }
+      if (step === 2) {
+        const promptSummary = JSON.stringify(JSON.parse(body).prompt);
+        expect(lastToolboxNote(body), promptSummary).toContain("The toolbox now holds");
+        expect(lastToolboxNote(body)).not.toContain("MCP servers:");
+        return fakeGatewayFinalText("TURN2_MCP_OFF");
+      }
+      expect(lastToolboxNote(body)).toContain("MCP servers: fixture");
+      return fakeGatewayFinalText("TURN3_MCP_BACK_ON");
+    }, { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 110,
+      height: 36,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+
+    await tui.sendText("Turn 1 check.");
+    await tui.waitForPane((pane) => pane.includes("TURN1_WITH_MCP") && turnSettled(pane), 15_000);
+
+    // Open /mcp, open fixture, press Turn off (2 keys from server screen).
+    await tui.sendText("/mcp");
+    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Turn off", 5_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Turn on", 10_000);
+    await tui.waitForText(/status\s+disabled/, 10_000);
+    await tui.sendKeys("Escape");
+    await tui.waitForText(/fixture\s+disabled\s+profile/, 5_000);
+    await tui.sendKeys("Escape");
+    await tui.waitForPane((pane) => !pane.includes("MCP servers"), 5_000);
+
+    const offConfig = JSON.parse(readFileSync(root.profilePath, "utf8"));
+    expect(offConfig.mcpServers.fixture.enabled).toBe(false);
+
+    await tui.sendText("Turn 2 check.");
+    await tui.waitForPane((pane) => pane.includes("TURN2_MCP_OFF") && turnSettled(pane), 15_000);
+
+    // Reopen /mcp, select disabled fixture, turn it back on.
+    await tui.sendText("/mcp");
+    await tui.waitForText(/fixture\s+disabled\s+profile/, 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Turn on", 5_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Turn off", 10_000);
+    await tui.waitForText(/status\s+ready/, 15_000);
+    await tui.sendKeys("Escape");
+    await tui.sendKeys("Escape");
+    await tui.waitForPane((pane) => !pane.includes("MCP servers"), 5_000);
+
+    const onConfig = JSON.parse(readFileSync(root.profilePath, "utf8"));
+    expect(onConfig.mcpServers.fixture.enabled).toBe(true);
+
+    await tui.sendText("Turn 3 check.");
+    await tui.waitForPane((pane) => pane.includes("TURN3_MCP_BACK_ON") && turnSettled(pane), 15_000);
+
+    // A failed write leaves ~/.fx/mcp.json untouched and shows the error in the menu.
+    const symlinkTarget = join(root.home, "external.json");
+    writeFileSync(symlinkTarget, readFileSync(root.profilePath, "utf8"));
+    rmSync(root.profilePath);
+    symlinkSync(symlinkTarget, root.profilePath);
+    const beforeFailure = readFileSync(symlinkTarget, "utf8");
+
+    await tui.sendText("/mcp");
+    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Turn off", 5_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Couldn't turn off fixture:", 10_000);
+    expect(readFileSync(symlinkTarget, "utf8")).toBe(beforeFailure);
+    await tui.sendKeys("Escape");
+    await tui.sendKeys("Escape");
+    await tui.waitForPane((pane) => !pane.includes("MCP servers"), 5_000);
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp toggles a project .mcp.json server via disabledMcpjsonServers without editing .mcp.json", async () => {
+    const root = createRoot(undefined, { mcpServers: { fixture: fixtureServer() } });
+    const settingsPath = join(root.home, ".fx", "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({
+      workspaces: {
+        [root.workspace]: { enabledMcpjsonServers: ["fixture"] },
+      },
+    }));
+    const strings = (value: unknown): string[] =>
+      typeof value === "string" ? [value]
+        : Array.isArray(value) ? value.flatMap(strings)
+        : value !== null && typeof value === "object" ? Object.values(value).flatMap(strings)
+        : [];
+    const text = (body: string) => strings(JSON.parse(body)).join("\n");
+    const menu = (body: string) => {
+      const all = text(body);
+      return all.slice(all.indexOf("<toolbox>"), all.indexOf("</toolbox>"));
+    };
+    const lastToolboxNote = (body: string) => {
+      const notes = [...text(body).matchAll(/The toolbox now holds[\s\S]*?(?=\n\n|$)/g)].map((m) => m[0]);
+      return notes.at(-1) ?? "";
+    };
+
+    const projectBefore = readFileSync(root.projectPath, "utf8");
+    let step = 0;
+    gateway = startDynamicFakeGateway((body) => {
+      step += 1;
+      if (step === 1) {
+        expect(menu(body)).toContain("- fixture");
+        return fakeGatewayFinalText("PROJECT_TURN1_ON");
+      }
+      if (step === 2) {
+        expect(lastToolboxNote(body)).toContain("The toolbox now holds");
+        expect(lastToolboxNote(body)).not.toContain("MCP servers:");
+        return fakeGatewayFinalText("PROJECT_TURN2_OFF");
+      }
+      expect(lastToolboxNote(body)).toContain("MCP servers: fixture");
+      return fakeGatewayFinalText("PROJECT_TURN3_ON");
+    }, { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 110,
+      height: 36,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+
+    await tui.sendText("Turn 1 project check.");
+    await tui.waitForPane((pane) => pane.includes("PROJECT_TURN1_ON") && turnSettled(pane), 15_000);
+
+    // Open /mcp, open fixture, move down past Reject to Turn off (3 keys).
+    await tui.sendText("/mcp");
+    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Turn off", 5_000);
+    await tui.sendKeys("Down Enter");
+    await tui.waitForText("Turn on", 10_000);
+    await tui.waitForText(/status\s+rejected/, 10_000);
+    await tui.sendKeys("Escape");
+    await tui.waitForText(/fixture\s+rejected\s+project/, 5_000);
+    await tui.sendKeys("Escape");
+    await tui.waitForPane((pane) => !pane.includes("MCP servers"), 5_000);
+
+    expect(readFileSync(root.projectPath, "utf8")).toBe(projectBefore);
+    const offSettings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    expect(offSettings.workspaces[root.workspace].disabledMcpjsonServers).toEqual(["fixture"]);
+
+    await tui.sendText("Turn 2 project check.");
+    await tui.waitForPane((pane) => pane.includes("PROJECT_TURN2_OFF") && turnSettled(pane), 15_000);
+
+    // Reopen /mcp, turn fixture back on.
+    await tui.sendText("/mcp");
+    await tui.waitForText(/fixture\s+rejected\s+project/, 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Turn on", 5_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Turn off", 10_000);
+    await tui.waitForText(/status\s+ready/, 15_000);
+    await tui.sendKeys("Escape");
+    await tui.sendKeys("Escape");
+    await tui.waitForPane((pane) => !pane.includes("MCP servers"), 5_000);
+
+    expect(readFileSync(root.projectPath, "utf8")).toBe(projectBefore);
+    const onSettings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    expect(onSettings.workspaces[root.workspace].enabledMcpjsonServers).toEqual(["fixture"]);
+    expect(onSettings.workspaces[root.workspace].disabledMcpjsonServers).toBeUndefined();
+
+    await tui.sendText("Turn 3 project check.");
+    await tui.waitForPane((pane) => pane.includes("PROJECT_TURN3_ON") && turnSettled(pane), 15_000);
   }, 90_000);
 });

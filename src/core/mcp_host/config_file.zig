@@ -87,6 +87,22 @@ pub fn remove(alloc: Allocator, file: File, text: []const u8, name: []const u8) 
     return .{ .text = try render(alloc, root), .url = url };
 }
 
+/// The file with `name`'s `"enabled"` field set to `enabled`, keeping every
+/// other server, key, number spelling, and order unchanged. Returns null when
+/// `name` isn't in the file.
+pub fn setEnabled(alloc: Allocator, file: File, text: []const u8, name: []const u8, enabled: bool) Error!?[]u8 {
+    try requireShallow(text);
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root = try parse(a, text);
+    const servers = (try serversOf(a, file, &root, false)) orelse return null;
+    const entry = servers.getPtr(name) orelse return null;
+    if (entry.* != .object) return error.NotAnObject;
+    try entry.object.put(a, "enabled", .{ .bool = enabled });
+    return try render(alloc, root);
+}
+
 /// Whether the file defines `name`; false for a file that can't be read.
 pub fn has(alloc: Allocator, file: File, text: []const u8, name: []const u8) bool {
     var arena: std.heap.ArenaAllocator = .init(alloc);
@@ -99,12 +115,14 @@ pub fn has(alloc: Allocator, file: File, text: []const u8, name: []const u8) boo
 pub const Change = union(enum) {
     add: struct { name: []const u8, entry: Entry },
     remove: []const u8,
+    set_enabled: struct { name: []const u8, enabled: bool },
 };
 
 pub const Updated = union(enum) {
     added,
     /// The removed entry's `url`, owned by the caller's allocator.
     removed: ?[]u8,
+    updated,
     missing,
     /// Nothing was written.
     refused: Refusal,
@@ -165,6 +183,15 @@ pub fn update(alloc: Allocator, profile_path: []const u8, file: File, path: []co
             }
             try write(alloc, file, path, removed.text);
             return .{ .removed = removed.url };
+        },
+        .set_enabled => |se| {
+            const before = text orelse return .missing;
+            const next = (try setEnabled(alloc, file, before, se.name, se.enabled)) orelse return .missing;
+            defer alloc.free(next);
+            if (try misspelledIn(alloc, file, before)) |key| return .{ .refused = .{ .misspelled = key } };
+            if (try project_config.entryProblemIn(alloc, file == .profile, next, se.name)) |problem| return .{ .refused = .{ .entry = problem } };
+            try write(alloc, file, path, next);
+            return .updated;
         },
     }
 }
@@ -922,4 +949,54 @@ test "an add the reader's check accepts is loaded by the reader's own entry poin
             "garbage!garbage!garbage!",
         }) ++ @import("fuzz_corpus").mcp_add_reader_agree.*),
     });
+}
+
+test "setEnabled toggles enabled in ~/.fx/mcp.json while keeping keys, numbers, and order" {
+    const alloc = testing.allocator;
+    const before =
+        \\{"theme":"dark","mcp":{"a":{"command":"true","startup_timeout_ms":1.50},"b":{"command":"false"}},"zz":true}
+    ;
+    const disabled = (try setEnabled(alloc, .profile, before, "a", false)).?;
+    defer alloc.free(disabled);
+    try testing.expect(std.mem.find(u8, disabled, "\"startup_timeout_ms\": 1.50") != null);
+    try testing.expect(std.mem.find(u8, disabled, "\"enabled\": false") != null);
+    try testing.expect(std.mem.find(u8, disabled, "\"theme\": \"dark\"") != null);
+    try testing.expect(std.mem.find(u8, disabled, "\"zz\": true") != null);
+
+    const enabled = (try setEnabled(alloc, .profile, disabled, "a", true)).?;
+    defer alloc.free(enabled);
+    try testing.expect(std.mem.find(u8, enabled, "\"enabled\": true") != null);
+    try testing.expect(try setEnabled(alloc, .profile, before, "missing", false) == null);
+}
+
+test "update set_enabled persists and leaves the file untouched when refused or unreadable" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const profile = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "mcp.json" });
+    defer alloc.free(profile);
+
+    const added = try update(alloc, profile, .profile, profile, .{ .add = .{ .name = "web", .entry = good_entry } });
+    try testing.expect(added == .added);
+    const off = try update(alloc, profile, .profile, profile, .{ .set_enabled = .{ .name = "web", .enabled = false } });
+    try testing.expect(off == .updated);
+    const after_off = (try read(alloc, profile)).?;
+    defer alloc.free(after_off);
+    try testing.expect(std.mem.find(u8, after_off, "\"enabled\": false") != null);
+
+    const on = try update(alloc, profile, .profile, profile, .{ .set_enabled = .{ .name = "web", .enabled = true } });
+    try testing.expect(on == .updated);
+    const after_on = (try read(alloc, profile)).?;
+    defer alloc.free(after_on);
+    try testing.expect(std.mem.find(u8, after_on, "\"enabled\": true") != null);
+
+    const misspelled = "{\"mcpServers\":{\"web\":{\"url\":\"https://mcp.example/mcp\",\"type\":\"http\"}},\"mcp_servers\":{\"bad\":{\"command\":\"x\"}}}";
+    try write(alloc, .profile, profile, misspelled);
+    const refused = try update(alloc, profile, .profile, profile, .{ .set_enabled = .{ .name = "web", .enabled = false } });
+    try testing.expectEqualStrings("mcp_servers", (try refusedKey(refused)).key());
+    const untouched = (try read(alloc, profile)).?;
+    defer alloc.free(untouched);
+    try testing.expectEqualStrings(misspelled, untouched);
 }

@@ -501,7 +501,7 @@ pub const Catalog = struct {
     /// The servers the model's prompt lists. Project servers that aren't
     /// approved stay out of it.
     /// The names of the servers the model may reach, for the toolbox menu:
-    /// every configured server but one waiting for approval or rejected.
+    /// every configured server but one waiting for approval, rejected, or disabled.
     /// `alloc` owns the slice and each name.
     pub fn serverNames(c: *Catalog, alloc: Allocator) ![]const []const u8 {
         var scratch: std.heap.ArenaAllocator = .init(c.gpa);
@@ -517,7 +517,7 @@ pub const Catalog = struct {
         for (c.servers) |server| {
             const s = statusOf(statuses, server.name) orelse continue;
             switch (s.state) {
-                .waiting_for_approval, .rejected => continue,
+                .waiting_for_approval, .rejected, .disabled => continue,
                 else => {},
             }
             try out.ensureUnusedCapacity(alloc, 1);
@@ -1210,6 +1210,23 @@ test "an MCP server's tools reach the model under fx's names" {
     }
     try testing.expectEqual(@as(usize, 1), names.len);
     try testing.expectEqualStrings("fake", names[0]);
+
+    // A disabled server leaves serverNames on reload, and returns when enabled again.
+    const off: mcp_contract.McpServerConfig = .{ .name = "fake", .command = f.server, .enabled = false };
+    try c.reload(try r.reload(&.{off}, &f.inherited));
+    const names_off = try c.serverNames(testing.allocator);
+    defer testing.allocator.free(names_off);
+    try testing.expectEqual(@as(usize, 0), names_off.len);
+
+    const on_cfg: mcp_contract.McpServerConfig = .{ .name = "fake", .command = f.server };
+    try c.reload(try r.reload(&.{on_cfg}, &f.inherited));
+    const names_on = try c.serverNames(testing.allocator);
+    defer {
+        for (names_on) |name| testing.allocator.free(name);
+        testing.allocator.free(names_on);
+    }
+    try testing.expectEqual(@as(usize, 1), names_on.len);
+    try testing.expectEqualStrings("fake", names_on[0]);
 }
 
 test "a reload keeps a kept server's list and the bindings made from it, until a server is dropped" {

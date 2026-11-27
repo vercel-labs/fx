@@ -509,7 +509,7 @@ const too_large_words = std.fmt.comptimePrint("is over {d} MB, the most fx reads
 const too_deep_words = std.fmt.comptimePrint("is nested more than {d} levels deep; flatten it by hand first", .{json_depth.max_depth});
 
 /// Why a write to `path` failed; a link says what it points to.
-fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
+pub fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
     switch (err) {
         error.SymLinkLoop => return "it " ++ link_loop_words,
         error.StreamTooLong => return "it " ++ too_large_words,
@@ -533,7 +533,7 @@ fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
 /// The reader's own words for an entry it would skip; for a misspelled key, the
 /// words of the skip note, with the command to run again, so a person or an
 /// agent can follow it.
-fn refusalWords(arena: Allocator, refusal: config_file.Refusal) ![]const u8 {
+pub fn refusalWords(arena: Allocator, refusal: config_file.Refusal) ![]const u8 {
     switch (refusal) {
         .entry => |problem| return project_config.entryProblemWords(problem),
         .misspelled => |misspelled| {
@@ -950,7 +950,7 @@ fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, e
             try c.err.print("Couldn't add {s} to {s}: {s}.\n", .{ name, fileLabel(file), try refusalWords(arena, refusal) });
             return 1;
         },
-        .added, .removed, .missing => {},
+        .added, .removed, .updated, .missing => {},
     }
     c.hosts.changed(c.hosts.context);
     try c.out.print("Added {s} to {s}.\n", .{ name, fileLabel(file) });
@@ -1047,7 +1047,7 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
             try c.err.print("Couldn't remove {s} from {s}: {s}.\n", .{ try safe(arena, name), fileLabel(file), try refusalWords(arena, refusal) });
             return 1;
         },
-        .added, .missing => null,
+        .added, .updated, .missing => null,
     };
     defer if (url) |u| c.gpa.free(u);
     var forgot = false;

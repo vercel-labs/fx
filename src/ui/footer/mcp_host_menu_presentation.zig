@@ -45,7 +45,7 @@ pub const Projection = struct {
     }
 
     pub fn layout(p: Projection, r: menu.Row) menu.Layout {
-        return menu.serverLayout(r, p.tools, p.filter, menu.server_window);
+        return menu.serverLayoutWithError(r, p.tools, p.filter, menu.server_window, p.state.errorText() != null);
     }
 
     /// The server's screen at `width`: its layout with the waiting address.
@@ -312,8 +312,13 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
         }
         if (r.status.version) |version| {
             if (later == 0) return row_text.composeFactRow(alloc, "protocol", version, width, fact_col, "");
+            later -= 1;
         }
-        return row_text.composeFactRow(alloc, "error", r.status.last_error orelse "", width, fact_col, ui_render.hint_style);
+        if (menu.showsError(r)) {
+            if (later == 0) return row_text.composeFactRow(alloc, "error", r.status.last_error orelse "", width, fact_col, ui_render.hint_style);
+            later -= 1;
+        }
+        return row_text.composeFactRow(alloc, "error", p.state.errorText() orelse "", width, fact_col, ui_render.hint_style);
     }
     var buf: [menu.max_choices]menu.Choice = undefined;
     const cs = menu.choices(r, &buf);
@@ -343,13 +348,13 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
         }
         try row.appendSlice(alloc, cs[at].label());
         try row.appendSlice(alloc, ui_render.reset_style);
-        if (width >= 56) {
+        if (width >= 56) if (cs[at].verb()) |verb_name| {
             try row_text.appendSpacesToColumn(alloc, &row, 16);
             try row.appendSlice(alloc, ui_render.dim_style);
-            const command = try arena.print("/mcp {s} {s}", .{ cs[at].verb(), r.status.name });
+            const command = try arena.print("/mcp {s} {s}", .{ verb_name, r.status.name });
             try row_text.appendTerminalSafeSingleLine(alloc, &row, command, @as(usize, width) -| 16);
             try row.appendSlice(alloc, ui_render.reset_style);
-        }
+        };
         return row;
     }
     const after = at - cs.len;
@@ -386,6 +391,7 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
     if (after == 1) {
         const heading: []const u8 = switch (menu.toolsFor(r, p.tools)) {
             .loading => "Loading tools…",
+            .disabled => "Its tools show here once you turn it on.",
             .needs_login => "Its tools show here once you log in.",
             .needs_approval => "Its tools show here once you approve it.",
             .failed => |reason| try arena.print("Its tools couldn't load: {s}", .{reason}),
@@ -478,7 +484,7 @@ fn confirmLines(p: Projection, r: menu.Row, width: u16, out: *Confirm) []const C
         .remove => std.mem.print(&out.question, "Remove {s} from {s}?", .{ name, p.fileOf(r) }),
         .approve => std.mem.print(&out.question, "Approve {s} for this project? It {s}:", .{ name, if (r.status.transport == .stdio) "runs" else "connects to" }),
         .reject => std.mem.print(&out.question, "Reject {s}? fx won't start it in this project.", .{name}),
-        .login, .logout => std.mem.print(&out.question, "{s} {s}?", .{ c.label(), name }),
+        .login, .logout, .turn_off, .turn_on => std.mem.print(&out.question, "{s} {s}?", .{ c.label(), name }),
     } catch "Are you sure?";
     out.lines[n] = .{ .text = q, .style = .question };
     n += 1;
@@ -865,6 +871,7 @@ test "a server's screen: facts, choices with their commands, then tools" {
         \\  protocol  2025-11-25
         \\
         \\› Log out       /mcp logout github
+        \\  Turn off
         \\  Remove        /mcp remove github
         \\
         \\  Tools 2
@@ -873,7 +880,7 @@ test "a server's screen: facts, choices with their commands, then tools" {
         \\
     , text);
     // On a tool, Enter does nothing, so the hint doesn't offer it.
-    p.state.cursor = 2;
+    p.state.cursor = 3;
     try testing.expectEqualStrings("↑↓ navigate     esc back", hintVariants(p)[0]);
 }
 
@@ -924,7 +931,7 @@ test "a long tool list scrolls with the selection and counts what's below" {
     menu.open(&p.state);
     _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
     const view: menu.View = .{ .rows = &rows, .open = rows[0], .layout = p.layout(rows[0]) };
-    for (0..12) |_| _ = menu.press(&p.state, view, .down);
+    for (0..13) |_| _ = menu.press(&p.state, view, .down);
     const text = try render(p, 60);
     defer testing.allocator.free(text);
     // What scrolled off the top isn't counted; what's below is.
@@ -964,8 +971,8 @@ test "Remove asks on its own row, at the same size" {
     var p: Projection = .{ .rows = &rows, .tools = .{ .ready = &.{} } };
     menu.open(&p.state);
     _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
-    // Log out, then Remove.
-    p.state.cursor = 1;
+    // Log out, Turn off, then Remove.
+    p.state.cursor = 2;
     const server_rows = menuRowCount(p, 88, 40);
     _ = menu.press(&p.state, .{ .rows = &rows, .open = rows[0], .layout = p.layout(rows[0]) }, .enter);
     try testing.expectEqual(menu.Screen.confirm, p.state.screen);
@@ -977,7 +984,7 @@ test "Remove asks on its own row, at the same size" {
     try testing.expect(std.mem.find(u8, text, "› Remove github and its login from ~/.fx/mcp.json?   yes  no\n") != null);
     try testing.expect(std.mem.find(u8, text, "  Log out       /mcp logout github\n") != null);
     try testing.expectEqualStrings("↑↓ navigate     enter run     esc back", hintVariants(p)[0]);
-    var asked = try composeRow(testing.allocator, p, 6, 88, menuRowCount(p, 88, 40));
+    var asked = try composeRow(testing.allocator, p, 7, 88, menuRowCount(p, 88, 40));
     defer asked.deinit(testing.allocator);
     const answers = try testing.allocator.print("{s}yes{s}  {s}no{s}", .{ ui_render.selected_completion_style, ui_render.reset_style, ui_render.dim_style, ui_render.reset_style });
     defer testing.allocator.free(answers);
@@ -988,8 +995,9 @@ test "Remove asks on its own row, at the same size" {
     var odd: Projection = .{ .rows = &odd_rows, .tools = .{ .ready = &.{} } };
     menu.open(&odd.state);
     _ = menu.press(&odd.state, .{ .rows = &odd_rows }, .enter);
+    odd.state.cursor = 1;
     _ = menu.press(&odd.state, .{ .rows = &odd_rows, .open = odd_rows[0], .layout = odd.layout(odd_rows[0]) }, .enter);
-    var row = try composeRow(testing.allocator, odd, 5, 88, menuRowCount(odd, 88, 40));
+    var row = try composeRow(testing.allocator, odd, 6, 88, menuRowCount(odd, 88, 40));
     defer row.deinit(testing.allocator);
     try testing.expect(std.mem.find(u8, row.items, "Remove x") != null);
     try testing.expect(std.mem.find(u8, row.items, "\x1b[2J") == null);
@@ -1008,11 +1016,11 @@ test "a sign-in that waits links its address in one line, like the transcript" {
     try testing.expect(std.mem.find(u8, text, "  Waiting for the browser. Didn't open? Open the sign-in page.\n") != null);
     try testing.expect(std.mem.find(u8, text, "Its tools show here once you log in.") == null);
     try testing.expect(std.mem.find(u8, text, "https://linear.app/oauth") == null);
-    // Title, three facts and a blank, two choices, a blank and the heading:
+    // Title, three facts and a blank, three choices, a blank and the heading:
     // the address takes no lines of its own.
-    try testing.expectEqual(@as(u16, 9), menuRowCount(p, 80, 40));
+    try testing.expectEqual(@as(u16, 10), menuRowCount(p, 80, 40));
     p.sign_in_url = null;
-    try testing.expectEqual(@as(u16, 9), menuRowCount(p, 80, 40));
+    try testing.expectEqual(@as(u16, 10), menuRowCount(p, 80, 40));
     p.sign_in_url = url;
 
     // The label links the whole address; narrower screens drop the lead.
@@ -1129,6 +1137,7 @@ test "a login under way says so until its address comes" {
         \\  status    needs login
         \\
         \\› Log in        /mcp login linear
+        \\  Turn off
         \\  Remove        /mcp remove linear
         \\
         \\  Signing in…
@@ -1201,9 +1210,34 @@ test "a server that needs a login says so, once" {
         \\  status    needs login
         \\
         \\› Log in        /mcp login linear
+        \\  Turn off
         \\  Remove        /mcp remove linear
         \\
         \\  Its tools show here once you log in.
+        \\
+    , text);
+}
+
+test "off servers and menu toggle errors render cleanly in the server view" {
+    const off = testStatus("linear", .disabled);
+    const rows = [_]menu.Row{.{ .status = off, .target = "https://mcp.linear.app/mcp" }};
+    var p: Projection = .{ .rows = &rows };
+    menu.open(&p.state);
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    p.state.setError("Couldn't turn on linear: permission denied.");
+    const text = try render(p, 80);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(
+        \\  linear
+        \\  http      https://mcp.linear.app/mcp
+        \\  file      ~/.fx/mcp.json
+        \\  status    disabled
+        \\  error     Couldn't turn on linear: permission denied.
+        \\
+        \\› Turn on
+        \\  Remove        /mcp remove linear
+        \\
+        \\  Its tools show here once you turn it on.
         \\
     , text);
 }
