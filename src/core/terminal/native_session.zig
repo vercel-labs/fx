@@ -2045,7 +2045,7 @@ const Session = struct {
         const target = self.launcherTarget() orelse return;
         const launcher_is_ours = switch (self.signalTargetMatch(target)) {
             .matched => true,
-            .missing => process_tree.exitedUncollectedSince(target.pid, target.token.view()),
+            .missing => process_tree.exitedUncollectedSince(target.pid, target.token),
             .mismatched, .unavailable => false,
         };
         if (!launcher_is_ours) return;

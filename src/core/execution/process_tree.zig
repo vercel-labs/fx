@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
 const io_mod = @import("../shared/io.zig");
+const process_identity = @import("process_identity.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1066,9 +1067,9 @@ fn listMacOSProcessIds(alloc: Allocator, out: *std.ArrayList(std.posix.pid_t)) !
 /// makes those tokens does not see an exited process that is still waiting to
 /// be collected, so its owner would take it for gone; this one does. It is
 /// false everywhere else, where the identity check sees such a process.
-pub fn exitedUncollectedSince(pid: std.posix.pid_t, token: []const u8) bool {
+pub fn exitedUncollectedSince(pid: std.posix.pid_t, token: process_identity.ProcessInstanceToken) bool {
     if (comptime builtin.target.os.tag != .macos) return false;
-    const start = macOSTokenStart(token) orelse return false;
+    const start = token.macos_start orelse return false;
     var info: Darwin.ProcBsdInfo = undefined;
     // The last argument asks for exited processes as well.
     const read_len = Darwin.proc_pidinfo(pid, 3, 1, &info, @sizeOf(Darwin.ProcBsdInfo));
@@ -1078,28 +1079,56 @@ pub fn exitedUncollectedSince(pid: std.posix.pid_t, token: []const u8) bool {
         info.pbi_start_tvusec == start.microseconds;
 }
 
-const MacOSTokenStart = struct { seconds: u64, microseconds: u64 };
+test "an exited child that is not collected yet is found by its start time" {
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
 
-/// The start time inside a `macos:<boot>:<seconds>:<microseconds>` token.
-fn macOSTokenStart(token: []const u8) ?MacOSTokenStart {
-    var parts = std.mem.splitScalar(u8, token, ':');
-    if (!std.mem.eql(u8, parts.next() orelse return null, "macos")) return null;
-    _ = parts.next() orelse return null;
-    const seconds = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null;
-    const microseconds = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null;
-    if (parts.next() != null) return null;
-    return .{ .seconds = seconds, .microseconds = microseconds };
+    // `cat` ends when its input does.
+    var child = try std.process.spawn(io, .{
+        .argv = &.{"cat"},
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+    const pid = child.id.?;
+    const started_us = (try captureSnapshot(alloc, pid)).started_at_us;
+    const token = try testMacOSToken(started_us);
+    const other_start = try testMacOSToken(started_us + 1);
+    try std.testing.expect(!exitedUncollectedSince(pid, token));
+
+    child.stdin.?.close(io);
+    child.stdin = null;
+    try waitUntilExitedUncollected(pid);
+    try std.testing.expect(exitedUncollectedSince(pid, token));
+    try std.testing.expect(!exitedUncollectedSince(pid, other_start));
+
+    _ = try child.wait(io);
+    try std.testing.expect(!exitedUncollectedSince(pid, token));
 }
 
-test "the start time is read from a macOS token and from nothing else" {
-    const start = macOSTokenStart("macos:0123456789abcdef0123456789abcdef:1795769402:695677").?;
-    try std.testing.expectEqual(@as(u64, 1795769402), start.seconds);
-    try std.testing.expectEqual(@as(u64, 695677), start.microseconds);
-    try std.testing.expect(macOSTokenStart("linux:0123456789abcdef0123456789abcdef:42") == null);
-    try std.testing.expect(macOSTokenStart("macos:0123456789abcdef0123456789abcdef:1:2:3") == null);
-    try std.testing.expect(macOSTokenStart("macos:0123456789abcdef0123456789abcdef:1") == null);
-    try std.testing.expect(macOSTokenStart("macos:0123456789abcdef0123456789abcdef:x:2") == null);
-    try std.testing.expect(macOSTokenStart("") == null);
+/// A macOS token for a process that started `started_us` microseconds after the epoch.
+fn testMacOSToken(started_us: u64) !process_identity.ProcessInstanceToken {
+    var buffer: [128]u8 = undefined;
+    return process_identity.ProcessInstanceToken.parse(try std.mem.print(
+        &buffer,
+        "macos:00112233445566778899aabbccddeeff:{d}:{d}",
+        .{ started_us / std.time.us_per_s, started_us % std.time.us_per_s },
+    ));
+}
+
+/// Blocks until the child `pid` has exited, and leaves it uncollected.
+fn waitUntilExitedUncollected(pid: std.posix.pid_t) !void {
+    const wait = struct {
+        extern "c" fn waitid(id_type: c_uint, id: c_uint, info: *std.c.siginfo_t, options: c_int) c_int;
+    };
+    const wait_for_pid: c_uint = 1; // P_PID
+    const wait_exited: c_int = 0x4; // WEXITED
+    const wait_leave_waitable: c_int = 0x20; // WNOWAIT
+    var info: std.c.siginfo_t = undefined;
+    const result = wait.waitid(wait_for_pid, @intCast(pid), &info, wait_exited | wait_leave_waitable);
+    if (result != 0) return error.TestWaitForChildFailed;
 }
 
 test "Linux proc helpers treat missing process data as vanished" {
