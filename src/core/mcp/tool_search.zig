@@ -181,7 +181,7 @@ pub fn rank(
         full = try renderSearchResult(alloc, matches, matches.len, page.total_matches, full_cursor, limits.mcp_description_bytes, limits.mcp_search_result_bytes, &loads, arguments, 0, false);
     };
     const observed_bytes = full.len;
-    const limit_triggered = full.len > effective_bytes;
+    const limit_triggered = matches.len > 0 and full.len > effective_bytes;
     var shown = matches.len;
     var output = full;
     if (limit_triggered) {

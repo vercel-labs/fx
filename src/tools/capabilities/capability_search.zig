@@ -8,10 +8,20 @@ const tool_result_limits = @import("../../core/tooling/tool_result_limits.zig");
 const skill_search = @import("../skills/skill_search.zig");
 
 const Allocator = std.mem.Allocator;
-/// Bytes reserved for `renderCombined`'s wrapper fields and counts so a
-/// domain-bounded page still fits inside `output_cap` once wrapped.
-const combined_wrapper_reserve_bytes: usize = 512;
-const min_wrapper_reserve_bytes: usize = 128;
+/// Largest byte growth `renderCombined` can add over a domain's own JSON page:
+/// 45 bytes for `skills`, `counts`, `total_matches`, and `state`/`next_cursor`,
+/// 16 bytes for `mcp_*` key prefixes (`mcp_context_limit`, `mcp_unavailable`,
+/// `mcp_state`, `mcp_error`), plus a 19-byte margin.
+const combined_wrapper_reserve_bytes: usize = 45 + 16 + 19;
+
+fn domainCap(output_cap: usize, searches_skills: bool, searches_mcp: bool) usize {
+    const wrapper_reserve = @min(combined_wrapper_reserve_bytes, output_cap / 2);
+    const available_cap = output_cap - wrapper_reserve;
+    return if (searches_skills and searches_mcp)
+        available_cap / 2
+    else
+        available_cap;
+}
 
 /// Searches skills and MCP tools for `request`, as toolbox search answers.
 /// A request that loads schemas reports the MCP tools it loaded as selected
@@ -26,17 +36,7 @@ pub fn search(
     );
     const searches_skills = request.includes(.skill);
     const searches_mcp = request.includes(.mcp);
-    const wrapper_reserve = if (output_cap > combined_wrapper_reserve_bytes)
-        combined_wrapper_reserve_bytes
-    else if (output_cap > min_wrapper_reserve_bytes)
-        min_wrapper_reserve_bytes
-    else
-        0;
-    const available_cap = output_cap - wrapper_reserve;
-    const domain_cap = if (searches_skills and searches_mcp)
-        available_cap / 2
-    else
-        available_cap;
+    const domain_cap = domainCap(output_cap, searches_skills, searches_mcp);
     var skill_result: ?skill_search.SearchResult = null;
     if (searches_skills) {
         skill_result = skill_search.searchRequest(ctx, request, domain_cap) catch |err| switch (err) {
@@ -467,5 +467,109 @@ test "unavailable servers in an MCP search keep combined output within output_ca
             return error.TestUnexpectedResult;
         },
         .rich => return error.TestUnexpectedResult,
+    }
+}
+
+test "worst-case renderCombined wrapper overhead fits inside combined_wrapper_reserve_bytes" {
+    const alloc = std.testing.allocator;
+
+    // Case 1: MCP-only paged result with max 2-digit counts, large total_matches,
+    // next_cursor, and every optional renamed field (context_limit, unavailable, state, error).
+    const paged_mcp =
+        "{\"tools\":[],\"count\":20,\"total_matches\":1000000,\"more_available\":true,\"next_cursor\":\"c1:m:20:1000000:1\"," ++
+        "\"context_limit\":{\"name\":\"mcp_search_result_bytes\"},\"unavailable\":[\"s1\"],\"state\":\"partial\",\"error\":\"warn\"}";
+    const paged_combined = try combineProjected(alloc, null, paged_mcp, paged_mcp.len + combined_wrapper_reserve_bytes);
+    defer alloc.free(paged_combined);
+    try std.testing.expect(paged_combined.len - paged_mcp.len <= combined_wrapper_reserve_bytes);
+
+    // Case 2: MCP-only no_match result with unavailable and context_limit.
+    const empty_mcp =
+        "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null," ++
+        "\"context_limit\":{\"name\":\"mcp_search_result_bytes\"},\"unavailable\":[\"s1\"]}";
+    const empty_mcp_combined = try combineProjected(alloc, null, empty_mcp, empty_mcp.len + combined_wrapper_reserve_bytes);
+    defer alloc.free(empty_mcp_combined);
+    try std.testing.expect(empty_mcp_combined.len - empty_mcp.len <= combined_wrapper_reserve_bytes);
+
+    // Case 3: Skill-only no_match result.
+    const empty_skills =
+        "{\"skills\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null}";
+    const skill_only_result = testSkillResult(empty_skills, 0, 0);
+    const default_mcp =
+        "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null}";
+    const skill_only_combined = try combineProjected(
+        alloc,
+        &skill_only_result,
+        default_mcp,
+        empty_skills.len + combined_wrapper_reserve_bytes,
+    );
+    defer alloc.free(skill_only_combined);
+    try std.testing.expect(skill_only_combined.len - empty_skills.len <= combined_wrapper_reserve_bytes);
+}
+
+test "domainCap never shrinks as output_cap grows and stays within cap at 128, 129, and 16384" {
+    const alloc = std.testing.allocator;
+    const tool_search = @import("../../core/mcp/tool_search.zig");
+    const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
+    const context_limits = @import("../../core/config/context_limits.zig");
+    const types = @import("../../core/shared/types.zig");
+
+    const caps = [_]usize{ 128, 129, 160, 161, 512, 513, 4096, result_store.large_result_threshold_bytes };
+    for (caps[0 .. caps.len - 1], caps[1..]) |lo, hi| {
+        try std.testing.expect(domainCap(lo, false, true) <= domainCap(hi, false, true));
+        try std.testing.expect(domainCap(lo, true, false) <= domainCap(hi, true, false));
+        try std.testing.expect(domainCap(lo, true, true) <= domainCap(hi, true, true));
+    }
+    try std.testing.expectEqual(
+        result_store.large_result_threshold_bytes - combined_wrapper_reserve_bytes,
+        domainCap(result_store.large_result_threshold_bytes, false, true),
+    );
+
+    const EmptyMcp = struct {
+        fn searchTools(
+            _: *anyopaque,
+            gpa: Allocator,
+            request: tool_mcp_runtime.SearchRequest,
+            _: types.PermissionRuleSet,
+            limits: context_limits.Values,
+            _: tool_mcp_runtime.Access,
+            _: ?*std.atomic.Value(bool),
+        ) anyerror!tool_mcp_runtime.SearchResult {
+            var res = try tool_search.rank(gpa, &.{}, request, limits, null);
+            errdefer res.deinit(gpa);
+            res.model_output = try tool_search.withUnavailable(
+                gpa,
+                res.model_output,
+                &.{"MCP server 'alpha' is unavailable: failed"},
+                limits.mcp_search_result_bytes.effectiveBytes(),
+            );
+            return res;
+        }
+    };
+
+    var dummy: u8 = 0;
+    const query = try lexical_relevance.prepare("missing");
+    for ([_]usize{ 128, 129, result_store.large_result_threshold_bytes }) |cap| {
+        const ctx: tool_dispatch.DispatchContext = .{
+            .allocator = alloc,
+            .max_tool_result_bytes = cap,
+            .mcp_ctx = &dummy,
+            .mcp_search_tools = EmptyMcp.searchTools,
+        };
+        const result = try search(ctx, .{
+            .query = &query,
+            .kind = .mcp,
+            .limit = 10,
+            .load_schemas = false,
+            .schemas_in_result = true,
+        });
+        defer result.deinit(alloc);
+        switch (result) {
+            .success => |text| try std.testing.expect(text.len <= cap),
+            .failure => |text| {
+                std.debug.print("unexpected failure at cap {d}: {s}\n", .{ cap, text });
+                return error.TestUnexpectedResult;
+            },
+            .rich => return error.TestUnexpectedResult,
+        }
     }
 }
