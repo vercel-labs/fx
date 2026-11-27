@@ -4806,6 +4806,15 @@ const default_command_output_block_cap: usize = 1024 * 1024;
 const full_transcript_snapshot_clone_max_bytes: usize = 8 * 1024 * 1024;
 const resume_publication_rows_per_frame: u32 = 64;
 
+/// How many rows of a resumed history one frame may write into scrollback.
+const ResumePublicationBatch = enum {
+    /// `resume_publication_rows_per_frame`, so input stays live meanwhile.
+    paced,
+    /// All the rows it owes: the footer grew, and the history must reach the
+    /// new viewport top before a later frame defers (`finish_at_new_top`).
+    rest,
+};
+
 pub const PaintTraceState = struct {
     transcript_top: u16 = 0,
     transcript_bottom: u16 = 0,
@@ -7884,9 +7893,10 @@ pub const TranscriptRuntime = struct {
     fn transcriptWindowDropHold(self: *TranscriptRuntime, alloc: Allocator) !TranscriptWindowDropHold {
         if (self.fullTranscriptActive()) return .all;
         // A resumed transcript not painted yet, or painted and handed off
-        // with no anchor yet: everything it holds is on screen or about to
-        // be. A resume flow released before the first paint holds the same
-        // drops until that paint (`unpainted_resume_hold`).
+        // with an anchor of the prepared flow's rows, not the entries':
+        // everything it holds is on screen or about to be. A resume flow
+        // released before the first paint holds the same drops until that
+        // paint (`unpainted_resume_hold`).
         if (self.notebook.pending_resume_source != null or self.resume_handoff_repaint_pending or self.unpainted_resume_hold) return .all;
         const history = switch (self.transcript_commit_state) {
             .invalid => return .none,
@@ -9295,8 +9305,9 @@ pub const TranscriptRuntime = struct {
         resize_reflow_rows: u16,
         semantic_rows: u32,
         semantic_progress_rows: u32,
+        batch: ResumePublicationBatch,
     ) u16 {
-        const semantic_cap = if (self.notebook.pending_resume_source != null)
+        const semantic_cap = if (self.notebook.pending_resume_source != null and batch == .paced)
             resume_publication_rows_per_frame
         else
             std.math.maxInt(u32);
@@ -9452,7 +9463,7 @@ pub const TranscriptRuntime = struct {
                 if (restore_projection) {
                     facts.semantic_rows = 0;
                     facts.semantic_progress_rows = 0;
-                    facts.planned_rows = self.plannedTranscriptRows(prepared, facts.source_visual_offset, facts.resize_reflow_rows, 0, 0);
+                    facts.planned_rows = self.plannedTranscriptRows(prepared, facts.source_visual_offset, facts.resize_reflow_rows, 0, 0, .paced);
                 }
             }
         }
@@ -9515,12 +9526,30 @@ pub const TranscriptRuntime = struct {
                     0
                 else
                     receipt.remaining_resize_reflow_rows;
-                const retained_semantic_rows = if (source_compatible)
+                // While a resumed history is written, a taller footer, such
+                // as a sent prompt's card, a resent request's activity row,
+                // or a composer of several lines, moves the viewport top
+                // further down the same history flow. The rows up to the old
+                // top would then no longer fit, and every later frame would
+                // defer and lose its append base, so the first frame that
+                // sees the new top writes the rest of the history, up to that
+                // top, at once. Other recovery keeps its own pace.
+                const finish_at_new_top = self.notebook.pending_resume_source != null and
+                    source_equal and
+                    recovery_progress_compatible and
+                    recovery_tracks_semantic_progress and
+                    receipt.remaining_semantic_progress_rows > 0 and
+                    target_offset > receipt.attempt_visual_offset;
+                const retained_semantic_rows = if (finish_at_new_top)
+                    target_offset -| receipt.accepted_history_visual_offset
+                else if (source_compatible)
                     receipt.remaining_semantic_rows
                 else
                     0;
                 const retained_semantic_progress_rows =
-                    if (recovery_progress_compatible and
+                    if (finish_at_new_top)
+                        target_offset -| receipt.accepted_visual_offset
+                    else if (recovery_progress_compatible and
                     recovery_tracks_semantic_progress)
                         receipt.remaining_semantic_progress_rows
                     else
@@ -9599,10 +9628,11 @@ pub const TranscriptRuntime = struct {
                         resize_reflow_rows,
                         semantic_rows,
                         semantic_progress_rows,
+                        if (finish_at_new_top) .rest else .paced,
                     );
                 debug_trace.logf(
                     "scroll",
-                    "transcript_transition_plan source_state=recovering source_visual_offset={d} attempt_visual_offset={d} target_visual_offset={d} attempt_total_visual_rows={d} target_total_visual_rows={d} remaining_resize_reflow_rows={d} remaining_semantic_rows={d} remaining_semantic_progress_rows={d} growth_rows={d} semantic_progress_rows={d} planned_rows={d} source_compatible={s} recovery_progress_compatible={s} recovery_rebase={s} recovery_projection_deferred={s}",
+                    "transcript_transition_plan source_state=recovering source_visual_offset={d} attempt_visual_offset={d} target_visual_offset={d} attempt_total_visual_rows={d} target_total_visual_rows={d} remaining_resize_reflow_rows={d} remaining_semantic_rows={d} remaining_semantic_progress_rows={d} growth_rows={d} semantic_progress_rows={d} planned_rows={d} source_compatible={s} recovery_progress_compatible={s} recovery_rebase={s} recovery_projection_deferred={s} finish_at_new_top={s}",
                     .{
                         receipt.accepted_visual_offset,
                         receipt.attempt_visual_offset,
@@ -9619,6 +9649,7 @@ pub const TranscriptRuntime = struct {
                         if (recovery_progress_compatible) "true" else "false",
                         if (recovery_rebase) "true" else "false",
                         if (recovery_projection_deferred) "true" else "false",
+                        if (finish_at_new_top) "true" else "false",
                     },
                 );
                 return .{
@@ -9649,6 +9680,7 @@ pub const TranscriptRuntime = struct {
                             0,
                             semantic_rows,
                             semantic_rows,
+                            .paced,
                         ),
                         .source_compatible = true,
                         .recovery_progress_compatible = true,
@@ -9783,6 +9815,7 @@ pub const TranscriptRuntime = struct {
             resize_reflow_rows,
             semantic_rows,
             semantic_rows,
+            .paced,
         );
         if (history_behind_viewport and !geometry_rebase and
             semantic_rows == 0 and releasable_advance > 0 and
@@ -11774,14 +11807,19 @@ pub const TranscriptRuntime = struct {
             self.notebook.last_rendered_cols = transition.target_layout.terminal_cols;
             self.resume_handoff_repaint_pending = pending_resume_bytes > 0;
             if (pending_resume_bytes > 0) {
-                self.invalidateTranscriptAnchor("resume publication retained source handoff");
                 if (transition.target_flow_owned) {
+                    self.invalidateTranscriptAnchor("resume publication retained source handoff");
                     debug_trace.logf(
                         "session",
                         "pending resume flow dropped reason=superseded bytes={d}",
                         .{pending_resume_bytes},
                     );
                 } else {
+                    // The anchor stays, so rows the next frame adds scroll the
+                    // old top into scrollback instead of painting over it
+                    // (`src/core/app/app_render_runtime.zig` "a notice right
+                    // after resumed history is handed off leaves every history
+                    // row in scrollback").
                     debug_trace.logf(
                         "session",
                         "resume historical flow committed bytes={d}",
@@ -12332,6 +12370,22 @@ pub const TranscriptRuntime = struct {
             .complete => {},
             .partial => |partial| debug_trace.logf(
                 "program_status",
+                "report write failed accepted_bytes={d} err={s}",
+                .{ partial.accepted_bytes, @errorName(partial.err) },
+            ),
+        }
+    }
+
+    /// Writes an OSC 7577 report between frames, like the notification bell.
+    pub fn writeProgramResume(
+        self: *TranscriptRuntime,
+        metrics: *Metrics,
+        report: []const u8,
+    ) void {
+        switch (transcript_io.writeFrameBytes(self, metrics, report)) {
+            .complete => {},
+            .partial => |partial| debug_trace.logf(
+                "program_resume",
                 "report write failed accepted_bytes={d} err={s}",
                 .{ partial.accepted_bytes, @errorName(partial.err) },
             ),
@@ -14764,7 +14818,7 @@ test "stable resume publication starts a fresh retained source epoch" {
     try std.testing.expectEqual(@as(usize, 0), runtime.pendingResumeFlow().len);
     try std.testing.expectEqualStrings(retained_flow, runtime.notebook.transcript.items);
     try std.testing.expectEqual(
-        TranscriptCommitDiagnosticState.invalid,
+        TranscriptCommitDiagnosticState.stable,
         runtime.transcriptCommitDiagnostic().state,
     );
 
@@ -15230,7 +15284,7 @@ test "pending resume publication yields after a bounded row batch" {
 
     try std.testing.expectEqual(
         @as(u16, 1_000),
-        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0),
+        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0, .paced),
     );
     runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
         &runtime,
@@ -15239,7 +15293,12 @@ test "pending resume publication yields after a bounded row batch" {
     );
     try std.testing.expectEqual(
         @as(u16, resume_publication_rows_per_frame),
-        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0),
+        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0, .paced),
+    );
+    // The frame that sees a taller footer writes all it owes.
+    try std.testing.expectEqual(
+        @as(u16, 1_000),
+        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0, .rest),
     );
 }
 

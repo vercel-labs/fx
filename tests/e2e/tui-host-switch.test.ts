@@ -16,6 +16,7 @@ import {
   turnSettled,
   hasEmptyComposer,
 } from "./tmux-helpers";
+import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
 
 // Switching between main and its subagents through the agent list, in one fx
 // process: ↓ on an empty composer or Ctrl+X opens it, moving through it shows
@@ -64,14 +65,26 @@ function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean
 }
 
 // Shows `agent`, "main" or a subagent's name, through the agent list: Ctrl+X
-// opens it whatever the composer holds, each arrow shows the next row's agent,
-// and Enter keeps it. Main's row comes first, then its working subagents, then
-// the rest by their latest reply. Those rows can move while the list is
-// open, so each step reads the rows again instead of counting them.
+// opens it whatever the composer holds, once fx has another agent to switch to
+// (`openAgentList`), each arrow shows the next row's agent, and Enter keeps it.
+// Main's row comes first, then its working subagents, then the rest by their
+// latest reply. Those rows can move while the list is open, so each step reads
+// the rows again instead of counting them.
 async function showAgent(session: TmuxSession, agent: string) {
   await selectAgent(session, agent);
   await session.sendKeys("Enter");
   await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+}
+
+// The person opens the subagent's own screen and types a task there, so its turn
+// is one the person started. A turn main started is answered by main and its
+// request is never lent; a turn the person typed still lends its approval to
+// main's screen, which is the path these tests keep
+// (`tests/tla/subagent/TuiParentApproval.tla` NoStaleLent).
+async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: string, task: string) {
+  await showAgent(session, agent);
+  await session.waitForPane((pane) => pane.includes(ready), 30_000);
+  await session.sendText(task);
 }
 
 // Waits until the open agent list highlights `agent`'s row, and returns the
@@ -87,10 +100,53 @@ async function waitForSelectedRow(session: TmuxSession, agent: string, timeoutMs
   }
 }
 
+// The trace file of the fx that `withFx` started last, which names why fx
+// refused a Ctrl+X. Empty when a test runs fx another way, which leaves
+// `openAgentList` no evidence to act on.
+let switchTrace = "";
+
+// That trace file's text, "" when fx has written none yet.
+function traceText(): string {
+  return switchTrace.length > 0 && existsSync(switchTrace) ? readFileSync(switchTrace, "utf8") : "";
+}
+
+// The refusal fx's trace holds after `mark`, the trace's length before a send,
+// such as "open_agent_list refused reason=no_other_agent", or "" when it holds
+// none.
+function refusedSince(mark: number): string {
+  const seen = traceText().slice(mark);
+  const line = seen.split("\n").find((value) => value.includes("open_agent_list refused"));
+  return line === undefined ? "" : line.slice(line.indexOf("open_agent_list refused"));
+}
+
+// Opens the agent list, which shows `LIST_HINT` while it is open. Ctrl+X opens
+// it whatever the composer holds, but fx drops the key when it has no other
+// agent to switch to: a subagent's "Started" row reaches the screen a moment
+// before the list can switch to it, so a send in that gap is lost. One more
+// send follows only fx's own trace line that says it refused the first one, so
+// a key fx handles late opens the list within the wait and nothing is sent to
+// close it. A test that runs fx without a trace file leaves no such evidence,
+// and its one send waits as long as this always did.
+async function openAgentList(session: TmuxSession): Promise<string> {
+  const mark = traceText().length;
+  await session.sendKeys("C-x");
+  try {
+    return await session.waitForPane((pane) => pane.includes(LIST_HINT), 10_000);
+  } catch (error) {
+    // No refusal of that send in the trace: fx has not handled the key yet, or
+    // it is not tracing. A second Ctrl+X could then close the list the first
+    // one opens.
+    if (refusedSince(mark).length === 0) throw error;
+  }
+  // fx refused the key, so no list is open to close: one more send, and the
+  // list it opens stays.
+  await session.sendKeys("C-x");
+  return session.waitForText(LIST_HINT, 10_000);
+}
+
 // Opens the agent list and moves its highlight to `agent`'s row.
 async function selectAgent(session: TmuxSession, agent: string) {
-  await session.sendKeys("C-x");
-  await session.waitForText(LIST_HINT, 10_000);
+  await openAgentList(session);
   const deadline = Date.now() + 15_000;
   let rows = agentRows(await session.capturePaneEscapes());
   for (;;) {
@@ -231,13 +287,13 @@ function outOfCredits(): Response {
 }
 
 // One model step that calls the subagent tool once per message, in order.
-function messageSteps(calls: Array<{ id: string; agent: string; message: string; profile?: string }>): Response {
+function messageSteps(calls: Array<{ id: string; agent: string; message: string; profile?: string; report?: string }>): Response {
   return fakeGatewaySse([
     ...calls.map((call) => ({
       type: "tool-call",
       toolCallId: call.id,
       toolName: "subagent",
-      input: { request: { action: "message", agent: call.agent, message: call.message, ...(call.profile ? { profile: call.profile } : {}) } },
+      input: { request: { action: "message", agent: call.agent, message: call.message, ...(call.profile ? { profile: call.profile } : {}), ...(call.report ? { report: call.report } : {}) } },
     })),
     { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
   ]);
@@ -354,18 +410,23 @@ async function reportBehindAnsweredPrompt(prompt: "approval" | "question") {
   const mainTurnEnded = held();
   const reports: string[] = [];
   let writerCalls = 0;
+  let writerDone = false;
   let tracePath = "";
   const env: Record<string, string> = {};
   const promptText = prompt === "approval" ? "Subagent writer needs permission" : "SWITCH_QUESTION pick one";
-  await withFx((body) => {
+  await withFx(async (body) => {
     const latest = latestUserText(body);
     if (latest.startsWith(REPORT_HEADER)) {
       reports.push(body);
       return text(`main_report_${reports.length}`, `SWITCH_MAIN_REPORT_${reports.length}`);
     }
+    if (latest.includes("SWITCH_READY_TASK")) return text("child_ready", "SWITCH_WRITER_READY");
     if (latest.includes("SWITCH_WRITE_TASK")) {
       writerCalls += 1;
-      if (writerCalls > 1) return text("child_done", "SWITCH_WRITER_DONE");
+      if (writerCalls > 1) {
+        writerDone = true;
+        return text("child_done", "SWITCH_WRITER_DONE");
+      }
       return prompt === "approval"
         ? toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" })
         : toolCall("child_ask", "ask_user_question", {
@@ -375,13 +436,17 @@ async function reportBehindAnsweredPrompt(prompt: "approval" | "question") {
     if (latest.includes("SWITCH_HELPER_TASK")) return mainTurnEnded.promise.then(() => text("helper_done", "SWITCH_HELPER_DONE"));
     if (!body.includes('"main_w"')) {
       return messageSteps([
-        { id: "main_w", agent: "writer", message: "SWITCH_WRITE_TASK", ...(prompt === "approval" ? { profile: "writer" } : {}) },
+        { id: "main_w", agent: "writer", message: prompt === "approval" ? "SWITCH_READY_TASK" : "SWITCH_WRITE_TASK", ...(prompt === "approval" ? { profile: "writer", report: "never" } : {}) },
         { id: "main_h", agent: "helper", message: "SWITCH_HELPER_TASK" },
       ]);
     }
     return promptShown.promise.then(() => text("main_one", "SWITCH_MAIN_ONE"));
   }, async (session) => {
     await session.sendText("SWITCH_USER");
+    if (prompt === "approval") {
+      await typeTaskOnSubagent(session, "writer", "SWITCH_WRITER_READY", "SWITCH_WRITE_TASK");
+      await showAgent(session, "main");
+    }
     await session.waitForText(promptText, 30_000);
     promptShown.release();
     await until("main's first turn to end", () => traceHas(tracePath, "event=processing_finished turn_id=1 "));
@@ -402,7 +467,7 @@ async function reportBehindAnsweredPrompt(prompt: "approval" | "question") {
     mkdirSync(folder, { recursive: true });
     writeFileSync(join(folder, "profile.json"), JSON.stringify({
       description: "Writes one file",
-      tools: ["read_file", "write_file"],
+      tools: ["read_file", "write_file", "glob_files"],
       permission_mode: "ask",
     }));
   }, false, env);
@@ -444,7 +509,7 @@ async function withFx(
   run: (session: TmuxSession, context: Run) => Promise<void>,
   setupHome: (home: string) => void = () => {},
   record = false,
-  env: Record<string, string> = {},
+  env: Record<string, string | undefined> = {},
   gatewayOptions: Parameters<typeof startDynamicFakeGateway>[1] = {},
 ) {
   const gateway = startDynamicFakeGateway(respond, gatewayOptions);
@@ -455,6 +520,9 @@ async function withFx(
   setupHome(home);
   const sessions: TmuxSession[] = [];
   const tape = join(workspace, "fx.fxtape");
+  // Every fx here traces the input scope, so a test can see why a switch key
+  // opened no list. A test that reads its own trace passes its path in `env`.
+  switchTrace = env.FX_TRACE_LOG ?? join(home, "fx-trace.log");
   const launch = async (args = "") => {
     const session = await TmuxSession.create({
       cmd: args ? `${JSON.stringify(FX_BIN)} ${args}` : FX_BIN,
@@ -469,6 +537,10 @@ async function withFx(
         FX_PERMISSION_MODE: "auto",
         FX_AUTO_UPGRADE: "0",
         FX_SOUND: "0",
+        FX_TRACE_LOG: switchTrace,
+        // A test that reads its own trace decides what it records; every other
+        // fx here records the input scope, which holds the refusal lines.
+        ...(env.FX_TRACE_LOG === undefined && env.FX_TRACE_SCOPES === undefined ? { FX_TRACE_SCOPES: "input" } : {}),
         ...(record && sessions.length === 0 ? { FX_RECORD: tape } : {}),
         ...env,
       },
@@ -511,27 +583,37 @@ async function withFx(
 // the loop committed them.
 async function reportWhilePromptStaysOpen(prompt: "approval" | "question" | "none", reportDelayMs = 0, secondReport = false) {
   const promptShown = held();
+  const turnStarted = held();
   const writerReleased = held();
   const mainTurnEnded = held();
   const reportTurnEnded = held();
   const reports: string[] = [];
   let writerCalls = 0;
+  let writerDone = false;
   let tracePath = "";
   const env: Record<string, string> = {};
   const promptText = prompt === "approval" ? "Subagent writer needs permission" : "SWITCH_QUESTION pick one";
-  await withFx((body) => {
+  await withFx(async (body) => {
     const latest = latestUserText(body);
     if (latest.startsWith(REPORT_HEADER)) {
       reports.push(body);
       return text(`main_report_${reports.length}`, `SWITCH_MAIN_REPORT_${reports.length}`);
     }
+    if (latest.includes("SWITCH_READY_TASK")) return text("child_ready", "SWITCH_WRITER_READY");
     if (latest.includes("SWITCH_WRITE_TASK")) {
       writerCalls += 1;
-      if (writerCalls > 1) return text("child_done", "SWITCH_WRITER_DONE");
+      if (writerCalls > 1) {
+        writerDone = true;
+        return text("child_done", "SWITCH_WRITER_DONE");
+      }
       if (prompt === "none") return writerReleased.promise.then(() => text("child_done", "SWITCH_WRITER_DONE"));
-      return prompt === "approval"
-        ? toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" })
-        : toolCall("child_ask", "ask_user_question", {
+      if (prompt === "approval") {
+        // The request waits for the turn under test, so the prompt is up while
+        // main's turn runs, as it was before Part 2.
+        await turnStarted.promise;
+        return toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" });
+      }
+      return toolCall("child_ask", "ask_user_question", {
           questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_A" }, { label: "SWITCH_B" }] }],
         });
     }
@@ -542,20 +624,51 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "question" | "non
       return reportTurnEnded.promise.then(() => Bun.sleep(reportDelayMs)).then(() => text("scout_done", "SWITCH_SCOUT_DONE"));
     }
     if (!body.includes('"main_w"')) {
+      // For an approval the first turn only starts the writer and ends with its
+      // own marker, so no screen switch happens during the turn under test.
+      if (prompt === "approval") {
+        return messageSteps([
+          { id: "main_w", agent: "writer", message: "SWITCH_READY_TASK", profile: "writer", report: "never" },
+        ]);
+      }
       return messageSteps([
-        { id: "main_w", agent: "writer", message: "SWITCH_WRITE_TASK", ...(prompt === "approval" ? { profile: "writer" } : {}) },
+        { id: "main_w", agent: "writer", message: "SWITCH_WRITE_TASK" },
         { id: "main_h", agent: "helper", message: "SWITCH_HELPER_TASK" },
         ...(secondReport ? [{ id: "main_s", agent: "scout", message: "SWITCH_SCOUT_TASK" }] : []),
       ]);
     }
+    if (prompt === "approval") {
+      if (!latest.includes("SWITCH_TURN")) return text("main_ready", "SWITCH_MAIN_READY");
+      if (!body.includes('"main_h"')) {
+        turnStarted.release();
+        return messageSteps([
+          { id: "main_h", agent: "helper", message: "SWITCH_HELPER_TASK" },
+          ...(secondReport ? [{ id: "main_s", agent: "scout", message: "SWITCH_SCOUT_TASK" }] : []),
+        ]);
+      }
+    }
     return promptShown.promise.then(() => text("main_one", "SWITCH_MAIN_ONE"));
-  }, async (session, { home }) => {
+  }, async (session, { home, workspace }) => {
     const trace = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
     await session.sendText("SWITCH_USER");
-    if (prompt === "none") await until("the writer's first request", () => writerCalls >= 1);
+    if (prompt === "approval") {
+      // The first turn ends first; the person types on the writer's screen and
+      // comes back; their second prompt starts the turn the report waits on.
+      await session.waitForText("SWITCH_MAIN_READY", 30_000);
+      // The write request waits for the turn under test, so the person can get
+      // back to main and start it before any prompt takes their keys.
+      await typeTaskOnSubagent(session, "writer", "SWITCH_WRITER_READY", "SWITCH_WRITE_TASK");
+      await showAgent(session, "main");
+      await session.waitForComposer(15_000);
+      await session.sendText("SWITCH_USER SWITCH_TURN");
+      await session.waitForText(promptText, 30_000);
+    } else if (prompt === "none") await until("the writer's first request", () => writerCalls >= 1);
     else await session.waitForText(promptText, 30_000);
     promptShown.release();
-    await until("main's first turn to end", () => traceHas(tracePath, "event=processing_finished turn_id=1 "));
+    // For an approval the turn under test is main's second, the first having
+    // only started the writer.
+    const turnId = prompt === "approval" ? 2 : 1;
+    await until("main's turn under test to end", () => traceHas(tracePath, `event=processing_finished turn_id=${turnId} `));
     mainTurnEnded.release();
     await until("main's request for the helper's report", () => reports.length >= 1);
 
@@ -587,7 +700,7 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "question" | "non
       const mainWorker = /event=processing_finished turn_id=1 worker=(\w+)/.exec(trace())?.[1];
       expect(mainWorker).toBeDefined();
       await until("the report's turn to end", () =>
-        trace().split("\n").filter((line) => line.includes("event=processing_finished") && line.includes(`worker=${mainWorker} `)).length >= 2);
+        trace().split("\n").filter((line) => line.includes("event=processing_finished") && line.includes(`worker=${mainWorker} `)).length >= (prompt === "approval" ? 3 : 2));
       reportTurnEnded.release();
       await until("main's request for the scout's report", () => reports.length >= 2);
       // The second report was posted before the loop committed the report's turn,
@@ -603,7 +716,15 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "question" | "non
 
     if (prompt === "none") writerReleased.release();
     else await session.sendKeys("1");
-    const reportTurns = secondReport ? 3 : 2;
+    if (prompt === "approval") {
+      // A typed turn owes no report, so the write and the writer's own answer
+      // stand in for it; the question and out_of_credits variants still cover
+      // the writer's report after an answered prompt.
+      const written = join(workspace, "switch-child.txt");
+      await until("the writer's write", () => existsSync(written) && readFileSync(written, "utf8") === "SWITCH_WROTE\n");
+      await until("the writer's answer", () => writerDone);
+    }
+    const reportTurns = prompt === "approval" ? (secondReport ? 2 : 1) : (secondReport ? 3 : 2);
     await session.waitForText("SWITCH_MAIN_REPORT_1", 30_000);
     await until("the writer's report turn", () => reports.length >= reportTurns);
     await session.waitForText(`SWITCH_MAIN_REPORT_${reportTurns}`, 30_000);
@@ -2120,7 +2241,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       await withFx((body) => {
         if (!isMainRequest(body)) {
           childCalls += 1;
-          if (childCalls === 1) {
+          if (childCalls === 1) return text("child_ready", "SWITCH_WRITER_READY");
+          if (childCalls === 2) {
             return toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" });
           }
           return text("child_done", "SWITCH_WRITER_DONE");
@@ -2128,12 +2250,17 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         mainCalls += 1;
         if (mainCalls === 1) {
           return toolCall("main_sub", "subagent", {
-            request: { action: "message", agent: "writer", message: "SWITCH_WRITE_TASK", profile: "writer" },
+            request: { action: "message", agent: "writer", message: "SWITCH_READY_TASK", profile: "writer" },
           });
         }
         return text("main_done", "SWITCH_MAIN_DONE");
       }, async (session, { workspace }) => {
         await session.sendText("SWITCH_USER");
+        // The person types the task on the subagent's own screen; the approval is
+        // then lent to main's screen as it was before Part 2.
+        await typeTaskOnSubagent(session, "writer", "SWITCH_WRITER_READY", "SWITCH_WRITE_TASK");
+        // The lend moves the prompt to main's screen, so it is not on the child's.
+        await showAgent(session, "main");
         await session.waitForText("Subagent writer needs permission", 30_000);
 
         // The open list takes the footer from the prompt, which keys can't
@@ -2177,6 +2304,57 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           permission_mode: "ask",
         }));
       });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's stop refuses a subagent's approval request, and its command never runs",
+    async () => {
+      let tracePath = "";
+      let mainCalls = 0;
+      let childCalls = 0;
+      const env: Record<string, string> = {};
+      await withFx((body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          if (childCalls === 1) return toolCall("child_shell", "shell", { action: "run", command: "touch stopped.txt" });
+          return text("child_done", "SWITCH_WRITER_DONE");
+        }
+        mainCalls += 1;
+        if (mainCalls === 1) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "writer", message: "SWITCH_RUN_TASK", profile: "writer" },
+          });
+        }
+        if (body.includes("I wait for your approval to run") && !body.includes("main_stop")) {
+          return toolCall("main_stop", "subagent", { action: "stop", agent: "writer" });
+        }
+        const reportTurn = body.includes(REPORT_HEADER);
+        if (body.includes("main_stop") && !reportTurn) return text("main_stopped", "SWITCH_MAIN_STOPPED");
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session, { workspace }) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_STOPPED", 60_000);
+        // fx answered and stays up: it quits from the composer, cleanly.
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+        // The refused command never ran.
+        expect(existsSync(join(workspace, "stopped.txt"))).toBe(false);
+        // The stop refused the request with its ids and counts in the trace.
+        expect(readFileSync(tracePath, "utf8")).toMatch(/approval requests refused child=\S+ refused=1 gone=0 ids=\S+/);
+      }, (home) => {
+        const folder = join(home, ".fx", "agents", "writer");
+        mkdirSync(folder, { recursive: true });
+        writeFileSync(join(folder, "profile.json"), JSON.stringify({
+          description: "Runs one command",
+          tools: ["shell"],
+          permission_mode: "ask",
+        }));
+        tracePath = join(home, "fx-trace.log");
+        env.FX_TRACE_LOG = tracePath;
+        env.FX_TRACE_SCOPES = "subagent,mailbox";
+      }, false, env);
     },
     TIMEOUT,
   );
@@ -2274,30 +2452,102 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   test(
     "main's status says a subagent waits for an approval, and not once it is answered",
     async () => {
-      const [waiting, answered] = await mainReadsStatus(
-        toolCall("child_write", "write_file", { path: "switch-wait.txt", content: "SWITCH_WROTE\n" }),
-        "writer",
-        "SWITCH_WRITE_TASK",
-        async (session) => {
-          await session.waitForText("Subagent writer needs permission", 30_000);
-        },
-        async (session) => {
-          await session.sendKeys("1");
-        },
-        (home) => {
-          const folder = join(home, ".fx", "agents", "writer");
-          mkdirSync(folder, { recursive: true });
-          writeFileSync(join(folder, "profile.json"), JSON.stringify({
-            description: "Writes one file",
-            tools: ["read_file", "write_file"],
-            permission_mode: "ask",
-          }));
-        },
-      );
-      expect(waiting).toContain("writer: waiting for an approval");
-      expect(waiting).not.toContain("writer: working");
-      expect(answered).toContain("writer: idle");
-      expect(answered).not.toContain("waiting for");
+      const statuses: string[] = [];
+      const promptShows = held();
+      const writeDone = held();
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          if (latestUserText(body).includes("SWITCH_WRITE_TASK")) {
+            if (body.includes('"child_write"')) return text("child_done", "SWITCH_WRITER_DONE");
+            return toolCall("child_write", "write_file", { path: "switch-wait.txt", content: "SWITCH_WROTE\n" });
+          }
+          return text("child_ready", "SWITCH_WRITER_READY");
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "writer", message: "SWITCH_READY_TASK", profile: "writer" },
+          });
+        }
+        // The task is typed on the writer's own screen, so its approval is lent
+        // to main and stays there while main reads `status`.
+        if (!body.includes('"main_status_1"')) {
+          await promptShows.promise;
+          return toolCall("main_status_1", "subagent", { request: { action: "status" } });
+        }
+        if (!body.includes('"main_status_2"')) {
+          statuses.push(toolResultText(body, "main_status_1"));
+          await writeDone.promise;
+          return toolCall("main_status_2", "subagent", { request: { action: "status" } });
+        }
+        if (statuses.length === 1) {
+          statuses.push(toolResultText(body, "main_status_2"));
+          return text("main_done", "SWITCH_MAIN_DONE");
+        }
+        return text("main_tail", "SWITCH_MAIN_TAIL");
+      }, async (session, { workspace }) => {
+        await session.sendText("SWITCH_USER");
+        await typeTaskOnSubagent(session, "writer", "SWITCH_WRITER_READY", "SWITCH_WRITE_TASK");
+        await session.waitForPane((pane) => pane.includes("Subagent writer needs permission"), 30_000);
+        promptShows.release();
+        await until("main's first status", () => statuses.length === 1);
+        await session.sendKeys("1");
+        await until("the write", () => existsSync(join(workspace, "switch-wait.txt")));
+        writeDone.release();
+        await until("main's second status", () => statuses.length === 2, 60_000);
+      }, writeSpikeWriter);
+      expect(statuses[0]).toContain("writer: waiting for an approval");
+      expect(statuses[0]).not.toContain("writer: working");
+      expect(statuses[1]).toContain("writer: idle");
+      expect(statuses[1]).not.toContain("waiting for");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's status says a subagent waits for an approval main answers, and the footer stays quiet",
+    async () => {
+      const statuses: string[] = [];
+      await withFx((body) => {
+        if (!isMainRequest(body)) {
+          if (body.includes('"child_write"')) return text("child_done", "SWITCH_WRITER_DONE");
+          return toolCall("child_write", "write_file", { path: "switch-wait2.txt", content: "SWITCH_WROTE\n" });
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "writer", message: "SWITCH_WRITE_TASK", profile: "writer" },
+          });
+        }
+        // The note turn: main reads `status`, then answers its own request.
+        if (latestUserText(body).includes("I wait for your approval to run")) {
+          if (!body.includes('"main_status_1"')) {
+            return toolCall("main_status_1", "subagent", { request: { action: "status" } });
+          }
+          if (!body.includes('"main_approve"')) {
+            statuses.push(toolResultText(body, "main_status_1"));
+            return toolCall("main_approve", "subagent", { action: "approve", agent: "writer" });
+          }
+          if (!body.includes('"main_second_done"')) {
+            return text("main_second_done", "SWITCH_MAIN_SECOND_DONE");
+          }
+        }
+        if (body.includes(REPORT_HEADER) && !body.includes('"main_status_2"')) {
+          return toolCall("main_status_2", "subagent", { request: { action: "status" } });
+        }
+        if (statuses.length === 1) {
+          statuses.push(toolResultText(body, "main_status_2"));
+          return text("main_done", "SWITCH_MAIN_DONE");
+        }
+        return text("main_tail", "SWITCH_MAIN_TAIL");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        const pane = await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+        // The person's footer never asks for this request: main answers it.
+        expect(pane).not.toContain("writer needs approval");
+        expect(pane).not.toContain("needs permission");
+      }, writeSpikeWriter);
+      expect(statuses[0]).toContain("writer: waiting for an approval");
+      expect(statuses[1]).toContain("writer: idle");
+      expect(statuses[1]).not.toContain("waiting for");
     },
     TIMEOUT,
   );
@@ -2393,8 +2643,6 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   test(
     "main's list of subagents says a wait began when the turn started, also once the wait is over, and the next turn's list says working",
     async () => {
-      let stage = 0;
-      let childCalls = 0;
       const promptShows = held();
       const answered = held();
       const writerResumes = held();
@@ -2402,77 +2650,133 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       let statusDuring = "";
       await withFx(async (body) => {
         if (!isMainRequest(body)) {
-          // The helper finishes once the writer's prompt is on screen, and its
-          // report starts main's second turn while the writer still waits.
+          // The helper finishes once the writer's prompt is up, and its report
+          // starts main's turn while the writer still waits.
           if (body.includes("SWITCH_HELPER_TASK")) {
             await promptShows.promise;
             return text("helper_done", "SWITCH_HELPER_DONE");
           }
-          childCalls += 1;
-          if (childCalls === 1) return toolCall("child_write", "write_file", { path: "switch-row.txt", content: "SWITCH_ROW\n" });
-          // After its approval the writer works until the test lets it end.
-          await writerResumes.promise;
-          return text("writer_done", "SWITCH_WRITER_DONE");
+          if (latestUserText(body).includes("SWITCH_WRITE_TASK")) {
+            if (body.includes('"child_write"')) {
+              // After its approval the writer works until the test lets it end.
+              await writerResumes.promise;
+              return text("writer_done", "SWITCH_WRITER_DONE");
+            }
+            return toolCall("child_write", "write_file", { path: "switch-row.txt", content: "SWITCH_ROW\n" });
+          }
+          return text("child_ready", "SWITCH_WRITER_READY");
         }
-        stage += 1;
-        if (stage === 1) {
+        if (!body.includes('"main_sub"')) {
           return messageSteps([
-            { id: "main_writer", agent: "writer", message: "SWITCH_WRITE_TASK", profile: "writer" },
+            { id: "main_sub", agent: "writer", message: "SWITCH_READY_TASK", profile: "writer" },
             { id: "main_helper", agent: "helper", message: "SWITCH_HELPER_TASK" },
           ]);
         }
-        if (stage === 2) return text("main_started", "SWITCH_MAIN_STARTED");
-        if (stage === 3) {
-          // Main's second turn begins with the writer waiting for its approval.
+        // The turn the ready task's report starts keeps its note, so it ends
+        // before the person types; the helper's later report starts the turn
+        // whose note is read here.
+        if (!body.includes("SWITCH_HELPER_DONE")) {
+          if (!body.includes(REPORT_HEADER)) return text("main_ready_done", "SWITCH_MAIN_READY");
+          return text("main_ready_kept", "SWITCH_MAIN_READY2");
+        }
+        if (!body.includes('"main_status_1"')) {
           rows.start = teamRow(body, "writer");
           await answered.promise;
-          return toolCall("main_status", "subagent", { request: { action: "status", agent: "writer" } });
+          return toolCall("main_status_1", "subagent", { request: { action: "status", agent: "writer" } });
         }
-        if (stage === 4) {
+        // A text reply has no call id, so the turn it ended is read from its text.
+        if (!body.includes("SWITCH_MAIN_SECOND_DONE")) {
+          statusDuring = toolResultText(body, "main_status_1");
           rows.later = teamRow(body, "writer");
-          statusDuring = toolResultText(body, "main_status");
           return text("main_second_done", "SWITCH_MAIN_SECOND_DONE");
         }
-        if (stage === 5) {
+        if (rows.next === undefined) {
           rows.next = teamRow(body, "writer");
-          return text("main_third_done", "SWITCH_MAIN_THIRD_DONE");
+          return text("main_done", "SWITCH_MAIN_DONE");
         }
-        return text("main_reported", "SWITCH_MAIN_REPORTED");
+        return text("main_tail", "SWITCH_MAIN_TAIL");
       }, async (session) => {
         await session.sendText("SWITCH_USER");
+        // The ready task's report turn ends first: its note is kept, so the row
+        // must be read from a later turn.
+        await session.waitForText("SWITCH_MAIN_READY2", 30_000);
+        await typeTaskOnSubagent(session, "writer", "SWITCH_WRITER_READY", "SWITCH_WRITE_TASK");
+        await showAgent(session, "main");
         await session.waitForText("Subagent writer needs permission", 30_000);
+        // Now the helper reports: a fresh turn starts while the writer waits,
+        // and its note carries the wait.
         promptShows.release();
-        // Main's second turn is under way, held on its first request.
-        await until("main's second turn", () => stage === 3, 60_000);
-        // The user answers the approval while that turn runs.
+        await until("the row of the turn the wait began in", () => rows.start !== undefined, 60_000);
         await session.sendKeys("1");
-        await until("the writer's next request", () => childCalls === 2, 60_000);
         answered.release();
         await until("main's status", () => rows.later !== undefined, 60_000);
         await session.waitForText("SWITCH_MAIN_SECOND_DONE", 30_000);
+        // A turn the person typed owes no report, so their next message starts
+        // main's next turn, and the writer still works while its row is read.
         await session.waitForComposer(15_000);
         await session.sendText("SWITCH_USER once more");
-        await until("main's third turn", () => rows.next !== undefined, 60_000);
+        await until("main's next turn", () => rows.next !== undefined, 60_000);
         writerResumes.release();
-        await until("the writer's report", () => stage >= 6, 60_000);
-      }, (home) => {
-        const folder = join(home, ".fx", "agents", "writer");
-        mkdirSync(folder, { recursive: true });
-        writeFileSync(join(folder, "profile.json"), JSON.stringify({
-          description: "Writes one file",
-          tools: ["read_file", "write_file"],
-          permission_mode: "ask",
-        }));
-      });
-      // The wait is in the list of the turn it began in, with when it was true.
-      expect(rows.start).toContain("- writer: waiting for an approval when this turn started.");
-      // The user answered during that turn: the list still says so, and `status` says working.
+      }, writeSpikeWriter);
+
+      // A typed turn has no named work, so the row names the last completed one.
+      expect(rows.start).toContain("- writer: waiting for an approval when this turn started, last work completed. For: SWITCH_READY_TASK");
       expect(rows.later).toBe(rows.start);
       expect(statusDuring).toContain("writer: working");
       expect(statusDuring).not.toContain("waiting for");
-      // The next turn's list is built again, and has no wait in it.
-      expect(rows.next).toContain("- writer: working.");
+      // The typed turn names the last completed work here too.
+      expect(rows.next).toContain("- writer: working, last work completed. For: SWITCH_READY_TASK");
       expect(rows.next).not.toContain("waiting for");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's agent list says a subagent main is answering works, not that it needs the person",
+    async () => {
+      const approved = held();
+      let noteSeen = false;
+      let waitingRow = "";
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          if (!body.includes('"child_write"')) {
+            return toolCall("child_write", "write_file", { path: "switch-row2.txt", content: "SWITCH_ROW\n" });
+          }
+          return text("child_done", "SWITCH_WRITER_DONE");
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "writer", message: "SWITCH_WRITE_TASK", profile: "writer" },
+          });
+        }
+        if (body.includes("I wait for your approval to run") && !body.includes('"main_approve"')) {
+          noteSeen = true;
+          // Main's team row for the writer, whose turn main started, while
+          // main answers its request.
+          waitingRow = teamRow(body, "writer");
+          await approved.promise;
+          return toolCall("main_approve", "subagent", { action: "approve", agent: "writer" });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await until("main's note turn", () => noteSeen, 60_000);
+        // While main answers, the list row says the writer is working.
+        await session.sendKeys("C-x");
+        const list = await session.waitForText(LIST_HINT, 10_000);
+        expect(list).toMatch(/^ {2}\u2514 writer .*working/m);
+        expect(list).not.toContain("needs approval");
+        await session.sendKeys("Escape");
+        approved.release();
+        await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+        // And after, it never said the person was needed.
+        const pane = await session.capturePaneGrid();
+        expect(pane).not.toContain("needs approval");
+        expect(pane).not.toContain("needs permission");
+      }, writeSpikeWriter);
+      // The registry still says the writer waits for the approval, since main
+      // started its turn and answers it.
+      expect(waitingRow).toContain("- writer: waiting for an approval when this turn started.");
     },
     TIMEOUT,
   );
@@ -2593,35 +2897,39 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     async () => {
       const gates = { first: held(), second: held() };
       const seen = { first: 0, second: 0 };
-      const started = { first: false, second: false };
+      const started = { both: false };
       await withFx(async (body) => {
         if (!isMainRequest(body)) {
-          const who: "first" | "second" = userTexts(body).some((t) => t.includes("SWITCH_TASK_SECOND")) ? "second" : "first";
+          const who: "first" | "second" = userTexts(body).some((t) => t.includes("SECOND")) ? "second" : "first";
           if (body.includes(`"write_${who}"`)) return text(`done_${who}`, `CHILD_DONE_${who.toUpperCase()}`);
+          // Main gives each subagent a task that ends at once; the write task is
+          // typed by the person on that subagent's own screen, so its approval is
+          // the person's and is lent to an instance's screen.
+          if (!latestUserText(body).includes(`SWITCH_TASK_${who.toUpperCase()}`)) {
+            return text(`ready_${who}`, `CHILD_READY_${who.toUpperCase()}`);
+          }
           seen[who] += 1;
           await gates[who].promise;
           return toolCall(`write_${who}`, "write_file", { path: `${who}.txt`, content: `${who}\n` });
         }
+        // A turn the person typed owes no report, so their own message starts the
+        // turn that reads the writes.
+        if (latestUserText(body).includes("all answered")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
         if (body.includes("CHILD_DONE_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
         if (body.includes("CHILD_DONE_SECOND")) return text("main_saw_second", "SWITCH_MAIN_SAW_SECOND");
-        if (latestUserText(body).includes("START_SECOND") && !started.second) {
-          started.second = true;
-          return toolCall("main_second", "subagent", {
-            request: { action: "message", agent: "second", message: "SWITCH_TASK_SECOND write second.txt" },
-          });
-        }
-        if (!started.first) {
-          started.first = true;
-          return toolCall("main_first", "subagent", {
-            request: { action: "message", agent: "first", message: "SWITCH_TASK_FIRST write first.txt" },
-          });
+        if (!started.both) {
+          started.both = true;
+          return messageSteps([
+            { id: "main_first", agent: "first", message: "SWITCH_READY_FIRST" },
+            { id: "main_second", agent: "second", message: "SWITCH_READY_SECOND" },
+          ]);
         }
         return text("main_idle", "SWITCH_MAIN_IDLE");
       }, async (session, { workspace }) => {
-        await session.sendText("SWITCH_USER start the first");
-        await until("the first subagent's request", () => seen.first === 1);
-        await session.sendText("SWITCH_USER START_SECOND");
-        await until("the second subagent's request", () => seen.second === 1);
+        await session.sendText("SWITCH_USER start them");
+        await typeTaskOnSubagent(session, "first", "CHILD_READY_FIRST", "SWITCH_TASK_FIRST write first.txt");
+        await typeTaskOnSubagent(session, "second", "CHILD_READY_SECOND", "SWITCH_TASK_SECOND write second.txt");
+        await until("both subagents' requests", () => seen.first === 1 && seen.second === 1);
 
         // On the first subagent's screen, the second asks, then the first.
         await showAgent(session, "first");
@@ -2643,6 +2951,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(readFileSync(secondFile, "utf8")).toBe("second\n");
         expect(existsSync(join(workspace, "first.txt"))).toBe(false);
         await session.sendKeys("1");
+        await session.waitForComposer(15_000);
+        await session.sendText("SWITCH_USER all answered");
         await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
         expect(readFileSync(join(workspace, "first.txt"), "utf8")).toBe("first\n");
       }, () => {}, false, { FX_PERMISSION_MODE: "ask" });
@@ -2767,6 +3077,23 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       }
       // Main's model never sees the subagent's summary.
       for (const body of bodies.filter(isMainRequest)) expect(body).not.toContain("SWITCH_COMPACT_SUMMARY");
+    },
+    TIMEOUT,
+  );
+
+  // The person's ruling on a Ctrl+X that lands before fx can switch is "trace
+  // only": fx keeps dropping the key, and the trace says why. This case pins
+  // both halves of that, so it fails on a build whose refusal is silent.
+  test(
+    "Ctrl+X with one agent open opens no list, and the trace says why",
+    async () => {
+      await withFx(() => text("unused", "unused"), async (session) => {
+        await session.sendKeys("C-x");
+        await until("fx to trace the switch key it refused", () =>
+          traceText().includes("open_agent_list refused reason=no_other_agent"));
+        const pane = await session.capturePane();
+        expect(pane).not.toContain(LIST_HINT);
+      });
     },
     TIMEOUT,
   );
@@ -3120,6 +3447,75 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         reviewer.release();
         await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), 30_000);
       }, () => {}, false, {}, subagentTitles);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the main agent's turn ending while its subagent works keeps the terminal busy and holds the completion sound until the subagent finishes",
+    async () => {
+      const reviewer = held();
+      const folder = mkdtempSync(join(tmpdir(), "fx-turn-end-sound-"));
+      const tracePath = join(folder, "trace.log");
+      const tapePath = join(folder, "fx.fxtape");
+      const traceText = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
+      const traceLines = (trace: string, needle: string) => trace.split("\n").filter((line) => line.includes(needle));
+      const statusReports = (stdout: Buffer) =>
+        [...stdout.toString("latin1").matchAll(/\x1b\]7501;([^\x1b]*)\x1b\\/g)].map((match) => match[1]!.replace(/:msg=.*$/, ""));
+      let childCalls = 0;
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            childCalls += 1;
+            await reviewer.promise;
+            return text("child_answer", "HOLD_CHILD_DONE");
+          }
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", { request: { action: "message", agent: "reviewer", message: "Review src/parser.zig for bugs" } });
+          }
+          return text("main_wait", "HOLD_MAIN_WAITING");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER plan it");
+          await session.waitForPane((pane) => pane.includes("HOLD_MAIN_WAITING") && turnSettled(pane), 30_000);
+          await until("the reviewer's turn", () => childCalls >= 1);
+          await session.waitForPane((pane) => /\u2022 waiting on 1 subagent \(\d+s\) \u00b7 \u2193 to view/.test(pane), 15_000);
+
+          // Main's turn has ended while the reviewer still works: no turn-end
+          // sound has played, and the program status still reads working.
+          expect(traceLines(traceText(), "sound play kind=turn_end")).toEqual([]);
+          const reportsWhileWorking = statusReports(
+            Buffer.concat(readTapeFrames(tapePath, { ignoreTruncatedTail: true }).filter((frame) => frame.kind === 1).map((frame) => frame.payload)),
+          );
+          expect(reportsWhileWorking.at(-1)).toBe("state=working:app=fx");
+
+          reviewer.release();
+          await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), TIMEOUT);
+          await until("the turn-end sound", () => traceLines(traceText(), "sound play kind=turn_end").length > 0);
+          await session.waitForPane((pane) => turnSettled(pane) && !pane.includes("subagent working"), TIMEOUT);
+
+          expect(traceLines(traceText(), "sound play kind=turn_end cue=success")).toHaveLength(1);
+          await session.sendText("/quit");
+          expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+
+          const reports = statusReports(Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)));
+          const cleared = reports.lastIndexOf("state=clear");
+          expect(cleared).toBeGreaterThan(0);
+          expect(reports[cleared - 1]).toBe("state=done:app=fx");
+          const lastWorking = reports.lastIndexOf("state=working:app=fx");
+          expect(lastWorking).toBeGreaterThan(-1);
+          expect(reports.slice(0, lastWorking)).not.toContain("state=done:app=fx");
+        }, (home) => {
+          writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", sound: { turn_end: true, attention_required: true } }));
+        }, false, {
+          FX_SOUND: undefined,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "notifications,program_status",
+          FX_RECORD: tapePath,
+        });
+      } finally {
+        reviewer.release();
+        rmSync(folder, { recursive: true, force: true });
+      }
     },
     TIMEOUT,
   );
@@ -4160,8 +4556,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER start them, then close tester");
         await until("main's turn that closes tester", () => mainCalls >= 3);
         await session.waitForPane((pane) => pane.includes("Started tester"), 15_000);
-        await session.sendKeys("C-x");
-        await session.waitForText(LIST_HINT, 10_000);
+        // "Started tester" comes before the list can switch to it, so open the
+        // list the way every other test does.
+        await openAgentList(session);
         const rows = agentRows(await session.capturePaneEscapes()).map((row) => row.name);
         expect([...rows].sort()).toEqual(["main", "reviewer", "tester"]);
         target = rows.at(-1)!;
@@ -4998,6 +5395,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       const sessionOf = (body: string) => /shell-\d+/.exec(body.slice(body.indexOf("TUI-QUIET-READY")))?.[0];
       let childWaiting = false;
       let childAsked = false;
+      let childWait1Start = 0;
+      let childWait1Ms = -1;
       const firstChildRequest = held();
       await withFx(async (body) => {
         if (!isMainRequest(body)) {
@@ -5007,14 +5406,16 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
             return toolCall("child_stop", "shell", { request: { action: "stop", session_id: sessionOf(body) } });
           }
           if (body.includes('"child_wait_1"')) {
+            childWait1Ms = Date.now() - childWait1Start;
             return toolCall("child_wait_2", "shell", {
-              request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 20_000 },
+              request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 5_000 },
             });
           }
           if (body.includes('"child_run"')) {
             childWaiting = true;
+            childWait1Start = Date.now();
             return toolCall("child_wait_1", "shell", {
-              request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 20_000 },
+              request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 5_000 },
             });
           }
           // The child's first request waits until the list has shown its turn's time.
@@ -5056,11 +5457,14 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(workerRow).not.toContain("TUI-QUIET-READY");
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
-        // The child's command crosses the quiet limit while main waits, and
+        // The child's wait ends past the quiet limit while main waits, and
         // fx's note wakes main's wait before the child ends.
         const pane = await session.waitForPane((pane) =>
           pane.includes("TUI_MAIN_SAW_RELAY") || pane.includes("TUI_MAIN_NO_RELAY"), 30_000);
         expect(pane).toContain("TUI_MAIN_SAW_RELAY");
+        await until("the child's first wait to finish", () => childWait1Ms >= 0, 15_000);
+        expect(childWait1Ms).toBeGreaterThanOrEqual(5_000);
+        expect(childWait1Ms).toBeLessThanOrEqual(10_000);
       }, () => {}, false, { FX_TEST_SHELL_QUIET_NOTICE_MS: "3000" });
     },
     TIMEOUT,
@@ -5107,6 +5511,259 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     "a second report more than the limit after the first hold starts its turn while a subagent's approval stays open",
     async () => {
       await reportWhilePromptStaysOpen("approval", 6000, true);
+    },
+    TIMEOUT,
+  );
+});
+
+// Part 2: a run main started asks through its turn, so the request is noted and
+// main answers it; a turn the person typed keeps the worker's prompter and is
+// never noted. A request main answers is never lent to an instance's screen.
+const SPIKE_MAIN = (body: string) => body.includes("SPIKE_USER_");
+const SPIKE_NOTE = "I wait for your approval to run";
+
+function writeSpikeProfile(home: string, name: string) {
+  const folder = join(home, ".fx", "agents", name);
+  mkdirSync(folder, { recursive: true });
+  writeFileSync(join(folder, "profile.json"), JSON.stringify({
+    description: "Writes one file",
+    tools: ["read_file", "write_file"],
+    permission_mode: "ask",
+  }));
+}
+
+function writeSpikeWriter(home: string) {
+  writeSpikeProfile(home, "writer");
+}
+
+// Main answered with an answer of its own, or was told the request is gone.
+function mainSaidGone(body: string): boolean {
+  return body.includes("no longer waiting") || body.includes("has no approval request waiting");
+}
+
+describe.skipIf(!tmuxAvailable())("TUI subagent approvals go to main", () => {
+  for (const decision of ["approve", "deny"] as const) {
+    test(
+      `a subagent's approval goes to main, which ${decision}s it`,
+      async () => {
+        const file = `spike-${decision}.txt`;
+        let childCalls = 0;
+        let mainSaid = false;
+        await withFx((body) => {
+          if (!SPIKE_MAIN(body)) {
+            childCalls += 1;
+            if (childCalls === 1) return toolCall("child_write", "write_file", { path: file, content: "SPIKE_WROTE\n" });
+            return text("child_done", "SPIKE_CHILD_DONE");
+          }
+          if (!body.includes('"main_start"')) {
+            return toolCall("main_start", "subagent", {
+              request: { action: "message", agent: "writer", message: "SPIKE_TASK", profile: "writer" },
+            });
+          }
+          if (body.includes(SPIKE_NOTE) && !body.includes("main_answer")) {
+            return toolCall("main_answer", "subagent", {
+              action: decision,
+              agent: "writer",
+              ...(decision === "deny" ? { message: "not this" } : {}),
+            });
+          }
+          if (body.includes("main_answer") && !mainSaid) {
+            mainSaid = true;
+            return text("main_said", "SPIKE_MAIN_ANSWERED");
+          }
+          return text("main_done", "SPIKE_MAIN_DONE");
+        }, async (session, { workspace }) => {
+          await session.sendText("SPIKE_USER_e1");
+          await session.waitForText("SPIKE_MAIN_ANSWERED", 30_000);
+          if (decision === "approve") {
+            await until("the write", () => existsSync(join(workspace, file)));
+            expect(readFileSync(join(workspace, file), "utf8")).toBe("SPIKE_WROTE\n");
+          } else {
+            expect(existsSync(join(workspace, file))).toBe(false);
+          }
+          const pane = await session.capturePaneGrid();
+          expect(pane).not.toContain("Subagent writer needs permission");
+        }, writeSpikeWriter);
+      },
+      TIMEOUT,
+    );
+  }
+
+  test(
+    "the person answers on the subagent's screen first, and main is told it no longer waits",
+    async () => {
+      const file = "spike-e2.txt";
+      const note = held();
+      const switched = held();
+      let childCalls = 0;
+      let mainApproved = false;
+      let mainReported = false;
+      await withFx((body) => {
+        if (!SPIKE_MAIN(body)) {
+          childCalls += 1;
+          // The first call waits for the person to be on the subagent's own
+          // screen, so the write's prompt appears there and nowhere else.
+          if (childCalls === 1) return switched.promise.then(() => toolCall("child_e2_glob", "glob_files", { pattern: "nothing-*" }));
+          if (childCalls === 2) return toolCall("child_e2_write", "write_file", { path: file, content: "SPIKE_WROTE\n" });
+          return text("child_e2_done", "SPIKE_CHILD_E2_DONE");
+        }
+        if (!body.includes('"main_e2_start"')) {
+          return toolCall("main_e2_start", "subagent", {
+            request: { action: "message", agent: "writer", message: "SPIKE_E2_TASK", profile: "writer" },
+          });
+        }
+        if (body.includes(SPIKE_NOTE) && !mainApproved) {
+          // Hold main's answer until the person has answered on the
+          // subagent's own screen, so the order under test is the one that runs.
+          return note.promise.then(() => {
+            mainApproved = true;
+            return toolCall("main_e2_answer", "subagent", { action: "approve", agent: "writer" });
+          });
+        }
+        if (body.includes("main_e2_answer") && !mainReported) {
+          mainReported = true;
+          return text("main_e2_said", mainSaidGone(body) ? "SPIKE_E2_GONE" : "SPIKE_E2_ANSWERED");
+        }
+        return text("main_e2_tail", "SPIKE_E2_DONE");
+      }, async (session, { workspace }) => {
+        await session.sendText("SPIKE_USER_e2");
+        await showAgent(session, "writer");
+        await session.waitForPane((pane) => pane.includes("SPIKE_E2_TASK"), 20_000);
+        switched.release();
+        await session.waitForPane((pane) => pane.includes("Apply this change?"), 30_000);
+        await session.sendKeys("1");
+        await until("the write", () => existsSync(join(workspace, file)));
+        note.release();
+        // Back on main, its answer to the note finds no request: the person
+        // took the binding away, so main reads that it no longer waits.
+        await showAgent(session, "main");
+        await session.waitForText("SPIKE_E2_GONE", 30_000);
+        expect(readFileSync(join(workspace, file), "utf8")).toBe("SPIKE_WROTE\n");
+      }, writeSpikeWriter);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a turn the person typed on the subagent's screen keeps its approval, lent as before",
+    async () => {
+      let childCalls = 0;
+      let mainSawNote = false;
+      await withFx((body) => {
+        if (SPIKE_MAIN(body) && body.includes(SPIKE_NOTE)) mainSawNote = true;
+        if (!SPIKE_MAIN(body)) {
+          childCalls += 1;
+          if (childCalls === 1) return text("child_e4_ready", "SPIKE_E4_READY");
+          if (childCalls === 2) return toolCall("child_e4_write", "write_file", { path: "spike-e4.txt", content: "SPIKE_WROTE\n" });
+          return text("child_e4_done", "SPIKE_E4_DONE");
+        }
+        if (!body.includes('"main_e4_start"')) {
+          return toolCall("main_e4_start", "subagent", {
+            request: { action: "message", agent: "writer", message: "SPIKE_E4_FIRST", profile: "writer" },
+          });
+        }
+        return text("main_e4_tail", "SPIKE_E4_MAIN_DONE");
+      }, async (session, { workspace }) => {
+        await session.sendText("SPIKE_USER_e4");
+        await session.waitForText("SPIKE_E4_MAIN_DONE", 30_000);
+        await showAgent(session, "writer");
+        await session.waitForPane((pane) => pane.includes("SPIKE_E4_FIRST"), 20_000);
+        // A turn the person types on the subagent's own screen.
+        await session.sendText("SPIKE_E4_TYPED");
+        await session.waitForPane((pane) => pane.includes("Apply this change?"), 30_000);
+        await showAgent(session, "main");
+        // Its approval is lent to main's screen, as it was before Part 2.
+        await session.waitForPane((pane) => pane.includes("Subagent writer needs permission"), 30_000);
+        await session.sendKeys("1");
+        await until("the write", () => existsSync(join(workspace, "spike-e4.txt")));
+        expect(mainSawNote).toBe(false);
+      }, writeSpikeWriter);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "two subagents wait at once, and main answers both",
+    async () => {
+      const childCalls = { writer: 0, helper: 0 };
+      const approveCalls = { writer: 0, helper: 0 };
+      const approve = (agent: "writer" | "helper") =>
+        toolCall(`main_e5_approve_${agent}_${approveCalls[agent]++}`, "subagent", { action: "approve", agent });
+      const approvalAllowed = (body: string, agent: string): boolean => {
+        let allowed = false;
+        const walk = (value: any) => {
+          if (allowed) return;
+          if (Array.isArray(value)) value.forEach(walk);
+          else if (value && typeof value === "object") {
+            if (
+              value.type === "tool-result" &&
+              typeof value.toolCallId === "string" &&
+              value.toolCallId.startsWith(`main_e5_approve_${agent}`) &&
+              JSON.stringify(value.output).includes("Allowed")
+            ) allowed = true;
+            else Object.values(value).forEach(walk);
+          }
+        };
+        walk(JSON.parse(body));
+        return allowed;
+      };
+      await withFx((body) => {
+        if (!SPIKE_MAIN(body)) {
+          const who = body.includes("SPIKE_E5_WRITER") ? "writer" : "helper";
+          childCalls[who] += 1;
+          if (childCalls[who] === 1) {
+            return toolCall(`child_e5_${who}`, "write_file", { path: `spike-e5-${who}.txt`, content: "SPIKE_WROTE\n" });
+          }
+          return text(`child_e5_${who}_done`, `SPIKE_E5_${who.toUpperCase()}_DONE`);
+        }
+        if (!body.includes('"main_e5_start"')) {
+          return messageSteps([
+            { id: "main_e5_start", agent: "writer", message: "SPIKE_E5_WRITER", profile: "writer" },
+            { id: "main_e5_helper", agent: "helper", message: "SPIKE_E5_HELPER", profile: "helper" },
+          ]);
+        }
+        if (body.includes(SPIKE_NOTE)) {
+          // Approve the agent the newest note names, once per agent: a fixed
+          // order approved writer before writer's request had reached fx ("has
+          // no approval request waiting"), and helper's earlier note then made
+          // the later one find both approve calls in the history and never get
+          // answered. The note's quotes arrive JSON-escaped inside its message,
+          // so match the agent's name, not `agent "name"`.
+          const note = latestUserText(body);
+          const named: "writer" | "helper" | null = note.includes(SPIKE_NOTE)
+            ? note.includes("helper") ? "helper" : note.includes("writer") ? "writer" : null
+            : null;
+          if (named && !approvalAllowed(body, named)) return approve(named);
+          // An approve that came too early is made again once that agent's note
+          // is in the history, under a new call id.
+          const noted = (agent: "writer" | "helper") =>
+            userTexts(body).some((text) => text.includes(SPIKE_NOTE) && text.includes(agent));
+          for (const agent of ["writer", "helper"] as const) {
+            if (approvalAllowed(body, agent)) continue;
+            if (!noted(agent)) continue;
+            return approve(agent);
+          }
+          // Both answered only once both approve results said the request was
+          // answered; otherwise end the turn so the next note starts another.
+          if (approvalAllowed(body, "writer") && approvalAllowed(body, "helper")) {
+            return text("main_e5_tail", "SPIKE_E5_BOTH_ANSWERED");
+          }
+          return text("main_e5_waiting", "SPIKE_E5_WAITING");
+        }
+        // Not a note turn (the opening turn's later request): nothing is
+        // answered yet, so only a note turn may say both were.
+        return text("main_e5_tail", "SPIKE_E5_STARTED");
+      }, async (session, { workspace }) => {
+        await session.sendText("SPIKE_USER_e5");
+        await session.waitForText("SPIKE_E5_BOTH_ANSWERED", 30_000);
+        await until("the writer's write", () => existsSync(join(workspace, "spike-e5-writer.txt")));
+        await until("the helper's write", () => existsSync(join(workspace, "spike-e5-helper.txt")));
+        const pane = await session.capturePaneGrid();
+        expect(pane).not.toContain("needs permission");
+      }, (home) => {
+        writeSpikeProfile(home, "writer");
+        writeSpikeProfile(home, "helper");
+      });
     },
     TIMEOUT,
   );

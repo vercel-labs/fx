@@ -149,6 +149,39 @@
 # trace driver runs fx along it: the inline tests in tool_host.zig and
 # "a wait that starts as a subagent's work ends with nothing to report still
 # returns" in tests/e2e/gateway-stream-lifecycle.test.ts hold fx in the gap.
+#
+# The ParentApproval configs:
+#
+# ParentApproval models a subagent's approval request reaching main and main
+# answering it (requestChildPermission and registerApproval in
+# src/core/subagent/execution.zig, noteChildApproval and answerApproval in
+# tool_host.zig, the registry in approval_registry.zig, awaitMailOrQuiet and
+# the fx ask loop in src/core/cli/cli_ask.zig). The request is registered
+# before its note is posted, and the mark that counts it noted runs only after
+# the post returned; a failed post refuses it at once. `PostNote` and
+# `MarkNoted` are separate because the ask loop can block between them
+# (`Block`), and only the mark's wake (or the loop's 50 ms re-check, `Wake`)
+# lets it look at the fallback again. approve runs the exact call through
+# main's own check, and fx ask's fallback refuses the waiting requests once
+# main is idle with no mail and the loop is not blocked. parent-approval.cfg
+# is the design and must pass. parent-approval-today.cfg is fx before this
+# change: no note and no approve, so a waiting request is never answered,
+# which TLC reports as a deadlock. Each parent-approval-mutation-*.cfg plants
+# one defect, and the rule or deadlock named for it must catch it:
+#
+#   final-answer  approve resolves allowed without main's check      Authority
+#   note-first    the note is posted before the request is
+#                 registered                                         NoLostApprove
+#   early-stall   the fallback counts a request that is not yet
+#                 noted                                              FallbackOnlyAfterSeen
+#   no-fallback   no fallback: a waiting request stays unanswered    deadlock
+#   note-lost     a failed note leaves the request registered
+#                 and waiting                                        deadlock
+#   no-nudge      the mark does not wake the blocked loop, so a
+#                 request noted after the loop looked is never
+#                 answered                                           deadlock
+#
+# No trace driver runs fx along it yet.
 
 set -eu
 
@@ -218,4 +251,35 @@ QuietRelay quiet-relay-mutation-check-first NoSleepOnMail
 WaitNudge wait-nudge -
 WaitNudge wait-nudge-today deadlock
 WaitNudge wait-nudge-mutation-check-first deadlock
+ParentApproval parent-approval -
+ParentApproval parent-approval-today deadlock
+ParentApproval parent-approval-mutation-final-answer Authority
+ParentApproval parent-approval-mutation-note-first NoLostApprove
+ParentApproval parent-approval-mutation-early-stall FallbackOnlyAfterSeen
+ParentApproval parent-approval-mutation-no-fallback deadlock
+ParentApproval parent-approval-mutation-note-lost deadlock
+ParentApproval parent-approval-mutation-no-nudge deadlock
+# The TuiParentApproval configs:
+# The trial (step 3b) and a must break: the trial breaks NoStaleLent (a lent
+# copy outliving its wait), a breaks NoStalePrompt (the call frees its review).
+# a2, b and c must pass; c is the code in this change (the prompt owns its
+# copy, so NoStalePrompt holds by construction).
+# lend_routed, free_anyway and note_typed each break the rule named on its row.
+# Two defects have no config because they cannot fail: no_withdraw (one request
+# per kid) and b_note_keeps_prompt (b's free guard waits on the prompt).
+# The simulate pair runs under ideal and non-ideal conditions.
+#
+TuiParentApproval tui-approval-current-trial NoStaleLent
+TuiParentApproval tui-approval-design-a NoStalePrompt
+TuiParentApproval tui-approval-design-a-person NoStalePrompt
+TuiParentApproval tui-approval-design-a2 -
+TuiParentApproval tui-approval-design-a2-person -
+TuiParentApproval tui-approval-design-b -
+TuiParentApproval tui-approval-design-c -
+TuiParentApproval tui-approval-design-b-person -
+TuiParentApproval tui-approval-mutant-lend-routed NoPersonPromptForParentRouted
+TuiParentApproval tui-approval-mutant-free-anyway NoStalePrompt
+TuiParentApproval tui-approval-mutant-note-typed TypedStaysWithPerson
+TuiParentApproval tui-approval-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
+TuiParentApproval tui-approval-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
 VERDICTS

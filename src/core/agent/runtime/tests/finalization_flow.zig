@@ -230,10 +230,11 @@ test "processQueuedPrompt preserves finish precedence over malformed argument re
             .finish_reason = case.finish_reason,
             .omit_finish = case.omit_finish,
         };
-        // A cut-off reply with nothing usable is resent once with fx's limit;
-        // the resend's own cut-off reply ends the turn.
-        const completions = [_]FakeCompletion{ reply, reply };
-        const requests: usize = if (case.expected == .length_limited) 2 else 1;
+        // A cut-off reply with nothing usable gets a note twice, and the
+        // third cut reply in a row ends the turn
+        // (`tests/tla/agent_runtime/OutputLimit.tla` EndsAfterThird).
+        const completions = [_]FakeCompletion{ reply, reply, reply };
+        const requests: usize = if (case.expected == .length_limited) 3 else 1;
         var gateway = FakeGateway.init(alloc, completions[0..requests]);
         defer gateway.deinit();
         var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -777,13 +778,16 @@ test "processQueuedPrompt step limit writes active debug trace" {
     try std.testing.expect(std.mem.find(u8, trace, "{\"path\":\"a\"}") == null);
 }
 
-test "common Stop natural completion allows and preserves disposition" {
+test "common Stop sees a cut answer joined with the reply that finished it" {
     const alloc = std.testing.allocator;
+    // A reply cut at its output limit never reaches Stop: fx asks the model
+    // to go on, and Stop sees the whole answer.
     var gateway = FakeGateway.init(alloc, &.{
         .{
             .content = "candidate",
             .finish_reason = .length,
         },
+        .{ .content = " and the rest" },
     });
     defer gateway.deinit();
     var deps = FakeAgentRuntimeDeps.init(alloc);
@@ -806,22 +810,21 @@ test "common Stop natural completion allows and preserves disposition" {
         testLifecycleContext(view, alloc, fixture.workspace_root),
     );
 
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 1), handler.calls);
-    try std.testing.expectEqualStrings("candidate", handler.seen_text.?);
-    try std.testing.expectEqual(@as(usize, 1), handler.seen_step_index);
+    try std.testing.expectEqualStrings("candidate and the rest", handler.seen_text.?);
+    try std.testing.expectEqual(@as(usize, 2), handler.seen_step_index);
     try std.testing.expect(handler.seen_can_continue);
     try std.testing.expectEqual(
-        types.ProviderCompletionDisposition.length_limited,
+        types.ProviderCompletionDisposition.completed,
         handler.seen_disposition.?,
     );
     try std.testing.expectEqualStrings(
-        "candidate",
+        "candidate and the rest",
         deps.history_turns.items[0].assistant.execution.tool_steps[0].assistant.?,
     );
-    try std.testing.expectEqual(
-        types.ProviderCompletionDisposition.length_limited,
-        deps.finalized_disposition.?,
-    );
+    // A finished turn carries no provider disposition to finalization.
+    try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, null), deps.finalized_disposition);
 }
 
 test "common Stop cancellation and failure preserve original replay" {
@@ -1355,8 +1358,10 @@ test "common Stop step limit retains candidate and current-turn execution" {
 
 test "common Stop length-limited tool failure retains candidate" {
     const alloc = std.testing.allocator;
+    // The call is cut off mid-arguments and no step is left, so the cut
+    // reply ends the turn.
     const calls = [_]ToolCall{
-        toolCall("call_read", "read_file", "{\"path\":\"README.md\"}"),
+        toolCall("call_read", "read_file", "{\"path\":\"READ"),
     };
     var gateway = FakeGateway.init(alloc, &.{
         .{ .content = "candidate" },
@@ -1379,10 +1384,12 @@ test "common Stop length-limited tool failure retains candidate" {
     defer handler.deinit();
     const view = try registerStopTestHandler(&lifecycle_runtime, &handler);
 
+    var config = fixture.config();
+    config.agent_step_limit = 2;
     try runFakePromptWithLifecycle(
         &gateway,
         &deps,
-        fixture.config(),
+        config,
         fixture.job(),
         testLifecycleContext(view, alloc, fixture.workspace_root),
     );
@@ -2048,6 +2055,143 @@ test "two standalone compaction cuts retain matching request and finalization hi
     try expectBodyNotContains(&follow_gateway, 0, "COMPACTED_PRIVATE_REPLAY");
 }
 
+test "a turn a compaction cut keeps its summarized step in the session log, and resume sends what fx sends live (D87)" {
+    const session_adapter = @import("../../../session/session_adapter.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const folded_call = toolCall("folded_call", "read_file", "{\"path\":\"a.txt\"}");
+    const kept_call = toolCall("kept_call", "read_file", "{\"path\":\"b.txt\"}");
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{folded_call} },
+        .{ .role = .tool, .content = "FOLDED_RESULT", .tool_call_id = folded_call.id, .tool_name = folded_call.name, .tool_result_status = .success },
+        .{ .role = .assistant, .tool_calls = &.{kept_call} },
+        .{ .role = .tool, .content = "KEPT_RESULT", .tool_call_id = kept_call.id, .tool_name = kept_call.name, .tool_result_status = .success },
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    const runtime_deps = deps.deps();
+    var finalization = TurnFinalizationGuard.init(&runtime_deps, 1, testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, "/tmp/workspace"));
+    defer finalization.deinit();
+    // A compaction inside the turn summarized its first step.
+    finalization.compacted_execution = .{ .tool_steps = 1 };
+    var fixture = PromptFixture{};
+    var summary = TurnSummaryAccumulator{ .turn_started_at_ms = io_mod.milliTimestamp() };
+    var finish_trace = PromptFinishTrace{ .ctx = .{ .turn_id = 1 } };
+    try finishCommonAssistantTerminal(&runtime_deps, &finalization, arena.allocator(), fixture.job(), &messages, &summary, .{ .history = "final answer" }, .completed, .completed, &finish_trace, "completed", null);
+    const live = deps.history_turns.items[0];
+    try std.testing.expectEqual(@as(usize, 1), live.assistant.execution.tool_steps.len);
+
+    // Saved as a host saves it: the turn is open, the compaction's line
+    // names the cut, and the finished turn commits.
+    var store = try session_adapter.Store.open(alloc, home);
+    defer store.deinit(alloc);
+    var model = "test-model".*;
+    const saved = try session_adapter.Session.create(alloc, &store, fixture.workspace_root, .ask, .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+    var summary_text = "SUMMARY_OF_FIRST_STEP".*;
+    try saved.beginTurn();
+    try saved.commitCompaction(.{ .summary = &summary_text, .removed_turn_count = 0, .compaction_count = 1 }, true, .{ .turns = 0, .tool_steps = 1 });
+    var prepared = try types.dupeHistoryTurn(alloc, live);
+    defer types.freeHistoryTurn(alloc, prepared);
+    try saved.prepareTurn(&prepared);
+    try saved.commitTurn(prepared, types.ConversationLanguage.default());
+    const id = try alloc.dupe(u8, saved.id());
+    defer alloc.free(id);
+    saved.close();
+
+    const resumed = try session_adapter.Session.resumeSession(alloc, &store, .{ .id = id }, fixture.workspace_root, .ask);
+    defer resumed.close();
+    const ShownCalls = struct {
+        ids: std.ArrayList([]u8) = .empty,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            for (turn.assistant.execution.tool_steps) |step| for (step.tool_calls) |call| {
+                try self.ids.append(std.testing.allocator, try std.testing.allocator.dupe(u8, call.id));
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.ids.items) |call_id| std.testing.allocator.free(call_id);
+            self.ids.deinit(std.testing.allocator);
+        }
+    };
+    // The transcript a resume draws, Ctrl+O's too, shows the summarized step.
+    var shown: ShownCalls = .{};
+    defer shown.deinit();
+    try resumed.visitHistory(alloc, &shown);
+    try std.testing.expectEqual(@as(usize, 2), shown.ids.items.len);
+    try std.testing.expectEqualStrings(folded_call.id, shown.ids.items[0]);
+    try std.testing.expectEqualStrings(kept_call.id, shown.ids.items[1]);
+
+    // The model gets the same next request either way: the summary, then the
+    // turn from the cut, as fx's history keeps it once the host saved it.
+    var restored = try resumed.restore(alloc);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), restored.history.len);
+    var live_history = [_]types.HistoryTurn{ restored.history[0], prepared };
+    var live_gateway = FakeGateway.init(alloc, &.{.{ .content = "next" }});
+    defer live_gateway.deinit();
+    var live_deps = FakeAgentRuntimeDeps.init(alloc);
+    defer live_deps.deinit();
+    var live_job = fixture.job();
+    live_job.history = &live_history;
+    try runFakePrompt(&live_gateway, &live_deps, fixture.config(), live_job);
+    var resumed_gateway = FakeGateway.init(alloc, &.{.{ .content = "next" }});
+    defer resumed_gateway.deinit();
+    var resumed_deps = FakeAgentRuntimeDeps.init(alloc);
+    defer resumed_deps.deinit();
+    var resumed_job = fixture.job();
+    resumed_job.history = restored.history;
+    try runFakePrompt(&resumed_gateway, &resumed_deps, fixture.config(), resumed_job);
+    try expectBodyContains(&resumed_gateway, 0, "KEPT_RESULT");
+    try expectBodyNotContains(&resumed_gateway, 0, "FOLDED_RESULT");
+    try std.testing.expectEqualStrings(live_gateway.request_bodies.items[0], resumed_gateway.request_bodies.items[0]);
+}
+
+test "a cancelled or failed turn a compaction cut hands the session its whole turn (D87)" {
+    const runtime_interruption = @import("../interruption.zig");
+    const alloc = std.testing.allocator;
+    const folded_call = toolCall("folded_call", "read_file", "{\"path\":\"a.txt\"}");
+    const kept_call = toolCall("kept_call", "read_file", "{\"path\":\"b.txt\"}");
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{folded_call} },
+        .{ .role = .tool, .content = "FOLDED_RESULT", .tool_call_id = folded_call.id, .tool_name = folded_call.name, .tool_result_status = .success },
+        .{ .role = .assistant, .tool_calls = &.{kept_call} },
+        .{ .role = .tool, .content = "KEPT_RESULT", .tool_call_id = kept_call.id, .tool_name = kept_call.name, .tool_result_status = .success },
+    };
+    const Ending = enum { cancelled, cancelled_after_candidate, failed_partial };
+    for ([_]Ending{ .cancelled, .cancelled_after_candidate, .failed_partial }) |ending| {
+        var deps = FakeAgentRuntimeDeps.init(alloc);
+        defer deps.deinit();
+        const runtime_deps = deps.deps();
+        var finalization = TurnFinalizationGuard.init(&runtime_deps, 1, testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, "/tmp/workspace"));
+        defer finalization.deinit();
+        finalization.compacted_execution = .{ .tool_steps = 1 };
+        var fixture = PromptFixture{};
+        var completed_tool_names = [_][]u8{};
+        var persisted = false;
+        var materializing = false;
+        switch (ending) {
+            .cancelled, .cancelled_after_candidate => try runtime_interruption.persistInterruptedTurnOnce(&runtime_deps, &finalization, fixture.job(), null, null, &completed_tool_names, &persisted, .{ .turn_id = 1 }, &messages, if (ending == .cancelled_after_candidate) "candidate reply" else null, &materializing),
+            .failed_partial => try runtime_interruption.persistFailedPartialTurnOnce(&runtime_deps, &finalization, fixture.job(), "partial reply", &persisted, .{ .turn_id = 1 }, &messages, &materializing),
+        }
+        const turn = deps.history_turns.items[0].interrupted;
+        try std.testing.expectEqual(@as(usize, 1), turn.execution.tool_steps.len);
+        const whole = turn.saved_execution orelse return error.TestExpectedSavedExecution;
+        try std.testing.expectEqual(@as(usize, 2), whole.tool_steps.len);
+        try std.testing.expectEqualStrings(folded_call.id, whole.tool_steps[0].tool_calls[0].id);
+        try std.testing.expectEqualStrings(kept_call.id, whole.tool_steps[1].tool_calls[0].id);
+    }
+}
+
 test "common Stop parallel cancellation preserves ordinary cancelled peer as completed failure" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
@@ -2435,6 +2579,39 @@ test "TurnFinalizationGuard runs PostTurnEnd once for every terminal outcome and
         try std.testing.expectEqual(case.outcome, hook_capture.outcomes[index]);
         try std.testing.expectEqual(case.disposition, hook_capture.dispositions[index]);
     }
+}
+
+test "TurnFinalizationGuard leaves a yielded turn open and still releases its terminal leases" {
+    const alloc = std.testing.allocator;
+    var hook_capture = PostTurnEndFinalizationCapture{};
+    var hook_runtime = lifecycle_hooks.Runtime.init(alloc);
+    defer hook_runtime.deinit();
+    try hook_runtime.registerPostTurnEnd(.{
+        .name = "capture",
+        .ctx = &hook_capture,
+        .run = PostTurnEndFinalizationCapture.run,
+    });
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    const runtime_deps = deps.deps();
+    var finalization = TurnFinalizationGuard.init(
+        &runtime_deps,
+        1,
+        testLifecycleContext(hook_runtime.freeze(), alloc, "/tmp/workspace"),
+    );
+    defer finalization.deinit();
+    try finalization.track_agent_terminal_lease("terminal-owned");
+
+    finalization.leaveOpenForResume();
+    // A finish after it, as a caller's catch might try, changes nothing.
+    try finalization.finish(.failed, null, null);
+
+    try std.testing.expectEqual(TurnFinalizationGuard.State.yielded, finalization.state);
+    try std.testing.expectEqual(@as(?types.TurnPresentationOutcome, null), finalization.outcome);
+    try std.testing.expectEqual(@as(usize, 1), deps.terminal_lease_cleanup_ids.items.len);
+    try std.testing.expectEqualStrings("terminal-owned", deps.terminal_lease_cleanup_ids.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), deps.finalization_count);
+    try std.testing.expectEqual(@as(usize, 0), hook_capture.calls);
 }
 
 test "TurnFinalizationGuard attempts every tracked lease without replacing accepted completion" {

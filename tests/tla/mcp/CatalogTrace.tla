@@ -16,6 +16,10 @@
 \*     in the ghost `graceLine`. `refused` is matched in every step.
 \*   - `page_received` carries `lapse`, which the core works out from the
 \*     pages' arrival times; the model takes it as given.
+\*   - Whether a refusal was for a temporary status (`unavail`) is not in the core's trace either: `Server`
+\*     keeps the status. TrackKind is FALSE, so a refusal never has the kind here.
+\*   - The count of tools a page leaves out (`gatherDrop`, `dropped` and their ghosts) is not in the core's trace: `Server`
+\*     keeps it. A page may leave tools out or not (`d`), and TrackDrops is FALSE, so it never does here.
 \*   - MaxPages comes from the scenario (ObsMaxPages). MaxGen and
 \*     MaxProcesses are the highest values in the trace.
 EXTENDS Catalog, TraceObs, Integers, Sequences
@@ -30,9 +34,9 @@ ObsMaxProcesses == Highest({r.data.process : r \in Recs} \cup {1})
 Step(r) ==
     CASE r.event = "process_started" -> ProcessStarted(r.data.arg_era)
       [] r.event = "need" -> Need
-      [] r.event = "page_received" -> PageReceived(r.data.more, r.data.ttl_zero, r.data.lapse)
+      [] r.event = "page_received" -> \E d \in BOOLEAN : PageReceived(r.data.more, r.data.ttl_zero, r.data.lapse, d)
       [] r.event = "invalid_cursor" -> InvalidCursor
-      [] r.event = "page_refused" -> PageRefused
+      [] r.event = "page_refused" -> \E k \in BOOLEAN : PageRefused(k)
       [] r.event = "page_failed" -> PageFailed \/ PageSharedGrace
       [] r.event = "invalidated" -> Invalidate
       [] r.event = "expired" -> Expired

@@ -274,10 +274,9 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
     };
     // What needs the user stays bright so it stands out among dim rows.
     try row.appendSlice(alloc, if (needs_you) ui_render.hint_style else ui_render.dim_style);
-    // A refused tool list says so whole where the row has room, and in its short words where it has not, so the
-    // cut never takes the word that says it.
-    const text = try verbs.runStatusText(arena, r.status);
-    const shown = if (r.status.tools_error != null and text.len > status_width) verbs.refusedShort(r.status) else text;
+    // A refused tool list says so whole where the row has room, and in fewer words where it has not. From 27 columns
+    // the shortest still fits whole. Under that the row is cut like any other, and may lose the word that says it.
+    const shown = try verbs.statusThatFits(arena, r.status, status_width);
     try row_text.appendTerminalSafeSingleLine(alloc, &row, shown, status_width);
     try row.appendSlice(alloc, ui_render.reset_style);
     if (show_source) {
@@ -301,11 +300,19 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
     if (line < l.lead) {
         const facts = l.lead - 1;
         if (line >= facts) return .empty;
-        const protocol_lines: usize = @intFromBool(r.status.version != null);
         if (line == 0) return row_text.composeFactRow(alloc, if (r.status.transport == .stdio) "runs" else @tagName(r.status.transport), r.target orelse "", width, fact_col, "");
         if (line == 1) return row_text.composeFactRow(alloc, "file", p.fileOf(r), width, fact_col, "");
         if (line == 2) return row_text.composeFactRow(alloc, "status", try statusFact(arena, r), width, fact_col, "");
-        if (line == 3 and protocol_lines == 1) return row_text.composeFactRow(alloc, "protocol", r.status.version.?, width, fact_col, "");
+        // Then the facts a server has only sometimes, in the order `fx mcp show` prints them: the tools fx left out, its
+        // protocol, its error.
+        var later = line - 3;
+        if (try verbs.droppedText(arena, r.status)) |left_out| {
+            if (later == 0) return row_text.composeFactRow(alloc, "left out", left_out, width, fact_col, "");
+            later -= 1;
+        }
+        if (r.status.version) |version| {
+            if (later == 0) return row_text.composeFactRow(alloc, "protocol", version, width, fact_col, "");
+        }
         return row_text.composeFactRow(alloc, "error", r.status.last_error orelse "", width, fact_col, ui_render.hint_style);
     }
     var buf: [menu.max_choices]menu.Choice = undefined;
@@ -770,6 +777,74 @@ test "a refused tool list shows whole in the list where the row has room, and in
     , unchanged);
 }
 
+/// The line of the list that is the row of server `name`.
+fn rowOfServer(text: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const bare = std.mem.trimStart(u8, std.mem.trimStart(u8, line, "\u{203a} "), " ");
+        if (std.mem.startsWith(u8, bare, name)) return line;
+    }
+    return null;
+}
+
+test "a refused or unavailable tool list fits its row at 30, 33, 60 and 200 columns, with the word that says it whole" {
+    var none = testStatus("none", .ready);
+    none.tools_error = "the server answered the list with HTTP 403";
+    var older = testStatus("older", .ready);
+    older.tools = 3;
+    older.tools_error = "the server answered the list with HTTP 403";
+    var wait = testStatus("wait", .ready);
+    wait.tools_error = "the server answered the list with HTTP 503, which is temporary";
+    wait.tools_unavailable = 503;
+    var later = wait;
+    later.tools = 3;
+    later.name = "later";
+    const rows = [_]menu.Row{ .{ .status = none }, .{ .status = older }, .{ .status = wait }, .{ .status = later } };
+    var p: Projection = .{ .rows = &rows };
+    menu.open(&p.state);
+
+    const Say = struct { name: []const u8, says: []const u8 };
+    const cases = [_]struct { width: u16, say: [4]Say }{
+        // The status column is 14 wide at 30 and 17 at 33: a row says its kind in fewer words, and never in a cut one.
+        .{ .width = 30, .say = .{ .{ .name = "none", .says = "list refused" }, .{ .name = "older", .says = "list refused" }, .{ .name = "wait", .says = "unavailable" }, .{ .name = "later", .says = "unavailable" } } },
+        .{ .width = 33, .say = .{ .{ .name = "none", .says = "tool list refused" }, .{ .name = "older", .says = "list refused" }, .{ .name = "wait", .says = "unavailable (503)" }, .{ .name = "later", .says = "unavailable (503)" } } },
+        .{ .width = 60, .say = .{ .{ .name = "none", .says = "ready, tool list refused" }, .{ .name = "older", .says = "newer list refused" }, .{ .name = "wait", .says = "ready, tool list unavailable (HTTP 503)" }, .{ .name = "later", .says = "newer list unavailable (HTTP 503)" } } },
+        .{ .width = 200, .say = .{ .{ .name = "none", .says = "ready, tool list refused" }, .{ .name = "older", .says = "ready, 3 tools, newer list refused" }, .{ .name = "wait", .says = "ready, tool list unavailable (HTTP 503)" }, .{ .name = "later", .says = "ready, 3 tools, newer list unavailable (HTTP 503)" } } },
+    };
+    for (cases) |case| {
+        const text = try render(p, case.width);
+        defer testing.allocator.free(text);
+        for (case.say) |one| {
+            const line = rowOfServer(text, one.name) orelse return error.TestExpectedRow;
+            // A row that does not say it fails by showing the words it should have had next to the row it had.
+            if (std.mem.find(u8, line, one.says) == null) return testing.expectEqualStrings(one.says, line);
+            try testing.expect(std.mem.find(u8, line, "\u{2026}") == null);
+            try testing.expect(try std.unicode.utf8CountCodepoints(line) <= case.width);
+        }
+    }
+}
+
+test "a refused or unavailable tool list is cut inside the row at 20 and 25 columns, where its words do not fit" {
+    var none = testStatus("none", .ready);
+    none.tools_error = "the server answered the list with HTTP 403";
+    var wait = testStatus("wait", .ready);
+    wait.tools_error = "the server answered the list with HTTP 503, which is temporary";
+    wait.tools_unavailable = 503;
+    const rows = [_]menu.Row{ .{ .status = none }, .{ .status = wait } };
+    var p: Projection = .{ .rows = &rows };
+    menu.open(&p.state);
+
+    for ([_]u16{ 20, 25 }) |width| {
+        const text = try render(p, width);
+        defer testing.allocator.free(text);
+        // Both rows are there, and no line of the picker is wider than the terminal.
+        try testing.expect(rowOfServer(text, "none") != null);
+        try testing.expect(rowOfServer(text, "wait") != null);
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| try testing.expect(try std.unicode.utf8CountCodepoints(line) <= width);
+    }
+}
+
 test "a server's screen: facts, choices with their commands, then tools" {
     var gh = testStatus("github", .ready);
     gh.signed_in = true;
@@ -800,6 +875,43 @@ test "a server's screen: facts, choices with their commands, then tools" {
     // On a tool, Enter does nothing, so the hint doesn't offer it.
     p.state.cursor = 2;
     try testing.expectEqualStrings("↑↓ navigate     esc back", hintVariants(p)[0]);
+}
+
+test "a server's screen says what fx left out of its tool list, between its status and its protocol" {
+    var gh = testStatus("github", .ready);
+    gh.tools = 2;
+    gh.version = "2025-11-25";
+    gh.dropped.add(.repeated_field, 1);
+    const rows = [_]menu.Row{.{ .status = gh, .target = "https://h/mcp" }};
+    const tools = [_]menu.Tool{ .{ .name = "create_issue", .description = "Create a new issue." }, .{ .name = "search_code", .description = "Search for code." } };
+    var p: Projection = .{ .rows = &rows, .tools = .{ .ready = &tools } };
+    menu.open(&p.state);
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    // The fact is one more line before the blank that ends the facts.
+    try testing.expectEqual(@as(usize, 6), p.layout(rows[0]).lead);
+    const text = try render(p, 88);
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.startsWith(u8, text,
+        \\  github
+        \\  http      https://h/mcp
+        \\  file      ~/.fx/mcp.json
+        \\  status    ready
+        \\  left out  1 tool: a field is written twice
+        \\  protocol  2025-11-25
+        \\
+        \\
+    ));
+    // A server that left nothing out has no such line, and its facts are where they were.
+    var quiet = gh;
+    quiet.dropped = .{};
+    const quiet_rows = [_]menu.Row{.{ .status = quiet, .target = "https://h/mcp" }};
+    var q: Projection = .{ .rows = &quiet_rows, .tools = .{ .ready = &tools } };
+    menu.open(&q.state);
+    _ = menu.press(&q.state, .{ .rows = &quiet_rows }, .enter);
+    try testing.expectEqual(@as(usize, 5), q.layout(quiet_rows[0]).lead);
+    const quiet_text = try render(q, 88);
+    defer testing.allocator.free(quiet_text);
+    try testing.expect(std.mem.find(u8, quiet_text, "left out") == null);
 }
 
 test "a long tool list scrolls with the selection and counts what's below" {

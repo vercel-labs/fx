@@ -79,8 +79,8 @@
   },
   {
     "description": "A failed listing makes the last list fresh, so it is served from the cache instead of listed again",
-    "old": "    /\\ lastAnswer' = lastAnswer\n    /\\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,\n                   page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>",
-    "new": "    /\\ lastAnswer' = lastAnswer\n    /\\ cache' = IF cache = \"none\" THEN cache ELSE \"fresh\"\n    /\\ cacheGen' = gen\n    /\\ cachedZero' = FALSE\n    /\\ cachedLapsed' = FALSE\n    /\\ UNCHANGED <<era, process, gen, startGen,\n                   page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>",
+    "old": "    /\\ lastAnswer' = lastAnswer\n    /\\ unavail' = unavail\n    /\\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,\n                   page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>",
+    "new": "    /\\ lastAnswer' = lastAnswer\n    /\\ unavail' = unavail\n    /\\ cache' = IF cache = \"none\" THEN cache ELSE \"fresh\"\n    /\\ cacheGen' = gen\n    /\\ cachedZero' = FALSE\n    /\\ cachedLapsed' = FALSE\n    /\\ UNCHANGED <<era, process, gen, startGen,\n                   page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>",
     "invariant": "FallbackRetries"
   },
   {
@@ -103,8 +103,8 @@
   },
   {
     "description": "A refused page is not remembered",
-    "old": "    /\\ refused' = TRUE\n    /\\ lastAnswer' = \"refused\"\n    /\\ UNCHANGED <<era, process, gen, cache,",
-    "new": "    /\\ refused' = refused\n    /\\ lastAnswer' = \"refused\"\n    /\\ UNCHANGED <<era, process, gen, cache,",
+    "old": "    /\\ refused' = TRUE\n    /\\ lastAnswer' = \"refused\"\n    /\\ unavail' = k\n    /\\ UNCHANGED <<era, process, gen, cache,",
+    "new": "    /\\ refused' = refused\n    /\\ lastAnswer' = \"refused\"\n    /\\ unavail' = k\n    /\\ UNCHANGED <<era, process, gen, cache,",
     "invariant": "RefusedIffLastAnswerRefused"
   },
   {
@@ -121,8 +121,62 @@
   },
   {
     "description": "A page that a grace ended on a line another request could have written is refused as unreadable, though its own answer is only late",
-    "old": "    /\\ lastAnswer' = lastAnswer\n    /\\ refused' = refused\n    /\\ graceLine' = IF",
-    "new": "    /\\ lastAnswer' = \"unreadable\"\n    /\\ refused' = TRUE\n    /\\ graceLine' = IF",
+    "old": "    /\\ lastAnswer' = lastAnswer\n    /\\ refused' = refused\n    /\\ unavail' = unavail\n    /\\ graceLine' = IF",
+    "new": "    /\\ lastAnswer' = \"unreadable\"\n    /\\ refused' = TRUE\n    /\\ unavail' = unavail\n    /\\ graceLine' = IF",
     "invariant": "NoReasonFromAnotherRequestsLine"
+  },
+  {
+    "description": "A listing counts only its last page's tools left out, so an earlier page's are forgotten",
+    "old": "                  /\\ gatherDrop' = (gatherDrop \\/ d)\n",
+    "new": "                  /\\ gatherDrop' = d\n",
+    "invariant": "GatheredCountIsOfTheRunningListing"
+  },
+  {
+    "description": "An invalid cursor drops the pages gathered but not what they counted, so the count reaches the next pages",
+    "old": "               /\\ gatherDrop' = FALSE\n               /\\ runDrop' = FALSE\n               /\\ UNCHANGED <<dropped, listedDrop>>\n",
+    "new": "               /\\ gatherDrop' = gatherDrop\n               /\\ runDrop' = FALSE\n               /\\ UNCHANGED <<dropped, listedDrop>>\n",
+    "invariant": "GatheredCountIsOfTheRunningListing"
+  },
+  {
+    "description": "A listing that fails changes the count of the list that is still served",
+    "old": "    /\\ gatherDrop' = FALSE\n    /\\ runDrop' = FALSE\n    /\\ UNCHANGED <<dropped, listedDrop>>\n",
+    "new": "    /\\ gatherDrop' = FALSE\n    /\\ runDrop' = FALSE\n    /\\ dropped' = FALSE\n    /\\ UNCHANGED listedDrop\n",
+    "invariant": "PublishedCountBelongsToPublishedList"
+  },
+  {
+    "description": "A list that kept every tool leaves the earlier list's count in place",
+    "old": "               /\\ dropped' = (gatherDrop \\/ d)\n",
+    "new": "               /\\ dropped' = (dropped \\/ gatherDrop \\/ d)\n",
+    "invariant": "PublishedCountBelongsToPublishedList"
+  },
+  {
+    "description": "A listing that fails keeps what its pages counted, so the count reaches the next listing",
+    "old": "    /\\ gatherDrop' = FALSE\n    /\\ runDrop' = FALSE\n    /\\ UNCHANGED <<dropped, listedDrop>>\n",
+    "new": "    /\\ gatherDrop' = gatherDrop\n    /\\ runDrop' = runDrop\n    /\\ UNCHANGED <<dropped, listedDrop>>\n",
+    "invariant": "IdleGathersNothing"
+  },
+  {
+    "description": "A published list leaves the refusal's kind, so a list that was not refused is called unavailable",
+    "old": "    /\\ graceLine' = \"none\"\n    /\\ unavail' = FALSE\n    /\\ UNCHANGED <<startGen, restarts>>\n",
+    "new": "    /\\ graceLine' = \"none\"\n    /\\ unavail' = unavail\n    /\\ UNCHANGED <<startGen, restarts>>\n",
+    "invariant": "UnavailableOnlyWhileRefused"
+  },
+  {
+    "description": "A new process keeps the refusal's kind of the one before it",
+    "old": "    /\\ unavail' = FALSE\n    /\\ UNCHANGED <<cacheGen, cachedZero, cachedLapsed, listingVars, servedStale, extraFetch>>\n",
+    "new": "    /\\ unavail' = unavail\n    /\\ UNCHANGED <<cacheGen, cachedZero, cachedLapsed, listingVars, servedStale, extraFetch>>\n",
+    "invariant": "UnavailableOnlyWhileRefused"
+  },
+  {
+    "description": "A page whose line fx could not read keeps the kind of the refusal before it, though it has no status",
+    "old": "    /\\ graceLine' = \"own\"\n    /\\ unavail' = FALSE\n",
+    "new": "    /\\ graceLine' = \"own\"\n    /\\ unavail' = unavail\n",
+    "invariant": "UnavailableOnlyWhileRefused"
+  },
+  {
+    "description": "A listing the server never answered says its list is unavailable",
+    "old": "    /\\ lastAnswer' = lastAnswer\n    /\\ unavail' = unavail\n    /\\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,\n                   page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>\n\n\\* list_changed",
+    "new": "    /\\ lastAnswer' = lastAnswer\n    /\\ unavail' = TRUE\n    /\\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,\n                   page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>\n\n\\* list_changed",
+    "invariant": "UnavailableOnlyWhileRefused"
   }
 ]

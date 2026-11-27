@@ -7,8 +7,8 @@
 //! work still counts as running, so a test can send a message in that gap
 //! every time (`tests/e2e/gateway-stream-lifecycle.test.ts`, "a message right
 //! after a stop starts the subagent's next turn";
-//! `tests/tla/drivers/subagent/stop-message.test.ts`). Only those tests set
-//! the controls, so the libfx artifacts leave them out.
+//! `tests/tla/drivers/subagent/stop-message.test.ts`). Only tests set the
+//! controls, so the libfx artifacts leave them out.
 //!
 //! Every hold reads two paths from the environment and uses them only when
 //! both are absolute (`holdFiles`): the file calls take no other kind, and a
@@ -36,8 +36,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
-
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const hold_marker = @import("../shared/hold_marker.zig");
 
 /// The longest any hold waits for its release file. Every seam in this folder
 /// reads it from here.
@@ -198,23 +197,11 @@ fn holdOnFiles(counter: *std.atomic.Value(u32), files: HoldFiles, comptime fmt: 
     const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ files.release, n }) catch return;
     var contents_buf: [256]u8 = undefined;
     const contents = std.mem.print(&contents_buf, fmt, args) catch return;
-    writeMarker(marker, contents) catch return;
+    hold_marker.write(marker, contents) catch return;
     const deadline = io_mod.milliTimestamp() + max_hold_ms;
     while (!pathExists(files.release) and !pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
         io_mod.sleep(std.time.ns_per_ms);
     }
-}
-
-/// Writes a hold's marker file with owner-only permissions and syncs it. Every
-/// seam in this folder writes its marker here.
-pub fn writeMarker(path: []const u8, contents: []const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{
-        .truncate = true,
-        .permissions = private_file_permissions,
-    });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), contents);
-    try file.sync(io_mod.getIo());
 }
 
 /// Whether a hold's release file exists. Every seam in this folder checks it

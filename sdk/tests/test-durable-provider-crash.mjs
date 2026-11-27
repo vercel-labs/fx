@@ -81,7 +81,6 @@ const providers = {
     sessionHeader: "session-id",
     accountHeader: "chatgpt-account-id",
     serve(url) {
-      if (url === "https://registry.npmjs.org/@openai/codex/latest") return Response.json({ version: "0.162.1" });
       if (url.startsWith("https://chatgpt.com/backend-api/codex/models")) {
         return Response.json({ models: [
           { slug: "gpt-6.1-sol", visibility: "list", supported_in_api: true, priority: 1, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
@@ -102,7 +101,6 @@ const providers = {
     sessionHeader: "x-grok-conv-id",
     accountHeader: "x-grok-user-id",
     serve(url) {
-      if (url === "https://x.ai/cli/stable") return new Response("1.0.50\n");
       if (url === "https://cli-chat-proxy.grok.com/v1/models") {
         return Response.json({ data: [{ id: "grok-4.5", model: "grok-4.5", api_backend: "responses", context_window: 500000, supports_reasoning_effort: true, reasoning_efforts: [{ value: "low" }] }] });
       }

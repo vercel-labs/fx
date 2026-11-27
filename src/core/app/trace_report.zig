@@ -32,6 +32,7 @@
 //! ## Records
 //!
 //! - `fx_trace`: `format_version` (1), `fx_version`, `git_commit`,
+//!   `update_channel` (`stable` or `dev`, the build's update channel),
 //!   `written_at`, and `notice`, the privacy warning.
 //! - `fatal_error`: only in a crash report, right after the header: `error`,
 //!   the error's name, `message`, the same plain words fx shows, and `at`, the
@@ -141,7 +142,12 @@
 //!   `kind`, `source`, `error`, `status`, `duration_ms`, `response_bytes`,
 //!   `input_tokens`, `output_tokens`, `web_search_requests` (web search calls
 //!   only), `stop_reason`, `provider_stop_reason`, `turn_id`, `step_id`, and
-//!   the masked `gateway_error`, `gateway_schema`, and `request_shape`.
+//!   the masked `gateway_error`, `gateway_schema`, and `request_shape`. A
+//!   gateway call that got a provider result also has `generation_id` (the
+//!   gateway's ID for the generation), `served_by` (the provider that served
+//!   it), and `effort` (the reasoning effort the request sent). The first two
+//!   are cut to 256 bytes and `effort` to 64; each is left out when unknown or
+//!   unsent.
 //!   The `network` record also has `kept_failures`, the failed calls kept
 //!   apart from the ring, at most 32, which later successful calls never
 //!   push out (0 when none failed); `session.errors` counts every failed
@@ -345,6 +351,7 @@ const network_problems_shown: usize = 3;
 const tool_problems_shown: usize = 5;
 const compaction_problems_shown: usize = 3;
 const model_catalog_problems_shown: usize = 3;
+const output_limit_problems_shown: usize = 5;
 const trace_tail_bytes: usize = 6 * 1024;
 const trace_max_lines: usize = 80;
 
@@ -610,6 +617,7 @@ fn writeHeader(r: *Records, fx_version: []const u8, now_ms: i64) !void {
     try r.number("format_version", format_version);
     try r.text("fx_version", fx_version);
     try r.text("git_commit", build_options.git_commit);
+    try r.text("update_channel", build_options.update_channel);
     try r.time("written_at", now_ms);
     try r.text("notice", notice_text);
     try r.end();
@@ -891,6 +899,7 @@ noinline fn writeProblems(r: *Records, app: anytype) !void {
     try writeCompactionProblems(p);
     try writeMcpHostProblems(p, app);
     try writeModelCatalogProblems(p);
+    try writeOutputLimitProblems(p);
 
     try r.begin("problems");
     try r.number("count", p.count);
@@ -1031,6 +1040,33 @@ fn writeModelCatalogProblems(p: *Records) !void {
         try beginProblem(p, "model_catalog");
         try p.text("event", event.name());
         try p.optionalText("detail", event.detail());
+        try p.end();
+    }
+}
+
+/// The newest replies cut off at their output limit while they called tools.
+/// The provider answered each with a success, so the network problems never
+/// list them.
+fn writeOutputLimitProblems(p: *Records) !void {
+    var stops: [diagnostics.output_limit_stop_capacity]diagnostics.OutputLimitStop = undefined;
+    const count = diagnostics.snapshotOutputLimitStops(&stops);
+    var index = count;
+    while (index > count -| output_limit_problems_shown) {
+        index -= 1;
+        const stop = &stops[index];
+        try beginProblem(p, "output_limit");
+        try p.text("action", @tagName(stop.action));
+        try p.text("model", stop.model());
+        if (stop.subagent_id != 0) try p.number("subagent_id", stop.subagent_id);
+        try p.number("turn_id", stop.turn_id);
+        try p.number("step_id", stop.step_id);
+        if (stop.outputLimit()) |limit| try p.number("max_output_tokens", limit);
+        if (stop.outputTokens()) |tokens| try p.number("output_tokens", tokens);
+        if (stop.raisedTo()) |limit| try p.number("raised_to", limit);
+        try p.number("complete_tool_calls", stop.complete_calls);
+        try p.number("cut_tool_calls", stop.cut_calls);
+        if (stop.cutTool()) |tool| try p.text("cut_tool", traceToolDisplayName(tool));
+        try p.number("in_a_row", stop.in_a_row);
         try p.end();
     }
 }
@@ -1589,6 +1625,9 @@ fn writeNetworkCallFields(r: *Records, call: *const diagnostics.NetworkCall) !vo
     try r.optionalText("provider_stop_reason", call.providerStopReason());
     if (call.turn_id != 0) try r.number("turn_id", call.turn_id);
     if (call.step_id != 0) try r.number("step_id", call.step_id);
+    try r.optionalText("generation_id", call.generationId());
+    try r.optionalText("served_by", call.servedBy());
+    try r.optionalText("effort", call.effort());
     // Gateway text comes from outside fx, so it is masked like tool output.
     try r.optionalMasked("gateway_error", call.gatewayErrorMessage());
     try r.optionalMasked("gateway_schema", call.gatewaySchemaDiagnostic());
@@ -3204,6 +3243,52 @@ test "trace header and end records frame the file" {
     const last = trace.records[trace.records.len - 1];
     try std.testing.expectEqualStrings("end", try testString(last, "type"));
     try std.testing.expectEqual(@as(i64, 2), try testInt(last, "records"));
+}
+
+test "trace header names the build's update channel" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeHeader(&w.records, "9.9.9", 1_700_000_000_123);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqualStrings(build_options.update_channel, try testString(trace.records[0], "update_channel"));
+}
+
+test "network call record writes the generation, served-by, and effort the request sent" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var call: diagnostics.NetworkCall = .{ .started_at_ms = 1_700_000_000_123, .status = 200 };
+    call.setModel("provider/model-a");
+    call.setGenerationId("gen_01JC7P5XQ2M8VZ");
+    call.setServedBy("bedrock");
+    call.setEffort("high");
+    try w.records.begin("network_call");
+    try writeNetworkCallFields(&w.records, &call);
+    try w.records.end();
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    const record = try trace.one("network_call");
+    try std.testing.expectEqualStrings("gen_01JC7P5XQ2M8VZ", try testString(record, "generation_id"));
+    try std.testing.expectEqualStrings("bedrock", try testString(record, "served_by"));
+    try std.testing.expectEqualStrings("high", try testString(record, "effort"));
+}
+
+test "network call record leaves out the generation, served-by, and effort when none were sent" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var call: diagnostics.NetworkCall = .{ .started_at_ms = 1_700_000_000_123, .status = 200 };
+    call.setModel("provider/model-a");
+    try w.records.begin("network_call");
+    try writeNetworkCallFields(&w.records, &call);
+    try w.records.end();
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    const record = try trace.one("network_call");
+    try expectAbsent(record, "generation_id");
+    try expectAbsent(record, "served_by");
+    try expectAbsent(record, "effort");
 }
 
 test "fatal error record names the error and the words fx shows" {
@@ -5495,6 +5580,66 @@ test "trace problems list the newest kept failures the windows no longer hold" {
         var buf: [32]u8 = undefined;
         try std.testing.expectEqualStrings(try std.mem.print(&buf, "model=m{d}", .{failures - index}), try testString(problem, "detail"));
     }
+}
+
+test "trace problems list replies cut off at their output limit and what fx did next" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    // A cut reply's network call succeeded, so it is no network problem.
+    diagnostics.recordNetworkCall(.{ .started_at_ms = 1_000, .status = 200 });
+    diagnostics.recordOutputLimitStop(.{
+        .model = "google/gemini-4-neon",
+        .subagent_id = 110,
+        .turn_id = 429,
+        .step_id = 11490,
+        .output_limit = 32_768,
+        .raised_to = 65_536,
+        .output_tokens = 32_768,
+        .complete_calls = 6,
+        .cut_calls = 1,
+        .in_a_row = 1,
+        .cut_tool = "edit_file",
+        .action = .ran_complete_calls,
+    });
+    diagnostics.recordOutputLimitStop(.{
+        .model = "google/gemini-4-neon",
+        .turn_id = 430,
+        .step_id = 11600,
+        .output_limit = null,
+        .raised_to = null,
+        .output_tokens = null,
+        .complete_calls = 0,
+        .cut_calls = 1,
+        .in_a_row = 3,
+        .cut_tool = null,
+        .action = .ended_turn,
+    });
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeNetworkProblems(&w.records);
+    try writeOutputLimitProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqual(@as(usize, 2), trace.count("problem"));
+    // The newest first.
+    const ended = try trace.nth("problem", 0);
+    try std.testing.expectEqualStrings("output_limit", try testString(ended, "kind"));
+    try std.testing.expectEqualStrings("ended_turn", try testString(ended, "action"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(ended, "in_a_row"));
+    try std.testing.expect(ended.get("max_output_tokens") == null);
+    try std.testing.expect(ended.get("subagent_id") == null);
+    try std.testing.expect(ended.get("cut_tool") == null);
+    const ran = try trace.nth("problem", 1);
+    try std.testing.expectEqualStrings("ran_complete_calls", try testString(ran, "action"));
+    try std.testing.expectEqualStrings("google/gemini-4-neon", try testString(ran, "model"));
+    try std.testing.expectEqual(@as(i64, 110), try testInt(ran, "subagent_id"));
+    try std.testing.expectEqual(@as(i64, 32_768), try testInt(ran, "max_output_tokens"));
+    try std.testing.expectEqual(@as(i64, 32_768), try testInt(ran, "output_tokens"));
+    try std.testing.expectEqual(@as(i64, 65_536), try testInt(ran, "raised_to"));
+    try std.testing.expectEqual(@as(i64, 6), try testInt(ran, "complete_tool_calls"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(ran, "cut_tool_calls"));
+    try std.testing.expectEqualStrings("edit_file", try testString(ran, "cut_tool"));
 }
 
 test "trace failures count the session's failures past what is kept" {

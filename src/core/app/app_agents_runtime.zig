@@ -1221,7 +1221,7 @@ pub fn Runtime(comptime App: type) type {
             for (app.child_agents.items) |child| {
                 if (!lendsTo(app, child, borrower)) continue;
                 const approval = &child.agent.approval_prompt;
-                if (approval.isActive() and approval.rule_management == null) {
+                if (approval.isActive() and approval.rule_management == null and !parentRoutedApproval(child)) {
                     if (oldest == null or child.approval_asked < oldest.?.asked) oldest = .{ .child = child, .kind = .approval, .asked = child.approval_asked };
                 }
                 if (child.agent.question_prompt.isActive()) {
@@ -1285,8 +1285,10 @@ pub fn Runtime(comptime App: type) type {
         /// Lends `child`'s approval to `borrower`'s prompt. Its request comes
         /// from the subagent's own worker and stays labeled with its name.
         /// It goes back when the subagent is shown, the instance gets its
-        /// own, or the subagent stops waiting (`keepLentApproval`).
+        /// own, or the subagent stops waiting (`keepLentApproval`). A request
+        /// main answers is never lent: main's screen does not show it.
         fn lendApproval(app: *App, borrower: *AppAgent, child: *ChildAgent) void {
+            if (parentRoutedApproval(child)) return;
             std.mem.swap(@TypeOf(child.agent.approval_prompt), &borrower.approval_prompt, &child.agent.approval_prompt);
             app.approval_lender = child;
             debug_trace.eventf("host", "approval_lent", .{}, "agent={s}", .{child.id});
@@ -1609,7 +1611,9 @@ pub fn Runtime(comptime App: type) type {
             }
             for (app.child_agents.items) |child| {
                 if (child == app.agent_on_screen) continue;
-                const approval = child.agent.approval_prompt.isActive();
+                // A request main answers is not a wait for the person: the
+                // screen shows no prompt for it and the footer stays quiet.
+                const approval = child.agent.approval_prompt.isActive() and !parentRoutedApproval(child);
                 const asks = child.agent.question_prompt.isActive();
                 if (!approval and !asks and !requestWaitsForUser(app, child)) continue;
                 if (!found) {
@@ -1725,9 +1729,37 @@ pub fn Runtime(comptime App: type) type {
         /// keep working: the restart waits until they finish
         /// (`anyTurnRunning`), so an upgrade loses none of their work.
         pub fn requestYields(app: *App) void {
-            app.main_agent.worker.requestYield();
+            yieldStepOnRestartAgents(app, .request);
+        }
+
+        /// Lets the turns held for the restart return (`WorkerRuntime.releaseYield`),
+        /// on the agents `requestYields` asked.
+        pub fn releaseYields(app: *App) void {
+            yieldStepOnRestartAgents(app, .release);
+        }
+
+        /// Takes back `requestYields` when the restart is cancelled
+        /// (`WorkerRuntime.cancelYield`).
+        pub fn cancelYields(app: *App) void {
+            yieldStepOnRestartAgents(app, .cancel);
+        }
+
+        const YieldStep = enum { request, release, cancel };
+
+        /// Takes `step` on the workers an upgrade's restart stops between
+        /// steps: main's and the other instances'.
+        fn yieldStepOnRestartAgents(app: *App, comptime step: YieldStep) void {
+            yieldStep(&app.main_agent.worker, step);
             for (app.child_agents.items) |child| {
-                if (child.agent.role == .instance) child.agent.worker.requestYield();
+                if (child.agent.role == .instance) yieldStep(&child.agent.worker, step);
+            }
+        }
+
+        fn yieldStep(worker: anytype, comptime step: YieldStep) void {
+            switch (step) {
+                .request => worker.requestYield(),
+                .release => worker.releaseYield(),
+                .cancel => worker.cancelYield(),
             }
         }
 
@@ -1737,14 +1769,30 @@ pub fn Runtime(comptime App: type) type {
         /// for the main loop to deliver it. An upgrade's restart waits until
         /// none does.
         pub fn anyTurnRunning(app: *App) bool {
-            if (app.main_agent.worker.isProcessing() or app.main_agent.worker.hasPendingEvents()) return true;
+            return anyTurnBusy(app, false);
+        }
+
+        /// As `anyTurnRunning`, with a turn held at its step boundary for the
+        /// restart counted as stopped: the restart lets the held turns return
+        /// once this is false (`tests/tla/recovery/RestartWait.tla` Release).
+        pub fn anyTurnUnheld(app: *App) bool {
+            return anyTurnBusy(app, true);
+        }
+
+        fn anyTurnBusy(app: *App, comptime held_counts_as_stopped: bool) bool {
+            if (workerBusy(&app.main_agent.worker, held_counts_as_stopped)) return true;
             for (app.child_agents.items) |child| {
                 const worker = &child.agent.worker;
-                if (worker.isProcessing() or worker.hasPendingEvents()) return true;
+                if (workerBusy(worker, held_counts_as_stopped)) return true;
                 // Only instances hold their queued work, so a subagent's runs.
                 if (child.agent.role == .subagent and worker.queuedPromptCount() > 0) return true;
             }
-            return deliveriesPending(app);
+            return deliveriesPending(app, null);
+        }
+
+        fn workerBusy(worker: anytype, comptime held_counts_as_stopped: bool) bool {
+            const runs = if (held_counts_as_stopped) worker.turnActivity() == .running else worker.isProcessing();
+            return runs or worker.hasPendingEvents();
         }
 
         /// Whether a subagent runs work, has work queued, or holds events
@@ -1759,11 +1807,17 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Whether a child's report or a hand-off waits for the main loop to
-        /// deliver it (`takePosts`).
-        fn deliveriesPending(app: *App) bool {
+        /// deliver it (`takePosts`): any report, or only `host`'s when given.
+        /// A hand-off does not name its host, so every one counts.
+        fn deliveriesPending(app: *App, host: ?*subagent_tool_host.Runtime) bool {
             app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
             defer app.child_handoffs.mutex.unlock(io_mod.getIo());
-            return app.child_handoffs.posts.items.len > 0 or app.child_handoffs.reports.items.len > 0;
+            if (app.child_handoffs.posts.items.len > 0) return true;
+            const wanted = host orelse return app.child_handoffs.reports.items.len > 0;
+            for (app.child_handoffs.reports.items) |report| {
+                if (report.host == wanted) return true;
+            }
+            return false;
         }
 
         /// Logs the work each agent still holds as fx exits for an upgrade's
@@ -1835,11 +1889,33 @@ pub fn Runtime(comptime App: type) type {
             if (turnInFlight(screen)) return 0;
             var count: usize = 0;
             for (app.child_agents.items) |child| {
-                if (child.agent.role != .subagent) continue;
-                if (ownerOf(app, hostOf(app, child)) != screen) continue;
-                if (turnInFlight(&child.agent) or resultPending(app, child)) count += 1;
+                if (ownSubagentWorking(app, screen, child)) count += 1;
             }
             return count;
+        }
+
+        fn ownSubagentWorking(app: *App, owner: @TypeOf(agents.screenAgentOf(app)), child: *ChildAgent) bool {
+            return child.agent.role == .subagent and
+                ownerOf(app, hostOf(app, child)) == owner and
+                (turnInFlight(&child.agent) or resultPending(app, child));
+        }
+
+        /// Whether the agent on screen waits on its subagents: one works or
+        /// holds an unapplied result, its host stays busy until the report is
+        /// posted, or the report is not handed over yet. Main loop only.
+        pub fn screenSubagentsWorking(app: *App) bool {
+            const screen = agents.screenAgentOf(app);
+            for (app.child_agents.items) |child| {
+                if (ownSubagentWorking(app, screen, child)) return true;
+            }
+            const host: ?*subagent_tool_host.Runtime = if (comptime agents.hasAgentField(App, "session_persistence")) screen.session_persistence.subagent_host else null;
+            const own_host = host orelse return false;
+            return !own_host.quiet() or deliveriesPending(app, own_host);
+        }
+
+        /// Main loop only.
+        pub fn screenWorkGoing(app: *App) bool {
+            return turnInFlight(agents.screenAgentOf(app)) or screenSubagentsWorking(app);
         }
 
         /// The activity row for an agent on screen whose turn ended while its
@@ -2515,9 +2591,27 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
+        /// The person answered a subagent's request on its own screen, so the
+        /// registry binding goes with it. An agent that is not a hosted child
+        /// does nothing.
+        pub fn withdrawAnsweredApproval(app: *App, agent: *AppAgent) void {
+            const child = hostedOf(app, agent) orelse return;
+            const host = hostOf(app, child) orelse return;
+            _ = host.withdrawAnsweredApproval(child.id);
+        }
+
         fn hostedOf(app: *App, agent: *const AppAgent) ?*ChildAgent {
             for (app.child_agents.items) |child| if (&child.agent == agent) return child;
             return null;
+        }
+
+        /// Whether `child`'s waiting approval came from a run main started. Main
+        /// answers those, so no instance's screen lends one and the footer and
+        /// the agent list never say the child needs the person
+        /// (`tests/tla/subagent/TuiParentApproval.tla` NoPersonPromptForParentRouted).
+        fn parentRoutedApproval(child: *const ChildAgent) bool {
+            const run = if (child.agent.child_run) |*value| value else return false;
+            return run.turn != null and run.startedByParent();
         }
 
         /// A subagent's approval or question is lent to an instance's screen
@@ -2720,6 +2814,9 @@ pub fn Runtime(comptime App: type) type {
             if (target) |child| {
                 if (app.approval_lender == child) return .needs_approval;
                 if (app.question_lender == child) return .has_question;
+                // A request main answers is main's work, not a wait for the
+                // person, so the list says working, not "needs approval".
+                if (parentRoutedApproval(child) and child.agent.approval_prompt.isActive()) return .working;
             }
             const last_end: LastEnd = if (target) |child| (if (child.agent.role == .subagent) child.last_end else .done) else .done;
             const state = instanceState(targetAgent(app, target), requestWaitsForUser(app, target), last_end);
@@ -3514,6 +3611,10 @@ pub fn Runtime(comptime App: type) type {
             noteLastEnd(app, agent, finished);
             const run = runInFlight(app, agent) orelse userWorkRun(app, agent) orelse return;
             run.ended_as = finished.outcome;
+            // The parent hears why, such as a reply cut off at the output
+            // limit, in place of `agent_turn_failed`. A provider's own error
+            // the worker kept stays first.
+            if (run.failure == null) run.failure = types.turnFailureFor(finished);
             if (finished.outcome == .interrupted and agent.worker.handedOff(finished.turn_id)) {
                 run.handed_off = true;
                 debug_trace.eventf("host", "child_turn_handed_off", .{}, "agent={s} work_id={s} turn_id={d}", .{ run.child_id, run.work_id, finished.turn_id });
