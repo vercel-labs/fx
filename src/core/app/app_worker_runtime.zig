@@ -836,6 +836,30 @@ pub fn Runtime(comptime App: type) type {
             try pushOwnedEvent(app, agent, .{ .diff_block = payload });
         }
 
+        /// Mirrors the pending request's file review into the approval prompt.
+        /// The prompt gets its own copy, taken under the worker's lock
+        /// (`WorkerRuntime.copyPendingReview`): the tool call that built the
+        /// review frees it as soon as its request is answered, and the answer
+        /// can come from another thread, so the snapshot's pointer only tells
+        /// one review from another and is never read. Returns whether the
+        /// prompt's review changed.
+        fn syncApprovalReview(
+            app: *App,
+            agent: *AppAgent,
+            waiting: ?worker_runtime.PendingPermissionReview,
+        ) bool {
+            const prompt = &agent.approval_prompt;
+            if (waiting) |pending| {
+                if (prompt.reviewCopyMatches(pending.request_id, pending.review)) return false;
+                const review = agent.worker.copyPendingReview(app.alloc, pending.request_id) catch |err| {
+                    debug_trace.logf("approval", "review copy dropped request={d} reason={s}", .{ pending.request_id, @errorName(err) });
+                    return false;
+                };
+                return prompt.adoptReview(app.alloc, pending.request_id, pending.review, review);
+            }
+            return prompt.adoptReview(app.alloc, null, null, null);
+        }
+
         pub fn syncState(
             app: *App,
             agent: *AppAgent,
@@ -875,19 +899,21 @@ pub fn Runtime(comptime App: type) type {
                 false
             else
                 agent.approval_prompt.syncRequest(app.alloc, pending_request) catch false;
-            const review_changed = if (comptime @hasDecl(@TypeOf(agent.approval_prompt), "syncReview")) blk: {
+            const review_changed = if (comptime @hasDecl(@TypeOf(agent.approval_prompt), "adoptReview") and
+                @hasDecl(@TypeOf(agent.worker), "copyPendingReview"))
+            blk: {
                 if (keep_lent) break :blk false;
-                const review = if (comptime @hasField(@TypeOf(snapshot), "pending_permission_review"))
+                const waiting: ?worker_runtime.PendingPermissionReview = if (comptime @hasField(@TypeOf(snapshot), "pending_permission_review"))
                     if (snapshot.pending_permission_review) |pending|
                         if (pending_request) |request|
-                            if (pending.request_id == request.id) pending.review else null
+                            if (pending.request_id == request.id) pending else null
                         else
                             null
                     else
                         null
                 else
                     null;
-                break :blk agent.approval_prompt.syncReview(review);
+                break :blk syncApprovalReview(app, agent, waiting);
             } else false;
             if (approval_changed and in_child and agent.approval_prompt.isActive()) {
                 debug_trace.eventf("host", "approval_requested", .{}, "agent={s}", .{subagentIdOf(app, agent).?});
@@ -1428,6 +1454,11 @@ pub fn Runtime(comptime App: type) type {
                             if (!was_active and agent.question_prompt.isActive()) {
                                 if (comptime @hasDecl(App, "notePromptAsked")) {
                                     if (isSubagent(app, agent)) app.notePromptAsked(agent, .question);
+                                }
+                                // Main hears of a wait it cannot answer, with a
+                                // fixed reason and none of the item's text.
+                                if (comptime @hasDecl(App, "noteChildQuestionPrompt")) {
+                                    if (isSubagent(app, agent)) app.noteChildQuestionPrompt(agent, question_snapshot.source);
                                 }
                                 app.shell.render_requests.request(.modal);
                                 if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
@@ -2036,6 +2067,15 @@ const FakeWorker = struct {
         };
     }
 
+    /// A copy of the review the pending request waits on, as
+    /// `WorkerRuntime.copyPendingReview` gives the app one.
+    pub fn copyPendingReview(self: *FakeWorker, alloc: std.mem.Allocator, request_id: u64) std.mem.Allocator.Error!?diff_mod.OwnedReview {
+        const request = self.pending_permission_request orelse return null;
+        if (request.id != request_id) return null;
+        const review = self.pending_permission_review orelse return null;
+        return try diff_mod.OwnedReview.init(alloc, review);
+    }
+
     pub fn interactiveAdmissionSnapshot(self: *FakeWorker) worker_runtime.InteractiveAdmissionSnapshot {
         return self.admission_snapshot;
     }
@@ -2088,12 +2128,23 @@ const FakeApprovalPrompt = struct {
     sync_count: usize = 0,
     force_active: bool = false,
     request: ?permission_request.OwnedPermissionRequest = null,
-    review: ?*const diff_mod.FileReview = null,
+    review: ?diff_mod.OwnedReview = null,
+    /// The review the owned copy was taken from, only to tell one review from
+    /// another, as `ApprovalPrompt` does.
+    review_source: ?*const diff_mod.FileReview = null,
     review_request_id: u64 = 0,
 
     fn deinit(self: *FakeApprovalPrompt, alloc: std.mem.Allocator) void {
         if (self.request) |*request| request.deinit(alloc);
         self.request = null;
+        self.clearReview(alloc);
+    }
+
+    fn clearReview(self: *FakeApprovalPrompt, alloc: std.mem.Allocator) void {
+        if (self.review) |*owned| owned.deinit(alloc);
+        self.review = null;
+        self.review_source = null;
+        self.review_request_id = 0;
     }
 
     fn syncRequest(
@@ -2111,21 +2162,38 @@ const FakeApprovalPrompt = struct {
         const changed = self.request != null;
         if (self.request) |*current| current.deinit(alloc);
         self.request = null;
-        self.review = null;
-        self.review_request_id = 0;
+        self.clearReview(alloc);
         return changed;
     }
 
-    pub fn syncReview(self: *FakeApprovalPrompt, review: ?*const diff_mod.FileReview) bool {
-        const request = self.request orelse {
+    fn reviewCopyMatches(self: *const FakeApprovalPrompt, request_id: u64, source: ?*const diff_mod.FileReview) bool {
+        return self.review_request_id == request_id and self.review_source == source;
+    }
+
+    /// Takes `review` as this fake's copy, freeing it when it cannot keep it,
+    /// as `ApprovalPrompt.adoptReview` does.
+    pub fn adoptReview(
+        self: *FakeApprovalPrompt,
+        alloc: std.mem.Allocator,
+        request_id: ?u64,
+        source: ?*const diff_mod.FileReview,
+        review: ?diff_mod.OwnedReview,
+    ) bool {
+        var incoming = review;
+        const keeps = if (request_id) |id|
+            if (self.request) |request| request.id == id else false
+        else
+            false;
+        if (!keeps) {
+            if (incoming) |*owned| owned.deinit(alloc);
             const changed = self.review != null;
-            self.review = null;
-            self.review_request_id = 0;
+            self.clearReview(alloc);
             return changed;
-        };
-        if (self.review == review and self.review_request_id == request.id) return false;
-        self.review = review;
-        self.review_request_id = if (review == null) 0 else request.id;
+        }
+        self.clearReview(alloc);
+        self.review = incoming;
+        self.review_source = source;
+        self.review_request_id = if (incoming == null) 0 else request_id.?;
         return true;
     }
 
@@ -3851,7 +3919,8 @@ test "core.app_worker_runtime syncState mirrors approvals without opening a pend
         @as(?u32, 2),
         app.agent().approval_prompt.request.?.file.?.preview.lines[0].old_line,
     );
-    try std.testing.expect(app.agent().approval_prompt.review == &review);
+    try std.testing.expect(app.agent().approval_prompt.review != null);
+    try std.testing.expect(app.agent().approval_prompt.review_source == &review);
     try std.testing.expectEqual(
         app.agent().approval_prompt.request.?.id,
         app.agent().approval_prompt.review_request_id,
@@ -3871,7 +3940,15 @@ test "core.app_worker_runtime syncState mirrors approvals without opening a pend
     app.agent().worker.pending_permission_review = &replacement_review;
     Runtime(FakeApp).syncState(&app, (&app).agent(), NoopBridge.lifecyclePresenter(&app));
 
-    try std.testing.expect(app.agent().approval_prompt.review == &replacement_review);
+    try std.testing.expect(app.agent().approval_prompt.review_source == &replacement_review);
+    const kept = &(app.agent().approval_prompt.review orelse return error.MissingReview);
+    const viewport = try kept.view().viewport(std.testing.allocator, 0, kept.view().rowCount());
+    defer std.testing.allocator.free(viewport.lines);
+    var shows_replacement = false;
+    for (viewport.lines) |line| {
+        shows_replacement = shows_replacement or std.mem.eql(u8, line.text, "after again");
+    }
+    try std.testing.expect(shows_replacement);
     try std.testing.expectEqual(@as(usize, 0), app.approval_screen.document_scroll_rows);
     try std.testing.expect(app.approval_screen.screen_commit == null);
 
