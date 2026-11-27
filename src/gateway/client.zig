@@ -22,6 +22,7 @@ const json_depth = @import("../core/shared/json_depth.zig");
 const host_stream_provider = @import("host_stream_provider.zig");
 const open_job = @import("../core/shared/open_job.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
+const raw_answer_testing = @import("raw_answer_testing.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
@@ -667,6 +668,10 @@ fn fetchGatewayJsonAtUrlCore(
         alloc.free(body);
         return error.Cancelled;
     }
+    if (plainBodyCutOff(&response, body.len)) {
+        alloc.free(body);
+        return error.HttpBodyCutOff;
+    }
     return .{ .success = body };
 }
 
@@ -691,7 +696,13 @@ fn decodeGatewayJsonBody(
 
     var decompress: std.http.Decompress = undefined;
     const reader = std.http.Decompress.init(&decompress, raw_reader, decompress_buffer, encoding);
-    return readGatewayJsonBody(alloc, reader, max_bytes);
+    // ReadFailed alone hides why the body failed; the decoder's error says whether it was cut off or broken.
+    return readGatewayJsonBody(alloc, reader, max_bytes) catch |err| {
+        if (err == error.ReadFailed) {
+            if (decompressError(encoding, &decompress)) |decoded| return decoded;
+        }
+        return err;
+    };
 }
 
 /// Returns the caller-owned body, or `error.GatewayJsonResponseTooLarge` when
@@ -734,10 +745,14 @@ test "gateway JSON body decode rejects malformed gzip and enforces size cap" {
     try std.testing.expectEqualStrings(sample, decoded);
 
     var truncated_reader = std.Io.Reader.fixed(gzip_bytes[0 .. gzip_bytes.len - 4]);
-    try std.testing.expectError(error.ReadFailed, decodeGatewayJsonBody(alloc, .gzip, &truncated_reader, max_gateway_json_bytes));
+    try std.testing.expectError(error.EndOfStream, decodeGatewayJsonBody(alloc, .gzip, &truncated_reader, max_gateway_json_bytes));
 
+    // The fixture ends inside a deflate block header, so the decoder reports the end of its input.
     var corrupt_reader = std.Io.Reader.fixed("\x1f\x8b\x08\x00bad-gzip");
-    try std.testing.expectError(error.ReadFailed, decodeGatewayJsonBody(alloc, .gzip, &corrupt_reader, max_gateway_json_bytes));
+    try std.testing.expectError(error.EndOfStream, decodeGatewayJsonBody(alloc, .gzip, &corrupt_reader, max_gateway_json_bytes));
+
+    var not_gzip_reader = std.Io.Reader.fixed(sample);
+    try std.testing.expectError(error.BadGzipHeader, decodeGatewayJsonBody(alloc, .gzip, &not_gzip_reader, max_gateway_json_bytes));
 
     var compress_reader = std.Io.Reader.fixed(sample);
     try std.testing.expectError(
@@ -750,6 +765,30 @@ test "gateway JSON body decode rejects malformed gzip and enforces size cap" {
         error.GatewayJsonResponseTooLarge,
         decodeGatewayJsonBody(alloc, .gzip, &cap_reader, sample.len - 1),
     );
+}
+
+/// Serves `answer` once, then reads it with the AI Gateway catalog reader.
+fn readGatewayJsonFromLoopbackAnswer(answer: []const u8) !GatewayJsonResult {
+    const alloc = std.testing.allocator;
+    var server = try raw_answer_testing.AnswerServer.start(alloc, answer);
+    const url = try server.url(alloc, "/v1/models");
+    defer alloc.free(url);
+    var cancel = std.atomic.Value(bool).init(false);
+    const result = fetchGatewayJsonAtUrlCancellable(alloc, null, null, url, &cancel, gateway_json_fetch_timeout_ms, null);
+    try server.finish();
+    return result;
+}
+
+test "gateway JSON reader reports a 200 body cut inside its Content-Length as cut off" {
+    try std.testing.expectError(error.HttpBodyCutOff, readGatewayJsonFromLoopbackAnswer(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"data\":[]}",
+    ));
+}
+
+test "gateway JSON reader returns the gzip decoder's error for a body marked gzip that is not gzip" {
+    try std.testing.expectError(error.BadGzipHeader, readGatewayJsonFromLoopbackAnswer(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}",
+    ));
 }
 
 fn fuzzGatewayJsonDecode(_: void, smith: *std.testing.Smith) !void {
@@ -2985,14 +3024,19 @@ fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchO
         },
         else => |e| return e,
     };
-    // The std reader ends a short body quietly. Chunked framing wins over
-    // Content-Length (RFC 9112 6.3), and an error status keeps its own category.
-    if (require_whole_body and response.head.status == .ok and response.head.transfer_encoding == .none and response.head.content_encoding == .identity) {
-        if (response.head.content_length) |expected| {
-            if (body_len < expected) return error.HttpBodyCutOff;
-        }
-    }
+    if (require_whole_body and plainBodyCutOff(&response, body_len)) return error.HttpBodyCutOff;
     return .{ .status = response.head.status };
+}
+
+/// True when a plain 200 body is shorter than its Content-Length. The std
+/// reader ends a short body quietly, so the caller counts the bytes it read.
+/// Chunked framing wins over Content-Length (RFC 9112 6.3), an error status
+/// keeps its own category, and a compressed body is checked by its decoder.
+fn plainBodyCutOff(response: *const std.http.Client.Response, body_len: usize) bool {
+    const head = &response.head;
+    if (head.status != .ok or head.transfer_encoding != .none or head.content_encoding != .identity) return false;
+    const expected = head.content_length orelse return false;
+    return body_len < expected;
 }
 
 /// The decoder's own error. ReadFailed means the input read failed, and an

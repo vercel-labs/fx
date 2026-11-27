@@ -17,6 +17,8 @@ if (backend === "wasm" && !supportsJspi()) {
 }
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
+const pins = await readFile(resolve(scriptDir, "../../src/core/gateway/provider_versions.zig"), "utf8");
+const grokClientVersion = pins.match(/pub const grok_client_version = "(\d+\.\d+\.\d+)";/)[1];
 const backendOptions = {
   backend,
   nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
@@ -44,7 +46,7 @@ const replySse =
   'data: {"type":"response.output_text.delta","output_index":0,"delta":"libfx on grok"}\n\n' +
   'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":23,"output_tokens":7}}}\n\n';
 
-/** A host fetch that plays x.ai's version file, the subscription proxy, and xAI's OAuth endpoints. */
+/** A host fetch that plays the subscription proxy and xAI's OAuth endpoints. */
 function grokWorld({ rejectFirstReply = false, rejectToken, refreshedToken = "unused", refreshedAccount = accountId }) {
   const log = [];
   let replies = 0;
@@ -54,7 +56,6 @@ function grokWorld({ rejectFirstReply = false, rejectToken, refreshedToken = "un
     const headers = new Headers(init.headers);
     const body = init.body === undefined ? undefined : typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body);
     log.push({ method, url, headers, body });
-    if (url === "https://x.ai/cli/stable") return new Response("1.0.50\n");
     if (url === modelsUrl) return Response.json(models);
     if (url === languageModelsUrl) return Response.json(languageModels);
     if (url === tokenUrl && method === "POST") {
@@ -106,6 +107,7 @@ const assertNoSecrets = (value, secrets) => {
   assert.equal(result.stopReason, "end_turn");
   assert.equal(text, "libfx on grok");
   assert.equal(world.log.some((entry) => entry.url.includes("ai-gateway.vercel.sh")), false, "a Grok agent must not call AI Gateway");
+  assert.equal(world.log.some((entry) => entry.url.startsWith("https://x.ai/")), false, "the Grok client version is pinned, not looked up");
   assert.equal(world.log.some((entry) => entry.url.startsWith("https://auth.x.ai/")), false, "fresh credentials need no refresh");
   const [reply] = replyRequests(world.log);
   assert.ok(reply, "the turn must reach Grok");
@@ -113,7 +115,7 @@ const assertNoSecrets = (value, secrets) => {
   assert.equal(reply.headers.get("x-grok-user-id"), accountId);
   assert.equal(reply.headers.get("X-XAI-Token-Auth"), "xai-grok-cli");
   assert.equal(reply.headers.get("x-authenticateresponse"), "authenticate-response");
-  assert.equal(reply.headers.get("x-grok-client-version"), "1.0.50");
+  assert.equal(reply.headers.get("x-grok-client-version"), grokClientVersion);
   assert.equal(reply.headers.get("x-grok-client-identifier"), "fx");
   assert.equal(reply.headers.get("x-grok-model-override"), "grok-4.5");
   const sessionId = reply.headers.get("x-grok-conv-id");
