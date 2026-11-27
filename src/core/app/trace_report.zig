@@ -196,7 +196,7 @@
 //!   `args_omitted_bytes` or `result_omitted_bytes`. A `web_fetch` call has no
 //!   arguments or result.
 //! - `permissions`: `grants`; then a `permission_grant` per grant: `tool`,
-//!   `target`.
+//!   `target` (masked).
 //! - `auto_reviews`: the auto-mode safety reviews this session. `reviews`
 //!   counts the reviews fx made or tried, `outcomes` {`clear`, `caution`,
 //!   `unavailable`, `held`, `error`} splits them, and `reused` counts the
@@ -2072,7 +2072,7 @@ fn writePermissions(r: *Records, grants: []const types.PermissionGrant) !void {
     for (grants) |grant| {
         try r.begin("permission_grant");
         try r.text("tool", traceToolDisplayName(grant.tool_name));
-        try r.text("target", grant.target_path);
+        try r.masked("target", grant.target_path);
         try r.end();
     }
 }
@@ -6076,6 +6076,7 @@ test "trace permissions and MCP servers become records with errors masked" {
     const grants = [_]types.PermissionGrant{
         .{ .tool_name = @constCast("exa_search"), .target_path = @constCast("*") },
         .{ .tool_name = @constCast("shell"), .target_path = @constCast("zig build") },
+        .{ .tool_name = @constCast("shell"), .target_path = @constCast("@fx-terminal-env:user:8:/bin/zsh::echo OPENAI_API_KEY=sk-G1abcdefghijklmnop12345") },
     };
     const w = try TestWriter.create();
     defer w.destroy();
@@ -6085,12 +6086,17 @@ test "trace permissions and MCP servers become records with errors masked" {
     var trace = try w.trace();
     defer trace.deinit();
     try expectNotIn(w.out.written(), "abcdefghijklmnop");
+    try expectNotIn(w.out.written(), "G1abcdefghijklmnop12345");
 
-    try std.testing.expectEqual(@as(i64, 2), try testInt(try trace.one("permissions"), "grants"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(try trace.one("permissions"), "grants"));
     const first_grant = try trace.nth("permission_grant", 0);
     try std.testing.expectEqualStrings("web_search", try testString(first_grant, "tool"));
     try std.testing.expectEqualStrings("*", try testString(first_grant, "target"));
     try std.testing.expectEqualStrings("zig build", try testString(try trace.nth("permission_grant", 1), "target"));
+    try std.testing.expectEqualStrings(
+        "@fx-terminal-env:user:8:/bin/zsh::echo OPENAI_API_KEY=[redacted]",
+        try testString(try trace.nth("permission_grant", 2), "target"),
+    );
 
     const context = try trace.one("runtime_context");
     try std.testing.expectEqual(@as(i64, 4), try testInt(context, "mcp_servers"));

@@ -224,12 +224,16 @@ pub const Decoder = struct {
                 self.recordEscapeByte(byte);
                 if (byte >= 0x40 and byte <= 0x7e) {
                     self.resetEscape();
-                } else if (byte < 0x20 or byte == 0x7f) {
+                } else if (byte < 0x20 or byte >= 0x7f) {
                     try self.flushIncompleteEscape(sink);
                 }
                 return true;
             },
             .osc => {
+                if (byte == '\n' or byte == '\r') {
+                    try self.flushIncompleteEscape(sink);
+                    return false;
+                }
                 try emitTransformProvenance(sink, .escape_byte, byte);
                 self.recordEscapeByte(byte);
                 if (byte == 0x07) {
@@ -263,7 +267,7 @@ pub const Decoder = struct {
 
     fn flushIncompleteEscape(self: *Decoder, sink: anytype) !void {
         for (self.escape_bytes[0..self.escape_len]) |byte| {
-            if (byte < 0x20 or byte == 0x7f) {
+            if (byte < 0x20 or byte >= 0x7f) {
                 try emitByteEscape(sink, byte);
             } else {
                 const bytes = [_]u8{byte};
@@ -685,6 +689,25 @@ test "canonical equality distinguishes transforms from literal projections" {
     try literal_result.append(alloc, .stdout, "\\x00");
     try literal_result.finish(alloc);
     try std.testing.expect(eql(literal_live, literal_result));
+}
+
+test "incomplete CSI escapes high bytes and unterminated OSC ends at newline" {
+    const alloc = std.testing.allocator;
+    var csi_out: CanonicalOutput = .{};
+    defer csi_out.deinit(alloc);
+    try csi_out.append(alloc, .stdout, "\x1b[\xc2\x9dok\n");
+    try csi_out.finish(alloc);
+    try std.testing.expect(csi_out.records.items.len > 0);
+    for (csi_out.records.items) |record| {
+        try std.testing.expect(std.mem.find(u8, record.text.items, "\xc2\x9d") == null);
+    }
+
+    var osc_out: CanonicalOutput = .{};
+    defer osc_out.deinit(alloc);
+    try osc_out.append(alloc, .stdout, "\x1b]0;unterminated\nsecond line\n");
+    try osc_out.finish(alloc);
+    try std.testing.expectEqual(@as(usize, 2), osc_out.records.items.len);
+    try std.testing.expectEqualStrings("second line", osc_out.records.items[1].text.items);
 }
 
 fn fuzzCommandOutputContent(_: void, smith: *std.testing.Smith) anyerror!void {
