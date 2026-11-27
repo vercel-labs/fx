@@ -730,7 +730,35 @@ pub fn dropEntries(self: anytype, alloc: Allocator, ids: []const u32) !bool {
     for (self.notebook.entries.items) |entry| {
         if (!entry_ids.contains(entry.id())) removed_bytes += entryRetainedBytes(entry);
     }
-    compactEntriesToRetainedSet(self, alloc, &entry_ids);
+    if (comptime hasNotebookField(@TypeOf(self.*), "mid_turn_prefix_dropped")) {
+        var active_start: usize = 0;
+        var idx = self.notebook.entries.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            switch (self.notebook.entries.items[idx]) {
+                .raw_bytes => |raw| if (raw.class == .turn_summary or raw.class == .turn_cancellation) {
+                    active_start = idx + 1;
+                    break;
+                },
+                else => {},
+            }
+        }
+        const dropped_active = for (self.notebook.entries.items[active_start..]) |entry| {
+            if (!entry_ids.contains(entry.id())) break true;
+        } else false;
+        compactEntriesToRetainedSet(self, alloc, &entry_ids);
+        if (dropped_active) {
+            self.notebook.mid_turn_prefix_dropped = true;
+        } else if (self.notebook.mid_turn_prefix_dropped) {
+            const rem = self.notebook.entries.items;
+            if (rem.len == 0 or rem[0] == .user_turn) {
+                self.notebook.mid_turn_prefix_dropped = false;
+                self.notebook.mid_turn_reprint_banner_active = false;
+            }
+        }
+    } else {
+        compactEntriesToRetainedSet(self, alloc, &entry_ids);
+    }
     if (coalesceCommandOutputPrunedRanges(self, alloc)) try rebuildEntryIdSet(self, alloc, &entry_ids);
     _ = pruneOrphanedFoldedCommandBlocks(self, alloc, &entry_ids);
     _ = pruneOrphanedCommandOutputBlocks(self, alloc, &entry_ids);
@@ -788,6 +816,13 @@ pub fn clearTranscript(self: anytype, alloc: Allocator) void {
     self.notebook.command_output_display = .{};
     self.notebook.replaceable_last_line = false;
     self.notebook.replaceable_start = 0;
+    if (comptime hasNotebookField(@TypeOf(self.*), "running_turn_recap")) {
+        self.notebook.running_turn_recap.reset(alloc);
+    }
+    if (comptime hasNotebookField(@TypeOf(self.*), "mid_turn_prefix_dropped")) {
+        self.notebook.mid_turn_prefix_dropped = false;
+        self.notebook.mid_turn_reprint_banner_active = false;
+    }
     self.resetPaintedTranscriptView(owned_top);
     requestTranscriptPaint(self);
 }
@@ -1653,6 +1688,10 @@ fn cloneMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
     if (comptime hasNotebookField(Runtime, "command_output_block_cap")) {
         shadow.notebook.command_output_block_cap = self.notebook.command_output_block_cap;
     }
+    if (comptime hasNotebookField(Runtime, "mid_turn_prefix_dropped")) {
+        shadow.notebook.mid_turn_prefix_dropped = self.notebook.mid_turn_prefix_dropped;
+        shadow.notebook.mid_turn_reprint_banner_active = self.notebook.mid_turn_reprint_banner_active;
+    }
     if (comptime @hasDecl(Runtime, "borrowedFrozenPrefix")) {
         shadow.frozen_prefix_source = self.borrowedFrozenPrefix();
     }
@@ -1786,6 +1825,10 @@ fn commitMutationStateWithReconciliationSource(
     self.notebook.command_output_display = shadow.notebook.command_output_display;
     self.notebook.replaceable_last_line = shadow.notebook.replaceable_last_line;
     self.notebook.replaceable_start = shadow.notebook.replaceable_start;
+    if (comptime hasNotebookField(Runtime, "mid_turn_prefix_dropped")) {
+        self.notebook.mid_turn_prefix_dropped = shadow.notebook.mid_turn_prefix_dropped;
+        self.notebook.mid_turn_reprint_banner_active = shadow.notebook.mid_turn_reprint_banner_active;
+    }
     self.adoptCommittedTranscriptView(shadow);
     if (requested) {
         if (!preserves_entry_prefix) {

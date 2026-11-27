@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { onlySessionId, sessionDir } from "./saved-sessions";
 
 // The shared tmux helper imports eval helpers; do not load repository dotenv files.
 process.env.FX_E2E_DISABLE_DOTENV = "1";
-const { FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, startFakeGateway, tmuxAvailable,
+const { FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, fakeGatewaySse, startDynamicFakeGateway, startFakeGateway, tmuxAvailable,
   turnSettled,
   hasEmptyComposer,
 } = await import("./tmux-helpers");
@@ -210,5 +210,170 @@ describe.skipIf(!tmuxAvailable())("tui: transcript window", () => {
       }
     },
     300_000,
+  );
+
+  test(
+    "mid-turn compaction drops pre-compaction entries before turn end, reprints from compaction with Earlier in this turn: Ctrl+O, and keeps them in Ctrl+O",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-midturn-drop-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      for (let i = 1; i <= 12; i += 1) {
+        writeFileSync(join(workspace, `early_${i}.txt`), `early file ${i}\n`);
+      }
+      writeFileSync(join(workspace, "post_compact.txt"), "post compact file\n");
+
+      const STEP_PADDING = "P".repeat(4_000);
+      let step = 0;
+      let compacted = false;
+      let postStepSent = false;
+      let releaseFinalAnswer!: () => void;
+      const finalGate = new Promise<void>((resolveGate) => {
+        releaseFinalAnswer = resolveGate;
+      });
+      let waitingForFinal = false;
+      let session: Session | null = null;
+
+      const gateway = startDynamicFakeGateway(
+        async (raw) => {
+          const req = JSON.parse(raw);
+          const isSummary = req.toolChoice?.type === "none" && req.tools?.length === 0;
+          if (isSummary) {
+            compacted = true;
+            return fakeGatewayFinalText("Compacted mid-turn summary.");
+          }
+          const approxTokens = Math.max(500, Math.round(raw.length / 4));
+          if (!compacted) {
+            if (step > 0 && session) {
+              await session.waitForText(`EARLY_STEP_${step}_DONE`, TIMEOUT);
+            }
+            step += 1;
+            const idx = Math.min(step, 12);
+            return fakeGatewaySse([
+              { type: "text-delta", id: `early_t_${step}`, delta: `EARLY_STEP_${step}: ${STEP_PADDING}\nEARLY_STEP_${step}_DONE\n` },
+              {
+                type: "tool-call",
+                toolCallId: `early_call_${step}`,
+                toolName: "read_file",
+                input: { path: `early_${idx}.txt` },
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: { inputTokens: { total: approxTokens }, outputTokens: { total: 1000 } },
+              },
+            ]);
+          }
+          if (!postStepSent) {
+            postStepSent = true;
+            return fakeGatewaySse([
+              { type: "text-delta", id: "post_t_1", delta: "POST_COMPACT_STEP_VISIBLE\n" },
+              {
+                type: "tool-call",
+                toolCallId: "post_call_1",
+                toolName: "read_file",
+                input: { path: "post_compact.txt" },
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: { inputTokens: { total: approxTokens }, outputTokens: { total: 500 } },
+              },
+            ]);
+          }
+          waitingForFinal = true;
+          await finalGate;
+          return fakeGatewayFinalText("MID_TURN_FINISHED_MARKER");
+        },
+        {
+          models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 32_000, max_tokens: 4096 }],
+        },
+      );
+
+      writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+        provider: "gateway",
+        model: FAKE_GATEWAY_MODEL,
+        auto_upgrade: false,
+        startup_scrollback: false,
+        session_titles: false,
+        max_agent_steps: 0,
+      }));
+
+      const tracePath = join(root, "trace.log");
+      const env: Record<string, string | undefined> = {
+        HOME: home,
+        TERM: "xterm-256color",
+        NO_COLOR: "1",
+        AI_GATEWAY_API_KEY: "fake-transcript-window-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "full-access",
+        FX_SOUND: "0",
+        FX_MAX_AGENT_STEPS: "0",
+        FX_TRACE_LOG: tracePath,
+        FX_TRACE_SCOPES: "transcript_window,compaction",
+      };
+
+      session = await TmuxSession.create({ cmd: binary, cwd: workspace, env, width: 120, height: 24, isolated: true });
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("MID_TURN_PROMPT_MARKER: run until compaction");
+
+        await waitFor(() => waitingForFinal, "post-compaction step finished while turn is still open");
+        await session.waitForPane((pane) => pane.includes("POST_COMPACT_STEP_VISIBLE") && pane.includes("post_compact.txt"), TIMEOUT);
+
+        // Before the turn ends, the trace must already show a mid-turn drop.
+        await waitFor(
+          () => existsSync(tracePath) && /\[transcript_window\] dropped entries=\d+/.test(readFileSync(tracePath, "utf8")),
+          "mid-turn drop logged before turn end",
+        );
+        const traceBeforeEnd = readFileSync(tracePath, "utf8");
+        expect(traceBeforeEnd).toMatch(/\[transcript_window\] dropped entries=\d+/);
+        expect(traceBeforeEnd).not.toContain("step event=turn_ended");
+
+        // Resize while the turn is open: reprint starts with the dim banner and
+        // post-compaction rows, and the dropped prompt is gone from the new screen.
+        await session.resizeWindow(100, 28, 500);
+        await session.waitForPane((pane) => pane.includes("Earlier in this turn: Ctrl+O") && pane.includes("POST_COMPACT_STEP_VISIBLE"), TIMEOUT);
+        const scrollbackAfterResize = await session.captureFullScrollback();
+        expect(scrollbackAfterResize).toContain("Earlier in this turn: Ctrl+O");
+        expect(scrollbackAfterResize).toContain("POST_COMPACT_STEP_VISIBLE");
+        expect(scrollbackAfterResize).not.toContain("MID_TURN_PROMPT_MARKER");
+        expect(scrollbackAfterResize).not.toContain("EARLY_STEP_1:");
+
+        // Finish the turn, then verify Ctrl+O still shows the prompt and early steps.
+        releaseFinalAnswer();
+        await session.waitForPane((pane) => pane.includes("MID_TURN_FINISHED_MARKER") && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
+
+        await session.sendHexBytes(["0f"]);
+        await session.waitForText(NAVIGATION, TIMEOUT);
+        let page = await session.capturePane();
+        const pages = [page];
+        for (let stuck = 0, presses = 0; stuck < 3 && presses < 200; presses += 1) {
+          const stepRes = await press(session, "PageUp", page);
+          stuck = stepRes.moved ? 0 : stuck + 1;
+          page = stepRes.pane;
+          pages.push(page);
+        }
+        const full = pages.join("\n");
+        expect(full).toContain("MID_TURN_PROMPT_MARKER");
+        expect(full).toContain("EARLY_STEP_1");
+        await session.sendHexBytes(["0f"]);
+        await session.waitForComposer(TIMEOUT);
+      } finally {
+        releaseFinalAnswer();
+        await session.kill();
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    180_000,
   );
 });

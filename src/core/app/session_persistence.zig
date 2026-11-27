@@ -925,6 +925,9 @@ pub const TranscriptArchiveRead = struct {
         /// The transcript's archive generation when the read started: a
         /// compaction, resume, or drop since then makes the read stale.
         generation: u64,
+        /// Include an open split turn's pre-compaction prefix at the end of
+        /// this cycle when the live transcript dropped it mid-turn.
+        include_split_prefix: bool = false,
     };
 
     pub const Task = struct {
@@ -965,7 +968,10 @@ pub const TranscriptArchiveRead = struct {
                 }
             };
             var visitor = Visitor{ .task = self };
-            self.damaged = self.reader.visitHistoryCycle(alloc, self.request.start, &visitor) catch |err| blk: {
+            self.damaged = (if (self.request.include_split_prefix)
+                self.reader.visitHistoryCycleWithSplitPrefix(alloc, self.request.start, &visitor)
+            else
+                self.reader.visitHistoryCycle(alloc, self.request.start, &visitor)) catch |err| blk: {
                 self.failure = err;
                 break :blk false;
             };
@@ -1374,6 +1380,7 @@ pub const Persistence = struct {
     /// session `fx -c` opens left a turn unfinished.
     interrupted_turn_hint_pending: bool = false,
     shutdown_failure: ?anyerror = null,
+    turn_piece_save_failed: bool = false,
     /// On the heap, so the pointer every session keeps survives `App.init`
     /// copying the app after it opens the store (`adoptStore`).
     v2_store: ?*session_adapter.Store = null,
@@ -1387,7 +1394,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 40) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 41) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1429,6 +1436,7 @@ pub const Persistence = struct {
         storage.pending_resume_yielded = false;
         storage.interrupted_turn_hint_pending = false;
         storage.shutdown_failure = null;
+        storage.turn_piece_save_failed = false;
         storage.v2_store = null;
         storage.v2 = null;
         storage.tool_identities = .{};

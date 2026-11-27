@@ -4249,6 +4249,9 @@ pub const Session = struct {
         skip,
         /// End the replay with `error.CycleEnd`: one cycle has been read.
         end_cycle,
+        /// End the replay with `error.CycleEnd` after emitting any split turn's
+        /// pre-compaction pieces held open at that compaction.
+        end_cycle_with_split_prefix,
     };
 
     /// The replay sink behind the `visitHistory` readers: hands each turn to
@@ -4268,7 +4271,7 @@ pub const Session = struct {
             fn summary(_: *@This(), _: []const u8) !void {
                 switch (at_summary) {
                     .skip => {},
-                    .end_cycle => return error.CycleEnd,
+                    .end_cycle, .end_cycle_with_split_prefix => return error.CycleEnd,
                 }
             }
         };
@@ -5008,7 +5011,14 @@ pub const CycleReader = struct {
     /// visited; the next cycle shows it whole (`cycleStart`). Returns true
     /// when reading stopped at a damaged line, so turns are missing.
     pub fn visitHistoryCycle(self: *const CycleReader, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
-        return visitCycle(self.source(), alloc, start, visitor);
+        return visitCycle(self.source(), alloc, start, .end_cycle, visitor);
+    }
+
+    /// Like `visitHistoryCycle`, and also hands `visitor` the pre-compaction
+    /// pieces of a turn still open at the ending compaction line (for live
+    /// Ctrl+O after a mid-turn drop freed them from memory).
+    pub fn visitHistoryCycleWithSplitPrefix(self: *const CycleReader, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
+        return visitCycle(self.source(), alloc, start, .end_cycle_with_split_prefix, visitor);
     }
 };
 
@@ -5066,13 +5076,14 @@ pub fn formatPendingRestoreFailedNotice(alloc: Allocator, err: anyerror) Allocat
 
 /// The turns of one compaction cycle from `src`, each handed to
 /// `visitor.append` and freed after it returns (`CycleReader.visitHistoryCycle`).
-fn visitCycle(src: Source, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
+fn visitCycle(src: Source, alloc: Allocator, start: ?sm.Cursor, at_summary: Session.AtSummary, visitor: anytype) !bool {
     var sink: Session.VisitorSink(@TypeOf(visitor), .end_cycle) = .{ .alloc = alloc, .visitor = visitor };
     const from: sm.From = if (start) |cursor| .{ .at = try src.cycleStart(alloc, cursor) } else .start;
     const skip_offset: ?u64 = if (start) |cursor| cursor.offset else null;
     var damaged = false;
     var replay_sink = ReplaySink.init(&sink);
     replay_sink.damaged = &damaged;
+    replay_sink.include_split_prefix = at_summary == .end_cycle_with_split_prefix;
     replay(src, alloc, alloc, from, skip_offset, replay_sink) catch |err| switch (err) {
         error.CycleEnd => {},
         else => |other| return other,
@@ -6422,6 +6433,9 @@ const ReplaySink = struct {
     /// Set when reading stopped at a damaged line, so the turns after it
     /// are missing. Null when the caller does not need to know.
     damaged: ?*bool = null,
+    /// When true, a turn still open in `builder` at `.compacted` is emitted
+    /// before `summary` stops the cycle.
+    include_split_prefix: bool = false,
 
     fn init(sink: anytype) ReplaySink {
         const SinkPtr = @TypeOf(sink);
@@ -6862,6 +6876,11 @@ noinline fn replay(
                     }
                 },
                 .compacted => |line| {
+                    if (sink.include_split_prefix and !builder.isIdle() and builder.user != null and builder.calls.items.len == 0 and builder.results.items.len == 0) {
+                        const prefix_turn = try presentStoredResults(src, alloc, try builder.finishAssistant(.{}));
+                        const joined = try joinHeld(alloc, &held, &continues_held, prefix_turn, null);
+                        try sink.turn(joined.turn, joined.number);
+                    }
                     abandonContinuation(alloc, &builder, &continues_held);
                     try sinkHeld(sink, &held);
                     try sink.summary(line.data);
@@ -11612,6 +11631,8 @@ test "a compaction inside an open turn starts its display cycle at that turn's p
     try visitor.expectPrompts(&.{"first"});
     try testing.expect(!try cycles.visitHistoryCycle(testing.allocator, compaction, &visitor));
     try visitor.expectPrompts(&.{ "split", "after" });
+    try testing.expect(!try cycles.visitHistoryCycleWithSplitPrefix(testing.allocator, null, &visitor));
+    try visitor.expectPrompts(&.{ "first", "split" });
 }
 
 test "the history visit shows every turn, even those a compaction summarized" {

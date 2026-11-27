@@ -15,10 +15,14 @@ current code.
 - D1: The main screen holds the current compaction cycle as finished blocks plus
   the live blocks. A finished block is kept as drawn text; the shell owns that
   text, keyed by the block's sequence number. Tool records are not kept.
-- D2: The previous cycle stays held after a compaction until the first turn end
-  after it, once the log holds it. A compaction can land mid-turn while a tool
-  line is still changing, and between turns a resize before the next turn end
-  still reprints the cycle.
+- D2: A compaction between turns (`/compact`) holds the previous cycle until the
+  first turn end after it, once the log holds it, so a resize before the next
+  turn end still reprints that cycle. A mid-turn compaction in a saved session
+  drops the older part of the turn (everything before the turn's last compaction)
+  as soon as the session log holds it (`saved_through >= cycle_first`), keeping
+  only live blocks and what came after the last compaction; `--no-save` sessions
+  still hold until the turn ends. A resize after a mid-turn drop reprints from
+  the turn's last compaction, led by one dim line: `"Earlier in this turn: Ctrl+O"`.
 - D3: A settled resize clears the screen and reprints every held block in finish
   order, at most `Slice` blocks per loop iteration, then repaints the live blocks.
 - D4: Ctrl+O opens on the newest `Window` blocks from memory, reads older blocks
@@ -46,17 +50,25 @@ current code.
   cancellation line, cleared lifecycle pins, a compaction): a user prompt
   starts a turn, a pinned tool line or a notice pending replacement opens a
   live block, a summary or cancellation ends the turn, anything else arrives
-  final. A turn summary confirms the save: the app commits the turn to the
-  log before it appends the summary.
+  final. A turn summary confirms the save at turn end, and `appendTurnPiece`
+  writes each finished turn piece to the log before the next request (D12) so
+  `saved_through` can advance at a mid-turn compaction when those pieces are
+  saved; a failed save leaves `saved_through` unchanged.
 - fx runs `drop` through `dropEntriesAtomic`, the commit and rebase the byte
   cap used before the window replaced it; it never removes a pinned entry.
-  An entry with a row still on screen is held (`applyTranscriptWindowDrops`)
+  In a saved session, a mid-turn compaction drops pre-compaction entries once
+  the log holds them (`saved_through >= cycle_first`) and no row of theirs is
+  still on screen (`applyTranscriptWindowDrops`); a between-turns compaction
+  (`/compact`) still waits for the next turn end. A resize reprint after a
+  mid-turn drop starts at the turn's last compaction, led by one dim line:
+  `"Earlier in this turn: Ctrl+O"`. An entry with a row still on screen is held
   until it scrolls into terminal history or a resize clears the screen,
   because the painter repaints the live area from the entries. A failed store
   drop keeps the entries still in the notebook pending, and the next sync tries
   them again (`dropPendingEntries`). A turn summary stores its turn's recap when
   it is created (`appendTurnSummaryEntry`), so pre-compaction and scrolled-off
-  entries of a turn drop without losing the summary's recap. A resumed
+  entries of a turn drop without losing the summary's recap (kept up to date
+  across mid-turn drops via a running per-turn recap tally). A resumed
   transcript holds every entry until a frame has
   repainted it from the entries: its first paint is the prepared resume
   flow, so the reset before that paint keeps them, and the commit anchor
@@ -163,10 +175,13 @@ maps it onto the TLA+ variables.
   reprinting, emit `paint_final(seq)` and advance `painted_through`.
 - `block_changed(id)` of a live block: emit `repaint_block(id)`, nothing else.
 - `compacted`: `cycle + 1`; `prev_first` keeps the oldest held start;
-  `cycle_first := next_seq`.
-- `turn_ended` and `saved_through`: then try the drop: when `prev_first` is set,
-  no turn is open, and the log holds `[prev_first, cycle_first)` or the session
-  is unsaved, emit `drop(prev_first, cycle_first)` and clear `prev_first`.
+  `cycle_first := next_seq`; `prev_waits_turn_end := !turn_open`; then try the
+  drop (dropping mid-turn in a saved session if `saved_through >= cycle_first`).
+- `turn_ended` and `saved_through`: `turn_ended` clears `turn_open` and
+  `prev_waits_turn_end`; then try the drop: when `prev_first` is set, no
+  between-turns wait is active, and either the session is saved with
+  `saved_through >= cycle_first` or the session is unsaved with no turn open,
+  emit `drop(prev_first, cycle_first)` and clear `prev_first`.
 - `resized`: new epoch, `painted_through := held_first`, `reprinting`, emit
   `reprint_begin`. `reprint_tick` emits the next slice of at most `Slice` blocks,
   and `repaint_live` once it reaches `next_seq`.
@@ -191,7 +206,7 @@ maps it onto the TLA+ variables.
 
 | Law | Statement |
 |---|---|
-| L1 HeldIsRecentCycles | When no turn is open, a turn has ended since the last compaction, and the log holds the previous cycles (or the session is unsaved), no block before `cycle_first` is held. |
+| L1 HeldIsRecentCycles | When no between-turns wait is active and the log holds the previous cycles (or the session is unsaved with no turn open), no block before `cycle_first` is held. |
 | L2 LiveNeverDropped | No drop range contains a live block, and a drop never changes `live`. |
 | L3 DropOnlySaved | In a saved session every drop range is below `saved_through`. |
 | L4 UpdateIsLocal | `block_changed(id)` emits exactly `repaint_block(id)` and changes no state. |
@@ -204,14 +219,15 @@ maps it onto the TLA+ variables.
 | L11 StaleReadIgnored | A read reply whose token is not the pending one leaves the state unchanged. |
 | L12 NoReadWhenUnsaved | An unsaved session never emits `read_log`. |
 | L13 RecoveredFromLog | After `resumed`, the held blocks are all in the log, and nothing of the earlier state survives: no previous cycle or wait for its turn end, live block, open turn, Ctrl+O, or pending read. |
-| L14 PreviousCycleDropped | After a compaction, once the next turn ends and saves land, the previous cycle is dropped, unless a compaction between turns starts a new wait (liveness). |
+| L14 PreviousCycleDropped | After a compaction in a saved session once the log holds it, or in an unsaved session once the next turn ends and saves land, the previous cycle is dropped, unless a compaction between turns starts a new wait (liveness). |
 | L15 ReprintFinishes | A reprint that no later resize or resume starts over finishes (liveness). |
 | L16 CtrlOReachesStart | Scrolling older while the log answers each read with the true count eventually reaches the start of the log (liveness). |
-| L18 DropBetweenTurns | Every drop happens while no turn is open, so a resize mid-turn reprints the whole current turn, the prompt included. |
+| L18 DropBetweenTurns | In an unsaved session every drop happens while no turn is open; in a saved session a drop during a turn covers only blocks before the turn's last compaction (`to <= cycle_first`), so a resize mid-turn reprints the turn from that compaction. |
 | L19 ScreenHoldsHeld | Outside a reprint, every held block is on the screen. |
 | L20 PaintedOnce | No step paints a block already on the screen in this epoch. |
 | L21 ReadBounded | One log reply moves the window by at most `Step` blocks, so a reply costs a bounded amount of work. |
-| L22 PreviousWaitsForTurnEnd | Until the first turn end after a compaction, the previous cycle is held, even when the log holds it, so a resize before that turn end reprints it. |
+| L22 PreviousWaitsForTurnEnd | Until the first turn end after a compaction between turns (`/compact`), the previous cycle is held, even when the log holds it, so a resize before that turn end reprints it. |
+| L23 HeldSinceLastCompaction | In a saved session, once no between-turns wait is active and the log holds every block before `cycle_first`, nothing before `cycle_first` is held except live blocks and blocks still on the screen, whether or not a turn is open. |
 | L17 PureCore | `transcript_window.zig` imports only `std` and reads no clock, environment, or global. |
 
 ## Enforcement
@@ -239,6 +255,7 @@ maps it onto the TLA+ variables.
 | L20 | `prop:PaintedOnce`, `trace:PaintedOnce` |
 | L21 | `prop:ReadBounded`, `trace:ReadBounded` |
 | L22 | `inv:PreviousWaitsForTurnEnd`, `trace:PreviousWaitsForTurnEnd` |
+| L23 | `inv:HeldSinceLastCompaction`, `trace:HeldSinceLastCompaction` |
 | L17 | `check:pure-core-imports` (the verify source check), not model checkable |
 
 Prefixes: `inv:` is an invariant in `spec/TranscriptWindow.tla` checked by

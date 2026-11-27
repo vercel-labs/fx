@@ -82,6 +82,7 @@ RecoveredFromLog == TW!RecoveredFromLog
 DropBetweenTurns == TW!DropBetweenTurns
 ScreenHoldsHeld == TW!ScreenHoldsHeld
 PreviousWaitsForTurnEnd == TW!PreviousWaitsForTurnEnd
+HeldSinceLastCompaction == TW!HeldSinceLastCompaction
 PaintedOnce == TW!PaintedOnce
 ReadBounded == TW!ReadBounded
 UpdateIsLocal == TW!UpdateIsLocal

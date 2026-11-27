@@ -25,7 +25,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { REPO_ROOT, outDir, writeJson } from "../lib/tlc.ts";
 import { onlySessionId, sessionDir } from "../../../e2e/saved-sessions.ts";
-import { FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, startFakeGateway } from "../../../e2e/tmux-helpers.ts";
+import { FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, fakeGatewaySse, startDynamicFakeGateway, startFakeGateway } from "../../../e2e/tmux-helpers.ts";
 import { SETS, runTrace, type Step } from "./code-to-spec.ts";
 import { buildHarness, checkTlc, specFiles, toTla, type CheckedTlc, type Config, type Effect, type Event } from "./lib.ts";
 
@@ -207,6 +207,107 @@ async function runScenario(bin: string, dir: string) {
   return { log: existsSync(trace) ? readFileSync(trace, "utf8") : "", shown };
 }
 
+async function runMidTurnScenario(bin: string, dir: string) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tla-tw-midturn-")));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace);
+  for (let i = 1; i <= 12; i += 1) writeFileSync(join(workspace, `early_${i}.txt`), `early ${i}\n`);
+  writeFileSync(join(workspace, "post_compact.txt"), "post compact\n");
+
+  const STEP_PADDING = "P".repeat(4_000);
+  let step = 0;
+  let compacted = false;
+  let postStepSent = false;
+  let waitingForFinal = false;
+  let releaseFinal!: () => void;
+  const finalGate = new Promise<void>((r) => { releaseFinal = r; });
+  let session: Awaited<ReturnType<typeof TmuxSession.create>> | null = null;
+
+  const gateway = startDynamicFakeGateway(
+    async (raw) => {
+      const req = JSON.parse(raw);
+      if (req.toolChoice?.type === "none" && req.tools?.length === 0) {
+        compacted = true;
+        return fakeGatewayFinalText("Compacted mid-turn.");
+      }
+      const approxTokens = Math.max(500, Math.round(raw.length / 4));
+      if (!compacted) {
+        if (step > 0 && session) {
+          await session.waitForText(`MID_EARLY_${step}_DONE`, TIMEOUT);
+        }
+        step += 1;
+        const idx = Math.min(step, 12);
+        return fakeGatewaySse([
+          { type: "text-delta", id: `mt_t_${step}`, delta: `MID_EARLY_${step}: ${STEP_PADDING}\nMID_EARLY_${step}_DONE\n` },
+          { type: "tool-call", toolCallId: `mt_c_${step}`, toolName: "read_file", input: { path: `early_${idx}.txt` } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage: { inputTokens: { total: approxTokens }, outputTokens: { total: 1000 } } },
+        ]);
+      }
+      if (!postStepSent) {
+        postStepSent = true;
+        return fakeGatewaySse([
+          { type: "text-delta", id: "mt_post_t", delta: "MID_POST_VISIBLE\n" },
+          { type: "tool-call", toolCallId: "mt_post_c", toolName: "read_file", input: { path: "post_compact.txt" } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage: { inputTokens: { total: approxTokens }, outputTokens: { total: 500 } } },
+        ]);
+      }
+      waitingForFinal = true;
+      await finalGate;
+      return fakeGatewayFinalText("MID_DONE_OK");
+    },
+    { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 32_000, max_tokens: 4096 }] },
+  );
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+    provider: "gateway",
+    model: FAKE_GATEWAY_MODEL,
+    auto_upgrade: false,
+    startup_scrollback: false,
+    session_titles: false,
+    max_agent_steps: 0,
+  }));
+  const trace = join(dir, "fx-midturn-trace.log");
+  const env: Record<string, string | undefined> = {
+    HOME: home,
+    AI_GATEWAY_API_KEY: "fake-tla-transcript-window",
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_MODEL: FAKE_GATEWAY_MODEL,
+    FX_AUTO_UPGRADE: "0",
+    FX_PERMISSION_MODE: "full-access",
+    FX_SOUND: "0",
+    NO_COLOR: "1",
+    FX_MAX_AGENT_STEPS: "0",
+    FX_TRACE_LOG: trace,
+    FX_TRACE_SCOPES: "transcript_window,full_transcript_cache",
+  };
+  let midResized = "";
+  let midCtrlO = "";
+  try {
+    session = await TmuxSession.create({ cmd: bin, cwd: workspace, env, width: 120, height: 24, isolated: true, stderrPath: join(dir, "fx-midturn.stderr") });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("MID_PROMPT_MARKER: run until compaction");
+    await waitFor(() => waitingForFinal, "mid-turn post-compaction step");
+    await session.waitForPane((pane) => pane.includes("MID_POST_VISIBLE") && pane.includes("post_compact.txt"), TIMEOUT);
+    await session.resizeWindow(100, 28, 500);
+    await session.waitForPane((pane) => pane.includes("Earlier in this turn: Ctrl+O") && pane.includes("MID_POST_VISIBLE"), TIMEOUT);
+    midResized = await session.captureFullScrollback();
+    releaseFinal();
+    await session.waitForPane((pane) => pane.includes("MID_DONE_OK"), TIMEOUT);
+    await session.waitForComposer(TIMEOUT);
+    midCtrlO = (await walkCtrlO(session)).join("\n");
+    await session.sendText("/quit");
+    await session.waitForSessionEnd(TIMEOUT);
+  } finally {
+    releaseFinal();
+    await session?.kill();
+    gateway.stop();
+  }
+  return { log: existsSync(trace) ? readFileSync(trace, "utf8") : "", midResized, midCtrlO };
+}
+
 export type BinaryToSpecResult = {
   windows: number;
   /// Windows that restarted from the log (`resumed`), replayed as a crash and resume.
@@ -221,7 +322,9 @@ export type BinaryToSpecResult = {
 
 export async function binaryToSpec(options: { bin: string; dir: string }): Promise<BinaryToSpecResult> {
   mkdirSync(options.dir, { recursive: true });
-  const { log, shown } = await runScenario(options.bin, options.dir);
+  const { log: mainLog, shown } = await runScenario(options.bin, options.dir);
+  const mid = await runMidTurnScenario(options.bin, options.dir);
+  const log = `${mainLog}\n${mid.log}`;
   const result: BinaryToSpecResult = {
     windows: 0,
     resumed: 0,
@@ -239,6 +342,10 @@ export async function binaryToSpec(options: { bin: string; dir: string }): Promi
   expect("Ctrl+O after resume", shown.resumed ?? [], ORDER);
   expect("the resumed main screen", shown.resumedMain ?? [], ["CYCLE2_A", "CYCLE2_B"]);
   expect("the main screen after a resize", shown.resizedMain ?? [], ["CYCLE2_A", "CYCLE2_B"]);
+  if (!result.problem && !/\[transcript_window\] dropped entries=\d+/.test(mid.log)) result.problem = "mid-turn trace missed a drop";
+  if (!result.problem && !mid.midResized.includes("Earlier in this turn: Ctrl+O")) result.problem = "mid-turn resize missed banner";
+  if (!result.problem && mid.midResized.includes("MID_PROMPT_MARKER")) result.problem = "mid-turn resize kept dropped prompt";
+  if (!result.problem && (!mid.midCtrlO.includes("MID_PROMPT_MARKER") || !mid.midCtrlO.includes("MID_EARLY_1"))) result.problem = "mid-turn Ctrl+O missed pre-compaction rows";
   if (result.rejected > 0) result.problem ??= `the binary traced ${result.rejected} rejected window events`;
 
   const harness = buildHarness(join(options.dir, "harness"));

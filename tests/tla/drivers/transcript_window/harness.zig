@@ -135,6 +135,10 @@ pub fn main(init: std.process.Init) !void {
             try writeLine(&stdout.interface, &state.?, null, null);
             continue;
         }
+        if (parsed.value.event) |name| if (std.mem.eql(u8, name, "save_failed")) {
+            try writeLine(&stdout.interface, &(state orelse return error.MissingConfig), null, null);
+            continue;
+        };
         const out = tw.step(state orelse return error.MissingConfig, try event(parsed.value));
         state = out.state;
         try writeLine(&stdout.interface, &state.?, out.effect, out.rejected);

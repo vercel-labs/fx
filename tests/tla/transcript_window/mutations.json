@@ -1,36 +1,60 @@
 {
   "spec": [
     {
-      "id": "drop-mid-turn",
-      "bug": "The previous cycle drops while a turn is open, so a resize mid-turn loses the turn's start.",
+      "id": "drop-mid-turn-unsaved",
+      "bug": "An unsaved (--no-save) session drops mid-turn, losing the turn's start on resize.",
+      "law": "DropBetweenTurns",
+      "constants": "MCTranscriptWindowSweepUnsaved",
+      "find": "    /\\ IF Saved THEN st >= cf ELSE ~open",
+      "replace": "    /\\ IF Saved THEN st >= cf ELSE TRUE"
+    },
+    {
+      "id": "drop-past-compaction-mid-turn",
+      "bug": "A mid-turn drop covers blocks at or after the turn's last compaction.",
       "law": "DropBetweenTurns",
       "constants": "MCTranscriptWindowSweep",
-      "find": "    /\\ ~open\n    /\\ (~Saved \\/ st >= cf)",
-      "replace": "    /\\ (~Saved \\/ st >= cf)"
+      "find": "DropEffect(from, to) == IF from < to THEN <<[kind |-> \"drop\", from |-> from, to |-> to]>> ELSE <<>>",
+      "replace": "DropEffect(from, to) == IF from < to THEN <<[kind |-> \"drop\", from |-> from, to |-> IF turnOpen THEN nextSeq ELSE to]>> ELSE <<>>"
     },
     {
       "id": "drop-unsaved",
       "bug": "A block leaves memory before the log holds it.",
       "law": "DropOnlySaved",
       "constants": "MCTranscriptWindowSweep",
-      "find": "    /\\ (~Saved \\/ st >= cf)",
-      "replace": "    /\\ TRUE"
+      "find": "    /\\ IF Saved THEN st >= cf ELSE ~open",
+      "replace": "    /\\ IF Saved THEN TRUE ELSE ~open"
+    },
+    {
+      "id": "midturn-drop-above-saved",
+      "bug": "A mid-turn drop frees blocks above saved_through before the log holds them.",
+      "law": "DropOnlySaved",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "    /\\ IF Saved THEN st >= cf ELSE ~open",
+      "replace": "    /\\ IF Saved THEN (open \\/ st >= cf) ELSE ~open"
     },
     {
       "id": "never-drop",
       "bug": "The previous cycle is never dropped, so memory grows with every compaction.",
       "law": "HeldIsRecentCycles",
       "constants": "MCTranscriptWindowSweep",
-      "find": "CanDrop(po, cf, open, st) ==\n    /\\ po # None",
-      "replace": "CanDrop(po, cf, open, st) ==\n    /\\ FALSE /\\ po # None"
+      "find": "\nCanDrop(po, cf, open, waits, st) ==\n    /\\ po # None",
+      "replace": "\nCanDrop(po, cf, open, waits, st) ==\n    /\\ FALSE /\\ po # None"
     },
     {
       "id": "never-drop-liveness",
       "bug": "The same bug, seen by the liveness property.",
       "law": "PreviousCycleDropped",
       "constants": "MCTranscriptWindowSweep",
-      "find": "CanDrop(po, cf, open, st) ==\n    /\\ po # None",
-      "replace": "CanDrop(po, cf, open, st) ==\n    /\\ FALSE /\\ po # None"
+      "find": "\nCanDrop(po, cf, open, waits, st) ==\n    /\\ po # None",
+      "replace": "\nCanDrop(po, cf, open, waits, st) ==\n    /\\ FALSE /\\ po # None"
+    },
+    {
+      "id": "midturn-never-drops",
+      "bug": "A saved session holds pre-compaction blocks until turn end even after a mid-turn compaction.",
+      "law": "HeldSinceLastCompaction",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "    /\\ IF Saved THEN st >= cf ELSE ~open",
+      "replace": "    /\\ IF Saved THEN (~open /\\ st >= cf) ELSE ~open"
     },
     {
       "id": "reprint-all-at-once",
@@ -69,8 +93,8 @@
       "bug": "A change to one live block starts a full reprint: the whole-transcript cost per update.",
       "law": "UpdateIsLocal",
       "constants": "MCTranscriptWindowSweep",
-      "find": "    /\\ UNCHANGED <<core, alive, cycleStarts>>",
-      "replace": "    /\\ reprinting' = TRUE\n    /\\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live, turnOpen, prevWaits, paintedThrough, coOpen, coLo, coHi, coAtStart, pending, pendingDir, nextToken, alive, cycleStarts>>"
+      "find": "BlockChanged(id) ==\n    /\\ alive /\\ id \\in live\n    /\\ out' = <<[kind |-> \"repaint_block\", id |-> id]>> /\\ act' = [name |-> \"BlockChanged\", id |-> id]\n    /\\ UNCHANGED <<core, alive, cycleStarts>>",
+      "replace": "BlockChanged(id) ==\n    /\\ alive /\\ id \\in live\n    /\\ out' = <<[kind |-> \"repaint_block\", id |-> id]>> /\\ act' = [name |-> \"BlockChanged\", id |-> id]\n    /\\ reprinting' = TRUE\n    /\\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live, turnOpen, prevWaits, paintedThrough, coOpen, coLo, coHi, coAtStart, pending, pendingDir, nextToken, alive, cycleStarts>>"
     },
     {
       "id": "open-reads-log",
@@ -165,24 +189,45 @@
       "bug": "A compaction between turns drops the previous cycle as soon as the log holds it, so a resize before the next turn end loses it.",
       "law": "PreviousWaitsForTurnEnd",
       "constants": "MCTranscriptWindowSweep",
-      "find": "          /\\ prevFirst' = po /\\ prevWaits' = TRUE\n",
-      "replace": "          /\\ prevWaits' = TRUE\n          /\\ prevFirst' = IF CanDrop(po, nextSeq, turnOpen, savedThrough) THEN None ELSE po\n"
+      "find": "          /\\ IF CanDrop(po, nextSeq, turnOpen, waits, savedThrough)",
+      "replace": "          /\\ IF CanDrop(po, nextSeq, turnOpen, FALSE, savedThrough)"
     }
   ],
   "core": [
     {
       "id": "core-drop-mid-turn",
-      "bug": "canDrop ignores an open turn.",
-      "sweep": "MCTranscriptWindowSweep",
-      "find": "    if (turn_open) return false;\n",
-      "replace": "    if (turn_open and false) return false;\n"
+      "bug": "canDrop allows an unsaved session to drop mid-turn.",
+      "sweep": "MCTranscriptWindowSweepUnsaved",
+      "find": "    return if (state.config.saved) saved_through >= cycle_first else !turn_open;",
+      "replace": "    _ = turn_open;\n    return if (state.config.saved) saved_through >= cycle_first else true;"
     },
     {
       "id": "core-drop-unsaved",
       "bug": "canDrop ignores the save watermark.",
       "sweep": "MCTranscriptWindowSweep",
-      "find": "    return !state.config.saved or saved_through >= cycle_first;",
-      "replace": "    return !state.config.saved or saved_through >= cycle_first or true;"
+      "find": "    return if (state.config.saved) saved_through >= cycle_first else !turn_open;",
+      "replace": "    _ = saved_through;\n    _ = cycle_first;\n    return if (state.config.saved) true else !turn_open;"
+    },
+    {
+      "id": "core-midturn-never-drops",
+      "bug": "canDrop blocks mid-turn drops even in a saved session.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "    return if (state.config.saved) saved_through >= cycle_first else !turn_open;",
+      "replace": "    if (turn_open) return false;\n    return if (state.config.saved) saved_through >= cycle_first else true;"
+    },
+    {
+      "id": "core-compacted-always-waits",
+      "bug": "A mid-turn compaction sets prev_waits_turn_end so the prefix stays until turn end.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "            next.prev_waits_turn_end = !state.turn_open;",
+      "replace": "            next.prev_waits_turn_end = true;"
+    },
+    {
+      "id": "core-midturn-drop-past-compaction",
+      "bug": "dropIfDone drops up to next_seq instead of stopping at cycle_first.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "    return .{ .state = out, .effect = dropEffect(from, out.cycle_first) };",
+      "replace": "    return .{ .state = out, .effect = dropEffect(from, out.next_seq) };"
     },
     {
       "id": "core-reprint-all-at-once",

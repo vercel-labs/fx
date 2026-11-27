@@ -187,8 +187,7 @@ fn reject(state: State, why: Rejection) Output {
 fn canDrop(state: *const State, prev_first: ?Seq, cycle_first: Seq, turn_open: bool, saved_through: Seq) bool {
     if (prev_first == null) return false;
     if (state.prev_waits_turn_end) return false;
-    if (turn_open) return false;
-    return !state.config.saved or saved_through >= cycle_first;
+    return if (state.config.saved) saved_through >= cycle_first else !turn_open;
 }
 
 fn dropEffect(from: Seq, to: Seq) ?Effect {
@@ -277,9 +276,9 @@ pub fn step(state: State, event: Event) Output {
             var next = state;
             next.cycle = state.cycle + 1;
             next.prev_first = state.heldFirst();
-            // A compaction drops nothing: the previous cycle waits for the
-            // next turn end, so a resize before it still reprints it.
-            next.prev_waits_turn_end = true;
+            // Between turns holds the previous cycle until the next turn ends
+            // (L22); a mid-turn compaction drops once saved (L23).
+            next.prev_waits_turn_end = !state.turn_open;
             next.cycle_first = state.next_seq;
             return dropIfDone(next);
         },
@@ -472,14 +471,30 @@ test "a stale read reply changes nothing" {
 }
 
 test "previous cycle stays held through a mid-turn compaction and drops at turn end" {
-    var state = finishBlocks(run(State.init(saved_config), &.{ .turn_started, .{ .block_opened = 9 } }), 2);
-    state = run(state, &.{ .compacted, .{ .saved_through = 2 } });
+    var unsaved = saved_config;
+    unsaved.saved = false;
+    var state = finishBlocks(run(State.init(unsaved), &.{ .turn_started, .{ .block_opened = 9 } }), 2);
+    state = step(state, .compacted).state;
     try testing.expectEqual(@as(?Seq, 0), state.prev_first);
     try testing.expect(state.live.contains(9));
     const finished = step(state, .{ .block_finished = 9 });
     try testing.expectEqual(Effect{ .paint_final = 2 }, finished.effect.?);
     const ended = step(finished.state, .turn_ended);
     try testing.expectEqual(Effect{ .drop = .{ .from = 0, .to = 2 } }, ended.effect.?);
+    try testing.expectEqual(Range{ .from = 2, .to = 3 }, ended.state.held());
+}
+
+test "a mid-turn compaction in a saved session drops when saved and turn end emits no drop" {
+    var state = finishBlocks(run(State.init(saved_config), &.{ .turn_started, .{ .block_opened = 9 } }), 2);
+    state = step(state, .{ .saved_through = 2 }).state;
+    const compacted = step(state, .compacted);
+    try testing.expectEqual(Effect{ .drop = .{ .from = 0, .to = 2 } }, compacted.effect.?);
+    try testing.expectEqual(@as(?Seq, null), compacted.state.prev_first);
+    try testing.expect(compacted.state.live.contains(9));
+    const finished = step(compacted.state, .{ .block_finished = 9 });
+    try testing.expectEqual(Effect{ .paint_final = 2 }, finished.effect.?);
+    const ended = step(finished.state, .turn_ended);
+    try testing.expect(ended.effect == null);
     try testing.expectEqual(Range{ .from = 2, .to = 3 }, ended.state.held());
 }
 
@@ -599,4 +614,63 @@ test "the core imports only std" {
         if (std.mem.find(u8, line, "@embedFile") != null) continue;
         try testing.expect(std.mem.startsWith(u8, line[at..], "@import(\"std\")"));
     }
+}
+
+test "a mid-turn compaction in a saved session drops pre-compaction blocks once saved_through reaches cycle_first" {
+    var state = finishBlocks(run(State.init(saved_config), &.{.turn_started}), 2);
+    const compacted = step(state, .compacted);
+    try testing.expect(compacted.effect == null);
+    state = compacted.state;
+
+    const saved = step(state, .{ .saved_through = 2 });
+    try testing.expectEqual(@as(?Effect, .{ .drop = .{ .from = 0, .to = 2 } }), saved.effect);
+    try testing.expectEqual(Range{ .from = 2, .to = 2 }, saved.state.held());
+    try testing.expect(saved.state.prev_first == null);
+
+    // When the log already holds everything before a mid-turn compaction, the drop happens at once.
+    const already_saved = run(finishBlocks(run(State.init(saved_config), &.{.turn_started}), 2), &.{.{ .saved_through = 2 }});
+    const immediate = step(already_saved, .compacted);
+    try testing.expectEqual(@as(?Effect, .{ .drop = .{ .from = 0, .to = 2 } }), immediate.effect);
+    try testing.expect(immediate.state.prev_first == null);
+
+    // An empty mid-turn compaction (next_seq = 0) leaves prev_first null and sets no between-turns wait.
+    const empty = step(step(State.init(saved_config), .turn_started).state, .compacted);
+    try testing.expect(empty.effect == null);
+    try testing.expect(empty.state.prev_first == null);
+    try testing.expect(!empty.state.prev_waits_turn_end);
+}
+
+test "mid-turn compaction guards: unsaved log, live blocks, --no-save, and between-turns wait" {
+    // L3: no drop when saves have not landed yet.
+    var unsaved_log = finishBlocks(run(State.init(saved_config), &.{.turn_started}), 2);
+    unsaved_log = run(unsaved_log, &.{ .compacted, .{ .saved_through = 1 } });
+    try testing.expectEqual(@as(?Seq, 0), unsaved_log.prev_first);
+    try testing.expectEqual(Range{ .from = 0, .to = 2 }, unsaved_log.held());
+
+    // L2: a live block stays live across compaction, save, and drop until it finishes.
+    var with_live = finishBlocks(run(State.init(saved_config), &.{ .turn_started, .{ .block_opened = 9 } }), 2);
+    with_live = run(with_live, &.{ .compacted, .{ .saved_through = 2 } });
+    try testing.expect(with_live.live.contains(9));
+    const live_done = step(with_live, .{ .block_finished = 9 });
+    try testing.expect(!live_done.state.live.contains(9));
+    const ended = step(live_done.state, .turn_ended);
+    try testing.expectEqual(Range{ .from = 2, .to = 3 }, ended.state.held());
+
+    // --no-save: holds across mid-turn compaction until the turn ends.
+    var no_save = saved_config;
+    no_save.saved = false;
+    const mid_unsaved = step(finishBlocks(run(State.init(no_save), &.{.turn_started}), 2), .compacted);
+    try testing.expect(mid_unsaved.effect == null);
+    try testing.expectEqual(@as(?Seq, 0), mid_unsaved.state.prev_first);
+    const ended_unsaved = step(mid_unsaved.state, .turn_ended);
+    try testing.expectEqual(Effect{ .drop = .{ .from = 0, .to = 2 } }, ended_unsaved.effect.?);
+
+    // L22: /compact between turns still waits for the next turn end even when saved.
+    const saved_idle = step(finishBlocks(State.init(saved_config), 2), .{ .saved_through = 2 }).state;
+    const between_turns = step(saved_idle, .compacted);
+    try testing.expect(between_turns.effect == null);
+    try testing.expectEqual(@as(?Seq, 0), between_turns.state.prev_first);
+    try testing.expect(between_turns.state.prev_waits_turn_end);
+    const after_next = step(step(between_turns.state, .turn_started).state, .turn_ended);
+    try testing.expectEqual(Effect{ .drop = .{ .from = 0, .to = 2 } }, after_next.effect.?);
 }

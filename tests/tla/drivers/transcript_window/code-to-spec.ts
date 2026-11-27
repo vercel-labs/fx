@@ -82,6 +82,7 @@ export class Recorder {
       case "block_changed": return { name: "BlockChanged", id: event.id as number };
       case "block_finished": return { name: "BlockFinished", id: event.id as number };
       case "saved_through": return { name: "SavedThrough", through: after.state.savedThrough };
+      case "save_failed": return { name: "SaveFailed" };
       case "compacted": return { name: "Compacted" };
       case "resized": return { name: "Resized" };
       case "reprint_tick": return { name: "ReprintTick" };
@@ -157,6 +158,7 @@ async function randomTrace(bin: string, config: Config, seed: number, length: nu
       [live.length ? 4 : 0, () => ({ event: "block_finished", id: pick(live) })],
       [free.length ? 1.5 : 0, () => ({ event: "block_finished", id: pick(free) })],
       [config.saved ? 3 : 0.2, () => ({ event: "saved_through", seq: random() < 0.85 ? s.savedThrough + 1 + Math.floor(random() * Math.max(1, s.nextSeq - s.savedThrough)) : Math.floor(random() * (s.nextSeq + 3)) })],
+      [config.saved && s.savedThrough < s.nextSeq ? 0.35 : 0, () => ({ event: "save_failed" })],
       [0.6, () => ({ event: "compacted" })],
       [0.8, () => ({ event: "resized" })],
       [s.reprinting ? 5 : 0.2, () => ({ event: "reprint_tick" })],
@@ -203,11 +205,26 @@ export function scriptedTraces(saved: boolean): { name: string; steps: Step[] }[
   const ticks = (n: number) => Array.from({ length: n }, () => E("reprint_tick"));
   const scripted = [
     {
-      name: "a compaction mid-turn keeps the live tool line and drops the old cycle at turn end",
+      name: "a compaction mid-turn in a saved session drops pre-compaction blocks when saved and keeps live blocks",
       steps: [
         E("turn_started"), E("block_opened", { id: 1 }), E("block_finished", { id: 2 }), E("block_finished", { id: 3 }),
-        E("saved_through", { seq: 2 }), E("compacted"), E("block_changed", { id: 1 }), E("turn_ended"),
+        E("saved_through", { seq: 2 }), E("compacted"), E("block_changed", { id: 1 }),
         E("block_finished", { id: 1 }), E("saved_through", { seq: 3 }), E("turn_ended"), E("resized"), ...ticks(4),
+      ],
+    },
+    {
+      name: "mid-turn compaction with failed save holds until saved_through advances",
+      steps: [
+        E("turn_started"), E("block_finished", { id: 1 }), E("block_finished", { id: 2 }),
+        E("compacted"), E("save_failed"), E("block_finished", { id: 3 }),
+        E("saved_through", { seq: 2 }), E("turn_ended"),
+      ],
+    },
+    {
+      name: "the --no-save mid-turn compaction holds until turn end",
+      steps: [
+        E("turn_started"), E("block_finished", { id: 1 }), E("block_finished", { id: 2 }),
+        E("compacted"), E("block_finished", { id: 3 }), E("turn_ended"),
       ],
     },
     {
@@ -265,7 +282,7 @@ export function scriptedTraces(saved: boolean): { name: string; steps: Step[] }[
   ];
   return saved
     ? scripted.filter((trace) => !trace.name.startsWith("the --no-save"))
-    : scripted.filter((trace) => !trace.steps.some((step) => step.event.event === "crash" || step.event.event === "resume"));
+    : scripted.filter((trace) => !trace.steps.some((step) => step.event.event === "crash" || step.event.event === "resume" || step.event.event === "save_failed"));
 }
 
 export async function codeToSpec(options: {

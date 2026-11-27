@@ -206,6 +206,7 @@ export function eventFor(act: Act, target: Record<string, unknown>): Event {
     case "BlockChanged": return { event: "block_changed", id: act.id };
     case "BlockFinished": return { event: "block_finished", id: act.id };
     case "SavedThrough": return { event: "saved_through", seq: act.through };
+    case "SaveFailed": return { event: "save_failed" };
     case "Compacted": return { event: "compacted" };
     case "Resized": return { event: "resized" };
     case "ReprintTick": return { event: "reprint_tick" };

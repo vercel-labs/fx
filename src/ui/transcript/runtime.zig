@@ -5076,6 +5076,13 @@ pub const TranscriptNotebook = struct {
     command_output_display: CommandOutputDisplayState = .{},
     replaceable_last_line: bool = false,
     replaceable_start: usize = 0,
+    running_turn_recap: tool_group_projection.TurnRecapTally = .{},
+    /// True after a mid-turn drop removed the active turn's start, until all
+    /// rows of that turn leave memory.
+    mid_turn_prefix_dropped: bool = false,
+    /// Set when a screen-cleared reprint runs while `mid_turn_prefix_dropped`
+    /// is true so the reprint starts with the dim Ctrl+O hint.
+    mid_turn_reprint_banner_active: bool = false,
 };
 
 /// The fields of `TranscriptRuntime` that belong to one transcript rather than
@@ -5505,6 +5512,7 @@ pub const TranscriptRuntime = struct {
         if (self.transcript_window) |*window| window.deinit(alloc);
         self.discardTranscriptArchive();
         self.notebook.lifecycle_state.deinit(alloc);
+        self.notebook.running_turn_recap.deinit(alloc);
         for (self.notebook.tool_details.items) |*detail| detail.deinit(alloc);
         self.notebook.tool_details.deinit(alloc);
         self.notebook.transcript.deinit(alloc);
@@ -7703,8 +7711,9 @@ pub const TranscriptRuntime = struct {
         var line_buf: [128]u8 = undefined;
         const line = formatTurnSummaryLine(&line_buf, summary);
         const entry = try alloc.print("{s}{s}{s}\n", .{ ui_render.dim_style, line, ui_render.reset_style });
-        const turn_recap = tool_group_projection.computeTurnRecap(
+        const turn_recap = tool_group_projection.computeTurnRecapWithSeed(
             alloc,
+            &self.notebook.running_turn_recap,
             self.notebook.entries.items,
             self.notebook.tool_details.items,
         ) catch |err| {
@@ -7728,6 +7737,7 @@ pub const TranscriptRuntime = struct {
             return err;
         };
         self.notebook.entries.items[self.notebook.entries.items.len - 1].raw_bytes.turn_recap = turn_recap;
+        self.notebook.running_turn_recap.reset(alloc);
         self.markTranscriptContentDirtyFrom(entry_id);
         try self.syncTranscriptWindow(alloc);
         return entry_id;
@@ -7774,19 +7784,35 @@ pub const TranscriptRuntime = struct {
     pub fn transcriptWindowResumed(self: *TranscriptRuntime, alloc: Allocator, holds_previous_cycle: bool) !void {
         // Which cycle is "one back" changed with the session.
         self.invalidateTranscriptArchive("resumed");
+        self.notebook.running_turn_recap.reset(alloc);
+        self.notebook.mid_turn_prefix_dropped = false;
+        self.notebook.mid_turn_reprint_banner_active = false;
         const window = if (self.transcript_window) |*value| value else return;
         try window.resumed(alloc, self.notebook.entries.items);
-        if (holds_previous_cycle) try self.transcriptWindowCompacted(alloc);
+        if (holds_previous_cycle) try self.transcriptWindowCompacted(alloc, window.saved());
     }
 
     /// The session compacted its context, after the session log committed it.
-    pub fn transcriptWindowCompacted(self: *TranscriptRuntime, alloc: Allocator) !void {
+    /// `pre_compaction_saved` is true only when all finished pieces before the
+    /// compaction are saved in the session log.
+    pub fn transcriptWindowCompacted(self: *TranscriptRuntime, alloc: Allocator, pre_compaction_saved: bool) !void {
         // A new newest compaction: the cycle Ctrl+O read as "one back" is
         // now two back.
         self.invalidateTranscriptArchive("compacted");
         const window = if (self.transcript_window) |*value| value else return;
+        // Finished tools before the compaction may leave memory only when the
+        // log holds them; an unsaved session or a failed save keeps them pinned
+        // until the turn ends, as before.
+        if (pre_compaction_saved and window.saved()) {
+            const terminal_ids = try self.notebook.lifecycle_state.terminalPinEntryIds(alloc);
+            defer alloc.free(terminal_ids);
+            if (terminal_ids.len > 0) {
+                try transcript_store.clearLifecyclePinsAtomic(self, alloc, terminal_ids);
+                self.notebook.lifecycle_state.markTerminalPinsReleased();
+            }
+        }
         const held = window.pending_drops.items.len;
-        try window.compacted(alloc, self.notebook.entries.items, &window.pending_drops);
+        try window.compacted(alloc, self.notebook.entries.items, &window.pending_drops, pre_compaction_saved);
         try self.applyTranscriptWindowDrops(alloc, window, window.pending_drops.items.len > held, "compacted");
     }
 
@@ -7829,10 +7855,37 @@ pub const TranscriptRuntime = struct {
         if (kept > 0) debug_trace.logf("transcript_window", "drop held entries={d} on screen", .{kept});
         if (ready.items.len == 0) return 0;
 
+        var dropped_tally: tool_group_projection.TurnRecapTally = .{};
+        defer dropped_tally.deinit(alloc);
         var going: transcript_store.EntryIdSet = .empty;
         defer going.deinit(alloc);
         try going.ensureTotalCapacity(alloc, @intCast(ready.items.len));
         for (ready.items) |id| going.putAssumeCapacity(id, {});
+
+        if (window.state.turn_open) {
+            var active_start: usize = 0;
+            var idx = self.notebook.entries.items.len;
+            while (idx > 0) {
+                idx -= 1;
+                switch (self.notebook.entries.items[idx]) {
+                    .raw_bytes => |raw| if (raw.class == .turn_summary or raw.class == .turn_cancellation) {
+                        active_start = idx + 1;
+                        break;
+                    },
+                    else => {},
+                }
+            }
+            var active_dropped: std.ArrayList(TranscriptEntry) = .empty;
+            defer active_dropped.deinit(alloc);
+            for (self.notebook.entries.items[active_start..]) |entry| {
+                const pinned = entry == .raw_bytes and entry.raw_bytes.lifecycle_pinned;
+                if (!pinned and going.contains(entry.id())) try active_dropped.append(alloc, entry);
+            }
+            if (active_dropped.items.len > 0) {
+                try dropped_tally.observeEntries(alloc, active_dropped.items, self.notebook.tool_details.items);
+                try self.notebook.running_turn_recap.reserveMerge(alloc, dropped_tally);
+            }
+        }
 
         var still_pending: usize = 0;
         for (window.pending_drops.items) |id| {
@@ -7842,7 +7895,7 @@ pub const TranscriptRuntime = struct {
         }
         window.pending_drops.shrinkRetainingCapacity(still_pending);
 
-        _ = transcript_store.dropEntriesAtomic(self, alloc, ready.items) catch |err| {
+        const changed = transcript_store.dropEntriesAtomic(self, alloc, ready.items) catch |err| {
             // Only ids still in the notebook go back, and since a failed drop leaves the notebook as it was, that is every id that left the list.
             var restored: usize = 0;
             for (self.notebook.entries.items) |entry| {
@@ -7853,6 +7906,7 @@ pub const TranscriptRuntime = struct {
             debug_trace.logf("transcript_window", "drop failed: kind={s} kept entries={d} pending reason={s}", .{ kind, restored, @errorName(err) });
             return err;
         };
+        if (changed) self.notebook.running_turn_recap.mergeAssumeCapacity(alloc, &dropped_tally);
         return ready.items.len;
     }
 
@@ -7866,18 +7920,33 @@ pub const TranscriptRuntime = struct {
     /// which still hold the cycle.
     pub fn transcriptWindowScreenCleared(self: *TranscriptRuntime, alloc: Allocator) !void {
         const window = if (self.transcript_window) |*value| value else return;
-        if (window.pending_drops.items.len == 0) return;
         if (self.notebook.pending_resume_source != null) {
-            debug_trace.logf("transcript_window", "screen cleared: keeping held drops entries={d} reason=resume_source_pending", .{window.pending_drops.items.len});
+            if (window.pending_drops.items.len > 0) {
+                debug_trace.logf("transcript_window", "screen cleared: keeping held drops entries={d} reason=resume_source_pending", .{window.pending_drops.items.len});
+            }
             return;
         }
         if (self.unpainted_resume_hold) {
-            debug_trace.logf("transcript_window", "screen cleared: keeping held drops entries={d} reason=unpainted_resume", .{window.pending_drops.items.len});
+            if (window.pending_drops.items.len > 0) {
+                debug_trace.logf("transcript_window", "screen cleared: keeping held drops entries={d} reason=unpainted_resume", .{window.pending_drops.items.len});
+            }
             return;
         }
-        const hold: TranscriptWindowDropHold = .none;
-        const released = try self.dropPendingEntries(alloc, window, &hold, "screen_cleared");
-        debug_trace.logf("transcript_window", "screen cleared: releasing held drops entries={d}", .{released});
+        var reprint_from_drop = false;
+        if (window.pending_drops.items.len > 0) {
+            const hold: TranscriptWindowDropHold = .none;
+            const released = try self.dropPendingEntries(alloc, window, &hold, "screen_cleared");
+            reprint_from_drop = released > 0;
+            debug_trace.logf("transcript_window", "screen cleared: releasing held drops entries={d}", .{released});
+        }
+        if (self.notebook.mid_turn_prefix_dropped and !self.notebook.mid_turn_reprint_banner_active) {
+            self.notebook.mid_turn_reprint_banner_active = true;
+            self.markTranscriptStructureDirty();
+            reprint_from_drop = true;
+        }
+        if (reprint_from_drop) {
+            self.resize_history_row_delta = null;
+        }
     }
 
     const TranscriptWindowDropHold = union(enum) {
@@ -8315,6 +8384,12 @@ pub const TranscriptRuntime = struct {
     /// span both).
     pub fn ctrlOJoinsPreviousCycle(self: *const TranscriptRuntime) bool {
         return self.transcript_archive_available and !self.transcriptWindowHoldsPreviousCycle();
+    }
+
+    /// Whether Ctrl+O's `back = 1` read needs the split turn's pre-compaction
+    /// prefix because the live transcript dropped it mid-turn.
+    pub fn ctrlOIncludesSplitPrefix(self: *const TranscriptRuntime) bool {
+        return !self.transcriptWindowHoldsPreviousCycle() and self.notebook.mid_turn_prefix_dropped;
     }
 
     /// The newest older cycle Ctrl+O shows on pages of its own.
@@ -11620,6 +11695,13 @@ pub const TranscriptRuntime = struct {
             std.debug.assert(std.meta.eql(scroll_plan, value.scroll_plan));
             self.consumeTranscriptTransitionWithCommit(alloc, value, result, scroll_commit);
         }
+        if (self.transcript_window) |*window| {
+            if (window.pending_drops.items.len > 0 and result.is_committed() and !self.unpainted_resume_hold) {
+                self.syncTranscriptWindow(alloc) catch |err| {
+                    debug_trace.logf("transcript_window", "post_commit sync failed err={s}", .{@errorName(err)});
+                };
+            }
+        }
         self.recordRenderCommit(
             before,
             before_recovery_pending,
@@ -12061,7 +12143,10 @@ pub const TranscriptRuntime = struct {
         class: RawEntryClass,
     ) !void {
         try transcript_writer.writeTranscriptClassified(self, alloc, metrics, text, record, class);
-        if (class == .turn_cancellation) try self.syncTranscriptWindow(alloc);
+        if (class == .turn_cancellation) {
+            self.notebook.running_turn_recap.reset(alloc);
+            try self.syncTranscriptWindow(alloc);
+        }
     }
 
     pub fn writeTranscriptBytesFrom(

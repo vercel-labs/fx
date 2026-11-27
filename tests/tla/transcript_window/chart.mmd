@@ -1,0 +1,38 @@
+%% Transcript window statechart (saved session unless noted)
+%% Omitted events: Crash, Resumed, BlockOpened/BlockChanged/BlockFinished within
+%% the same retention state, CtrlOOpened/CtrlOClosed/CtrlOScrolledNewer, LogReadDone/
+%% LogReadFailed (stale/duplicate/lost replies), ReprintTick slices, and --no-save
+%% (where mid-turn compaction keeps the pre-compaction turn until turn end).
+
+stateDiagram-v2
+    [*] --> Idle: session starts
+
+    Idle --> TurnRunning: user sends a prompt
+    Idle --> WaitingTurnEnd: /compact between turns (L22 holds previous cycle)
+    Idle --> ReadingFull: open Ctrl+O from memory (L10)
+
+    WaitingTurnEnd --> TurnRunning: user sends next prompt
+    WaitingTurnEnd --> BrokenL22: [bug] drop at /compact before next turn ends
+
+    TurnRunning --> WaitingForSave: context compacts mid-turn
+    TurnRunning --> Idle: turn ends and log confirms save
+
+    WaitingForSave --> CompactedInTurn: log confirms pre-compaction pieces saved
+    WaitingForSave --> WaitingForSave: mid-turn save fails (L3 holds blocks)
+    WaitingForSave --> Idle: turn ends after save confirms
+    WaitingForSave --> BrokenL3: [bug] drop mid-turn before log saved
+    WaitingForSave --> BrokenL23: [today/bug] hold pre-compaction blocks even after save confirms
+
+    CompactedInTurn --> CompactedInTurn: live tool updates or another mid-turn compaction + save
+    CompactedInTurn --> Reprinting: terminal resized (reprints from last compaction with "Earlier in this turn: Ctrl+O")
+    CompactedInTurn --> ReadingFull: open Ctrl+O (reads dropped prefix from log)
+    CompactedInTurn --> Idle: turn ends
+    CompactedInTurn --> BrokenL2L18: [bug] drop covers live or post-compaction blocks
+
+    Reprinting --> CompactedInTurn: reprint slices finish (L15)
+    ReadingFull --> CompactedInTurn: close Ctrl+O
+
+    state "Rule broken (L23): HeldSinceLastCompaction\nShortest path: Idle -> send prompt -> compact mid-turn -> log saves" as BrokenL23
+    state "Rule broken (L3): DropOnlySaved\nShortest path: Idle -> send prompt -> compact mid-turn -> save fails -> bug drops" as BrokenL3
+    state "Rule broken (L2, L18): LiveNeverDropped / DropBetweenTurns\nShortest path: Idle -> send prompt -> compact mid-turn -> finish block -> bug drops past compaction" as BrokenL2L18
+    state "Rule broken (L22): PreviousWaitsForTurnEnd\nShortest path: Idle -> /compact between turns -> bug drops at once" as BrokenL22

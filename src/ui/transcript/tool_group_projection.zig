@@ -5866,8 +5866,144 @@ fn turnSummaryTurnStart(entries: []const TranscriptEntry, summary_index: usize) 
     return turn_start;
 }
 
+/// Accumulated turn-recap counters for entries of the open turn that the
+/// transcript window already dropped mid-turn (`TranscriptNotebook`).
+pub const TurnRecapTally = struct {
+    changed_paths: std.ArrayList([]u8) = .empty,
+    read_paths: std.ArrayList([]u8) = .empty,
+    change_calls: usize = 0,
+    diff: DiffTotals = .{},
+    commands: usize = 0,
+    subagent_calls: usize = 0,
+
+    pub fn deinit(self: *TurnRecapTally, alloc: std.mem.Allocator) void {
+        for (self.changed_paths.items) |path| alloc.free(path);
+        self.changed_paths.deinit(alloc);
+        for (self.read_paths.items) |path| alloc.free(path);
+        self.read_paths.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn reset(self: *TurnRecapTally, alloc: std.mem.Allocator) void {
+        self.deinit(alloc);
+    }
+
+    pub fn observeEntries(
+        self: *TurnRecapTally,
+        alloc: std.mem.Allocator,
+        entries: []const TranscriptEntry,
+        details: []const ToolDetailRecord,
+    ) !void {
+        if (entries.len == 0) return;
+        var scratch_state = std.heap.ArenaAllocator.init(alloc);
+        defer mem_utils.deinit_arena(scratch_state);
+        const scratch = scratch_state.allocator();
+
+        var detail_indices: std.AutoHashMapUnmanaged(u32, usize) = .empty;
+        for (details, 0..) |detail, detail_index| {
+            const result = try detail_indices.getOrPut(scratch, detail.entry_id);
+            if (!result.found_existing) result.value_ptr.* = detail_index;
+        }
+        var tally: StoryTally = .{};
+        for (entries) |entry| {
+            const entry_id = toolStatusEntryId(entry) orelse continue;
+            const detail = detailForEntry(details, &detail_indices, entry_id, null);
+            if (statusNamesAsk(entry, detail)) continue;
+            try tally.observe(scratch, entry, detail);
+        }
+        try self.reserveAndAdd(alloc, tally);
+    }
+
+    fn reserveAndAdd(self: *TurnRecapTally, alloc: std.mem.Allocator, tally: StoryTally) !void {
+        var new_changed: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (new_changed.items) |path| alloc.free(path);
+            new_changed.deinit(alloc);
+        }
+        for (tally.changed_paths.items) |path| {
+            if (!containsPath(self.changed_paths.items, path) and !containsOwnedPath(new_changed.items, path)) {
+                try new_changed.append(alloc, try alloc.dupe(u8, path));
+            }
+        }
+        var new_reads: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (new_reads.items) |path| alloc.free(path);
+            new_reads.deinit(alloc);
+        }
+        for (tally.read_paths.items) |path| {
+            if (!containsPath(self.read_paths.items, path) and !containsOwnedPath(new_reads.items, path)) {
+                try new_reads.append(alloc, try alloc.dupe(u8, path));
+            }
+        }
+        try self.changed_paths.ensureUnusedCapacity(alloc, new_changed.items.len);
+        try self.read_paths.ensureUnusedCapacity(alloc, new_reads.items.len);
+        self.changed_paths.appendSliceAssumeCapacity(new_changed.items);
+        self.read_paths.appendSliceAssumeCapacity(new_reads.items);
+        new_changed.deinit(alloc);
+        new_reads.deinit(alloc);
+        self.change_calls += tally.change_calls;
+        self.diff.added += tally.diff.added;
+        self.diff.removed += tally.diff.removed;
+        self.commands += tally.commands;
+        self.subagent_calls += tally.subagent_calls;
+    }
+
+    pub fn reserveMerge(self: *TurnRecapTally, alloc: std.mem.Allocator, other: TurnRecapTally) !void {
+        try self.changed_paths.ensureUnusedCapacity(alloc, other.changed_paths.items.len);
+        try self.read_paths.ensureUnusedCapacity(alloc, other.read_paths.items.len);
+    }
+
+    /// Merges `other` into `self` without allocating; caller must call
+    /// `reserveMerge` beforehand and `other` is left empty.
+    pub fn mergeAssumeCapacity(self: *TurnRecapTally, alloc: std.mem.Allocator, other: *TurnRecapTally) void {
+        for (other.changed_paths.items) |path| {
+            if (containsOwnedPath(self.changed_paths.items, path)) {
+                alloc.free(path);
+            } else {
+                self.changed_paths.appendAssumeCapacity(path);
+            }
+        }
+        other.changed_paths.clearRetainingCapacity();
+        for (other.read_paths.items) |path| {
+            if (containsOwnedPath(self.read_paths.items, path)) {
+                alloc.free(path);
+            } else {
+                self.read_paths.appendAssumeCapacity(path);
+            }
+        }
+        other.read_paths.clearRetainingCapacity();
+        self.change_calls += other.change_calls;
+        self.diff.added += other.diff.added;
+        self.diff.removed += other.diff.removed;
+        self.commands += other.commands;
+        self.subagent_calls += other.subagent_calls;
+        other.deinit(alloc);
+    }
+
+    fn seedInto(self: TurnRecapTally, scratch: std.mem.Allocator, tally: *StoryTally) !void {
+        for (self.changed_paths.items) |path| try StoryTally.addDistinct(&tally.changed_paths, scratch, path);
+        for (self.read_paths.items) |path| try StoryTally.addDistinct(&tally.read_paths, scratch, path);
+        tally.change_calls += self.change_calls;
+        tally.diff.added += self.diff.added;
+        tally.diff.removed += self.diff.removed;
+        tally.commands += self.commands;
+        tally.subagent_calls += self.subagent_calls;
+    }
+
+    fn containsPath(list: []const []u8, needle: []const u8) bool {
+        for (list) |item| if (std.mem.eql(u8, item, needle)) return true;
+        return false;
+    }
+
+    fn containsOwnedPath(list: []const []u8, needle: []const u8) bool {
+        for (list) |item| if (std.mem.eql(u8, item, needle)) return true;
+        return false;
+    }
+};
+
 fn computeTurnRecapText(
     scratch: std.mem.Allocator,
+    seed: ?*const TurnRecapTally,
     entries: []const TranscriptEntry,
     details: []const ToolDetailRecord,
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
@@ -5875,6 +6011,7 @@ fn computeTurnRecapText(
 ) ![]const u8 {
     const turn_start = turnSummaryTurnStart(entries, summary_index);
     var tally: StoryTally = .{};
+    if (seed) |saved| try saved.seedInto(scratch, &tally);
     for (entries[turn_start..summary_index]) |entry| {
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, detail_indices, entry_id, null);
@@ -5884,10 +6021,12 @@ fn computeTurnRecapText(
     return formatTurnRecap(scratch, tally);
 }
 
-/// Computes the recap for a turn summary about to be appended after `entries`.
+/// Computes the recap for a turn summary about to be appended after `entries`,
+/// including any counts from `seed` dropped earlier in the same turn.
 /// Caller owns any `.text` slice returned.
-pub fn computeTurnRecap(
+pub fn computeTurnRecapWithSeed(
     alloc: std.mem.Allocator,
+    seed: ?*const TurnRecapTally,
     entries: []const TranscriptEntry,
     details: []const ToolDetailRecord,
 ) !transcript_blocks.TurnRecap {
@@ -5900,9 +6039,19 @@ pub fn computeTurnRecap(
         const result = try detail_indices.getOrPut(scratch, detail.entry_id);
         if (!result.found_existing) result.value_ptr.* = detail_index;
     }
-    const recap = try computeTurnRecapText(scratch, entries, details, &detail_indices, entries.len);
+    const recap = try computeTurnRecapText(scratch, seed, entries, details, &detail_indices, entries.len);
     if (recap.len == 0) return .empty;
     return .{ .text = try alloc.dupe(u8, recap) };
+}
+
+/// Computes the recap for a turn summary about to be appended after `entries`.
+/// Caller owns any `.text` slice returned.
+pub fn computeTurnRecap(
+    alloc: std.mem.Allocator,
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+) !transcript_blocks.TurnRecap {
+    return computeTurnRecapWithSeed(alloc, null, entries, details);
 }
 
 /// Inserts the turn recap before the first visible character of a turn
@@ -5928,7 +6077,7 @@ fn recapTurnSummary(
     const recap = switch (raw.turn_recap) {
         .empty => return null,
         .text => |text| text,
-        .uncomputed => try computeTurnRecapText(scratch, entries, details, detail_indices, summary_index),
+        .uncomputed => try computeTurnRecapText(scratch, null, entries, details, detail_indices, summary_index),
     };
     if (recap.len == 0) return null;
 

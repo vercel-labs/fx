@@ -2516,6 +2516,7 @@ const RenderEntriesOptions = struct {
     /// last entry) into `captured`.
     capture_at: ?usize = null,
     captured: ?*?PreparationResume = null,
+    leading_banner: ?[]const u8 = null,
 
     fn resetSummaryIndices(self: RenderEntriesOptions) void {
         std.debug.assert(self.summary_entry_ids.len == self.summary_transcript_indices.len);
@@ -2842,6 +2843,16 @@ fn renderEntriesInterruptible(
         std.debug.assert(prefix.entry_count <= entries.len);
         first = prefix.entry_count;
         try builder.resumeFrom(alloc, prefix, options);
+    } else if (options.leading_banner) |banner| {
+        if (banner.len > 0) {
+            try builder.out.appendSlice(alloc, banner);
+            const banner_lines = renderedHardLineCount(banner);
+            if (options.line_provenance) |lines| {
+                try lines.appendNTimes(alloc, .block_separator, banner_lines);
+            }
+            builder.line_index += banner_lines -| 1;
+            builder.sequence.observe(.system_notice, false, 1);
+        }
     }
     for (entries[first..], first..) |entry, entry_index| {
         if (options.capture_at == entry_index) try builder.capture(alloc, options, entry_index);
@@ -3078,6 +3089,7 @@ pub const TranscriptPreparationOptions = struct {
     resume_from: ?*const PreparationResume = null,
     capture_at: ?usize = null,
     captured: ?*?PreparationResume = null,
+    leading_banner: ?[]const u8 = null,
 };
 
 pub fn renderEntriesForPreparation(
@@ -3132,6 +3144,7 @@ pub fn renderEntriesForPreparationInterruptible(
             .resume_from = options.resume_from,
             .capture_at = options.capture_at,
             .captured = options.captured,
+            .leading_banner = options.leading_banner,
         },
         checkpoint,
     );

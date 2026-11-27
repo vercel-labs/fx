@@ -125,10 +125,12 @@ fn checkStep(before: tw.State, event: tw.Event, out: tw.Output, world: *World) !
     if (out.effect) |effect| switch (effect) {
         .drop => |range| {
             try std.testing.expect(range.from < range.to);
-            try std.testing.expect(range.to <= after.cycle_first); // L2
+            try std.testing.expect(range.to <= after.cycle_first); // L2, L18
             if (config.saved) try std.testing.expect(range.to <= world.log_saved); // L3
-            try std.testing.expect(!after.turn_open); // L18
-            try std.testing.expect(event != .compacted); // L22
+            if (after.turn_open) {
+                try std.testing.expect(config.saved and range.to <= after.cycle_first); // L18
+            }
+            if (event == .compacted) try std.testing.expect(before.turn_open); // L22
         },
         .paint_final => |seq| {
             try std.testing.expectEqual(after.next_seq - 1, seq); // L5
@@ -148,8 +150,13 @@ fn checkStep(before: tw.State, event: tw.Event, out: tw.Output, world: *World) !
         },
         else => {},
     };
-    // L1
-    if (!after.turn_open and !after.prev_waits_turn_end and (!config.saved or after.saved_through >= after.cycle_first)) try std.testing.expect(after.prev_first == null);
+    // L1, L23
+    if (!after.prev_waits_turn_end and ((config.saved and after.saved_through >= after.cycle_first) or (!config.saved and !after.turn_open))) {
+        try std.testing.expect(after.prev_first == null);
+    }
+    if (config.saved and !after.prev_waits_turn_end and after.saved_through >= after.cycle_first) {
+        try std.testing.expectEqual(after.cycle_first, after.heldFirst());
+    }
     // L22
     if (after.prev_waits_turn_end) try std.testing.expect(after.prev_first != null);
     if (after.reprinting) {

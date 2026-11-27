@@ -131,14 +131,19 @@ pub const Shell = struct {
     }
 
     /// The session compacted its context: the entries so far belong to the
-    /// cycle that just closed.
+    /// cycle that just closed. `pre_compaction_saved` is true only when the
+    /// session log already holds every finished piece before this compaction.
     pub fn compacted(
         self: *Shell,
         alloc: Allocator,
         entries: []const TranscriptEntry,
         drops: *std.ArrayList(u32),
+        pre_compaction_saved: bool,
     ) !void {
         try self.sync(alloc, entries, drops);
+        if (self.saved() and pre_compaction_saved and self.state.saved_through < self.state.next_seq) {
+            self.apply(.{ .saved_through = self.state.next_seq }, drops);
+        }
         self.apply(.compacted, drops);
     }
 
@@ -316,7 +321,7 @@ test "the transcript window shell reports a turn's entries in list order and end
     try testing.expectEqual(@as(usize, 0), drops.items.len);
 }
 
-test "the transcript window shell drops a compaction's closed cycle at the next saved turn end, not before" {
+test "the transcript window shell drops a compaction's closed cycle at the next saved turn end when the pieces before the compaction are not confirmed saved" {
     const alloc = testing.allocator;
     var shell = Shell.init(true);
     defer shell.deinit(alloc);
@@ -326,9 +331,10 @@ test "the transcript window shell drops a compaction's closed cycle at the next 
     defer entries.deinit(alloc);
     try entries.appendSlice(alloc, &.{ user(1), rawEntry(2, .tool_status, false), rawEntry(3, .turn_summary, false) });
     try shell.sync(alloc, entries.items, &drops);
-    // The next turn compacts mid-turn while a tool line is still pinned.
+    // The next turn compacts mid-turn while a tool line is still pinned and its
+    // pre-compaction pieces are not confirmed saved yet.
     try entries.appendSlice(alloc, &.{ user(4), rawEntry(5, .tool_status, true) });
-    try shell.compacted(alloc, entries.items, &drops);
+    try shell.compacted(alloc, entries.items, &drops, false);
     try testing.expectEqual(@as(usize, 0), drops.items.len);
     try entries.append(alloc, notice(6));
     entries.items[4] = rawEntry(5, .tool_status, false);
@@ -357,9 +363,10 @@ test "a failed allocation in a sync leaves the transcript window shell as it was
         defer entries.deinit(alloc);
         try entries.appendSlice(alloc, &.{ user(1), rawEntry(2, .tool_status, false), rawEntry(3, .turn_summary, false) });
         try shell.sync(alloc, entries.items, &drops);
-        // The next turn compacts mid-turn while a tool line is still pinned.
+        // The next turn compacts mid-turn while a tool line is still pinned and its
+        // pre-compaction pieces are not confirmed saved yet, so the later sync drops them.
         try entries.appendSlice(alloc, &.{ user(4), rawEntry(5, .tool_status, true) });
-        try shell.compacted(alloc, entries.items, &drops);
+        try shell.compacted(alloc, entries.items, &drops, false);
         try testing.expectEqual(@as(usize, 0), drops.items.len);
         try entries.append(alloc, notice(6));
         entries.items[4] = rawEntry(5, .tool_status, false);
@@ -418,7 +425,7 @@ test "a failed allocation in a resume leaves the transcript window shell empty" 
         try entries.appendSlice(alloc, &.{ user(1), rawEntry(2, .tool_status, false), rawEntry(3, .turn_summary, false) });
         try shell.sync(alloc, entries.items, &drops);
         try entries.appendSlice(alloc, &.{ user(4), rawEntry(5, .tool_status, true) });
-        try shell.compacted(alloc, entries.items, &drops);
+        try shell.compacted(alloc, entries.items, &drops, false);
         try entries.append(alloc, notice(6));
         entries.items[4] = rawEntry(5, .tool_status, false);
         try entries.append(alloc, rawEntry(7, .turn_summary, false));
@@ -459,7 +466,7 @@ test "the transcript window shell drops at the turn end of an unsaved session wi
     defer drops.deinit(alloc);
     const first = [_]TranscriptEntry{ user(1), rawEntry(2, .turn_summary, false) };
     try shell.sync(alloc, &first, &drops);
-    try shell.compacted(alloc, &first, &drops);
+    try shell.compacted(alloc, &first, &drops, false);
     // Nothing goes at the compaction itself: the closed cycle waits for the
     // next turn end.
     try testing.expectEqual(@as(usize, 0), drops.items.len);
@@ -476,7 +483,7 @@ test "the transcript window shell ends a cancelled turn without confirming a sav
     defer drops.deinit(alloc);
     const first = [_]TranscriptEntry{ user(1), rawEntry(2, .turn_summary, false) };
     try shell.sync(alloc, &first, &drops);
-    try shell.compacted(alloc, &first, &drops);
+    try shell.compacted(alloc, &first, &drops, true);
     try testing.expectEqual(@as(usize, 0), drops.items.len);
     const cancelled = first ++ [_]TranscriptEntry{ user(3), rawEntry(4, .turn_cancellation, false) };
     try shell.sync(alloc, &cancelled, &drops);
@@ -540,7 +547,9 @@ test "the transcript window shell never drops an unsaved or live entry on seeded
                 },
                 6 => {
                     const before = drops.items.len;
-                    try shell.compacted(alloc, entries.items, &drops);
+                    const pre_compaction_saved = random.boolean();
+                    if (shell.saved() and pre_compaction_saved) saved_through_id = next_id - 1;
+                    try shell.compacted(alloc, entries.items, &drops, pre_compaction_saved);
                     try expectDropsSafe(&shell, entries.items, drops.items[before..], saved_through_id);
                     removeDropped(&entries, drops.items[before..]);
                     continue;
@@ -584,4 +593,27 @@ fn removeDropped(entries: *std.ArrayList(TranscriptEntry), dropped: []const u32)
         kept += 1;
     }
     entries.shrinkRetainingCapacity(kept);
+}
+
+test "shell advances saved_through at mid-turn compaction only when pre-compaction pieces are saved" {
+    const alloc = testing.allocator;
+    var shell = Shell.init(true);
+    defer shell.deinit(alloc);
+    var drops: std.ArrayList(u32) = .empty;
+    defer drops.deinit(alloc);
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer entries.deinit(alloc);
+
+    try entries.appendSlice(alloc, &.{ user(1), rawEntry(2, .tool_status, false) });
+    // Failed mid-turn save: saved_through stays 0 and nothing drops.
+    try shell.compacted(alloc, entries.items, &drops, false);
+    try testing.expectEqual(@as(core.Seq, 0), shell.state.saved_through);
+    try testing.expectEqual(@as(usize, 0), drops.items.len);
+
+    // Confirmed mid-turn save: saved_through advances to cycle_first (3) and pre-compaction blocks drop.
+    try entries.append(alloc, rawEntry(3, .tool_status, false));
+    try shell.compacted(alloc, entries.items, &drops, true);
+    try testing.expectEqual(@as(core.Seq, 3), shell.state.saved_through);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, drops.items);
+    try testing.expectEqual(@as(usize, 0), shell.finished.items.len);
 }

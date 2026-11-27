@@ -3134,6 +3134,7 @@ pub fn Runtime(comptime App: type) type {
                     v2.commitTurn(prepared.*, agent.session.languageSnapshot());
                 committed catch |err| break :saved err;
                 captures.committed(capture_token);
+                agent.session_persistence.turn_piece_save_failed = false;
                 return null;
             };
             switch (mode) {
@@ -3143,6 +3144,7 @@ pub fn Runtime(comptime App: type) type {
                     return .uncommitted;
                 },
                 .finished_prompt => {
+                    agent.session_persistence.turn_piece_save_failed = true;
                     recordShutdownFailure(agent, failure);
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
                         var plain_buf: [96]u8 = undefined;
@@ -3164,7 +3166,10 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             const v2 = agent.session_persistence.v2 orelse return;
-            try v2.appendProgressWithRecord(progress.user, progress.execution, progress.saved_execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }, progress.recovery_record);
+            v2.appendProgressWithRecord(progress.user, progress.execution, progress.saved_execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }, progress.recovery_record) catch |err| {
+                agent.session_persistence.turn_piece_save_failed = true;
+                return err;
+            };
         }
 
         /// `AgentRuntimeDeps.record_usage` on v2: each reply's usage
@@ -4481,8 +4486,9 @@ pub fn Runtime(comptime App: type) type {
                 try cache.starts.append(app.alloc, cache.startOf(next_back, try v2.previousCompactionCursor(app.alloc, end)));
             }
             const start = cache.starts.items[back - 1];
+            const include_split_prefix = back == 1 and app.shell.ctrlOIncludesSplitPrefix();
             const reader = try v2.cycleReader(std.heap.c_allocator);
-            try read.start(reader, .{ .back = back, .start = start, .generation = generation });
+            try read.start(reader, .{ .back = back, .start = start, .generation = generation, .include_split_prefix = include_split_prefix });
             debug_trace.logf("full_transcript_cache", "archive_read_started back={d} generation={d} find_us={d}", .{
                 back,
                 generation,
@@ -5859,6 +5865,7 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             discardAnyPendingCancelledCommand(app, agent, "writable_session_close");
+            agent.session_persistence.turn_piece_save_failed = false;
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
                 agent.session_persistence.pending_input_restore.onSessionClosed();
             }
@@ -6167,7 +6174,11 @@ pub fn Runtime(comptime App: type) type {
             prepared_owned = false;
             if (comptime @hasField(App, "shell")) {
                 if (comptime @hasDecl(@TypeOf(app.shell), "transcriptWindowCompacted")) {
-                    if (transcriptInContext(app, agent)) try app.shell.transcriptWindowCompacted(app.alloc);
+                    const pre_compaction_saved = if (comptime agents.hasAgentField(App, "session_persistence"))
+                        agent.session_persistence.v2 != null and !agent.session_persistence.turn_piece_save_failed
+                    else
+                        false;
+                    if (transcriptInContext(app, agent)) try app.shell.transcriptWindowCompacted(app.alloc, pre_compaction_saved);
                     syncTranscriptArchiveAvailable(app, agent);
                 }
             }
@@ -14525,4 +14536,191 @@ test "eb03: failed restore notice still withdraws accepted inputs" {
     var remaining = try app.agent().session_persistence.v2.?.pendingAcceptedInputs(alloc);
     defer remaining.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), remaining.ids.len);
+}
+
+const ArchiveTestApp = struct {
+    alloc: Allocator,
+    workspace_root: []u8,
+    main_agent: @FieldType(TestApp, "main_agent") = .{},
+    shell: transcript_runtime.TranscriptRuntime = .{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 21,
+        .divider_top_row = 22,
+        .input_row = 23,
+        .divider_bottom_row = 24,
+        .hint_row = 22,
+    } },
+    permission_engine: @FieldType(TestApp, "permission_engine") = .{},
+
+    fn init(alloc: Allocator, workspace_root: []const u8) !ArchiveTestApp {
+        return .{
+            .alloc = alloc,
+            .workspace_root = try alloc.dupe(u8, workspace_root),
+        };
+    }
+
+    fn deinit(self: *ArchiveTestApp) void {
+        self.shell.deinit(self.alloc);
+        Runtime(ArchiveTestApp).deinitPersistence(self, self.agent());
+        self.agent().session.deinit(self.alloc);
+        self.agent().worker.deinit(std.heap.c_allocator);
+        self.permission_engine.deinit(self.alloc);
+        self.alloc.free(self.workspace_root);
+        self.* = undefined;
+    }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
+
+    pub fn beginResumeProjection(self: *ArchiveTestApp, _: anytype) !resume_projection.ResumeProjection {
+        return resume_projection.ResumeProjection.init(self.alloc, &self.shell, io_mod.milliTimestamp(), 1);
+    }
+
+    fn toolAdvertisementSet(_: *const ArchiveTestApp, _: anytype) tool_set_contract.ToolSet {
+        return builtin_tools.advertisement_set;
+    }
+
+    fn toolRegistry(_: *const ArchiveTestApp, _: anytype) tool_dispatch.Registry {
+        return builtin_tools.advertisement_set.registry;
+    }
+
+    fn historicalToolActivityKind(self: *ArchiveTestApp, _: anytype, call: types.ToolCall) types.ToolActivityKind {
+        return tool_dispatch.toolActivityKindForCall(self.alloc, builtin_tools.advertisement_set.registry, call);
+    }
+
+    fn prepareHistoricalQuestionResolution(self: *ArchiveTestApp, answers: []const types.QuestionAnswer) ![]u8 {
+        return question_ui.composeResolvedQuestionAnswers(self.alloc, answers, self.shell.layout.cols);
+    }
+
+    fn describeToolActionCompletedWithAdvertised(_: *ArchiveTestApp, _: anytype, arena: Allocator, call: types.ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
+        return if (display_target) |target| arena.print("● Read {s}", .{target}) else arena.print("● {s}", .{call.name});
+    }
+
+    fn describeToolActionDeniedWithAdvertised(_: *ArchiveTestApp, _: anytype, arena: Allocator, call: types.ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
+        return arena.print("● {s} {s}", .{ label, call.name });
+    }
+
+    pub fn writeDomainNotice(_: *ArchiveTestApp, _: types.SemanticNotice, _: bool) !void {}
+};
+
+test "Ctrl+O after a mid-turn drop shows the split turn's pre-compaction rows from the log" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try ArchiveTestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(ArchiveTestApp).initializePersistence(&app, app.agent(), true);
+    try Runtime(ArchiveTestApp).beginFresh(&app, app.agent(), .later, null);
+    defer Runtime(ArchiveTestApp).closeWritableSession(&app, app.agent());
+
+    const v2 = app.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("FIRST_TURN_PROMPT") },
+        .assistant = @constCast("FIRST_TURN_ANSWER"),
+    } }, types.ConversationLanguage.default());
+
+    const split_user: types.UserTurn = .{ .text = @constCast("SPLIT_MID_PROMPT") };
+    var pre_calls = [_]types.ToolCall{.{
+        .id = @constCast("call-pre"),
+        .name = @constCast("read_file"),
+        .arguments_json = @constCast("{\"path\":\"pre_compact.txt\"}"),
+    }};
+    var pre_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-pre"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("pre contents\n"),
+        .output_bytes = 13,
+        .stored_output_bytes = 13,
+        .created_at_ms = 100,
+    }};
+    var pre_steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast("EARLY_STEP_TEXT"),
+        .tool_calls = &pre_calls,
+        .tool_results = &pre_results,
+    }};
+    try v2.appendProgressWithRecord(
+        split_user,
+        .{ .tool_steps = &pre_steps },
+        null,
+        .{ .calls = &.{}, .assistant = null },
+        .keep,
+    );
+
+    const summary_text = try alloc.dupe(u8, "mid-turn summary");
+    defer alloc.free(summary_text);
+    try v2.commitCompaction(.{
+        .summary = summary_text,
+        .removed_turn_count = 0,
+        .compaction_count = 1,
+    }, true, .{ .turns = 1 });
+
+    // Simulate the live transcript window compacting mid-turn: pre-compaction
+    // entries drop at compaction, leaving only post-compaction rows in memory.
+    try app.shell.enableTranscriptWindow(alloc, true);
+    var metrics: types.Metrics = .{};
+    _ = try app.shell.writeUserPromptCard(alloc, &metrics, split_user, false, &.{});
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, "● Read pre_compact.txt\n", .tool_status);
+    try app.shell.transcriptWindowCompacted(alloc, true);
+
+    const late_id = try app.shell.appendRawTranscriptEntryClassified(alloc, "● Read post_compact.txt\n", .tool_status);
+    try app.shell.attachHistoricalToolDetail(alloc, late_id, .{
+        .id = "call-post",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"post_compact.txt\"}",
+    }, .read, .{
+        .tool_call_id = @constCast("call-post"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("post contents\n"),
+        .output_bytes = 14,
+        .stored_output_bytes = 14,
+        .created_at_ms = 200,
+    });
+    Runtime(ArchiveTestApp).syncTranscriptArchiveAvailable(&app, app.agent());
+
+    _ = app.shell.requestFullTranscriptOpen();
+    try Runtime(ArchiveTestApp).loadTranscriptArchive(&app, app.agent(), 1);
+    // The read runs on its own thread and exposes only its done flag, so the
+    // test polls it, and fails instead of hanging if the read never ends.
+    var polls: usize = 0;
+    while (!try Runtime(ArchiveTestApp).pollTranscriptArchive(&app, app.agent())) {
+        polls += 1;
+        if (polls > 5_000) return error.TranscriptArchiveReadTimedOut;
+        io_mod.sleep(1_000_000);
+    }
+
+    var page = try app.shell.snapshotFullTranscriptPage(.{ .anchor = .tail, .content_revision = 0, .cols = 80 }, null, null);
+    defer page.deinit(std.heap.c_allocator);
+
+    var saw_split_prompt = false;
+    var saw_pre_step = false;
+    var saw_post_step = false;
+    for (page.entries.items) |entry| switch (entry) {
+        .user_turn => |u| if (std.mem.find(u8, u.turn.text, "SPLIT_MID_PROMPT") != null) {
+            saw_split_prompt = true;
+        },
+        .assistant_turn => |a| if (std.mem.find(u8, a.segments.text.items, "EARLY_STEP_TEXT") != null) {
+            saw_pre_step = true;
+        },
+        .raw_bytes => |r| {
+            if (std.mem.find(u8, r.bytes, "pre_compact.txt") != null) saw_pre_step = true;
+            if (std.mem.find(u8, r.bytes, "post_compact.txt") != null) saw_post_step = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_split_prompt);
+    try std.testing.expect(saw_pre_step);
+    try std.testing.expect(saw_post_step);
 }

@@ -56,12 +56,15 @@ Init ==
     /\ alive = TRUE /\ cycleStarts = {0}
     /\ painted = {}
 
-\* The drop that turn_ended and saved_through attempt (D2, D6). A save also
-\* waits for the first turn end after the compaction (`prevWaits`).
-CanDrop(po, cf, open, st) ==
+\* The drop that compacted, turn_ended, and saved_through attempt (D2, D6).
+\* Between-turns compactions (/compact) set `prevWaits`, holding until the next
+\* turn end; mid-turn compactions in a saved session drop as soon as the log
+\* holds the blocks before `cycleFirst`, while unsaved sessions hold until
+\* turn end.
+CanDrop(po, cf, open, waits, st) ==
     /\ po # None
-    /\ ~open
-    /\ (~Saved \/ st >= cf)
+    /\ ~waits
+    /\ IF Saved THEN st >= cf ELSE ~open
 
 \* The drop effect: none when the range holds no block.
 DropEffect(from, to) == IF from < to THEN <<[kind |-> "drop", from |-> from, to |-> to]>> ELSE <<>>
@@ -83,7 +86,7 @@ TurnStarted ==
 TurnEnded ==
     /\ alive /\ turnOpen /\ live = {}     \* A4
     /\ turnOpen' = FALSE /\ prevWaits' = FALSE /\ act' = [name |-> "TurnEnded"]
-    /\ IF CanDrop(prevFirst, cycleFirst, FALSE, savedThrough)
+    /\ IF CanDrop(prevFirst, cycleFirst, FALSE, FALSE, savedThrough)
           THEN /\ out' = DropEffect(prevFirst, cycleFirst)
                /\ prevFirst' = None
                /\ paintedThrough' = AfterDrop(paintedThrough, cycleFirst)
@@ -126,7 +129,7 @@ SavedThrough(through) ==
     /\ alive /\ Saved
     /\ through > savedThrough /\ through <= nextSeq
     /\ savedThrough' = Min(through, nextSeq) /\ act' = [name |-> "SavedThrough", through |-> through]
-    /\ IF ~prevWaits /\ CanDrop(prevFirst, cycleFirst, turnOpen, Min(through, nextSeq))
+    /\ IF CanDrop(prevFirst, cycleFirst, turnOpen, prevWaits, Min(through, nextSeq))
           THEN /\ out' = DropEffect(prevFirst, cycleFirst)
                /\ prevFirst' = None
                /\ paintedThrough' = AfterDrop(paintedThrough, cycleFirst)
@@ -135,22 +138,36 @@ SavedThrough(through) ==
                    reprinting, coOpen, coLo, coHi, coAtStart, pending,
                    pendingDir, nextToken, alive, cycleStarts>>
 
+\* A failed log write does not advance `savedThrough` and drops nothing.
+SaveFailed ==
+    /\ alive /\ Saved /\ ~OnlyOlder /\ savedThrough < nextSeq
+    /\ out' = <<>> /\ act' = [name |-> "SaveFailed"]
+    /\ UNCHANGED <<core, alive, cycleStarts>>
+
 \* The log commits the compaction record before the transcript hears of it
 \* (A2), so recovery finds it. Saves still arrive only as SavedThrough: a
 \* compaction never counts as proof that earlier blocks are in the log.
-\* A compaction drops nothing, even between turns (a manual compaction, or a
-\* resume whose newest compaction followed its last turn) with the log
-\* holding every block: the previous cycle waits for the next turn end
-\* (D2), so a resize before it still reprints that cycle.
+\* A compaction between turns (/compact) sets `prevWaits` so the previous
+\* cycle stays until the next turn end (L22). A mid-turn compaction clears any
+\* wait and drops the pre-compaction blocks in a saved session once the log
+\* holds them.
 Compacted ==
     /\ alive /\ cycle < MaxCycles
     /\ LET po == IF prevFirst = None THEN cycleFirst ELSE prevFirst
+           waits == ~turnOpen
        IN /\ cycle' = cycle + 1
           /\ cycleFirst' = nextSeq
           /\ cycleStarts' = cycleStarts \cup {nextSeq}
-          /\ prevFirst' = po /\ prevWaits' = TRUE
-    /\ out' = <<>> /\ act' = [name |-> "Compacted"]
-    /\ UNCHANGED <<nextSeq, savedThrough, live, turnOpen, paintedThrough,
+          /\ prevWaits' = waits
+          /\ IF CanDrop(po, nextSeq, turnOpen, waits, savedThrough)
+                THEN /\ out' = DropEffect(po, nextSeq)
+                     /\ prevFirst' = None
+                     /\ paintedThrough' = AfterDrop(paintedThrough, nextSeq)
+                ELSE /\ out' = <<>>
+                     /\ prevFirst' = po
+                     /\ UNCHANGED paintedThrough
+    /\ act' = [name |-> "Compacted"]
+    /\ UNCHANGED <<nextSeq, savedThrough, live, turnOpen,
                    reprinting, coOpen, coLo, coHi, coAtStart, pending,
                    pendingDir, nextToken, alive>>
 
@@ -312,6 +329,7 @@ UserMoves ==
 
 EnvMoves ==
     \/ \E t \in 1..MaxSeq : SavedThrough(t)
+    \/ SaveFailed
     \/ \E t \in 1..MaxTokens, c \in 0..(Step + 1) : LogReadDone(t, c)
     \/ \E t \in 1..MaxTokens : LogReadFailed(t)
     \/ Crash \/ Resumed
@@ -329,6 +347,74 @@ Next == (UserMoves \/ EnvMoves) /\ PaintedUpdate
 
 \* The pending read answered with the right count.
 GoodReply == LogReadDone(pending, Min(Step, Available(pendingDir)))
+
+\* Ideal environment for simulate-ideal: saves succeed, log reads return exact
+\* counts, and the process does not crash.
+IdealEnvMoves ==
+    \/ \E t \in 1..MaxSeq : SavedThrough(t)
+    \/ (coOpen /\ pending # 0 /\ GoodReply)
+
+IdealSpec == Init /\ [][((UserMoves \/ IdealEnvMoves) /\ PaintedUpdate)]_vars
+NonidealSpec == Init /\ [][Next]_vars
+
+\* Today's code (before FXC-1323): CanDrop always blocks mid-turn drops (~open).
+TodayCanDrop(po, cf, open, waits, st) ==
+    /\ po # None
+    /\ ~waits
+    /\ ~open
+    /\ (~Saved \/ st >= cf)
+
+TodayTurnEnded ==
+    /\ alive /\ turnOpen /\ live = {}
+    /\ turnOpen' = FALSE /\ prevWaits' = FALSE /\ act' = [name |-> "TurnEnded"]
+    /\ IF TodayCanDrop(prevFirst, cycleFirst, FALSE, FALSE, savedThrough)
+          THEN /\ out' = DropEffect(prevFirst, cycleFirst)
+               /\ prevFirst' = None
+               /\ paintedThrough' = AfterDrop(paintedThrough, cycleFirst)
+          ELSE /\ out' = <<>> /\ UNCHANGED <<prevFirst, paintedThrough>>
+    /\ UNCHANGED <<cycle, cycleFirst, nextSeq, savedThrough, live, reprinting,
+                   coOpen, coLo, coHi, coAtStart, pending, pendingDir, nextToken,
+                   alive, cycleStarts>>
+
+TodaySavedThrough(through) ==
+    /\ alive /\ Saved
+    /\ through > savedThrough /\ through <= nextSeq
+    /\ savedThrough' = Min(through, nextSeq) /\ act' = [name |-> "SavedThrough", through |-> through]
+    /\ IF TodayCanDrop(prevFirst, cycleFirst, turnOpen, prevWaits, Min(through, nextSeq))
+          THEN /\ out' = DropEffect(prevFirst, cycleFirst)
+               /\ prevFirst' = None
+               /\ paintedThrough' = AfterDrop(paintedThrough, cycleFirst)
+          ELSE /\ out' = <<>> /\ UNCHANGED <<prevFirst, paintedThrough>>
+    /\ UNCHANGED <<cycle, cycleFirst, nextSeq, live, turnOpen, prevWaits,
+                   reprinting, coOpen, coLo, coHi, coAtStart, pending,
+                   pendingDir, nextToken, alive, cycleStarts>>
+
+TodayCompacted ==
+    /\ alive /\ cycle < MaxCycles
+    /\ LET po == IF prevFirst = None THEN cycleFirst ELSE prevFirst
+       IN /\ cycle' = cycle + 1
+          /\ cycleFirst' = nextSeq
+          /\ cycleStarts' = cycleStarts \cup {nextSeq}
+          /\ prevFirst' = po /\ prevWaits' = ~turnOpen
+    /\ out' = <<>> /\ act' = [name |-> "Compacted"]
+    /\ UNCHANGED <<nextSeq, savedThrough, live, turnOpen, paintedThrough,
+                   reprinting, coOpen, coLo, coHi, coAtStart, pending,
+                   pendingDir, nextToken, alive>>
+
+TodayUserMoves ==
+    \/ TurnStarted \/ TodayTurnEnded
+    \/ \E id \in Ids : BlockOpened(id) \/ BlockChanged(id) \/ BlockFinished(id)
+    \/ TodayCompacted \/ Resized \/ ReprintTick
+    \/ CtrlOOpened \/ CtrlOScrolledOlder \/ CtrlOScrolledNewer \/ CtrlOClosed
+
+TodayEnvMoves ==
+    \/ \E t \in 1..MaxSeq : TodaySavedThrough(t)
+    \/ SaveFailed
+    \/ \E t \in 1..MaxTokens, c \in 0..(Step + 1) : LogReadDone(t, c)
+    \/ \E t \in 1..MaxTokens : LogReadFailed(t)
+    \/ Crash \/ Resumed
+
+TodaySpec == Init /\ [][(TodayUserMoves \/ TodayEnvMoves) /\ PaintedUpdate]_vars
 
 \* Each fair action carries the screen update, since alone it leaves `painted'` open.
 Fairness ==
@@ -358,7 +444,12 @@ TypeOK ==
 
 \* L1
 HeldIsRecentCycles ==
-    (alive /\ ~turnOpen /\ ~prevWaits /\ (~Saved \/ savedThrough >= cycleFirst)) => prevFirst = None
+    (alive /\ ~prevWaits /\ ((Saved /\ savedThrough >= cycleFirst) \/ (~Saved /\ ~turnOpen))) => prevFirst = None
+
+\* L23: in a saved session without a between-turns wait, once the log holds
+\* everything before cycleFirst, nothing before cycleFirst is held.
+HeldSinceLastCompaction ==
+    (alive /\ Saved /\ ~prevWaits /\ savedThrough >= cycleFirst) => prevFirst = None
 
 \* L2: drop ranges hold finished blocks only, which never include a live block.
 LiveNeverDropped ==
@@ -389,8 +480,11 @@ OneReadInFlight == pending # 0 => coOpen
 \* L12
 NoReadWhenUnsaved == ~Saved => \A e \in Effects : e.kind # "read_log"
 
-\* L18: a resize mid-turn reprints the whole current turn.
-DropBetweenTurns == \A e \in Effects : e.kind = "drop" => ~turnOpen
+\* L18: unsaved sessions drop only between turns; saved sessions may drop
+\* mid-turn, covering only blocks before the turn's last compaction.
+DropBetweenTurns ==
+    \A e \in Effects : e.kind = "drop" =>
+        IF Saved THEN (~turnOpen \/ e.to <= cycleFirst) ELSE ~turnOpen
 
 \* L19: outside a reprint, every held block is on the screen.
 ScreenHoldsHeld == (alive /\ ~reprinting) => (HeldFirst..(nextSeq - 1)) \subseteq painted

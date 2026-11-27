@@ -1143,7 +1143,11 @@ fn prepareTranscriptSourceInternal(
 
     var finality: transcript_release.Candidates = .{};
     errdefer finality.deinit(alloc);
-    if ((self.notebook.entries.items.len > 0 or self.assistant_tail.items.len > 0) and self.layout.cols > 0) {
+    const has_mid_turn_banner = if (comptime @hasField(@TypeOf(self.notebook), "mid_turn_reprint_banner_active"))
+        self.notebook.mid_turn_reprint_banner_active
+    else
+        false;
+    if ((self.notebook.entries.items.len > 0 or self.assistant_tail.items.len > 0 or has_mid_turn_banner) and self.layout.cols > 0) {
         rendered_from_entries = true;
         const capture_provenance = true;
         const replaceable_entry_id: ?u32 = if (self.notebook.replaceable_last_line and
@@ -1173,9 +1177,17 @@ fn prepareTranscriptSourceInternal(
             summary_entry_ids[index] = block.summary_entry_id;
         }
 
-        // A focused or omitted entry changes the projection for this one
-        // preparation; it neither uses nor replaces the shared prefix.
-        const plan: PrefixPlan = if (focused_entry_id == null and omitted_entry_id == null)
+        // A focused or omitted entry, or a mid-turn reprint banner, changes the
+        // prefix for this preparation; it neither uses nor replaces the shared prefix.
+        const leading_banner: ?[]u8 = if (comptime @hasField(@TypeOf(self.notebook), "mid_turn_reprint_banner_active"))
+            if (self.notebook.mid_turn_reprint_banner_active)
+                try alloc.print("{s}Earlier in this turn: Ctrl+O{s}", .{ ui_render.dim_style, ui_render.reset_style })
+            else
+                null
+        else
+            null;
+        defer if (leading_banner) |banner| alloc.free(banner);
+        const plan: PrefixPlan = if (focused_entry_id == null and omitted_entry_id == null and leading_banner == null)
             planFrozenPrefix(self, .prepared, entry_actions, self.layout.cols)
         else
             .{};
@@ -1192,6 +1204,7 @@ fn prepareTranscriptSourceInternal(
             .capture_provenance = capture_provenance,
             .entry_actions = entry_actions,
             .tail = self.assistant_tail.items,
+            .leading_banner = leading_banner,
         };
         var resumable_options = render_options;
         resumable_options.resume_from = plan.resume_from;
