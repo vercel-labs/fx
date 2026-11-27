@@ -665,6 +665,7 @@ const AcpContext = struct {
             });
         }
         var tc: tool_runtime.Context = .{
+            .nested_tool_registry = builtin_tools.registry,
             .observer = self.observer,
             .workspace_root = self.state.workspace_root,
             .access_scope = self.state.workspace_access.scope(self.state.workspace_root),

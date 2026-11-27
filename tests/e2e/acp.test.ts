@@ -11759,6 +11759,55 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP bash fx tool web under a domain deny rule exits 5 before any fetch",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-bash-web-deny-");
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          experimental: { bash_tool: true },
+          permission: { bash: "allow", web_fetch: { "domain:example.com": "deny" } },
+        }),
+      );
+      const gateway = startDynamicFakeGateway((body) => {
+        if (body.includes('"toolCallId":"acp_web_deny"')) return finalText("ACP_WEB_DONE");
+        if (body.includes("Fetch the page once.")) {
+          return fakeGatewayToolCall("acp_web_deny", "bash", {
+            command: `${JSON.stringify(FX_BIN)} tool web https://example.com/page; echo "exit=$?"`,
+          });
+        }
+        return finalText("ACP_OTHER");
+      });
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine(); // consume session/update notification
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const run = await runPrompt(client, "Fetch the page once.", 60_000);
+        expect(run.promptResult.result.stopReason).toBe("end_turn");
+
+        const webRequest = gateway.requests.find((request) => request.body.includes('"toolCallId":"acp_web_deny"'));
+        expect(webRequest).toBeDefined();
+        expect(acpToolResultText(webRequest!.body, "acp_web_deny")).toContain("exit=5");
+
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  test(
     "ACP bash runs skill list and agent status, and the result holds the skill line and the agent status",
     async () => {
       const root = createIsolatedRoot("fx-acp-bash-skill-agent-");

@@ -1062,6 +1062,7 @@ const AskContext = struct {
             });
         }
         var tc: tool_runtime.Context = .{
+            .nested_tool_registry = builtin_tools.registry,
             .workspace_root = self.workspace_root,
             .access_scope = self.workspace_access.scope(self.workspace_root),
             .ignored_list_entries = self.cfg.ignored_list_entries,

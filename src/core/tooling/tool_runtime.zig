@@ -91,6 +91,10 @@ const test_builtin_tools = if (builtin.is_test)
     @import("../../builtins/tools.zig")
 else
     struct {};
+const test_bash_tools = if (builtin.is_test)
+    @import("../../builtins/bash_tools.zig")
+else
+    struct {};
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -232,6 +236,10 @@ pub const Context = struct {
     provider_strict: bool = false,
     first_call_tool_choice: types.ToolChoice = .auto,
     tool_registry: tool_dispatch.Registry = .{},
+    /// The registry a bridged call's permission contract comes from when the
+    /// session's `tool_registry` lacks the tool. Hosts set it to the built-in
+    /// registry. Null means such a call is refused, so a missed tool fails closed.
+    nested_tool_registry: ?tool_dispatch.Registry = null,
     host_tool_provider: ?tool_dispatch.HostToolProvider = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_caller_id: ?[]const u8 = null,
@@ -1892,6 +1900,24 @@ const NestedCheck = union(enum) {
 /// with its definition for the review.
 fn checkNestedCall(ctx: Context, arena: Allocator, call: ToolCall, mcp: ?tool_mcp_runtime.SelectedTool) !NestedCheck {
     var check = ctx;
+    // A built-in the session's registry lacks, such as web_fetch in a bash session, is
+    // checked with the host's built-in registry, as a direct call is. Only this copy
+    // changes; the call still runs in the session's registry.
+    if (ctx.tool_registry.lookup(call.name) == null) {
+        if (ctx.nested_tool_registry) |nested| {
+            if (nested.lookup(call.name) != null) check.tool_registry = nested;
+        }
+    }
+    // Admission lets a call with no permission contract through without reading a rule.
+    // Refuse it here instead, so a missed tool fails closed (R4.2).
+    if (mcp == null and
+        check.tool_registry.lookup(call.name) == null and
+        !types.isMcpToolName(call.name) and
+        !tool_mcp_runtime.isAdvertisedDynamicToolName(ctx.advertised_dynamic_tool_names, call.name))
+    {
+        debug_trace.logf("permission", "nested call refused: tool={s} has no permission contract", .{call.name});
+        return .{ .deny = try arena.print("{f} has no permission check in fx, so the call was refused.", .{text_utils.terminalSafe(call.name)}) };
+    }
     if (mcp) |resolved| {
         const names = try arena.alloc([]const u8, ctx.advertised_dynamic_tool_names.len + 1);
         @memcpy(names[0..ctx.advertised_dynamic_tool_names.len], ctx.advertised_dynamic_tool_names);
@@ -1902,7 +1928,10 @@ fn checkNestedCall(ctx: Context, arena: Allocator, call: ToolCall, mcp: ?tool_mc
     }
     check.permission_review_turn = try nestedReviewTurn(ctx, arena, call);
     const outcome = try tool_admission.requestPermissionOutcome(check.admissionInput(), arena, call, ctx.permission_mode, ctx.session_grants);
-    if (!outcome.decision.isDenied() and outcome.tool_failure == null) return .{ .allow = check };
+    if (!outcome.decision.isDenied() and outcome.tool_failure == null) {
+        check.tool_registry = ctx.tool_registry;
+        return .{ .allow = check };
+    }
     if (outcome.tool_failure orelse outcome.feedback) |message| return .{ .deny = message };
     // Say why, as a direct call would: a held review's reason and advice tell
     // the calling command what to change, such as an action too large to
@@ -3707,6 +3736,100 @@ test "bridged web rows show Fetching or Searching with the url or the query, and
     try std.testing.expectEqualStrings("zig release notes", search.action.target);
 }
 
+test "bridged web_fetch under a domain deny rule is refused when the bash session's registry lacks web_fetch" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The registry `fx ask` gives a bash session: the advertised tools, without web_fetch.
+    const bash_registry = test_bash_tools.select(true, test_builtin_tools.advertisement_set).registry;
+    var deny_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("web_fetch"),
+        .pattern = @constCast("domain:example.com"),
+        .action = .deny,
+    }};
+    var rt = TestRuntime{
+        .workspace_root = "/unused",
+        .permission_mode = .ask,
+        .interactive = false,
+        .permission_rules = .{ .rules = &deny_rules },
+        .tool_registry = bash_registry,
+        .nested_tool_registry = test_builtin_tools.registry,
+    };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-70", .{ .web_fetch = .{ .url = "https://example.com/page" } })) {
+        .allow => return error.TestExpectedDeny,
+        .deny => {},
+    }
+}
+
+test "bridged web_search under a deny rule is refused when the bash session's registry lacks web_search" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bash_registry = test_bash_tools.select(true, test_builtin_tools.advertisement_set).registry;
+    var backend = WebSearchBackendFixture{};
+    var deny_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("web_search"),
+        .pattern = @constCast("*"),
+        .action = .deny,
+    }};
+    var rt = TestRuntime{
+        .workspace_root = "/unused",
+        .permission_mode = .ask,
+        .interactive = false,
+        .permission_rules = .{ .rules = &deny_rules },
+        .tool_registry = bash_registry,
+        .nested_tool_registry = test_builtin_tools.registry,
+        .web_search_runtime_ready = true,
+        .web_search_backend = .{ .ctx = @ptrCast(&backend), .execute_fn = WebSearchBackendFixture.search },
+    };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-71", .{ .web_search = .{ .query = "zig release notes" } })) {
+        .allow => return error.TestExpectedDeny,
+        .deny => {},
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.calls);
+}
+
+test "a nested call of a tool with no permission contract is refused with its name, not allowed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var rt = TestRuntime{ .workspace_root = "/unused", .permission_mode = .yolo };
+    defer rt.deinit(alloc);
+    const call: ToolCall = .{ .id = "nested-made-up", .name = "made_up_tool", .arguments_json = "{}" };
+    switch (try checkNestedCall(rt.context(), arena, call, null)) {
+        .allow => return error.TestExpectedDeny,
+        .deny => |why| try std.testing.expect(std.mem.find(u8, why, "made_up_tool") != null),
+    }
+}
+
+test "a bridged web_fetch with no nested registry is refused, not allowed, because the built-in contract is unknown" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bash_registry = test_bash_tools.select(true, test_builtin_tools.advertisement_set).registry;
+    // Yolo with no rule: a call that reaches admission's allow branch would pass.
+    var rt = TestRuntime{
+        .workspace_root = "/unused",
+        .permission_mode = .yolo,
+        .tool_registry = bash_registry,
+        .nested_tool_registry = null,
+    };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-72", .{ .web_fetch = .{ .url = "https://example.com/page" } })) {
+        .allow => return error.TestExpectedDeny,
+        .deny => {},
+    }
+}
+
 test "bridged skill open target lookup propagates OutOfMemory from a location's resolve" {
     var name_buf: [16 * 1024]u8 = undefined;
     @memset(&name_buf, 'a');
@@ -5446,6 +5569,7 @@ const TestRuntime = struct {
     observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     tool_registry: tool_dispatch.Registry = test_tool_registry,
+    nested_tool_registry: ?tool_dispatch.Registry = null,
     worker: WorkerRuntime = .{},
     session: SessionRuntime = .{ .max_history_turns = 8 },
     subagent_host: ?*subagent_tool_host.Runtime = null,
@@ -5535,6 +5659,7 @@ const TestRuntime = struct {
             .session_grants = self.session_grants,
             .permission_rules = self.permission_rules,
             .tool_registry = self.tool_registry,
+            .nested_tool_registry = self.nested_tool_registry,
             .subagent_host = self.subagent_host,
             .subagent_caller_id = self.subagent_caller_id,
             .worker = &self.worker,

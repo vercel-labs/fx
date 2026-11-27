@@ -3200,6 +3200,92 @@ describe("slice 7: fx tool web and search", () => {
     expect(out).toContain("exit=5");
   }, TIMEOUT);
 
+  test("fx tool search under a web_search deny rule exits 5 before any search", async () => {
+    const root = createRoot();
+    mkdirSync(join(root.home, ".fx"), { recursive: true });
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ permission: { bash: "allow", web_search: "deny" } }),
+    );
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("b_search_deny", "bash", {
+        command: `${JSON.stringify(FX_BIN)} tool search "zig release notes"; echo "exit=$?"`,
+      }),
+      fakeGatewayFinalText("Denied.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--auto", ...BASH_SETTING, "Search for zig release notes."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = (JSON.parse(toolResultText(gateway.requests[1]!.body, "b_search_deny")) as { value: string }).value;
+    expect(out).toContain("exit=5");
+  }, TIMEOUT);
+
+  test("in bash-tool mode a direct model call of web_fetch gets the same result as before the nested check fix", async () => {
+    const root = createRoot();
+    mkdirSync(join(root.home, ".fx"), { recursive: true });
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ permission: { bash: "allow", web_fetch: { "domain:example.com": "deny" } } }),
+    );
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("direct_fetch", "web_fetch", { url: "https://example.com/page" }),
+      fakeGatewayFinalText("Done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--auto", ...BASH_SETTING, "Fetch example.com."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = (JSON.parse(toolResultText(gateway.requests[1]!.body, "direct_fetch")) as { value: string }).value;
+    expect(out).toBe("Unsupported tool: web_fetch");
+  }, TIMEOUT);
+
+  test("a subagent child's fx tool web under a domain deny rule exits 5 before any fetch", async () => {
+    const root = createRoot();
+    mkdirSync(join(root.home, ".fx", "agents", "helper"), { recursive: true });
+    writeFileSync(join(root.home, ".fx", "agents", "helper", "profile.json"), JSON.stringify({ description: "Helper agent" }));
+    mkdirSync(join(root.home, ".fx"), { recursive: true });
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ permission: { bash: "allow", web_fetch: { "domain:example.com": "deny" } } }),
+    );
+    let step = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (body.includes('"name":"permission_decision"')) return fakeGatewayPermissionDecision("clear");
+      if (!body.includes('"name":"subagent"')) {
+        if (body.includes('"toolCallId":"child_web"')) return fakeGatewayFinalText("CHILD_DONE");
+        return fakeGatewayToolCall("child_web", "bash", {
+          command: `${JSON.stringify(FX_BIN)} tool web https://example.com/page; echo "exit=$?"`,
+        });
+      }
+      step += 1;
+      if (step === 1) return fakeGatewayToolCall("spawn", "subagent", { action: "message", agent: "helper", message: "run bash" });
+      if (step === 2) return fakeGatewayToolCall("wait_sub", "subagent", { action: "wait" });
+      return fakeGatewayFinalText("Subagent done.\n");
+    });
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--auto", ...BASH_SETTING, "Fetch example.com with the helper."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = toolResultText(gateway.requests.find((request) => request.body.includes('"toolCallId":"child_web"'))!.body, "child_web");
+    expect(out).toContain("exit=5");
+  }, TIMEOUT);
+
   test("fx tool search with no Gateway search backend exits 6 with the next step", async () => {
     // The configured local provider is not the AI Gateway, so it has no search backend.
     let calls = 0;

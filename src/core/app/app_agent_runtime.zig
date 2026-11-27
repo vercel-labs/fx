@@ -62,6 +62,7 @@ const test_builtin_tools = if (@import("builtin").is_test)
     @import("../../builtins/tools.zig")
 else
     struct {};
+const builtin_tools = @import("../../builtins/tools.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
 const toolbox = @import("../tooling/toolbox.zig");
@@ -401,6 +402,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
+                .nested_tool_registry = builtin_tools.registry,
                 .workspace_root = workspace.root,
                 .access_scope = workspace.access_scope,
                 .ignored_list_entries = ignored_list_entries,
@@ -2085,6 +2087,13 @@ fn makeTestContextSnapshot(alloc: Allocator, provider_id: []const u8, content: [
 
 fn testToolContext(app: *FakeApp) tool_runtime.Context {
     return Runtime(FakeApp).toolContext(app, app.agent(), &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+}
+
+test "the app's tool context carries the built-in registry for nested permission checks" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    try std.testing.expect(testToolContext(&app).nested_tool_registry != null);
 }
 
 const ProjectionBarrier = struct {
