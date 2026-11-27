@@ -2336,6 +2336,43 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP keeps retrying past the fx ask retry budget",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-no-ask-budget-");
+      const gateway = startFakeGateway([
+        retryAfterUnavailable(0),
+        retryAfterUnavailable(0),
+        retryAfterUnavailable(0),
+        finalText("ACP recovered after three transient failures."),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500",
+          },
+        });
+        await startAutoSession(client);
+
+        const result = await runPrompt(
+          client,
+          "Keep retrying in ACP past the ask budget.",
+          TIMEOUT,
+        );
+        expect(result.promptResult.error).toBeUndefined();
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(4);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP cancellation preserves earlier preview while replacement language is rejected",
     async () => {
       const root = createIsolatedRoot("fx-acp-rejected-replacement-");

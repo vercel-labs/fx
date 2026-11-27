@@ -20,6 +20,8 @@
 #   cannot-ask-resends  fx ask resends a request that needs the user       CannotAskEnds
 #   asking-host-resends the TUI resends without the user's answer          AskingHostWaits
 #   filter-answer-keeps-count  the user's answer keeps the blocks' count  AnswerGivesResends
+#   budget-on-unbudgeted  a non-budgeted host ends on the retry budget     NeverGivesUp
+#   budget-never-ends   a budgeted host keeps retrying past its budget     BudgetEnds
 #
 # RecoveryTimed.tla adds a discrete clock. recovery-timed.cfg must pass, and
 # each of its mutations plants one defect:
@@ -94,6 +96,8 @@ Recovery recovery-mutation-filter-asks-early FilterBounded
 Recovery recovery-mutation-cannot-ask-resends CannotAskEnds
 Recovery recovery-mutation-asking-host-resends AskingHostWaits
 Recovery recovery-mutation-filter-answer-keeps-count AnswerGivesResends
+Recovery recovery-mutation-budget-on-unbudgeted NeverGivesUp
+Recovery recovery-mutation-budget-never-ends temporal
 RecoveryTimed recovery-timed -
 RecoveryTimed recovery-mutation-unbounded-wait WaitBounded
 RecoveryTimed recovery-mutation-frozen-countdown StatusFresh

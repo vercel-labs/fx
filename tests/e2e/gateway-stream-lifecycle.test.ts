@@ -730,6 +730,7 @@ function parseAskJson(stdout: string): {
   recovery?: {
     state: string;
     attempt: number;
+    cause?: string;
     need?: string;
     message?: string;
   };
@@ -14092,6 +14093,79 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("fx ask --json stops retrying 503 responses once the retry budget passes", async () => {
+    const root = createFixtureRoot("ask-retry-budget-503");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => unavailableResponse("1"));
+    const started = Date.now();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Stop retrying after the budget."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500",
+          },
+          timeoutMs: 8_000,
+        },
+      );
+      const elapsedMs = Date.now() - started;
+
+      expect(result.timedOut).toBe(false);
+      expect(result.code).not.toBe(0);
+      expect(elapsedMs).toBeLessThan(6_000);
+      const json = parseAskJson(result.stdout);
+      expect(json.exit_code).not.toBe(0);
+      expect(typeof json.error).toBe("string");
+      expect(json.error!.length).toBeGreaterThan(0);
+      expect(json.recovery).toEqual({
+        state: "failed",
+        attempt: 2,
+        cause: "server",
+      });
+      expect(gateway.requestCount()).toBe(2);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("fx ask --json stops retrying provider_error events once the retry budget passes", async () => {
+    const root = createFixtureRoot("ask-retry-budget-provider-error");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => providerErrorResponse("always broken provider"));
+    const started = Date.now();
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Stop retrying provider errors after the budget."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TEST_RECOVERY_RETRY_BUDGET_MS: "1500",
+          },
+          timeoutMs: 8_000,
+        },
+      );
+      const elapsedMs = Date.now() - started;
+
+      expect(result.timedOut).toBe(false);
+      expect(result.code).not.toBe(0);
+      expect(elapsedMs).toBeLessThan(6_000);
+      const json = parseAskJson(result.stdout);
+      expect(json.exit_code).not.toBe(0);
+      expect(json.error).toBe("ModelError");
+      expect(json.recovery?.state).toBe("failed");
+      expect(json.recovery?.cause).toBe("server");
+      expect(json.recovery?.attempt).toBe(2);
+      expect(gateway.requestCount()).toBe(2);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   test("a retried model request leaves its recovery timeline in the session log", async () => {
     const root = createFixtureRoot("recovery-timeline");
