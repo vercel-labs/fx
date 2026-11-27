@@ -6180,6 +6180,126 @@ test.skipIf(!tmuxAvailable())(
   TIMEOUT * 5,
 );
 
+// One press of Ctrl+G never refuses. With prompts queued behind a running
+// command, or text in the composer, the restart waits until nothing runs and
+// the composer is empty, and the queued or typed prompt goes out first.
+for (const blocker of ["queued", "draft"] as const) {
+  test.skipIf(!tmuxAvailable())(
+    blocker === "queued"
+      ? "upgrade ctrl-g with a prompt queued behind a running command never refuses, and restarts after it"
+      : "upgrade ctrl-g with text in the composer never refuses, and restarts after it is sent",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-never-refuses-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const installDir = join(root, "install");
+      const stderrPath = join(root, "stderr.log");
+      const argvLogPath = join(root, "upgrade-argv.log");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      mkdirSync(installDir);
+      const workspaceRoot = realpathSync(workspace);
+      const installedFx = join(installDir, "fx");
+      copyFileSync(FX_BIN, installedFx);
+      chmodSync(installedFx, 0o755);
+
+      let active: TmuxSession | null = null;
+      const firstAsked = signal();
+      // The first turn runs a command that waits on this FIFO, so a prompt
+      // typed meanwhile sits in the queue until the test releases it.
+      const releaseFifo = join(root, "release-held-command");
+      execFileSync("mkfifo", [releaseFifo]);
+      const command = `read -r _ < ${JSON.stringify(releaseFifo)}; printf HELD_COMMAND_DONE`;
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (body.includes("SECOND_PROMPT")) return fakeGatewayFinalText("SECOND_ANSWERED");
+        if (body.includes("HELD_COMMAND_DONE")) return fakeGatewayFinalText("FIRST_ANSWERED");
+        if (body.includes("FIRST_PROMPT")) {
+          firstAsked.fire();
+          return fakeGatewayToolCall("held_command", "shell", {
+            request: { action: "run", yield_time_ms: 600_000, timeout_ms: 600_000, command },
+          });
+        }
+        return fakeGatewayFinalText("Local title");
+      });
+      const release = startUpgradeServer(root, argvLogPath);
+      const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+
+      try {
+        writeFileSync(stderrPath, "");
+        active = await TmuxSession.create({
+          cmd: shellQuote(installedFx),
+          cwd: workspaceRoot,
+          env: {
+            ...gatewayEnv(home, gateway),
+            FX_AUTO_UPGRADE: "1",
+            FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+            FX_PERMISSION_MODE: "full-access",
+            FX_TEST_STEER_YIELD_GRACE_MS: "600000",
+          },
+          stderrPath,
+          width: 110,
+          height: 32,
+        });
+        await active.waitForComposer(TIMEOUT);
+        await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+        const version = (await runFx(["--version"])).stdout.trim();
+
+        if (blocker === "queued") {
+          await active.sendText("FIRST_PROMPT run the command");
+          await firstAsked.fired;
+          await active.waitForText("Running read", TIMEOUT);
+          await active.sendText("SECOND_PROMPT waits in the queue");
+          await active.waitForText("┋ SECOND_PROMPT waits in the queue", TIMEOUT);
+        } else {
+          await active.sendLiteral("SECOND_PROMPT typed, not sent");
+          await active.waitForPane((pane) => composerContains(pane, "SECOND_PROMPT typed, not sent"), TIMEOUT);
+        }
+
+        // One press is enough: no refusal, and the footer shows the restart.
+        await active.sendHexBytes(["07"]);
+        const pressed = await active.waitForPane(
+          (pane) => pane.includes("restarts when idle") || pane.includes("unavailable") || pane.includes("before upgrading"),
+          TIMEOUT,
+        );
+        expect(pressed).not.toContain("unavailable");
+        expect(pressed).not.toContain("before upgrading");
+        expect(relaunched()).toBe(false);
+
+        if (blocker === "queued") {
+          // The command ends, and the queued prompt goes out before fx restarts.
+          writeFileSync(releaseFifo, "release\n");
+        } else {
+          await active.sendKeys("Enter");
+        }
+        await active.waitForText(`✓ fx has been updated to v${version} (notes)`, TIMEOUT);
+        expect(relaunched()).toBe(true);
+        expect(gateway.requests.some((request) => request.body.includes("SECOND_PROMPT"))).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).not.toContain("relaunch failed");
+
+        await active.waitForComposer(TIMEOUT);
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd()).toBe(true);
+        await active.kill();
+        active = null;
+      } finally {
+        try {
+          closeSync(openSync(releaseFifo, constants.O_WRONLY | constants.O_NONBLOCK));
+        } catch {}
+        if (active) {
+          try {
+            await active.sendText("/quit");
+          } catch {}
+          await active.kill();
+        }
+        release.stop();
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    UPGRADE_TIMEOUT * 2,
+  );
+}
+
 // What the person sends while Ctrl+G waits for a working subagent. A prompt
 // goes out at once and fx restarts once the subagent is done; `/new` leaves
 // the subagent's session, so fx restarts into the new one at once; `/launch`
@@ -8223,7 +8343,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "upgrade ctrl-g refuses while another instance has queued prompts, and names it",
+  "upgrade ctrl-g while another instance has queued prompts never refuses, and restarts after they run",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-queued-")));
     const home = join(root, "home");
@@ -8297,20 +8417,26 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("┋ QUEUE_SECOND waits in the queue", TIMEOUT);
 
       // Back on fx 1: the list opens on fx 2, so Up selects fx 1. Ctrl+G
-      // refuses and names the instance whose queue the restart would drop.
+      // never refuses: a restart now would drop fx 2's queue, so it waits.
       await active.sendKeys("C-x");
       await active.waitForText(LIST_HINT, TIMEOUT);
       await active.sendKeys("Up");
       await active.sendKeys("Enter");
       await active.waitForPane((pane) => pane.includes("fx 1/2") && !pane.includes(LIST_HINT), TIMEOUT);
+      const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
-      const refused = await active.waitForText("upgrade is unavailable while fx 2 has queued prompts", TIMEOUT);
-      expect(refused).not.toContain("fx restarts for the upgrade");
+      const pressed = await active.waitForText("fx restarts for the upgrade once nothing runs", TIMEOUT);
+      expect(pressed).not.toContain("unavailable");
       expect(relaunched()).toBe(false);
 
-      // The command ends, the turn answers, and fx 1 quits.
+      // The command ends, fx 2's turn takes its queued prompt and answers,
+      // and then fx restarts.
       writeFileSync(releaseFifo, "release\n");
       await toolDone.fired;
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, TIMEOUT);
+      expect(relaunched()).toBe(true);
+      expect(gateway.requests.some((request) => request.body.includes("QUEUE_SECOND"))).toBe(true);
+      await active.waitForComposer(TIMEOUT);
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
       await active.kill();
