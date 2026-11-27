@@ -98,6 +98,11 @@ const Bridge = struct {
     accept_waits: u32 = 0,
     /// Passes of a request-line wait in this run. A test waits for one.
     request_polls: u32 = 0,
+    /// Requests the core admitted in this run. A test waits for them.
+    admitted: u32 = 0,
+    /// Requests the core withdrew while they waited for their permission check.
+    /// A test waits for them.
+    withdrawn: u32 = 0,
 };
 
 var bridge: Bridge = .{};
@@ -213,6 +218,8 @@ fn startLocked(io: std.Io) !void {
     bridge.wake = wake;
     bridge.accept_waits = 0;
     bridge.request_polls = 0;
+    bridge.admitted = 0;
+    bridge.withdrawn = 0;
     bridge.stop.store(false, .release);
     bridge.accept_task = std.Io.concurrent(io, acceptLoop, .{}) catch |err| {
         bridge.listener = null;
@@ -273,9 +280,17 @@ fn applyLocked(out: mcp_call.Output) void {
                 if (live.id == id) live.cancel.store(true, .release);
             }
         },
-        .withdraw => |id| debug_trace.logf("mcp-call", "request={d} client or owner gone; its permission prompt stays until answered, and nothing runs", .{@backingInt(id)}),
+        .authorize => {
+            bridge.admitted += 1;
+            bridge.changed.broadcast(io_mod.getIo());
+        },
+        .withdraw => |id| {
+            bridge.withdrawn += 1;
+            bridge.changed.broadcast(io_mod.getIo());
+            debug_trace.logf("mcp-call", "request={d} client or owner gone; nothing runs, and a permission prompt that is already open stays until answered", .{@backingInt(id)});
+        },
         .log => |log| debug_trace.logf("mcp-call", "request={d} dropped={s}", .{ @backingInt(log.id), @tagName(log.drop) }),
-        .refuse, .authorize, .call, .reply => {},
+        .refuse, .call, .reply => {},
     };
 }
 
@@ -544,6 +559,12 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
         .call => |value| blk: {
             bridge.prompt.lockUncancelable(io);
             defer bridge.prompt.unlock(io);
+            // The client may have left while this request waited for the lock. Then
+            // no prompt opens for it, and the core frees its slot with the answer.
+            bridge.mutex.lockUncancelable(io);
+            const waiting = mcp_call.awaitingPermission(&bridge.state, work.id);
+            bridge.mutex.unlock(io);
+            if (!waiting) break :blk .{ .deny = "The request left before its permission check." };
             break :blk registration.capability.authorize(arena, request_id, value.tool, value.arguments_json) catch |err|
                 .{ .deny = arena.print("The permission check for {f} failed: {s}", .{ text_utils.terminalSafe(value.tool), @errorName(err) }) catch "The permission check failed." };
         },
@@ -606,6 +627,8 @@ const FakeTool = struct {
     /// While set, the permission check waits, as for a prompt.
     gate: std.atomic.Value(bool) = .init(false),
     authorizing: std.atomic.Value(bool) = .init(false),
+    /// Permission checks begun. Guarded by the bridge mutex, which signals each one.
+    authorize_calls: u32 = 0,
     calls: std.atomic.Value(u32) = .init(0),
 
     fn capability(self: *FakeTool) capability_mod.Capability {
@@ -623,6 +646,11 @@ const FakeTool = struct {
         _ = .{ arena, request_id, tool, arguments_json };
         const self: *FakeTool = @ptrCast(@alignCast(raw));
         self.authorizing.store(true, .release);
+        const io = io_mod.getIo();
+        bridge.mutex.lockUncancelable(io);
+        self.authorize_calls += 1;
+        bridge.changed.broadcast(io);
+        bridge.mutex.unlock(io);
         while (self.gate.load(.acquire)) io_mod.sleep(5 * std.time.ns_per_ms);
         if (self.fail) return error.PermissionCheckFailed;
         return if (self.allow) .{ .allow = .{} } else .{ .deny = "Denied by the test." };
@@ -791,6 +819,61 @@ test "a command that leaves while its call waits for permission runs nothing, an
     try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
 }
 
+test "a request that leaves while it waits for the prompt lock opens no prompt" {
+    if (!supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tool: FakeTool = .{};
+    tool.gate.store(true, .release);
+    const registration = try register(tool.capability());
+    var unregistered = false;
+    // Declared first, so it runs last: the gate opens before unregister waits for the requests.
+    defer if (!unregistered) unregister(registration);
+    defer tool.gate.store(false, .release);
+    const variables = registration.environment();
+    const address = try std.Io.net.UnixAddress.init(variables[0].value);
+    const token = wire.parseToken(variables[1].value).?;
+
+    // Client A's call takes the prompt lock, and its permission check waits on the gate.
+    const first = try address.connect(io);
+    defer first.close(io);
+    var first_buffer: [512]u8 = undefined;
+    var first_writer = first.writer(io, &first_buffer);
+    try wire.writeRequest(&first_writer.interface, token, .{ .call = .{ .tool = "mcp_s_first", .arguments_json = "{}" } });
+    try first_writer.interface.flush();
+    try waitAtLeast(io, &bridge.admitted, 1);
+    try waitAtLeast(io, &tool.authorize_calls, 1);
+
+    // Client B's call waits for that lock, and then its client leaves.
+    const second = try address.connect(io);
+    var second_buffer: [512]u8 = undefined;
+    var second_writer = second.writer(io, &second_buffer);
+    try wire.writeRequest(&second_writer.interface, token, .{ .call = .{ .tool = "mcp_s_second", .arguments_json = "{}" } });
+    try second_writer.interface.flush();
+    try waitAtLeast(io, &bridge.admitted, 2);
+    second.close(io);
+    try waitAtLeast(io, &bridge.withdrawn, 1);
+
+    // A's prompt answers now, and B is withdrawn, so it must not open a prompt when the
+    // lock is free. Wait for both requests to end: a stop would withdraw A first.
+    tool.gate.store(false, .release);
+    try waitAtMost(io, &registration.in_use, 0);
+    unregister(registration);
+    unregistered = true;
+    try std.testing.expectEqual(@as(u32, 1), tool.authorize_calls);
+    try std.testing.expectEqual(@as(u32, 1), tool.calls.load(.acquire));
+
+    var read_buffer: [wire.max_header_bytes]u8 = undefined;
+    var reader = first.reader(io, &read_buffer);
+    const line = (try reader.interface.takeDelimiter('\n')) orelse return error.TestUnexpectedResult;
+    const header = try wire.parseHeader(arena, line);
+    try std.testing.expectEqual(wire.Status.ok, header.status);
+    const bytes = try reader.interface.readAllocAll(arena, @intCast(header.bytes));
+    try std.testing.expectEqualStrings("mcp_s_first {}\n", bytes);
+}
+
 test "the bridge removes its socket after the last shell call" {
     if (!supported) return error.SkipZigTest;
     const io = std.testing.io;
@@ -810,10 +893,26 @@ test "the bridge removes its socket after the last shell call" {
 /// Waits until a counter on the bridge has moved past zero, or fails after five
 /// seconds. A timed wait on the bridge's condition, not a sleep.
 fn waitForCount(io: std.Io, count: *const u32) !void {
+    return waitAtLeast(io, count, 1);
+}
+
+/// Waits until a counter on the bridge reaches `at_least`, or fails after five
+/// seconds. A timed wait on the bridge's condition, not a sleep.
+fn waitAtLeast(io: std.Io, count: *const u32, at_least: u32) !void {
+    return waitUntil(io, count, at_least, true);
+}
+
+/// Waits until a counter on the bridge falls to `at_most` or less, or fails after
+/// five seconds. A timed wait on the bridge's condition, not a sleep.
+fn waitAtMost(io: std.Io, count: *const u32, at_most: u32) !void {
+    return waitUntil(io, count, at_most, false);
+}
+
+fn waitUntil(io: std.Io, count: *const u32, limit: u32, rising: bool) !void {
     const deadline = io_mod.milliTimestamp() + 5_000;
     bridge.mutex.lockUncancelable(io);
     defer bridge.mutex.unlock(io);
-    while (count.* == 0) {
+    while (if (rising) count.* < limit else count.* > limit) {
         const remaining = deadline - io_mod.milliTimestamp();
         if (remaining <= 0) return error.TestTimedOut;
         bridge.changed.waitTimeout(io, &bridge.mutex, .{ .duration = .{ .raw = .fromMilliseconds(remaining), .clock = .awake } }) catch |err| switch (err) {
