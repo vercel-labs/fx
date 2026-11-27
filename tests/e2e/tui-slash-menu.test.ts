@@ -4860,19 +4860,19 @@ describe.skipIf(SKIP)("tui: custom shortcuts", () => {
   const CTRL_2 = ["1b", "5b", "35", "30", "3b", "35", "75"];
   const CTRL_3 = ["1b", "5b", "35", "31", "3b", "35", "75"];
   const ALT_M = ["1b", "6d"];
-  const TARGET_PRESET = { action: "select_model", provider: "gateway", model: TARGET_MODEL, effort: "high", fast_mode: true };
+  const TARGET_PRESET = { provider: "gateway", model: TARGET_MODEL, effort: "high", fast_mode: true };
   const SHORTCUTS = {
     "ctrl+2": TARGET_PRESET,
-    "alt+m": { action: "open_model_picker" },
+    "alt+m": "/model",
   };
   // Shell-quotes one argument for the fake shell tool call.
   const quote = (text: string) => `'${text.replace(/'/g, `'\\''`)}'`;
   // Runs the worktree's own binary through `fx config set`, with HOME and FX_HOME
   // both pinned to the fixture profile, so no mutation reaches the developer's ~/.fx.
-  function setterCommand(fixture: { home: string }, json: string): string {
+  function setterCommand(fixture: { home: string }, chord: string, value: string): string {
     const profileDir = join(fixture.home, ".fx");
     return `HOME=${quote(fixture.home)} FX_HOME=${quote(profileDir)} ${quote(FX_BIN)} ` +
-      `config set shortcuts.ctrl+2 ${quote(json)} && printf 'SETTER_%s\\n' OK`;
+      `config set shortcuts.${chord} ${quote(value)} && printf 'SETTER_%s\\n' OK`;
   }
 
   const CATALOG = [
@@ -4934,7 +4934,7 @@ describe.skipIf(SKIP)("tui: custom shortcuts", () => {
       const fixture = createModelsMenuFixture();
       writeProfile(fixture.settingsPath);
       // The shell tool runs the worktree's own binary on the fixture profile.
-      const setCommand = setterCommand(fixture, JSON.stringify(TARGET_PRESET));
+      const setCommand = setterCommand(fixture, "ctrl+2", JSON.stringify(TARGET_PRESET));
       let replies = 0;
       const fake = startDynamicFakeGateway(
         () => {
@@ -4992,7 +4992,7 @@ describe.skipIf(SKIP)("tui: custom shortcuts", () => {
   test("custom shortcut from an existing profile cannot stage a permission command", async () => {
     const fixture = createModelsMenuFixture();
     writeProfile(fixture.settingsPath, {
-      shortcuts: { up: { action: "command", command: "/permissions ask" } },
+      shortcuts: { up: "/permissions ask" },
     });
     const before = readFileSync(fixture.settingsPath, "utf8");
     const fake = startFakeGateway([fakeGatewayFinalText("UNCHANGED")], { models: CATALOG });
@@ -5059,19 +5059,14 @@ describe.skipIf(SKIP)("tui: custom shortcuts", () => {
     TEST_TIMEOUT,
   );
 
-  // The turn's own selection, read from the system block fx puts in the request.
-  function turnSelectionOf(raw: string): Record<string, string> {
+  // The model the agent's turn context names: main's `model:` line. Effort and Fast
+  // are not in that context, so this test checks the model alone.
+  function turnContextModelOf(raw: string): string {
     const messages: Array<{ content?: unknown }> = JSON.parse(raw).prompt ?? [];
     const text = messages
       .map((message) => (typeof message.content === "string" ? message.content : ""))
-      .find((content) => content.includes("<fx-turn-selection>")) ?? "";
-    const block = /<fx-turn-selection>\n([\s\S]*?)\n<\/fx-turn-selection>/.exec(text);
-    if (!block) throw new Error("the request has no <fx-turn-selection> block");
-    // Only the named fields: the block may carry other lines, such as notes.
-    const field = (name: string) => new RegExp(`^${name}: (.*)$`, "m").exec(block[1]!)?.[1] ?? "";
-    return Object.fromEntries(
-      ["provider", "model", "effort", "fast_mode", "ultrafast_mode"].map((name) => [name, field(name)]),
-    );
+      .find((content) => content.includes("<fx-turn-context>")) ?? "";
+    return /^model: (.*)$/m.exec(text)?.[1] ?? "";
   }
 
   const CURRENT_CATALOG = ["private-team/current-fast", "private-team/current-plain"].map((id) => ({
@@ -5091,54 +5086,18 @@ describe.skipIf(SKIP)("tui: custom shortcuts", () => {
   ];
 
   test.each(CURRENT_SESSIONS)(
-    "custom shortcut 'mi modelo actual' saves the session's own selection for $model",
+    "the turn context names the session's model $model for 'mi modelo actual'",
     async (config) => {
       const fixture = createModelsMenuFixture();
       writeProfile(fixture.settingsPath, { effort: config.effort, fast_mode: config.fast });
-      let selection: Record<string, string> | null = null;
-      let replies = 0;
-      const fake = startDynamicFakeGateway(
-        (raw) => {
-          replies += 1;
-          if (replies > 1) return fakeGatewayFinalText(`REPLY_${replies}`);
-          // The preset is built from the values fx reports for this turn, not from the test's config.
-          selection = turnSelectionOf(raw);
-          const preset = {
-            action: "select_model",
-            provider: selection.provider,
-            model: selection.model,
-            effort: selection.effort,
-            fast_mode: selection.fast_mode === "true",
-          };
-          return fakeShellRun("set-current", setterCommand(fixture, JSON.stringify(preset)));
-        },
-        { models: CURRENT_CATALOG },
-      );
+      const fake = startFakeGateway([fakeGatewayFinalText("MODEL_REPLY")], { models: CURRENT_CATALOG });
       session = await openShell(fixture, fake, config.model);
 
       await session.sendText("mi modelo actual");
-      await session.waitForPane(replySettled("REPLY_2"), TIMEOUT);
-      expect(fake.requests.length).toBeGreaterThanOrEqual(2);
-
-      // The block names this session's values, and the request really used that model.
-      expect(selection).toEqual({
-        provider: "gateway",
-        model: config.model,
-        effort: config.effort,
-        fast_mode: String(config.fast),
-        ultrafast_mode: "false",
-      });
+      await session.waitForPane(replySettled("MODEL_REPLY"), TIMEOUT);
+      expect(fake.requests).toHaveLength(1);
+      expect(turnContextModelOf(fake.requests[0]!.body)).toBe(config.model);
       expect(chatModelOf(fake.requests[0]!)).toBe(config.model);
-      expect(fake.requests[1]!.body).toContain("SETTER_OK");
-      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).shortcuts).toEqual({
-        "ctrl+2": {
-          action: "select_model",
-          provider: "gateway",
-          model: config.model,
-          effort: config.effort,
-          fast_mode: config.fast,
-        },
-      });
     },
     TEST_TIMEOUT,
   );
@@ -5158,7 +5117,7 @@ describe.skipIf(SKIP)("tui: custom shortcuts", () => {
     {
       name: "Ctrl+Super+F with only Ctrl+F bound",
       keys: hexOf("\x1b[102;13u"),
-      shortcuts: { "ctrl+f": { action: "command", command: "/fast" } },
+      shortcuts: { "ctrl+f": "/fast" },
     },
   ])(
     "custom shortcut keeps the cursor fallback for an unbound report, $name",
@@ -5193,7 +5152,7 @@ describe.skipIf(SKIP)("tui: custom shortcuts", () => {
       writeProfile(fixture.settingsPath, {
         effort: "high",
         fast_mode: false,
-        shortcuts: { "ctrl+f": { action: "command", command: "/fast" } },
+        shortcuts: { "ctrl+f": "/fast" },
       });
       const fake = startFakeGateway(
         [fakeGatewayFinalText("ANSWER_ONE"), fakeGatewayFinalText("ANSWER_TWO")],
@@ -5241,7 +5200,7 @@ describe.skipIf(SKIP)("tui: custom shortcuts", () => {
       writeProfile(fixture.settingsPath, {
         effort: "high",
         fast_mode: false,
-        shortcuts: { "ctrl+alt+k": { action: "command", command: "/effort low" } },
+        shortcuts: { "ctrl+alt+k": "/effort low" },
       });
       const fake = startFakeGateway([fakeGatewayFinalText("ANSWER_LOW")], { models: CURRENT_CATALOG });
       session = await openShell(fixture, fake, CURRENT_FAST);
@@ -5258,6 +5217,39 @@ describe.skipIf(SKIP)("tui: custom shortcuts", () => {
       expect(chatModelOf(fake.requests[0]!)).toBe(CURRENT_FAST);
       expect(fake.requests[0]!.body).toContain("borrador");
       expect(JSON.parse(fake.requests[0]!.body)).toMatchObject({ reasoning: "low" });
+      expect(session.isAlive()).toBe(true);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a profile edit with an unknown chord is announced once and keeps the previous shortcuts",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      writeProfile(fixture.settingsPath, { shortcuts: { "ctrl+2": TARGET_PRESET } });
+      let replies = 0;
+      const fake = startDynamicFakeGateway(
+        () => {
+          replies += 1;
+          return fakeGatewayFinalText(`REPLY_${replies}`);
+        },
+        { models: CATALOG },
+      );
+      session = await openShell(fixture, fake);
+
+      await session.sendText("primero");
+      await session.waitForPane(replySettled("REPLY_1"), TIMEOUT);
+
+      // `bogus+1` is not a chord fx can bind, so the whole edit is refused.
+      const notice = 'profile shortcut "bogus+1" is invalid; your previous shortcuts stay active';
+      writeProfile(fixture.settingsPath, { shortcuts: { "bogus+1": "/model" } });
+      await session.sendText("segundo");
+      await session.waitForPane((screen) => screen.includes(notice) && replySettled("REPLY_2")(screen), TIMEOUT);
+      expect((await session.captureFullScrollback()).split(notice).length - 1).toBe(1);
+
+      await session.sendText("tercero");
+      await session.waitForPane(replySettled("REPLY_3"), TIMEOUT);
+      expect((await session.captureFullScrollback()).split(notice).length - 1).toBe(1);
       expect(session.isAlive()).toBe(true);
     },
     TEST_TIMEOUT,

@@ -1,24 +1,27 @@
 //! Personal keyboard shortcuts from the profile's top-level `shortcuts` object.
-//! Each key is a chord, as the key module parses it; each value is one action:
-//! a saved model preset, the model picker, a fast-mode toggle, or one fx
-//! command line. Parsing never reads the rest of the profile. One bad entry
-//! rejects the whole map, so a caller that keeps its last good map never loses
-//! shortcuts to a partial edit.
+//! Each key is a chord, as the chord module parses it. Each value is one action:
+//! a string holding one fx command line, such as "/fast", or an object holding
+//! a saved model preset. Parsing never reads the rest of the profile. One bad
+//! entry rejects the whole map, so a caller that keeps its last good map never
+//! loses shortcuts to a partial edit.
 
 const std = @import("std");
-const key_chord = @import("../input/key_chord.zig");
-const model_provider = @import("model_provider.zig");
-const settings_store = @import("settings_store.zig");
+const key_chord = @import("chord.zig");
+const model_provider = @import("../config/model_provider.zig");
+const durable_model = @import("../shared/durable_model.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 
-/// The one chord type. Config reads and writes chords only through the key module.
+/// The one chord type. Config reads and writes chords only through shortcuts.zig.
 pub const Chord = key_chord.Chord;
 
-pub const max_model_bytes: usize = settings_store.max_model_bytes;
+/// A key fx keeps for itself, with the reason, from the chord module's table.
+pub const Reserved = key_chord.Reserved;
 
-/// Longest chord text a shortcut key may hold, in bytes. Also the buffer a
-/// caller formats a canonical chord into.
+pub const max_model_bytes: usize = durable_model.max_bytes;
+
+/// Longest chord text a shortcut key may hold, in bytes. This map owns the
+/// limit; the settings store reads it from here.
 pub const max_key_bytes: usize = 64;
 
 /// Most shortcuts one profile may hold. A count bound, not a chord count: an
@@ -28,9 +31,9 @@ pub const max_entries: usize = 32;
 
 /// Longest `command` text. It is one line typed by the user, so it shares the
 /// single-line bound that model ids use.
-pub const max_command_bytes: usize = settings_store.max_model_bytes;
+pub const max_command_bytes: usize = durable_model.max_bytes;
 
-/// What a chord text looks like, for the schema. It follows the key module's
+/// What a chord text looks like, for the schema. It follows the chord module's
 /// own grammar; the parser is the rule that counts.
 pub const key_grammar_description = "A key chord: the modifiers ctrl, alt, shift, and super, each at most once and in any order, joined with +, then one key, such as ctrl+f, Alt+Shift+Left, or ctrl+. A plain key with no modifier is typing, not a chord.";
 
@@ -48,9 +51,10 @@ pub const ParseError = error{
     InvalidEffort,
     InvalidFastMode,
     InvalidCommand,
+    ReservedChord,
 };
 
-const preset_fields = [_][]const u8{ "action", "provider", "model", "effort", "fast_mode" };
+const preset_fields = [_][]const u8{ "provider", "model", "effort", "fast_mode" };
 
 pub const Preset = struct {
     provider: model_provider.ProviderId,
@@ -76,40 +80,11 @@ pub const Command = struct {
     }
 };
 
-/// The two canonical actions. Saved and written profiles use only these.
+/// What one shortcut runs: a fx command line, or a saved model preset.
 pub const Action = union(enum) {
     command: Command,
     select_model: Preset,
 };
-
-/// Input-only names from the first shortcut format, each with the one slash
-/// command it means. Both consumers read this table: the parser turns a name
-/// into its command, and the setter writes the canonical `command` JSON.
-const legacy_aliases = [_]struct { name: []const u8, command: []const u8 }{
-    .{ .name = "open_model_picker", .command = "/model" },
-    .{ .name = "toggle_fast_mode", .command = "/fast" },
-};
-
-const canonical_command_format = "{{\"action\":\"command\",\"command\":\"{s}\"}}";
-
-fn legacyAliasCommand(name: []const u8) ?[]const u8 {
-    for (legacy_aliases) |alias| {
-        if (std.mem.eql(u8, alias.name, name)) return alias.command;
-    }
-    return null;
-}
-
-/// The canonical JSON for a legacy action name, or null for any other name.
-/// Callers validate the whole action with `parseAction` first. The text is
-/// built at compile time from the same command the parser uses.
-pub fn canonicalActionJson(name: []const u8) ?[]const u8 {
-    inline for (legacy_aliases) |alias| {
-        if (std.mem.eql(u8, alias.name, name)) {
-            return comptime std.fmt.comptimePrint(canonical_command_format, .{alias.command});
-        }
-    }
-    return null;
-}
 
 pub const Entry = struct {
     chord: Chord,
@@ -133,11 +108,25 @@ pub const Map = struct {
 };
 
 /// Where a rejected `shortcuts` value went wrong. Slices borrow from the
-/// parsed JSON, so a caller copies them before that JSON is freed.
+/// parsed JSON, so a caller copies them before that JSON is freed. `reserved`
+/// is set when the chord is a key fx keeps for itself, and says why.
 pub const Problem = struct {
     chord: []const u8 = "",
     field: []const u8 = "",
+    reserved: ?Reserved = null,
 };
+
+/// The reserved table entry a chord text names, in any letter case, or null.
+/// The chord module's canonical names are the only spellings compared, so this
+/// finds every text `Chord.parseChecked` refuses as reserved.
+pub fn reservedEntry(text: []const u8) ?Reserved {
+    var buffer: [max_key_bytes]u8 = undefined;
+    for (key_chord.reserved) |entry| {
+        const name = entry.chord.format(&buffer) orelse continue;
+        if (std.ascii.eqlIgnoreCase(text, name)) return entry;
+    }
+    return null;
+}
 
 pub fn parseJsonObject(value: std.json.Value) ParseError!Map {
     var ignored: Problem = .{};
@@ -154,7 +143,13 @@ pub fn parseJsonObjectChecked(value: std.json.Value, problem: *Problem) ParseErr
     while (iterator.next()) |field| {
         problem.* = .{ .chord = field.key_ptr.* };
         if (field.key_ptr.*.len > max_key_bytes) return error.UnknownChord;
-        const chord = Chord.parse(field.key_ptr.*) orelse return error.UnknownChord;
+        const chord = Chord.parseChecked(field.key_ptr.*) catch |err| switch (err) {
+            error.Malformed => return error.UnknownChord,
+            error.Reserved => {
+                problem.reserved = reservedEntry(field.key_ptr.*);
+                return error.ReservedChord;
+            },
+        };
         if (map.find(chord) != null) return error.DuplicateChord;
         const action = try parseActionChecked(field.value_ptr.*, problem);
         map.entries[map.entries_len] = .{ .chord = chord, .action = action };
@@ -169,29 +164,18 @@ pub fn parseAction(value: std.json.Value) ParseError!Action {
     return parseActionChecked(value, &ignored);
 }
 
+/// A string is one command line; an object is a model preset. Any other JSON
+/// type is refused. The failing field is the chord's own entry, so a command
+/// error names `shortcuts.<chord>` and never a field of the value.
 fn parseActionChecked(value: std.json.Value, problem: *Problem) ParseError!Action {
-    if (value != .object) return error.InvalidAction;
-    const name = value.object.get("action") orelse return fail(problem, "action", error.MissingField);
-    if (name != .string) return fail(problem, "action", error.InvalidAction);
-
-    if (legacyAliasCommand(name.string)) |command_text| {
-        for (value.object.keys()) |key| {
-            if (!std.mem.eql(u8, key, "action")) return fail(problem, key, error.UnknownField);
-        }
-        return .{ .command = try makeCommand(command_text) };
+    switch (value) {
+        .string => |text| {
+            const command = makeCommand(text) catch |err| return fail(problem, "", err);
+            return .{ .command = command };
+        },
+        .object => |object| return .{ .select_model = try parsePreset(object, problem) },
+        else => return fail(problem, "", error.InvalidAction),
     }
-    if (std.mem.eql(u8, name.string, "command")) {
-        for (value.object.keys()) |key| {
-            if (!std.mem.eql(u8, key, "action") and !std.mem.eql(u8, key, "command")) return fail(problem, key, error.UnknownField);
-        }
-        const text = value.object.get("command") orelse return fail(problem, "command", error.MissingField);
-        if (text != .string) return fail(problem, "command", error.InvalidCommand);
-        return .{ .command = makeCommand(text.string) catch |err| return fail(problem, "command", err) };
-    }
-    if (std.mem.eql(u8, name.string, "select_model")) {
-        return .{ .select_model = try parsePreset(value.object, problem) };
-    }
-    return fail(problem, "action", error.UnknownAction);
 }
 
 /// A command is "/name", then optional arguments, all on one line. Its name is
@@ -199,7 +183,7 @@ fn parseActionChecked(value: std.json.Value, problem: *Problem) ParseError!Actio
 /// may hold any terminal-safe UTF-8.
 fn makeCommand(text: []const u8) ParseError!Command {
     if (text.len < 2 or text.len > max_command_bytes) return error.InvalidCommand;
-    if (text[0] != '/' or text[text.len - 1] == ' ' or !terminalSafeText(text)) return error.InvalidCommand;
+    if (text[0] != '/' or text[text.len - 1] == ' ' or !text_utils.isTerminalSafe(text)) return error.InvalidCommand;
     const name_end = std.mem.findScalar(u8, text, ' ') orelse text.len;
     const name = text[1..name_end];
     if (name.len == 0 or !std.ascii.isLower(name[0])) return error.InvalidCommand;
@@ -209,17 +193,6 @@ fn makeCommand(text: []const u8) ParseError!Command {
     var command: Command = .{ .len = @intCast(text.len) };
     @memcpy(command.bytes[0..text.len], text);
     return command;
-}
-
-/// Valid UTF-8 with no control character: no C0 byte, no DEL, and no C1
-/// code point (U+0080 through U+009F, encoded as 0xC2 0x80 through 0xC2 0x9F).
-fn terminalSafeText(text: []const u8) bool {
-    if (!std.unicode.utf8ValidateSlice(text)) return false;
-    for (text, 0..) |byte, index| {
-        if (byte < 0x20 or byte == 0x7f) return false;
-        if (byte == 0xc2 and index + 1 < text.len and text[index + 1] >= 0x80 and text[index + 1] <= 0x9f) return false;
-    }
-    return true;
 }
 
 /// Records the field that failed, so the caller can name it, and returns `err`.
@@ -259,7 +232,7 @@ fn makePreset(
     fast_mode: bool,
 ) ParseError!Preset {
     if (provider == .configured) return error.InvalidProvider;
-    settings_store.validateModel(model_text) catch return error.InvalidModel;
+    durable_model.validate(model_text) catch return error.InvalidModel;
     if (!text_utils.isTerminalSafe(model_text)) return error.InvalidModel;
 
     var preset: Preset = .{
@@ -291,7 +264,7 @@ fn chordOf(text: []const u8) Chord {
 }
 
 const valid_text =
-    \\{"ctrl+1":{"action":"select_model","provider":"gateway","model":"openai/gpt-5","effort":"high","fast_mode":true},"alt+m":{"action":"open_model_picker"}}
+    \\{"ctrl+1":{"provider":"gateway","model":"openai/gpt-5","effort":"high","fast_mode":true},"alt+m":"/model"}
 ;
 
 test "a chord parses the terminal keys with modifiers, in any case and modifier order" {
@@ -334,7 +307,7 @@ test "map reads both action kinds and finds each chord" {
 }
 
 test "a chord with a dot is a key, and the map keeps it" {
-    const map = try parseMapText("{\"ctrl+.\":{\"action\":\"toggle_fast_mode\"}}");
+    const map = try parseMapText("{\"ctrl+.\":\"/fast\"}");
     try std.testing.expectEqualStrings("/fast", map.find(chordOf("ctrl+.")).?.action.command.text());
 }
 
@@ -346,16 +319,16 @@ test "empty object is an empty map" {
 test "one bad entry rejects the whole map" {
     try std.testing.expectError(error.NotAnObject, parseMapText("[]"));
     try std.testing.expectError(error.UnknownChord, parseMapText(
-        \\{"1":{"action":"open_model_picker"}}
+        \\{"1":"/model"}
     ));
     try std.testing.expectError(error.DuplicateChord, parseMapText(
-        \\{"ctrl+1":{"action":"open_model_picker"},"CTRL+1":{"action":"open_model_picker"}}
+        \\{"ctrl+1":"/model","CTRL+1":"/model"}
     ));
-    try std.testing.expectError(error.UnknownAction, parseMapText(
-        \\{"alt+m":{"action":"run_shell"}}
+    try std.testing.expectError(error.InvalidCommand, parseMapText(
+        \\{"alt+m":"open_model_picker"}
     ));
     try std.testing.expectError(error.InvalidAction, parseMapText(
-        \\{"alt+m":"open_model_picker"}
+        \\{"alt+m":5}
     ));
     try std.testing.expectError(error.UnknownField, parseMapText(
         \\{"alt+m":{"action":"open_model_picker","provider":"gateway"}}
@@ -364,34 +337,43 @@ test "one bad entry rejects the whole map" {
 
 test "a preset needs provider, model, effort, and fast_mode" {
     try std.testing.expectError(error.MissingField, parseMapText(
-        \\{"ctrl+1":{"action":"select_model","model":"m","effort":"high","fast_mode":true}}
+        \\{"ctrl+1":{"model":"m","effort":"high","fast_mode":true}}
     ));
     try std.testing.expectError(error.MissingField, parseMapText(
-        \\{"ctrl+1":{"action":"select_model","provider":"gateway","effort":"high","fast_mode":true}}
+        \\{"ctrl+1":{"provider":"gateway","effort":"high","fast_mode":true}}
     ));
     try std.testing.expectError(error.MissingField, parseMapText(
-        \\{"ctrl+1":{"action":"select_model","provider":"gateway","model":"m","fast_mode":true}}
+        \\{"ctrl+1":{"provider":"gateway","model":"m","fast_mode":true}}
     ));
     try std.testing.expectError(error.MissingField, parseMapText(
-        \\{"ctrl+1":{"action":"select_model","provider":"gateway","model":"m","effort":"high"}}
+        \\{"ctrl+1":{"provider":"gateway","model":"m","effort":"high"}}
     ));
 }
 
 test "a preset rejects unknown fields and bad values" {
     try std.testing.expectError(error.UnknownField, parseMapText(
-        \\{"ctrl+1":{"action":"select_model","provider":"gateway","model":"m","effort":"high","fast_mode":true,"ultrafast_mode":true}}
+        \\{"ctrl+1":{"provider":"gateway","model":"m","effort":"high","fast_mode":true,"ultrafast_mode":true}}
     ));
     try std.testing.expectError(error.InvalidProvider, parseMapText(
-        \\{"ctrl+1":{"action":"select_model","provider":"nope provider","model":"m","effort":"high","fast_mode":true}}
+        \\{"ctrl+1":{"provider":"nope provider","model":"m","effort":"high","fast_mode":true}}
     ));
     try std.testing.expectError(error.InvalidModel, parseMapText(
-        \\{"ctrl+1":{"action":"select_model","provider":"gateway","model":"","effort":"high","fast_mode":true}}
+        \\{"ctrl+1":{"provider":"gateway","model":"","effort":"high","fast_mode":true}}
     ));
     try std.testing.expectError(error.InvalidEffort, parseMapText(
-        \\{"ctrl+1":{"action":"select_model","provider":"gateway","model":"m","effort":"high level","fast_mode":true}}
+        \\{"ctrl+1":{"provider":"gateway","model":"m","effort":"high level","fast_mode":true}}
     ));
     try std.testing.expectError(error.InvalidFastMode, parseMapText(
-        \\{"ctrl+1":{"action":"select_model","provider":"gateway","model":"m","effort":"high","fast_mode":"yes"}}
+        \\{"ctrl+1":{"provider":"gateway","model":"m","effort":"high","fast_mode":"yes"}}
+    ));
+}
+
+test "the retired action field is refused, so no object is read as an action" {
+    try std.testing.expectError(error.UnknownField, parseMapText(
+        \\{"ctrl+1":{"action":"select_model","provider":"gateway","model":"m","effort":"high","fast_mode":true}}
+    ));
+    try std.testing.expectError(error.UnknownField, parseMapText(
+        \\{"ctrl+2":{"action":"command","command":"/fast"}}
     ));
 }
 
@@ -400,17 +382,36 @@ test "a map holds at most max_entries shortcuts" {
         var built: []const u8 = "{";
         for (0..max_entries + 1) |index| {
             const separator: []const u8 = if (index == 0) "" else ",";
-            built = built ++ std.fmt.comptimePrint("{s}\"k{d}\":{{\"action\":\"open_model_picker\"}}", .{ separator, index });
+            built = built ++ std.fmt.comptimePrint("{s}\"k{d}\":\"/model\"", .{ separator, index });
         }
         break :blk built ++ "}";
     };
     try std.testing.expectError(error.TooManyShortcuts, parseMapText(text));
 }
 
+test "a map holds exactly max_entries distinct chords" {
+    const text = comptime blk: {
+        var built: []const u8 = "{";
+        for (0..max_entries) |index| {
+            const separator: []const u8 = if (index == 0) "" else ",";
+            const key: []const u8 = if (index < 26)
+                &.{'a' + @as(u8, @intCast(index))}
+            else
+                &.{'0' + @as(u8, @intCast(index - 26))};
+            built = built ++ std.fmt.comptimePrint("{s}\"alt+{s}\":\"/model\"", .{ separator, key });
+        }
+        break :blk built ++ "}";
+    };
+    const map = try parseMapText(text);
+    try std.testing.expectEqual(max_entries, map.items().len);
+    try std.testing.expect(map.find(chordOf("alt+a")) != null);
+    try std.testing.expect(map.find(chordOf("alt+5")) != null);
+}
+
 test "a preset longer than the model limit is rejected" {
-    const long_model = @as([settings_store.max_model_bytes + 1]u8, @splat('m'));
+    const long_model = @as([durable_model.max_bytes + 1]u8, @splat('m'));
     const text = std.fmt.comptimePrint(
-        "{{\"ctrl+1\":{{\"action\":\"select_model\",\"provider\":\"gateway\",\"model\":\"{s}\",\"effort\":\"high\",\"fast_mode\":true}}}}",
+        "{{\"ctrl+1\":{{\"provider\":\"gateway\",\"model\":\"{s}\",\"effort\":\"high\",\"fast_mode\":true}}}}",
         .{long_model[0..]},
     );
     try std.testing.expectError(error.InvalidModel, parseMapText(text));
@@ -421,35 +422,15 @@ test "an empty map holds no entries" {
     try std.testing.expect(map.items().len == 0);
 }
 
-test "legacy aliases parse to the canonical command, byte for byte" {
-    const alias_model = try parseMapText("{\"alt+m\":{\"action\":\"open_model_picker\"}}");
-    const canonical_model = try parseMapText("{\"alt+m\":{\"action\":\"command\",\"command\":\"/model\"}}");
-    try std.testing.expect(std.meta.eql(alias_model.find(chordOf("alt+m")).?.action, canonical_model.find(chordOf("alt+m")).?.action));
-
-    const alias_fast = try parseMapText("{\"ctrl+.\":{\"action\":\"toggle_fast_mode\"}}");
-    const canonical_fast = try parseMapText("{\"ctrl+.\":{\"action\":\"command\",\"command\":\"/fast\"}}");
-    try std.testing.expect(std.meta.eql(alias_fast.find(chordOf("ctrl+.")).?.action, canonical_fast.find(chordOf("ctrl+.")).?.action));
-}
-
-test "canonical JSON is written only for legacy names" {
-    try std.testing.expectEqualStrings("{\"action\":\"command\",\"command\":\"/model\"}", canonicalActionJson("open_model_picker").?);
-    try std.testing.expectEqualStrings("{\"action\":\"command\",\"command\":\"/fast\"}", canonicalActionJson("toggle_fast_mode").?);
-    try std.testing.expect(canonicalActionJson("command") == null);
-    try std.testing.expect(canonicalActionJson("select_model") == null);
-}
-
-test "toggle_fast_mode is a bare action, and Ctrl+F is a chord in any letter case" {
-    const map = try parseMapText("{\"CTRL+F\":{\"action\":\"toggle_fast_mode\"}}");
+test "a fast-mode toggle is the string /fast, and Ctrl+F is a chord in any letter case" {
+    const map = try parseMapText("{\"CTRL+F\":\"/fast\"}");
     const entry = map.find(chordOf("ctrl+f")).?;
     try std.testing.expectEqualStrings("/fast", entry.action.command.text());
-    try std.testing.expectError(error.UnknownField, parseMapText(
-        \\{"ctrl+f":{"action":"toggle_fast_mode","fast_mode":true}}
-    ));
 }
 
 test "a command keeps its arguments whole, with punctuation and UTF-8" {
     const map = try parseMapText(
-        \\{"ctrl+2":{"action":"command","command":"/model gpt-5; ! ünïcode | x"}}
+        \\{"ctrl+2":"/model gpt-5; ! ünïcode | x"}
     );
     const entry = map.find(chordOf("ctrl+2")).?;
     try std.testing.expectEqualStrings("/model gpt-5; ! ünïcode | x", entry.action.command.text());
@@ -462,16 +443,34 @@ test "a command is one slash line of terminal-safe text" {
     for (accepted) |text| try std.testing.expectEqualStrings(text, (try makeCommand(text)).text());
 }
 
-test "a command rejects missing, extra, and non-string fields" {
+test "a shortcut value is a string or a preset object, nothing else" {
+    try std.testing.expectError(error.InvalidAction, parseMapText("{\"ctrl+2\":7}"));
+    try std.testing.expectError(error.InvalidAction, parseMapText("{\"ctrl+2\":[\"/fast\"]}"));
+    try std.testing.expectError(error.InvalidAction, parseMapText("{\"ctrl+2\":null}"));
     try std.testing.expectError(error.MissingField, parseMapText(
-        \\{"ctrl+2":{"action":"command"}}
+        \\{"ctrl+2":{"provider":"gateway"}}
     ));
-    try std.testing.expectError(error.UnknownField, parseMapText(
-        \\{"ctrl+2":{"action":"command","command":"/fast","fast_mode":true}}
-    ));
-    try std.testing.expectError(error.InvalidCommand, parseMapText(
-        \\{"ctrl+2":{"action":"command","command":7}}
-    ));
+}
+
+test "a reserved chord is refused as reserved, and keeps its reason" {
+    try std.testing.expectError(error.ReservedChord, parseMapText("{\"ctrl+c\":\"/fast\"}"));
+    try std.testing.expectError(error.ReservedChord, parseMapText("{\"CTRL+P\":\"/model\"}"));
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"alt+m\":\"/model\",\"Ctrl+C\":\"/fast\"}", .{});
+    defer parsed.deinit();
+    var problem: Problem = .{};
+    try std.testing.expectError(error.ReservedChord, parseJsonObjectChecked(parsed.value, &problem));
+    try std.testing.expectEqualStrings("Ctrl+C", problem.chord);
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "ctrl+c is reserved for fx: interrupts a running turn and exits",
+        problem.reserved.?.chord.reservedMessage(&buffer).?,
+    );
+}
+
+test "reservedEntry finds the reserved table entry in any letter case" {
+    try std.testing.expect(reservedEntry("ctrl+c") != null);
+    try std.testing.expect(reservedEntry("CTRL+P") != null);
+    try std.testing.expect(reservedEntry("ctrl+f") == null);
 }
 
 test "shortcut map parses or is refused on fuzzed bytes" {
@@ -480,8 +479,8 @@ test "shortcut map parses or is refused on fuzzed bytes" {
             valid_text,
             "{}",
             "[]",
-            "{\"alt+m\":{\"action\":\"open_model_picker\"}}",
-            "{\"ctrl+1\":{\"action\":\"select_model\",\"provider\":\"gateway\",\"model\":\"m\",\"effort\":\"high\",\"fast_mode\":true}}",
+            "{\"alt+m\":\"/model\"}",
+            "{\"ctrl+1\":{\"provider\":\"gateway\",\"model\":\"m\",\"effort\":\"high\",\"fast_mode\":true}}",
             "\xff\x00{",
         }) ++ @import("fuzz_corpus").shortcut_map.*),
     });
@@ -512,12 +511,12 @@ fn expectMapLaws(map: Map) !void {
         switch (entry.action) {
             .command => |command| {
                 try std.testing.expect(command.text().len > 1 and command.text()[0] == '/');
-                try std.testing.expect(terminalSafeText(command.text()));
+                try std.testing.expect(text_utils.isTerminalSafe(command.text()));
             },
             .select_model => |preset| {
                 try std.testing.expect(preset.provider != .configured);
                 try std.testing.expect(preset.model().len <= max_model_bytes);
-                try settings_store.validateModel(preset.model());
+                try durable_model.validate(preset.model());
                 try std.testing.expect(text_utils.isTerminalSafe(preset.model()));
             },
         }

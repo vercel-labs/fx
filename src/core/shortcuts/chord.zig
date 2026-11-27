@@ -51,7 +51,40 @@ pub const Chord = struct {
     /// any order, each named once, then a key. Text keys (letters, digits,
     /// punctuation, Enter, Tab, Backspace, Space) need ctrl, alt, or super, so a
     /// chord never takes plain typing.
+    /// Parses a chord a profile may bind. A reserved key is refused here, so every
+    /// caller that parses a binding (the setter and the loader) refuses it too.
     pub fn parse(text: []const u8) ?Chord {
+        const chord = parseSyntax(text) orelse return null;
+        if (chord.reservedReason() != null) return null;
+        return chord;
+    }
+
+    /// Like `parse`, but names why a binding is refused.
+    pub fn parseChecked(text: []const u8) ParseError!Chord {
+        const chord = parseSyntax(text) orelse return error.Malformed;
+        if (chord.reservedReason() != null) return error.Reserved;
+        return chord;
+    }
+
+    /// Why fx keeps this key for itself, or null when a profile may bind it.
+    pub fn reservedReason(self: Chord) ?[]const u8 {
+        for (reserved) |entry| {
+            if (entry.chord.eql(self)) return entry.why;
+        }
+        return null;
+    }
+
+    /// `ctrl+c is reserved for fx: interrupts a running turn and exits`, written into `buf`.
+    pub fn reservedMessage(self: Chord, buf: []u8) ?[]const u8 {
+        const why = self.reservedReason() orelse return null;
+        const name = self.format(buf) orelse return null;
+        var len = name.len;
+        len = appendText(buf, len, " is reserved for fx: ") orelse return null;
+        len = appendText(buf, len, why) orelse return null;
+        return buf[0..len];
+    }
+
+    fn parseSyntax(text: []const u8) ?Chord {
         var modifier_text: []const u8 = "";
         var has_modifiers = false;
         var key: Key = undefined;
@@ -90,6 +123,29 @@ pub const Chord = struct {
         };
         return buf[0..len];
     }
+};
+
+pub const ParseError = error{ Malformed, Reserved };
+
+/// A key fx keeps for itself. Each has its own handler in fx, and a profile
+/// binding it would shadow that handler. Composer editing keys (Ctrl+A, Ctrl+E,
+/// Ctrl+F, Ctrl+K, and the rest) are not here: a bound chord takes them only
+/// while the composer owns the keyboard, which is how Ctrl+F can switch fast mode.
+pub const Reserved = struct {
+    chord: Chord,
+    why: []const u8,
+};
+
+pub const reserved = [_]Reserved{
+    .{ .chord = .{ .key = .{ .char = 'c' }, .ctrl = true }, .why = "interrupts a running turn and exits" },
+    .{ .chord = .{ .key = .{ .char = 'd' }, .ctrl = true }, .why = "exits fx" },
+    .{ .chord = .{ .key = .{ .char = 'g' }, .ctrl = true }, .why = "restarts for an upgrade, or cancels the waiting restart" },
+    .{ .chord = .{ .key = .{ .char = 'o' }, .ctrl = true }, .why = "opens the full transcript" },
+    .{ .chord = .{ .key = .{ .char = 'p' }, .ctrl = true }, .why = "opens the model catalog" },
+    .{ .chord = .{ .key = .{ .char = 't' }, .ctrl = true }, .why = "cycles the reasoning effort" },
+    .{ .chord = .{ .key = .{ .char = 'x' }, .ctrl = true }, .why = "opens the agent list" },
+    .{ .chord = .{ .key = .{ .named = .enter }, .ctrl = true }, .why = "submits the prompt" },
+    .{ .chord = .{ .key = .{ .named = .enter }, .alt = true }, .why = "inserts a newline" },
 };
 
 fn chordIsAllowed(chord: Chord) bool {
@@ -278,6 +334,37 @@ test "chord parses any order and case, and rejects typing and repeated modifiers
     try std.testing.expect(Chord.parse("ctrl+ctrl+f") == null);
     try std.testing.expect(Chord.parse("ctrl+ff") == null);
     try std.testing.expect(Chord.parse("hyper+f") == null);
+}
+
+test "reserved keys are refused by parse, and the chords next to them still bind" {
+    for (reserved) |entry| {
+        var buf: [64]u8 = undefined;
+        const text = entry.chord.format(&buf).?;
+        try std.testing.expect(Chord.parse(text) == null);
+        try std.testing.expectError(error.Reserved, Chord.parseChecked(text));
+    }
+    try std.testing.expect(Chord.parse("ctrl+f") != null);
+    try std.testing.expect(Chord.parse("ctrl+shift+c") != null);
+    try std.testing.expect(Chord.parse("ctrl+2") != null);
+    try std.testing.expect(Chord.parse("ctrl+k") != null);
+    try std.testing.expect(Chord.parse("alt+m") != null);
+    try std.testing.expectError(error.Malformed, Chord.parseChecked("f"));
+}
+
+test "reservedMessage names the chord and why fx keeps it" {
+    var buf: [128]u8 = undefined;
+    const ctrl_c: Chord = .{ .key = .{ .char = 'c' }, .ctrl = true };
+    try std.testing.expectEqualStrings(
+        "ctrl+c is reserved for fx: interrupts a running turn and exits",
+        ctrl_c.reservedMessage(&buf).?,
+    );
+    const ctrl_f: Chord = .{ .key = .{ .char = 'f' }, .ctrl = true };
+    try std.testing.expect(ctrl_f.reservedMessage(&buf) == null);
+}
+
+test "the decoder still names Ctrl+C, so the runtime can refuse it as a defense" {
+    try std.testing.expect(fromControlByte(3).?.eql(.{ .key = .{ .char = 'c' }, .ctrl = true }));
+    try std.testing.expect(fromControlByte(3).?.reservedReason() != null);
 }
 
 test "bare function and navigation keys round-trip, and bare text keys stay refused" {

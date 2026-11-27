@@ -8,7 +8,7 @@ const app_agents_runtime = @import("app_agents_runtime.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const personal_shortcut_runtime = @import("personal_shortcut_runtime.zig");
-const shortcut_map = @import("../config/shortcut_map.zig");
+const shortcut_rules = @import("../shortcuts/shortcuts.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_trust_runtime = @import("app_trust_runtime.zig");
 const app_workspace_runtime = @import("app_workspace_runtime.zig");
@@ -175,25 +175,6 @@ fn validateExplicitModelSelection(selection: ExplicitModelSelection, capabilitie
         return .invalid;
     }
     return .{ .selection = selection };
-}
-
-test "legacy aliases act byte for byte like their canonical command" {
-    const builtin_commands = @import("../../builtins/commands.zig");
-    const pairs = [_]struct { alias: []const u8, canonical: []const u8 }{
-        .{ .alias = "{\"action\":\"open_model_picker\"}", .canonical = "{\"action\":\"command\",\"command\":\"/model\"}" },
-        .{ .alias = "{\"action\":\"toggle_fast_mode\"}", .canonical = "{\"action\":\"command\",\"command\":\"/fast\"}" },
-    };
-    for (pairs) |pair| {
-        var alias_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, pair.alias, .{});
-        defer alias_json.deinit();
-        var canonical_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, pair.canonical, .{});
-        defer canonical_json.deinit();
-        const alias_action = try shortcut_map.parseAction(alias_json.value);
-        const canonical_action = try shortcut_map.parseAction(canonical_json.value);
-        try std.testing.expect(std.meta.eql(alias_action, canonical_action));
-        const parsed = command_router.parse(builtin_commands.slash_registry, alias_action.command.text());
-        try std.testing.expectEqual(command_router.chordCommandRoute(parsed), command_router.chordCommandRoute(command_router.parse(builtin_commands.slash_registry, canonical_action.command.text())));
-    }
 }
 
 test "chord unregistered command text is unknown and never routed" {
@@ -2376,7 +2357,7 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        /// Ctrl+P and a personal `open_model_picker` shortcut share this path.
+        /// Ctrl+P and a personal shortcut bound to `/model` share this path.
         fn openModelCatalogKey(app: *App, agent: *AppAgent) !void {
             if (comptime !@hasField(App, "model_cache")) return;
             // A second Ctrl+P backs out of the shortcut's flow
@@ -2397,10 +2378,13 @@ pub fn Runtime(comptime App: type) type {
         /// Runs the profile's binding for `chord` when the composer owns the
         /// keyboard. Returns false when nothing ran, so the original event
         /// routes exactly as before (unbound chords, other focus, prompts).
-        fn routeBoundChord(app: *App, agent: *AppAgent, chord: shortcut_map.Chord) !bool {
+        fn routeBoundChord(app: *App, agent: *AppAgent, chord: shortcut_rules.Chord) !bool {
             if (comptime !@hasField(App, "personal_shortcuts")) return false;
             const entry = app.personal_shortcuts.map.find(chord) orelse return false;
             if (!composerOwnsKeyboard(app, agent)) return false;
+            // fx keeps reserved keys for itself (shortcut_rules.reserved). The loader
+            // refuses them; this is the same rule at the dispatch point.
+            if (chord.reservedReason() != null) return false;
             switch (entry.action) {
                 .select_model => |*preset| try personal_shortcut_rt.applyPreset(app, agent, preset),
                 .command => |*command| try runBoundCommand(app, agent, command.text()),
@@ -2419,12 +2403,12 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasDecl(App, "handleCommand")) return;
             const parsed = command_router.parse(app.slashRegistry(), text);
             switch (command_router.chordCommandRoute(parsed)) {
-                .refuse => return writeShortcutRefusal(app, "this command is not available from shortcuts; nothing ran"),
+                .refuse => return refuseBoundChord(app, "this command is not available from shortcuts; nothing ran"),
                 .run_now => try app.handleCommand(text),
                 .open_catalog => try openModelCatalogKey(app, agent),
                 .preview => {
                     if (draftHasState(app, agent)) {
-                        return writeShortcutRefusal(app, "clear the draft to use this shortcut's command; nothing changed");
+                        return refuseBoundChord(app, "clear the draft to use this shortcut's command; nothing changed");
                     }
                     try app.input_runtime.textReplacementState().replace(app.alloc, text);
                     app.shell.render_requests.request(.footer);
@@ -2434,6 +2418,13 @@ pub fn Runtime(comptime App: type) type {
 
         fn writeShortcutRefusal(app: *App, body: []const u8) !void {
             try app.writeDomainNotice(.{ .topic = "shortcut", .tone = .warning, .body = body }, true);
+        }
+
+        /// A bound key already took the key, so the refusal says why nothing ran.
+        /// The trace holds the fixed reason only, never the command text.
+        fn refuseBoundChord(app: *App, body: []const u8) !void {
+            debug_trace.logf("shortcut", "bound chord took the key, then refused: {s}", .{body});
+            return writeShortcutRefusal(app, body);
         }
 
         /// Ctrl+P opens the same catalog `/model` opens, but the composer is

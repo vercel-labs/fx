@@ -1,17 +1,16 @@
 const std = @import("std");
-const shortcut_map = @import("../config/shortcut_map.zig");
+const shortcut_rules = @import("../shortcuts/shortcuts.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const profile_shortcuts = @import("../config/profile_shortcuts.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
-const personal_shortcut_check = @import("personal_shortcut_check.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const session_commands = @import("../session/session_commands.zig");
 
 /// The personal shortcut map held by the app, and the profile stamp it was
 /// read at. Input and render only read `map`; `reloadAfterTurn` replaces it.
 pub const State = struct {
-    map: shortcut_map.Map = .{},
+    map: shortcut_rules.Map = .{},
     stamp: ?profile_shortcuts.Stamp = null,
 };
 
@@ -27,10 +26,40 @@ pub fn reconcile(state: *State, stamp: ?profile_shortcuts.Stamp, load: profile_s
     state.stamp = stamp;
 }
 
+/// The one-line transcript notice for a profile edit that did not apply. It
+/// names the failing chord when the parser found one, and says the previous
+/// shortcuts stay active.
+pub fn formatInvalidNotice(writer: *std.Io.Writer, invalid: profile_shortcuts.Invalid) !void {
+    if (invalid.chord().len == 0) {
+        return writer.writeAll("profile shortcuts could not be read; your previous shortcuts stay active");
+    }
+    try writer.print("profile shortcut \"{s}\" is invalid; your previous shortcuts stay active", .{invalid.chord()});
+}
+
+test "invalid profile notice names the chord and keeps the previous shortcuts" {
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    var named: profile_shortcuts.Invalid = .{};
+    @memcpy(named.chord_bytes[0..14], "ctrl+not-a-key");
+    named.chord_len = 14;
+    try formatInvalidNotice(&writer, named);
+    try std.testing.expectEqualStrings(
+        "profile shortcut \"ctrl+not-a-key\" is invalid; your previous shortcuts stay active",
+        writer.buffered(),
+    );
+
+    var unnamed: std.Io.Writer = .fixed(&buffer);
+    try formatInvalidNotice(&unnamed, .{});
+    try std.testing.expectEqualStrings(
+        "profile shortcuts could not be read; your previous shortcuts stay active",
+        unnamed.buffered(),
+    );
+}
+
 test "reconcile clears only on a real absence and keeps the last good map" {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"alt+m\":{\"action\":\"open_model_picker\"}}", .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"alt+m\":\"/model\"}", .{});
     defer parsed.deinit();
-    const map = try shortcut_map.parseJsonObject(parsed.value);
+    const map = try shortcut_rules.parseJsonObject(parsed.value);
 
     var first = std.mem.zeroes(profile_shortcuts.Stamp);
     first.size = 1;
@@ -39,15 +68,15 @@ test "reconcile clears only on a real absence and keeps the last good map" {
 
     var state: State = .{};
     reconcile(&state, first, .{ .loaded = map });
-    try std.testing.expect(state.map.find(shortcut_map.Chord.parse("alt+m").?) != null);
+    try std.testing.expect(state.map.find(shortcut_rules.Chord.parse("alt+m").?) != null);
     try std.testing.expectEqual(first.size, state.stamp.?.size);
 
-    reconcile(&state, second, .invalid);
-    try std.testing.expect(state.map.find(shortcut_map.Chord.parse("alt+m").?) != null);
+    reconcile(&state, second, .{ .invalid = .{} });
+    try std.testing.expect(state.map.find(shortcut_rules.Chord.parse("alt+m").?) != null);
     try std.testing.expectEqual(second.size, state.stamp.?.size);
 
     reconcile(&state, null, .absent);
-    try std.testing.expect(state.map.find(shortcut_map.Chord.parse("alt+m").?) == null);
+    try std.testing.expect(state.map.find(shortcut_rules.Chord.parse("alt+m").?) == null);
     try std.testing.expectEqual(@as(?profile_shortcuts.Stamp, null), state.stamp);
 }
 
@@ -60,16 +89,17 @@ pub fn Runtime(comptime App: type) type {
     return struct {
         /// Validates the preset, then applies it through the picker's path.
         /// A refused preset leaves the model, effort, speed, and draft as they were.
-        pub fn applyPreset(app: *App, agent: *AppAgent, preset: *const shortcut_map.Preset) !void {
+        pub fn applyPreset(app: *App, agent: *AppAgent, preset: *const shortcut_rules.Preset) !void {
             const model = preset.model();
-            const facts: personal_shortcut_check.Facts = .{
+            const facts: shortcut_rules.PresetFacts = .{
                 .same_provider = provider_runtime.providerOf(app, agent).eql(preset.provider),
                 .model_in_catalog = modelInCatalog(app, model),
                 .effort = preset.effort,
                 .fast_mode = preset.fast_mode,
             };
             const capabilities = model_capabilities.resolveForApp(App, app, model);
-            if (personal_shortcut_check.check(facts, capabilities)) |refusal| {
+            if (shortcut_rules.checkPreset(facts, capabilities)) |refusal| {
+                debug_trace.logf("shortcuts", "preset refused reason={s}", .{@tagName(refusal)});
                 try writeRefusal(app, refusal, model);
                 return;
             }
@@ -93,7 +123,16 @@ pub fn Runtime(comptime App: type) type {
                 debug_trace.logf("shortcuts", "reload kept last map stage=read err={s}", .{@errorName(err)});
                 return;
             };
-            if (load == .invalid) debug_trace.logf("shortcuts", "reload kept last map reason=invalid_profile", .{});
+            // A changed profile is read once, so an invalid edit is announced once.
+            switch (load) {
+                .invalid => |invalid| {
+                    debug_trace.logf("shortcuts", "reload kept last map reason=invalid_profile", .{});
+                    writeInvalidNotice(app, invalid) catch |err| {
+                        debug_trace.logf("shortcuts", "invalid notice dropped err={s}", .{@errorName(err)});
+                    };
+                },
+                .absent, .loaded => {},
+            }
             reconcile(&app.personal_shortcuts, stamp, load);
         }
 
@@ -106,7 +145,16 @@ pub fn Runtime(comptime App: type) type {
             return app.model_cache.catalogModelCompletion(model) != null;
         }
 
-        fn writeRefusal(app: *App, refusal: personal_shortcut_check.Refusal, model: []const u8) !void {
+        fn writeInvalidNotice(app: *App, invalid: profile_shortcuts.Invalid) !void {
+            var body: std.Io.Writer.Allocating = .init(app.alloc);
+            defer body.deinit();
+            try formatInvalidNotice(&body.writer, invalid);
+            const text = try body.toOwnedSlice();
+            defer app.alloc.free(text);
+            try app.writeDomainNotice(.{ .topic = "shortcut", .tone = .warning, .body = text }, true);
+        }
+
+        fn writeRefusal(app: *App, refusal: shortcut_rules.PresetRefusal, model: []const u8) !void {
             const reason: []const u8 = switch (refusal) {
                 .provider_mismatch => "this shortcut is for another provider",
                 .model_not_in_catalog => "the model is not in the catalog",

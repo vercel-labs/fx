@@ -4,7 +4,7 @@ const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const env_settings = @import("../config/env_settings.zig");
 const config_runtime = @import("../config/config_runtime.zig");
-const shortcut_map = @import("../config/shortcut_map.zig");
+const shortcut_rules = @import("../shortcuts/shortcuts.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const host = @import("../hosts/host.zig");
@@ -271,7 +271,7 @@ pub const StartupState = struct {
     theme_monitor_enabled: bool = false,
     theme: ?[]const u8 = null,
     /// `shortcuts` from the profile, read by the same settings load as the rest.
-    personal_shortcuts: shortcut_map.Map = .{},
+    personal_shortcuts: shortcut_rules.Map = .{},
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
         self.workspace_access.deinit(alloc);

@@ -41,7 +41,7 @@ pub const Kind = enum {
     object,
     /// The `workspaces` map from a workspace path to its overrides.
     workspaces,
-    /// The `shortcuts` object: a closed set of chords, each one action.
+    /// The `shortcuts` object: each key is a chord, each value a command or a preset.
     shortcuts,
     /// A key fx refuses to load, so a file that has it fails.
     refused,
@@ -143,7 +143,7 @@ pub const keys = [_]Key{
     .{ .name = "review_model", .where = .profile, .kind = .string, .description = "The AI Gateway model that reviews actions in auto mode" },
     .{ .name = "sandbox", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "session_titles", .where = .profile, .kind = .boolean, .description = "Name each session from its first prompt" },
-    .{ .name = "shortcuts", .where = .profile, .kind = .shortcuts, .map = true, .top_level_only = true, .description = "Personal key shortcuts: a key chord such as ctrl+1 or alt+m runs a saved model, the model picker, fast mode, or one fx command" },
+    .{ .name = "shortcuts", .where = .profile, .kind = .shortcuts, .map = true, .top_level_only = true, .description = "Personal key shortcuts: a key chord such as ctrl+1 or alt+m runs one fx command line, such as \"/fast\", or a saved model preset" },
     // Retired, but still read so that fx can explain the migration.
     .{ .name = "skill_match_fuzzy", .where = .profile, .kind = .refused, .description = "No longer supported; fx refuses a file that sets it, so remove it" },
     .{ .name = "skill_symlink_authorities", .where = .profile, .kind = .strings, .description = "Absolute directories that symlinked skills may resolve into" },

@@ -16,7 +16,7 @@ const configured_provider = @import("configured_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
 pub const tool_placement = @import("tool_placement.zig");
-const shortcut_map = @import("shortcut_map.zig");
+const shortcut_rules = @import("../shortcuts/shortcuts.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -58,7 +58,7 @@ pub const Settings = struct {
     tool_placement: tool_placement.Overrides = .{},
     /// Personal key shortcuts, heap-owned and freed in deinit. Profile-only;
     /// null when the profile sets none, so an unset profile costs one pointer.
-    shortcuts: ?*shortcut_map.Map = null,
+    shortcuts: ?*shortcut_rules.Map = null,
     /// The `shortcuts` entry that failed to parse, such as `shortcuts.ctrl+2.model`,
     /// owned. The rest of the profile still loads; the detailed loader reports it.
     shortcut_problem: ?[]u8 = null,
@@ -285,7 +285,7 @@ pub fn writeDiagnosticMetadata(writer: *std.Io.Writer, diagnostic: ConfigDiagnos
         try writer.writeAll("; tool_placement keys must be built-in tools that can move (" ++ tool_placement.movable_list ++ ") with the value \"toolbox\" or \"direct\"");
     }
     if (diagnostic.cause == .invalid_shortcuts) {
-        try writer.print("; the shortcuts map is ignored; other settings still load; bind each key to a command or a model preset (see fx config schema); at most {d} shortcuts", .{shortcut_map.max_entries});
+        try writer.print("; the shortcuts map is ignored; other settings still load; bind each key to a command or a model preset (see fx config schema); at most {d} shortcuts", .{shortcut_rules.max_entries});
     }
     if (diagnostic.cause == .invalid_additional_directories) {
         try writer.print(
@@ -2142,29 +2142,37 @@ fn pathHasDotDotComponent(path: []const u8) bool {
 }
 
 const max_shortcut_problem_bytes = 48;
+/// Longest reserved explanation in a diagnostic: a chord name and the chord module's reason.
+const max_reserved_reason_bytes = 256;
 
 /// Parses the profile's `shortcuts`. A bad entry leaves the map unset and
 /// records the field that failed; the rest of the profile still loads.
 fn parseShortcutsSetting(alloc: Allocator, settings: *Settings, value: std.json.Value) !void {
-    var problem: shortcut_map.Problem = .{};
-    const map = shortcut_map.parseJsonObjectChecked(value, &problem) catch {
+    var problem: shortcut_rules.Problem = .{};
+    const map = shortcut_rules.parseJsonObjectChecked(value, &problem) catch {
         settings.shortcut_problem = try shortcutProblemKey(alloc, problem);
         return;
     };
-    const stored = try alloc.create(shortcut_map.Map);
+    const stored = try alloc.create(shortcut_rules.Map);
     errdefer alloc.destroy(stored);
     stored.* = map;
     settings.shortcuts = stored;
 }
 
 /// `shortcuts`, `shortcuts.<chord>`, or `shortcuts.<chord>.<field>`, with the
-/// user's text bounded and made printable so it can't write control bytes.
-fn shortcutProblemKey(alloc: Allocator, problem: shortcut_map.Problem) ![]u8 {
+/// user's text bounded and made printable so it can't write control bytes. A
+/// reserved chord adds the chord module's reason after `; `.
+fn shortcutProblemKey(alloc: Allocator, problem: shortcut_rules.Problem) ![]u8 {
     var chord_buffer: [max_shortcut_problem_bytes]u8 = undefined;
     var field_buffer: [max_shortcut_problem_bytes]u8 = undefined;
     const chord = printableInto(&chord_buffer, problem.chord);
     const field = printableInto(&field_buffer, problem.field);
     if (chord.len == 0) return alloc.dupe(u8, "shortcuts");
+    if (problem.reserved) |reserved| {
+        var reason_buffer: [max_reserved_reason_bytes]u8 = undefined;
+        const reason = reserved.chord.reservedMessage(&reason_buffer) orelse "that key is reserved for fx";
+        return alloc.print("shortcuts.{s}; {s}", .{ chord, reason });
+    }
     if (field.len == 0) return alloc.print("shortcuts.{s}", .{chord});
     return alloc.print("shortcuts.{s}.{s}", .{ chord, field });
 }
@@ -5258,7 +5266,7 @@ test "experimental.workspace_capture is read from the profile only and stays off
 
 test "shortcuts are read from the profile top level only" {
     const alloc = std.testing.allocator;
-    const valid = "{\"shortcuts\":{\"alt+m\":{\"action\":\"open_model_picker\"}}}";
+    const valid = "{\"shortcuts\":{\"alt+m\":\"/model\"}}";
     var profile = try parseSettingsJson(alloc, valid);
     defer profile.deinit(alloc);
     try std.testing.expect(profile.shortcuts != null);
@@ -5276,7 +5284,7 @@ test "shortcuts are read from the profile top level only" {
 test "a bad shortcut is named by its field and leaves theme and permission_mode loaded" {
     const alloc = std.testing.allocator;
     var settings = try parseSettingsJson(alloc,
-        \\{"theme":"light","permission_mode":"ask","shortcuts":{"ctrl+1":{"action":"select_model","provider":"gateway","model":"openai/gpt-5","effort":"high"}}}
+        \\{"theme":"light","permission_mode":"ask","shortcuts":{"ctrl+1":{"provider":"gateway","model":"openai/gpt-5","effort":"high"}}}
     );
     defer settings.deinit(alloc);
     try std.testing.expectEqualStrings("light", settings.theme.?);
@@ -5292,6 +5300,20 @@ test "a shortcuts value that is not an object is named as the whole key" {
     try std.testing.expectEqualStrings("dark", settings.theme.?);
     try std.testing.expect(settings.shortcuts == null);
     try std.testing.expectEqualStrings("shortcuts", settings.shortcut_problem.?);
+}
+
+test "a reserved shortcut names its reason, and only the map is dropped" {
+    const alloc = std.testing.allocator;
+    var settings = try parseSettingsJson(alloc,
+        \\{"theme":"light","shortcuts":{"alt+m":"/model","ctrl+c":"/fast"}}
+    );
+    defer settings.deinit(alloc);
+    try std.testing.expectEqualStrings("light", settings.theme.?);
+    try std.testing.expect(settings.shortcuts == null);
+    try std.testing.expectEqualStrings(
+        "shortcuts.ctrl+c; ctrl+c is reserved for fx: interrupts a running turn and exits",
+        settings.shortcut_problem.?,
+    );
 }
 
 test "a shortcut problem key stays printable and bounded" {

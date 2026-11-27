@@ -5742,12 +5742,13 @@ test {
     _ = @import("core/recovery/recovery.zig");
     _ = @import("core/workspace_trust/workspace_trust.zig");
     _ = @import("core/app/app_trust_runtime.zig");
+    _ = @import("core/app/personal_shortcut_runtime.zig");
     _ = @import("ui/footer/trust_prompt_ui.zig");
     _ = @import("core/quiesce/quiesce.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
-    _ = @import("core/config/shortcut_map.zig");
+    _ = @import("core/shortcuts/shortcuts.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/function_tools.zig");
     _ = @import("core/shared/json_depth.zig");

@@ -1765,37 +1765,48 @@ describe("cli: status", () => {
     TIMEOUT,
   );
 
-  test("shortcut edits use key identity and preserve unrelated legacy bindings", async () => {
+  test("shortcut edits use key identity and preserve unrelated bindings", async () => {
     const home = mkdtempSync(join(tmpdir(), "fx-shortcut-identity-"));
     try {
       const profile = join(home, ".fx");
       mkdirSync(profile);
       const file = join(profile, "settings.json");
-      const legacy = { action: "open_model_picker" };
-      writeFileSync(file, JSON.stringify({ theme: "light", shortcuts: { "Alt+Ctrl+K": legacy, F8: legacy } }));
+      writeFileSync(file, JSON.stringify({ theme: "light", shortcuts: { "Alt+Ctrl+K": "/model", F8: "/model" } }));
       const config = (...args: string[]) => runFx(["config", ...args], {
         cwd: home, env: { ...NO_GATEWAY_AUTH, ...NO_SETTING_ENV, HOME: home, FX_HOME: profile },
       });
       const original = readFileSync(file, "utf8");
-      const restricted = await config("set", "shortcuts.f9", JSON.stringify({ action: "command", command: "/permissions ask" }));
+      const restricted = await config("set", "shortcuts.f9", "/permissions ask");
       expect(restricted.code).toBe(2);
       expect(restricted.stderr).toContain("not available from shortcuts");
       expect(readFileSync(file, "utf8")).toBe(original);
+      const reserved = await config("set", "shortcuts.ctrl+c", "/fast");
+      expect(reserved.code).toBe(2);
+      expect(reserved.stderr).toContain("ctrl+c is reserved for fx: interrupts a running turn and exits");
+      expect(reserved.stderr).not.toContain("use a key chord");
+      expect(readFileSync(file, "utf8")).toBe(original);
       const key = "shortcuts.ctrl+alt+k";
       expect((await config("get", key)).code).toBe(0);
-      const field = await config("get", "shortcuts.CTRL+ALT+k.action");
-      expect([field.code, field.stdout.trim()]).toEqual([0, "open_model_picker"]);
+      const alias = await config("get", "shortcuts.CTRL+ALT+k");
+      expect([alias.code, alias.stdout.trim()]).toEqual([0, "/model"]);
       const before = readFileSync(file, "utf8");
-      const occupied = await config("set", key, JSON.stringify({ action: "toggle_fast_mode" }));
+      const occupied = await config("set", key, "/fast");
       expect(occupied.code).toBe(1);
       expect(occupied.stderr).toContain("already has a shortcut");
       expect(readFileSync(file, "utf8")).toBe(before);
       expect((await config("unset", key)).code).toBe(0);
       expect((await config("get", key)).code).toBe(1);
-      expect((await config("set", key, JSON.stringify({ action: "toggle_fast_mode" }))).code).toBe(0);
+      expect((await config("set", key, "/fast")).code).toBe(0);
       expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({
-        theme: "light", shortcuts: { F8: legacy, "ctrl+alt+k": { action: "command", command: "/fast" } },
+        theme: "light", shortcuts: { F8: "/model", "ctrl+alt+k": "/fast" },
       });
+      const preset = JSON.stringify({ provider: "gateway", model: "openai/gpt-5", effort: "high", fast_mode: true });
+      expect((await config("set", "shortcuts.ctrl+1", preset)).code).toBe(0);
+      expect((await config("get", "shortcuts.ctrl+1.model")).stdout.trim()).toBe("openai/gpt-5");
+      expect((await config("unset", "shortcuts.ctrl+1")).code).toBe(0);
+      expect((await config("unset", key)).code).toBe(0);
+      expect((await config("unset", "shortcuts.F8")).code).toBe(0);
+      expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ theme: "light" });
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

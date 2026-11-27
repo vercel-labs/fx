@@ -1,7 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const input_action = @import("../../core/input/input_action.zig");
-const key_chord = @import("../../core/input/key_chord.zig");
+const shortcut_rules = @import("../../core/shortcuts/shortcuts.zig");
 const escape_parser = @import("escape_parser.zig");
 const shortcuts = @import("shortcuts.zig");
 
@@ -96,7 +96,7 @@ pub const Decoder = struct {
 
         if (self.stage != 0) {
             const prior_stage = self.stage;
-            var report_chord: ?key_chord.Chord = null;
+            var report_chord: ?shortcut_rules.Chord = null;
             const action = escape_parser.consumeKeyReport(
                 &self.stage,
                 &self.param,
@@ -141,7 +141,7 @@ pub const Decoder = struct {
             }
         }
 
-        const control_chord = if (names_chord) key_chord.fromControlByte(byte) else null;
+        const control_chord = if (names_chord) shortcut_rules.fromControlByte(byte) else null;
         if (escape_parser.controlByteFeatureAction(byte)) |resolved| {
             appendAction(&ingress, resolved, false, control_chord);
         } else {
@@ -234,7 +234,7 @@ pub const Decoder = struct {
 fn appendRaw(
     ingress: *input_action.TerminalInputIngress,
     byte: u8,
-    chord: ?key_chord.Chord,
+    chord: ?shortcut_rules.Chord,
 ) void {
     ingress.setEvent(.{ .raw = .{
         .byte = byte,
@@ -247,7 +247,7 @@ fn appendAction(
     ingress: *input_action.TerminalInputIngress,
     action: input_action.Action,
     cancel_pending: bool,
-    chord: ?key_chord.Chord,
+    chord: ?shortcut_rules.Chord,
 ) void {
     ingress.setEvent(.{ .action = .{
         .action = action,
@@ -275,8 +275,8 @@ fn feedSequence(
     return ingress;
 }
 
-fn expectChord(text: []const u8, actual: ?key_chord.Chord) !void {
-    const expected = key_chord.Chord.parse(text) orelse return error.TestBadChordText;
+fn expectChord(text: []const u8, actual: ?shortcut_rules.Chord) !void {
+    const expected = shortcut_rules.Chord.parse(text) orelse return error.TestBadChordText;
     try std.testing.expect(actual != null);
     try std.testing.expect(actual.?.eql(expected));
 }
