@@ -8703,6 +8703,82 @@ test "processQueuedPrompt names a reset and a read failure the same dropped conn
     try expectRecovered(&hooks, 4);
 }
 
+test "processQueuedPrompt resends after OS errors Zig has no name for while DNS keeps failing" {
+    const alloc = std.testing.allocator;
+    // A Mac that wakes for a moment without a network: lookups fail, and a
+    // send fails with an errno Zig reports only as Unexpected.
+    const completions = [_]FakeCompletion{
+        .{ .pre_send_error = error.UnknownHostName },
+        .{ .pre_send_error = error.UnknownHostName },
+        .{ .pre_send_error = error.UnknownHostName },
+        .{ .stream_error = error.Unexpected },
+        .{ .pre_send_error = error.UnknownHostName },
+        .{ .stream_error = error.Unexpected },
+        .{ .pre_send_error = error.UnknownHostName },
+        .{ .content = "Recovered" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 8), gateway.request_models.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try expectRecovered(&hooks, 8);
+}
+
+test "processQueuedPrompt ends the turn after three OS errors Zig has no name for" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .stream_error = error.Unexpected },
+        .{ .stream_error = error.Unexpected },
+        .{ .stream_error = error.Unexpected },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try std.testing.expectError(
+        error.Unexpected,
+        runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()),
+    );
+
+    // An error that comes back every time is not taken as the network.
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in 1s · attempt 1");
+    try expectRouteStatus(
+        &hooks,
+        hooks.route_recovery_statuses.items.len - 1,
+        .terminal_provider_error,
+        "⚠ Network interrupted · OS error, see /trace · stopped after 3 attempts",
+    );
+}
+
+test "processQueuedPrompt keeps resending a connection that closed under the request" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .stream_error = error.SocketUnconnected },
+        .{ .stream_error = error.SocketUnconnected },
+        .{ .stream_error = error.SocketUnconnected },
+        .{ .content = "Recovered" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
+    try expectRecovered(&hooks, 4);
+}
+
 test "processQueuedPrompt clears retry status when a replay is cancelled" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
