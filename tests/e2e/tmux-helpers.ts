@@ -16,7 +16,6 @@ import {
   DEFAULT_UNSET_ENV_KEYS,
   FX_BIN,
   REPO_ROOT,
-  providerVersionTestEnv,
 } from "../evals/eval-helpers";
 
 // A pane inherits the tmux server's environment, which a developer's shell
@@ -779,7 +778,7 @@ export class TmuxSession {
       isolated = false,
       socketName,
     } = opts ?? {};
-    const env = localCreditsEnv(providerVersionTestEnv(requestedEnv));
+    const env = localCreditsEnv(requestedEnv);
 
     if (
       minimumHistoryLines !== undefined &&
