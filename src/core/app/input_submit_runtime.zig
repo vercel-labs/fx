@@ -259,9 +259,6 @@ pub fn SubmitRuntime(comptime App: type) type {
         /// belongs to the first instance, so it waits while another is shown.
         pub fn collectLaunchPromptFacts(app: *App, max_prompt_history: usize) !void {
             if (comptime !agents.hasAgentField(App, "submission")) return;
-            if (comptime @hasField(App, "trust")) {
-                if (app.trust.asking()) return;
-            }
             const agent = agents.screenAgentOf(app);
             const prompt = agent.submission.launch_prompt orelse return;
             if (app.shell.render_requests.hasReason(.first_frame)) return;

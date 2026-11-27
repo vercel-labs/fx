@@ -66,9 +66,6 @@ jobs:
       - name: Check recovery boundary
         run: ./scripts/check-recovery-boundary.sh
 
-      - name: Check workspace trust boundary
-        run: ./scripts/check-workspace-trust-boundary.sh
-
       - name: Model-check request recovery
         run: |
           set -euo pipefail
@@ -1204,7 +1201,6 @@ jobs:
             scripts/check-indexer-boundary.sh
             scripts/check-public-surface.sh
             scripts/check-recovery-boundary.sh
-            scripts/check-workspace-trust-boundary.sh
             scripts/detect-ci-need.sh
             scripts/detect-macos-need.sh
             scripts/dev-channel-forward.sh

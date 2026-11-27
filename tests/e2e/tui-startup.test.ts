@@ -12,7 +12,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
+import {
+  cleanupIsolatedTestHome,
+  createIsolatedTestHome,
+  FX_BIN,
+  HAS_API_KEY,
+} from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -27,6 +32,7 @@ import { ignoresFileModes } from "./file-modes";
 const SKIP = !tmuxAvailable() || !HAS_API_KEY;
 const SKIP_TMUX = !tmuxAvailable();
 const TIMEOUT = 30_000;
+const MODERN_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
 
 /// Whether `chflags` can make a file immutable here, as macOS can and Linux
 /// cannot without root.
@@ -1529,6 +1535,155 @@ describe.skipIf(SKIP_TMUX)("tui: theme notifications", () => {
           session = null;
         }
         rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
+describe.skipIf(!tmuxAvailable())("tui: a new folder opens straight to the composer", () => {
+  let gatewayToStop: { stop: () => void } | null = null;
+
+  afterEach(() => {
+    gatewayToStop?.stop();
+    gatewayToStop = null;
+  });
+
+  test(
+    "a new repository sends the launch prompt and starts profile MCP servers at once, and holds an unapproved project server",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-folder-prompt-")));
+      const home = realpathSync(createIsolatedTestHome());
+      const repo = join(root, "repo");
+      const stderrPath = join(root, "stderr.log");
+      const profilePidPath = join(repo, "profile-mcp.pid");
+      const profileWireLogPath = join(repo, "profile-mcp-wire.jsonl");
+      const projectPidPath = join(repo, "project-mcp.pid");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(repo, ".fx", "skills", "hello"), { recursive: true });
+      execFileSync("git", ["init"], { cwd: repo, stdio: "pipe" });
+      writeFileSync(join(repo, "AGENTS.md"), "# Project instructions\n");
+      writeFileSync(
+        join(repo, ".fx", "skills", "hello", "SKILL.md"),
+        "---\nname: hello\ndescription: Says hello\n---\nSay hello.\n",
+      );
+      writeFileSync(
+        join(home, ".fx", "mcp.json"),
+        `${JSON.stringify({
+          mcp: {
+            profile: {
+              type: "local",
+              command: [process.execPath, MODERN_FIXTURE],
+              enabled: true,
+              environment: {
+                FX_MCP_WIRE_LOG: profileWireLogPath,
+                FX_MCP_PID_PATH: profilePidPath,
+                FX_MCP_MODE: "normal",
+              },
+            },
+          },
+        })}\n`,
+      );
+      writeFileSync(
+        join(repo, ".mcp.json"),
+        `${JSON.stringify({
+          mcpServers: {
+            project: {
+              command: process.execPath,
+              args: [MODERN_FIXTURE],
+              env: { FX_MCP_PID_PATH: projectPidPath, FX_MCP_MODE: "normal" },
+            },
+          },
+        })}\n`,
+      );
+      writeFileSync(stderrPath, "");
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("NEW_FOLDER_OK"));
+      gatewayToStop = gateway;
+      const quotedFx = `'${FX_BIN.replaceAll("'", "'\\''")}'`;
+
+      try {
+        session = await TmuxSession.create({
+          cmd: `${quotedFx} "say hi"`,
+          cwd: repo,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "new-folder-fixture-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+          },
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+
+        await session.waitForText("NEW_FOLDER_OK", 15_000);
+        expect(gateway.requestCount()).toBe(1);
+        expect(gateway.requests[0]!.body).toContain("say hi");
+        const grid = await session.capturePaneGrid();
+        expect(grid.join("\n")).not.toContain("Folder access");
+
+        await session.waitForPane(
+          () =>
+            existsSync(profilePidPath) &&
+            existsSync(profileWireLogPath) &&
+            readFileSync(profileWireLogPath, "utf8").includes("\"tools/list\""),
+          10_000,
+        );
+        expect(existsSync(projectPidPath)).toBe(false);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the home folder opens straight to the composer",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-folder-home-")));
+      const home = realpathSync(createIsolatedTestHome());
+      const stderrPath = join(root, "stderr.log");
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: home,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+          },
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+
+        await session.waitForComposer(15_000);
+        const grid = await session.capturePaneGrid();
+        expect(grid.join("\n")).not.toContain("Folder access");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+        cleanupIsolatedTestHome(home);
       }
     },
     TIMEOUT,

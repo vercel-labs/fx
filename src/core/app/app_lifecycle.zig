@@ -1935,7 +1935,10 @@ fn loadStartupStatusModel(alloc: Allocator, default_model: []const u8, configure
 }
 
 fn credentialOnboardingDisabled() bool {
-    return env_settings.testSwitchOn(io_mod.getenv("FX_TEST_SKIP_ONBOARDING"));
+    const value = io_mod.getenv("FX_TEST_SKIP_ONBOARDING") orelse return false;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    return !std.mem.eql(u8, trimmed, "0") and !std.ascii.eqlIgnoreCase(trimmed, "false");
 }
 
 fn soundEnvOverride() ?env_settings.SoundPreset {
