@@ -2797,7 +2797,7 @@ fn runGooglePlanLogin(alloc: Allocator, cfg: Config, deps: RunDeps) !RunResult {
     const email = runGoogleLoginAttempt(alloc, cfg, deps, false) catch |err| switch (err) {
         error.GoogleScopeMissing => blk: {
             try writeStderr(deps, "Google did not grant permission to run Gemini models on your Google AI Pro or Ultra plan.\n");
-            if (!deps.setup_terminal_available(deps.setup_ctx) or !promptYesNoConsentRetry()) {
+            if (!deps.setup_terminal_available(deps.setup_ctx) or !promptYesNoConsentRetry(deps)) {
                 if (!deps.setup_terminal_available(deps.setup_ctx)) {
                     try writeStderr(deps, "Run fx login google to try again.\n");
                 }
@@ -2884,11 +2884,8 @@ fn handleGoogleLoginError(alloc: Allocator, deps: RunDeps, err: anyerror) !RunRe
     }
 }
 
-fn promptYesNoConsentRetry() bool {
-    std.Io.File.stderr().writeStreamingAll(
-        io_mod.getIo(),
-        "Retry sign-in and ask for permission again? [y/N] ",
-    ) catch return false;
+fn promptYesNoConsentRetry(deps: RunDeps) bool {
+    writeStderr(deps, "Retry sign-in and ask for permission again? [y/N] ") catch return false;
     var buf: [64]u8 = undefined;
     const read_len = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return false;
     if (read_len == 0) return false;
