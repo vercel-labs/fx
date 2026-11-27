@@ -31,7 +31,7 @@ const TIMEOUT = 300_000;
 const GUIDANCE = "The shell could not parse this command";
 
 type ShellClass = "zsh" | "bash32" | "bash5";
-type LineClass = "evalLine1" | "devFd0Eval" | "bashEvalLine" | "none";
+type LineClass = "evalLine1" | "devFd0Eval" | "procFd0Eval" | "bashEvalLine" | "none";
 type Shell = { cls: ShellClass; path: string };
 type Scenario = { name: string; kind: "error" | "clean"; command: string; aliases: number };
 type Observation = {
@@ -105,6 +105,8 @@ function classify(output: string): { line: LineClass; lineNumber: number | null 
   if (/^\(eval\):1: /.test(first)) return { line: "evalLine1", lineNumber: 1 };
   const fd = /^\/dev\/fd\/0: eval: line (\d+): /.exec(first);
   if (fd) return { line: "devFd0Eval", lineNumber: Number(fd[1]) };
+  const procFd = /^\/proc\/self\/fd\/0: eval: line (\d+): /.exec(first);
+  if (procFd) return { line: "procFd0Eval", lineNumber: Number(procFd[1]) };
   const bash = /^(?:\S*\/)?bash: eval: line (\d+): /.exec(first);
   if (bash) return { line: "bashEvalLine", lineNumber: Number(bash[1]) };
   return { line: "none", lineNumber: null };
@@ -254,9 +256,11 @@ test.skipIf(!supported)("controls: planted wrong matchers and a tampered or empt
 const LINES: Array<[string, string, boolean]> = [
   ["zsh", '(eval):1: unmatched "', true],
   ["bash 5", "/dev/fd/0: eval: line 2: unexpected EOF while looking for matching `\"'", true],
+  ["bash 5, no /dev/fd", "/proc/self/fd/0: eval: line 2: unexpected EOF while looking for matching `\"'", true],
   ["bash 3.2 as the PGSO log showed it", "bash: eval: line 7: unexpected EOF while looking for matching `\"'", true],
   ["bash 3.2 with a long path and a long line number", "/usr/local/bin/bash: eval: line 123: syntax error: unexpected end of file", true],
   ["a bash run-time error, which does not name eval", '/dev/fd/0: line 3: 1 +  : syntax error: operand expected (error token is " ")', false],
+  ["a bash run-time error under /proc/self/fd/0, which does not name eval", '/proc/self/fd/0: line 3: 1 +  : syntax error: operand expected (error token is " ")', false],
   ["an eval error with no line number", "bash: eval: -x: invalid option", false],
   ["a command's own output", "fx-clean-run", false],
 ];
