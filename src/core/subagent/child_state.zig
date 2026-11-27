@@ -602,10 +602,12 @@ pub const V2Children = struct {
         self.* = undefined;
     }
 
-    /// Remembers the settings a new child starts with, replacing older ones.
-    pub fn rememberSeed(self: *V2Children, child_id: []const u8, seed: ChildSeed) !void {
+    /// Remembers `seed` for `child_id`. When `keep_existing` is true, an
+    /// already recorded seed stays in place.
+    pub fn setSeed(self: *V2Children, child_id: []const u8, seed: ChildSeed, keep_existing: bool) !void {
         self.state.lockUncancelable(io_mod.getIo());
         defer self.state.unlock(io_mod.getIo());
+        if (keep_existing and self.seeds.contains(child_id)) return;
         var owned = seed;
         owned.preferences.model = try self.alloc.dupe(u8, seed.preferences.model);
         errdefer self.alloc.free(owned.preferences.model);
@@ -614,19 +616,6 @@ pub const V2Children = struct {
             existing.* = owned;
             return;
         }
-        const key = try self.alloc.dupe(u8, child_id);
-        errdefer self.alloc.free(key);
-        try self.seeds.put(self.alloc, key, owned);
-    }
-
-    /// Remembers `seed` for `child_id` only when no seed is recorded yet.
-    pub fn ensureSeed(self: *V2Children, child_id: []const u8, seed: ChildSeed) !void {
-        self.state.lockUncancelable(io_mod.getIo());
-        defer self.state.unlock(io_mod.getIo());
-        if (self.seeds.contains(child_id)) return;
-        var owned = seed;
-        owned.preferences.model = try self.alloc.dupe(u8, seed.preferences.model);
-        errdefer self.alloc.free(owned.preferences.model);
         const key = try self.alloc.dupe(u8, child_id);
         errdefer self.alloc.free(key);
         try self.seeds.put(self.alloc, key, owned);
@@ -2186,10 +2175,15 @@ test "v2 children live in the parent's log and come back after a reopen (D22)" {
         try registry.finish(alloc, child_id, "work-1", .completed, null);
         try state_store.save(alloc, registry);
 
-        try children.rememberSeed(child_id, .{ .preferences = seed.preferences, .language = seed.language });
+        try children.setSeed(child_id, .{ .preferences = seed.preferences, .language = seed.language }, false);
         var copy = (try children.seedFor(alloc, child_id)).?;
         defer copy.preferences.deinit(alloc);
         try std.testing.expectEqualStrings("test-model", copy.preferences.model);
+        var other_model = "other-model".*;
+        try children.setSeed(child_id, .{ .preferences = .{ .model = &other_model, .effort = .auto, .fast_mode = false }, .language = seed.language }, true);
+        var kept = (try children.seedFor(alloc, child_id)).?;
+        defer kept.preferences.deinit(alloc);
+        try std.testing.expectEqualStrings("test-model", kept.preferences.model);
         try std.testing.expect((try children.seedFor(alloc, "1786460757753-none")) == null);
     }
     parent.close();

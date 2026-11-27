@@ -1171,7 +1171,7 @@ pub const Runtime = struct {
             if (std.mem.eql(u8, item.child_id, child_id)) waiting += 1;
         }
         if (waiting >= max_pending_per_child) return error.QueueFull;
-        try self.ensureManagedChildSeedIfMissing(child_id, operation_id, effectiveDefaults(options.defaults, request.override(), resolved_model));
+        try self.ensureManagedChildSeed(child_id, effectiveDefaults(options.defaults, request.override(), resolved_model), true);
         var work = try makeManagedWork(self.alloc, operation_id, fingerprint, request, options);
         errdefer work.deinit(self.alloc);
         const owned_child = try self.alloc.dupe(u8, child_id);
@@ -3288,11 +3288,7 @@ pub const Runtime = struct {
                     .operation_conflict,
                 );
             }
-            try self.ensureManagedChildSeedIfMissing(
-                existing.id,
-                operation_id,
-                defaults,
-            );
+            try self.ensureManagedChildSeed(existing.id, defaults, true);
             if (existing.last_work_id) |work_id| {
                 if (std.mem.eql(u8, work_id, operation_id)) return .{ .completed = .{
                     .child_id = try alloc.dupe(u8, existing.id),
@@ -3364,7 +3360,7 @@ pub const Runtime = struct {
                     // slot is a child marked running that takes no message.
                     // A child lost before its first turn has no log to
                     // resume, so its next work starts it fresh (D33).
-                    try self.ensureManagedChildSeedIfMissing(started.id, active.id, defaults);
+                    try self.ensureManagedChildSeed(started.id, defaults, true);
                     var ready = try managedAdmissionReady(alloc, started.id, false);
                     errdefer ready.deinit(alloc);
                     try self.managed.state_store.save(alloc, registry);
@@ -3396,7 +3392,12 @@ pub const Runtime = struct {
                 }
                 if (message.report) |rule| try registry.setReportRule(child_id, rule);
                 // The save is the last step that can fail (see above).
-                try self.ensureManagedChildSession(child_id, active.id, defaults);
+                try self.ensureManagedChildSeed(child_id, defaults, false);
+                debug_trace.logf(
+                    "subagent",
+                    "child session reserved child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={} ultrafast_mode={}",
+                    .{ child_id, active.id, @tagName(defaults.provider), defaults.model, defaults.effort.label(), defaults.fast_mode, defaults.ultrafast_mode },
+                );
                 var ready = try managedAdmissionReady(
                     alloc,
                     registry.children[registry.children.len - 1].id,
@@ -3423,15 +3424,15 @@ pub const Runtime = struct {
         try registry.setStartedWith(alloc, child_id, started);
     }
 
-    fn ensureManagedChildSession(
+    fn ensureManagedChildSeed(
         self: *Runtime,
         child_id: []const u8,
-        work_id: []const u8,
         defaults: Defaults,
+        keep_existing: bool,
     ) !void {
         // A child reaches the disk with its first turn, under the id its
         // spawn line names (D34); until then only its settings wait here.
-        try self.children.rememberSeed(child_id, .{
+        try self.children.setSeed(child_id, .{
             .preferences = .{
                 .provider = defaults.provider,
                 .model = @constCast(defaults.model),
@@ -3440,31 +3441,7 @@ pub const Runtime = struct {
                 .ultrafast_mode = defaults.ultrafast_mode,
             },
             .language = defaults.conversation_language,
-        });
-        debug_trace.logf(
-            "subagent",
-            "child session reserved child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={} ultrafast_mode={}",
-            .{ child_id, work_id, @tagName(defaults.provider), defaults.model, defaults.effort.label(), defaults.fast_mode, defaults.ultrafast_mode },
-        );
-    }
-
-    fn ensureManagedChildSeedIfMissing(
-        self: *Runtime,
-        child_id: []const u8,
-        work_id: []const u8,
-        defaults: Defaults,
-    ) !void {
-        try self.children.ensureSeed(child_id, .{
-            .preferences = .{
-                .provider = defaults.provider,
-                .model = @constCast(defaults.model),
-                .effort = defaults.effort,
-                .fast_mode = defaults.fast_mode,
-                .ultrafast_mode = defaults.ultrafast_mode,
-            },
-            .language = defaults.conversation_language,
-        });
-        _ = work_id;
+        }, keep_existing);
     }
 
     fn managedResultText(
@@ -9043,6 +9020,80 @@ test "a subagent message whose model query resolves to the child's model is acce
     const third = try runtime.executeManaged(arena, &third_req, third_opts);
     try std.testing.expect(!third.success);
     try std.testing.expect(std.mem.find(u8, third.body, "\"error_code\":\"override_after_create\"") != null);
+}
+
+test "queuing a message after the parent changes model keeps the child's startup seed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    var req1 = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "first", .model = "model-a" } });
+    defer req1.deinit(alloc);
+    const first = try runtime.executeManaged(arena, &req1, .{
+        .caller_id = parent.parent.id(),
+        .invocation_id = "seed-keep-1",
+        .defaults = .{ .provider = .gateway, .model = "model-a", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+    });
+    try std.testing.expect(first.success);
+    const child_id = try reviewerId(runtime, arena);
+    try waitForRuns(&fixture, 1);
+
+    // Change the parent's model to model-b before queuing a follow-up while the
+    // child still has no log on disk.
+    var model_b = "model-b".*;
+    try parent.parent.setPreferences(.{ .provider = .gateway, .model = &model_b, .effort = .auto, .fast_mode = false });
+    const parent_b_options = ExecuteOptions{
+        .caller_id = parent.parent.id(),
+        .invocation_id = "seed-keep-2",
+        .defaults = .{ .provider = .gateway, .model = "model-b", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 2,
+    };
+    var req2 = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "second" } });
+    defer req2.deinit(alloc);
+    const queued = try runtime.executeManaged(arena, &req2, parent_b_options);
+    try std.testing.expect(queued.success);
+    try std.testing.expect(std.mem.find(u8, queued.body, "is busy") != null);
+
+    var seed = (try runtime.children.seedFor(alloc, child_id)).?;
+    defer seed.preferences.deinit(alloc);
+    try std.testing.expectEqualStrings("model-a", seed.preferences.model);
+
+    var prefs = try runtime.childPreferences(alloc, child_id);
+    defer prefs.deinit(alloc);
+    try std.testing.expectEqualStrings("model-a", prefs.model);
+
+    var req3 = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "third", .model = "model-a" } });
+    defer req3.deinit(alloc);
+    var repeat_opts = parent_b_options;
+    repeat_opts.invocation_id = "seed-keep-3";
+    const repeat = try runtime.executeManaged(arena, &req3, repeat_opts);
+    try std.testing.expect(repeat.success);
+    try std.testing.expect(std.mem.find(u8, repeat.body, "is busy") != null);
+
+    var req4 = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "fourth", .model = "model-b" } });
+    defer req4.deinit(alloc);
+    var changed_opts = parent_b_options;
+    changed_opts.invocation_id = "seed-keep-4";
+    const changed = try runtime.executeManaged(arena, &req4, changed_opts);
+    try std.testing.expect(!changed.success);
+    try std.testing.expect(std.mem.find(u8, changed.body, "\"error_code\":\"override_after_create\"") != null);
+
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+    try std.testing.expect(std.mem.find(u8, fixture.began_contents.items[1], "second") != null);
+    try std.testing.expect(std.mem.find(u8, fixture.began_contents.items[1], "third") != null);
 }
 
 fn formatFailedResult(alloc: Allocator, failure: ?[]const u8, partial: ?[]const u8) ![]u8 {
