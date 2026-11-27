@@ -196,7 +196,7 @@
 //!   `args_omitted_bytes` or `result_omitted_bytes`. A `web_fetch` call has no
 //!   arguments or result.
 //! - `permissions`: `grants`; then a `permission_grant` per grant: `tool`,
-//!   `target` (masked).
+//!   `target` (masked, or `[omitted]` for shell and terminal grants).
 //! - `auto_reviews`: the auto-mode safety reviews this session. `reviews`
 //!   counts the reviews fx made or tried, `outcomes` {`clear`, `caution`,
 //!   `unavailable`, `held`, `error`} splits them, and `reused` counts the
@@ -2072,7 +2072,15 @@ fn writePermissions(r: *Records, grants: []const types.PermissionGrant) !void {
     for (grants) |grant| {
         try r.begin("permission_grant");
         try r.text("tool", traceToolDisplayName(grant.tool_name));
-        try r.masked("target", grant.target_path);
+        const permission = permissions.permissionNameForTool(grant.tool_name);
+        if (std.mem.eql(u8, permission, "bash") or
+            std.mem.eql(u8, permission, "shell") or
+            std.mem.eql(u8, permission, "terminal"))
+        {
+            try r.text("target", "[omitted]");
+        } else {
+            try r.masked("target", grant.target_path);
+        }
         try r.end();
     }
 }
@@ -6076,7 +6084,8 @@ test "trace permissions and MCP servers become records with errors masked" {
     const grants = [_]types.PermissionGrant{
         .{ .tool_name = @constCast("exa_search"), .target_path = @constCast("*") },
         .{ .tool_name = @constCast("shell"), .target_path = @constCast("zig build") },
-        .{ .tool_name = @constCast("shell"), .target_path = @constCast("@fx-terminal-env:user:8:/bin/zsh::echo OPENAI_API_KEY=sk-G1abcdefghijklmnop12345") },
+        .{ .tool_name = @constCast("run_command"), .target_path = @constCast("@fx-terminal-env:user:8:/bin/zsh::example unknown-credential-canary") },
+        .{ .tool_name = @constCast("terminal"), .target_path = @constCast("terminal-identity-canary") },
     };
     const w = try TestWriter.create();
     defer w.destroy();
@@ -6086,17 +6095,18 @@ test "trace permissions and MCP servers become records with errors masked" {
     var trace = try w.trace();
     defer trace.deinit();
     try expectNotIn(w.out.written(), "abcdefghijklmnop");
-    try expectNotIn(w.out.written(), "G1abcdefghijklmnop12345");
+    try expectNotIn(w.out.written(), "unknown-credential-canary");
+    try expectNotIn(w.out.written(), "terminal-identity-canary");
 
-    try std.testing.expectEqual(@as(i64, 3), try testInt(try trace.one("permissions"), "grants"));
+    try std.testing.expectEqual(@as(i64, 4), try testInt(try trace.one("permissions"), "grants"));
     const first_grant = try trace.nth("permission_grant", 0);
     try std.testing.expectEqualStrings("web_search", try testString(first_grant, "tool"));
     try std.testing.expectEqualStrings("*", try testString(first_grant, "target"));
-    try std.testing.expectEqualStrings("zig build", try testString(try trace.nth("permission_grant", 1), "target"));
-    try std.testing.expectEqualStrings(
-        "@fx-terminal-env:user:8:/bin/zsh::echo OPENAI_API_KEY=[redacted]",
-        try testString(try trace.nth("permission_grant", 2), "target"),
-    );
+    for (1..grants.len) |index| {
+        const grant = try trace.nth("permission_grant", index);
+        try std.testing.expectEqualStrings(grants[index].tool_name, try testString(grant, "tool"));
+        try std.testing.expectEqualStrings("[omitted]", try testString(grant, "target"));
+    }
 
     const context = try trace.one("runtime_context");
     try std.testing.expectEqual(@as(i64, 4), try testInt(context, "mcp_servers"));
