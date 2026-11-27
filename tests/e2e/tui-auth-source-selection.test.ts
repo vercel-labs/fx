@@ -18,7 +18,7 @@ import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { traceReportNames, waitForNewTraceReport } from "./trace-report";
-import { FX_BIN, REPO_ROOT, runFx, pinnedClientVersions } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, REPO_ROOT, runFx, pinnedClientVersions } from "../evals/eval-helpers";
 import { closeStatusPanel, panelAuth, readStatusPanel, waitForStatusPanel } from "./info-panel";
 import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER, turnSettled } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
@@ -948,7 +948,7 @@ async function runGrokLoginWithBrowser(
   env: Record<string, string | undefined>,
   authorizationCode?: string,
 ) {
-  const childEnv: NodeJS.ProcessEnv = { ...process.env };
+  const childEnv: NodeJS.ProcessEnv = fxChildEnv();
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) delete childEnv[key];
     else childEnv[key] = value;
@@ -1030,7 +1030,7 @@ async function completeDisplayedSubscriptionLogin(
 async function runCodexLoginWithBrowser(
   env: Record<string, string | undefined>,
 ) {
-  const childEnv: NodeJS.ProcessEnv = { ...process.env };
+  const childEnv: NodeJS.ProcessEnv = fxChildEnv();
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) delete childEnv[key];
     else childEnv[key] = value;
@@ -6673,7 +6673,7 @@ test("a Codex sign-out stays kept when fx is killed while OpenAI has not answere
   const working = startFakeChatGptOAuth();
   try {
     writeSeededChatGptLogin(home, silent.accessToken);
-    const childEnv: NodeJS.ProcessEnv = { ...process.env, FX_SOUND: "0" };
+    const childEnv: NodeJS.ProcessEnv = fxChildEnv({ FX_SOUND: "0" });
     for (const [key, value] of Object.entries(codexLogoutEnv(home, silent.env.FX_TEST_CHATGPT_REVOKE_URL))) {
       if (value === undefined) delete childEnv[key];
       else childEnv[key] = value;

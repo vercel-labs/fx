@@ -11,7 +11,7 @@
 import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { FX_BIN, REPO_ROOT, envWithoutFxHome } from "../evals/eval-helpers";
+import { FX_BIN, REPO_ROOT, fxChildEnv } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   TITLE_GENERATION_MARKER,
@@ -409,8 +409,8 @@ export type SharedAsk = {
 
 /**
  * Starts `fx ask --json --no-save` as process `label`, with the environment
- * runFx gives fx, and keeps the handle so a test can kill it. `bin` defaults
- * to this checkout's zig-out/bin/fx.
+ * `fxChildEnv` gives a test's fx, and keeps the handle so a test can kill it.
+ * `bin` defaults to this checkout's zig-out/bin/fx.
  */
 export function spawnSharedAsk(
   world: SharedLoginWorld,
@@ -420,14 +420,13 @@ export function spawnSharedAsk(
 ): SharedAsk {
   if (!existsSync(bin)) throw new Error(`fx binary not found at ${bin}. Run 'zig build' first.`);
   const env: Record<string, string> = {};
-  const merged = {
-    ...envWithoutFxHome(process.env),
+  const merged = fxChildEnv({
     NO_COLOR: "1",
     PATH: process.env.PATH ?? "",
     FX_SOUND: "0",
     ...world.env(),
     ...extraEnv,
-  };
+  });
   for (const [key, value] of Object.entries(merged)) if (value !== undefined) env[key] = value;
   const child = spawn(bin, ["ask", "--json", "--no-save", sharedAskPrompt(label)], {
     env,
