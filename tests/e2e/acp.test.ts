@@ -3056,6 +3056,7 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-continue-rerun-dropped-");
       const prompt = "ACP rerun-dropped prompt";
       const notice = "Resuming from unexpected session interruption.";
+      const tracePath = join(root.root, "trace.log");
       const gateway = startDynamicFakeGateway(async (body) => {
         if (body.includes(notice)) return finalText("ACP_RERUN_DROPPED_OK");
         if (body.includes(prompt)) return new Promise<Response>(() => {});
@@ -3077,7 +3078,14 @@ describe("acp: model-independent", () => {
         await exited;
         expect(proc.signalCode).toBe("SIGKILL");
 
-        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "session",
+          },
+        });
         await client.request("initialize", { protocolVersion: 1 }, 10);
         const loaded = await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 11) as any;
         expect(loaded.error).toBeUndefined();
@@ -3094,6 +3102,8 @@ describe("acp: model-independent", () => {
         const body = gateway.requests[1]!.body;
         expect(occurrenceCount(body, prompt)).toBe(1);
         expect(occurrenceCount(body, notice)).toBe(1);
+        const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+        expect(trace).toContain("event=acp_resume_rerun_ignored count=1 reason=native_log_has_no_journal");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
