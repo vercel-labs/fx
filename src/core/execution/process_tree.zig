@@ -101,10 +101,6 @@ pub const ActivitySample = struct {
 pub const ActivityGrowth = struct {
     cpu: bool = false,
     writes: bool = false,
-
-    pub fn any(self: ActivityGrowth) bool {
-        return self.cpu or self.writes;
-    }
 };
 
 pub fn compareActivity(previous: ActivitySample, current: ActivitySample) ActivityGrowth {

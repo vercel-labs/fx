@@ -64,10 +64,6 @@ fn noticeDue(quiet_ms: u64, limit_ms: u64) bool {
 pub const Activity = struct {
     cpu: bool = false,
     writes: bool = false,
-
-    pub fn any(self: Activity) bool {
-        return self.cpu or self.writes;
-    }
 };
 
 /// Short description placed after the quiet duration when the command's
