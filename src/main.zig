@@ -160,6 +160,7 @@ const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
 const js_host_model_catalog = @import("gateway/js_host_model_catalog.zig");
 const url_opener = @import("core/hosts/url_opener.zig");
 const event_loop = @import("ui/event_loop.zig");
+const loop_timeout = @import("ui/loop_timeout.zig");
 const footer_runtime = @import("ui/footer/runtime.zig");
 const question_ui = @import("ui/footer/question_ui.zig");
 const ui_input = @import("ui/input/runtime.zig");
@@ -206,9 +207,6 @@ const ResumeProjection = resume_projection.ResumeProjection;
 const RawEnviron = io_mod.RawEnviron;
 
 const footer_rows: u16 = 4;
-const active_poll_timeout_ms: i32 = 8;
-const focused_ui_worker_poll_timeout_ms: i32 = 1;
-const idle_wasm_poll_timeout_ms: i32 = 16;
 const resize_debounce_ms: i64 = 100;
 const max_transcript_bytes: usize = 256 * 1024;
 const default_max_agent_steps: usize = agent_steps.default_max_agent_steps;
@@ -220,32 +218,6 @@ const max_read_file_lines: usize = 400;
 const max_read_file_line_len: usize = 2000;
 const max_command_output_bytes: usize = 64 * 1024;
 const input_escape_timeout_ms: i64 = 30;
-
-/// The first frame counts as focused work: an idle wait before it would only
-/// delay the launch.
-fn nativeLoopPollTimeoutMs(
-    default_timeout_ms: i32,
-    first_frame_pending: bool,
-    auth_refresh_active: bool,
-    skills_refresh_active: bool,
-    transcript_page_work_active: bool,
-    file_listing_hold_pending: bool,
-    pending_input_restore_active: bool,
-    /// A time-bounded drain put events back: run the next iteration without
-    /// waiting for input.
-    next_iteration_due: bool,
-) i32 {
-    if (next_iteration_due) return 0;
-    return if (first_frame_pending or
-        auth_refresh_active or
-        skills_refresh_active or
-        transcript_page_work_active or
-        file_listing_hold_pending or
-        pending_input_restore_active)
-        @min(default_timeout_ms, focused_ui_worker_poll_timeout_ms)
-    else
-        default_timeout_ms;
-}
 
 const max_prompt_history: usize = 100;
 
@@ -1395,7 +1367,7 @@ const App = struct {
             const exit_cause = try event_loop.run(
                 self.terminal,
                 &self.should_exit,
-                active_poll_timeout_ms,
+                loop_timeout.active_ms,
                 callbacks,
             );
             switch (exit_cause) {
@@ -1408,18 +1380,65 @@ const App = struct {
     pub fn loopPollTimeoutMs(ctx: *anyopaque, default_timeout_ms: i32) i32 {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (comptime !host_target.is_wasm) {
-            return nativeLoopPollTimeoutMs(
-                default_timeout_ms,
-                self.shell.render_requests.hasReason(.first_frame),
-                self.auth.sourceInventoryRefreshActive(),
-                self.skills.refreshActive(),
-                self.fullTranscriptFocusedWorkActive(),
-                InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
-                self.pendingInputRestoreActive(),
-                self.takeDrainContinuationDue(),
-            );
+            return loop_timeout.timeoutMs(self.loopTimeoutFacts());
         }
-        return if (self.pacer.hasPending()) default_timeout_ms else idle_wasm_poll_timeout_ms;
+        return if (self.pacer.hasPending()) default_timeout_ms else loop_timeout.idle_wasm_ms;
+    }
+
+    fn loopTimeoutFacts(self: *App) loop_timeout.Facts {
+        return .{
+            .next_iteration_due = self.takeDrainContinuationDue(),
+            .first_frame_pending = self.shell.render_requests.hasReason(.first_frame),
+            .auth_refresh_active = self.auth.sourceInventoryRefreshActive(),
+            .skills_refresh_active = self.skills.refreshActive(),
+            .transcript_page_work_active = self.fullTranscriptFocusedWorkActive(),
+            .file_listing_hold_pending = InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
+            .pending_input_restore_active = self.pendingInputRestoreActive(),
+            .render_pending = self.shell.render_requests.hasPending(),
+            .animation_visible = self.shell.render_requests.animation_visible,
+            .pacer_pending = self.pacer.hasPending(),
+            .agent_active = self.anyAgentLoopActive(),
+            .input_pending = self.terminal_input_runtime.hasPendingTerminalInput() or
+                self.terminal_input_runtime.native_clear_probe.active() or
+                InputAppRuntime.terminalPasteActive(self),
+            .gesture_armed = self.anyInputGestureArmed(),
+            .resize_pending = resize_interlock.resizePending() or !shell_runtime.resizeLifecycleIdle(&self.shell),
+            .open_ui_waiting = self.openUiWaitingForBackground(),
+        };
+    }
+
+    fn anyAgentLoopActive(self: *App) bool {
+        if (AgentsAppRuntime.firstOpen(self) and agentLoopActive(&self.main_agent)) return true;
+        for (self.child_agents.items) |child| {
+            if (agentLoopActive(&child.agent)) return true;
+        }
+        return false;
+    }
+
+    fn agentLoopActive(agent: *agents.Agent) bool {
+        return agent.stream.active or agent.worker.isProcessing() or agent.worker.hasPendingEvents();
+    }
+
+    fn anyInputGestureArmed(self: *const App) bool {
+        const gestures = self.input_runtime.gestures;
+        return gestures.ctrlCExitArmed() or
+            gestures.escapeClearArmed() or
+            gestures.escapeInterruptArmed();
+    }
+
+    fn openUiWaitingForBackground(self: *App) bool {
+        const picker = &self.input_runtime.picker.file_completion;
+        const file_listing_in_flight = picker.active and !picker.indexed and picker.directory_request != null;
+        const model_loading = self.model_cache.menu.active and self.model_cache.isLoading();
+        const mcp_loading = self.mcp.host_menu.active and self.mcp.host_menu_tools == .loading;
+        const session_picker = &self.screenAgent().session_persistence.session_picker;
+        const session_loading = session_picker.isLoading() or
+            (session_picker.active and session_picker.loading_more);
+        return self.input_runtime.usage_menu.active or
+            file_listing_in_flight or
+            model_loading or
+            mcp_loading or
+            session_loading;
     }
 
     /// Whether any agent's budgeted drain put events back for the loop's next
@@ -4753,19 +4772,6 @@ test "process io connects through a reachable address while fx tasks hold every 
     }
 }
 
-test "focused UI workers retain a bounded native poll timeout" {
-    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, true, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, false, true, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true, false));
-    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false, true));
-    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true, true));
-}
-
 test "poll timeout is not 1 ms while only a held restore result waits" {
     const test_session_adapter = @import("core/session/session_adapter.zig");
     var tmp = std.testing.tmpDir(.{});
@@ -4800,6 +4806,35 @@ test "poll timeout is not 1 ms while only a held restore result waits" {
     // The background task finished and is waiting for handoff (`isActive()` is still true).
     try std.testing.expect(app.main_agent.session_persistence.pending_input_restore.isActive());
     try std.testing.expect(!app.pendingInputRestoreActive());
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
+}
+
+test "poll timeout stays active 8 ms while theme monitor buffers an escape byte" {
+    var app = App{ .alloc = std.testing.allocator };
+    defer app.lifecycle_runtime.deinit();
+
+    app.terminal_input_runtime.terminal_theme_monitor.start();
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
+
+    try std.testing.expectEqual(.pending, app.terminal_input_runtime.terminal_theme_monitor.feed(0x1b, 1_000));
+    try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
+}
+
+test "poll timeout stays active 8 ms while session picker loads" {
+    var app = App{ .alloc = std.testing.allocator };
+    defer app.lifecycle_runtime.deinit();
+
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
+
+    const picker = &app.screenAgent().session_persistence.session_picker;
+    picker.active = true;
+    picker.load_state = .loading;
+    try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
+
+    picker.load_state = .ready;
+    try std.testing.expectEqual(@as(i32, 250), App.loopPollTimeoutMs(&app, 8));
+
+    picker.loading_more = true;
     try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
 }
 
@@ -4955,6 +4990,7 @@ fn runAcpServer(_: ?*anyopaque, alloc: Allocator, cfg: acp_runner.Config) anyerr
 
 fn handleSigWinchNative(_: std.posix.SIG) callconv(.c) void {
     resize_interlock.noteResizeSignal();
+    shell_runtime.notifyResizeWakePipe();
 }
 
 fn handleSigWinchWeb() callconv(.c) void {
@@ -5773,6 +5809,8 @@ test {
     _ = @import("core/app/app_upgrade_runtime.zig");
     _ = @import("core/app/app_worker_runtime.zig");
     _ = @import("ui/event_loop.zig");
+    _ = @import("ui/loop_timeout.zig");
+    _ = @import("ui/terminal/theme_detection.zig");
     _ = @import("ui/resize_tests.zig");
     _ = @import("ui/transcript/transcript_window_fuzz.zig");
     _ = @import("ui/transcript/frozen_prefix_tests.zig");
