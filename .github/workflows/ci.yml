@@ -99,6 +99,9 @@ jobs:
       - name: Model-check CLI hang-up
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/cli_hangup/check.sh design-a design-b
 
+      - name: Model-check the terminal lifecycle
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/terminal/check.sh TerminalLifecycle
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
