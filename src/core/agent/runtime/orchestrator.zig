@@ -5019,7 +5019,7 @@ fn needsUserFailureKind(
     failure: agent_stream_provider.Failure,
     credential_source: ?types.CredentialSource,
 ) ?runtime_request_recovery.Failure.Kind {
-    // A cyber policy block is reported, never sent again.
+    // A cyber policy block resends up to the content-filter bound, never waits for the user.
     if (failure.kind == .cyber_policy) return null;
     if (failure.kind == .quota_exhausted or
         gateway_error_format.namesOutOfCredits(alloc, failure.detail orelse ""))
@@ -5539,8 +5539,26 @@ fn providerFailureReplaySafe(
         streamReplaySafe(stream_ctx);
 }
 
-fn routeFailureDetail(completion: types.ModelCompletion) []const u8 {
-    return if (completion.provider_failure_detail) |detail| debug_trace.preview(detail, 240) else "";
+fn routeFailureDetail(
+    arena: Allocator,
+    completion: types.ModelCompletion,
+    active_api_key: []const u8,
+) ![]const u8 {
+    const detail = completion.provider_failure_detail orelse return "";
+    const masked = try withoutCredential(arena, detail, active_api_key);
+    return debug_trace.preview(masked, 240);
+}
+
+test "routeFailureDetail masks the active credential before preview" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const key = "vck_secret_route_failure_key";
+    const prefix: [225]u8 = @splat('a');
+    const raw = try arena.print("{s} {s}", .{ prefix, key });
+    const preview = try routeFailureDetail(arena, .{ .provider_failure_detail = raw }, key);
+    try std.testing.expect(std.mem.find(u8, preview, key) == null);
+    try std.testing.expect(std.mem.find(u8, preview, "vck_") == null);
 }
 
 fn isTerminalProviderExecutedCompletion(completion: types.ModelCompletion) bool {
@@ -5901,6 +5919,30 @@ fn pushCyberPolicyStatus(
     });
 }
 
+fn pushTerminalCyberPolicy(
+    arena: Allocator,
+    deps: *const AgentRuntimeDeps,
+    request: *runtime_request_recovery.RequestRecovery,
+    raw_detail: []const u8,
+    active_api_key: []const u8,
+    prepare_diagnostic: bool,
+) !void {
+    const masked = try withoutCredential(arena, raw_detail, active_api_key);
+    const diagnostic = if (prepare_diagnostic)
+        try prepareExternalFailureDiagnostic(arena, masked, types.cyber_policy_code)
+    else
+        try safeFailureDiagnostic(arena, masked, types.cyber_policy_code);
+    try deps.push_system_notice(deps.ctx, try cyberPolicyNotice(arena, masked, diagnostic));
+    try pushCyberPolicyStatus(request, diagnostic);
+}
+
+fn traceContentFilterResend(step_ctx: TraceContext, attempt: usize, gateway_model: []const u8) void {
+    debug_trace.eventf("agent", "content_filter_resend", step_ctx, "attempt={d} model={s}", .{
+        attempt,
+        gateway_model,
+    });
+}
+
 /// The most a cyber policy notice shows of the provider's message. The
 /// gateway keeps up to 600 bytes of it, more than a diagnostic holds, and
 /// making it terminal-safe can make it longer.
@@ -6149,6 +6191,7 @@ fn providerCompletionDiagnostic(
 }
 
 fn traceRouteFailure(
+    arena: Allocator,
     step_ctx: TraceContext,
     selected_model: []const u8,
     route_model: []const u8,
@@ -6156,6 +6199,7 @@ fn traceRouteFailure(
     attempt: usize,
     completion: types.ModelCompletion,
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
+    active_api_key: []const u8,
     retry: bool,
 ) void {
     const reason = if (completion.finish_reason) |value|
@@ -6178,7 +6222,9 @@ fn traceRouteFailure(
             if (stream_ctx.saw_visible_text or completionContentBytes(completion) > 0) "true" else "false",
             if (stream_ctx.saw_tool_start) "true" else "false",
             if (retry) "true" else "false",
-            routeFailureDetail(completion),
+            // A trace line must never end the turn: when masking runs out of
+            // memory, the line leaves the provider detail out.
+            routeFailureDetail(arena, completion, active_api_key) catch "",
         },
     );
 }
@@ -9670,7 +9716,8 @@ fn processQueuedPromptLoop(
             // `assistant_prefill_recovery_used` caps this repair at one resend
             // per step; it does not go through the recovery module. A cyber
             // policy block is never repaired, whatever its text says.
-            const policy_blocked = if (response_failure) |failure| failure.kind == .cyber_policy else false;
+            const policy_blocked = (if (response_failure) |failure| failure.kind == .cyber_policy else false) or
+                (if (streamCompletionPtr(&stream_result)) |completion| completion.provider_failure_cause == .cyber_policy else false);
             const prefill_tool_name: ?[]const u8 = if (!assistant_prefill_recovery_used and
                 !policy_blocked and
                 streamReplaySafe(&stream_ctx))
@@ -9729,6 +9776,28 @@ fn processQueuedPromptLoop(
                         reset_stream_for_next_attempt = true;
                         continue;
                     }
+                }
+            };
+
+            if (response_failure) |failure| if (failure.kind == .cyber_policy and !config.cancel_flag.load(.seq_cst)) {
+                const resend_now = try request_recovery.failed(.{ .kind = .content_filter }) != null;
+                if (resend_now) {
+                    traceContentFilterResend(step_ctx, request_recovery.attempt(), gateway_model);
+                    const failure_tool_evidence = effectiveRecoveryToolEvidence(
+                        preserved_tool_evidence,
+                        response_completion,
+                        &stream_ctx,
+                    );
+                    preserved_tool_evidence = failure_tool_evidence;
+                    stream_result.deinit(arena);
+                    stream_result_set = false;
+                    recovery_strategy = resend_strategy.select(.possibly_sent, failure_tool_evidence);
+                    recovery_cause = .provider_unavailable;
+                    if (resendFollowsUnexecutedCalls(recovery_strategy)) {
+                        recovery_has_unexecuted_tool_start = true;
+                    }
+                    reset_stream_for_next_attempt = true;
+                    continue;
                 }
             };
 
@@ -9962,8 +10031,10 @@ fn processQueuedPromptLoop(
                 // does not resend keep their terminal path below.
                 const finish_reason = attempt_completion.finish_reason;
                 const failure_cause = attempt_completion.provider_failure_cause;
+                const stream_policy_blocked = attempt_disposition == .provider_failure and
+                    failure_cause == .cyber_policy;
                 const content_filtered = attempt_disposition == .provider_failure and
-                    finish_reason.? == .content_filter;
+                    (finish_reason.? == .content_filter or stream_policy_blocked);
                 const cause: types.ModelRecoveryCause = if (failure_cause == .gateway_stream_timeout)
                     .provider_stream_timeout
                 else if (failure_cause == .rate_limited)
@@ -9975,15 +10046,20 @@ fn processQueuedPromptLoop(
                 const diagnostic = try providerCompletionDiagnostic(
                     arena,
                     attempt_completion,
-                    if (content_filtered) "content_filter" else types.ModelFailureDiagnostic.defaultTextForCause(cause),
+                    if (stream_policy_blocked)
+                        types.cyber_policy_code
+                    else if (content_filtered)
+                        "content_filter"
+                    else
+                        types.ModelFailureDiagnostic.defaultTextForCause(cause),
                 );
                 attempt_failure_diagnostic = diagnostic;
                 // The module resends a content filter's block at once a few
-                // times. Then a host that can ask waits for the user, and
-                // elsewhere the turn ends as other non-retryable endings do.
+                // times. Then a host that can ask waits for the user unless the
+                // block is cyber_policy, which never waits and ends the turn.
                 const failure_kind: ?runtime_request_recovery.Failure.Kind = if (content_filtered)
                     .content_filter
-                else if (failure_cause == .non_retryable or failure_cause == .cyber_policy)
+                else if (failure_cause == .non_retryable)
                     null
                 else
                     runtime_request_recovery.failureKind(cause);
@@ -9998,6 +10074,7 @@ fn processQueuedPromptLoop(
                     !(content_filtered and retries))
                 {
                     traceRouteFailure(
+                        arena,
                         step_ctx,
                         job.model,
                         gateway_model,
@@ -10005,6 +10082,7 @@ fn processQueuedPromptLoop(
                         failed_attempt,
                         attempt_completion,
                         &stream_ctx,
+                        active_api_key,
                         retries,
                     );
                 }
@@ -10109,6 +10187,7 @@ fn processQueuedPromptLoop(
                     // every other failure here waits.
                     const resend_now = try request_recovery.failed(.{ .kind = failure_kind.? }) != null;
                     if (content_filtered) traceRouteFailure(
+                        arena,
                         step_ctx,
                         job.model,
                         gateway_model,
@@ -10116,19 +10195,17 @@ fn processQueuedPromptLoop(
                         failed_attempt,
                         attempt_completion,
                         &stream_ctx,
+                        active_api_key,
                         resend_now,
                     );
                     if (resend_now) {
-                        debug_trace.eventf("agent", "content_filter_resend", step_ctx, "attempt={d} model={s}", .{
-                            request_recovery.attempt(),
-                            gateway_model,
-                        });
+                        traceContentFilterResend(step_ctx, request_recovery.attempt(), gateway_model);
                     }
                     // Past its resends, the module needs the user. A host
-                    // that can ask waits for them below; on one that cannot,
-                    // the turn ends on the content-filter error further
-                    // down, as it did before the resends.
-                    if (content_filtered and !resend_now and !request_recovery.canAskUser()) break :retry;
+                    // that can ask waits for them below; on one that cannot
+                    // (or for cyber_policy, which never waits), the turn ends
+                    // further down.
+                    if (content_filtered and !resend_now and (stream_policy_blocked or !request_recovery.canAskUser())) break :retry;
                     if (resend_now or try request_recovery.waitForSend() != null) {
                         preserved_tool_evidence = failure_tool_evidence;
                         recovery_strategy = resend_strategy.select(.possibly_sent, failure_tool_evidence);
@@ -10186,10 +10263,14 @@ fn processQueuedPromptLoop(
                 const failure_cause = attempt_completion.provider_failure_cause;
                 if (failure_cause == .non_retryable or failure_cause == .cyber_policy) {
                     if (failure_cause == .cyber_policy) {
-                        const detail = try withoutCredential(arena, attempt_completion.provider_failure_detail orelse "", active_api_key);
-                        const cyber_diagnostic = try prepareExternalFailureDiagnostic(arena, detail, types.cyber_policy_code);
-                        try deps.push_system_notice(deps.ctx, try cyberPolicyNotice(arena, detail, cyber_diagnostic));
-                        try pushCyberPolicyStatus(&request_recovery, cyber_diagnostic);
+                        try pushTerminalCyberPolicy(
+                            arena,
+                            deps,
+                            &request_recovery,
+                            attempt_completion.provider_failure_detail orelse "",
+                            active_api_key,
+                            true,
+                        );
                     } else {
                         try deps.push_system_notice(deps.ctx, diagnostic.view());
                     }
@@ -10322,17 +10403,20 @@ fn processQueuedPromptLoop(
             // Every exit below returns normally, so the request reports its
             // end here rather than through the step's errdefer.
             request_recovery.endWithError();
-            if (!http_failure_notice_shown) {
-                const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
-                try deps.push_http_error(deps.ctx, failureStatus(failure), http_detail, job.credential_source);
-            }
             if (failure.kind == .cyber_policy) {
                 const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
                 const message = try gateway_error_format.formatHttpRecoveryDiagnostic(arena, failureStatus(failure), http_detail);
-                try pushCyberPolicyStatus(
+                try pushTerminalCyberPolicy(
+                    arena,
+                    deps,
                     &request_recovery,
-                    try safeFailureDiagnostic(arena, message, types.cyber_policy_code),
+                    message,
+                    active_api_key,
+                    false,
                 );
+            } else if (!http_failure_notice_shown) {
+                const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
+                try deps.push_http_error(deps.ctx, failureStatus(failure), http_detail, job.credential_source);
             }
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;

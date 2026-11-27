@@ -9305,6 +9305,79 @@ test "processQueuedPrompt resends a content-filtered request three times, then w
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
+test "processQueuedPrompt resends a cyber_policy block up to the content-filter bound then ends with cyber_policy status" {
+    const alloc = std.testing.allocator;
+    const stream_blocked: FakeCompletion = .{
+        .finish_reason = .provider_error,
+        .provider_failure_cause = .cyber_policy,
+        .provider_failure_detail = "cyber_policy: This content was flagged for possible cybersecurity risk.",
+    };
+    const stream_completions = [_]FakeCompletion{ stream_blocked, stream_blocked, stream_blocked, stream_blocked };
+    var stream_gateway = FakeGateway.init(alloc, &stream_completions);
+    defer stream_gateway.deinit();
+    var stream_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer stream_hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try std.testing.expectError(
+        error.ModelError,
+        runFakePrompt(&stream_gateway, &stream_hooks, fixture.config(), fixture.job()),
+    );
+    try std.testing.expectEqual(@as(usize, 4), stream_gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 1), stream_hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(u8, stream_hooks.system_notices.items[0], "Blocked by the provider's cyber policy") != null);
+    const stream_statuses = stream_hooks.route_recovery_statuses.items;
+    try std.testing.expectEqual(@as(usize, 4), stream_statuses.len);
+    try expectModuleStatus(&stream_hooks, 0, .retrying, "Blocked by the content filter · retrying (1/3)");
+    try expectModuleStatus(&stream_hooks, 1, .retrying, "Blocked by the content filter · retrying (2/3)");
+    try expectModuleStatus(&stream_hooks, 2, .retrying, "Blocked by the content filter · retrying (3/3)");
+    try expectRouteStatus(
+        &stream_hooks,
+        stream_statuses.len - 1,
+        .cyber_policy,
+        "⚠ Blocked by the provider's cyber policy · cyber_policy: This content was flagged for possible cybersecurity risk.",
+    );
+
+    const http_blocked: FakeCompletion = .{
+        .status = .bad_request,
+        .err_body = "{\"error\":{\"code\":\"cyber_policy\",\"message\":\"This content was flagged for possible cybersecurity risk.\"}}",
+    };
+    const http_completions = [_]FakeCompletion{ http_blocked, http_blocked, http_blocked, http_blocked };
+    var http_gateway = FakeGateway.init(alloc, &http_completions);
+    defer http_gateway.deinit();
+    var http_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer http_hooks.deinit();
+
+    try runFakePrompt(&http_gateway, &http_hooks, fixture.config(), fixture.job());
+    try std.testing.expectEqual(@as(usize, 4), http_gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 1), http_hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(u8, http_hooks.system_notices.items[0], "Blocked by the provider's cyber policy") != null);
+    try std.testing.expectEqual(@as(usize, 0), httpErrorCount(&http_hooks));
+    const http_statuses = http_hooks.route_recovery_statuses.items;
+    try std.testing.expectEqual(@as(usize, 5), http_statuses.len);
+    try expectModuleStatus(&http_hooks, 0, .retrying, "Blocked by the content filter · retrying (1/3)");
+    try expectModuleStatus(&http_hooks, 1, .retrying, "Blocked by the content filter · retrying (2/3)");
+    try expectModuleStatus(&http_hooks, 2, .retrying, "Blocked by the content filter · retrying (3/3)");
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.failed, http_statuses[http_statuses.len - 2].kind);
+    try expectRouteStatus(
+        &http_hooks,
+        http_statuses.len - 1,
+        .cyber_policy,
+        "⚠ Blocked by the provider's cyber policy · HTTP 400 · cyber_policy: This content was flagged for possible cybersecurity risk.",
+    );
+
+    const recover_completions = [_]FakeCompletion{ stream_blocked, .{ .content = "allowed after resend" } };
+    var recover_gateway = FakeGateway.init(alloc, &recover_completions);
+    defer recover_gateway.deinit();
+    var recover_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer recover_hooks.deinit();
+
+    try runFakePrompt(&recover_gateway, &recover_hooks, fixture.config(), fixture.job());
+    try std.testing.expectEqual(@as(usize, 2), recover_gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 0), recover_hooks.system_notices.items.len);
+    try expectRecovered(&recover_hooks, 2);
+}
+
 test "processQueuedPrompt waits for the user after a rejected request and resends on Enter" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{

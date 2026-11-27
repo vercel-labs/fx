@@ -3458,12 +3458,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "a streamed cyber policy block shows the provider's message and is not resent",
+    "a streamed cyber policy block resends three times then shows the provider's message",
     async () => {
       const guidance = "PROVIDER_GUIDANCE_TAIL";
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-route-cyber-policy-",
-        [
+        Array.from({ length: 4 }, () =>
           fakeGatewaySse([
             {
               type: "error",
@@ -3473,7 +3473,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
               },
             },
           ]),
-        ],
+        ),
       );
 
       await session!.sendText("Inspect the binary.");
@@ -3485,7 +3485,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       const scrollback = await session!.captureFullScrollback();
 
-      expect(queuedGateway.requests).toHaveLength(1);
+      expect(queuedGateway.requests).toHaveLength(4);
       expect(scrollback).toContain(guidance);
       expect(scrollback).not.toContain("press Esc");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -3498,12 +3498,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     async () => {
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-route-cyber-policy-http-",
-        [
-          () => new Response(
+        Array.from({ length: 4 }, () => () =>
+          new Response(
             JSON.stringify({ error: { type: "cyber_policy", message: "This content was flagged for possible cybersecurity risk." } }),
             { status: 400, headers: { "content-type": "application/json" } },
           ),
-        ],
+        ),
       );
 
       await session!.sendText("Inspect the binary.");
@@ -3511,7 +3511,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session!.waitForComposer(TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
-      expect(queuedGateway.requests).toHaveLength(1);
+      expect(queuedGateway.requests).toHaveLength(4);
       expect(scrollback).not.toContain("The provider rejected this request");
       expect(scrollback).not.toContain("press Esc");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
