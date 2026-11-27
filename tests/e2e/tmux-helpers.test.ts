@@ -617,6 +617,43 @@ tmuxTest("pane environment does not poison a shared tmux server", async () => {
   }
 });
 
+tmuxTest("waitForReplyAndTurnEnd waits for the turn's end, not only the reply's text", async () => {
+  const root = mkdtempSync(join(tmpdir(), "fx-tmux-reply-turn-end-"));
+  const releasePath = join(root, "release");
+  const scriptPath = join(root, "pane.sh");
+  writeFileSync(scriptPath, [
+    "printf 'REPLY_TEXT_DONE\\nGenerating (1s)\\n'",
+    `while [ ! -e '${releasePath}' ]; do sleep 0.05; done`,
+    "clear",
+    "printf 'REPLY_TEXT_DONE\\n'",
+    "sleep 60",
+    "",
+  ].join("\n"));
+  let session: TmuxSession | undefined;
+  try {
+    session = await TmuxSession.create({ cmd: `/bin/sh ${scriptPath}`, startupWaitMs: 0 });
+    let settledPane: string | undefined;
+    const settled = session.waitForReplyAndTurnEnd("REPLY_TEXT_DONE", 10_000).then((pane) => {
+      settledPane = pane;
+    });
+    await session.waitForPane(
+      (pane) => pane.includes("REPLY_TEXT_DONE") && pane.includes("Generating ("),
+      10_000,
+    );
+    // The helper polls every 25 ms, so a check of the text alone would return in this window.
+    await Bun.sleep(300);
+    expect(settledPane).toBeUndefined();
+
+    writeFileSync(releasePath, "");
+    await settled;
+    expect(settledPane).toContain("REPLY_TEXT_DONE");
+    expect(settledPane).not.toContain("Generating (");
+  } finally {
+    await session?.kill();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 tmuxTest("minimum history lines survive a fresh tmux server restart", async () => {
   const socketName = `fx-history-limit-${process.pid}-${Date.now()}`;
   let first: TmuxSession | undefined;

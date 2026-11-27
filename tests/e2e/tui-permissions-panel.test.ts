@@ -20,7 +20,7 @@ import {
   type PanelReport,
 } from "./info-panel";
 import { Profile } from "./shell-sessions";
-import { fakeGatewayFinalText, fakeGatewayToolCall, tmuxAvailable, turnSettled } from "./tmux-helpers";
+import { fakeGatewayFinalText, fakeGatewayToolCall, tmuxAvailable } from "./tmux-helpers";
 import { assertSingleFooter } from "./tui-render-assertions";
 
 const TIMEOUT = 120_000;
@@ -132,7 +132,7 @@ scenario("a session grant an approval adds while the panel is open shows when th
   release();
   await shell.session.waitForText("Apply + allow workspace file access for this session", STEP);
   await shell.session.sendKeys("2");
-  await shell.session.waitForPane((pane) => pane.includes("WROTE_NOTE") && turnSettled(pane), STEP);
+  await shell.session.waitForReplyAndTurnEnd("WROTE_NOTE", STEP);
   await waitForPanel(shell.session, "Permissions", STEP, (panel) => panel.fields["Session grants"] !== "none");
   await closePanel(shell.session, "Permissions", STEP);
   await shell.session.sendKeys("C-u");

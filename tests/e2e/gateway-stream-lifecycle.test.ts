@@ -344,7 +344,7 @@ test("the user talks to the parent while its subagent works, and a stop ends the
     await tui.waitForStableComposer(15000);
     await tui.sendText("STEERING_START");
     // The parent's turn ends with the receipt while its subagent works.
-    await tui.waitForPane((pane) => pane.includes("START_SENT") && turnSettled(pane), 10000);
+    await tui.waitForReplyAndTurnEnd("START_SENT", 10000);
     await tui.waitForPane(() => childRequests === 1, 10000);
     await tui.waitForPane(() => work().spawns === 1, 10000);
     const original = work();
@@ -352,17 +352,17 @@ test("the user talks to the parent while its subagent works, and a stop ends the
 
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_FIRST");
-    await tui.waitForPane((pane) => pane.includes("FIRST_ACCEPTED") && turnSettled(pane), 10000);
+    await tui.waitForReplyAndTurnEnd("FIRST_ACCEPTED", 10000);
     // Still the one piece of work, still running.
     expect(work()).toEqual(original);
 
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_STOP");
-    await tui.waitForPane((pane) => pane.includes("STOP_DONE") && turnSettled(pane), 10000);
+    await tui.waitForReplyAndTurnEnd("STOP_DONE", 10000);
     await tui.waitForPane(() => work().outcome === "cancelled", 10000);
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_LATER");
-    await tui.waitForPane((pane) => pane.includes("LATER_OK") && turnSettled(pane), 10000);
+    await tui.waitForReplyAndTurnEnd("LATER_OK", 10000);
     expect(childRequests).toBe(1);
     // A stop is answered by the stop call, never by a report.
     expect(reportTurns).toBe(0);
@@ -1590,7 +1590,7 @@ describe("gateway stream lifecycle", () => {
       });
       await session.waitForStableComposer(15_000);
       await session.sendText("!echo bang-routing-probe");
-      await session.waitForPane((pane) => pane.includes("BANG_PROMPT_ROUTED") && turnSettled(pane), 15_000);
+      await session.waitForReplyAndTurnEnd("BANG_PROMPT_ROUTED", 15_000);
       expect(gateway.requests).toHaveLength(1);
       await session.sendText("/quit");
       await session.waitForPane(() => session!.paneStatus().dead, 10_000);
@@ -2652,10 +2652,7 @@ describe("gateway stream lifecycle", () => {
         await tui.sendText("verify the bounded project context");
         let compact: string;
         try {
-          compact = await tui.waitForPane(
-            (text) => text.includes("CONTEXT_LIMIT_FIRST_COMPLETE") && turnSettled(text),
-            30_000,
-          );
+          compact = await tui.waitForReplyAndTurnEnd("CONTEXT_LIMIT_FIRST_COMPLETE", 30_000);
         } catch (error) {
           throw new Error(
             `${error}\nstderr:\n${readFileSync(stderrPath, "utf8")}\ntrace:\n${readFileSync(tracePath, "utf8").slice(-12_000)}\nscrollback:\n${await tui.captureFullScrollback()}`,
@@ -2702,7 +2699,7 @@ describe("gateway stream lifecycle", () => {
         expect(restored).not.toContain("toolbox menu shortened");
 
         await tui.sendText("verify the bounded project context again");
-        await tui.waitForPane((text) => text.includes("CONTEXT_LIMIT_SECOND_COMPLETE") && turnSettled(text), 30_000);
+        await tui.waitForReplyAndTurnEnd("CONTEXT_LIMIT_SECOND_COMPLETE", 30_000);
         expect(gateway.requestCount()).toBe(2);
         await tui.resizeWindow(119, 32);
         await tui.resizeWindow(123, 34);
@@ -2818,10 +2815,7 @@ describe("gateway stream lifecycle", () => {
         });
         await tui.waitForComposer(15_000);
         await tui.sendText("inspect the deeply scoped target");
-        const compact = await tui.waitForPane(
-          (text) => text.includes("PROJECT_OMISSION_TUI_COMPLETE") && turnSettled(text),
-          30_000,
-        );
+        const compact = await tui.waitForReplyAndTurnEnd("PROJECT_OMISSION_TUI_COMPLETE", 30_000);
         const compactScrollback = await tui.captureFullScrollback();
         expect(compact).not.toContain("reason=oversized rule file");
         expect(compact).not.toContain("reason=selection cap");
@@ -2908,10 +2902,7 @@ describe("gateway stream lifecycle", () => {
         await tui.waitForComposer(15_000);
         await waitForMcpServerReady(tui, "fixture", mcp);
         await tui.sendText("Load the bounded skill and select the MCP tool.");
-        const compact = await tui.waitForPane(
-          (text) => text.includes("TOOL_TIME_CONTEXT_COMPLETE") && turnSettled(text),
-          30_000,
-        );
+        const compact = await tui.waitForReplyAndTurnEnd("TOOL_TIME_CONTEXT_COMPLETE", 30_000);
         const compactScrollback = await tui.captureFullScrollback();
         expect(compact).not.toContain("skill resource");
         expect(compact).not.toContain("MCP schema");
@@ -3682,7 +3673,7 @@ describe("gateway stream lifecycle", () => {
             releaseFinish();
           } else {
             releaseFinish();
-            await tui.waitForPane((pane) => pane.includes("HELD_SKILL_RESOURCE_COMPLETE") && turnSettled(pane), 15_000);
+            await tui.waitForReplyAndTurnEnd("HELD_SKILL_RESOURCE_COMPLETE", 15_000);
             await tui.waitForStableComposer(10_000);
             const completed = await tui.captureFullScrollback();
             expect(completed).toContain(`Read skill resource ${resource}`);
@@ -3691,7 +3682,7 @@ describe("gateway stream lifecycle", () => {
             expect(gateway.requestCount()).toBe(heldRequestCount + 1);
           }
           await tui.sendText("Confirm later input still works.");
-          await tui.waitForPane((pane) => pane.includes("HELD_SKILL_LATER_INPUT_OK") && turnSettled(pane), 15_000);
+          await tui.waitForReplyAndTurnEnd("HELD_SKILL_LATER_INPUT_OK", 15_000);
           await tui.waitForStableComposer(10_000);
           expect(gateway.requestCount()).toBe(heldRequestCount + (scenario.cancel ? 1 : 2));
           const scrollback = await tui.captureFullScrollback();
@@ -9350,7 +9341,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         });
         await tui.waitForComposer(15_000);
         await tui.sendText("FIRST_PROMPT_COMPACTION_SENTINEL");
-        await tui.waitForPane((pane) => pane.includes("FIRST_REPLY_COMPACTION_SENTINEL") && turnSettled(pane), 15_000);
+        await tui.waitForReplyAndTurnEnd("FIRST_REPLY_COMPACTION_SENTINEL", 15_000);
         await tui.sendText("SECOND_PROMPT_COMPACTION_SENTINEL");
         await tui.waitForPane(
           (pane) =>
@@ -11064,7 +11055,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(existsSync(join(target, "match.txt"))).toBe(true);
       renameSync(target, join(root.workspace, "moved-target"));
       await session.sendKeys("Enter");
-      await session.waitForPane((pane) => pane.includes("APPROVAL_RECOVERY_COMPLETE") && turnSettled(pane), 15_000);
+      await session.waitForReplyAndTurnEnd("APPROVAL_RECOVERY_COMPLETE", 15_000);
       await session.waitForStableComposer(15_000);
       expect(childRequests).toBe(3);
       const lines = readFileSync(trace, "utf8").split("\n").filter(line => line.includes("call_id=approval-search "));
@@ -13419,7 +13410,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       child.release("CHILD_REPORT_TEXT");
       await tui.waitForPane(() => /event=mail_posted .*mail=report delivery=joined/.test(trace()), 10000);
       parentHold.release!();
-      await tui.waitForPane((pane) => pane.includes("EMPTY_REPORT_ALL_DONE") && turnSettled(pane), 10000);
+      await tui.waitForReplyAndTurnEnd("EMPTY_REPORT_ALL_DONE", 10000);
 
       expect(childRequests).toBe(1);
       expect(parentBodies).toHaveLength(3);
@@ -13542,7 +13533,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         10000,
       );
       writeFileSync(paths.release, "");
-      await tui.waitForPane((pane) => pane.includes("EMPTY_HANDOFF_ALL_DONE") && turnSettled(pane), 10000);
+      await tui.waitForReplyAndTurnEnd("EMPTY_HANDOFF_ALL_DONE", 10000);
 
       expect(childRequests()).toBe(1);
       // The report takes the nudge's place, as one that waited in the
@@ -13592,7 +13583,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         10000,
       );
       writeFileSync(paths.release, "");
-      await tui.waitForPane((pane) => pane.includes("EMPTY_MESSAGE_ALL_DONE") && turnSettled(pane), 10000);
+      await tui.waitForReplyAndTurnEnd("EMPTY_MESSAGE_ALL_DONE", 10000);
 
       const next = parentBodies[2]!;
       expect(next).toContain("CHILD_MESSAGE_TEXT");
@@ -13684,7 +13675,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       secondHold.release!();
       await tui.waitForText("Continue with a follow-up prompt if needed.", 10000);
       writeFileSync(paths.release, "");
-      await tui.waitForPane((pane) => pane.includes("EMPTY_SECOND_REPORT_DONE") && turnSettled(pane), 10000);
+      await tui.waitForReplyAndTurnEnd("EMPTY_SECOND_REPORT_DONE", 10000);
 
       expect(parentBodies).toHaveLength(4);
       expect(parentBodies[3]).toContain("CHILD_REPORT_TEXT");
@@ -13713,7 +13704,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       tui = await startHandoffTui(root, gateway, paths);
       await tui.waitForStableComposer(15000);
       await tui.sendText("EMPTY_PLAIN_START");
-      await tui.waitForPane((pane) => pane.includes("EMPTY_PLAIN_ALL_DONE") && turnSettled(pane), 10000);
+      await tui.waitForReplyAndTurnEnd("EMPTY_PLAIN_ALL_DONE", 10000);
 
       expect(parentBodies).toHaveLength(2);
       expect(parentBodies[1]).toContain(EMPTY_REPLY_NUDGE);

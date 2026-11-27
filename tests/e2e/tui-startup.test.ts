@@ -20,7 +20,6 @@ import {
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
-  turnSettled,
 } from "./tmux-helpers";
 import { ignoresFileModes } from "./file-modes";
 
@@ -416,7 +415,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         });
         await session.waitForComposer(10_000);
         await session.sendText("first fixture prompt");
-        await session.waitForPane((pane) => pane.includes("FIXTURE_REPLY_OK") && turnSettled(pane), 10_000);
+        await session.waitForReplyAndTurnEnd("FIXTURE_REPLY_OK", 10_000);
         await session.sendText("/new");
         await session.waitForPane((pane) => pane.includes(banner) && hasEmptyComposer(pane), 10_000);
         const history = await session.captureFullScrollback();

@@ -24,7 +24,6 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
-  turnSettled,
 } from "./tmux-helpers";
 import { ignoresFileModes } from "./file-modes";
 import { copyV1Fixture, savedSession, savedSessionIds, savedText, savedToolResults, sessionDir, storeRoot, withoutConversionNotice } from "./saved-sessions";
@@ -1015,7 +1014,7 @@ describe("session recovery", () => {
       await tui.waitForComposer(TIMEOUT);
       await tui.waitForText("CONV_FIRST_ANSWER", TIMEOUT);
       await tui.sendText("Continue the same conversation.");
-      await tui.waitForPane((pane) => pane.includes("CONTINUE_DISCOVERY_OK") && turnSettled(pane), TIMEOUT);
+      await tui.waitForReplyAndTurnEnd("CONTINUE_DISCOVERY_OK", TIMEOUT);
       await tui.waitForComposer(TIMEOUT);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(TIMEOUT)).toBe(true);

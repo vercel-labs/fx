@@ -22,7 +22,6 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
-  turnSettled,
 } from "./tmux-helpers";
 import { holdChildAnswer } from "./saved-sessions";
 
@@ -1113,7 +1112,7 @@ describe("ultrafast fake Gateway", () => {
           await session.sendKeys("Escape");
           await session.waitForPane((pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"), TIMEOUT);
           await session.sendText("Return the Settings disabled marker.");
-          await session.waitForPane((pane) => pane.includes("Settings disabled Ultra") && turnSettled(pane), TIMEOUT);
+          await session.waitForReplyAndTurnEnd("Settings disabled Ultra", TIMEOUT);
           const settled = await session.waitForStableComposer(TIMEOUT);
           expect(settled).not.toContain("⚡︎");
           expect(await session.captureFullScrollback()).toContain("Settings disabled Ultra");
@@ -1178,7 +1177,7 @@ describe("ultrafast fake Gateway", () => {
             .toMatchObject({ ultrafast_mode: true, models: { gateway: ULTRA_MODEL }, effort: "xhigh" });
           expect(gateway.requests).toEqual([]);
           await session.sendText("Return the model picker marker.");
-          await session.waitForPane((pane) => pane.includes("marker selection response") && turnSettled(pane), TIMEOUT);
+          await session.waitForReplyAndTurnEnd("marker selection response", TIMEOUT);
           expect(gateway.requests).toHaveLength(1);
           expectUltrafastRequest(gateway.requests[0]!.body);
           await session.sendText("/ultrafast off");
@@ -1310,7 +1309,7 @@ describe("ultrafast fake Gateway", () => {
           await session.waitForComposer(TIMEOUT);
           await waitForGatewayModelCatalog(gateway);
           await session.sendText("Return the downgrade sentinel.");
-          await session.waitForPane((pane) => pane.includes("downgraded answer") && turnSettled(pane), TIMEOUT);
+          await session.waitForReplyAndTurnEnd("downgraded answer", TIMEOUT);
           const scrollback = normalizeTerminalWhitespace(
             await session.captureFullScrollback(),
           );

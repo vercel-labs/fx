@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
 import { logLines, onlySessionId } from "./saved-sessions";
-import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable, turnSettled } from "./tmux-helpers";
+import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 // `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
@@ -804,7 +804,7 @@ describe("/mcp in the shell", () => {
     expect((await mcp(root, "add", "outside", "--", process.execPath, MODERN_FIXTURE)).code).toBe(0);
     // The next prompt loads it first, so its own request tells the model.
     await tui.sendText("first prompt");
-    await tui.waitForPane((pane) => pane.includes("first done") && turnSettled(pane), 15_000);
+    await tui.waitForReplyAndTurnEnd("first done", 15_000);
     expect(gateway.requests).toHaveLength(1);
     const firstMenu = menu(gateway.requests[0]!.body);
     expect(firstMenu).toContain("- fixture");
@@ -933,7 +933,7 @@ describe("/mcp in the shell", () => {
         await Bun.sleep(50);
       }
       held.release("first done");
-      await tui.waitForPane((pane) => pane.includes("second done") && turnSettled(pane), 15_000);
+      await tui.waitForReplyAndTurnEnd("second done", 15_000);
       // The next prompt, sent with no turn running, loads the change.
       await tui.sendText("third prompt");
       await tui.waitForText("third done", 15_000);

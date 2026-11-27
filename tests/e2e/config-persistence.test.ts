@@ -1543,7 +1543,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(stored.fast_mode_model_bound).toBe(true);
 
         await session.sendText("Use portable auto.");
-        await session.waitForPane((pane) => pane.includes("portable auto complete") && turnSettled(pane), TIMEOUT);
+        await session.waitForReplyAndTurnEnd("portable auto complete", TIMEOUT);
         const footer = await session.waitForText("0k/750k 0%", TIMEOUT);
         expect(footer).toContain("new-reasoning-model");
         expect(footer).not.toMatch(/[*✓!✗⊘i] context:/);

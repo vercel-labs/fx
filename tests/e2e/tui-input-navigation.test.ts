@@ -20,7 +20,6 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
-  turnSettled,
 } from "./tmux-helpers";
 import {
   assertPaneContains,
@@ -237,12 +236,12 @@ async function expectOptionColumn(
 
 async function setupPromptHistory(active: TmuxSession): Promise<void> {
   await active.sendText("zz-history");
-  await active.waitForPane((pane) => pane.includes("history prompt complete") && turnSettled(pane), READY_TIMEOUT);
+  await active.waitForReplyAndTurnEnd("history prompt complete", READY_TIMEOUT);
 }
 
 async function setupMultilinePromptHistory(active: TmuxSession): Promise<void> {
   await active.sendText("older");
-  await active.waitForPane((pane) => pane.includes("history prompt complete") && turnSettled(pane), READY_TIMEOUT);
+  await active.waitForReplyAndTurnEnd("history prompt complete", READY_TIMEOUT);
   await typeLiteral(active, "newer top");
   await active.sendKeys("M-Enter");
   await typeLiteral(active, "newer bottom");
@@ -994,7 +993,7 @@ tmuxTest(
   async () => {
     const active = await startFx(80, 24, true, false, 1);
     await active.sendText("hello");
-    await active.waitForPane((pane) => pane.includes("history prompt complete") && turnSettled(pane), READY_TIMEOUT);
+    await active.waitForReplyAndTurnEnd("history prompt complete", READY_TIMEOUT);
     // A model call's line: its time, the model, then tokens and the gen ID.
     const callLine = /^  \d{2}:\d{2}:\d{2} · gpt-5 · .*in 3 · out 5 · /m;
 
@@ -1532,7 +1531,7 @@ tmuxTest(
     await active.waitForPane((pane) => pane.includes("[Image 1]"), READY_TIMEOUT);
     await typeLiteral(active, " first turn");
     await active.sendKeys("Enter");
-    await active.waitForPane((pane) => pane.includes("turn 1 complete") && turnSettled(pane), READY_TIMEOUT);
+    await active.waitForReplyAndTurnEnd("turn 1 complete", READY_TIMEOUT);
 
     await typeLiteral(active, `/image ${second}`);
     await active.sendKeys("Enter");
