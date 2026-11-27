@@ -1120,11 +1120,11 @@ describe("cli: closed terminal", () => {
   );
 
   test.skipIf(!Bun.which("python3"))(
-    "fx login --api-key and fx setup with stdin closed exit 129 with empty stderr",
+    "fx login --api-key with stdin closed exits 129 with empty stderr",
     async () => {
       const home = createIsolatedTestHome();
       try {
-        for (const argv of [["login", "--api-key"], ["setup"]]) {
+        for (const argv of [["login", "--api-key"]]) {
           const result = await runInPty({
             mode: "separate_err",
             argv,

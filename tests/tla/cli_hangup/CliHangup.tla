@@ -3,7 +3,7 @@
 (* CLI command terminal hang-up vs real I/O error classification.          *)
 (*                                                                         *)
 (* Models CLI commands (`fx ask`, `fx replay`, `fx status`, `fx login`,    *)
-(* `fx setup`, `fx teams`) across:                                         *)
+(* `fx teams`) across:                                                     *)
 (*   - `design-a`: classify at every read/write boundary via shared        *)
 (*     `terminalGone`, propagate `TerminalHungUp` through subcommand       *)
 (*     catch blocks, and exit quietly with 129 (`128 + SIGHUP`) at         *)
@@ -21,7 +21,7 @@ VARIABLES termState,     \* "open" | "hung_up"
           phase,         \* "write_io" | "stdin_prompt" | "subcmd_catch" | "exit_handler" | "done"
           errKind,       \* "none" | "eio_tty" | "eof_hup" | "eio_file" | "TerminalHungUp" | "OutputWriteFailed" | "SwallowedMsg"
           errOnOpenTerm, \* BOOLEAN
-          hasCatch,      \* BOOLEAN: command runs inside a subcommand catch block (setup, teams, ask --json)
+          hasCatch,      \* BOOLEAN: command runs inside a subcommand catch block (teams, ask --json)
           outcome,       \* "running" | "quiet_129" | "error_1" | "hung"
           msgPrinted     \* "none" | "disk" | "write_failed" | "swallowed" | "file_err"
 
