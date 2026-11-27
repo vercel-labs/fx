@@ -203,6 +203,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    benchmark_exports_mod.addImport("build_options", build_options.createModule());
     const file_index_bench = b.addExecutable(.{
         .name = "file-index-bench",
         .root_module = b.createModule(.{
@@ -392,8 +393,10 @@ fn addWasmArtifact(
     wasm_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     wasm_options.addOption(WasmSurface, "wasm_surface", surface);
     wasm_options.addOption(bool, "libfx", true);
-    // A wasm host installs the environment, so `FX_TRACE*` can turn tracing on.
-    wasm_options.addOption(bool, "trace_log", true);
+    // The core surface starts with `minimal_kernel`, which never reads
+    // `FX_TRACE*`; only the term surface runs the full app, and the SDK tests
+    // turn tracing on there through `env:`.
+    wasm_options.addOption(bool, "trace_log", surface == .term);
     wasm_options.addOption(bool, "builtin_tools", true);
 
     const wasm_root = switch (surface) {
@@ -441,8 +444,9 @@ fn addNapiArtifact(
     napi_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     napi_options.addOption(NapiSurface, "napi_surface", surface);
     napi_options.addOption(bool, "libfx", true);
-    // The addon never installs an environment, so `FX_TRACE*` cannot reach it
-    // (`sdk/tests/test-native-core-misuse.mjs` holds that), and the trace log
+    // The addon starts with `minimal_kernel`, so startup never calls
+    // `configureFromEnv` and nothing sets a log file
+    // (`sdk/tests/test-native-core-misuse.mjs` holds that). The trace log
     // would only add its formatting at every call site.
     napi_options.addOption(bool, "trace_log", false);
     // libfx agents run only the host's tools, so the addon leaves fx's out.
