@@ -317,6 +317,7 @@ const FakeStream = struct {
     saw_expected_model_only: bool = true,
     saw_required_tool_payload: bool = true,
     saw_read_tool: bool = false,
+    first_offers_decision: bool = false,
     deadlines: [2]?std.Io.Clock.Timestamp = .{ null, null },
 
     fn execute(
@@ -339,6 +340,7 @@ const FakeStream = struct {
         self.saw_required_tool_payload = self.saw_required_tool_payload and
             std.mem.find(u8, payload, "permission_decision") != null;
         self.saw_read_tool = self.saw_read_tool or std.mem.find(u8, payload, "\"name\":\"read_prior_result\"") != null;
+        if (self.calls == 0) self.first_offers_decision = std.mem.find(u8, payload, "\"name\":\"permission_decision\"") != null;
         const outcome = self.outcomes[@min(self.calls, self.outcomes.len - 1)];
         self.calls += 1;
         return switch (outcome) {
@@ -481,11 +483,13 @@ test "gateway review offers the read tool only when the review has stored answer
     var held = try reviewGatewayConfig(testConfig(&fake, &cancel), std.testing.allocator, with_answers, reviewer_model);
     defer held.deinit(std.testing.allocator);
     try std.testing.expect(fake.saw_read_tool);
+    try std.testing.expect(!fake.first_offers_decision);
 
     var plain = FakeStream{ .outcomes = &.{.valid} };
     var cleared = try reviewGatewayConfig(testConfig(&plain, &cancel), std.testing.allocator, testRequest(), reviewer_model);
     defer cleared.deinit(std.testing.allocator);
     try std.testing.expect(!plain.saw_read_tool);
+    try std.testing.expect(plain.first_offers_decision);
 }
 
 test "gateway review asks GPT-5.6 and later to skip cache writes" {

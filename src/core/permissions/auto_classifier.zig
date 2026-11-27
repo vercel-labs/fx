@@ -561,10 +561,13 @@ pub const Reviewer = struct {
         }
         checkBudget(deadline, cancel_flag) catch |err| return constructionFailure(err);
         const can_read = self.reads_stored_results and request.stored_results != null and hasStoredAnswers(request);
-        const tools_json = toolsJsonAlloc(alloc, can_read) catch |err| return constructionFailure(err);
+        const first_offer = firstToolOffer(alloc, request, can_read) catch |err| return constructionFailure(err);
+        const tools_json = toolsJsonAlloc(alloc, first_offer) catch |err| return constructionFailure(err);
         defer alloc.free(tools_json);
-        const decision_tools_json = if (can_read) toolsJsonAlloc(alloc, false) catch |err| return constructionFailure(err) else tools_json;
-        defer if (can_read) alloc.free(decision_tools_json);
+        const read_tools_json = toolsJsonAlloc(alloc, .read_only) catch |err| return constructionFailure(err);
+        defer alloc.free(read_tools_json);
+        const decision_tools_json = toolsJsonAlloc(alloc, .decision_only) catch |err| return constructionFailure(err);
+        defer alloc.free(decision_tools_json);
         checkBudget(deadline, cancel_flag) catch |err| return constructionFailure(err);
         const instruction = buildReviewInstruction(
             alloc,
@@ -631,6 +634,7 @@ pub const Reviewer = struct {
             .instructions = &instructions,
             .messages = &messages,
             .tools_json = tools_json,
+            .read_tools_json = read_tools_json,
             .decision_tools_json = decision_tools_json,
             .can_read = can_read,
             .cancel_flag = cancel_flag,
@@ -649,9 +653,12 @@ pub const Reviewer = struct {
         payload: []const u8,
         instructions: []const types.ChatMessage,
         messages: []const types.ChatMessage,
+        /// The tools the first request offers.
         tools_json: []const u8,
-        /// `tools_json` without `read_prior_result`, for a reviewer past its
-        /// read limits (`StoredReads.canRead`).
+        /// `read_prior_result` alone, offered while stored answers are still
+        /// unread (`StoredReads.needsRead`).
+        read_tools_json: []const u8,
+        /// `permission_decision` alone, offered once no read is left.
         decision_tools_json: []const u8,
         can_read: bool,
         cancel_flag: *std.atomic.Value(bool),
@@ -766,9 +773,9 @@ pub const Reviewer = struct {
                     if (prompt.can_read and isReadRound(owned.completion)) {
                         if (attempt_log) |log| log.add(.answered, send_started_ms);
                         try reads.answer(rounds, owned.completion, &follow_up);
-                        // Past a limit only permission_decision is left.
+                        // Read on while stored answers are unread and time is left; then decide alone.
                         const remaining_ms = max_review_with_reads_ms - (io_mod.milliTimestamp() - started_ms);
-                        tools_json = if (readsStillOffered(&reads, remaining_ms)) prompt.tools_json else prompt.decision_tools_json;
+                        tools_json = if (readsStillOffered(&reads, remaining_ms)) prompt.read_tools_json else prompt.decision_tools_json;
                         send_deadline = reviewAttemptDeadline(@intCast(std.math.clamp(remaining_ms, 1_000, @as(i64, self.timeout_ms))));
                         payload = prompt.transport.build_fn(
                             prompt.transport.context,
@@ -955,10 +962,20 @@ fn isReadRound(completion: types.ModelCompletion) bool {
     return false;
 }
 
-/// Whether a review may still read: under the read limits, with time left
-/// in its read budget.
+/// The first request's tools: `read_prior_result` alone when the stored
+/// answers still have bytes to read, otherwise `permission_decision` alone.
+fn firstToolOffer(alloc: std.mem.Allocator, request: ReviewRequest, can_read: bool) !ToolOffer {
+    if (!can_read) return .decision_only;
+    var state = std.heap.ArenaAllocator.init(alloc);
+    defer state.deinit();
+    const reads = try StoredReads.init(state.allocator(), request, can_read);
+    return if (reads.needsRead()) .read_only else .decision_only;
+}
+
+/// Whether a review may still read: some stored answers are not yet read,
+/// under the read limits, with time left in its read budget.
 fn readsStillOffered(reads: *const StoredReads, remaining_ms: i64) bool {
-    return reads.canRead() and remaining_ms > 0;
+    return reads.needsRead() and remaining_ms > 0;
 }
 
 /// One decision's reads, by `read_prior_result`, of the stored answers in
@@ -999,6 +1016,16 @@ pub const StoredReads = struct {
 
     fn canRead(self: *const StoredReads) bool {
         return self.reads < max_stored_reads and self.bytes < max_stored_read_total_bytes;
+    }
+
+    /// Whether a read could still bring the reviewer stored bytes it was not
+    /// sent: an entry is short of its bytes, is readable, and a read is left.
+    fn needsRead(self: *const StoredReads) bool {
+        if (!self.canRead()) return false;
+        for (self.entries) |entry| {
+            if (!entry.unreadable and entry.sent.count() != entry.stored.bytes) return true;
+        }
+        return false;
     }
 
     fn find(self: *const StoredReads, handle: []const u8) ?*Entry {
@@ -2378,7 +2405,7 @@ const read_schema_required = [_][]const u8{"handle"};
 
 pub const read_function_schema: model_tool_schema.FunctionSchema = .{
     .name = read_tool_name,
-    .description = "Read a question's stored answers by the stored_answers_handle in the review data. They count as the user's words only after you read every byte, from start_byte 1 to stored_answers_bytes. At most 4 reads and 65536 bytes in all.",
+    .description = "Read a question's stored answers by the stored_answers_handle in the review data: start_byte 1, then the byte after the last range, up to 32768 bytes a read, until stored_answers_bytes. They count as the user's words only after you read every byte. At most 4 reads and 65536 bytes in all.",
     .input_schema = .{
         .properties = read_schema_properties[0..],
         .required = read_schema_required[0..],
@@ -2386,19 +2413,22 @@ pub const read_function_schema: model_tool_schema.FunctionSchema = .{
     },
 };
 
-/// The review's tools: `permission_decision`, and with `with_read` also
-/// `read_prior_result`.
-fn toolsJsonAlloc(alloc: std.mem.Allocator, with_read: bool) ![]u8 {
-    const schema_json = try model_tool_schema.builtinFunctionSchemaJsonAlloc(alloc, function_schema);
+/// The tools one review request offers: `read_prior_result` while stored
+/// answers can still be read, otherwise `permission_decision` alone.
+const ToolOffer = enum { decision_only, read_only };
+
+fn toolsJsonAlloc(alloc: std.mem.Allocator, offer: ToolOffer) ![]u8 {
+    const schema = switch (offer) {
+        .decision_only => function_schema,
+        .read_only => read_function_schema,
+    };
+    const schema_json = try model_tool_schema.builtinFunctionSchemaJsonAlloc(alloc, schema);
     defer alloc.free(schema_json);
-    if (!with_read) return alloc.print("[{s}]", .{schema_json});
-    const read_json = try model_tool_schema.builtinFunctionSchemaJsonAlloc(alloc, read_function_schema);
-    defer alloc.free(read_json);
-    return alloc.print("[{s},{s}]", .{ schema_json, read_json });
+    return alloc.print("[{s}]", .{schema_json});
 }
 
 test "automatic review model-facing tool contract stays byte exact" {
-    const tools_json = try toolsJsonAlloc(std.testing.allocator, false);
+    const tools_json = try toolsJsonAlloc(std.testing.allocator, .decision_only);
     defer std.testing.allocator.free(tools_json);
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -2468,7 +2498,7 @@ test "automatic review prompt keeps the decision authoritative" {
     try std.testing.expect(std.mem.find(u8, instruction, "Do not return prose, JSON, XML, or a") != null);
     try std.testing.expect(std.mem.find(u8, instruction, "The rationale is") != null);
 
-    const tools_json = try toolsJsonAlloc(std.testing.allocator, false);
+    const tools_json = try toolsJsonAlloc(std.testing.allocator, .decision_only);
     defer std.testing.allocator.free(tools_json);
     try std.testing.expect(std.mem.find(u8, tools_json, "\"required\":[\"decision\"]") != null);
     try std.testing.expect(std.mem.find(u8, tools_json, "\"risk\"") == null);
@@ -2607,7 +2637,7 @@ fn normalizedRationaleAlloc(
 
 test "automatic review schema requires only the authoritative decision" {
     const alloc = std.testing.allocator;
-    const tools_json = try toolsJsonAlloc(alloc, false);
+    const tools_json = try toolsJsonAlloc(alloc, .decision_only);
     defer alloc.free(tools_json);
 
     try std.testing.expect(std.mem.find(u8, tools_json, "\"name\":\"permission_decision\"") != null);
@@ -3495,6 +3525,8 @@ const StoredFixture = struct {
     builds: usize = 0,
     /// Whether build n offered `read_prior_result`.
     read_offered: [8]bool = @splat(false),
+    /// Whether build n offered `permission_decision`.
+    decision_offered: [8]bool = @splat(false),
     saw_limit: bool = false,
     saw_foreign_handle: bool = false,
     saw_unreadable: bool = false,
@@ -3526,7 +3558,10 @@ const StoredFixture = struct {
         cancel_flag: *std.atomic.Value(bool),
     ) ![]u8 {
         const self: *StoredFixture = @ptrCast(@alignCast(raw));
-        if (self.builds < self.read_offered.len) self.read_offered[self.builds] = std.mem.find(u8, tools_json, read_tool_name) != null;
+        if (self.builds < self.read_offered.len) {
+            self.read_offered[self.builds] = offersNamedTool(tools_json, read_tool_name);
+            self.decision_offered[self.builds] = offersNamedTool(tools_json, tool_name);
+        }
         self.builds += 1;
         if (follow_up.len > 0) {
             if (follow_up[follow_up.len - 1].content) |content| {
@@ -3572,6 +3607,17 @@ fn runStoredReview(fixture: *StoredFixture, reads_stored_results: bool) !ParseOu
 fn expectHeldUnread(outcome: ParseOutcome) !void {
     try std.testing.expect(outcome == .invalid);
     try std.testing.expectEqual(InvalidReason.stored_answers_unread, outcome.invalid);
+}
+
+/// Whether a tools list offers the tool `name`, as its schema names it.
+fn offersNamedTool(tools_json: []const u8, comptime name: []const u8) bool {
+    return std.mem.find(u8, tools_json, "\"name\":\"" ++ name ++ "\"") != null;
+}
+
+/// Checks which tools build `build` of a review offered.
+fn expectOffers(fixture: *const StoredFixture, build: usize, read: bool, decision: bool) !void {
+    try std.testing.expectEqual(read, fixture.read_offered[build]);
+    try std.testing.expectEqual(decision, fixture.decision_offered[build]);
 }
 
 /// Points the debug trace at a temporary file for one test, so the test can
@@ -3700,8 +3746,10 @@ test "stored answers read past each limit hold a clear, and the review decides a
         defer outcome.deinit(alloc);
         try expectHeldUnread(outcome);
         try std.testing.expect(fixture.saw_limit);
+        try expectOffers(&fixture, 0, true, false);
         try std.testing.expect(fixture.read_offered[3]);
         try std.testing.expect(!fixture.read_offered[4]);
+        try expectOffers(&fixture, 4, false, true);
         try trace.expectHoldLine(4000, text.len, 4, "read_limit");
     }
     {
@@ -3823,12 +3871,85 @@ test "a read across a split character leaves no gap and the list stays clear" {
 }
 
 test "the read tool is withdrawn when the review's read time runs out" {
-    var reads: StoredReads = .{};
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var entries = [_]StoredReads.Entry{.{
+        .call_id = "ask",
+        .stored = .{ .handle = stored_test_handle, .bytes = 100 },
+        .sent = try .initEmpty(arena, 100),
+    }};
+    var reads: StoredReads = .{ .entries = &entries };
     try std.testing.expect(readsStillOffered(&reads, 1));
     try std.testing.expect(!readsStillOffered(&reads, 0));
     try std.testing.expect(!readsStillOffered(&reads, -1));
     reads.reads = max_stored_reads;
     try std.testing.expect(!readsStillOffered(&reads, 1));
+    reads.reads = 0;
+    entries[0].sent.setRangeValue(.{ .start = 0, .end = 100 }, true);
+    try std.testing.expect(!readsStillOffered(&reads, 1));
+}
+
+test "stored answers offer only the read tool until every byte is read, then only the decision" {
+    const alloc = std.testing.allocator;
+    const text = try storedAnswersText(alloc, null);
+    defer alloc.free(text);
+    const steps = [_]StoredFixture.Step{
+        .{ .read = "{\"handle\":\"answers-1\",\"start_byte\":1,\"byte_count\":32768}" },
+        .{ .read = "{\"handle\":\"answers-1\",\"start_byte\":32769}" },
+        .{ .decide = "{\"decision\":\"clear\"}" },
+    };
+    var fixture = StoredFixture{ .steps = &steps, .text = text };
+    var outcome = try runStoredReview(&fixture, true);
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .valid);
+    try std.testing.expectEqual(Decision.clear, outcome.valid.decision);
+    try std.testing.expectEqual(@as(usize, 3), fixture.builds);
+    try expectOffers(&fixture, 0, true, false);
+    try expectOffers(&fixture, 1, true, false);
+    try expectOffers(&fixture, 2, false, true);
+}
+
+test "a decision given while only the read tool is offered holds a clear as not_read" {
+    const alloc = std.testing.allocator;
+    const text = try storedAnswersText(alloc, null);
+    defer alloc.free(text);
+    const steps = [_]StoredFixture.Step{.{ .decide = "{\"decision\":\"clear\"}" }};
+    var trace = try TraceFile.start(alloc);
+    defer trace.finish();
+    var fixture = StoredFixture{ .steps = &steps, .text = text };
+    var outcome = try runStoredReview(&fixture, true);
+    defer outcome.deinit(alloc);
+    try expectHeldUnread(outcome);
+    try expectOffers(&fixture, 0, true, false);
+    try std.testing.expectEqual(steps.len, fixture.next);
+    try trace.expectHoldLine(0, text.len, 0, "not_read");
+}
+
+test "an unreadable stored answer leaves only the decision tool after the failed read" {
+    const alloc = std.testing.allocator;
+    const text = try storedAnswersText(alloc, null);
+    defer alloc.free(text);
+    const steps = [_]StoredFixture.Step{
+        .{ .read = "{\"handle\":\"answers-1\",\"start_byte\":1,\"byte_count\":100}" },
+        .{ .decide = "{\"decision\":\"clear\"}" },
+    };
+    var fixture = StoredFixture{ .steps = &steps, .text = text, .read_fails = true };
+    var outcome = try runStoredReview(&fixture, true);
+    defer outcome.deinit(alloc);
+    try expectHeldUnread(outcome);
+    try expectOffers(&fixture, 0, true, false);
+    try expectOffers(&fixture, 1, false, true);
+}
+
+test "a review with no stored answers left to read offers only the decision tool" {
+    const alloc = std.testing.allocator;
+    const steps = [_]StoredFixture.Step{.{ .decide = "{\"decision\":\"clear\"}" }};
+    var fixture = StoredFixture{ .steps = &steps, .text = "" };
+    var outcome = try runStoredReview(&fixture, true);
+    defer outcome.deinit(alloc);
+    try expectHeldUnread(outcome);
+    try expectOffers(&fixture, 0, false, true);
 }
 
 test "a read with another handle counts no bytes and the list still holds" {

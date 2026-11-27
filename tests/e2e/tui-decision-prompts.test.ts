@@ -621,7 +621,8 @@ function startFakeGateway(
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
       const body = await req.text();
-      if (body.includes('"permission_decision"')) {
+      // A review offers permission_decision, or read_prior_result alone while stored answers are unread.
+      if (body.includes('"permission_decision"') || body.includes('"read_prior_result"')) {
         classifierRequests.push({ body, headers: req.headers });
         const decision = classifierDecision(body);
         if (decision instanceof Response) return decision;
