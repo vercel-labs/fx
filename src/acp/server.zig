@@ -1430,6 +1430,8 @@ pub const RunningCopy = struct {
         extension: sh_fx.Extension,
         /// A member takes `with` when its client shows ACP notices.
         notices,
+        /// A member takes `with` when it lists ACP's `session.compaction` capability.
+        compaction,
         /// A prompt chunk: a member takes `with` when its listing of `sh.fx/sessionClients` is
         /// `listed`, and it is not `sender`, the connection that sent the prompt.
         prompt_chunk: struct { listed: bool, sender: ?ConnectionId },
@@ -1712,6 +1714,7 @@ fn memberTakes(member: *const Member, need: RunningCopy.Need) bool {
         .none => true,
         .extension => |extension| member.extensions.contains(extension),
         .notices => member.client_notices,
+        .compaction => member.client_compaction,
         .prompt_chunk => |chunk| member.extensions.contains(.session_clients) == chunk.listed and takesPromptFrom(member, chunk.sender),
         .steer_chunk => |chunk| member.extensions.contains(.session_clients) == chunk.listed and
             member.sendsSteerInput() == chunk.steer_input,

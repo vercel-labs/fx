@@ -2219,14 +2219,101 @@ function modelSystemText(body: string): string {
     .join("\n");
 }
 
+/// A client's capabilities at initialize when it lists no compaction support.
+const plainCompactionCapabilities = { _meta: {} };
+
+/// A client's capabilities at initialize when it lists session.compaction.
+const listingCompactionCapabilities = { session: { compaction: {} }, _meta: {} };
+
+/// A reply without provider usage, so fx sizes the conversation by its own estimate.
+function compactingReply(text: string) {
+  return fakeGatewaySse([
+    { type: "text-delta", id: "answer_1", delta: text },
+    { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+  ]);
+}
+
+/// About 30,000 estimated tokens: past 20 percent of the model's input, well short of the default 80 percent.
+const largeCompactingText = "ACP_LARGE_REPLY\n" + "historical reference line, not new completed work.\n".repeat(2_400);
+
+const compactingModels = [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128_000 }];
+
+/// The update that starts compaction-1, and the update that ends it as completed.
+const compactionStarted = { sessionUpdate: "compaction_update", compactionId: "compaction-1", status: "in_progress" };
+const compactionEnded = { sessionUpdate: "compaction_update", compactionId: "compaction-1", status: "completed" };
+
+/// The compaction_update updates in `messages`, in order.
+function compactionUpdatesOf(messages: any[]): any[] {
+  return sessionUpdates(messages).filter((update) => update.sessionUpdate === "compaction_update");
+}
+
+/// The text of each agent message chunk in `messages`, in order.
+function agentChunkTexts(messages: any[]): string[] {
+  return messages
+    .filter((message) => message.method === "session/update" && message.params?.update?.sessionUpdate === "agent_message_chunk")
+    .map((message) => message.params.update.content?.text ?? "");
+}
+
+/// Runs a leader and a follower on one session, with a compaction in the leader's second turn. The
+/// follower joins after the first turn. Each client lists session.compaction only when its flag says
+/// so. Returns each client's compaction updates once the follower has the second turn's reply.
+async function compactionOnLeaderAndFollower(
+  root: ReturnType<typeof createShortIsolatedRoot>,
+  ownerLists: boolean,
+  followerLists: boolean,
+) {
+  const gateway = startFakeGateway(
+    [compactingReply(largeCompactingText), compactingReply("ACP_AFTER_REPLY")],
+    { models: compactingModels },
+  );
+  let owner: AcpClient | undefined;
+  let follower: LeaderSocketClient | undefined;
+  try {
+    owner = await AcpClient.create({
+      cwd: root.workspace,
+      env: { ...leaderEnv(root, gateway), FX_AUTO_COMPACT_PERCENT: "20" },
+    });
+    const sessionId = await startSessionListing(
+      owner,
+      ownerLists ? listingCompactionCapabilities : plainCompactionCapabilities,
+    );
+    expect((await runPrompt(owner, "Write the large reply.", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+    const { socket } = JSON.parse(sessionLock(root.home, sessionId)) as { socket: string };
+    follower = await followSession(
+      socket,
+      sessionId,
+      root,
+      followerLists ? listingCompactionCapabilities : plainCompactionCapabilities,
+    );
+
+    const second = await runPrompt(owner, "Continue.", TIMEOUT);
+    expect(second.promptResult.result.stopReason).toBe("end_turn");
+    expect(gateway.requests[1]!.body.includes("compacted_conversation")).toBe(true);
+    await follower.waitForMessage(agentChunk("ACP_AFTER_REPLY"), "the follower's copy of the second reply");
+    return {
+      ownerMessages: second.messages,
+      ownerUpdates: compactionUpdatesOf(second.messages),
+      followerMessages: follower.received,
+      followerUpdates: compactionUpdatesOf(follower.received),
+      ownerStderr: owner.stderr,
+    };
+  } finally {
+    follower?.close();
+    await owner?.close();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}
+
 /// Connects a follower to a session's leader socket and loads the session there.
 async function followSession(
   socket: string,
   sessionId: string,
   root: ReturnType<typeof createShortIsolatedRoot>,
+  capabilities: object = fxClientCapabilities,
 ): Promise<LeaderSocketClient> {
   const follower = await LeaderSocketClient.connect(socket);
-  await follower.request("initialize", { protocolVersion: 1, clientCapabilities: fxClientCapabilities });
+  await follower.request("initialize", { protocolVersion: 1, clientCapabilities: capabilities });
   const loaded = await follower.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] });
   expect(loaded.answer.error).toBeUndefined();
   return follower;
@@ -3510,6 +3597,136 @@ describe("acp: model-independent", () => {
           rmSync(root.root, { recursive: true, force: true });
         }
       }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "ACP sends compaction updates to the main client, and not to a follower that does not list session.compaction",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-compaction-plain-follower-");
+      const run = await compactionOnLeaderAndFollower(root, true, false);
+      expect(run.ownerStderr).toBe("");
+      expect(run.ownerUpdates).toEqual([compactionStarted, compactionEnded]);
+      expect(run.followerUpdates).toEqual([]);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "ACP sends compaction updates to a follower that lists session.compaction, even when the main client does not",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-compaction-listing-follower-");
+      const run = await compactionOnLeaderAndFollower(root, false, true);
+      expect(run.ownerStderr).toBe("");
+      expect(run.ownerUpdates).toEqual([]);
+      expect(run.followerUpdates).toEqual([compactionStarted, compactionEnded]);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "ACP sends compaction updates to the main client and to a follower when both list session.compaction",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-compaction-both-list-");
+      const run = await compactionOnLeaderAndFollower(root, true, true);
+      expect(run.ownerStderr).toBe("");
+      expect(run.ownerUpdates).toEqual([compactionStarted, compactionEnded]);
+      expect(run.followerUpdates).toEqual([compactionStarted, compactionEnded]);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "ACP sends no compaction update to the main client or a follower when neither lists session.compaction",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-compaction-neither-list-");
+      const run = await compactionOnLeaderAndFollower(root, false, false);
+      expect(run.ownerStderr).toBe("");
+      expect(run.ownerUpdates).toEqual([]);
+      expect(run.followerUpdates).toEqual([]);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "ACP sends a client that joins during a compaction its start and end only when it lists session.compaction",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-compaction-join-");
+      writeFileSync(join(root.workspace, "notes.md"), "recorded notes\n");
+      const summaryReply = deferred<Response>();
+      let summaryRequests = 0;
+      let turnRequests = 0;
+      const gateway = startDynamicFakeGateway((raw) => {
+        // fx's compaction asks for its notes with this sentence, which a turn never sends.
+        if (raw.includes("Write the compaction notes for")) {
+          summaryRequests += 1;
+          return summaryReply.promise;
+        }
+        turnRequests += 1;
+        if (turnRequests === 1) return fakeGatewayToolCall("notes_1", "read_file", { path: "notes.md" });
+        if (turnRequests === 2) return compactingReply(largeCompactingText);
+        return compactingReply("ACP_AFTER_COMPACTION");
+      }, { models: compactingModels });
+      let owner: AcpClient | undefined;
+      let listing: LeaderSocketClient | undefined;
+      let plain: LeaderSocketClient | undefined;
+      try {
+        owner = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...leaderEnv(root, gateway), FX_AUTO_COMPACT_PERCENT: "20" },
+        });
+        const sessionId = await startSessionListing(owner, listingCompactionCapabilities);
+        const first = await runPrompt(owner, "Read notes.md, then write the large reply.", TIMEOUT);
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        const { socket } = JSON.parse(sessionLock(root.home, sessionId)) as { socket: string };
+
+        const running = runPrompt(owner, "Continue.", TIMEOUT);
+        running.catch(() => undefined);
+        await waitForCondition("the summary request the compaction holds", () => summaryRequests === 1, TIMEOUT);
+        await waitForCondition(
+          "the owner's compaction start",
+          () => owner!.rawLines.some((line) => line.includes("\"compaction_update\"") && line.includes("\"in_progress\"")),
+          TIMEOUT,
+        );
+
+        listing = await followSession(socket, sessionId, root, listingCompactionCapabilities);
+        plain = await followSession(socket, sessionId, root, plainCompactionCapabilities);
+        expect(compactionUpdatesOf(listing.received)).toEqual([compactionStarted]);
+
+        summaryReply.resolve(compactingReply("Retain the notes the turn read."));
+        const second = await running;
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        expect(compactionUpdatesOf(second.messages)).toEqual([compactionStarted, compactionEnded]);
+        await listing.waitForMessage(agentChunk("ACP_AFTER_COMPACTION"), "the joined client's copy of the reply");
+        expect(compactionUpdatesOf(listing.received)).toEqual([compactionStarted, compactionEnded]);
+        await plain.waitForMessage(agentChunk("ACP_AFTER_COMPACTION"), "the plain joined client's copy of the reply");
+        expect(compactionUpdatesOf(plain.received)).toEqual([]);
+        expect(owner.stderr).toBe("");
+      } finally {
+        summaryReply.resolve(compactingReply("Retain the notes the turn read."));
+        plain?.close();
+        listing?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "ACP sends a client that does not list session.compaction one done line after a compaction, and no line to a follower that lists it",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-compaction-done-line-");
+      const run = await compactionOnLeaderAndFollower(root, false, true);
+      expect(run.ownerStderr).toBe("");
+      // The words of the terminal's done line. The test cannot reach the Zig function that builds
+      // them, so it checks their form: the words, then the elapsed time in parentheses.
+      const doneLine = /^Context compacted \([0-9hms]+\)$/;
+      expect(agentChunkTexts(run.ownerMessages).filter((text) => doneLine.test(text))).toHaveLength(1);
+      expect(agentChunkTexts(run.followerMessages).filter((text) => doneLine.test(text))).toEqual([]);
+      expect(run.followerUpdates).toEqual([compactionStarted, compactionEnded]);
     },
     TIMEOUT * 2,
   );

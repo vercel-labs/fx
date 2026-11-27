@@ -100,6 +100,7 @@ const types = @import("../core/shared/types.zig");
 const history_range = @import("../core/shared/history_range.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const compaction_activity = @import("../core/output/compaction_activity.zig");
+const activity_status = @import("../core/output/activity_status.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const libfx_hooks = @import("libfx_hooks.zig");
 const runtime_gateway_step = @import("../core/agent/runtime/gateway_step.zig");
@@ -430,12 +431,44 @@ const AcpContext = struct {
         try audience.deliver(self.alloc, sh_fx.method.session_model_call, .{ .extension = .model_calls }, out.written(), null);
     }
 
-    fn sendCompactionUpdate(self: *AcpContext, number: usize, status: acp_types.CompactionStatus, error_text: ?[]const u8) !void {
+    /// One compaction update to the audience, under one lock. A member that lists
+    /// `session.compaction` takes the update. A member that does not takes `done_line`, which only
+    /// a completed compaction has, and nothing otherwise.
+    fn deliverCompactionUpdate(
+        self: *AcpContext,
+        number: usize,
+        status: acp_types.CompactionStatus,
+        error_text: ?[]const u8,
+        done_line: ?[]const u8,
+    ) !void {
         var id: [32]u8 = undefined;
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeCompactionUpdate(&out.writer, try acp_types.writeCompactionId(&id, number), status, error_text);
-        try self.sendUpdate(out.written());
+        const with = try self.updateParams(out.written());
+        defer self.alloc.free(with);
+        var audience = server.lockAudience(self.session);
+        defer audience.unlock();
+        const without = if (done_line) |text| self.doneLineParams(text) else null;
+        defer if (without) |params| self.alloc.free(params);
+        try audience.deliver(self.alloc, "session/update", .compaction, with, without);
+    }
+
+    /// The params of the done line for the members that do not list `session.compaction`. Its
+    /// message id follows `pushContextNotice`: the operational id when a member lacks the
+    /// capability, else a fresh id that leaves the owner's id state unchanged. Null when the
+    /// line cannot be built, which is logged. The caller holds the audience.
+    fn doneLineParams(self: *AcpContext, text: []const u8) ?[]u8 {
+        var fresh: acp_types.MessageIdBuffer = undefined;
+        var some_member_lacks = !server.mainLocked(self.session).?.client_compaction;
+        for (self.session.members.items) |member| {
+            if (!member.client_compaction) some_member_lacks = true;
+        }
+        const message_id = if (some_member_lacks) self.operationalMessageId() else acp_types.generateMessageId(&fresh);
+        return self.agentTextParams(message_id, text) catch |err| {
+            debug_trace.logf("acp", "dropped a compaction's done line reason={s}", .{@errorName(err)});
+            return null;
+        };
     }
 
     /// The params of a `session/update` that carries `update_json`. The caller frees them.
@@ -2472,8 +2505,6 @@ fn acpCacheWarmer(proc: *server.Host, session: *server.ActiveSessionState) ?*@im
 }
 
 fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
-    const main_record = server.holdMain(ctx.session);
-    defer main_record.drop();
     const session = ctx.session;
     session.capture_home = if (!ctx.session.workspace_capture)
         null
@@ -2534,11 +2565,12 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         else
             null,
         .propagate_grant = retainAcpGrant,
-        .compaction_activity = if (main_record.client_compaction) .{
+        // Bound on every turn: a member that does not list session.compaction still gets the done line.
+        .compaction_activity = .{
             .begin = compactionBegin,
             .running = compactionRunning,
             .settle = compactionSettle,
-        } else null,
+        },
         .emit_event = emitEvent,
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
@@ -4114,9 +4146,20 @@ const LiveCompaction = struct {
     /// The number the compaction gets once it is saved, which makes its id
     /// the one a replay gives it.
     number: usize,
+    /// When the compaction began, in milliseconds: the start of its done line's time.
+    began_ms: i64,
     /// `in_progress` went out: its summary or its saving started.
     started: bool = false,
 };
+
+const compaction_done_line_bytes: usize = 64;
+
+/// The done line a completed compaction leaves for the clients that do not list
+/// `session.compaction`: the terminal's words for the time from `began_ms` to `ended_ms`.
+fn compactionDoneLine(buf: []u8, began_ms: i64, ended_ms: i64) ?[]const u8 {
+    const seconds = @divTrunc(@max(ended_ms - began_ms, 0), std.time.ms_per_s);
+    return activity_status.compactionDoneText(buf, seconds);
+}
 
 /// The number the session's next saved compaction gets.
 fn nextCompactionNumber(session: *server.ActiveSessionState) usize {
@@ -4132,7 +4175,11 @@ fn compactionBegin(raw_ctx: *anyopaque, _: compaction_activity.Origin, _: ?u64) 
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const operation: compaction_activity.OperationId = @fromBackingInt(ctx.next_compaction_operation);
     ctx.next_compaction_operation += 1;
-    ctx.compaction = .{ .operation = operation, .number = nextCompactionNumber(ctx.session) };
+    ctx.compaction = .{
+        .operation = operation,
+        .number = nextCompactionNumber(ctx.session),
+        .began_ms = io_mod.milliTimestamp(),
+    };
     return operation;
 }
 
@@ -4142,7 +4189,7 @@ fn compactionRunning(raw_ctx: *anyopaque, operation: compaction_activity.Operati
     const live = if (ctx.compaction) |*value| value else return;
     if (live.operation != operation or live.started or stage == .preparation) return;
     live.started = true;
-    ctx.sendCompactionUpdate(live.number, .in_progress, null) catch |err|
+    ctx.deliverCompactionUpdate(live.number, .in_progress, null, null) catch |err|
         debug_trace.logf("acp", "compaction update failed status=in_progress err={s}", .{@errorName(err)});
 }
 
@@ -4160,8 +4207,20 @@ fn compactionSettle(raw_ctx: *anyopaque, operation: compaction_activity.Operatio
         .cancelled, .no_op, .busy => .cancelled,
     };
     if (!live.started and status != .failed) return;
-    ctx.sendCompactionUpdate(live.number, status, if (status == .failed) compactionFailureText(feedback) else null) catch |err|
+    var line_buf: [compaction_done_line_bytes]u8 = undefined;
+    const done_line: ?[]const u8 = if (status == .completed)
+        compactionDoneLine(&line_buf, live.began_ms, io_mod.milliTimestamp())
+    else
+        null;
+    const error_text: ?[]const u8 = if (status == .failed) compactionFailureText(feedback) else null;
+    ctx.deliverCompactionUpdate(live.number, status, error_text, done_line) catch |err|
         debug_trace.logf("acp", "compaction update failed status={s} err={s}", .{ @tagName(status), @errorName(err) });
+}
+
+test "the ACP done line uses the terminal's words, timed from the compaction's begin to its end" {
+    var buf: [compaction_done_line_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings("Context compacted (2m10s)", compactionDoneLine(&buf, 1_000, 131_000).?);
+    try std.testing.expectEqualStrings("Context compacted (0s)", compactionDoneLine(&buf, 5_000, 4_000).?);
 }
 
 /// A failed compaction's error, in the words of fx's terminal without its

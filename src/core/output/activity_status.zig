@@ -63,6 +63,13 @@ pub fn compactionDoneNotice(buf: []u8, op: compaction_activity.Operation) ?[]con
     };
     if (feedback.outcome != .succeeded) return null;
     const seconds = turn_clock.seconds(turn_clock.compactionMarks(op), op.settled_at_ms) orelse return null;
+    return compactionDoneText(buf, seconds);
+}
+
+/// The words of a finished compaction's line for `seconds` of its time, such as
+/// `Context compacted (2m10s)`. The terminal's line and ACP's done line both use
+/// it, so the words have one owner. Null when `buf` cannot hold the whole line.
+pub fn compactionDoneText(buf: []u8, seconds: i64) ?[]const u8 {
     var out: std.Io.Writer = .fixed(buf);
     out.writeAll("Context compacted (") catch return null;
     writeElapsed(&out, seconds) catch return null;
@@ -382,6 +389,18 @@ test "a finished compaction leaves a line with its own time, only when it succee
     try std.testing.expect(compactionDoneNotice(&buf, state.snapshot.operation.?) != null);
     var small: [10]u8 = undefined;
     try std.testing.expect(compactionDoneNotice(&small, state.snapshot.operation.?) == null);
+}
+
+test "the terminal's done line and the ACP words are one helper's output for the same seconds" {
+    var state: compaction_activity.State = .{};
+    var buf: [64]u8 = undefined;
+    var words: [64]u8 = undefined;
+    const id = state.begin(.automatic, 1, 1_000);
+    state.running(id, .summary);
+    state.settle(id, .{ .outcome = .succeeded, .stage = .publication, .publication = .committed }, 131_400);
+    const terminal = compactionDoneNotice(&buf, state.snapshot.operation.?).?;
+    try std.testing.expectEqualStrings(terminal, compactionDoneText(&words, 130).?);
+    try std.testing.expectEqualStrings("Context compacted (1h2m3s)", compactionDoneText(&words, 3723).?);
 }
 
 test "compaction terminal feedback is static scoped and publication honest" {
