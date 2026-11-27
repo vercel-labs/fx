@@ -159,7 +159,7 @@ Config precedence (highest wins):
 
 Project `.fx.json` accepts only repo-safe defaults: `max_agent_steps`, `max_tool_result_bytes`, `context`, `provider_order`, and `provider_strict`, parsed by `parseProjectSafeFields` in `src/core/config/config_runtime.zig`. The project layer never parses profile-owned keys, such as provider and model selection, permissions, and interface preferences.
 
-Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `background/`, `subagent/`, `logs/`). Sessions are global and portable across workspaces. Each session tracks its `workspace_root`, which updates when resumed in a different workspace. Subagent children are internal sessions registered in their parent's `subagent/children.json`. They stay out of session discovery and cannot be resumed directly.
+Runtime state lives under `~/.fx/sessions/v2/<session-id>/`. Each session is one append-only `log.jsonl`, with a `lock` file held by the process that writes it and large bodies stored in `blobs/`. Sessions are global and portable across workspaces. Each session tracks its `workspace_root`, which updates when resumed in a different workspace. Subagent children are internal sessions with their own folders, and the parent's log records each child's work in `child_spawned` and `child_finished` lines. They stay out of session discovery and cannot be resumed directly. fx still reads the v1 layout, `~/.fx/sessions/<session-id>/` with `session.json`, and converts a v1 session when it opens it. `tests/tla/session_manager/system-design.md` describes the format.
 
 ## Permissions
 
