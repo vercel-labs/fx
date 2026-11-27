@@ -23,7 +23,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { envWithoutFxHome, FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
 import { replayGrids } from "./info-panel";
 import { findFooterBlocks } from "./tui-render-assertions";
 import {
@@ -6196,7 +6196,7 @@ test("manual upgrade output links stable notes and dev changes", async () => {
 
   try {
     const stable = Bun.spawn([installedFx, "upgrade", "--channel", "stable"], {
-      env: { ...envWithoutFxHome(), HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl },
+      env: fxChildEnv({ HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl }),
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -6209,7 +6209,7 @@ test("manual upgrade output links stable notes and dev changes", async () => {
     copyFileSync(FX_BIN, installedFx);
     chmodSync(installedFx, 0o755);
     const dev = Bun.spawn([installedFx, "upgrade", "--channel", "dev"], {
-      env: { ...envWithoutFxHome(), HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl },
+      env: fxChildEnv({ HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl }),
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -6240,7 +6240,7 @@ test("update runs the manual upgrade", async () => {
 
   try {
     const update = Bun.spawn([installedFx, "update", "--channel", "stable"], {
-      env: { ...envWithoutFxHome(), HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl },
+      env: fxChildEnv({ HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl }),
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -6255,6 +6255,82 @@ test("update runs the manual upgrade", async () => {
     rmSync(root, { recursive: true, force: true });
   }
 }, UPGRADE_TIMEOUT);
+
+test.skipIf(!tmuxAvailable())(
+  "a newer dev release replaces the update that waits for ctrl+g",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-newer-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ update_channel: "dev" }));
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+    const firstRevision = "1111111111111111111111111111111111111111";
+    const newestRevision = "2222222222222222222222222222222222222222";
+
+    let active: TmuxSession | null = null;
+    const gateway = startFakeGateway([]);
+    const release = startUpgradeServer(root, argvLogPath, { revision: firstRevision });
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: realpathSync(workspace),
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      expect(readFileSync(installedFx, "utf8")).toContain(`# fake fx release ${firstRevision}`);
+
+      // A second dev release comes out while the first waits for Ctrl+G. The
+      // next check installs it over the waiting one, and the footer keeps
+      // offering the reload.
+      release.setRevision(newestRevision);
+      const deadline = Date.now() + UPGRADE_TIMEOUT;
+      while (!readFileSync(installedFx, "utf8").includes(`# fake fx release ${newestRevision}`)) {
+        if (Date.now() > deadline) {
+          throw new Error(`the newer dev release was never installed:\n${readFileSync(installedFx, "utf8").slice(0, 200)}`);
+        }
+        await Bun.sleep(100);
+      }
+      expect(await active.capturePane()).toContain("update ready: ctrl+g to reload");
+
+      await active.sendHexBytes(["07"]);
+      await active.waitForText("fx has been updated to", UPGRADE_TIMEOUT);
+      // One relaunch, of the file that holds the newest release.
+      const launches = readFileSync(argvLogPath, "utf8").trim().split("\n").map((line) => line.split("\t"));
+      expect(launches).toHaveLength(1);
+      expect(launches[0]![0]).toBe(installedFx);
+      expect(launches[0]).toContain("--upgrade-relaunch");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      release.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 3,
+);
 
 test.skipIf(!tmuxAvailable())(
   "TTY upgrade prints bold fx version header before output",
@@ -6276,12 +6352,11 @@ test.skipIf(!tmuxAvailable())(
         isolated: true,
         cmd: `/bin/sh -c ${sq(cmd)}`,
         cwd: root,
-        env: {
-          ...envWithoutFxHome(),
+        env: fxChildEnv({
           HOME: home,
           FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
           NO_COLOR: undefined,
-        },
+        }),
         width: 96,
         height: 24,
         remainOnExit: true,
@@ -6618,7 +6693,7 @@ test.skipIf(!tmuxAvailable())(
           FX_AUTO_UPGRADE: "1",
           FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
           FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent",
+          FX_TRACE_SCOPES: "agent,worker",
           FX_RECORD: tapeBefore,
         },
         stderrPath,
@@ -6641,8 +6716,8 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForPane((pane) => composerContains(pane, "HOLD"), TIMEOUT);
       releaseFirst();
 
-      // The tool runs and the turn stops before its next request.
-      await active.waitForText("stopped between steps for the upgrade; this turn goes on after fx restarts", TIMEOUT);
+      // The tool runs and the turn holds before its next request.
+      await waitForCondition(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=turn_held_for_restart"), "the turn held for the restart");
       expect(relaunched()).toBe(false);
 
       // With the composer empty, fx relaunches and the new build continues
@@ -6705,11 +6780,302 @@ test.skipIf(!tmuxAvailable())(
       // the continuation after it.
       expect(tapesShowed([tapeBefore], ["stopped between steps for the upgrade"], join(frames, "before"))).toEqual(["stopped between steps for the upgrade"]);
       expect(tapesShowed([tapeAfter], ["continuing the turn after the upgrade"], join(frames, "after"))).toEqual(["continuing the turn after the upgrade"]);
+      // The yielded turn stays open, so the first launch never reports it to
+      // the terminal as failed, only as work in progress.
+      const writtenBefore = readTapeFrames(tapeBefore, { ignoreTruncatedTail: true })
+        .filter((frame) => frame.kind === 1)
+        .map((frame) => frame.payload.toString("utf8"))
+        .join("");
+      expect(writtenBefore).toContain("\x1b]7501;state=working:app=fx");
+      expect(writtenBefore).not.toContain("\x1b]7501;state=error");
       await active.kill();
       active = null;
     } finally {
       releaseFirst();
       releaseContinued();
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g twice cancels the restart and the turn goes on in the same process",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-cancel-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    const tracePath = join(root, "trace.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    writeFileSync(join(workspaceRoot, "notes.txt"), "CANCEL_NOTES_CONTENT\n");
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const prompt = "Read notes.txt and say what it holds.";
+    let releaseFirst = () => {};
+    const firstHeld = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let releaseSecond = () => {};
+    const secondHeld = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    const firstAsked = signal();
+    const secondAsked = signal();
+    const gateway = startDynamicFakeGateway(async () => {
+      if (gateway.requests.length === 1) {
+        firstAsked.fire();
+        await firstHeld;
+        return fakeGatewayToolCall("call_cancel_read", "read_file", { path: "notes.txt" });
+      }
+      secondAsked.fire();
+      await secondHeld;
+      return fakeGatewayFinalText("CANCEL_CONTINUED_DONE");
+    });
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,upgrade",
+        },
+        stderrPath,
+        width: 200,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+
+      await active.sendText(prompt);
+      await firstAsked.fired;
+      expect(gateway.requests.length).toBe(1);
+
+      await active.sendHexBytes(["07"]);
+      await active.waitForText(
+        "fx restarts for the upgrade when the running turns stop or end; Ctrl+G cancels the restart, Esc twice interrupts the turn, /quit exits without the restart",
+        TIMEOUT,
+      );
+      await active.waitForText("restart waits: ctrl+g to cancel", TIMEOUT);
+      await active.sendLiteralText("HOLD");
+      await active.waitForPane((pane) => composerContains(pane, "HOLD"), TIMEOUT);
+      releaseFirst();
+
+      await waitForCondition(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=turn_held_for_restart"), "the turn held for the restart");
+      expect(gateway.requests.length).toBe(1);
+      expect(relaunched()).toBe(false);
+
+      await active.sendHexBytes(["07"]);
+      await active.waitForText("restart cancelled; Ctrl+G restarts for the upgrade later", TIMEOUT);
+      await secondAsked.fired;
+      expect(gateway.requests.length).toBe(2);
+      expect(relaunched()).toBe(false);
+      await active.waitForText("update ready: ctrl+g to reload", TIMEOUT);
+
+      releaseSecond();
+      await active.waitForText("CANCEL_CONTINUED_DONE", TIMEOUT);
+
+      const before = gateway.requests[0].body;
+      const after = gateway.requests[1].body;
+      expect(countOccurrences(after, prompt)).toBe(countOccurrences(before, prompt));
+      expect(after).toContain("call_cancel_read");
+      expect(after).toContain("CANCEL_NOTES_CONTENT");
+      expect(after).not.toContain("session_resumed");
+
+      await active.sendKeys("BSpace BSpace BSpace BSpace");
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      expect(relaunched()).toBe(false);
+
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("event=restart_cancelled");
+      expect(trace).toContain("event=yield_cancelled");
+      expect(trace).not.toContain("event=restart_after_yield");
+
+      const items = savedItems(home, sessionIdFromHome(home));
+      expect(items.filter((item: any) => item.turn_yielded !== undefined).length).toBe(1);
+      expect(items.filter((item: any) => item.turn_continued !== undefined).length).toBe(0);
+      expect(items.filter((item: any) => item.tool_call !== undefined && JSON.stringify(item.tool_call).includes("call_cancel_read")).length).toBe(1);
+
+      expect(readFileSync(stderrPath, "utf8")).not.toContain("relaunch failed");
+      await active.kill();
+      active = null;
+    } finally {
+      releaseFirst();
+      releaseSecond();
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g after a cancel still restarts and continues the turn",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-after-cancel-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    const tracePath = join(root, "trace.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    writeFileSync(join(workspaceRoot, "notes.txt"), "FIRST_NOTES_CONTENT\n");
+    writeFileSync(join(workspaceRoot, "notes2.txt"), "SECOND_NOTES_CONTENT\n");
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const prompt = "Read notes.txt and notes2.txt and say what they hold.";
+    let releaseFirst = () => {};
+    const firstHeld = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let releaseSecond = () => {};
+    const secondHeld = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    const firstAsked = signal();
+    const secondAsked = signal();
+    const thirdAsked = signal();
+    const gateway = startDynamicFakeGateway(async () => {
+      if (gateway.requests.length === 1) {
+        firstAsked.fire();
+        await firstHeld;
+        return fakeGatewayToolCall("call_first_read", "read_file", { path: "notes.txt" });
+      }
+      if (gateway.requests.length === 2) {
+        secondAsked.fire();
+        await secondHeld;
+        return fakeGatewayToolCall("call_second_read", "read_file", { path: "notes2.txt" });
+      }
+      thirdAsked.fire();
+      return fakeGatewayFinalText("AFTER_CANCEL_RESTART_DONE");
+    });
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,upgrade",
+        },
+        stderrPath,
+        width: 200,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+
+      await active.sendText(prompt);
+      await firstAsked.fired;
+
+      await active.sendHexBytes(["07"]);
+      await active.waitForText(
+        "fx restarts for the upgrade when the running turns stop or end; Ctrl+G cancels the restart, Esc twice interrupts the turn, /quit exits without the restart",
+        TIMEOUT,
+      );
+      await active.sendLiteralText("HOLD");
+      await active.waitForPane((pane) => composerContains(pane, "HOLD"), TIMEOUT);
+      releaseFirst();
+
+      await waitForCondition(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=turn_held_for_restart"), "the turn held for the restart");
+      await active.sendHexBytes(["07"]);
+      await active.waitForText("restart cancelled; Ctrl+G restarts for the upgrade later", TIMEOUT);
+      await secondAsked.fired;
+
+      await active.sendKeys("BSpace BSpace BSpace BSpace");
+      await active.waitForComposer(TIMEOUT);
+      await active.sendHexBytes(["07"]);
+      await waitForCondition(
+        () => existsSync(tracePath) && countOccurrences(readFileSync(tracePath, "utf8"), "event=restart_waits_for_turns") >= 2,
+        "the second restart wait",
+      );
+      await active.sendLiteralText("HOLD");
+      await active.waitForPane((pane) => composerContains(pane, "HOLD"), TIMEOUT);
+
+      releaseSecond();
+      await waitForCondition(
+        () => existsSync(tracePath) && countOccurrences(readFileSync(tracePath, "utf8"), "event=turn_held_for_restart") >= 2,
+        "the second turn hold for the restart",
+      );
+      expect(gateway.requests.length).toBe(2);
+      expect(relaunched()).toBe(false);
+
+      await active.sendKeys("BSpace BSpace BSpace BSpace");
+      await active.waitForText("continuing the turn after the upgrade", UPGRADE_TIMEOUT);
+      await thirdAsked.fired;
+      await active.waitForText("AFTER_CANCEL_RESTART_DONE", UPGRADE_TIMEOUT);
+      expect(relaunched()).toBe(true);
+
+      expect(gateway.requests.length).toBe(3);
+      const first = gateway.requests[0].body;
+      const third = gateway.requests[2].body;
+      expect(countOccurrences(third, prompt)).toBe(countOccurrences(first, prompt));
+      expect(third).toContain("call_first_read");
+      expect(third).toContain("FIRST_NOTES_CONTENT");
+      expect(third).toContain("call_second_read");
+      expect(third).toContain("SECOND_NOTES_CONTENT");
+      expect(third).not.toContain("session_resumed");
+      expect(readFileSync(stderrPath, "utf8")).not.toContain("relaunch failed");
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+
+      const items = savedItems(home, sessionIdFromHome(home));
+      expect(items.filter((item: any) => item.turn_continued !== undefined).length).toBe(1);
+      expect(items.filter((item: any) => item.tool_call !== undefined && JSON.stringify(item.tool_call).includes("call_first_read")).length).toBe(1);
+      expect(items.filter((item: any) => item.tool_call !== undefined && JSON.stringify(item.tool_call).includes("call_second_read")).length).toBe(1);
+
+      await active.kill();
+      active = null;
+    } finally {
+      releaseFirst();
+      releaseSecond();
       if (active) {
         try {
           await active.sendText("/quit");
@@ -7127,7 +7493,7 @@ function replayPaneBytes(
   const gridPath = join(root, `${name}.grid.txt`);
   writeFileSync(tapePath, Buffer.concat([header, frame, bytes]));
   const replay = Bun.spawnSync([FX_BIN, "replay", tapePath, "--golden", gridPath], {
-    env: { ...envWithoutFxHome(), HOME: home, FX_AUTO_UPGRADE: "0", FX_SOUND: "0" },
+    env: fxChildEnv({ HOME: home, FX_AUTO_UPGRADE: "0", FX_SOUND: "0" }),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -7832,6 +8198,7 @@ test.skipIf(!tmuxAvailable())(
     const installDir = join(root, "install");
     const stderrPath = join(root, "stderr.log");
     const argvLogPath = join(root, "upgrade-argv.log");
+    const tracePath = join(root, "trace.log");
     mkdirSync(home);
     mkdirSync(workspace);
     mkdirSync(installDir);
@@ -7880,6 +8247,8 @@ test.skipIf(!tmuxAvailable())(
           FX_AUTO_UPGRADE: "1",
           FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
           FX_PERMISSION_MODE: "full-access",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "worker",
           FX_RECORD: tapeBefore,
         },
         stderrPath,
@@ -7897,7 +8266,7 @@ test.skipIf(!tmuxAvailable())(
       // Main starts the subagent, then stops before its next request. The
       // subagent keeps working, so fx waits for it.
       releaseMain();
-      await active.waitForText("stopped between steps for the upgrade", TIMEOUT);
+      await waitForCondition(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=turn_held_for_restart"), "the turn held for the restart");
       await soloAsked.fired;
       expect(relaunched()).toBe(false);
 
@@ -12152,24 +12521,6 @@ function drainScrollbackFacts(scrollback: string, lines: number) {
   };
 }
 
-/// The history in `scrollback` once and in order, except for a few rows
-/// right at its end: when the transcript grows in the frame after the history
-/// is handed off, the rows at the old screen top can be painted over before
-/// they reach scrollback. That loss is not this test's subject.
-function expectHistoryNearlyOnceInOrder(scrollback: string, lines: number) {
-  const numbers = scrollback.split("\n").flatMap((row) => {
-    const match = DRAIN_HISTORY.exec(row);
-    return match ? [Number(match[1])] : [];
-  });
-  const seen = new Set(numbers);
-  const missing: number[] = [];
-  for (let n = 1; n <= lines; n++) if (!seen.has(n)) missing.push(n);
-  expect(numbers.length - seen.size).toBe(0);
-  expect(numbers.every((n, i) => i === 0 || n > numbers[i - 1]!)).toBe(true);
-  expect(missing.length).toBeLessThanOrEqual(8);
-  for (const n of missing) expect(n).toBeGreaterThan(lines - 40);
-}
-
 /// The publication frames in the trace: the rows each one planned before the
 /// footer grew, the rows the frame that saw the taller footer planned, and
 /// how many frames after it still left part of the history unwritten.
@@ -12290,7 +12641,7 @@ async function resumeLongHistory(options: DrainCase) {
     const frames = drainFrames(trace());
     expect(readFileSync(stderrPath, "utf8")).toBe("");
     passed = true;
-    return { scrollback: drainScrollbackFacts(scrollback, options.lines), scrollbackText: scrollback, pastedScrollback, frames };
+    return { scrollback: drainScrollbackFacts(scrollback, options.lines), pastedScrollback, frames };
   } finally {
     if (!passed) console.error(`resume drain evidence kept: ${root}; steps=${steps} held=${held}`);
     hold.dispose();
@@ -12332,8 +12683,9 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
     expect(result.frames.finish_frame_rows).toBeGreaterThan(DRAIN_ROWS_PER_FRAME);
     expect(result.frames.partial_frames_after).toBe(0);
     for (const rows of result.frames.before) expect(rows).toBeLessThanOrEqual(DRAIN_ROWS_PER_FRAME);
-    expectHistoryNearlyOnceInOrder(result.scrollbackText, 6000);
-    expect(result.scrollback).toMatchObject({ prompt_rows: 1, prompt_below_history: true });
+    expect(result.scrollback).toEqual({
+      history_rows: 6000, repeats: 0, out_of_order: 0, first_missing: [], prompt_rows: 1, prompt_below_history: true,
+    });
   }, TIMEOUT * 4);
 
   test("fx --resume with a prompt, 18000 lines: the history lands once, in order, and keys typed during the long frame reach the composer", async () => {
@@ -12376,13 +12728,14 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
     expectFinishedDrain(result, 6000);
   }, TIMEOUT * 4);
 
-  test("a request sent again at resume writes the history at once, and a restored prompt comes back once", async () => {
+  for (const lines of [40, 6000]) test(`a request sent again at resume writes the history at once, and a restored prompt comes back once, ${lines} lines`, async () => {
     // A prompt that waited in the queue when fx was killed comes back in the
     // composer once the resumed history is written. The killed turn's request
     // goes out again at resume, and its activity row makes the footer taller,
     // so the history is written in one frame while that request waits. The
     // prompt waits behind a stalled MCP call, as in the restore tests above.
-    const lines = 6000;
+    // 40 lines fit in the first frame, so no batches run; the notices that
+    // land right after it must not paint over its last rows either.
     const root = mkdtempSync(join(tmpdir(), "fx-resume-drain-restore-"));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
@@ -12465,9 +12818,9 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
       await terminal.waitForPane((pane) => composerText(pane) === queuedPrompt, TIMEOUT);
       expect(resumedRequests).toBe(1);
       const frames = drainFrames(trace());
-      expect(frames.finished).toBe(true);
       expect(frames.committed).toBe(true);
-      expect(frames.finish_frame_rows).toBeGreaterThan(DRAIN_ROWS_PER_FRAME);
+      expect(frames.finished).toBe(lines > 40);
+      if (frames.finished) expect(frames.finish_frame_rows).toBeGreaterThan(DRAIN_ROWS_PER_FRAME);
       expect(frames.partial_frames_after).toBe(0);
       for (const rows of frames.before) expect(rows).toBeLessThanOrEqual(DRAIN_ROWS_PER_FRAME);
 
@@ -12476,7 +12829,7 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
       expect(composerText(settled)).toBe(queuedPrompt);
       const scrollback = await terminal.captureFullScrollback();
       expect(countOccurrences(scrollback, RESTORE_SINGULAR_NOTICE)).toBe(1);
-      expectHistoryNearlyOnceInOrder(scrollback, lines);
+      expect(drainScrollbackFacts(scrollback, lines)).toMatchObject({ history_rows: lines, repeats: 0, out_of_order: 0, first_missing: [] });
       // The restored prompt waits in the composer; it was never sent.
       expect(gateway.requests.some((request) => request.body.includes(queuedPrompt))).toBe(false);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

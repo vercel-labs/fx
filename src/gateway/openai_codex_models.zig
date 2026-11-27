@@ -8,7 +8,8 @@ const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const versions = @import("../core/gateway/provider_versions.zig");
-const version_lookup = @import("provider_versions.zig");
+const catalog_fetch_failure = @import("catalog_fetch_failure.zig");
+const raw_answer_testing = @import("raw_answer_testing.zig");
 
 const max_catalog_models: usize = 128;
 const max_model_id_bytes: usize = 1024;
@@ -82,16 +83,7 @@ fn fetchCatalogForProvider(
         .clock = .awake,
         .raw = .fromMilliseconds(fetch_timeout_ms),
     });
-    const version = if (request_auth.credential != null)
-        version_lookup.resolve(alloc, .codex, cancel_flag, deadline) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            return .{ .failure = .{
-                .category = if (err == error.Cancelled) .cancellation else .transport,
-                .retryable = err != error.Cancelled,
-            } };
-        }
-    else
-        null;
+    const version: ?[]const u8 = if (request_auth.credential != null) versions.codex_client_version else null;
     const request_url = modelsUrl(alloc, version) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
@@ -112,10 +104,8 @@ fn fetchCatalogForProvider(
         &operation,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .failure = .{
-            .category = if (err == error.Cancelled) .cancellation else .transport,
-            .retryable = err != error.Cancelled,
-        } };
+        if (err == error.CodexModelCatalogTooLarge) return .{ .failure = .{ .category = .malformed_response } };
+        return .{ .failure = catalog_fetch_failure.classify(err) };
     };
     defer response.deinit(alloc);
     if (response.status != .ok) {
@@ -204,7 +194,7 @@ const FetchOperation = struct {
         extra_len += 1;
         extra_headers[extra_len] = .{ .name = "accept", .value = "application/json" };
         extra_len += 1;
-        const result = gateway_client.fetchOnOpenJob(.{
+        const result = gateway_client.fetchWholeBodyOnOpenJob(.{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = headers,
@@ -224,8 +214,8 @@ const FetchOperation = struct {
     }
 };
 
-/// The models endpoint, with the Codex client version when known. Caller owns it.
-pub fn modelsUrl(alloc: std.mem.Allocator, version: ?versions.Version) ![]u8 {
+/// The models endpoint, with the Codex client version when given. Caller owns it.
+pub fn modelsUrl(alloc: std.mem.Allocator, version: ?[]const u8) ![]u8 {
     const base = io_mod.getenv(e2e_models_endpoint_env) orelse default_models_endpoint;
     if (io_mod.getenv(e2e_models_endpoint_env) != null and !gateway_client.isLoopbackHttpUrl(base)) {
         return error.InvalidE2ECodexModelsEndpoint;
@@ -234,7 +224,7 @@ pub fn modelsUrl(alloc: std.mem.Allocator, version: ?versions.Version) ![]u8 {
     const separator: u8 = if (std.mem.findScalar(u8, base, '?') == null) '?' else '&';
     return alloc.print(
         "{s}{c}client_version={s}",
-        .{ base, separator, compatible.slice() },
+        .{ base, separator, compatible },
     );
 }
 
@@ -371,11 +361,10 @@ test "Codex catalog parser keeps visible API models and live capabilities" {
     try std.testing.expectEqual(@as(u32, 272_000), model.context_window);
 }
 
-test "Codex catalog URL uses the resolved compatibility version" {
-    const url = try modelsUrl(std.testing.allocator, versions.Version.parse("0.999.1").?);
+test "Codex catalog URL carries the pinned client version" {
+    const url = try modelsUrl(std.testing.allocator, versions.codex_client_version);
     defer std.testing.allocator.free(url);
-    try std.testing.expect(std.mem.find(u8, url, "client_version=0.999.1") != null);
-    try std.testing.expect(std.mem.find(u8, url, "client_version=0.148.0") == null);
+    try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/models?client_version=" ++ versions.codex_client_version, url);
 }
 
 test "host-managed Codex catalog auth carries no local headers" {
@@ -407,4 +396,74 @@ test "a Codex catalog fetch stops at once when cancelled during a lookup that ha
         &operation,
     ));
     try std.testing.expect(stuck_lookup_testing.elapsedMsSince(started) < 1_000);
+}
+
+const codex_test_access: credentials.CatalogAccess = .{ .authenticated = .{
+    .source = .chatgpt_subscription,
+    .credential = "codex-token",
+    .team_context = null,
+    .account_id = "acct_codex",
+} };
+
+const codex_answer_head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n";
+const codex_reviewer_body = "{\"models\":[{\"slug\":\"" ++ reviewer_model ++ "\",\"visibility\":\"list\",\"supported_in_api\":true}]}";
+
+/// Fetches the Codex catalog through the public provider, from a loopback
+/// server that sends `answer` or from a closed port when `answer` is null. The
+/// result must be a failure with `category` and `retryable`.
+fn expectCodexCatalogFailure(answer: ?[]const u8, category: model_catalog.FailureCategory, retryable: bool) !void {
+    const alloc = std.testing.allocator;
+    var server: ?raw_answer_testing.AnswerServer = null;
+    if (answer) |bytes| server = try raw_answer_testing.AnswerServer.start(alloc, bytes);
+    const url = if (server) |running|
+        try running.url(alloc, "/backend-api/codex/models")
+    else
+        try alloc.dupe(u8, "http://127.0.0.1:1/backend-api/codex/models");
+    defer alloc.free(url);
+    const env = try raw_answer_testing.Env.install(alloc, &[_][2][]const u8{
+        .{ "FX_TEST_OPENAI_CODEX_MODELS_URL", url },
+    });
+    defer env.deinit();
+    const result = try model_catalog_provider.fetch(alloc, .{ .access = codex_test_access, .endpoint = "" });
+    if (server) |running| try running.finish();
+    switch (result) {
+        .failure => |failure| {
+            try std.testing.expectEqual(category, failure.category);
+            try std.testing.expectEqual(retryable, failure.retryable);
+        },
+        .catalog => |catalog| {
+            var unexpected = catalog;
+            model_catalog.freeModelCatalog(alloc, &unexpected);
+            return error.TestExpectedCatalogFailure;
+        },
+    }
+}
+
+test "Codex catalog cut inside its Content-Length is malformed and retryable, even when the reviewer model is kept" {
+    const answer: []const u8 = codex_answer_head ++ codex_reviewer_body;
+    try expectCodexCatalogFailure(answer, .malformed_response, true);
+}
+
+test "Codex catalog gzip that is not gzip is malformed and not retryable" {
+    const answer: []const u8 = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"models\":[]}";
+    try expectCodexCatalogFailure(answer, .malformed_response, false);
+}
+
+test "Codex catalog cut inside a chunk is malformed and retryable" {
+    const answer: []const u8 = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n40\r\n{\"models\":[";
+    try expectCodexCatalogFailure(answer, .malformed_response, true);
+}
+
+test "Codex catalog refused before it connects is a retryable transport failure" {
+    try expectCodexCatalogFailure(null, .transport, true);
+}
+
+test "Codex catalog body over its size cap is malformed and not retryable" {
+    const alloc = std.testing.allocator;
+    const body = try alloc.alloc(u8, max_catalog_bytes + 1);
+    defer alloc.free(body);
+    @memset(body, ' ');
+    const answer = try alloc.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body });
+    defer alloc.free(answer);
+    try expectCodexCatalogFailure(answer, .malformed_response, false);
 }

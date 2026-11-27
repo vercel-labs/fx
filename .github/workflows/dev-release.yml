@@ -122,6 +122,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          # The dev channel step compares this commit with the one in dev.json.
+          fetch-depth: 0
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -184,18 +186,29 @@ jobs:
             fi
           done
 
-      - name: Point dev channel at this commit
-        id: point-dev
+      - name: Decide whether the dev channel moves
+        id: forward
         run: |
           set -euo pipefail
-          echo "updated=false" >> "$GITHUB_OUTPUT"
-
-          MAIN_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
-          if [ "$MAIN_SHA" != "$RELEASE_SHA" ]; then
-            echo "main advanced to ${MAIN_SHA}; leaving dev.json unchanged"
-            exit 0
+          # dev.json is read through the CDN, which caches it for 60 seconds.
+          # Runs go one at a time and each builds for minutes before this
+          # step, so the read sees the previous run's write unless the CDN
+          # serves a copy past that age.
+          CURRENT_SHA=$(curl -fsS --max-time 30 https://releases.fx.sh/dev.json | jq -r '.commit // empty') || CURRENT_SHA=""
+          if [ -z "$CURRENT_SHA" ]; then
+            echo "::warning::could not read a commit from dev.json; only main's newest commit may replace it"
           fi
+          MAIN_SHA=$(timeout 60 git ls-remote origin refs/heads/main | cut -f1) || MAIN_SHA=""
+          # The rule comes from this workflow's own commit, since the build's
+          # checkout can be older than the script.
+          git show "${GITHUB_SHA}:scripts/dev-channel-forward.sh" > "$RUNNER_TEMP/dev-channel-forward.sh"
+          bash "$RUNNER_TEMP/dev-channel-forward.sh" "$CURRENT_SHA" "$RELEASE_SHA" "$MAIN_SHA"
 
+      - name: Point dev channel at this commit
+        id: point-dev
+        if: steps.forward.outputs.move == 'true'
+        run: |
+          set -euo pipefail
           VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
           jq -n --arg version "$VERSION" --arg commit "$RELEASE_SHA" \
             '{version: $version, commit: $commit}' > /tmp/dev.json

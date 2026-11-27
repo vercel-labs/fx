@@ -5401,24 +5401,35 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
 const resumed_history_rows = 300;
 const resumed_history_prompt = "SENT_WHILE_PUBLISHING";
 const resumed_history_composer = "COMPOSER_LINE_ONE\nCOMPOSER_LINE_TWO\nCOMPOSER_LINE_THREE";
+const resumed_history_notice: types.SemanticNotice = .{
+    .topic = "session",
+    .tone = .information,
+    .body = "RESTORED_NOTICE a notice long enough to wrap over several rows of the eighty column " ++
+        "terminal, as a restored prompt's notice can, so the transcript grows by more than one row " ++
+        "in the frame right after the resumed history is handed off.",
+};
 
-/// What makes the footer taller after the first frame of a resume.
-const ResumeFooterGrowth = enum {
+/// What grows during a resume, or right after it.
+const ResumeGrowth = enum {
     none,
-    /// A prompt sent as Enter sends it: its card shows above the composer.
+    /// A prompt sent as Enter sends it, after the first frame: its card
+    /// shows above the composer.
     prompt_card,
-    /// A composer of several lines, with nothing sent yet.
+    /// A composer of several lines after the first frame, with nothing sent.
     taller_composer,
+    /// A notice in the transcript right after the frame that hands the
+    /// resumed history off, as a restored prompt's notice lands.
+    notice_after_handoff,
 };
 
 /// Resumes `resumed_history_rows` numbered rows into the 12-row coordinator
-/// terminal and paints frames until the resumed flow is released, with the
-/// footer made taller by `growth` after the first frame. Appends the history
-/// rows each frame wrote into scrollback to `frame_rows`, and checks that
-/// every row reached the terminal once, in order, above what grew.
+/// terminal and paints frames until the resumed flow is released, with
+/// `growth` applied. Appends the history rows each frame wrote into
+/// scrollback to `frame_rows`, and checks that every row reached the
+/// terminal once, in order, above what grew.
 fn publishResumedHistory(
     alloc: std.mem.Allocator,
-    growth: ResumeFooterGrowth,
+    growth: ResumeGrowth,
     frame_rows: *std.ArrayList(u32),
 ) !void {
     var tmp = std.testing.tmpDir(.{});
@@ -5454,10 +5465,17 @@ fn publishResumedHistory(
     var offset: u64 = 0;
     app.shell.render_requests.request(.first_frame);
     var settle_frames: usize = 0;
+    var notice_added = false;
     while (settle_frames < 3) {
         if (frame_rows.items.len == 40) return error.TestResumePublicationNeverFinished;
+        if (growth == .notice_after_handoff and !notice_added and
+            frame_rows.items.len > 0 and app.shell.notebook.pending_resume_source == null)
+        {
+            _ = try app.shell.appendSemanticNotice(alloc, resumed_history_notice);
+            notice_added = true;
+        }
         if (frame_rows.items.len == 1) switch (growth) {
-            .none => {},
+            .none, .notice_after_handoff => {},
             .prompt_card => app.agent().submission.pending = .{ .draft = .{
                 .turn_id = 1,
                 .prompt = try alloc.dupe(u8, resumed_history_prompt),
@@ -5499,6 +5517,7 @@ fn publishResumedHistory(
         .none => return,
         .prompt_card => resumed_history_prompt,
         .taller_composer => "COMPOSER_LINE_THREE",
+        .notice_after_handoff => "RESTORED_NOTICE",
     };
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, grown));
     try std.testing.expect(std.mem.find(u8, text, grown).? > last_row_end);
@@ -5533,6 +5552,17 @@ test "core.app_render_runtime a composer of several lines while resumed history 
 
     // No prompt was sent; the footer grew all the same.
     try expectRestAfterGrowth(frame_rows.items);
+}
+
+test "core.app_render_runtime a notice right after resumed history is handed off leaves every history row in scrollback" {
+    const alloc = std.testing.allocator;
+    var frame_rows: std.ArrayList(u32) = .empty;
+    defer frame_rows.deinit(alloc);
+    errdefer std.debug.print("rows per frame: {any}\n", .{frame_rows.items});
+    // Without this, the frame after the handoff moves the screen top down by
+    // the notice's rows without scrolling, and paints over the last history
+    // rows before they reach scrollback.
+    try publishResumedHistory(alloc, .notice_after_handoff, &frame_rows);
 }
 
 test "core.app_render_runtime resumed history with no prompt publishes in paced batches" {

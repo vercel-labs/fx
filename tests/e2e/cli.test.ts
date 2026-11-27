@@ -21,8 +21,8 @@ import { join, sep } from "node:path";
 import {
   cleanupIsolatedTestHome,
   createIsolatedTestHome,
-  envWithoutFxHome,
   FX_BIN,
+  fxChildEnv,
   HAS_API_KEY,
   REPO_ROOT,
   runFx,
@@ -3795,6 +3795,58 @@ describe("cli: sessions", () => {
   );
 
   test(
+    "session lists return every session for small and large stores",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-sizes-"));
+      try {
+        // 40 sessions is past sessions_before_helper_threads in
+        // src/core/session/session_catalog_cache.zig, so it takes the helper threads.
+        for (const sessions of [8, 40]) {
+          const home = join(root, `home-${sessions}`);
+          const workspace = join(root, `workspace-${sessions}`);
+          mkdirSync(home);
+          mkdirSync(workspace);
+          const workspaceRoot = realpathSync(workspace);
+          const fixture = spawnSync(
+            "python3",
+            [
+              join(REPO_ROOT, "benchmarks", "session_list_fixture.py"),
+              "--home",
+              home,
+              "--workspace",
+              workspaceRoot,
+              "--sessions",
+              String(sessions),
+              "--log-size",
+              "4096",
+            ],
+            { encoding: "utf8" },
+          );
+          expect(fixture.status).toBe(0);
+
+          const listed = await runFx(["sessions", "--json"], {
+            cwd: workspaceRoot,
+            env: { HOME: home },
+            timeoutMs: TIMEOUT,
+          });
+          expect(listed.code).toBe(0);
+          const page = JSON.parse(listed.stdout);
+          expect(page.count).toBe(sessions);
+          expect(page.sessions.map((session: { id: string }) => session.id)).toEqual(
+            Array.from(
+              { length: sessions },
+              (_, index) => `benchmark-session-${String(sessions - 1 - index).padStart(2, "0")}`,
+            ),
+          );
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "workspace-scoped session discovery filters list and last by cwd",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-workspace-sessions-"));
@@ -4466,10 +4518,7 @@ describe("cli: models", () => {
       });
       const proc = Bun.spawn([FX_BIN, "models", "--json"], {
         cwd: REPO_ROOT,
-        env: {
-          ...envWithoutFxHome(),
-          ...modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
-        },
+        env: fxChildEnv(modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`)),
         stdout: "pipe",
         stderr: "pipe",
       });
@@ -5003,6 +5052,65 @@ describe("cli: replay failures", () => {
         expect(JSON.parse(malformed.stdout.trim())).toMatchObject({
           kind: "replay",
         });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
+/// A tape, as `FX_RECORD` writes one, whose frames are the given stdout reads.
+function stdoutTape(cols: number, rows: number, reads: string[]): Buffer {
+  const version = Buffer.from("test");
+  const header = Buffer.alloc(18);
+  header.write("FXTP\x01", 0, "binary");
+  header.writeUInt16LE(cols, 5);
+  header.writeUInt16LE(rows, 7);
+  header.writeBigInt64LE(0n, 9);
+  header.writeUInt8(version.length, 17);
+  const parts = [header, version];
+  for (const read of reads) {
+    const payload = Buffer.from(read, "binary");
+    const frame = Buffer.alloc(9);
+    frame.writeInt32LE(0, 0);
+    frame.writeUInt8(1, 4);
+    frame.writeUInt32LE(payload.length, 5);
+    parts.push(frame, payload);
+  }
+  return Buffer.concat(parts);
+}
+
+describe("cli: replay", () => {
+  test(
+    "fx replay drops charset designations, also when a read splits one",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-replay-charset-"));
+      try {
+        const tapePath = join(root, "charset.fxtape");
+        writeFileSync(tapePath, stdoutTape(40, 6, [
+          // What `tput sgr0` sends on xterm terminfo.
+          "1 sgr0: A\x1b(B\x1b[mC\r\n",
+          "2 split: A\x1b(",
+          "BC\r\n",
+          // ncurses line drawing; the designation is ignored, not applied.
+          "3 lines: \x1b(0lqqk\x1b(B end\r\n",
+          "4 ESC SP F: A\x1b F C\r\n",
+        ]));
+        const goldenPath = join(root, "golden.txt");
+        const replay = await runFx(["replay", tapePath, "--golden", goldenPath]);
+        expect(replay.code).toBe(0);
+        expect(replay.stderr).toBe("");
+        const rows = readFileSync(goldenPath, "utf8")
+          .split("\n")
+          .slice(0, 4)
+          .map((line) => line.slice(1, -1).trimEnd());
+        expect(rows).toEqual([
+          "1 sgr0: AC",
+          "2 split: AC",
+          "3 lines: lqqk end",
+          "4 ESC SP F: A C",
+        ]);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -5549,6 +5657,60 @@ describe("cli: ask success", () => {
     },
     TIMEOUT,
   );
+
+  // `fx ask` shows no question, so the reply after one starts a new paragraph,
+  // as it does after any other tool.
+  const ASK_QUESTION = { questions: [{ question: "Choose next step?", options: [{ label: "Run tests" }, { label: "Stop" }] }] };
+  for (const [placement, settings, call] of [
+    ["direct", {}, { name: "ask_user_question", input: ASK_QUESTION }],
+    ["toolbox", { tool_placement: { ask_user_question: "toolbox" } }, { name: "toolbox", input: { run: "ask_user_question", arguments: ASK_QUESTION } }],
+  ] as const) {
+    for (const [label, flags] of [["text", []], ["--json", ["--json"]]] as const) {
+      test(
+        `fx ask ${label} starts a new paragraph after a ${placement} question`,
+        async () => {
+          const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-question-break-"));
+          const home = join(root, "home");
+          const workspace = join(root, "workspace");
+          const gateway = startFakeGateway([
+            fakeGatewaySse([
+              { type: "text-delta", id: "prose_1", delta: "One question first." },
+              { type: "tool-call", toolCallId: "ask_1", toolName: call.name, input: call.input },
+              { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+            ]),
+            fakeGatewayFinalText("Done after the question."),
+          ]);
+          try {
+            mkdirSync(join(home, ".fx"), { recursive: true });
+            mkdirSync(workspace);
+            writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify(settings));
+
+            const result = await runFx(["ask", ...flags, "--auto", "--no-save", "Ask me, then finish."], {
+              cwd: realpathSync(workspace),
+              env: {
+                HOME: realpathSync(home),
+                AI_GATEWAY_API_KEY: "fake-question-break-key",
+                VERCEL_OIDC_TOKEN: undefined,
+                FX_GATEWAY_BASE_URL: gateway.baseUrl,
+                FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+                FX_MODEL: FAKE_GATEWAY_MODEL,
+                FX_AUTO_UPGRADE: "0",
+              },
+              timeoutMs: TIMEOUT,
+            });
+
+            expect(result.code, result.stderr).toBe(0);
+            const output = label === "--json" ? JSON.parse(result.stdout).output : result.stdout;
+            expect(output).toBe("One question first.\n\nDone after the question.");
+          } finally {
+            gateway.stop();
+            rmSync(root, { recursive: true, force: true });
+          }
+        },
+        TIMEOUT,
+      );
+    }
+  }
 
   test(
     "fx ask stdin prompts above the old 1 MiB limit reach Gateway byte-for-byte",

@@ -4329,6 +4329,7 @@ fn persistPromptBeforeCapture(
         append(deps.ctx, .{
             .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
             .execution = projected,
+            .saved_execution = finalization.savedExecution(execution),
         }) catch |err| break :saved err;
         return;
     };
@@ -4359,6 +4360,7 @@ fn appendRunningToolCalls(
     try append(deps.ctx, .{
         .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
         .execution = try finalization.persistedExecution(arena, execution),
+        .saved_execution = finalization.savedExecution(execution),
         .running_calls = running,
         .running_assistant = issuing.content,
     });
@@ -4516,7 +4518,7 @@ fn persistRecoveryCheckpointWithAction(
     const projected = try finalization.persistedExecution(arena, execution);
     const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id };
     // Every completed piece reaches the session before the next request.
-    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected, .recovery_record = record });
+    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected, .saved_execution = finalization.savedExecution(execution), .recovery_record = record });
     const effect = deps.recovery_checkpoint orelse return;
     try effect.set(deps.ctx, .{
         .turn_id = job.turn_id,
@@ -4627,7 +4629,7 @@ fn canStopForRestart(
 /// record is saved: marked clean, as a closing fx saves it, so the next
 /// launch resumes it without counting a death, and the session marks the turn
 /// as yielded, so the launch continues it as the same turn
-/// (`tests/tla/recovery/Resume.tla` Relaunch, NoFalseCrashQuestion).
+/// (`tests/tla/recovery/Resume.tla` Hold, NoFalseCrashQuestion).
 /// Its start capture is settled first, so it never lands after the marker.
 /// Only a turn `canStopForRestart` allows gets here. When the clean record does
 /// not land, nothing is marked and it returns false: the request is still
@@ -4657,6 +4659,17 @@ fn yieldTurn(
     }
     debug_trace.eventf("agent", "turn_yielded", trace_ctx, "record_saved=true marked={}", .{marked});
     return true;
+}
+
+/// Holds a turn that stopped for its host's restart until the restart
+/// goes ahead or is cancelled. A host with no hold, such as libfx or
+/// ACP, stops the turn at once. No WebAssembly host restarts itself, so
+/// those builds leave the hold and its cancel out
+/// (`sdk/tests/package-size-budgets.json`).
+inline fn holdForRestart(deps: *const AgentRuntimeDeps) AgentRuntimeDeps.RestartHoldEnd {
+    if (comptime host_target.is_wasm) return .stop;
+    const hold = deps.hold_for_restart orelse return .stop;
+    return hold(deps.ctx);
 }
 
 /// A checkpoint `persistFinalReplyCheckpoint` saved holds the reply its turn
@@ -6253,7 +6266,9 @@ pub fn processAgentPrompt(
 
     processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         observed_error = err;
-        if (finalization.state == .open) {
+        if (err == error.TurnYielded) {
+            finalization.leaveOpenForResume();
+        } else if (finalization.state == .open) {
             finalization.finish(.failed, null, null) catch |finalization_err| {
                 observed_error = finalization_err;
                 if (deps.compaction_failure) |out| out.* = null;
@@ -9179,7 +9194,9 @@ fn processQueuedPromptLoop(
             // prompt has sent its first request. Only the gateway path saves
             // the turn before its send, so only it stops here, and only when
             // the next launch can continue it (`canStopForRestart`); any
-            // other turn goes on, and the restart waits for it to end.
+            // other turn goes on, and the restart waits for it to end. It then
+            // holds there until the restart goes ahead or is cancelled
+            // (`holdForRestart`).
             const stop_requested = if (config.yield_flag) |flag| flag.load(.seq_cst) else false;
             if (job.provider == .gateway and quiesce.step(&turn_quiesce, .{ .boundary = .{
                 .now_ms = io_mod.milliTimestamp(),
@@ -9188,7 +9205,24 @@ fn processQueuedPromptLoop(
             } }) == .yield and canStopForRestart(deps, &request_recovery, &yield_skip_traced, step_ctx)) {
                 // A stop whose clean record does not land leaves the turn
                 // going on; the next boundary asks again.
-                if (yieldTurn(deps, &request_recovery, step_ctx)) return error.TurnYielded;
+                if (yieldTurn(deps, &request_recovery, step_ctx)) switch (holdForRestart(deps)) {
+                    .stop => return error.TurnYielded,
+                    // The restart was cancelled: the request goes out after
+                    // all, once its send's record is saved again.
+                    .go_on => try request_recovery.reopenAfterYield(),
+                    .cancelled => {
+                        // As at every cancel, steering that waits goes on
+                        // in place of the request that never went out.
+                        if (try append_immediate_steering_after_cancel(deps, arena, &within_turn_suffix, turn_id, "")) {
+                            reset_recovery_after_immediate_steering(&recovery_strategy, &recovery_cause, &preserved_tool_evidence);
+                            continue :agent_steps_loop;
+                        }
+                        runtime_telemetry.traceCancelObserved(step_ctx, false);
+                        try persistCancelledTurn(deps, finalization, job, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                        finish_trace.finish("interrupted");
+                        return;
+                    },
+                };
             }
 
             disarmCacheWarming(deps);
@@ -10699,6 +10733,7 @@ fn processQueuedPromptLoop(
                 .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
                 .assistant = @constCast(assistant_text),
                 .execution = try finalization.persistedExecution(arena, finish_execution),
+                .saved_execution = finalization.savedExecution(finish_execution),
             } };
             types.setHistoryTurnSummary(&turn, completed_summary);
             try deps.propagate_history_turn(deps.ctx, turn);
@@ -11307,10 +11342,7 @@ fn processQueuedPromptLoop(
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
         empty_reply_nudged = false;
         if (step_has_content) {
-            // The model's own call, so a toolbox question keeps the break that ends the prose in `fx ask`.
-            const first_tool_is_ask = effective_tool_calls.len > 0 and
-                tool_dispatch.toolActivityKindForCall(arena, deps.tool_registry, effective_tool_calls[0]) == .ask;
-            if (!first_tool_is_ask) try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+            try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
             silent_tool_steps = 0;
         } else {
             silent_tool_steps += 1;
@@ -13779,6 +13811,7 @@ fn finishFailedTurnWithNotice(
         .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
         .assistant = @constCast(notice),
         .execution = try finalization.persistedExecution(arena, execution_memory),
+        .saved_execution = finalization.savedExecution(execution_memory),
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     try deps.propagate_history_turn(deps.ctx, turn);

@@ -790,6 +790,91 @@ test "a turn asked to yield stops at its next step boundary after the first requ
     try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
 }
 
+test "a turn held for a cancelled restart sends its request in the same turn" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_record = true;
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "search output" } }};
+    // Set before the turn starts: the first request still goes out.
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var config = fixture.config();
+    config.yield_flag = &yield_flag;
+    hooks.restart_hold_end = .go_on;
+    hooks.restart_yield_flag = &yield_flag;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.turn_yielded_marks);
+    try std.testing.expectEqual(@as(usize, 1), hooks.restart_holds);
+    try std.testing.expect(!yield_flag.load(.seq_cst));
+    // The reopen saved the send's record again, after the clean one.
+    try std.testing.expect(hooks.recovery_record_writes > hooks.recovery_record_writes_at_hold);
+}
+
+test "a held turn whose restart goes ahead returns TurnYielded" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_record = true;
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "search output" } }};
+    // Set before the turn starts: the first request still goes out.
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var config = fixture.config();
+    config.yield_flag = &yield_flag;
+    hooks.restart_hold_end = .stop;
+
+    try std.testing.expectError(error.TurnYielded, runFakePrompt(&gateway, &hooks, config, fixture.job()));
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.turn_yielded_marks);
+    try std.testing.expectEqual(@as(usize, 1), hooks.restart_holds);
+}
+
+test "a held turn that is cancelled ends cancelled without its next request" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_record = true;
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "search output" } }};
+    // Set before the turn starts: the first request still goes out.
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var config = fixture.config();
+    config.yield_flag = &yield_flag;
+    hooks.restart_hold_end = .cancelled;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.restart_holds);
+}
+
 test "a yielded turn is traced as yielded, not as an HTTP error" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -827,6 +912,56 @@ test "a yielded turn is traced as yielded, not as an HTTP error" {
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "outcome_kind=yielded") != null);
     try std.testing.expect(std.mem.find(u8, trace, "outcome_kind=http_error") == null);
+}
+
+const YieldPostTurnEndCapture = struct {
+    calls: usize = 0,
+
+    fn run(raw: *anyopaque, _: lifecycle_hooks.PostTurnEndInput) lifecycle_hooks.HandlerError!void {
+        const self: *YieldPostTurnEndCapture = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+    }
+};
+
+test "a yielded turn stays open: no host hears it finished and no post-turn hook runs" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_record = true;
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "search output" } }};
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var config = fixture.config();
+    config.yield_flag = &yield_flag;
+    var post_turn_end = YieldPostTurnEndCapture{};
+    var hook_runtime = lifecycle_hooks.Runtime.init(alloc);
+    defer hook_runtime.deinit();
+    try hook_runtime.registerPostTurnEnd(.{
+        .name = "capture",
+        .ctx = &post_turn_end,
+        .run = YieldPostTurnEndCapture.run,
+    });
+
+    try std.testing.expectError(error.TurnYielded, runFakePromptWithLifecycle(
+        &gateway,
+        &hooks,
+        config,
+        fixture.job(),
+        testLifecycleContext(hook_runtime.freeze(), alloc, fixture.workspace_root),
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.turn_yielded_marks);
+    // The host resumes the same turn, and that run reports how it ends.
+    try std.testing.expectEqual(@as(?types.TurnPresentationOutcome, null), hooks.finalized_outcome);
+    try std.testing.expectEqual(@as(usize, 0), hooks.finalization_count);
+    try std.testing.expectEqual(@as(usize, 0), post_turn_end.calls);
 }
 
 test "a turn on a session fx does not save goes on to its end when asked to yield" {
