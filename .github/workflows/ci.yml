@@ -93,6 +93,8 @@ jobs:
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/acp_eof/check.sh design-a design-b
       - name: Model-check web_fetch DNS cancellation
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/web_fetch_dns/check.sh design-b design-a
+      - name: Model-check terminal hang-up
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/terminal_hangup/check.sh design-a design-b
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -112,7 +114,7 @@ jobs:
         run: python3 -m scripts.check_cli_shape
 
       - name: Test CI and release scripts
-        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape scripts.tests.test_check_provider_versions
+        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_dev_channel_forward scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape scripts.tests.test_check_provider_versions
 
       - name: Test the zig skill's scripts and examples
         run: python3 -m unittest discover -s .fx/skills/zig/scripts
@@ -129,10 +131,16 @@ jobs:
       - name: Walk fx ask turns along the malformed tool call model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/malformed.ts --self-check
 
+      - name: Walk fx ask turns along the output limit model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/output_limit.ts --self-check
+
       - name: Walk fx acp along the ACP EOF model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/acp_eof/
+
       - name: Walk fx along the web_fetch DNS model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/web_fetch_dns/
+      - name: Walk fx along the terminal hang-up model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/terminal_hangup/
 
       # The zsh user profile tests in src/core/execution/command_runner.zig
       # skip without /bin/zsh. They start interactive zsh with no terminal,
@@ -1192,6 +1200,7 @@ jobs:
             scripts/check-recovery-boundary.sh
             scripts/detect-ci-need.sh
             scripts/detect-macos-need.sh
+            scripts/dev-channel-forward.sh
             scripts/smoke-binary.sh
             tests/e2e/ci-run-files.sh
           )

@@ -104,11 +104,7 @@ const Context = struct {
         result.permission_state_override = &self.admission.permission_state;
         result.advertised_dynamic_tool_names = self.admission.integration_names;
         result.mcp_access = if (self.admission.mcp_view) |*view|
-            .{ .scoped = .{
-                .captured = view,
-                .admission_authority_generation = self.admission.authority_generation,
-                .live = .{ .context = self, .resolve_fn = resolveLiveMcpView },
-            } }
+            .{ .scoped = .{ .captured = view } }
         else
             .disabled;
         result.subagent_host = self.config.host;
@@ -135,15 +131,6 @@ const Context = struct {
             .subagent_id = self.subagent_id,
         };
         return result;
-    }
-
-    fn resolveLiveMcpView(
-        raw: *anyopaque,
-        alloc: Allocator,
-    ) !tool_mcp_runtime.ResolvedLiveView {
-        const self: *Context = @ptrCast(@alignCast(raw));
-        var authority = try self.turn.resolveLiveAuthority(alloc);
-        return execution.liveMcpViewFrom(alloc, &authority);
     }
 };
 
@@ -751,12 +738,19 @@ fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
 
 fn finalizeTurn(
     raw: *anyopaque,
-    _: u64,
+    turn_id: u64,
     outcome: types.TurnPresentationOutcome,
-    _: ?types.ProviderCompletionDisposition,
+    disposition: ?types.ProviderCompletionDisposition,
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     context.turn_outcome = outcome;
+    // The parent hears why, such as a reply cut off at the output limit, in
+    // place of `agent_turn_failed`; a failure set earlier stays first.
+    if (context.turn.failureDiagnostic() == null) {
+        if (types.turnFailureFor(.{ .turn_id = turn_id, .outcome = outcome, .disposition = disposition })) |failure| {
+            context.turn.failure_diagnostic = failure;
+        }
+    }
 }
 
 fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {

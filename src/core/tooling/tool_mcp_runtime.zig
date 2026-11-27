@@ -25,28 +25,6 @@ pub const ToolSchemaFn = *const fn (*anyopaque, Allocator, []const u8, types.Per
 pub const Progress = mcp_contract.Progress;
 pub const ProgressSink = mcp_contract.ProgressSink;
 
-pub const ResolvedLiveView = struct {
-    /// Generation of the MCP-specific immutable view.
-    authority_generation: u64,
-    view: access_policy.View,
-    /// Full child authority generation for final action precommit.
-    action_authority_generation: u64 = 0,
-
-    pub fn deinit(self: *ResolvedLiveView, alloc: Allocator) void {
-        self.view.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-const LiveViewProvider = struct {
-    context: *anyopaque,
-    resolve_fn: *const fn (*anyopaque, Allocator) anyerror!ResolvedLiveView,
-
-    pub fn resolve(self: LiveViewProvider, alloc: Allocator) !ResolvedLiveView {
-        return self.resolve_fn(self.context, alloc);
-    }
-};
-
 /// The MCP servers an agent may use, by name: an instance's profile.
 pub const ServerFilter = struct {
     context: *const anyopaque,
@@ -63,21 +41,10 @@ pub const Access = union(enum) {
     /// Every tool of a server the filter allows. The host, which knows each
     /// tool's server, decides.
     servers: ServerFilter,
+    /// A subagent's view of the servers: the tools and servers its parent had when it was made.
     scoped: struct {
         captured: *const access_policy.View,
-        admission_authority_generation: u64,
-        live: LiveViewProvider,
-        action_authority_generation: u64 = 0,
     },
-
-    pub fn allowsTool(self: Access, runtime_generation: u64, name: []const u8) bool {
-        return switch (self) {
-            .unrestricted, .servers => true,
-            .disabled => false,
-            .scoped => |scope| scope.captured.runtime_generation == runtime_generation and
-                scope.captured.tool(name) != null,
-        };
-    }
 };
 
 pub const DefinitionSnapshot = union(enum) {

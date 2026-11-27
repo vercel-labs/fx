@@ -3311,6 +3311,43 @@ pub fn Runtime(comptime App: type) type {
             return v2.id();
         }
 
+        /// Writes an OSC 7577 resume report after each main loop pass, and only
+        /// when the main chat's saved session changes. It runs only when the
+        /// terminal gave fx a token. The main chat, not a subagent on screen, is
+        /// what a restart brings back.
+        pub fn reportProgramResume(app: *App) void {
+            if (comptime (!@hasField(App, "program_resume") or !@hasDecl(App, "programResumeToken"))) return;
+            const token = App.programResumeToken() orelse return;
+            const session_id = savedSessionId(&app.main_agent) orelse return;
+            if (!app.program_resume.changed(session_id)) return;
+            // pathForPeerReexec allocates two copies of the path, so twice the path size fits any path fx can hold.
+            var path_buffer: [2 * std.Io.Dir.max_path_bytes]u8 = undefined;
+            const executable: []const u8 = App.programResumeExecutable(&path_buffer) orelse "fx";
+            const pid: u32 = @intCast(std.c.getpid());
+            const time_s = @divFloor(io_mod.milliTimestamp(), std.time.ms_per_s);
+            const bytes = app.program_resume.update(token, .{
+                .pid = pid,
+                .time_s = time_s,
+                .executable = executable,
+                .cwd = app.workspace_root,
+            }, session_id) orelse return;
+            const kind: []const u8 = if (app.program_resume.reported) "resume" else "clear";
+            debug_trace.logf("program_resume", "report kind={s} bytes={d}", .{ kind, bytes.len });
+            app.writeProgramResume(bytes);
+        }
+
+        /// Writes the report that removes this terminal's resume record, when fx
+        /// has reported one. Called when the person quits.
+        pub fn clearProgramResume(app: *App) void {
+            if (comptime (!@hasField(App, "program_resume") or !@hasDecl(App, "programResumeToken"))) return;
+            const token = App.programResumeToken() orelse return;
+            const pid: u32 = @intCast(std.c.getpid());
+            const time_s = @divFloor(io_mod.milliTimestamp(), std.time.ms_per_s);
+            const bytes = app.program_resume.clear(token, pid, time_s) orelse return;
+            debug_trace.logf("program_resume", "report kind=clear bytes={d}", .{bytes.len});
+            app.writeProgramResume(bytes);
+        }
+
         /// Replaces the cached footer title. App owns the copy.
         pub fn setCachedSessionTitle(app: *App, agent: *AppAgent, title: []const u8) !void {
             if (comptime !agents.hasAgentField(App, "session_title")) return;
