@@ -50,6 +50,16 @@ pub fn autoUpgradeOff(raw: []const u8) bool {
     return std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "false");
 }
 
+/// True when a test switch such as `FX_TEST_SKIP_ONBOARDING` is set to a
+/// non-blank value other than `0` or `false` (any case), after trimming
+/// spaces, tabs, CR and LF.
+pub fn testSwitchOn(raw: ?[]const u8) bool {
+    const value = raw orelse return false;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    return !std.mem.eql(u8, trimmed, "0") and !std.ascii.eqlIgnoreCase(trimmed, "false");
+}
+
 /// Every documented `FX_*` setting override set in this process, in a fixed
 /// order, with the value fx uses. A value fx ignores or rejects, such as
 /// `FX_MAX_AGENT_STEPS=many`, is left out. `FX_MODEL` overrides the model of
@@ -139,6 +149,18 @@ test "FX_SOUND presets and FX_AUTO_UPGRADE read the words fx accepts" {
     try std.testing.expect(soundPreset("  ") == null);
     try std.testing.expect(autoUpgradeOff("0") and autoUpgradeOff("FALSE"));
     try std.testing.expect(!autoUpgradeOff("1") and !autoUpgradeOff("no"));
+}
+
+test "a test switch is on for any value but blank, 0, or false" {
+    try std.testing.expect(!testSwitchOn(null));
+    try std.testing.expect(!testSwitchOn(""));
+    try std.testing.expect(!testSwitchOn(" \t"));
+    try std.testing.expect(!testSwitchOn("0"));
+    try std.testing.expect(!testSwitchOn("false"));
+    try std.testing.expect(!testSwitchOn("FALSE"));
+    try std.testing.expect(testSwitchOn("1"));
+    try std.testing.expect(testSwitchOn("yes"));
+    try std.testing.expect(testSwitchOn(" 1\n"));
 }
 
 var test_empty_environ: ?*std.process.Environ.Map = null;

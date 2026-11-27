@@ -753,7 +753,7 @@ fn finalizeTurn(
     }
 }
 
-fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {
+fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, model: []const u8, messages: *std.ArrayList(types.ChatMessage)) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     const tool_ctx = context.toolContext();
     try context.config.context_registry.appendDefaultTransient(.{
@@ -761,6 +761,7 @@ fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayL
         .access_scope = tool_ctx.access_scope,
         .interactive = false,
         .permission_mode = context.admission.permission_mode,
+        .model = model,
     }, arena, messages);
 }
 
