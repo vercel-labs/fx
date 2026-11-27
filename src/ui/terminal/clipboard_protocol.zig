@@ -54,7 +54,7 @@ const max_packet_bytes: usize = 8 * 1024;
 
 pub const ModeSupport = enum { supported, unsupported };
 
-pub const ReplyStart = union(enum) {
+const ReplyStart = union(enum) {
     /// Not a clipboard reply.
     none,
     /// May still become a clipboard reply.

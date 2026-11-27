@@ -169,18 +169,7 @@ pub const Monitor = struct {
         // reply, so the monitor that sees replies first hands them off.
         if (comptime clipboard_replies) {
             switch (clipboard_protocol.classifyReplyStart(candidate)) {
-                // A clipboard reply start that stops matching is a broken reply,
-                // not keys; the new byte is read on its own.
-                .none => if (clipboard_start) {
-                    debug_trace.logf(
-                        "theme",
-                        "theme clipboard reply start dropped bytes={d} reason=broken_reply",
-                        .{self.candidate_len - 1},
-                    );
-                    self.candidate_len = 0;
-                    self.candidate_deadline_ms = 0;
-                    return self.feed(byte, now_ms);
-                },
+                .none => if (clipboard_start) return self.dropBrokenClipboardStart(byte, now_ms),
                 .pending => return .pending,
                 .packet => {
                     self.candidate_len = 0;
@@ -361,6 +350,20 @@ pub const Monitor = struct {
         const light = self.notification_light orelse return;
         self.notification_light = null;
         self.settled_update = .{ .light = light };
+    }
+
+    /// A clipboard reply start that stops matching is a broken reply, not
+    /// keys: its bytes are dropped, and `byte`, which broke it, is read on
+    /// its own.
+    fn dropBrokenClipboardStart(self: *Monitor, byte: u8, now_ms: i64) FeedResult {
+        debug_trace.logf(
+            "theme",
+            "theme clipboard reply start dropped bytes={d} reason=broken_reply",
+            .{self.candidate_len - 1},
+        );
+        self.candidate_len = 0;
+        self.candidate_deadline_ms = 0;
+        return self.feed(byte, now_ms);
     }
 
     fn deferCandidate(self: *Monitor) void {
