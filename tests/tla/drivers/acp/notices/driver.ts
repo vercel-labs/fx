@@ -69,8 +69,8 @@ const PLANS: Plan[] = [
   { name: "empty-twice-fails", replies: ["empty_other", "empty_other"], requests: 2, replay: true },
   { name: "done-placeholder", replies: ["empty_stop"], requests: 1, replay: true },
   { name: "auth-failure", replies: ["unauthorized"], requests: 1, replay: false },
-  { name: "length-cut-text", replies: ["length_text"], requests: 1, replay: true },
-  { name: "length-cut-tools", replies: ["length_tools", "length_tools"], requests: 2, replay: true },
+  { name: "length-cut-text", replies: ["length_text", "reply"], requests: 2, replay: true },
+  { name: "length-cut-tools", replies: ["length_tools", "length_tools", "reply"], requests: 3, replay: true },
   { name: "restart-after-partial", replies: ["partial_eof", "reply"], requests: 2, replay: false },
   // The turns below end on a provider error or a language failure, so the
   // prompt answers with a JSON-RPC error and the text is the only reason.
@@ -154,11 +154,12 @@ export function classify(raw: string): string {
   if (text === "Done.") return "saved_reply";
   if (/^The reply ran out of output tokens before (any text\.$|its tool calls were complete)/.test(text)) return "saved_reply";
   if (/Restarted the answer$|^Response interrupted\. Restarting\.$/.test(text)) return "restarted";
+  if (/^The reply reached (its|the) output limit/.test(text)) return "operational";
   if (/^response hit provider length limit|^File change committed, but some secondary reporting failed\.$/.test(text)) return "system";
   if (/authentication failed · HTTP \d{3}$|^HTTP \d{3}/.test(text)) return "http_failure";
   // The text that ends a turn on a provider error event or a language failure.
   if (/NOTICE_CHECK_INVALID_/.test(text)) return "turn_failure_notice";
-  if (/^The model response used a different language than your request, and fx could not accept it\./.test(text)) return "turn_failure_notice";
+  if (/^The model answered in a different language\./.test(text)) return "turn_failure_notice";
   if (/^\[context\]|^skill discovery /.test(text)) return "context";
   return "unknown";
 }
