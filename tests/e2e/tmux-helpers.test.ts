@@ -632,16 +632,28 @@ tmuxTest("waitForReplyAndTurnEnd waits for the turn's end, not only the reply's 
   let session: TmuxSession | undefined;
   try {
     session = await TmuxSession.create({ cmd: `/bin/sh ${scriptPath}`, startupWaitMs: 0 });
-    let settledPane: string | undefined;
-    const settled = session.waitForReplyAndTurnEnd("REPLY_TEXT_DONE", 10_000).then((pane) => {
-      settledPane = pane;
-    });
     await session.waitForPane(
       (pane) => pane.includes("REPLY_TEXT_DONE") && pane.includes("Generating ("),
       10_000,
     );
-    // The helper polls every 25 ms, so a check of the text alone would return in this window.
-    await Bun.sleep(300);
+    // The pane now shows the text and a live turn until the release file exists. A second
+    // capture means the helper's first check of that pane did not return, while a helper that
+    // checked only the text would return at the first one.
+    const capture = session.capturePane.bind(session);
+    let captures = 0;
+    let secondCapture!: () => void;
+    const sawSecondCapture = new Promise<void>((resolve) => { secondCapture = resolve; });
+    session.capturePane = async (...args: Parameters<TmuxSession["capturePane"]>) => {
+      const pane = await capture(...args);
+      captures += 1;
+      if (captures === 2) secondCapture();
+      return pane;
+    };
+    let settledPane: string | undefined;
+    const settled = session.waitForReplyAndTurnEnd("REPLY_TEXT_DONE", 10_000).then((pane) => {
+      settledPane = pane;
+    });
+    await Promise.race([sawSecondCapture, settled]);
     expect(settledPane).toBeUndefined();
 
     writeFileSync(releasePath, "");
