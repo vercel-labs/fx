@@ -636,7 +636,8 @@ const AcpContext = struct {
     /// runs: `<child id>:<order>:<call id>`. It names the run's latest call of
     /// that id, and stays the same across the card's updates, so every id is
     /// unique in the session (`tests/tla/acp/AcpChildApproval.tla` UniqueIds).
-    /// Allocated in `arena`.
+    /// A subagent's read of `latest_call` holds `subagent_cards_mutex`, which
+    /// `startCall` writes it under. Allocated in `arena`.
     fn cardId(self: *const AcpContext, arena: Allocator, call_id: []const u8) ![]const u8 {
         const asker = self.subagent orelse return call_id;
         const order = self.latest_call.get(call_id) orelse 0;
@@ -2080,12 +2081,13 @@ fn recordChildToolActivity(
     if (ctx.subagent == null) return;
     var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
     defer arena_state.deinit();
-    const card_id = try ctx.cardId(arena_state.allocator(), call_id);
     // Under the card lock the prompt's end closes the cards with: a card it
     // closed, or a call it ended before this report, shows no further update.
+    // The card id reads `latest_call`, which `startCall` writes under this lock.
     const state = ctx.state;
     state.subagent_cards_mutex.lockUncancelable(io_mod.getIo());
     defer state.subagent_cards_mutex.unlock(io_mod.getIo());
+    const card_id = try ctx.cardId(arena_state.allocator(), call_id);
     const card = ctx.published_tool_calls.getKey(card_id) orelse return;
     if (ctx.finalUpdateSent(card)) return;
     if (!server.subagentCardOpenLocked(state, card)) {
@@ -3293,10 +3295,11 @@ fn requestAcpPermission(
 /// (`PermissionPromptClosed`), or the registry has no slot for a subagent
 /// (`PermissionPromptFull`). Admission reads each as "approval was required
 /// and could not be asked", with that cause, not as a refusal by the person.
+/// Out of memory is no refusal: it comes out as `OutOfMemory`.
 fn beginSubagentRequest(
     state: *server.ServerState,
     asker: SubagentAsker,
-) error{ PermissionPromptStopped, PermissionPromptClosed, PermissionPromptFull, PermissionPromptUnavailable }!u64 {
+) error{ PermissionPromptStopped, PermissionPromptClosed, PermissionPromptFull, OutOfMemory }!u64 {
     if (asker.stop.load(.seq_cst)) {
         debug_trace.logf("acp", "subagent permission refused child_id={s} work_id={s} reason=stopped", .{ asker.child_id, asker.work_id });
         return error.PermissionPromptStopped;
@@ -3306,8 +3309,7 @@ fn beginSubagentRequest(
         return switch (err) {
             error.PromptClosed => error.PermissionPromptClosed,
             error.RequestsFull => error.PermissionPromptFull,
-            // Out of memory for the entry names no cause.
-            error.OutOfMemory => error.PermissionPromptUnavailable,
+            error.OutOfMemory => error.OutOfMemory,
         };
     };
 }
@@ -6267,6 +6269,16 @@ test "ACP finishes each open tool-call card once when a turn is cancelled" {
         }
     }
     try std.testing.expectEqual([2]usize{ 1, 1 }, finals);
+}
+
+test "out of memory while a subagent asks for approval is out of memory, not an unavailable approval" {
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
+    var state = server.ServerState{ .alloc = failing.allocator(), .cfg = undefined, .writer = jsonrpc.Writer.init() };
+    defer state.pending_outbound.deinit(failing.allocator());
+    state.subagent_asks_open = true;
+    var stop = std.atomic.Value(bool).init(false);
+    const asker: SubagentAsker = .{ .child_id = "child_a", .work_id = "work_1", .name = "writer", .stop = &stop };
+    try std.testing.expectError(error.OutOfMemory, beginSubagentRequest(&state, asker));
 }
 
 test "a subagent's card carries its child id and ends once with its call's status" {
