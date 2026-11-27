@@ -52,7 +52,7 @@ export type WorldOptions = {
   store?: string;
   /** The queue keeps a message until a delivery acknowledges it, across crashes. `prompt()` stores the prompt first either way. Default false. */
   queueDurable?: boolean;
-  /** How often a waiting worker reads the session again. Default 1000. */
+  /** How often a waiting worker reads the session again, at most 2147483647. Default 1000. */
   pollMs?: number;
   /**
    * The queue keeps a message from every other delivery while one handles it, and delivers it again once that
@@ -70,9 +70,9 @@ export type WorldOptions = {
   runInRequest?: boolean;
   /** Keeps the request alive until `work`, a turn it runs after its response, settles, such as Vercel's `waitUntil` or Next's `after()`. */
   waitUntil?(work: Promise<void>): void;
-  /** Without liveness, how long a lease lasts after its worker took or last renewed it; renewed every third of that. At least 1000. Default 15000. */
+  /** Without liveness, how long a lease lasts after its worker took or last renewed it; renewed every third of that. From 1000 to 2147483647. Default 15000. */
   leaseMs?: number;
-  /** Each delivery stops `reserveMs` before `maxDurationMs`, or before the World's `getRuntimeDeadline()`. No limit by default. */
+  /** Each delivery stops `reserveMs` before `maxDurationMs`, or before the World's `getRuntimeDeadline()`. At most 2147483647. No limit by default. */
   maxDurationMs?: number;
   /** Default 30000. */
   reserveMs?: number;

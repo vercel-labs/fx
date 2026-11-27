@@ -81,6 +81,7 @@ const runtime_tool_batch = @import("tool_batch.zig");
 const observation = @import("observation.zig");
 const model_call_record = @import("model_call_record.zig");
 const resend_strategy = @import("resend_strategy.zig");
+const output_limit = @import("output_limit.zig");
 const runtime_request_recovery = @import("request_recovery.zig");
 const response_language = @import("response_language.zig");
 const tool_mcp_runtime = @import("../../tooling/tool_mcp_runtime.zig");
@@ -98,7 +99,6 @@ const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 const RefreshedGatewayCredential = runtime_deps.RefreshedGatewayCredential;
 
 const http_error_detail_max_bytes: usize = 4096;
-const empty_length_limited_reply = "The reply ran out of output tokens before any text.";
 // The AI SDK folds the stop reasons it does not list, such as Gemini's
 // UNEXPECTED_TOOL_CALL, into `other`. A reply that stops that way with no text
 // and no tool call has stalled mid-task, so the turn asks once for the next step
@@ -220,6 +220,302 @@ test "malformed tool call feedback names the tool, then asks for smaller calls" 
     );
 }
 
+// A reply cut off at its output limit: fx runs the calls the provider
+// finished, keeps text the reply wrote before any call, and tells the model in
+// the same turn what was cut, so it can go on with no one's help. The third
+// cut reply in a row ends the turn (`src/core/agent/runtime/output_limit.zig`,
+// `tests/tla/agent_runtime/OutputLimit.tla` EveryCutGetsNote, CutCallNeverRuns,
+// EndsAfterThird, NoFalseSuccess).
+const output_limit_smaller_steps =
+    "Continue the task in smaller steps: at most one or two edits per reply, and split a large file or change across several calls.";
+const output_limit_continue_text =
+    "Its text is above. Continue exactly where it stopped, without repeating it. If you planned to use tools, call them now, one small step at a time.";
+const output_limit_act_now =
+    "Think less and take one small step now: one or two tool calls, or a short answer.";
+
+/// The output limit a step's request asks for: fx's raised limit after a cut
+/// reply, or the model's own.
+fn stepOutputTokens(capabilities: model_capabilities.Capabilities, cut_reply_limit: ?u32) ?u32 {
+    return cut_reply_limit orelse model_capabilities.requestOutputTokens(capabilities);
+}
+
+fn outputLimitName(arena: Allocator, limit: ?u32) ![]const u8 {
+    const tokens = limit orelse return "its output limit";
+    return try arena.print("the output limit of {d} tokens", .{tokens});
+}
+
+fn callsWord(count: usize) []const u8 {
+    return if (count == 1) "call" else "calls";
+}
+
+/// What fx tells the model after a reply cut off at `limit`: it ran the
+/// reply's `ran` complete calls, and `cut` calls, the first to `cut_tool`,
+/// were cut off. `again` says the reply before it was cut too.
+fn outputLimitNote(arena: Allocator, limit: ?u32, ran: usize, cut: usize, cut_tool: ?[]const u8, again: bool) ![]const u8 {
+    const reached = try outputLimitName(arena, limit);
+    const again_text = if (again) " again" else "";
+    const to_tool = if (cut_tool) |name| try arena.print(" to {s}", .{name}) else "";
+    if (ran == 0) return try arena.print(
+        "Your last reply reached {s}{s} before its tool call{s} was complete, so fx did not run it. {s}",
+        .{ reached, again_text, to_tool, output_limit_smaller_steps },
+    );
+    const lost = if (cut > 0)
+        try arena.print("The call{s} after them was cut off, and fx did not run it.", .{to_tool})
+    else
+        "Anything the reply had after them is lost.";
+    return try arena.print(
+        "Your last reply reached {s}{s} and was cut off. fx ran its {d} complete tool {s}, and the results are above. {s} {s}",
+        .{ reached, again_text, ran, callsWord(ran), lost, output_limit_smaller_steps },
+    );
+}
+
+/// What fx shows when it goes on after a cut reply: the raised limit the
+/// next requests allow, if any, and whether the next step reasons at low
+/// effort.
+fn outputLimitNotice(arena: Allocator, limit: ?u32, ran: usize, raised: ?u32, low_effort: bool) ![]const u8 {
+    const reached = try outputLimitName(arena, limit);
+    const raise_text = if (raised) |tokens| try arena.print(" The next requests allow {d} output tokens.", .{tokens}) else "";
+    if (ran == 0) return try arena.print(
+        "The reply reached {s} before its tool call was complete. Asking the model to do it in smaller steps{s}.{s}",
+        .{ reached, if (low_effort) ", at low effort" else "", raise_text },
+    );
+    return try arena.print(
+        "The reply reached {s} and was cut off. fx ran its {d} complete tool {s} and asked the model to continue in smaller steps.{s}",
+        .{ reached, ran, callsWord(ran), raise_text },
+    );
+}
+
+/// What a turn that a cut reply ended says: the cuts in a row, when the
+/// notes ran out, and what the user can do.
+fn outputLimitEndNotice(arena: Allocator, limit: ?u32, cuts_in_a_row: usize, tool_calls: bool) ![]const u8 {
+    const reached = try outputLimitName(arena, limit);
+    const times = if (cuts_in_a_row > 1) try arena.print(" {d} times in a row", .{cuts_in_a_row}) else "";
+    if (!tool_calls) return try arena.print(
+        "The reply reached {s}{s} before it was complete, so fx stopped the turn. {s}",
+        .{ reached, times, empty_reply_follow_up },
+    );
+    return try arena.print(
+        "The reply reached {s}{s} before its tool calls were complete, so fx did not run them. {s}",
+        .{ reached, times, empty_reply_follow_up },
+    );
+}
+
+/// What fx tells the model after a reply cut off at `limit` before any tool
+/// call: with `text`, its text stays above the note and the model goes on
+/// from there; without, it spent the limit thinking. `again` says the reply
+/// before it was cut too.
+fn outputLimitTextNote(arena: Allocator, limit: ?u32, text: bool, again: bool) ![]const u8 {
+    const reached = try outputLimitName(arena, limit);
+    const again_text = if (again) " again" else "";
+    if (text) return try arena.print(
+        "Your last reply reached {s}{s} and was cut off. {s}",
+        .{ reached, again_text, output_limit_continue_text },
+    );
+    return try arena.print(
+        "Your last reply reached {s}{s} before any text or tool call, likely while thinking. {s}",
+        .{ reached, again_text, output_limit_act_now },
+    );
+}
+
+/// The text of replies cut off before any tool call, which a later reply
+/// completes. fx joins the parts, so the turn's final text, its saved turn,
+/// and a subagent's report hold the whole answer once
+/// (`tests/tla/agent_runtime/OutputLimit.tla` AnswerHasEveryPart).
+const ContinuedAnswer = struct {
+    text: std.ArrayList(u8) = .empty,
+    /// Where the first part's message starts in the turn's suffix, and where
+    /// the last note after a part ends.
+    suffix_start: ?usize = null,
+    suffix_end: usize = 0,
+
+    /// Keeps `part`, a cut reply's text, before its message joins a suffix of
+    /// `suffix_len` messages.
+    fn begin(self: *ContinuedAnswer, arena: Allocator, suffix_len: usize, part: []const u8) !void {
+        if (self.suffix_start == null) self.suffix_start = suffix_len;
+        try self.text.appendSlice(arena, part);
+    }
+
+    fn noteEnd(self: *ContinuedAnswer, suffix_len: usize) void {
+        if (self.suffix_start != null) self.suffix_end = suffix_len;
+    }
+
+    fn forget(self: *ContinuedAnswer) void {
+        self.text.clearRetainingCapacity();
+        self.suffix_start = null;
+        self.suffix_end = 0;
+    }
+
+    /// Ends the answer at tool activity: its parts stay in the turn as
+    /// replies of their own, and fx stops joining them into the final text.
+    fn endAtToolActivity(self: *ContinuedAnswer, reason: []const u8) void {
+        if (self.suffix_start == null) return;
+        debug_trace.logf("agent", "continued answer not joined: {s} ended it, so its {d} bytes stay replies of their own", .{ reason, self.text.items.len });
+        self.forget();
+    }
+
+    /// The whole answer, ending with `last`, the reply that finishes it. The
+    /// parts' messages and fx's notes leave `suffix` when nothing came after
+    /// them, so the saved turn holds the answer once.
+    fn finish(self: *ContinuedAnswer, arena: Allocator, last: []const u8, suffix: *std.ArrayList(ChatMessage)) ![]const u8 {
+        defer self.forget();
+        const start = self.suffix_start orelse return last;
+        if (suffix.items.len == self.suffix_end) suffix.shrinkRetainingCapacity(start);
+        return try std.mem.concat(arena, u8, &.{ self.text.items, last });
+    }
+};
+
+/// What fx shows after a reply cut off before any tool call, as it asks the
+/// model to go on.
+fn outputLimitTextNotice(arena: Allocator, limit: ?u32, text: bool, raised: ?u32, low_effort: bool) ![]const u8 {
+    const reached = try outputLimitName(arena, limit);
+    const raise_text = if (raised) |tokens| try arena.print(" The next requests allow {d} output tokens.", .{tokens}) else "";
+    if (text) return try arena.print(
+        "The reply reached {s} and was cut off. Asking the model to continue from where it stopped.{s}",
+        .{ reached, raise_text },
+    );
+    return try arena.print(
+        "The reply reached {s} before any text or tool call. Asking the model to take a smaller step{s}.{s}",
+        .{ reached, if (low_effort) ", at low effort" else "", raise_text },
+    );
+}
+
+test "output limit notes say what ran, what was cut, and how to go on" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings(
+        "Your last reply reached the output limit of 32768 tokens and was cut off. fx ran its 6 complete tool calls, and the results are above. The call to edit_file after them was cut off, and fx did not run it. " ++ output_limit_smaller_steps,
+        try outputLimitNote(arena, 32_768, 6, 1, "edit_file", false),
+    );
+    try std.testing.expectEqualStrings(
+        "Your last reply reached its output limit again and was cut off. fx ran its 1 complete tool call, and the results are above. Anything the reply had after them is lost. " ++ output_limit_smaller_steps,
+        try outputLimitNote(arena, null, 1, 0, null, true),
+    );
+    try std.testing.expectEqualStrings(
+        "Your last reply reached the output limit of 32768 tokens before its tool call to write_file was complete, so fx did not run it. " ++ output_limit_smaller_steps,
+        try outputLimitNote(arena, 32_768, 0, 1, "write_file", false),
+    );
+    try std.testing.expectEqualStrings(
+        "The reply reached the output limit of 32768 tokens and was cut off. fx ran its 6 complete tool calls and asked the model to continue in smaller steps. The next requests allow 65536 output tokens.",
+        try outputLimitNotice(arena, 32_768, 6, 65_536, false),
+    );
+    try std.testing.expectEqualStrings(
+        "The reply reached its output limit before its tool call was complete. Asking the model to do it in smaller steps.",
+        try outputLimitNotice(arena, null, 0, null, false),
+    );
+    try std.testing.expectEqualStrings(
+        "The reply reached the output limit of 8000 tokens before its tool call was complete. Asking the model to do it in smaller steps, at low effort.",
+        try outputLimitNotice(arena, 8_000, 0, null, true),
+    );
+    try std.testing.expectEqualStrings(
+        "The reply reached the output limit of 65536 tokens 3 times in a row before its tool calls were complete, so fx did not run them. Continue with a follow-up prompt if needed.",
+        try outputLimitEndNotice(arena, 65_536, 3, true),
+    );
+    try std.testing.expectEqualStrings(
+        "The reply reached the output limit of 32768 tokens before it was complete, so fx stopped the turn. Continue with a follow-up prompt if needed.",
+        try outputLimitEndNotice(arena, 32_768, 1, false),
+    );
+    try std.testing.expectEqualStrings(
+        "Your last reply reached the output limit of 32768 tokens and was cut off. Its text is above. Continue exactly where it stopped, without repeating it. If you planned to use tools, call them now, one small step at a time.",
+        try outputLimitTextNote(arena, 32_768, true, false),
+    );
+    try std.testing.expectEqualStrings(
+        "Your last reply reached its output limit again before any text or tool call, likely while thinking. Think less and take one small step now: one or two tool calls, or a short answer.",
+        try outputLimitTextNote(arena, null, false, true),
+    );
+    try std.testing.expectEqualStrings(
+        "The reply reached the output limit of 32768 tokens and was cut off. Asking the model to continue from where it stopped. The next requests allow 65536 output tokens.",
+        try outputLimitTextNotice(arena, 32_768, true, 65_536, false),
+    );
+    try std.testing.expectEqualStrings(
+        "The reply reached its output limit before any text or tool call. Asking the model to take a smaller step, at low effort.",
+        try outputLimitTextNotice(arena, null, false, null, true),
+    );
+}
+
+/// A cut reply's tool calls: those that are whole, which fx may run, and the
+/// rest, which never run. A call is whole when its arguments are a JSON
+/// object fx can read and another call started after it, so the stream had
+/// moved on before the cut. The call that started last may be the one the
+/// limit stopped, with arguments a layer before fx closed, and a call the
+/// stream never showed starting has no place in that order, so neither runs
+/// (`tests/tla/agent_runtime/OutputLimit.tla` CutCallNeverRuns). `cut` counts
+/// the listed calls that are not whole and the streamed starts no call
+/// finished. The slices live in `arena`.
+const CutReplyCalls = struct {
+    complete: []const ToolCall,
+    cut_listed: []const ToolCall,
+    cut: usize,
+    cut_tool: ?[]const u8,
+};
+
+/// Whether one of `calls` asks the user a question.
+fn callsAskQuestion(arena: Allocator, registry: tool_dispatch.Registry, calls: []const ToolCall) bool {
+    for (calls) |call| {
+        if (runtime_tool_presentation.activityKindForCall(arena, registry, call) == .ask) return true;
+    }
+    return false;
+}
+
+fn classifyCutReplyCalls(
+    arena: Allocator,
+    calls: []const ToolCall,
+    tool_starts: *const runtime_assistant_stream.StreamedToolStarts,
+    saw_tool_start: bool,
+) Allocator.Error!CutReplyCalls {
+    var complete: std.ArrayList(ToolCall) = .empty;
+    var cut_listed: std.ArrayList(ToolCall) = .empty;
+    var cut_tool: ?[]const u8 = null;
+    for (calls) |call| {
+        // A chat-completions reply keeps the cut call with its partial
+        // arguments, so the arguments are checked as well as the order.
+        const whole = call.argument_integrity == .valid and
+            tool_starts.startedBefore(call) and
+            try types.ToolArgumentIntegrity.classifySerialized(arena, call.arguments_json) == .valid;
+        if (whole) {
+            try complete.append(arena, call);
+        } else {
+            try cut_listed.append(arena, call);
+            if (cut_tool == null) cut_tool = call.name;
+        }
+    }
+    var cut = cut_listed.items.len;
+    const unfinished = tool_starts.unfinished(calls);
+    cut += unfinished.count;
+    // The next attempt clears the record, so the arena keeps a copy.
+    if (cut_tool == null) if (unfinished.first_tool) |name| {
+        cut_tool = try arena.dupe(u8, name);
+    };
+    // Starts past the record's capacity still show that a call began.
+    if (cut == 0 and complete.items.len == 0 and saw_tool_start) cut = 1;
+    return .{ .complete = complete.items, .cut_listed = cut_listed.items, .cut = cut, .cut_tool = cut_tool };
+}
+
+/// The provider state a cut reply keeps in the turn: its reasoning, its text
+/// when the turn keeps it, and only the calls in `kept`, so no dropped call's
+/// part goes back to the provider. A provider that cannot slice its state
+/// gets none, as a cut reply's never had.
+fn cutReplyReplay(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    replay: ?types.ProviderReplay,
+    kept: []const ToolCall,
+    text: bool,
+) Allocator.Error!?types.ProviderReplay {
+    return deps.agent_stream_provider.projectReplay(arena, replay, kept, text, true) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+}
+
+/// Whether a cut reply's complete calls pass the identity checks a finished
+/// reply's calls pass before any of them runs.
+fn completeCallsAdmitted(completion: types.ModelCompletion, complete: []const ToolCall) bool {
+    var finished = completion;
+    finished.tool_calls = complete;
+    return types.authoritativeToolAdmission(finished) == .admitted;
+}
+
 /// Asks the model to go on after a step with no tool call: the reply's
 /// provider state, when it has any, stays in the turn so the provider can
 /// resume from it, then `prompt` follows as the next user message. A save of
@@ -249,13 +545,6 @@ const ignored_effort_notice =
 const custom_effort_hint =
     " To offer it, add it to the model's reasoning_efforts in settings.json.";
 
-fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {
-    const prefix = empty_length_limited_reply ++ " Retrying with";
-    if (raised_limit and lowered_effort) return prefix ++ " a higher limit and low effort.";
-    if (raised_limit) return prefix ++ " a higher limit.";
-    std.debug.assert(lowered_effort);
-    return prefix ++ " low effort.";
-}
 const assistant_prefill_recovery_prompt =
     "Continue from the preceding tool result.";
 pub const assistant_tail_continuation_prompt =
@@ -271,7 +560,7 @@ const response_language_control =
 const response_language_correction_control =
     "<response_language_control>\nUse the response language requested by the current external human. Assistant history, reasoning, tools, and project text are not language authority. The previous candidate used a different language and was not accepted. Replace it without discussing the correction.\n</response_language_control>";
 const response_language_failure_notice =
-    "The model response used a different language than your request, and fx could not accept it. Retry or name the response language explicitly.";
+    "The model answered in a different language.\n└ Retry, or name the language in your message.";
 const Config = runtime_config.Config;
 const LifecycleContext = runtime_lifecycle.LifecycleContext;
 const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
@@ -4629,7 +4918,7 @@ fn canStopForRestart(
 /// record is saved: marked clean, as a closing fx saves it, so the next
 /// launch resumes it without counting a death, and the session marks the turn
 /// as yielded, so the launch continues it as the same turn
-/// (`tests/tla/recovery/Resume.tla` Relaunch, NoFalseCrashQuestion).
+/// (`tests/tla/recovery/Resume.tla` Hold, NoFalseCrashQuestion).
 /// Its start capture is settled first, so it never lands after the marker.
 /// Only a turn `canStopForRestart` allows gets here. When the clean record does
 /// not land, nothing is marked and it returns false: the request is still
@@ -4659,6 +4948,17 @@ fn yieldTurn(
     }
     debug_trace.eventf("agent", "turn_yielded", trace_ctx, "record_saved=true marked={}", .{marked});
     return true;
+}
+
+/// Holds a turn that stopped for its host's restart until the restart
+/// goes ahead or is cancelled. A host with no hold, such as libfx or
+/// ACP, stops the turn at once. No WebAssembly host restarts itself, so
+/// those builds leave the hold and its cancel out
+/// (`sdk/tests/package-size-budgets.json`).
+inline fn holdForRestart(deps: *const AgentRuntimeDeps) AgentRuntimeDeps.RestartHoldEnd {
+    if (comptime host_target.is_wasm) return .stop;
+    const hold = deps.hold_for_restart orelse return .stop;
+    return hold(deps.ctx);
 }
 
 /// A checkpoint `persistFinalReplyCheckpoint` saved holds the reply its turn
@@ -5161,7 +5461,7 @@ fn httpFailureDetail(
 }
 
 /// Shows the provider's reason in the transcript while a request waits for
-/// the user, since the status line holds what the user can do.
+/// the user, since the status line holds what the user can do. The CLI and ACP keep the codes inline.
 fn pushWaitingHttpFailureReason(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -5170,10 +5470,17 @@ fn pushWaitingHttpFailureReason(
     request_capabilities: model_capabilities.Capabilities,
 ) !void {
     const detail = try httpFailureDetail(arena, failure, job, request_capabilities);
-    const message = try gateway_error_format.formatHttpErrorMessage(arena, failureStatus(failure), detail);
     if (deps.push_interactive_notice) |push| {
-        try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
+        const notice = try gateway_error_format.formatHttpErrorNotice(arena, failureStatus(failure), detail);
+        try push(deps.ctx, .{
+            .topic = "",
+            .tone = .warning,
+            .body = notice.body,
+            .detail = notice.codes,
+            .detail_visibility = .full_only,
+        });
     } else {
+        const message = try gateway_error_format.formatHttpErrorMessage(arena, failureStatus(failure), detail);
         try deps.push_system_notice(deps.ctx, message);
     }
 }
@@ -5188,19 +5495,51 @@ fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: Que
     // name reaches the terminal.
     const message = if (types.displayGatewayTeam(job.gateway_team_label, job.gateway_team)) |team|
         try arena.print(
-            "fx sent this request for the Vercel team {s}. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
+            "fx sent this request for the Vercel team {s}.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.",
             .{team},
         )
     else
-        "fx sent this request for this login's Vercel team. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.";
-    if (deps.push_interactive_notice) |push| {
-        try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
-    } else {
-        try deps.push_system_notice(deps.ctx, message);
-    }
+        "fx sent this request for this login's Vercel team.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.";
+    try deps.pushWarningNotice(message);
 }
 
 const UserAnswer = enum { resend, cancelled, switch_model };
+
+/// Reads the provider, model and capabilities a subagent's continued request
+/// runs with: the pick its worker holds for this one wait, taken so no later
+/// request can use it (`tests/tla/subagent/ViewWaits.tla` PickForItsWaitOnly).
+/// A root request keeps the copy it started with, so only a non-root origin
+/// calls this.
+fn applyContinuedSelection(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    job: *QueuedPrompt,
+    capabilities: *model_capabilities.Capabilities,
+) !void {
+    const current = deps.continue_selection orelse return;
+    const selection = (try current(deps.ctx, arena)) orelse return;
+    job.provider = selection.provider;
+    job.model = selection.model;
+    capabilities.* = deps.available_model_capabilities(deps.ctx, job.model);
+}
+
+/// A subagent's waiting request continues on the model the view's picker
+/// chose: true when the person picked one, so the caller runs the attempt
+/// again (`tests/tla/subagent/ViewWaits.tla` ModelChosen). False for a root
+/// request, which keeps its own prompt and model.
+fn continueOnPickedModel(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    job: *QueuedPrompt,
+    capabilities: *model_capabilities.Capabilities,
+    request_recovery: *runtime_request_recovery.RequestRecovery,
+    config: Config,
+) !bool {
+    if (config.origin == .root) return false;
+    if (try request_recovery.waitForSend() == null) return false;
+    try applyContinuedSelection(deps, arena, job, capabilities);
+    return true;
+}
 
 /// Reports a failure that needs the user and waits for their answer.
 fn waitForUser(
@@ -5760,7 +6099,7 @@ fn onRequiredVisionStreamToolStart(
     arguments_json: ?[]const u8,
 ) void {
     if (!std.mem.eql(u8, tool_name, "vision")) {
-        runtime_assistant_stream.recordStreamToolStart(ctx, tool_name);
+        runtime_assistant_stream.recordStreamToolStart(ctx, tool_id, tool_name);
         return;
     }
     runtime_assistant_stream.onStreamToolStart(
@@ -6252,7 +6591,9 @@ pub fn processAgentPrompt(
 
     processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         observed_error = err;
-        if (finalization.state == .open) {
+        if (err == error.TurnYielded) {
+            finalization.leaveOpenForResume();
+        } else if (finalization.state == .open) {
             finalization.finish(.failed, null, null) catch |finalization_err| {
                 observed_error = finalization_err;
                 if (deps.compaction_failure) |out| out.* = null;
@@ -8072,6 +8413,58 @@ test "compaction activity transaction settles only after publication and preserv
     }
 }
 
+/// What `processQueuedPromptLoop` hands back or frees on every exit. A `defer`
+/// body is emitted again at each of the loop's `try` and `return` points, so
+/// these two scopes keep that work in one out-of-line call each.
+const LoopExitScope = struct {
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    within_turn_suffix_out: *std.ArrayList(ChatMessage),
+    local_grants: *std.ArrayList(PermissionGrant),
+    local_grants_out: *std.ArrayList(PermissionGrant),
+    turn_file_mutation_denials: *runtime_tool_admission.TurnFileMutationDenials,
+    turn_review_cache: *runtime_tool_admission.TurnReviewCache,
+    terminal_validation_retry: *runtime_tool_admission.TerminalValidationRetryState,
+    shell_execution_failure_retry: *runtime_tool_admission.ShellExecutionFailureRetryState,
+    identical_failure_escalation: *runtime_tool_admission.IdenticalFailureEscalationState,
+    completed_tool_names: *std.ArrayList([]u8),
+    completed_tool_names_out: *std.ArrayList([]u8),
+    context_delivery_state: *context_contract.DeliveryState,
+
+    /// Runs last declared first, as the separate defers did.
+    noinline fn release(self: *const LoopExitScope) void {
+        self.context_delivery_state.deinit(self.arena);
+        self.completed_tool_names_out.* = self.completed_tool_names.*;
+        self.identical_failure_escalation.deinit(self.arena);
+        self.shell_execution_failure_retry.deinit(self.arena);
+        self.terminal_validation_retry.deinit(self.arena);
+        self.turn_review_cache.deinit(self.arena);
+        self.turn_file_mutation_denials.deinit(self.arena);
+        self.local_grants_out.* = self.local_grants.*;
+        self.within_turn_suffix_out.* = self.within_turn_suffix.*;
+    }
+};
+
+/// The turn's results, copied back to the caller on exit. It starts once the
+/// loop's own copies exist, so an earlier failure leaves the caller's alone.
+const LoopResultScope = struct {
+    owned_refreshed_api_key: *?[]u8,
+    summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
+    summary_accumulator_out: *runtime_telemetry.TurnSummaryAccumulator,
+    finish_trace: *PromptFinishTrace,
+    finish_trace_out: *PromptFinishTrace,
+    interrupted_persisted: *bool,
+    interrupted_persisted_out: *bool,
+
+    /// Runs last declared first, as the separate defers did.
+    noinline fn release(self: *const LoopResultScope) void {
+        self.interrupted_persisted_out.* = self.interrupted_persisted.*;
+        self.finish_trace_out.* = self.finish_trace.*;
+        self.summary_accumulator_out.* = self.summary_accumulator.*;
+        if (self.owned_refreshed_api_key.*) |key| secret.zeroAndFree(std.heap.c_allocator, key);
+    }
+};
+
 fn processQueuedPromptLoop(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -8105,19 +8498,12 @@ fn processQueuedPromptLoop(
     var image_route_state = image_route.step(.{}, .{ .turn_started = request_capabilities.image_input_support }).state;
     const history_messages = history_messages_ptr.*;
     var within_turn_suffix = within_turn_suffix_ptr.*;
-    defer within_turn_suffix_ptr.* = within_turn_suffix;
     var local_grants = local_grants_ptr.*;
-    defer local_grants_ptr.* = local_grants;
     var turn_file_mutation_denials: runtime_tool_admission.TurnFileMutationDenials = .{};
-    defer turn_file_mutation_denials.deinit(arena);
     var turn_review_cache: runtime_tool_admission.TurnReviewCache = .{};
-    defer turn_review_cache.deinit(arena);
     var terminal_validation_retry: runtime_tool_admission.TerminalValidationRetryState = .{};
-    defer terminal_validation_retry.deinit(arena);
     var shell_execution_failure_retry: runtime_tool_admission.ShellExecutionFailureRetryState = .{};
-    defer shell_execution_failure_retry.deinit(arena);
     var identical_failure_escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
-    defer identical_failure_escalation.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var active_compaction_handoff: ?ChatMessage = null;
     var active_compaction_history_tail: []const ChatMessage = &.{};
@@ -8131,12 +8517,28 @@ fn processQueuedPromptLoop(
     // Request-token calibration lives on the agent so the first request of a
     // new turn still calibrates from the previous turn's exact usage.
     var completed_tool_names = completed_tool_names_ptr.*;
-    defer completed_tool_names_ptr.* = completed_tool_names;
-    var context_delivery_state: context_contract.DeliveryState = if (deps.context_enabled)
-        try context_contract.DeliveryState.initFromSnapshot(arena, job.context_snapshot)
-    else
-        .{};
-    defer context_delivery_state.deinit(arena);
+    // Starts empty so the scope below can own it before the first `try`; an
+    // empty state frees nothing, as when the context is off.
+    var context_delivery_state: context_contract.DeliveryState = .{};
+    const exit_scope: LoopExitScope = .{
+        .arena = arena,
+        .within_turn_suffix = &within_turn_suffix,
+        .within_turn_suffix_out = within_turn_suffix_ptr,
+        .local_grants = &local_grants,
+        .local_grants_out = local_grants_ptr,
+        .turn_file_mutation_denials = &turn_file_mutation_denials,
+        .turn_review_cache = &turn_review_cache,
+        .terminal_validation_retry = &terminal_validation_retry,
+        .shell_execution_failure_retry = &shell_execution_failure_retry,
+        .identical_failure_escalation = &identical_failure_escalation,
+        .completed_tool_names = &completed_tool_names,
+        .completed_tool_names_out = completed_tool_names_ptr,
+        .context_delivery_state = &context_delivery_state,
+    };
+    defer exit_scope.release();
+    if (deps.context_enabled) {
+        context_delivery_state = try context_contract.DeliveryState.initFromSnapshot(arena, job.context_snapshot);
+    }
     // Files saved notes delivered that changed since; their current rules
     // are delivered again when a tool call reaches them.
     var replaced_note_sources: std.ArrayList([]const u8) = .empty;
@@ -8200,13 +8602,19 @@ fn processQueuedPromptLoop(
     };
     var active_api_key: []const u8 = job.api_key;
     var owned_refreshed_api_key: ?[]u8 = null;
-    defer if (owned_refreshed_api_key) |key| secret.zeroAndFree(std.heap.c_allocator, key);
     var summary_accumulator = summary_accumulator_ptr.*;
-    defer summary_accumulator_ptr.* = summary_accumulator;
     var finish_trace = finish_trace_ptr.*;
-    defer finish_trace_ptr.* = finish_trace;
     var interrupted_persisted = interrupted_persisted_ptr.*;
-    defer interrupted_persisted_ptr.* = interrupted_persisted;
+    const result_scope: LoopResultScope = .{
+        .owned_refreshed_api_key = &owned_refreshed_api_key,
+        .summary_accumulator = &summary_accumulator,
+        .summary_accumulator_out = summary_accumulator_ptr,
+        .finish_trace = &finish_trace,
+        .finish_trace_out = finish_trace_ptr,
+        .interrupted_persisted = &interrupted_persisted,
+        .interrupted_persisted_out = interrupted_persisted_ptr,
+    };
+    defer result_scope.release();
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
     // The last reply stopped for `other` with nothing in it and was answered
@@ -8215,12 +8623,22 @@ fn processQueuedPromptLoop(
     var empty_reply_nudged = false;
     // The limit the turn's one retry of an empty, cut-short reply set. Later
     // steps keep it until the catalog names a limit of its own.
-    var length_retry_output_tokens: ?u32 = null;
     // The effort of the next step when it resends a reply that hit its output
     // limit with nothing usable; null when the next step is not a resend. A
     // resend's own reply is never resent, so one such reply costs at most one
     // more request.
     var length_resend_effort: ?types.ReasoningEffort = null;
+    // Replies in a row cut off at the output limit. A step that ends without
+    // a cut starts the count again
+    // (`tests/tla/agent_runtime/OutputLimit.tla` EveryCutGetsNote).
+    var output_limit_cuts: usize = 0;
+    // The text of replies cut before any tool call, which the reply that
+    // finishes the answer completes.
+    var continued_answer: ContinuedAnswer = .{};
+    // The higher output limit for the rest of the turn after a reply was cut.
+    // fx raises it at most once in a turn.
+    var cut_reply_output_tokens: ?u32 = null;
+    var cut_reply_raise_spent = false;
     var last_step_ctx = finish_trace.ctx;
     var current_step_index: usize = 0;
     var last_tool_call_name: []const u8 = "none";
@@ -8356,7 +8774,7 @@ fn processQueuedPromptLoop(
         // A changed runtime context joins this boundary before its steering,
         // as the notes above do (D93, D94).
         var current_runtime_context: std.ArrayList(ChatMessage) = .empty;
-        try deps.append_runtime_context(deps.ctx, overlay_arena, &current_runtime_context);
+        try deps.append_runtime_context(deps.ctx, overlay_arena, job.model, &current_runtime_context);
         const was_captured = runtime_context.captured != null;
         const runtime_update = try runtime_context.refresh(arena, overlay_arena, current_runtime_context.items);
         if (!was_captured and runtime_context.captured != null) {
@@ -8864,7 +9282,7 @@ fn processQueuedPromptLoop(
                 .tool_choice = tool_choice,
                 .vision_mode = vision_mode,
                 .provider_options = provider_opts,
-                .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities) orelse length_retry_output_tokens,
+                .max_output_tokens = stepOutputTokens(request_capabilities, cut_reply_output_tokens),
                 .budget = .{ .cancel_flag = config.cancel_flag },
             };
             // The request re-sends every image the session keeps, and
@@ -9178,7 +9596,9 @@ fn processQueuedPromptLoop(
             // prompt has sent its first request. Only the gateway path saves
             // the turn before its send, so only it stops here, and only when
             // the next launch can continue it (`canStopForRestart`); any
-            // other turn goes on, and the restart waits for it to end.
+            // other turn goes on, and the restart waits for it to end. It then
+            // holds there until the restart goes ahead or is cancelled
+            // (`holdForRestart`).
             const stop_requested = if (config.yield_flag) |flag| flag.load(.seq_cst) else false;
             if (job.provider == .gateway and quiesce.step(&turn_quiesce, .{ .boundary = .{
                 .now_ms = io_mod.milliTimestamp(),
@@ -9187,7 +9607,24 @@ fn processQueuedPromptLoop(
             } }) == .yield and canStopForRestart(deps, &request_recovery, &yield_skip_traced, step_ctx)) {
                 // A stop whose clean record does not land leaves the turn
                 // going on; the next boundary asks again.
-                if (yieldTurn(deps, &request_recovery, step_ctx)) return error.TurnYielded;
+                if (yieldTurn(deps, &request_recovery, step_ctx)) switch (holdForRestart(deps)) {
+                    .stop => return error.TurnYielded,
+                    // The restart was cancelled: the request goes out after
+                    // all, once its send's record is saved again.
+                    .go_on => try request_recovery.reopenAfterYield(),
+                    .cancelled => {
+                        // As at every cancel, steering that waits goes on
+                        // in place of the request that never went out.
+                        if (try append_immediate_steering_after_cancel(deps, arena, &within_turn_suffix, turn_id, "")) {
+                            reset_recovery_after_immediate_steering(&recovery_strategy, &recovery_cause, &preserved_tool_evidence);
+                            continue :agent_steps_loop;
+                        }
+                        runtime_telemetry.traceCancelObserved(step_ctx, false);
+                        try persistCancelledTurn(deps, finalization, job, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                        finish_trace.finish("interrupted");
+                        return;
+                    },
+                };
             }
 
             disarmCacheWarming(deps);
@@ -9257,18 +9694,27 @@ fn processQueuedPromptLoop(
                         debug_trace.logf("recovery", "unreadable reply limit reached, ending the turn err={s}", .{@errorName(err)});
                         break :blk null;
                     }
+                    if (evidence.cause == .unnamed_os_error and request_recovery.unnamedOsErrorEndsRequest()) {
+                        debug_trace.logf("recovery", "unnamed OS error limit reached, ending the turn err={s}", .{@errorName(err)});
+                        break :blk null;
+                    }
                     break :blk evidence;
                 } else null;
                 const failure_cause: types.ModelRecoveryCause = if (network_failure) |evidence|
                     switch (evidence.cause) {
                         // Saved sessions name only causes every version reads.
-                        .transport_interrupted, .unreadable_reply => .network_interrupted,
+                        .transport_interrupted, .unreadable_reply, .unnamed_os_error => .network_interrupted,
                         .connectivity_lost => .connectivity_lost,
                         .stream_stalled => .provider_stream_timeout,
                     }
                 else
                     recovery_cause;
-                const failure_diagnostic = types.ModelFailureDiagnostic.init(@errorName(err));
+                const unnamed_os_error = if (gateway_attempt_evidence.network_failure) |evidence|
+                    evidence.cause == .unnamed_os_error
+                else
+                    false;
+                // Its name says nothing; /trace has the errno (`os_errors.zig`).
+                const failure_diagnostic = types.ModelFailureDiagnostic.init(if (unnamed_os_error) "OS error, see /trace" else @errorName(err));
                 const failure_tool_evidence = settledAttemptToolEvidence(
                     deps.tool_registry,
                     preserved_tool_evidence,
@@ -9836,6 +10282,10 @@ fn processQueuedPromptLoop(
                             http_failure_notice_shown = false;
                             // The resend uses the credential the sign-in stored.
                             if (kind == .sign_in) credential_reload_pending = true;
+                            // A subagent's request continues on the model the
+                            // person chose for it while it waited
+                            // (`ViewWaits.tla` ModelChosen).
+                            if (config.origin != .root) try applyContinuedSelection(deps, arena, &job, &request_capabilities);
                             recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
                             reset_stream_for_next_attempt = true;
                             continue;
@@ -9847,6 +10297,21 @@ fn processQueuedPromptLoop(
                             // model.
                             restorePromptAfterTerminalFailure(deps, job, config);
                             try deps.push_event(deps.ctx, .open_model_picker);
+                            // A subagent has no composer to send from again:
+                            // its wait stays open across the picker, and the
+                            // person's choice continues this request with the
+                            // new model, as "retry" does (`ViewWaits.tla`
+                            // ModelChosen). Closing the picker without a choice
+                            // leaves the wait open and the card comes back;
+                            // only a cancel ends the turn.
+                            if (try continueOnPickedModel(deps, arena, &job, &request_capabilities, &request_recovery, config)) {
+                                stream_result.deinit(arena);
+                                stream_result_set = false;
+                                http_failure_notice_shown = false;
+                                recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
+                                reset_stream_for_next_attempt = true;
+                                continue;
+                            }
                         },
                         .cancelled => {},
                     }
@@ -9970,7 +10435,7 @@ fn processQueuedPromptLoop(
                             continue;
                         }
                         stream_ctx.drop_staged_response_language_candidate();
-                        try deps.push_system_notice(deps.ctx, response_language_failure_notice);
+                        try deps.pushWarningNotice(response_language_failure_notice);
                         finish_trace.finish("response_language_mismatch");
                         return error.ResponseLanguageMismatch;
                     },
@@ -10288,7 +10753,7 @@ fn processQueuedPromptLoop(
         held_live_call = null;
 
         var completion = streamCompletion(stream_result);
-        const provider_replay: ?types.ProviderReplay = if (completion.provider_state_json) |parts| replay: {
+        var provider_replay: ?types.ProviderReplay = if (completion.provider_state_json) |parts| replay: {
             // Later requests borrow these turn-arena bytes after response cleanup.
             stream_result.completed.completion.provider_state_json = null;
             break :replay .{ .source = .{ .provider = job.provider, .model = gateway_model }, .parts_json = parts };
@@ -10540,6 +11005,24 @@ fn processQueuedPromptLoop(
                 },
             }
         }
+        // A reply cut off at its output limit runs the calls the provider
+        // finished, or keeps the text it wrote before any call, and the model
+        // hears in the same turn what was cut, so it goes on without a person
+        // (`tests/tla/agent_runtime/OutputLimit.tla`).
+        const cut_reply: ?CutReplyCalls = if (disposition == .length_limited)
+            try classifyCutReplyCalls(arena, completion.tool_calls, &stream_ctx.tool_starts, stream_ctx.saw_tool_start)
+        else
+            null;
+        const reply_text = std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0;
+        const output_limit_action: ?output_limit.Action = if (cut_reply) |calls| output_limit.decide(.{
+            .earlier_cuts = output_limit_cuts,
+            .complete_calls = calls.complete.len,
+            .complete_calls_admitted = completeCallsAdmitted(completion, calls.complete),
+            .cut_calls = calls.cut,
+            .text = reply_text,
+            .provider_executed = hasProviderExecutedCall(completion.tool_calls),
+            .step_left = agent_steps.allowsStep(config.agent_step_limit, step + 1),
+        }) else null;
         if (disposition == .completed) try stream_ctx.start_response();
         var step_has_visible_tool_calls = false;
         var step_asked_question = false;
@@ -10565,9 +11048,14 @@ fn processQueuedPromptLoop(
                     .has_visible_text = step_has_visible_text,
                     .saw_tool_start = stream_ctx.saw_tool_start,
                     .saw_visible_text_after_tool_start = stream_ctx.saw_visible_text_after_tool_start,
-                    // A length-limited reply's calls never run: they are
-                    // dropped for a resend or blocked below.
-                    .asked_question = step_asked_question and disposition == .completed,
+                    // A cut reply runs only its complete calls, and only
+                    // when fx runs them, so only a question among those shows.
+                    .asked_question = if (disposition == .completed)
+                        step_asked_question
+                    else if (output_limit_action) |action|
+                        action == .run_complete_calls and callsAskQuestion(arena, deps.tool_registry, cut_reply.?.complete)
+                    else
+                        false,
                 },
             );
         stream_ctx.provisional_statuses.presentation_group_id =
@@ -10612,53 +11100,156 @@ fn processQueuedPromptLoop(
             },
         );
         try runtime_telemetry.traceReturnedToolCalls(arena, step_ctx, completion.tool_calls);
-        // A reply the provider cut short before any text, such as reasoning
-        // that never reached an answer followed at most by tool calls cut off
-        // mid-arguments, is dropped and asked once more when the resend can
-        // differ: with fx's limit when the request named none and the
-        // provider takes one, since the provider's own default ran out, and at
-        // `low` effort when that reasons less. A resend's own reply, visible
-        // text, tool calls the provider already ran, and a resend that would
-        // repeat the request end the turn as before.
-        const may_resend = disposition == .length_limited and
-            resend_effort == null and
-            std.mem.trim(u8, partial_assistant, " \t\r\n").len == 0 and
-            !hasProviderExecutedCall(completion.tool_calls) and
-            agent_steps.allowsStep(config.agent_step_limit, step + 1);
-        const raised_limit: ?u32 = if (may_resend and
-            length_retry_output_tokens == null and
-            config.provider_capabilities.sends_output_limit and
-            model_capabilities.requestOutputTokens(request_capabilities) == null)
-            model_capabilities.emptyLengthRetryOutputTokens(request_capabilities)
+        const sent_output_limit: ?u32 = if (config.provider_capabilities.sends_output_limit)
+            stepOutputTokens(request_capabilities, cut_reply_output_tokens)
         else
             null;
-        const lowered_effort = if (may_resend)
-            model_capabilities.lengthResendEffort(request_capabilities, step_effort)
-        else
-            null;
-        if (raised_limit != null or lowered_effort != null) {
-            if (raised_limit) |limit| length_retry_output_tokens = limit;
-            const effort = lowered_effort orelse step_effort;
-            length_resend_effort = effort;
-            try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
-            debug_trace.eventf("agent", "length_limited_resend", step_ctx, "dropped_tool_calls={d} max_output_tokens={any} effort={s}", .{
-                completion.tool_calls.len,
-                raised_limit,
-                effort.label(),
-            });
-            try deps.push_text(deps.ctx, .{ .operational = lengthResendNotice(raised_limit != null, lowered_effort != null) });
-            try deps.push_text(deps.ctx, .{ .operational = "\n" });
-            continue;
+        if (output_limit_action == null) {
+            output_limit_cuts = 0;
+        } else {
+            output_limit_cuts += 1;
+            // A cut reply skips the language check a finished one gets, so
+            // text held for that check shows now, before the notice; a short
+            // part would otherwise never show.
+            try stream_ctx.accept_staged_response_language();
         }
-        try runtime_assistant_stream.emitProviderLengthNotice(deps, arena, disposition);
+        if (output_limit_action) |action| if (action != .end_turn) {
+            const calls = cut_reply.?;
+            const tool_cut = action == .run_complete_calls or action == .ask_smaller_steps;
+            // fx chose the limit that ran out, so the rest of the turn gets
+            // more room, once.
+            var raised: ?u32 = null;
+            if (!cut_reply_raise_spent and config.provider_capabilities.sends_output_limit) {
+                cut_reply_raise_spent = true;
+                if (model_capabilities.cutReplyOutputTokens(request_capabilities)) |limit| {
+                    if (sent_output_limit == null or limit > sent_output_limit.?) {
+                        cut_reply_output_tokens = limit;
+                        raised = limit;
+                    }
+                }
+            }
+            const ran = if (action == .run_complete_calls) calls.complete.len else 0;
+            // A reply with nothing to run or show may have spent its limit
+            // reasoning, so the step after its note reasons less when the
+            // model offers it.
+            const lowered_effort = if ((action == .ask_smaller_steps or action == .act_now) and resend_effort == null)
+                model_capabilities.lengthResendEffort(request_capabilities, step_effort)
+            else
+                null;
+            if (lowered_effort) |effort| length_resend_effort = effort;
+            const again = output_limit_cuts > 1;
+            const note = if (tool_cut)
+                try outputLimitNote(arena, sent_output_limit, ran, calls.cut, calls.cut_tool, again)
+            else
+                try outputLimitTextNote(arena, sent_output_limit, action == .continue_text, again);
+            debug_trace.eventf("agent", "output_limit_cut", step_ctx, "action={s} complete_calls={d} cut_calls={d} text={s} in_a_row={d} max_output_tokens={any} raised_to={any} effort={s}", .{
+                @tagName(action),
+                calls.complete.len,
+                calls.cut,
+                if (reply_text) "true" else "false",
+                output_limit_cuts,
+                sent_output_limit,
+                raised,
+                if (lowered_effort) |effort| effort.label() else step_effort.label(),
+            });
+            diagnostics.recordOutputLimitStop(.{
+                .model = job.model,
+                .subagent_id = config.subagent_id,
+                .turn_id = turn_id,
+                .step_id = step_ctx.step_id,
+                .output_limit = sent_output_limit,
+                .raised_to = raised,
+                .output_tokens = completion.usage.output_tokens,
+                .complete_calls = calls.complete.len,
+                .cut_calls = calls.cut,
+                .in_a_row = output_limit_cuts,
+                .cut_tool = calls.cut_tool,
+                .action = switch (action) {
+                    .run_complete_calls => .ran_complete_calls,
+                    .ask_smaller_steps => .asked_smaller_steps,
+                    .continue_text => .continued_text,
+                    .act_now => .asked_to_act,
+                    .end_turn => unreachable,
+                },
+            });
+            const notice = if (tool_cut)
+                try outputLimitNotice(arena, sent_output_limit, ran, raised, lowered_effort != null)
+            else
+                try outputLimitTextNotice(arena, sent_output_limit, action == .continue_text, raised, lowered_effort != null);
+            // The notice starts a line of its own after the text it cut.
+            if (action == .continue_text) try deps.push_text(deps.ctx, .{ .operational = "\n" });
+            try deps.push_text(deps.ctx, .{ .operational = notice });
+            try deps.push_text(deps.ctx, .{ .operational = "\n" });
+            // Tool activity ends an answer the model was continuing: its text
+            // stays a reply of its own.
+            if (tool_cut) continued_answer.endAtToolActivity("a cut tool call");
+            switch (action) {
+                .run_complete_calls => {
+                    // The cut calls' rows settle as calls that never ran, and
+                    // the note follows the complete calls' results in the
+                    // next request.
+                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, calls.cut_listed, advertised_dynamic_tool_names);
+                    try stream_ctx.provisional_statuses.finishCutStarts(deps, stream_ctx.alloc, arena, turn_id, completion.tool_calls);
+                    try pending_context_notes.append(arena, .{ .role = .user, .content = note, .recovery_prompt = true });
+                    provider_replay = try cutReplyReplay(deps, arena, provider_replay, calls.complete, true);
+                    completion.tool_calls = calls.complete;
+                },
+                .ask_smaller_steps, .continue_text, .act_now => {
+                    try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
+                    try stream_ctx.provisional_statuses.finishCutStarts(deps, stream_ctx.alloc, arena, turn_id, completion.tool_calls);
+                    if (action == .continue_text) try continued_answer.begin(arena, within_turn_suffix.items.len, partial_assistant);
+                    // The model sees the text it wrote before the cut, so it
+                    // goes on from there. The text is copied, since the
+                    // stream's buffer is freed before the next request. A
+                    // reply with no text leaves no assistant message, and its
+                    // reasoning, which led to the cut, is not sent again: the
+                    // note follows the request alone, as the malformed tool
+                    // call feedback does.
+                    if (reply_text) try within_turn_suffix.append(arena, .{
+                        .role = .assistant,
+                        .content = try arena.dupe(u8, partial_assistant),
+                        .provider_replay = try cutReplyReplay(deps, arena, provider_replay, &.{}, true),
+                    });
+                    try within_turn_suffix.append(arena, .{ .role = .user, .content = note, .recovery_prompt = true });
+                    continued_answer.noteEnd(within_turn_suffix.items.len);
+                    continue :agent_steps_loop;
+                },
+                .end_turn => unreachable,
+            }
+        };
+        if (output_limit_action == .end_turn) try runtime_assistant_stream.emitProviderLengthNotice(deps, disposition);
+        // Tool calls run in this step: an answer the model was continuing
+        // ends here, and its text stays a reply of its own.
+        if (completion.tool_calls.len > 0) continued_answer.endAtToolActivity("tool calls");
         const terminal_provider_completion = isTerminalProviderExecutedCompletion(completion);
         const final_provider_replay = if (terminal_provider_completion or filtered_provider_calls.removed > 0)
             try deps.agent_stream_provider.projectReplay(arena, provider_replay, &.{}, true, !terminal_provider_completion)
         else
             provider_replay;
 
-        if (disposition == .length_limited and completion.tool_calls.len > 0) {
-            const assistant_text = try runtime_assistant_stream.finishLengthLimitedToolCallCompletion(deps, arena, completion, stream_ctx.raw_text.items.len);
+        if (output_limit_action == .end_turn) {
+            const calls = cut_reply.?;
+            diagnostics.recordOutputLimitStop(.{
+                .model = job.model,
+                .subagent_id = config.subagent_id,
+                .turn_id = turn_id,
+                .step_id = step_ctx.step_id,
+                .output_limit = sent_output_limit,
+                .raised_to = null,
+                .output_tokens = completion.usage.output_tokens,
+                .complete_calls = calls.complete.len,
+                .cut_calls = calls.cut,
+                .in_a_row = output_limit_cuts,
+                .cut_tool = calls.cut_tool,
+                .action = .ended_turn,
+            });
+            const tool_calls = calls.complete.len + calls.cut > 0;
+            const blocker = try outputLimitEndNotice(arena, sent_output_limit, output_limit_cuts, tool_calls);
+            // A reply cut before any tool call ends the answer it continued:
+            // the turn keeps every part, then says why it stopped. Only this
+            // reply's text is shown, since the earlier parts already were.
+            const earlier = if (tool_calls) "" else try continued_answer.finish(arena, "", &within_turn_suffix);
+            const assistant_text = try runtime_assistant_stream.finishLengthLimitedToolCallCompletion(deps, arena, completion, stream_ctx.raw_text.items.len, earlier, blocker);
             debug_trace.eventf("agent", "provider_completion_blocked", step_ctx, "finish_reason={s} tool_calls={d}", .{
                 finish_reason.label(),
                 completion.tool_calls.len,
@@ -10711,8 +11302,11 @@ fn processQueuedPromptLoop(
         }
 
         if (completion.tool_calls.len == 0) {
+            // This reply finishes an answer that cut replies began, so the
+            // turn's text is every part of it.
+            const answer = try continued_answer.finish(arena, partial_assistant, &within_turn_suffix);
             const has_content =
-                std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0;
+                std.mem.trim(u8, answer, " \t\r\n").len > 0;
             const empty_other = finish_reason == .other and !has_content;
             if (!empty_other) empty_reply_nudged = false;
             const needs_continuation =
@@ -10734,13 +11328,15 @@ fn processQueuedPromptLoop(
                 continue;
             }
 
-            const empty_final: []const u8 = if (disposition == .length_limited) empty_length_limited_reply else "Done.";
+            // A reply cut at its output limit never ends the turn here: fx
+            // asks the model to go on, or ends the turn above.
+            const empty_final: []const u8 = "Done.";
             // A stalled reply keeps no stand-in text, so steering or a subagent's
             // report that continues the turn below never saves "Done." for it
             // (`tests/e2e/gateway-stream-lifecycle.test.ts` "an empty reply that
             // stops for another reason gives way to a subagent's report, with no
             // Done.").
-            const raw_final = if (has_content) partial_assistant else if (empty_other) "" else empty_final;
+            const raw_final = if (has_content) answer else if (empty_other) "" else empty_final;
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
             const rendered = if (final_text.len > 0) final_text else empty_final;
             const history_text = try arena.dupe(u8, raw_final);

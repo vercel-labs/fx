@@ -19,10 +19,8 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const editor_state = @import("../input/editor_state.zig");
 const command_lex = @import("../shell_command/command_lex.zig");
 const mod_registry = @import("../mods/registry.zig");
-const context_limits = @import("../config/context_limits.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
-const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
-const types = @import("../shared/types.zig");
+const tool_runtime = @import("../tooling/tool_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -147,6 +145,7 @@ pub const State = struct {
     /// Set by process-exit teardown before it joins a pending reload, so the
     /// reload discards its candidate runtime without grace or session DELETEs.
     process_exiting: std.atomic.Value(bool) = .init(false),
+    held_for_trust: bool = false,
 
     /// Loads the host at startup with `load`, which reloads use too. The host's
     /// lifecycle is modeled in `tests/tla/mcp_host/HostLifecycle.tla`.
@@ -286,10 +285,21 @@ pub const State = struct {
         self.host_status_at_ms = 0;
     }
 
+    pub fn holdForTrust(self: *State) void {
+        self.held_for_trust = true;
+    }
+
+    pub fn releaseTrustHold(self: *State) void {
+        self.held_for_trust = false;
+        self.startHostServers();
+    }
+
     /// Starts every server in the background, so each is ready before it's
     /// needed. Nothing waits: the host's own thread connects them, and quitting
     /// still signals them all at once.
     pub fn startHostServers(self: *State) void {
+        // Servers wait for the folder access answer (`tests/tla/workspace_trust/WorkspaceTrust.tla` ConsentBeforeSession).
+        if (self.held_for_trust) return;
         const lease = self.leaseHost() orelse return;
         defer lease.deinit();
         self.host_started_ms = io_mod.milliTimestamp();
@@ -1092,81 +1102,30 @@ pub const State = struct {
         }
     };
 
-    pub fn hasTool(self: *State, name: []const u8, access: tool_mcp_runtime.Access) bool {
-        if (self.leaseHost()) |l| {
-            defer l.deinit();
-            return l.host.catalog.hasTool(name, access);
-        }
-        return false;
+    /// Points `tc`'s MCP operations at the host there is now, through
+    /// `Catalog.wireVia`: each runs on the host current when it runs. A
+    /// context made while there is no host gets none, as on a surface with no MCP.
+    pub fn wire(self: *State, tc: *tool_runtime.Context) void {
+        if (!self.hasHost()) return;
+        mcp_host.Catalog.wireVia(State, self, tc);
     }
 
-    pub fn validateTool(
-        self: *State,
-        arena: Allocator,
-        name: []const u8,
-        arguments_json: []const u8,
-        access: tool_mcp_runtime.Access,
-    ) !tool_mcp_runtime.ValidationResult {
-        if (self.leaseHost()) |l| {
-            defer l.deinit();
-            return l.host.catalog.validateTool(arena, name, arguments_json, access);
-        }
-        return .not_available;
+    fn hasHost(self: *State) bool {
+        self.host_mutex.lockUncancelable(io_mod.getIo());
+        defer self.host_mutex.unlock(io_mod.getIo());
+        return self.host != null;
     }
 
-    pub fn callTool(
-        self: *State,
-        arena: Allocator,
-        name: []const u8,
-        arguments_json: []const u8,
-        max_tool_result_bytes: usize,
-        options: tool_mcp_runtime.CallOptions,
-    ) !?tool_mcp_runtime.CallResult {
-        if (self.leaseHost()) |l| {
-            defer l.deinit();
-            return l.host.catalog.callTool(arena, name, arguments_json, max_tool_result_bytes, options);
-        }
-        return null;
+    /// The current host's catalog, kept until `releaseCatalog`, even if a
+    /// reload replaces the host meanwhile; null when there is no host.
+    pub fn acquireCatalog(self: *State) ?*mcp_host.Catalog {
+        const lease = self.leaseHost() orelse return null;
+        return &lease.host.catalog;
     }
 
-    pub fn searchTools(
-        self: *State,
-        arena: Allocator,
-        request: tool_mcp_runtime.SearchRequest,
-        permission_rules: types.PermissionRuleSet,
-        limits: context_limits.Values,
-        access: tool_mcp_runtime.Access,
-        cancel_flag: ?*std.atomic.Value(bool),
-    ) !tool_mcp_runtime.SearchResult {
-        if (self.leaseHost()) |l| {
-            defer l.deinit();
-            return l.host.catalog.searchTools(arena, request, permission_rules, limits, access, cancel_flag);
-        }
-        return .{ .model_output = try arena.dupe(u8, "{\"tools\":[],\"count\":0}") };
-    }
-
-    pub fn toolSchema(
-        self: *State,
-        arena: Allocator,
-        name: []const u8,
-        permission_rules: types.PermissionRuleSet,
-        limits: context_limits.Values,
-        access: tool_mcp_runtime.Access,
-        cancel_flag: ?*std.atomic.Value(bool),
-    ) !?tool_mcp_runtime.ToolSchemaResult {
-        if (self.leaseHost()) |l| {
-            defer l.deinit();
-            return l.host.catalog.toolSchema(arena, name, permission_rules, limits, access, cancel_flag);
-        }
-        return null;
-    }
-
-    pub fn snapshotToolDefinition(self: *State, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access) !tool_mcp_runtime.DefinitionSnapshot {
-        if (self.leaseHost()) |l| {
-            defer l.deinit();
-            return l.host.catalog.snapshotToolDefinition(alloc, name, known, permission_rules, limits, access);
-        }
-        return .unavailable;
+    pub fn releaseCatalog(self: *State, catalog: *mcp_host.Catalog) void {
+        const host_of_catalog: *mcp_host.Host = @fieldParentPtr("catalog", catalog);
+        self.releaseHost(host_of_catalog);
     }
 
     pub fn snapshotToolNames(

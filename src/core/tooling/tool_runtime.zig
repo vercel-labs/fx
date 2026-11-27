@@ -470,10 +470,6 @@ pub fn executeToolCallAuthorized(
         execution_ctx.session_grants = authority.grants;
         execution_ctx.permission_rules = authority.rules;
         execution_ctx.advertised_dynamic_tool_names = authority.integrations;
-        execution_ctx.mcp_access = rebindMcpAuthorityGeneration(
-            execution_ctx.mcp_access,
-            authority.generation,
-        );
     } else {
         execution_ctx.session_grants = request.session_grants;
         execution_ctx.advertised_dynamic_tool_names =
@@ -736,21 +732,6 @@ pub fn executeHostToolCallAuthorized(
         request.call,
     );
     return toolExecutionResultFromDispatch(dispatched, .{});
-}
-
-fn rebindMcpAuthorityGeneration(
-    access: tool_mcp_runtime.Access,
-    authority_generation: u64,
-) tool_mcp_runtime.Access {
-    return switch (access) {
-        .scoped => |scope| .{ .scoped = .{
-            .captured = scope.captured,
-            .admission_authority_generation = scope.admission_authority_generation,
-            .live = scope.live,
-            .action_authority_generation = authority_generation,
-        } },
-        else => access,
-    };
 }
 
 fn containsName(values: []const []const u8, needle: []const u8) bool {
@@ -3057,6 +3038,48 @@ fn subagentProviderRefusal(
     return .{ .status = .failure, .body = try why.body(alloc) };
 }
 
+/// Checks a subagent's waiting call as main's own, for `answerApproval`
+/// (`Runtime.ApprovalCheck`). It borrows the caller's tool context, which
+/// this provider call keeps alive while `executeManaged` runs.
+const SubagentApprovalCheck = struct {
+    runtime: Context,
+    /// The subagent whose request this check answers, for the card ACP shows
+    /// in main's session. Empty when the answer is not for a named subagent.
+    agent: []const u8 = "",
+
+    fn check(raw: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 {
+        const self: *SubagentApprovalCheck = @ptrCast(@alignCast(raw));
+        const ctx = self.runtime;
+        // A name this context cannot resolve is refused, not allowed:
+        // `requestPermissionOutcome` allows a name it has no contract for as
+        // its not-registered default, and the child's own admission runs the
+        // action, so allowing it would grant what main never saw (RULES.md
+        // R4.3). An MCP tool main does not advertise is such a name, since
+        // the child's profile may select servers main never did.
+        if (ctx.tool_registry.lookup(call.name) == null and
+            !containsName(ctx.advertised_dynamic_tool_names, call.name))
+        {
+            return try arena.dupe(u8, "your parent's permissions cannot check this action");
+        }
+        // The check answers another agent's call, not one of main's, so its
+        // card gets an id of its own: main's session must not reuse a card of
+        // its own with the child's id, and ACP names the agent on the card
+        // from this prefix (`subagentCardAgent`).
+        const check_call = types.ToolCall{
+            .id = try arena.print("subagent:{s}:{s}", .{ self.agent, call.id }),
+            .name = call.name,
+            .arguments_json = call.arguments_json,
+        };
+        // No selected MCP view is passed: a dynamic tool is checked as an
+        // advertised name of main's, and one it does not advertise is refused
+        // above, so nothing is checked through a view this path cannot supply.
+        return switch (try checkNestedCall(ctx, arena, check_call, null)) {
+            .allow => null,
+            .deny => |message| message,
+        };
+    }
+};
+
 fn executeSubagentProvider(
     raw_context: ?*anyopaque,
     arena: Allocator,
@@ -3071,6 +3094,15 @@ fn executeSubagentProvider(
         return subagentProviderRefusal(arena, .{ .caller_unavailable = .unidentified });
     const identity_epoch = host.issueOperationIdentity(invocation_id);
     var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
+    // The parent's answer checks the subagent's waiting call as main's own,
+    // with the permission context this call runs under.
+    var approval_check = SubagentApprovalCheck{
+        .runtime = ctx,
+        .agent = switch (request.*) {
+            .approve => |value| value.agent,
+            else => "",
+        },
+    };
     const output = host.executeManaged(arena, request, .{
         .observer = ctx.observer,
         .caller_id = caller_id,
@@ -3093,6 +3125,7 @@ fn executeSubagentProvider(
         .cancel_flag = runtimeCancelFlag(ctx),
         .caller_worker = ctx.worker,
         .turn_messages = ctx.current_turn_messages,
+        .approval_check = .{ .context = &approval_check, .check_fn = SubagentApprovalCheck.check },
         .progress = if (progress_bridge) |*bridge| bridge.sink() else null,
         .model_capability_resolver = ctx.model_capability_resolver,
         .model_override_resolver = ctx.model_override_resolver,
@@ -7430,10 +7463,9 @@ const McpFixture = struct {
         snapshot_rule_count: usize = 0,
     };
 
-    const AuthorityContext = struct {
+    const ScopedCallContext = struct {
         calls: usize = 0,
-        admission_generation: u64 = 0,
-        action_generation: u64 = 0,
+        captured: ?*const mcp_access_policy.View = null,
         expected_runtime_generation: ?u64 = null,
     };
 
@@ -7463,15 +7495,14 @@ const McpFixture = struct {
         return .{ .model_output = try arena.dupe(u8, "mcp ok") };
     }
 
-    fn callRecordingAuthority(raw_ctx: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
-        const ctx: *AuthorityContext = @ptrCast(@alignCast(raw_ctx));
+    fn callRecordingScope(raw_ctx: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
+        const ctx: *ScopedCallContext = @ptrCast(@alignCast(raw_ctx));
         const scope = switch (options.access) {
             .scoped => |value| value,
             else => return error.McpScopedAccessExpected,
         };
         ctx.calls += 1;
-        ctx.admission_generation = scope.admission_authority_generation;
-        ctx.action_generation = scope.action_authority_generation;
+        ctx.captured = scope.captured;
         ctx.expected_runtime_generation = options.expected_runtime_generation;
         return .{ .model_output = try arena.dupe(u8, "mcp ok") };
     }
@@ -7751,7 +7782,7 @@ test "an MCP call that finishes after a cancel is not a cancelled command" {
     try std.testing.expectEqual(false, result.cancelled);
 }
 
-test "MCP execution binds the last live action generation before transport" {
+test "MCP execution gives the transport the child's view and the expected generation, once" {
     const alloc = std.testing.allocator;
     var captured = mcp_access_policy.View{
         .runtime_generation = 1,
@@ -7761,27 +7792,14 @@ test "MCP execution binds the last live action generation before transport" {
         .tools = try alloc.alloc(mcp_access_policy.ToolIdentity, 0),
     };
     defer captured.deinit(alloc);
-    const UnusedLiveProvider = struct {
-        fn resolve(_: *anyopaque, _: Allocator) !tool_mcp_runtime.ResolvedLiveView {
-            return error.TestUnexpectedResult;
-        }
-    };
-    var marker: u8 = 0;
-    var authority = McpFixture.AuthorityContext{};
+    var recorded = McpFixture.ScopedCallContext{};
     var rt = TestRuntime{
-        .mcp_ctx = @ptrCast(&authority),
-        .mcp_call_tool = McpFixture.callRecordingAuthority,
+        .mcp_ctx = @ptrCast(&recorded),
+        .mcp_call_tool = McpFixture.callRecordingScope,
     };
     defer rt.deinit(alloc);
     var tool_ctx = rt.context();
-    tool_ctx.mcp_access = .{ .scoped = .{
-        .captured = &captured,
-        .admission_authority_generation = 17,
-        .live = .{
-            .context = @ptrCast(&marker),
-            .resolve_fn = UnusedLiveProvider.resolve,
-        },
-    } };
+    tool_ctx.mcp_access = .{ .scoped = .{ .captured = &captured } };
     const integrations = [_][]const u8{"mcp_fs_read"};
     const result = try executeToolCallAuthorized(tool_ctx, .{
         .call_allocator = alloc,
@@ -7810,16 +7828,9 @@ test "MCP execution binds the last live action generation before transport" {
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
     try std.testing.expectEqualStrings("mcp ok", result.model_output);
-    try std.testing.expectEqual(@as(usize, 1), authority.calls);
-    try std.testing.expectEqual(@as(u64, 17), authority.admission_generation);
-    try std.testing.expectEqual(@as(u64, 41), authority.action_generation);
-    try std.testing.expectEqual(@as(?u64, 73), authority.expected_runtime_generation);
-    const original_scope = switch (tool_ctx.mcp_access) {
-        .scoped => |scope| scope,
-        else => return error.McpScopedAccessExpected,
-    };
-    try std.testing.expectEqual(@as(u64, 17), original_scope.admission_authority_generation);
-    try std.testing.expectEqual(@as(u64, 0), original_scope.action_authority_generation);
+    try std.testing.expectEqual(@as(usize, 1), recorded.calls);
+    try std.testing.expectEqual(@as(?*const mcp_access_policy.View, &captured), recorded.captured);
+    try std.testing.expectEqual(@as(?u64, 73), recorded.expected_runtime_generation);
 }
 
 test "MCP dynamic tool preserves provider errors without leaking dispatch output" {
@@ -9368,4 +9379,19 @@ test "in auto mode a command's fx mcp call skips the safety check for the approv
     try std.testing.expectEqual(@as(usize, 1), reviewer.calls);
     try std.testing.expect(try nestedBridgeStatus(&rt, &.{}, "mcp_fixture_echo") != .denied);
     try std.testing.expectEqual(@as(usize, 2), reviewer.calls);
+}
+
+test "the approve check refuses a name main cannot resolve" {
+    var rt = TestRuntime{ .interactive = false };
+    defer rt.deinit(std.testing.allocator);
+    var check = SubagentApprovalCheck{ .runtime = rt.context() };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const refused = try SubagentApprovalCheck.check(
+        &check,
+        arena.allocator(),
+        .{ .id = "call-1", .name = "not_a_main_tool", .arguments_json = "{}" },
+    );
+    try std.testing.expect(refused != null);
+    try expectContains(refused.?, "your parent's permissions cannot check this action");
 }

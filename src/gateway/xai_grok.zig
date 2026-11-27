@@ -17,7 +17,7 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const Allocator = std.mem.Allocator;
 const endpoint = "https://cli-chat-proxy.grok.com/v1/responses";
 // The proxy gates this as Grok wire compatibility; fx identifies itself separately below.
-const version_lookup = @import("provider_versions.zig");
+const versions = @import("../core/gateway/provider_versions.zig");
 const e2e_endpoint_env = "FX_TEST_XAI_GROK_RESPONSES_URL";
 const max_error_body_bytes: usize = 256 * 1024;
 const max_sse_line_bytes: usize = 1024 * 1024;
@@ -271,15 +271,11 @@ pub fn streamPrepared(
     defer auth_headers.deinit(alloc);
     const request_endpoint = responsesEndpoint() catch |err| return stream_provider.failResult(err);
     const uri = try std.Uri.parse(request_endpoint);
-    const compatibility = if (auth_headers.include_subscription_headers)
-        try version_lookup.resolve(alloc, .grok, request.cancel_flag, request.deadline)
-    else
-        null;
 
     var extra_headers_buf: [max_extra_headers]std.http.Header = undefined;
     const extra_headers = extraHeaders(&extra_headers_buf, .{
         .subscription = auth_headers.include_subscription_headers,
-        .client_version = if (compatibility) |*version| version.slice() else null,
+        .client_version = if (auth_headers.include_subscription_headers) versions.grok_client_version else null,
         .account_id = auth_headers.account_id,
         .model = request.model,
         .session_id = request.session_id,
@@ -846,7 +842,6 @@ const XaiTestEnvironment = struct {
         };
         errdefer self.map.deinit();
         try self.map.put(e2e_endpoint_env, responses_url);
-        try self.map.put("FX_TEST_GROK_CLIENT_VERSION", "1.0.6");
         io_mod.setEnvironMap(&self.map);
         return self;
     }

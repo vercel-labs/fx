@@ -5,6 +5,7 @@
     {"name": "vision_json", "module": "fx", "test": "Vision JSON parsers tolerate arbitrary bounded bytes", "iterations": 1200000},
     {"name": "doctor_child_status", "module": "fx", "test": "doctor child status parser tolerates arbitrary bytes", "iterations": 1500000},
     {"name": "token_pass_memory", "module": "fx", "test": "token pass memory: a saved-answers file reads and rewrites on fuzzed bytes", "iterations": 1000000},
+    {"name": "worktree_links", "module": "fx", "test": "a worktree link's commondir and gitdir files never break the main root lookup on fuzzed bytes", "iterations": 20000},
     {"name": "host_record_decode", "module": "fx", "test": "a host record file decodes or is refused on fuzzed bytes", "iterations": 1500000},
     {"name": "mcp_add_reader_agree", "module": "fx", "test": "an add the reader's check accepts is loaded by the reader's own entry points, for fuzzed entries and files", "iterations": 300000},
     {"name": "fx_login_replace_rejected", "module": "fx", "test": "a forced fx login refresh rotates only a rejected or expired saved login on fuzzed tokens and deadlines", "iterations": 20000},
@@ -115,6 +116,7 @@
     {"name": "vercel_back_text", "module": "fx", "test": "a stderr note and a deferred path parse or are ignored, a deferred path survives its escaping, and an accepted name is clean, on fuzzed bytes", "iterations": 200000},
     {"name": "vercel_config_remote", "module": "fx", "test": "a remote section parses or is refused on fuzzed bytes, and a parsed remote keeps the strings its JSON gave", "iterations": 200000},
     {"name": "vercel_wait_answer", "module": "fx", "test": "a wait answer parses or is refused, and a parsed exit code holds when it is written back, on fuzzed bytes", "iterations": 200000},
-    {"name": "gateway_json_decode", "module": "fx", "test": "gateway JSON body decode stays bounded and round-trips gzip on fuzzed bytes", "iterations": 20000}
+    {"name": "gateway_json_decode", "module": "fx", "test": "gateway JSON body decode stays bounded and round-trips gzip on fuzzed bytes", "iterations": 20000},
+    {"name": "shortcut_map", "module": "fx", "test": "shortcut map parses or is refused on fuzzed bytes", "iterations": 400000}
   ]
 }

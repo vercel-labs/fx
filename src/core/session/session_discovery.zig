@@ -19,7 +19,7 @@ const types = @import("session_store_types.zig");
 const classifyAuthority = authority.classifyAuthority;
 const entryExistsRelative = authority.entryExistsRelative;
 const eventLogSize = authority.eventLogSize;
-const loadAuthorityMarkerOptional = authority.loadAuthorityMarkerOptional;
+const loadClassifiedAuthorityMarker = authority.loadClassifiedAuthorityMarker;
 const manifestSchemaVersion = authority.manifestSchemaVersion;
 const openSessionFile = authority.openSessionFile;
 const readOptionalSessionFile = authority.readOptionalSessionFile;
@@ -114,18 +114,25 @@ fn classifyReadOnlyCandidateWithCancellation(
     if (cancelled) |stop| {
         if (stop.load(.acquire)) return error.Cancelled;
     }
-    if (try session_log.readConversationMetadata(alloc, session_dir)) |value| {
-        var metadata = value;
-        defer metadata.deinit();
-        return classifyConversationCandidate(alloc, session_dir, session_id, metadata.value, cancelled);
+    // One read of session.json serves both the conversation check and the
+    // schema-v3 manifest.
+    const manifest_bytes = try session_log.readConversationMetadataBytes(alloc, session_dir);
+    defer if (manifest_bytes) |bytes| alloc.free(bytes);
+    if (manifest_bytes) |bytes| {
+        if (try session_log.decodeConversationMetadata(alloc, bytes)) |value| {
+            var metadata = value;
+            defer metadata.deinit();
+            return classifyConversationCandidate(alloc, session_dir, session_id, metadata.value, cancelled);
+        }
     }
     if (cancelled) |stop| {
         if (stop.load(.acquire)) return error.Cancelled;
     }
-    const candidate = switch (try classifyAuthority(alloc, session_dir, session_id)) {
-        .schema_v3 => classifySchemaV3Candidate(alloc, session_dir, session_id),
-        .legacy => classifyLegacyCandidateWithCancellation(alloc, session_dir, session_id, cancelled),
-    };
+    const candidate = if (try loadClassifiedAuthorityMarker(alloc, session_dir, session_id)) |marker| schema_v3: {
+        var owned_marker = marker;
+        defer owned_marker.deinit(alloc);
+        break :schema_v3 classifySchemaV3Candidate(alloc, session_dir, session_id, owned_marker, manifest_bytes);
+    } else classifyLegacyCandidateWithCancellation(alloc, session_dir, session_id, cancelled);
     var owned = try candidate;
     errdefer owned.deinit(alloc);
     if (cancelled) |stop| {
@@ -226,33 +233,28 @@ fn classifySchemaV3Candidate(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
     session_id: []const u8,
+    marker: authority.AuthorityMarker,
+    known_manifest_bytes: ?[]const u8,
 ) !ReadOnlyCandidate {
-    var marker = (try loadAuthorityMarkerOptional(alloc, session_dir)) orelse
-        return error.InvalidSessionFormat;
-    defer marker.deinit(alloc);
-    if (!std.mem.eql(u8, marker.session_id, session_id)) {
-        return error.InvalidSessionFormat;
-    }
-
-    const manifest_bytes = readOptionalSessionFile(
-        alloc,
-        session_dir,
-        "session.json",
-        session_projection.manifest_max_bytes,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return error.SessionNotFound,
-        else => return err,
-    } orelse return error.SessionNotFound;
-    defer alloc.free(manifest_bytes);
-    if (manifestSchemaVersion(alloc, manifest_bytes)) |schema_version| {
-        if (schema_version != 3) return error.UnsupportedSessionSchema;
-    } else |_| {}
+    const reread_bytes = if (known_manifest_bytes == null) try readManifestBytes(alloc, session_dir) else null;
+    defer if (reread_bytes) |bytes| alloc.free(bytes);
+    const manifest_bytes = known_manifest_bytes orelse reread_bytes.?;
+    // The reread refuses a manifest this long, so the bytes reused from the
+    // conversation check must too.
+    if (manifest_bytes.len >= session_projection.manifest_max_bytes) return error.InvalidSessionFormat;
     var manifest = session_projection.decodeManifest(
         alloc,
         manifest_bytes,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidSessionFormat,
+        else => {
+            // Every schema but 3 fails to decode; a known other version is
+            // unsupported rather than invalid.
+            if (manifestSchemaVersion(alloc, manifest_bytes)) |schema_version| {
+                if (schema_version != 3) return error.UnsupportedSessionSchema;
+            } else |_| {}
+            return error.InvalidSessionFormat;
+        },
     };
     defer manifest.deinit(alloc);
     if (!std.mem.eql(u8, manifest.id, session_id) or
@@ -297,6 +299,19 @@ fn classifySchemaV3Candidate(
         .storage = .schema_v3,
         .projection_state = projection_state,
     };
+}
+
+fn readManifestBytes(alloc: Allocator, session_dir: *io_mod.VerifiedDir) ![]u8 {
+    const bytes = readOptionalSessionFile(
+        alloc,
+        session_dir,
+        "session.json",
+        session_projection.manifest_max_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return error.SessionNotFound,
+        else => return err,
+    };
+    return bytes orelse return error.SessionNotFound;
 }
 
 /// Listing's recovery of a schema-v3 session whose manifest is missing or
@@ -650,4 +665,22 @@ fn discoveryCause(err: anyerror) DiscoveryCause {
         error.SessionPathUnsafe, error.DurablePathUnsafe => .unsafe_path,
         else => .invalid_manifest,
     };
+}
+
+test "a session whose manifest has another schema version is unsupported" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const id = "11111111111111111111111111111111";
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "authority.json",
+        .data = "{\"schema_version\":1,\"storage_format\":\"event_log_v1\",\"session_id\":\"" ++ id ++
+            "\",\"authority_id\":\"22222222222222222222222222222222\",\"source\":\"native_create\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "session.json",
+        .data = "{\"schema_version\":99,\"id\":\"" ++ id ++ "\"}",
+    });
+    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
+    try std.testing.expectError(error.UnsupportedSessionSchema, classifyReadOnlyCandidate(alloc, &dir, id));
 }

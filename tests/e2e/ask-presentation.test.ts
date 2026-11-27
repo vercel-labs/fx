@@ -1497,7 +1497,7 @@ describe("fx ask presentation", () => {
       const scrollback = await session.captureFullScrollback();
       const notice = "shell snapshot unavailable (the captured state exceeded 8 MiB)";
       expect(occurrences(scrollback, notice)).toBe(1);
-      expect(scrollback).toMatch(/^! startup: shell snapshot unavailable /m);
+      expect(scrollback).toMatch(/^⚠ startup: shell snapshot unavailable /m);
     },
     TIMEOUT,
   );
@@ -2034,7 +2034,7 @@ describe("fx ask presentation", () => {
 
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toMatch(
-        /^! permission: fx ask: permission required for tool execution in noninteractive mode\s*$/m,
+        /^⚠ permission: fx ask: permission required for tool execution in noninteractive mode\s*$/m,
       );
       expect(scrollback).toContain("fx ask: rerun with --auto to review this exact action automatically");
     },

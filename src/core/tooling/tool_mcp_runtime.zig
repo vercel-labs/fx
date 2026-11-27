@@ -13,6 +13,9 @@ const Allocator = std.mem.Allocator;
 pub const HasToolFn = *const fn (*anyopaque, []const u8, Access) bool;
 /// Whether `access` is a subagent's view of servers that have changed since it was given, which allows nothing now.
 pub const AccessChangedFn = *const fn (*anyopaque, Access) bool;
+/// What a search of MCP says when there is no MCP to search.
+pub const unavailable_search_output = "{\"tools\":[],\"count\":0,\"state\":\"unavailable\"}";
+
 /// Why a subagent's lookup of an MCP tool, server or search finds nothing after
 /// the session's servers changed under it, in the words every such answer ends with.
 pub const servers_changed_reason = "the session's MCP servers changed after it began. Work that starts later sees the current servers.";
@@ -24,28 +27,6 @@ pub const ToolSchemaFn = *const fn (*anyopaque, Allocator, []const u8, types.Per
 
 pub const Progress = mcp_contract.Progress;
 pub const ProgressSink = mcp_contract.ProgressSink;
-
-pub const ResolvedLiveView = struct {
-    /// Generation of the MCP-specific immutable view.
-    authority_generation: u64,
-    view: access_policy.View,
-    /// Full child authority generation for final action precommit.
-    action_authority_generation: u64 = 0,
-
-    pub fn deinit(self: *ResolvedLiveView, alloc: Allocator) void {
-        self.view.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-const LiveViewProvider = struct {
-    context: *anyopaque,
-    resolve_fn: *const fn (*anyopaque, Allocator) anyerror!ResolvedLiveView,
-
-    pub fn resolve(self: LiveViewProvider, alloc: Allocator) !ResolvedLiveView {
-        return self.resolve_fn(self.context, alloc);
-    }
-};
 
 /// The MCP servers an agent may use, by name: an instance's profile.
 pub const ServerFilter = struct {
@@ -63,21 +44,10 @@ pub const Access = union(enum) {
     /// Every tool of a server the filter allows. The host, which knows each
     /// tool's server, decides.
     servers: ServerFilter,
+    /// A subagent's view of the servers: the tools and servers its parent had when it was made.
     scoped: struct {
         captured: *const access_policy.View,
-        admission_authority_generation: u64,
-        live: LiveViewProvider,
-        action_authority_generation: u64 = 0,
     },
-
-    pub fn allowsTool(self: Access, runtime_generation: u64, name: []const u8) bool {
-        return switch (self) {
-            .unrestricted, .servers => true,
-            .disabled => false,
-            .scoped => |scope| scope.captured.runtime_generation == runtime_generation and
-                scope.captured.tool(name) != null,
-        };
-    }
 };
 
 pub const DefinitionSnapshot = union(enum) {

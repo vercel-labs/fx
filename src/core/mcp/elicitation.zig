@@ -321,119 +321,6 @@ pub const Request = struct {
     }
 };
 
-pub const legacy_url_required_error_code: i64 = -32042;
-
-const UrlRequired = struct {
-    requests: []Request,
-
-    pub fn deinit(self: *UrlRequired, alloc: Allocator) void {
-        for (self.requests) |*request| request.deinit(alloc);
-        alloc.free(self.requests);
-        self.* = undefined;
-    }
-};
-
-pub const LegacyUrlConsent = enum {
-    accepted,
-    declined,
-    cancelled,
-};
-
-pub fn renderLegacyUrlRequiredRequests(
-    alloc: Allocator,
-    required: UrlRequired,
-    limits: Limits,
-) Error![]u8 {
-    return renderLegacyUrlRequiredRequestsFallible(alloc, required, limits) catch |err| switch (err) {
-        error.WriteFailed => error.OutOfMemory,
-        else => |other| other,
-    };
-}
-
-fn renderLegacyUrlRequiredRequestsFallible(
-    alloc: Allocator,
-    required: UrlRequired,
-    limits: Limits,
-) (Error || std.Io.Writer.Error)![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeByte('{');
-    for (required.requests, 0..) |request, index| {
-        if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(request.elicitation_id.?, .{}, &out.writer);
-        try out.writer.writeAll(":{\"method\":\"elicitation/create\",\"params\":");
-        try out.writer.writeAll(request.raw_params_json);
-        try out.writer.writeByte('}');
-        if (out.writer.buffered().len > limits.max_response_bytes) return error.LimitExceeded;
-    }
-    try out.writer.writeByte('}');
-    return out.toOwnedSlice();
-}
-
-/// Parses the `2025-11-25` URL-required error data. Older legacy revisions do
-/// not define this error or URL mode and are rejected before any interaction.
-pub fn parseLegacyUrlRequired(
-    alloc: Allocator,
-    wire: Wire,
-    data_json: []const u8,
-    limits: Limits,
-) Error!UrlRequired {
-    if (wire != .legacy_mcp_2025_11) return error.UnsupportedMode;
-    if (data_json.len > limits.max_response_bytes) return error.LimitExceeded;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, data_json, .{
-        .parse_numbers = false,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidRequest,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidRequest;
-    const elicitations = parsed.value.object.get("elicitations") orelse
-        return error.InvalidRequest;
-    if (elicitations != .array or elicitations.array.items.len == 0 or
-        elicitations.array.items.len > limits.max_options)
-    {
-        return error.InvalidRequest;
-    }
-
-    const requests = try alloc.alloc(Request, elicitations.array.items.len);
-    var ids: std.StringHashMapUnmanaged(void) = .empty;
-    defer ids.deinit(alloc);
-    var count: usize = 0;
-    errdefer {
-        for (requests[0..count]) |*request| request.deinit(alloc);
-        alloc.free(requests);
-    }
-    for (elicitations.array.items) |value| {
-        if (value != .object) return error.InvalidRequest;
-        const params_json = try stringifyBounded(alloc, value, limits.max_request_bytes);
-        defer alloc.free(params_json);
-        requests[count] = try parseRequest(
-            alloc,
-            .legacy_mcp_2025_11,
-            params_json,
-            limits,
-        );
-        var current_owned = true;
-        errdefer if (current_owned) requests[count].deinit(alloc);
-        if (requests[count].mode != .url) {
-            requests[count].deinit(alloc);
-            current_owned = false;
-            return error.InvalidRequest;
-        }
-        const id = requests[count].elicitation_id.?;
-        if (ids.contains(id)) {
-            requests[count].deinit(alloc);
-            current_owned = false;
-            return error.InvalidRequest;
-        }
-        try ids.put(alloc, id, {});
-        count += 1;
-        current_owned = false;
-    }
-    return .{ .requests = requests };
-}
-
 const AcpProjectionScope = union(enum) {
     session: struct {
         session_id: []const u8,
@@ -1887,44 +1774,6 @@ test "exact numeric constraints retain large integer and fractional lexemes" {
     try std.testing.expectError(error.InvalidResponse, validateFormContent(alloc, form, not_multiple.value, .{}));
 }
 
-test "2025-11 URL-required errors parse only on their negotiated wire" {
-    const alloc = std.testing.allocator;
-    const data =
-        "{\"elicitations\":[{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"url-1\"}]}";
-    var required = try parseLegacyUrlRequired(alloc, .legacy_mcp_2025_11, data, .{});
-    defer required.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), required.requests.len);
-    try std.testing.expectEqualStrings("url-1", required.requests[0].elicitation_id.?);
-    const rendered = try renderLegacyUrlRequiredRequests(alloc, required, .{});
-    defer alloc.free(rendered);
-    try std.testing.expectEqualStrings(
-        "{\"url-1\":{\"method\":\"elicitation/create\",\"params\":{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"url-1\"}}}",
-        rendered,
-    );
-    try std.testing.expectError(
-        error.UnsupportedMode,
-        parseLegacyUrlRequired(alloc, .legacy_mcp_2025_06, data, .{}),
-    );
-    try std.testing.expectError(
-        error.InvalidRequest,
-        parseLegacyUrlRequired(
-            alloc,
-            .legacy_mcp_2025_11,
-            "{\"elicitations\":[{\"mode\":\"form\",\"message\":\"No\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}]}",
-            .{},
-        ),
-    );
-    try std.testing.expectError(
-        error.InvalidRequest,
-        parseLegacyUrlRequired(
-            alloc,
-            .legacy_mcp_2025_11,
-            "{\"elicitations\":[{\"mode\":\"url\",\"message\":\"One\",\"url\":\"https://example.test/one\",\"elicitationId\":\"same\"},{\"mode\":\"url\",\"message\":\"Two\",\"url\":\"https://example.test/two\",\"elicitationId\":\"same\"}]}",
-            .{},
-        ),
-    );
-}
-
 test "ambiguous schemas are rejected before interaction" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(
@@ -2228,16 +2077,6 @@ fn checkAllocationFailures(alloc: Allocator) !void {
         .{},
     );
     alloc.free(projected);
-
-    var url_required = try parseLegacyUrlRequired(
-        alloc,
-        .legacy_mcp_2025_11,
-        "{\"elicitations\":[{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"id\"}]}",
-        .{},
-    );
-    defer url_required.deinit(alloc);
-    const url_requests = try renderLegacyUrlRequiredRequests(alloc, url_required, .{});
-    alloc.free(url_requests);
 }
 
 fn fuzzElicitationJson(_: void, smith: *std.testing.Smith) !void {
