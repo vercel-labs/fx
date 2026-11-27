@@ -1776,6 +1776,11 @@ describe("cli: status", () => {
       const config = (...args: string[]) => runFx(["config", ...args], {
         cwd: home, env: { ...NO_GATEWAY_AUTH, ...NO_SETTING_ENV, HOME: home, FX_HOME: profile },
       });
+      const original = readFileSync(file, "utf8");
+      const restricted = await config("set", "shortcuts.f9", JSON.stringify({ action: "command", command: "/permissions ask" }));
+      expect(restricted.code).toBe(2);
+      expect(restricted.stderr).toContain("not available from shortcuts");
+      expect(readFileSync(file, "utf8")).toBe(original);
       const key = "shortcuts.ctrl+alt+k";
       expect((await config("get", key)).code).toBe(0);
       const field = await config("get", "shortcuts.CTRL+ALT+k.action");

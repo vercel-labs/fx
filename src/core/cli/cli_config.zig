@@ -4,6 +4,7 @@
 const std = @import("std");
 const builtin_commands = @import("../../builtins/commands.zig");
 const cli_flags = @import("cli_flags.zig");
+const command_router = @import("../slash_commands/command_router.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const env_settings = @import("../config/env_settings.zig");
@@ -290,7 +291,7 @@ fn shortcutKeyOf(key: []const u8) ?[]const u8 {
 /// A chord travels in the patch as a value, and the store spells it when it
 /// writes, so no slice points at a buffer that this function is about to lose.
 /// A key that is no chord, such as a malformed entry, is removed as written.
-fn shortcutChange(options: Options, entry: []const u8, problem: *WriteProblem) error{InvalidConfigValue}!Change {
+fn shortcutChange(options: Options, entry: []const u8, problem: *WriteProblem) error{ RefusedConfigSetting, InvalidConfigValue }!Change {
     if (options.action == .unset) {
         const patch: settings_store.ShortcutPatch = if (shortcut_map.Chord.parse(entry)) |chord|
             .{ .chord = chord, .action_json = null, .check = checkShortcutMap }
@@ -304,7 +305,14 @@ fn shortcutChange(options: Options, entry: []const u8, problem: *WriteProblem) e
     var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
     const value = std.json.parseFromSliceLeaky(std.json.Value, fixed.allocator(), raw, .{}) catch
         return invalid(problem, shortcut_action_expected);
-    _ = shortcut_map.parseAction(value) catch return invalid(problem, shortcut_action_expected);
+    const action = shortcut_map.parseAction(value) catch return invalid(problem, shortcut_action_expected);
+    if (action == .command) {
+        const parsed = command_router.parse(builtin_commands.slash_registry, action.command.text());
+        if (command_router.chordCommandRoute(parsed) == .refuse) {
+            problem.* = .{ .refused = "this command is not available from shortcuts; type it yourself if you intend to run it" };
+            return error.RefusedConfigSetting;
+        }
+    }
     const text = canonicalShortcutText(value, raw);
     return .{
         .patch = .{ .shortcut = .{ .chord = chord, .action_json = text, .check = checkShortcutMap } },

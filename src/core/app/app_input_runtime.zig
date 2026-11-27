@@ -177,61 +177,6 @@ fn validateExplicitModelSelection(selection: ExplicitModelSelection, capabilitie
     return .{ .selection = selection };
 }
 
-/// How a chord's slash command is carried out. `run_now` runs the real
-/// command at once; it only reads state or flips a reversible setting, and
-/// never touches the draft. `open_catalog` reuses the native Ctrl+P flow,
-/// which lends the composer and restores the draft. `preview` writes the
-/// exact command into an empty composer, and it runs only on Enter.
-const ChordCommandRoute = enum { run_now, open_catalog, preview };
-
-fn chordCommandRoute(parsed: command_router.ParsedCommand) ChordCommandRoute {
-    return switch (parsed) {
-        .fast, .version, .status, .stats, .usage, .help => .run_now,
-        .effort => |level| if (blankArgs(level)) .preview else .run_now,
-        .ultrafast => |rest| if (ultrafastReadOrToggle(rest)) .run_now else .preview,
-        .model => |query| if (blankArgs(query)) .open_catalog else .preview,
-        else => .preview,
-    };
-}
-
-fn blankArgs(rest: []const u8) bool {
-    return std.mem.trim(u8, rest, " \t").len == 0;
-}
-
-/// `/ultrafast` with no argument or `status` reads state; `on` and `off` flip a
-/// reversible mode, as `/fast` does.
-fn ultrafastReadOrToggle(rest: []const u8) bool {
-    const arg = std.mem.trim(u8, rest, " \t");
-    return std.ascii.eqlIgnoreCase(arg, "") or std.ascii.eqlIgnoreCase(arg, "status") or
-        std.ascii.eqlIgnoreCase(arg, "on") or std.ascii.eqlIgnoreCase(arg, "off");
-}
-
-test "chord commands: read-only and reversible run now, the rest waits" {
-    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.status));
-    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.stats));
-    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.usage));
-    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.help));
-    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.version));
-    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.{ .fast = "" }));
-    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.{ .effort = "low" }));
-    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(.{ .ultrafast = "status" }));
-    try std.testing.expectEqual(ChordCommandRoute.preview, chordCommandRoute(.{ .effort = "  " }));
-    try std.testing.expectEqual(ChordCommandRoute.preview, chordCommandRoute(.{ .ultrafast = "always" }));
-}
-
-test "chord /model with no argument reuses the native catalog, not a typed command" {
-    try std.testing.expectEqual(ChordCommandRoute.open_catalog, chordCommandRoute(.{ .model = "" }));
-    try std.testing.expectEqual(ChordCommandRoute.preview, chordCommandRoute(.{ .model = "gpt-5" }));
-}
-
-test "chord dangerous commands are previewed, never run from the key" {
-    try std.testing.expectEqual(ChordCommandRoute.preview, chordCommandRoute(.{ .permissions = "full-access" }));
-    try std.testing.expectEqual(ChordCommandRoute.preview, chordCommandRoute(.quit));
-    try std.testing.expectEqual(ChordCommandRoute.preview, chordCommandRoute(.reset_session));
-    try std.testing.expectEqual(ChordCommandRoute.preview, chordCommandRoute(.{ .shell = "rm -rf x" }));
-    try std.testing.expectEqual(ChordCommandRoute.preview, chordCommandRoute(.credits));
-}
-
 test "legacy aliases act byte for byte like their canonical command" {
     const builtin_commands = @import("../../builtins/commands.zig");
     const pairs = [_]struct { alias: []const u8, canonical: []const u8 }{
@@ -247,7 +192,7 @@ test "legacy aliases act byte for byte like their canonical command" {
         const canonical_action = try shortcut_map.parseAction(canonical_json.value);
         try std.testing.expect(std.meta.eql(alias_action, canonical_action));
         const parsed = command_router.parse(builtin_commands.slash_registry, alias_action.command.text());
-        try std.testing.expectEqual(chordCommandRoute(parsed), chordCommandRoute(command_router.parse(builtin_commands.slash_registry, canonical_action.command.text())));
+        try std.testing.expectEqual(command_router.chordCommandRoute(parsed), command_router.chordCommandRoute(command_router.parse(builtin_commands.slash_registry, canonical_action.command.text())));
     }
 }
 
@@ -256,7 +201,7 @@ test "chord unregistered command text is unknown and never routed" {
     const parsed = command_router.parse(builtin_commands.slash_registry, "/no-such-command");
     try std.testing.expect(parsed == .unknown);
     const status = command_router.parse(builtin_commands.slash_registry, "/status");
-    try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(status));
+    try std.testing.expectEqual(command_router.ChordCommandRoute.run_now, command_router.chordCommandRoute(status));
 }
 
 /// What a keystroke means while the wait card holds the keys. The card's own
@@ -2467,17 +2412,14 @@ pub fn Runtime(comptime App: type) type {
         /// A bound command is a slash command the router recognizes, never the
         /// shell and never prompt text. Read-only and reversible commands run
         /// from the key and keep the draft. `/model` alone opens the native
-        /// catalog. Every other command is previewed: written into an empty
+        /// catalog. Only commands explicitly classified for preview enter an empty
         /// composer, and run only on Enter through the normal submit path with
         /// its confirmations. An existing draft is never replaced.
         fn runBoundCommand(app: *App, agent: *AppAgent, text: []const u8) !void {
             if (comptime !@hasDecl(App, "handleCommand")) return;
             const parsed = command_router.parse(app.slashRegistry(), text);
-            switch (parsed) {
-                .shell, .unknown => return writeShortcutRefusal(app, "this shortcut is not a runnable slash command; nothing ran"),
-                else => {},
-            }
-            switch (chordCommandRoute(parsed)) {
+            switch (command_router.chordCommandRoute(parsed)) {
+                .refuse => return writeShortcutRefusal(app, "this command is not available from shortcuts; nothing ran"),
                 .run_now => try app.handleCommand(text),
                 .open_catalog => try openModelCatalogKey(app, agent),
                 .preview => {

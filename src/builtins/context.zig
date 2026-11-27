@@ -2865,6 +2865,7 @@ const personal_shortcut_note =
     "where chord is a key chord such as ctrl+1 or alt+m, and the action is " ++
     "{\"action\":\"select_model\",\"provider\":\"...\",\"model\":\"...\",\"effort\":\"...\",\"fast_mode\":true} " ++
     "or {\"action\":\"command\",\"command\":\"/name arguments\"}, for example {\"action\":\"command\",\"command\":\"/model\"} or {\"action\":\"command\",\"command\":\"/fast\"}. " ++
+    "Security and administrative commands cannot be bound. Do not work around a refused shortcut. " ++
     "If the chord already has an action, name it and ask the user before replacing or removing it. " ++
     "If ultrafast_mode is true, save no preset: ultrafast cannot be stored, and it must never be saved as fast_mode.\n";
 

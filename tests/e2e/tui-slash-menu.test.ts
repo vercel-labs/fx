@@ -4989,6 +4989,27 @@ describe.skipIf(SKIP)("tui: custom shortcuts", () => {
     TEST_TIMEOUT,
   );
 
+  test("custom shortcut from an existing profile cannot stage a permission command", async () => {
+    const fixture = createModelsMenuFixture();
+    writeProfile(fixture.settingsPath, {
+      shortcuts: { up: { action: "command", command: "/permissions ask" } },
+    });
+    const before = readFileSync(fixture.settingsPath, "utf8");
+    const fake = startFakeGateway([fakeGatewayFinalText("UNCHANGED")], { models: CATALOG });
+    session = await openShell(fixture, fake);
+    await session.sendKeys("Up");
+    const pane = await session.waitForPane(
+      (screen) => screen.includes("not available from shortcuts") && hasEmptyComposer(screen), TIMEOUT,
+    );
+    expect(pane).not.toContain("/permissions ask");
+    expect(fake.requests).toHaveLength(0);
+    await session.sendKeys("Enter");
+    await session.sendLiteralText("still editing");
+    await session.waitForPane((screen) => composerContains(screen, "still editing"), TIMEOUT);
+    expect(fake.requests).toHaveLength(0);
+    expect(readFileSync(fixture.settingsPath, "utf8")).toBe(before);
+  }, TEST_TIMEOUT);
+
   test(
     "custom shortcut alt+m opens the model picker and returns the draft",
     async () => {
