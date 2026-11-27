@@ -287,11 +287,14 @@ test.skipIf(!tmuxAvailable())("/effort lists the model's levels with the one in 
   await waitForEffortMenu(current, "high     current");
   await session.sendKeys("Escape");
   await session.waitForPane((pane) => !pane.includes("Effort 5"), 5_000);
-  // A typed character closes the menu and lands in the composer.
+  // A typed character stays in the composer as the menu's query, and Esc
+  // closes the menu.
   await session.sendText("/effort");
   await waitForEffortMenu(current);
   await session.sendLiteral("x");
-  await session.waitForPane((pane) => !pane.includes("Effort 5") && /^┃ x$/m.test(pane), 5_000);
+  await session.waitForPane((pane) => pane.includes("Effort 1") && /^┃ x$/m.test(pane), 5_000);
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("Effort 1"), 5_000);
   await session.sendKeys("C-u");
   expect(savedEffort(current)).toBe("high");
   expect(readFileSync(current.stderrPath, "utf8")).toBe("");
@@ -339,6 +342,47 @@ test.skipIf(!tmuxAvailable())("/effort <level> applies the level directly, and t
   // The model's default sends no effort at all.
   expect(turn("second question")).not.toHaveProperty("reasoning");
   expect(menuViews(current, "direct")).toEqual([]);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("typing over the open /effort menu filters its levels, as typing over the /model menu filters its models", async () => {
+  const current = await launch();
+  const { session, gateway } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  // The typed text stays in the composer as the query, and the first match
+  // is highlighted.
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  await press(session, "Down");
+  await session.sendKeys("Enter");
+  await session.waitForText("Reasoning effort set to xhigh for acme/thinker", 5_000);
+  expect(savedEffort(current)).toBe("xhigh");
+
+  // A query with no match lists no level, and Enter neither applies one nor
+  // sends the query as a prompt: Backspace still edits the menu's query, and
+  // an empty query lists every level again with the one in use highlighted.
+  await session.sendText("/effort");
+  await waitForEffortMenu(current, "xhigh    current");
+  await session.sendLiteral("zz");
+  await session.waitForPane((pane) => pane.includes("Effort 0") && pane.includes("No levels found.") && /^┃ zz$/m.test(pane), 5_000);
+  await session.sendKeys("Enter");
+  await session.sendKeys("BSpace");
+  await session.sendKeys("BSpace");
+  await session.waitForPane((pane) => pane.includes("Effort 5") && /^┃ *$/m.test(pane), 5_000);
+  await session.sendKeys("Enter");
+  await session.waitForPane((pane) => count(pane, "Reasoning effort set to xhigh for acme/thinker") === 2, 5_000);
+  expect(savedEffort(current)).toBe("xhigh");
+  expect(gateway.requests.some((request) => request.body.includes("zz"))).toBe(false);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+
+  const views = menuViews(current, "filter").map((view) => view.menu);
+  expect(views).toContainEqual({ count: 2, model: MODEL, levels: ["high", "xhigh"], current: null });
+  expect(views).toContainEqual({ count: 0, model: MODEL, levels: [], current: null });
+  expect(views.at(-1)).toEqual({ count: 5, model: MODEL, levels: LEVELS, current: "xhigh" });
+  expect(highlightsAfter(current, /^h$/)).toEqual(["high"]);
+  expect(highlightsAfter(current, ARROW)).toEqual(["xhigh"]);
+  expect(highlightsAfter(current, /^\x7f$/).at(-1)).toBe("xhigh");
 }, TIMEOUT);
 
 test.skipIf(!tmuxAvailable())("a level the model does not offer, or a malformed one, changes nothing and names the levels", async () => {

@@ -2413,11 +2413,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn dismissActiveMenusForComposerEdit(app: *App, agent: *AppAgent) bool {
-            // The fork and effort menus read no query from the composer, so an
-            // edit closes them. The agent list searches with it instead.
+            // The fork menu reads no query from the composer, so an edit
+            // closes it. The agent list and the effort menu filter with it
+            // instead.
             const fork_menu_closed = cancelForkMenu(app, agent);
-            const effort_menu_closed = cancelEffortMenu(app);
-            return dismissAuthPickerForComposerEdit(app, agent) or fork_menu_closed or effort_menu_closed;
+            return dismissAuthPickerForComposerEdit(app, agent) or fork_menu_closed;
         }
 
         fn dismissActiveMenusThenRedraw(app: *App, agent: *AppAgent) void {
@@ -2950,8 +2950,13 @@ pub fn Runtime(comptime App: type) type {
             syncHelpMenu(app);
             syncSkillsMenu(app);
             syncModelMenu(app);
+            syncEffortMenu(app);
             syncSessionMenu(app, agent);
             syncMcpHostMenu(app);
+        }
+
+        fn syncEffortMenu(app: *App) void {
+            app.input_runtime.effort_menu.setQuery(app.input_runtime.edit_state.input.items);
         }
 
         fn syncMcpHostMenu(app: *App) void {
@@ -3377,17 +3382,28 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Closes the `/effort` menu and clears its query from the
+        /// composer, as Esc on the `/model` menu does.
         fn cancelEffortMenu(app: *App) bool {
             if (!app.input_runtime.effort_menu.active) return false;
             app.input_runtime.effort_menu.close(app.alloc);
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             return true;
         }
 
         /// Applies the level highlighted in the `/effort` menu and closes it.
+        /// With no level matching the query, Enter keeps the menu open and
+        /// never sends the query as a prompt.
         fn submitEffortMenuSelection(app: *App, agent: *AppAgent) !bool {
             const menu = &app.input_runtime.effort_menu;
-            const effort = menu.selectedEffort() orelse return false;
-            menu.close(app.alloc);
+            if (!menu.active) return false;
+            const effort = menu.selectedEffort() orelse {
+                debug_trace.logf("input", "effort menu enter ignored reason=no_matching_level", .{});
+                app.shell.render_requests.request(.footer);
+                return true;
+            };
+            _ = cancelEffortMenu(app);
             try session_commands.Commands(App).selectEffort(app, agent, effort);
             app.shell.render_requests.request(.footer);
             return true;
@@ -9496,6 +9512,32 @@ test "app_input_runtime ctrl+t closes the open effort menu and cycles from the l
     try std.testing.expectEqual(routing_cycle_efforts[2], app.agent().effort);
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
     try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+}
+
+test "app_input_runtime typing over the open effort menu filters it, and Enter with no match sends nothing" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+    try app.input_runtime.effort_menu.open(alloc, "test/model", app.resolvedModelCapabilities("test/model"), .auto);
+
+    try feedRoutingBytes(&app, "zz");
+    try std.testing.expect(app.input_runtime.effort_menu.active);
+    try std.testing.expectEqualStrings("zz", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.effort_menu.levels().len);
+    try feedRoutingBytes(&app, "\r");
+    try std.testing.expect(app.input_runtime.effort_menu.active);
+    try std.testing.expectEqualStrings("zz", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+
+    try feedRoutingBytes(&app, "\x7f\x7fh");
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.effort_menu.levels().len);
+    try std.testing.expect(app.input_runtime.effort_menu.levels()[0].eql(routing_cycle_efforts[2]));
+    try feedRoutingBytes(&app, "\r");
+    try std.testing.expect(!app.input_runtime.effort_menu.active);
+    try std.testing.expectEqual(routing_cycle_efforts[2], app.agent().effort);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
 }
 
 test "app_input_runtime ctrl+c while the picker borrows the composer keeps the stashed draft and its image" {

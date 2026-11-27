@@ -156,9 +156,10 @@ pub const ForkMenuProjection = struct {
 pub const EffortMenuProjection = struct {
     active: bool = false,
     model: []const u8 = "",
-    /// `default`, then the model's levels.
+    /// The levels that match the query: `default`, then the model's levels.
     levels: []const types.ReasoningEffort = &.{},
-    current: usize = 0,
+    /// The level in use, or null when the query leaves it out.
+    current: ?usize = null,
     selected: usize = 0,
     window_start: usize = 0,
 };
