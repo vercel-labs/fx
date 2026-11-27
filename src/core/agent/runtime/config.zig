@@ -52,6 +52,9 @@ pub const Config = struct {
     /// request that needs the user then waits for this flag or the cancel
     /// flag. Without it, such a request ends the turn.
     recovery_continue_flag: ?*std.atomic.Value(bool) = null,
+    /// Optional retry budget in milliseconds from a request's first failure.
+    /// Only `fx ask` sets this; null retries transient failures without a cap.
+    recovery_retry_budget_ms: ?u64 = null,
     /// Set by the same host when the sign-in it opened for a request that
     /// waits for one closes without a new login, so the request tries the
     /// saved login once more.

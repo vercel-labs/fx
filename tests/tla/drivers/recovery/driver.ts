@@ -127,7 +127,7 @@ async function loadGraph(out: string): Promise<Graph> {
     states.set(id!, state);
     if (/style\s*=\s*filled/.test(rest!)) inits.push(id!);
   }
-  if (inits.length !== 2) fail(2, `the graph has ${inits.length} initial states, not one for each kind of host`);
+  if (inits.length !== 3) fail(2, `the graph has ${inits.length} initial states, not one for each kind of host`);
   console.log(`graph: ${states.size} states, ${run.durationMs} ms`);
   return { states, next, inits };
 }
@@ -170,10 +170,13 @@ function opsFor(label: string, s: Model): Op[] {
   }
 }
 
-const initStep = (graph: Graph, init: string): Step => ({
-  label: "Init", from: init, to: init,
-  ops: [{ op: "walk" }, { op: "start", resume: false }],
-});
+const initStep = (graph: Graph, init: string): Step => {
+  const s = graph.states.get(init)!;
+  return {
+    label: "Init", from: init, to: init,
+    ops: [{ op: "walk" }, { op: "start", resume: false, budgeted: Boolean(s.budgeted) }],
+  };
+};
 
 // Each walk picks among the possible next steps in proportion to
 // 1 / (1 + how often their action was taken so far), so rare actions such as
@@ -296,15 +299,22 @@ function check(walks: Walk[], graph: Graph, results: Result[], tamper: boolean):
       if (step.label === "Init" || step.label === "Relaunch" || step.label === "Continue") shown = "clear";
       for (const result of own) if (result.plan?.status) shown = result.plan.status.kind;
       // fx's own error replaces the question nobody can answer.
-      if (step.label === "HostEnds") shown = "failed";
+      if (step.label === "HostEnds" || t.phase === "done_failed") shown = "failed";
       if (!t.alive) shown = "none";
       expect("status", t.status, shown);
 
       const real = last.state;
       if (!t.alive) return;
       if (!Active.has(t.phase)) {
-        // fx, not the module, ends a request nobody can answer.
-        const finish = { done_ok: "succeeded", done_cancel: "cancelled", done_failed: null }[t.phase as string];
+        // fx, not the module, ends a request nobody can answer (HostEnds);
+        // a budgeted host ends inside the module with finish: "failed".
+        const finish = t.phase === "done_ok"
+          ? "succeeded"
+          : t.phase === "done_cancel"
+          ? "cancelled"
+          : step.label === "HostEnds"
+          ? null
+          : "failed";
         expect("finished", finish ?? null, own.find((x) => x.plan?.finish)?.plan?.finish ?? null);
         expect("phase", "idle", real.phase);
         expect("record deleted", null, last.disk);
@@ -408,6 +418,11 @@ if (options.selfCheck) {
       name: "shows a turn it continues after a restart as a retry",
       target: "    if (start.continues) return sendPlanned(state, now_ms);\n",
       planted: "",
+    },
+    {
+      name: "ignores the retry budget on a budgeted host",
+      target: "if (elapsed_ms +| requested_delay_ms > budget_ms) {",
+      planted: "if (false and elapsed_ms +| requested_delay_ms > budget_ms) {",
     },
   ];
   let mutantsCaught = true;

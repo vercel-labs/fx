@@ -245,6 +245,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_RECOVERY_RETRY_BUDGET_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_REPORT_DELIVERY_HELD": {
       "job": "test",
       "stability": "internal"

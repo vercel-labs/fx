@@ -7,9 +7,10 @@
 //! events at the same times always produce the same plans.
 //!
 //! Only `succeeded` finishes a request successfully, and only `user_cancel`
-//! finishes it any other way. Every failure waits instead: for time, or for
-//! the user when only they can fix it (`tests/tla/recovery/Recovery.tla`
-//! NeverGivesUp, Heals). A wait for a sign-in also resends now and then on
+//! or an `fx ask` retry budget (`retry_budget_ms`) finishes it any other way.
+//! Otherwise every failure waits: for time, or for the user when only they can
+//! fix it (`tests/tla/recovery/Recovery.tla` NeverGivesUp, Heals, BudgetEnds).
+//! A wait for a sign-in also resends now and then on
 //! its own, since a login can work again without the user (SignInPoll). A
 //! reply the content filter blocks is resent at once a few times before the
 //! request needs the user (FilterBounded). Comments below name the model
@@ -76,6 +77,10 @@ pub const Start = struct {
     /// planned send goes out with no new attempt and nothing on the status
     /// line (`tests/tla/recovery/Recovery.tla` NoFalseAlarm).
     continues: bool = false,
+    /// Optional retry budget in milliseconds from the request's first failure;
+    /// null keeps retrying transient failures without a time cap. Only `fx ask`
+    /// sets this (`tests/tla/recovery/Recovery.tla` BudgetEnds).
+    retry_budget_ms: ?u64 = null,
 };
 
 pub const Failure = struct {
@@ -128,7 +133,7 @@ pub const Send = packed struct {
     no_fast: bool = false,
 };
 
-pub const Finish = enum { succeeded, cancelled };
+pub const Finish = enum { succeeded, cancelled, failed };
 
 /// Opaque saved state. fx stores the bytes and hands them back unchanged.
 pub const Record = [32]u8;
@@ -208,6 +213,10 @@ pub const State = struct {
     polling: bool = false,
     /// The user continued while that resend was on the wire.
     continue_pending: bool = false,
+    /// Optional budget in milliseconds from `first_failure_ms` (`fx ask`).
+    retry_budget_ms: ?u64 = null,
+    /// When the first failure of this request happened, for `retry_budget_ms`.
+    first_failure_ms: ?u64 = null,
 };
 
 const Phase = enum(u8) { idle = 0, sending = 1, waiting = 2, need_user = 3 };
@@ -260,6 +269,20 @@ const max_sign_in_wait_seconds: u64 = 999 * 3600 + 59 * 60;
 const record_version: u8 = 1;
 /// Short forms must fit a 48-column row after the two-column status sign.
 const short_columns = 46;
+/// Default retry budget for `fx ask`: 5 minutes from the request's first
+/// failure (`tests/tla/recovery/Recovery.tla` BudgetEnds).
+pub const default_retry_budget_ms: u64 = 5 * 60 * 1_000;
+/// Shortest budget `FX_TEST_RECOVERY_RETRY_BUDGET_MS` may set.
+pub const min_test_retry_budget_ms: u64 = 100;
+
+/// Returns `default_retry_budget_ms`, or `value` when it is a whole number of
+/// milliseconds from `min_test_retry_budget_ms` to the default.
+pub fn retryBudgetFromValue(value: ?[]const u8) u64 {
+    const text = value orelse return default_retry_budget_ms;
+    const parsed = std.fmt.parseInt(u64, text, 10) catch return default_retry_budget_ms;
+    if (parsed < min_test_retry_budget_ms or parsed > default_retry_budget_ms) return default_retry_budget_ms;
+    return parsed;
+}
 
 // Events.
 
@@ -275,6 +298,7 @@ fn onStart(state: *State, start: Start, now_ms: u64) Plan {
         .seed = seedFrom(now_ms),
         .started_ms = now_ms,
         .fast = start.fast,
+        .retry_budget_ms = start.retry_budget_ms,
     };
     if (start.stale) return askUser(state, .stale, now_ms);
     return .{ .save = encode(state, now_ms), .send = .{} };
@@ -290,6 +314,8 @@ fn resumeFrom(state: *State, saved: State, start: Start, now_ms: u64) Plan {
     state.* = saved;
     state.fast = start.fast;
     state.started_ms = now_ms;
+    state.retry_budget_ms = start.retry_budget_ms;
+    state.first_failure_ms = null;
     const abrupt = saved.phase == .sending and !saved.flags.clean_exit;
     state.flags.clean_exit = false;
     if (abrupt) state.abrupt_deaths +|= 1;
@@ -474,9 +500,11 @@ fn sendPlanned(state: *State, now_ms: u64) Plan {
     return .{ .save = encode(state, now_ms), .send = .{ .no_fast = state.flags.no_fast } };
 }
 
-/// A transient failure always waits before the next send
-/// (`tests/tla/recovery/Recovery.tla` NoHotRetry).
+/// A transient failure waits before the next send, unless a budgeted host
+/// (`fx ask`) would pass its budget (`tests/tla/recovery/Recovery.tla`
+/// NoHotRetry, BudgetEnds).
 fn waitAfter(state: *State, failure: Failure, now_ms: u64) Plan {
+    if (state.first_failure_ms == null) state.first_failure_ms = now_ms;
     state.phase = .waiting;
     state.cause = failure.kind;
     state.retry_label = .after_failure;
@@ -485,6 +513,21 @@ fn waitAfter(state: *State, failure: Failure, now_ms: u64) Plan {
         .dropped, .unreadable, .server, .rate_limited, .refused => transientDelay(state, failure),
         .too_long, .rejected, .sign_in, .quota, .content_filter => unreachable, // routed by onFailed
     };
+    const requested_delay_ms: u64 = if (failure.kind != .offline) blk: {
+        if (failure.retry_after_ms) |hint| if (hint > 0) break :blk hint;
+        break :blk delay_ms;
+    } else delay_ms;
+    if (state.retry_budget_ms) |budget_ms| {
+        const elapsed_ms = now_ms -| state.first_failure_ms.?;
+        if (elapsed_ms +| requested_delay_ms > budget_ms) {
+            const plan: Plan = .{
+                .status = if (state.shown != 0) Status{ .kind = .clear } else null,
+                .finish = .failed,
+            };
+            state.* = .{};
+            return plan;
+        }
+    }
     state.wait_until_ms = now_ms +| delay_ms;
     return .{
         .save = encode(state, now_ms),
@@ -1818,6 +1861,7 @@ const SimHost = struct {
         if (plan.finish) |finish| switch (finish) {
             .succeeded => try testing.expect(event == .succeeded and was_outstanding),
             .cancelled => try testing.expect(event == .user_cancel),
+            .failed => try testing.expect(event == .failed and was_outstanding),
         };
         if (!was_outstanding) switch (event) {
             .responding, .succeeded, .failed => try testing.expectEqual(Plan{}, plan),
@@ -2019,5 +2063,78 @@ test "simulation: the rules hold across random hosts and faults" {
             std.debug.print("recovery simulation failed with seed {d}\n", .{seed});
             return err;
         };
+    }
+}
+
+test "with a retry budget, transient failures end once the budget passes and keep the cause" {
+    const causes = [_]Failure.Kind{ .offline, .dropped, .server, .rate_limited, .unreadable };
+    for (causes) |kind| {
+        var state: State = .{};
+        const started = step(&state, .{ .start = .{ .retry_budget_ms = 1_500 } }, 10_000);
+        try testing.expect(started.send != null);
+
+        // First failure at 10_000: waits <= 1_000 ms, within the 1_500 ms budget.
+        const first = step(&state, .{ .failed = .{ .kind = kind } }, 10_000);
+        try testing.expect(first.finish == null);
+        try testing.expectEqual(Phase.waiting, state.phase);
+        try testing.expectEqual(@as(?Failure.Kind, kind), state.cause);
+
+        const resend = tickUntilSend(&state, 10_000);
+        try testing.expect(resend.plan.send != null);
+
+        // Second failure at 11_000: elapsed 1_000 + next delay > 1_500, so it ends.
+        const second = step(&state, .{ .failed = .{ .kind = kind } }, resend.at_ms);
+        try testing.expectEqual(@as(?Finish, .failed), second.finish);
+        try testing.expectEqual(Status.Kind.clear, second.status.?.kind);
+        try testing.expectEqual(Phase.idle, state.phase);
+    }
+
+    // A Retry-After longer than the remaining budget ends at once with rate_limited.
+    var rate_state: State = .{};
+    _ = step(&rate_state, .{ .start = .{ .retry_budget_ms = 300_000 } }, 20_000);
+    const over_budget = step(&rate_state, .{ .failed = .{ .kind = .rate_limited, .retry_after_ms = 300_001 } }, 20_000);
+    try testing.expectEqual(@as(?Finish, .failed), over_budget.finish);
+    try testing.expect(over_budget.status == null);
+    try testing.expectEqual(Phase.idle, rate_state.phase);
+
+    // A success resets the failure clock for the next request.
+    var next_state: State = .{};
+    _ = step(&next_state, .{ .start = .{ .retry_budget_ms = 1_500 } }, 30_000);
+    _ = step(&next_state, .{ .failed = .{ .kind = .server } }, 30_000);
+    const ok = tickUntilSend(&next_state, 30_000);
+    try testing.expectEqual(@as(?Finish, .succeeded), step(&next_state, .succeeded, ok.at_ms).finish);
+    _ = step(&next_state, .{ .start = .{ .retry_budget_ms = 1_500 } }, 100_000);
+    const fresh_wait = step(&next_state, .{ .failed = .{ .kind = .server } }, 100_000);
+    try testing.expect(fresh_wait.finish == null);
+    try testing.expectEqual(Phase.waiting, next_state.phase);
+}
+
+test "retryBudgetFromValue takes whole milliseconds in range" {
+    try testing.expectEqual(default_retry_budget_ms, retryBudgetFromValue(null));
+    try testing.expectEqual(default_retry_budget_ms, retryBudgetFromValue(""));
+    try testing.expectEqual(default_retry_budget_ms, retryBudgetFromValue("fast"));
+    try testing.expectEqual(default_retry_budget_ms, retryBudgetFromValue("-5"));
+    try testing.expectEqual(default_retry_budget_ms, retryBudgetFromValue("99"));
+    try testing.expectEqual(@as(u64, 100), retryBudgetFromValue("100"));
+    try testing.expectEqual(@as(u64, 1_500), retryBudgetFromValue("1500"));
+    try testing.expectEqual(default_retry_budget_ms, retryBudgetFromValue("300000"));
+    try testing.expectEqual(default_retry_budget_ms, retryBudgetFromValue("300001"));
+    try testing.expectEqual(default_retry_budget_ms, retryBudgetFromValue("18446744073709551616"));
+}
+
+test "without a retry budget, transient failures never end on time" {
+    var state: State = .{};
+    var now_ms: u64 = 10_000;
+    _ = step(&state, .{ .start = .{} }, now_ms);
+    const kinds = [_]Failure.Kind{ .offline, .dropped, .server, .rate_limited, .unreadable };
+    for (0..50) |i| {
+        const kind = kinds[i % kinds.len];
+        const hint: ?u32 = if (kind == .rate_limited) 600_000 else null;
+        const plan = step(&state, .{ .failed = .{ .kind = kind, .retry_after_ms = hint } }, now_ms);
+        try testing.expect(plan.finish == null);
+        try testing.expectEqual(Phase.waiting, state.phase);
+        const resend = tickUntilSend(&state, now_ms);
+        try testing.expect(resend.plan.send != null);
+        now_ms = resend.at_ms;
     }
 }

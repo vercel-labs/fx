@@ -64,6 +64,7 @@ const auto_classifier_context = @import("../permissions/auto_classifier_context.
 const permission_gate = @import("../permissions/permission_gate.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
+const recovery_policy = @import("../recovery/recovery.zig");
 const session_runtime = @import("../session/session.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -1954,6 +1955,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .max_tool_result_bytes = startup.max_tool_result_bytes,
         .auto_compact_percent = startup.auto_compact_percent,
         .cancel_flag = ctx.cancelFlag(),
+        .recovery_retry_budget_ms = recovery_policy.retryBudgetFromValue(io_mod.getenv("FX_TEST_RECOVERY_RETRY_BUDGET_MS")),
         .fast_mode = ctx.fast_mode,
         .ultrafast_mode = ctx.ultrafast_mode,
         .effort = ctx.effort,
@@ -3641,6 +3643,7 @@ fn pushCommandOutputComplete(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId) !vo
 fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.failed = true;
+    if (ctx.typed_error_code == null) ctx.typed_error_code = "ModelError";
     const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
     ctx.auth_failure = auth_failure;
     const message = if (auth_failure) |failure|

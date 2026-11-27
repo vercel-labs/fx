@@ -8533,6 +8533,7 @@ fn processQueuedPromptLoop(
         var request_recovery = runtime_request_recovery.RequestRecovery.init(deps, config.cancel_flag, step_ctx);
         request_recovery.continue_flag = config.recovery_continue_flag;
         request_recovery.sign_in_closed_flag = config.recovery_sign_in_closed_flag;
+        request_recovery.retry_budget_ms = config.recovery_retry_budget_ms;
         // `deinit` clears a status still shown on every exit; an error exit
         // reports `failed` first.
         defer request_recovery.deinit();
@@ -9377,9 +9378,11 @@ fn processQueuedPromptLoop(
                 var delay_completed = true;
                 if (will_auto_retry) {
                     _ = try request_recovery.failed(.{ .kind = failure_kind.? });
-                    delay_completed = try request_recovery.waitForSend() != null;
+                    if (!request_recovery.budgetExhausted()) {
+                        delay_completed = try request_recovery.waitForSend() != null;
+                    }
                 }
-                if (cancel_requested or !delay_completed) {
+                if (cancel_requested or (!request_recovery.budgetExhausted() and !delay_completed)) {
                     runtime_telemetry.traceCancelObserved(step_ctx, false);
                     try request_recovery.cancel();
                     try stream_ctx.provisional_statuses.finishTrackedCancelled(
@@ -9413,7 +9416,7 @@ fn processQueuedPromptLoop(
                     finish_trace.finish("interrupted");
                     return;
                 }
-                if (will_auto_retry) {
+                if (will_auto_retry and !request_recovery.budgetExhausted()) {
                     preserved_tool_evidence = failure_tool_evidence;
                     recovery_strategy = next_strategy;
                     recovery_cause = failure_cause;
@@ -9788,7 +9791,9 @@ fn processQueuedPromptLoop(
                         .kind = runtime_request_recovery.failureKind(cause).?,
                         .retry_after_ms = retryAfterMs(failure.retry_after_seconds),
                     });
-                    if (try request_recovery.waitForSend() != null) {
+                    if (!request_recovery.budgetExhausted() and
+                        try request_recovery.waitForSend() != null)
+                    {
                         preserved_tool_evidence = failure_tool_evidence;
                         stream_result.deinit(arena);
                         stream_result_set = false;
@@ -10198,7 +10203,9 @@ fn processQueuedPromptLoop(
                     // the turn ends on the content-filter error further
                     // down, as it did before the resends.
                     if (content_filtered and !resend_now and !request_recovery.canAskUser()) break :retry;
-                    if (resend_now or try request_recovery.waitForSend() != null) {
+                    if (!request_recovery.budgetExhausted() and
+                        (resend_now or try request_recovery.waitForSend() != null))
+                    {
                         preserved_tool_evidence = failure_tool_evidence;
                         recovery_strategy = resend_strategy.select(.possibly_sent, failure_tool_evidence);
                         recovery_cause = cause;
@@ -10208,6 +10215,7 @@ fn processQueuedPromptLoop(
                         reset_stream_for_next_attempt = true;
                         continue;
                     }
+                    if (request_recovery.budgetExhausted() and !config.cancel_flag.load(.seq_cst)) break :retry;
                     runtime_telemetry.traceCancelObserved(step_ctx, false);
                     try request_recovery.cancel();
                     try finishPendingCancelledCalls(
