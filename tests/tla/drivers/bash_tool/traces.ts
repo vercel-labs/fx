@@ -56,9 +56,9 @@ export function plausibleEvents(state: Vars): Input[] {
     case "run":
       return KINDS.flatMap((kind) => [finish(kind, false), finish(kind, true)]);
     case "ended":
-      return [plain("file")];
+      return [plain("file"), plain("file_fault")];
     case "filed":
-      return [plain("index")];
+      return [plain("index"), plain("index_fault")];
     default:
       return [plain("show"), plain("clear"), plain("give_up"), plain("wait_more"), plain("restart")];
   }

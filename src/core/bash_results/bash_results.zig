@@ -11,7 +11,7 @@ const Writer = std.Io.Writer;
 pub const variable_name = "FX_OUT";
 
 /// The folder the model reads a saved output from, as the program and the model see it.
-pub const shown_folder = "$" ++ variable_name;
+const shown_folder = "$" ++ variable_name;
 
 /// What the model sees inline, and how much of a long output it sees.
 pub const Limits = struct {
@@ -115,7 +115,7 @@ pub const Stats = struct {
 };
 
 /// The part of an output the model sees, as slices of what the caller holds.
-pub const Preview = struct {
+const Preview = struct {
     head: []const u8,
     tail: []const u8,
     hidden_lines: u64,
@@ -270,7 +270,7 @@ pub const State = union(enum) {
 };
 
 /// Where the full output went, and what it kept.
-pub const FileCut = struct {
+const FileCut = struct {
     number: u64,
     /// Bytes kept from each end of the file.
     kept_each_bytes: u64,
@@ -284,7 +284,7 @@ pub const Saved = union(enum) {
     not_saved_error: []const u8,
 };
 
-pub const Header = struct {
+const Header = struct {
     state: State,
     bytes: u64,
     lines: u64,
@@ -293,6 +293,12 @@ pub const Header = struct {
 
 pub fn writeHeader(w: *Writer, header: Header) Writer.Error!void {
     try w.writeByte('[');
+    try writeHeaderFields(w, header);
+    try w.writeByte(']');
+}
+
+/// The header's words, without its brackets: how the program ended, its size, and its file.
+fn writeHeaderFields(w: *Writer, header: Header) Writer.Error!void {
     switch (header.state) {
         .exit => |code| try w.print("exit {d}", .{code}),
         .signal => |signal| try w.print("killed by signal {d}", .{signal}),
@@ -314,7 +320,6 @@ pub fn writeHeader(w: *Writer, header: Header) Writer.Error!void {
         .not_saved_full => try w.writeAll("not saved: the results folder is full"),
         .not_saved_error => |reason| try w.print("not saved: {s}", .{reason}),
     }
-    try w.writeByte(']');
 }
 
 fn writeCount(w: *Writer, count: u64, singular: []const u8, plural: []const u8) Writer.Error!void {
@@ -363,6 +368,25 @@ pub fn writeIndexMissing(w: *Writer, saved: Saved) Writer.Error!void {
         .file => |number| try w.print("[the index line for this result was not written; the file is still {s}/{d}.txt]", .{ shown_folder, number }),
         .file_cut => |cut| try w.print("[the index line for this result was not written; the file is still {s}/{d}.txt]", .{ shown_folder, cut.number }),
         .not_saved_full, .not_saved_error => {},
+    }
+}
+
+/// A program that ended after the last result that showed it. Its output is in no result.
+const EndedNotice = struct {
+    header: Header,
+    /// The file was saved, but its index line was not written.
+    index_missing: bool,
+};
+
+/// The notice for a program that ended after its last result was shown: its header
+/// without the brackets, behind a fixed lead, then its missing index line if any.
+pub fn writeEndedNotice(w: *Writer, notice: EndedNotice) Writer.Error!void {
+    try w.writeAll("[the last program ended after its last result: ");
+    try writeHeaderFields(w, notice.header);
+    try w.writeByte(']');
+    if (notice.index_missing) {
+        try w.writeByte('\n');
+        try writeIndexMissing(w, notice.header.saved);
     }
 }
 
@@ -1006,4 +1030,38 @@ test "writeBinaryNotice names the file, not-saved, or running notice" {
     out.clearRetainingCapacity();
     try writeBinaryNotice(&out.writer, .running);
     try std.testing.expectEqualStrings("[binary output, not shown yet]", out.written());
+}
+
+test "writeEndedNotice says a program ended after its last result, with its header, and names a missing index line" {
+    var out: Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeEndedNotice(&out.writer, .{
+        .header = .{ .state = .{ .exit = 0 }, .bytes = 11, .lines = 1, .saved = .{ .file = 1 } },
+        .index_missing = false,
+    });
+    try std.testing.expectEqualStrings(
+        "[the last program ended after its last result: exit 0, 1 line, 11 B, $FX_OUT/1.txt]",
+        out.written(),
+    );
+
+    out.clearRetainingCapacity();
+    try writeEndedNotice(&out.writer, .{
+        .header = .{ .state = .{ .signal = 9 }, .bytes = 2048, .lines = 3, .saved = .not_saved_full },
+        .index_missing = false,
+    });
+    try std.testing.expectEqualStrings(
+        "[the last program ended after its last result: killed by signal 9, 3 lines, 2 KB, not saved: the results folder is full]",
+        out.written(),
+    );
+
+    out.clearRetainingCapacity();
+    try writeEndedNotice(&out.writer, .{
+        .header = .{ .state = .{ .exit = 0 }, .bytes = 11, .lines = 1, .saved = .{ .file = 4 } },
+        .index_missing = true,
+    });
+    try std.testing.expectEqualStrings(
+        "[the last program ended after its last result: exit 0, 1 line, 11 B, $FX_OUT/4.txt]\n[the index line for this result was not written; the file is still $FX_OUT/4.txt]",
+        out.written(),
+    );
 }

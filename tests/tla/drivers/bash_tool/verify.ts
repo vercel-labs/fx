@@ -9,7 +9,7 @@
 //   6. every planted bug in mutations.json built into its own copy of src/, and caught by code to spec: its named property fails alone and the full trace check fails.
 //
 // Why two programs in stage 4: the three-program design (result-store.cfg) has
-// 1,100,789 states and 2,652,223 distinct steps, too many for a walk. Each
+// 10,845,949 distinct states and about 28 million generated states, too many for a walk. Each
 // witness needs three programs, so stage 5 checks the three-program rules on
 // recorded runs instead. check.sh's TLC verdicts still check the design itself.
 //

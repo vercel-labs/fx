@@ -32,13 +32,15 @@ export type Reply = { state: Vars; out: string[] };
 export const VARIABLES = [
   "sent", "current", "phase", "ready", "waiting", "shown", "files", "indexed", "unsaved",
   "fullNoticed", "stopped", "restarts", "runs", "saves", "torn", "how", "savedBy", "refused",
-  "noticed", "damaged", "lost", "lostNoticed", "unreported",
+  "noticed", "damaged", "lost", "lostNoticed", "unreported", "saveFailed", "indexFailed", "failNoticed",
+  "indexNoticed",
 ];
 
 /// The variables that are sets. A set is compared as its sorted members.
 const SET_VARIABLES = new Set([
   "sent", "shown", "files", "indexed", "unsaved", "fullNoticed", "stopped",
-  "savedBy", "refused", "noticed", "lost", "lostNoticed",
+  "savedBy", "refused", "noticed", "lost", "lostNoticed", "saveFailed", "indexFailed", "failNoticed",
+  "indexNoticed",
 ]);
 
 /// The variables that are functions over the programs, printed as records.
@@ -66,6 +68,8 @@ const EVENT_OF: Record<string, string> = {
   Damage: "damage",
   HealFails: "heal_fails",
   Restart: "restart",
+  FileFails: "file_fault",
+  IndexFails: "index_fault",
 };
 
 /// Every event the harness takes. A random walk sends these, with a fault now and then.

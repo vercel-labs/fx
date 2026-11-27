@@ -38,5 +38,13 @@
     "find": "if (bytes.len == 0) index_header else bytes",
     "replace": "if (bytes.len == 0) index_header else index_header",
     "expect": "StoreAppendOnly"
+  },
+  {
+    "id": "silent-index",
+    "breaks": "A result whose index line cannot be written is shown with its file but no notice that the line is missing (bash_results.zig writeIndexMissing).",
+    "file": "src/core/bash_results/bash_results.zig",
+    "find": "        .file => |number| try w.print(\"[the index line for this result was not written; the file is still {s}/{d}.txt]\", .{ shown_folder, number }),",
+    "replace": "        .file => |number| {\n            _ = number;\n        },",
+    "expect": "SavedBeforeShown"
   }
 ]

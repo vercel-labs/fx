@@ -15,7 +15,7 @@ reaching_in="$({
   git grep --untracked -n -E '@import\("[^"]*bash_results/[a-z_]+\.zig"\)' -- src ":(exclude)$folder" || true
 } | grep -v 'bash_results/bash_results\.zig")' || true)"
 if [[ -n "$reaching_in" ]]; then
-  printf 'Only %s/bash_results.zig may be imported from outside the bash session module:\n%s\n' "$folder" "$reaching_in" >&2
+  printf 'Only %s/bash_results.zig may be imported from outside the bash results module:\n%s\n' "$folder" "$reaching_in" >&2
   exit 1
 fi
 

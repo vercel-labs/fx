@@ -40,6 +40,7 @@ const output_bytes = 32;
 const inline_bytes = 4096;
 const full_notice = "not saved: the results folder is full";
 const names = [programs][]const u8{ "p1", "p2", "p3" };
+const index_fault_name = "index.tsv.fault";
 const no_flags: [programs]bool = .{ false, false, false };
 const no_counts: [programs]u32 = .{ 0, 0, 0 };
 const no_kinds: [programs]Kind = .{ .none, .none, .none };
@@ -72,6 +73,10 @@ const StateJson = struct {
     indexed: []const u64,
     unsaved: []const []const u8,
     fullNoticed: []const []const u8,
+    saveFailed: []const []const u8,
+    indexFailed: []const []const u8,
+    failNoticed: []const []const u8,
+    indexNoticed: []const []const u8,
     stopped: []const []const u8,
     restarts: u32,
     runs: RunsJson,
@@ -109,6 +114,10 @@ const Harness = struct {
     shown: [programs]bool = no_flags,
     unsaved: [programs]bool = no_flags,
     full_noticed: [programs]bool = no_flags,
+    save_failed: [programs]bool = no_flags,
+    index_failed: [programs]bool = no_flags,
+    fail_noticed: [programs]bool = no_flags,
+    index_noticed: [programs]bool = no_flags,
     stopped: [programs]bool = no_flags,
     restarts: u32 = 0,
     runs: [programs]u32 = no_counts,
@@ -192,6 +201,8 @@ const Harness = struct {
         if (eq(event, "finish")) return self.finish(try kindOf(input.kind), input.big);
         if (eq(event, "file")) return self.file();
         if (eq(event, "index")) return self.index();
+        if (eq(event, "file_fault")) return self.fileFault();
+        if (eq(event, "index_fault")) return self.indexFault();
         if (eq(event, "clear")) return self.clear();
         if (eq(event, "show")) return self.show();
         if (eq(event, "give_up")) return self.giveUp();
@@ -316,6 +327,94 @@ const Harness = struct {
         return true;
     }
 
+    /// The ended program's output cannot be written as a file: a link a program left at the
+    /// number the folder picks refuses the publish, so no file is written, and the result
+    /// says why (RULES.md R3.8; program_output.save). The link is removed after, so the
+    /// folder holds only the files the model has.
+    fn fileFault(self: *Harness) !bool {
+        if (self.phase != .ended or self.files.items.len >= self.room) return false;
+        const k = self.current.?;
+        const io = io_mod.getIo();
+        const n = try self.folder.nextNumber();
+        var name_buf: [32]u8 = undefined;
+        const name = try std.mem.print(&name_buf, "{d}.txt", .{n});
+        self.folder.dir.dir.symLink(io, "fault-target-missing", name, .{ .is_directory = false }) catch |err| switch (err) {
+            // The number is taken, so there is no free name to put the fault at: refused, as the model's guard refuses it.
+            error.PathAlreadyExists => return false,
+            else => return err,
+        };
+        defer self.folder.dir.dir.deleteFile(io, name) catch {};
+        const content = outputOf(k);
+        var reader: std.Io.Reader = .fixed(content[0..]);
+        var captured = try self.folder.capture(&reader);
+        defer captured.deinit(self.alloc);
+        const outcome = self.folder.publish(n, &captured) catch |err| {
+            if (err == error.NumberTaken) return error.LinkWasTaken;
+            try self.note("file not written: {s}", .{@errorName(err)});
+            self.save_failed[k] = true;
+            const text = try self.resultText(k, .{ .not_saved_error = "the results folder could not be written" }, self.how[k], false);
+            self.fail_noticed[k] = std.mem.find(u8, text, "not saved: the results folder could not be written") != null;
+            self.ready = k;
+            self.ready_text = text;
+            self.ready_file = null;
+            self.phase = .saved;
+            return true;
+        };
+        // The code refused no name here, so it did what the file step does: a saved outcome
+        // is shown as file shows it, and the trace check judges it. Only a planted bug gets here.
+        switch (outcome) {
+            .saved => {
+                self.pending_n = n;
+                self.phase = .filed;
+            },
+            .full => return false,
+        }
+        return true;
+    }
+
+    /// The file's index line cannot be written: a directory is at index.tsv, so the append
+    /// refuses it, and the file stays with no line (RULES.md R3.8; program_output.save).
+    /// The directory is removed after, and the index that was there is put back.
+    fn indexFault(self: *Harness) !bool {
+        if (self.phase != .filed) return false;
+        const k = self.current.?;
+        const n = self.pending_n.?;
+        const io = io_mod.getIo();
+        const index_name = result_files.index_file_name;
+        const moved = blk: {
+            self.folder.dir.dir.rename(index_name, self.folder.dir.dir, index_fault_name, io) catch |err| switch (err) {
+                error.FileNotFound => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        };
+        try self.folder.dir.dir.createDir(io, index_name, .fromMode(0o700));
+        defer {
+            self.folder.dir.dir.deleteDir(io, index_name) catch {};
+            if (moved) self.folder.dir.dir.rename(index_fault_name, self.folder.dir.dir, index_name, io) catch {};
+        }
+        var index_missing = false;
+        self.folder.appendIndex(.{
+            .n = n,
+            .exit = exitOf(self.how[k]),
+            .bytes = output_bytes,
+            .lines = 1,
+            .command = commands[k],
+        }) catch |err| {
+            index_missing = true;
+            try self.note("index line not written: {s}", .{@errorName(err)});
+        };
+        if (!index_missing) return error.DirectoryDidNotRefuseIndex;
+        self.index_failed[k] = true;
+        self.pending_n = null;
+        self.ready = k;
+        self.ready_text = try self.resultText(k, .{ .file = n }, self.how[k], true);
+        self.index_noticed[k] = std.mem.find(u8, self.ready_text.?, "the index line for this result was not written") != null;
+        self.ready_file = n;
+        self.phase = .saved;
+        return true;
+    }
+
     fn clear(self: *Harness) bool {
         if (self.phase != .saved) return false;
         self.phase = .idle;
@@ -329,7 +428,7 @@ const Harness = struct {
         if (self.ready != w) return false;
         const text = self.ready_text orelse return error.ReadyWithoutText;
         if (self.ready_file) |n| {
-            if (!self.fileExists(n) or !self.hasIndexed(n)) {
+            if (!self.index_failed[w] and (!self.fileExists(n) or !self.hasIndexed(n))) {
                 try self.note("shown before its file was saved and indexed: {d}.txt", .{n});
             }
         }
@@ -477,6 +576,10 @@ const Harness = struct {
             .indexed = self.indexed.items,
             .unsaved = try progSet(alloc, self.unsaved),
             .fullNoticed = try progSet(alloc, self.full_noticed),
+            .saveFailed = try progSet(alloc, self.save_failed),
+            .indexFailed = try progSet(alloc, self.index_failed),
+            .failNoticed = try progSet(alloc, self.fail_noticed),
+            .indexNoticed = try progSet(alloc, self.index_noticed),
             .stopped = try progSet(alloc, self.stopped),
             .restarts = self.restarts,
             .runs = .{ .p1 = self.runs[0], .p2 = self.runs[1], .p3 = self.runs[2] },

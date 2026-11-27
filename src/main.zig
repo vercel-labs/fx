@@ -5463,6 +5463,7 @@ test {
     _ = @import("core/bash_session/bash_session.zig");
     _ = @import("core/bash_results/bash_results.zig");
     _ = @import("tools/bash/bash.zig");
+    _ = @import("tools/bash/program_output.zig");
     _ = @import("builtins/bash_tools.zig");
     _ = @import("core/mcp_host/verbs.zig");
     _ = @import("core/mcp_host/login_words.zig");

@@ -22,14 +22,16 @@ EXTENDS Naturals, Sequences, FiniteSets, TraceData
 
 VARIABLES sent, current, phase, ready, waiting, shown, files, indexed, unsaved,
           fullNoticed, stopped, restarts, runs, saves, torn, how, savedBy, refused,
-          noticed, damaged, lost, lostNoticed, unreported, trace, at
+          noticed, damaged, lost, lostNoticed, unreported, saveFailed, indexFailed,
+          failNoticed, indexNoticed, trace, at
 
 vars == <<sent, current, phase, ready, waiting, shown, files, indexed, unsaved,
           fullNoticed, stopped, restarts, runs, saves, torn, how, savedBy, refused,
-          noticed, damaged, lost, lostNoticed, unreported>>
+          noticed, damaged, lost, lostNoticed, unreported, saveFailed, indexFailed,
+          failNoticed, indexNoticed>>
 
 MC == INSTANCE ResultStore WITH Programs <- {"p1", "p2", "p3"}, Room <- 2,
-                                 MaxRestarts <- 1, Mutation <- "none"
+                                 MaxRestarts <- 1, Faults <- TRUE, Mutation <- "none"
 
 ToSet(s) == {s[i] : i \in DOMAIN s}
 
@@ -58,6 +60,10 @@ Load(s) ==
     /\ lost = ToSet(s.lost)
     /\ lostNoticed = ToSet(s.lostNoticed)
     /\ unreported = s.unreported
+    /\ saveFailed = ToSet(s.saveFailed)
+    /\ indexFailed = ToSet(s.indexFailed)
+    /\ failNoticed = ToSet(s.failNoticed)
+    /\ indexNoticed = ToSet(s.indexNoticed)
 
 LoadNext(s) ==
     /\ sent' = ToSet(s.sent)
@@ -83,6 +89,10 @@ LoadNext(s) ==
     /\ lost' = ToSet(s.lost)
     /\ lostNoticed' = ToSet(s.lostNoticed)
     /\ unreported' = s.unreported
+    /\ saveFailed' = ToSet(s.saveFailed)
+    /\ indexFailed' = ToSet(s.indexFailed)
+    /\ failNoticed' = ToSet(s.failNoticed)
+    /\ indexNoticed' = ToSet(s.indexNoticed)
 
 TraceInit == trace \in 1..Len(Traces) /\ at = 1 /\ Load(Traces[trace][1])
 

@@ -3,8 +3,13 @@
 # each config's expected verdict, then run the Bun driver that runs the real
 # result store along this model.
 #
-# result-store.cfg is the design and must pass. Each mutation config plants
-# one defect, and the rule it names must catch it:
+# result-store.cfg is the design, with three programs and Faults = FALSE, and
+# must pass. Faults = FALSE leaves out the failure steps (a file or an index line
+# that cannot be written), which keeps this check at its size without them.
+# result-store-faults.cfg checks those steps on two programs (Faults = TRUE), and
+# the driver's two walked instances turn them on too. Each mutation config plants
+# one defect, and the rule it names must catch it. The silent-index one runs on
+# the two-program instance with Faults = TRUE, since its failure step must happen:
 #
 #   show-before-save   a preview reaches the model before its output is indexed      SavedBeforeShown
 #   skip-index         a result file is saved without its index line                 SavedBeforeShown
@@ -18,6 +23,7 @@
 #   forget-on-fail     a failed heal forgets an unreported loss                      ReportedBeforeRun
 #   number-from-index  the next number ignores a file with no index line             NoReuse
 #   silent-full        output that finds no room is dropped with no notice           FullNoticed
+#   silent-index       a file whose index line fails is shown with no notice         SavedBeforeShown
 #
 # Each witness config must be violated, to show TLC reaches that case: a file
 # left without its index line when fx stops (OrphanWitness), output that finds
@@ -25,8 +31,8 @@
 # (ResumeWitness).
 #
 # result-store-small-room2 and result-store-small-room1 are the design with two
-# programs (room for two files, and for one). Their graphs are small enough for
-# the driver to walk every distinct step on the real result store.
+# programs (room for two files, and for one) and Faults = TRUE. Their graphs are
+# small enough for the driver to walk every distinct step on the real result store.
 #
 # Then the driver, tests/tla/drivers/bash_tool/verify.ts, walks those two graphs
 # on the real result store (src/core/session/result_files.zig,
@@ -52,6 +58,7 @@ cd "$(dirname "$0")"
 tlc_verdicts "$@" <<'VERDICTS'
 ResultStore result-store -
 ResultStore result-store-small-room2 -
+ResultStore result-store-faults -
 ResultStore result-store-small-room1 -
 ResultStore result-store-mutation-show-before-save SavedBeforeShown
 ResultStore result-store-mutation-skip-index SavedBeforeShown
@@ -65,6 +72,7 @@ ResultStore result-store-mutation-skip-heal NeverLoadsDamaged
 ResultStore result-store-mutation-forget-on-fail ReportedBeforeRun
 ResultStore result-store-mutation-number-from-index NoReuse
 ResultStore result-store-mutation-silent-full FullNoticed
+ResultStore result-store-mutation-silent-index SavedBeforeShown
 ResultStore result-store-witness-orphan OrphanWitness
 ResultStore result-store-witness-full FullWitness
 ResultStore result-store-witness-resume ResumeWitness

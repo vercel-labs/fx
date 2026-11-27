@@ -9,21 +9,24 @@ const Allocator = std.mem.Allocator;
 
 /// Per-file size limit (16 MiB). Outputs larger than this keep their first and
 /// last `cut_keep_bytes` with a cut marker line between them (S4-5).
-pub const max_file_bytes: usize = 16 * 1024 * 1024;
-pub const cut_keep_bytes: usize = max_file_bytes / 2;
+const max_file_bytes: usize = 16 * 1024 * 1024;
 
 /// Per-folder size limit across all `N.txt` files (256 MiB, S4-5).
-pub const max_folder_bytes: u64 = 256 * 1024 * 1024;
+const max_folder_bytes: u64 = 256 * 1024 * 1024;
 
 /// Maximum UTF-8 byte length of the `command` column in `index.tsv` (S4-7).
-pub const max_command_bytes: usize = 200;
+const max_command_bytes: usize = 200;
 
 pub const index_file_name = "index.tsv";
-pub const index_header = "n\texit\tbytes\tlines\tcommand\n";
+const index_header = "n\texit\tbytes\tlines\tcommand\n";
+
+/// The largest `index.tsv` that is read. A larger one is an index failure, so no row is appended to it.
+const max_index_bytes: usize = 16 * 1024 * 1024;
 
 pub const Limits = struct {
     max_file_bytes: usize = max_file_bytes,
     max_folder_bytes: u64 = max_folder_bytes,
+    max_index_bytes: usize = max_index_bytes,
 };
 
 pub const Exit = union(enum) {
@@ -34,7 +37,7 @@ pub const Exit = union(enum) {
     unknown,
 };
 
-pub const IndexRow = struct {
+const IndexRow = struct {
     n: u64,
     exit: Exit,
     bytes: u64,
@@ -42,7 +45,7 @@ pub const IndexRow = struct {
     command: []const u8,
 };
 
-pub const SaveOutcome = union(enum) {
+const SaveOutcome = union(enum) {
     saved: struct {
         original_bytes: u64,
         written_bytes: usize,
@@ -62,7 +65,7 @@ pub const ResultFolder = struct {
 
     /// Opens or creates a plain result folder at `dir_path` (the `--no-save`
     /// path, e.g. `out/` inside a temp folder) with `0700` permissions.
-    pub fn init(alloc: Allocator, dir_path: []const u8) !ResultFolder {
+    fn init(alloc: Allocator, dir_path: []const u8) !ResultFolder {
         return initWithLimits(alloc, dir_path, .{});
     }
 
@@ -90,6 +93,7 @@ pub const ResultFolder = struct {
 
     /// Adopts an already-opened private directory (used by `session_adapter`).
     pub fn fromVerifiedDir(alloc: Allocator, path: []u8, dir: io_mod.VerifiedDir, limits: Limits) ResultFolder {
+        sweepLeftoverTemps(dir.dir);
         return .{
             .alloc = alloc,
             .path = path,
@@ -104,40 +108,80 @@ pub const ResultFolder = struct {
         self.* = undefined;
     }
 
-    /// Returns 1 + the highest number among `N.txt` files and `index.tsv` rows.
-    /// Temp files and unrelated names are ignored (`ResultStore.tla` `NoReuse`).
+    /// Returns 1 + the highest number among `N.txt` entries of any kind and `index.tsv` rows.
+    /// A link or a directory at a number is counted too, so no save is ever tried at it.
+    /// Temp files and unrelated names are ignored (`ResultStore.tla` `NoReuse`). Reads the
+    /// index without waiting on it. An index over `limits.max_index_bytes` is not read, so its
+    /// rows are left out, and numbering comes from the files alone. A save then still runs,
+    /// and its index line is reported missing (`appendIndex`). NoReuse still holds: `publish`
+    /// links a file in with create_new, so a number that holds a file is refused, never
+    /// replaced, whatever the index says.
     pub fn nextNumber(self: *ResultFolder) !u64 {
         const io = io_mod.getIo();
         var max_n: u64 = 0;
 
         var it = self.dir.dir.iterate();
         while (try it.next(io)) |entry| {
-            if (entry.kind != .file) continue;
             if (parseResultFileNumber(entry.name)) |n| {
                 max_n = @max(max_n, n);
             }
         }
 
-        const maybe_index = self.dir.dir.openFile(io, index_file_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-        if (maybe_index) |index_file| {
-            var file = index_file;
-            defer file.close(io);
-            const stat = try file.stat(io);
-            if (stat.kind != .file) return error.DurablePathUnsafe;
-
-            var read_buf: [4096]u8 = undefined;
-            var reader = file.reader(io, &read_buf);
-            max_n = @max(max_n, try maxNumberInIndex(&reader.interface));
-        }
-
+        max_n = @max(max_n, try self.highestIndexedNumber());
         return std.math.add(u64, max_n, 1);
     }
 
+    /// The highest row number in index.tsv, or 0 when there is no index or the index is over
+    /// the limit. The rows of an index over the limit are dropped for numbering, and that is
+    /// logged. `error.DurablePathUnsafe` for a non-regular index, which blocks numbering.
+    fn highestIndexedNumber(self: *ResultFolder) !u64 {
+        const io = io_mod.getIo();
+        const index_file = (self.openIndexFile() catch |err| switch (err) {
+            error.IndexTooLarge => return self.droppedIndexRows(),
+            else => return err,
+        }) orelse return 0;
+        var file = index_file;
+        defer file.close(io);
+        var read_buf: [4096]u8 = undefined;
+        var reader = file.reader(io, &read_buf);
+        return maxNumberInIndex(&reader.interface, self.limits.max_index_bytes) catch |err| switch (err) {
+            error.IndexTooLarge => return self.droppedIndexRows(),
+            else => return err,
+        };
+    }
+
+    fn droppedIndexRows(self: *const ResultFolder) u64 {
+        debug_trace.logf("session", "event=result_files_index_rows_dropped limit={d}", .{self.limits.max_index_bytes});
+        return 0;
+    }
+
+    /// Opens `index.tsv` for reading, and never waits on what a program may have put
+    /// there. The open does not follow a link and does not block on a FIFO, a device,
+    /// or a socket, and the file it opened is checked, so only a regular file is read.
+    /// Null when there is no index. `error.IndexTooLarge` when it is over
+    /// `limits.max_index_bytes`. The caller closes the file it gets.
+    fn openIndexFile(self: *ResultFolder) !?std.Io.File {
+        const io = io_mod.getIo();
+        const fd = std.posix.openat(self.dir.dir.handle, index_file_name, .{
+            .ACCMODE = .RDONLY,
+            .NONBLOCK = true,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+        }, 0) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            error.SymLinkLoop, error.NotDir => return error.DurablePathUnsafe,
+            else => return err,
+        };
+        const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+        errdefer file.close(io);
+        const stat = try file.stat(io);
+        if (stat.kind != .file) return error.DurablePathUnsafe;
+        if (stat.size > self.limits.max_index_bytes) return error.IndexTooLarge;
+        return file;
+    }
+
     /// Total byte size across all `N.txt` files in this folder (`S4-5`).
-    pub fn folderUsageBytes(self: *ResultFolder) !u64 {
+    fn folderUsageBytes(self: *ResultFolder) !u64 {
         const io = io_mod.getIo();
         var total: u64 = 0;
         var it = self.dir.dir.iterate();
@@ -152,7 +196,7 @@ pub const ResultFolder = struct {
 
     /// A result's output as `capture` read it, held until `publish` writes it under a
     /// number. A number another writer takes can then be tried again with the same output.
-    pub const Captured = struct {
+    const Captured = struct {
         head: std.ArrayList(u8) = .empty,
         tail: std.ArrayList(u8) = .empty,
         tail_pos: usize = 0,
@@ -289,18 +333,15 @@ pub const ResultFolder = struct {
         var existing: ?[]u8 = null;
         defer if (existing) |bytes| self.alloc.free(bytes);
 
-        const maybe_file = self.dir.dir.openFile(io, index_file_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-        if (maybe_file) |opened| {
+        if (try self.openIndexFile()) |opened| {
             var file = opened;
             defer file.close(io);
-            const stat = try file.stat(io);
-            if (stat.kind != .file) return error.DurablePathUnsafe;
             var read_buf: [4096]u8 = undefined;
             var reader = file.reader(io, &read_buf);
-            existing = try reader.interface.allocRemaining(self.alloc, .unlimited);
+            existing = reader.interface.allocRemaining(self.alloc, .limited(self.limits.max_index_bytes)) catch |err| switch (err) {
+                error.StreamTooLong => return error.IndexTooLarge,
+                else => |other| return other,
+            };
         }
 
         var row_out: std.Io.Writer.Allocating = .init(self.alloc);
@@ -319,24 +360,12 @@ pub const ResultFolder = struct {
         };
         try writeSlicesAtomic(self.alloc, &self.dir, index_file_name, &slices);
     }
-
-    /// Rewrites the entire `index.tsv` from `rows` via a temp file and atomic rename.
-    pub fn writeIndex(self: *ResultFolder, rows: []const IndexRow) !void {
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        defer out.deinit();
-        try out.writer.writeAll(index_header);
-        for (rows) |row| {
-            try formatIndexRow(self.alloc, &out.writer, row);
-        }
-        const slices = [_][]const u8{out.written()};
-        try writeSlicesAtomic(self.alloc, &self.dir, index_file_name, &slices);
-    }
 };
 
 /// Formats the `command` column: first line of `program`, tabs and line ends
 /// replaced by spaces, truncated to at most `max_command_bytes` on a UTF-8 boundary.
 /// Caller owns the returned slice.
-pub fn formatCommandColumn(alloc: Allocator, program: []const u8) Allocator.Error![]u8 {
+fn formatCommandColumn(alloc: Allocator, program: []const u8) Allocator.Error![]u8 {
     const first_line = if (std.mem.findScalar(u8, program, '\n')) |nl|
         if (nl > 0 and program[nl - 1] == '\r') program[0 .. nl - 1] else program[0..nl]
     else
@@ -363,18 +392,23 @@ fn formatIndexRow(alloc: Allocator, w: *std.Io.Writer, row: IndexRow) !void {
     try w.print("\t{d}\t{d}\t{s}\n", .{ row.bytes, row.lines, command });
 }
 
-fn maxNumberInIndex(reader: *std.Io.Reader) !u64 {
+/// The highest row number in an index read from `reader`. `error.IndexTooLarge` when
+/// the index is longer than `max_bytes`, which stops the read at the first chunk past it.
+fn maxNumberInIndex(reader: *std.Io.Reader, max_bytes: usize) !u64 {
     var max_n: u64 = 0;
     var at_line_start = true;
     var num_buf: [32]u8 = undefined;
     var num_len: usize = 0;
     var num_overflow = false;
     var reading_first_field = true;
+    var read_total: usize = 0;
 
     while (true) {
         var chunk: [4096]u8 = undefined;
         const n_read = try reader.readSliceShort(&chunk);
         if (n_read == 0) break;
+        read_total += n_read;
+        if (read_total > max_bytes) return error.IndexTooLarge;
         for (chunk[0..n_read]) |byte| {
             if (byte == '\n') {
                 at_line_start = true;
@@ -539,7 +573,58 @@ fn writeSlices(
             temp_exists = false;
         },
     }
-    try io_mod.syncVerifiedDir(dir.dir);
+    io_mod.syncVerifiedDir(dir.dir) catch |err| {
+        if (mode == .replace) return err;
+        // The name is linked already, so the result is saved. Only the sync that makes the link durable failed.
+        debug_trace.logf(
+            "session",
+            "event=result_files_dir_sync_failed target={s} err={s}",
+            .{ target_name, @errorName(err) },
+        );
+    };
+}
+
+/// Whether `name` is a temp name `writeSlices` makes: `.<target>.tmp.<32 lowercase hex digits>`,
+/// where the target is `index.tsv` or `<n>.txt`.
+fn isTempName(name: []const u8) bool {
+    const marker = ".tmp.";
+    const hex_len = 32;
+    if (name.len < 1 + marker.len + hex_len or name[0] != '.') return false;
+    const hex_start = name.len - hex_len;
+    if (!std.mem.eql(u8, name[hex_start - marker.len .. hex_start], marker)) return false;
+    for (name[hex_start..]) |byte| {
+        const lower_hex = (byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f');
+        if (!lower_hex) return false;
+    }
+    const target = name[1 .. hex_start - marker.len];
+    return std.mem.eql(u8, target, index_file_name) or parseResultFileNumber(target) != null;
+}
+
+/// Removes the temp files a crashed save left in `dir`. Only a regular file with a temp
+/// name `isTempName` accepts is removed. A link, a directory, or any other kind is logged
+/// and left alone, so nothing is removed through a link. Every removal and failure is
+/// logged, and none of them stops the open. Safe because one writer per session holds
+/// (`tests/tla/bash_tool/ResultStore.tla`, `R3.6`), so no save that is running has a temp file
+/// in this folder. Temp files are never counted in the folder's usage, since their names
+/// are not result names.
+fn sweepLeftoverTemps(dir: std.Io.Dir) void {
+    const io = io_mod.getIo();
+    var it = dir.iterate();
+    while (it.next(io) catch |err| blk: {
+        debug_trace.logf("session", "event=result_files_sweep_failed err={s}", .{@errorName(err)});
+        break :blk null;
+    }) |entry| {
+        if (!isTempName(entry.name)) continue;
+        if (entry.kind != .file) {
+            debug_trace.logf("session", "event=result_files_temp_kept name={s} kind={s}", .{ entry.name, @tagName(entry.kind) });
+            continue;
+        }
+        dir.deleteFile(io, entry.name) catch |err| {
+            debug_trace.logf("session", "event=result_files_temp_removal_failed name={s} err={s}", .{ entry.name, @errorName(err) });
+            continue;
+        };
+        debug_trace.logf("session", "event=result_files_temp_removed name={s}", .{entry.name});
+    }
 }
 
 fn writeTestBytes(dir: std.Io.Dir, name: []const u8, data: []const u8) !void {
@@ -696,7 +781,9 @@ test "a captured output is published under the next number after its first numbe
     try expectNoTempFiles(folder.dir.dir);
 }
 
-test "save enforces the 16 MiB per-file cap with exact first and last 8 MiB and one cut line" {
+test "save enforces the per-file cap with exact first and last halves and one cut line" {
+    const cap: usize = 256 * 1024;
+    const cut_keep_bytes = cap / 2;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -705,11 +792,12 @@ test "save enforces the 16 MiB per-file cap with exact first and last 8 MiB and 
     const out_path = try std.Io.Dir.path.join(alloc, &.{ root, "file-cap" });
     defer alloc.free(out_path);
 
-    var folder = try ResultFolder.init(alloc, out_path);
+    // A cap above one 64 KiB read chunk and an odd cut size, so the cut crosses chunk edges.
+    var folder = try ResultFolder.initWithLimits(alloc, out_path, .{ .max_file_bytes = cap });
     defer folder.deinit();
 
-    const extra: usize = 512 * 1024;
-    const total: usize = max_file_bytes + extra;
+    const extra: usize = 100_003;
+    const total: usize = cap + extra;
     const big = try alloc.alloc(u8, total);
     defer alloc.free(big);
     @memset(big[0..cut_keep_bytes], 'H');
@@ -726,14 +814,20 @@ test "save enforces the 16 MiB per-file cap with exact first and last 8 MiB and 
     try std.testing.expectEqual(@as(u64, extra), saved.cut_bytes);
     try expectNoTempFiles(folder.dir.dir);
 
-    const written = try readTestBytes(alloc, folder.dir.dir, "1.txt", max_file_bytes + 4096);
+    const written = try readTestBytes(alloc, folder.dir.dir, "1.txt", cap + 4096);
     defer alloc.free(written);
     try std.testing.expectEqual(saved.written_bytes, written.len);
     try std.testing.expectEqualSlices(u8, big[0..cut_keep_bytes], written[0..cut_keep_bytes]);
     try std.testing.expectEqualSlices(u8, big[total - cut_keep_bytes ..], written[written.len - cut_keep_bytes ..]);
     const middle = written[cut_keep_bytes .. written.len - cut_keep_bytes];
-    try std.testing.expect(std.mem.find(u8, middle, "524288 bytes cut") != null);
+    try std.testing.expect(std.mem.find(u8, middle, "100003 bytes cut") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, middle, "\n") - 1);
+}
+
+test "the default limits keep 16 MiB per file and 16 MiB of index" {
+    const defaults: Limits = .{};
+    try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), defaults.max_file_bytes);
+    try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), defaults.max_index_bytes);
 }
 
 test "save enforces the per-folder cap and writes nothing when full" {
@@ -777,7 +871,7 @@ test "save enforces the per-folder cap and writes nothing when full" {
     try std.testing.expect((try folder.save(2, &r2_exact)) == .saved);
 }
 
-test "appendIndex and writeIndex rewrite atomically and appendIndex preserves earlier rows byte for byte" {
+test "appendIndex rewrites atomically and preserves earlier rows byte for byte" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -803,14 +897,6 @@ test "appendIndex and writeIndex rewrite atomically and appendIndex preserves ea
         "n\texit\tbytes\tlines\tcommand\n1\t0\t12\t1\techo hi\n2\tsignal:9\t0\t0\tsleep 30\n",
         after_second,
     );
-    try expectNoTempFiles(folder.dir.dir);
-
-    try folder.writeIndex(&.{
-        .{ .n = 1, .exit = .{ .code = 2 }, .bytes = 5, .lines = 1, .command = "false" },
-    });
-    const after_write = try readTestBytes(alloc, folder.dir.dir, index_file_name, 4096);
-    defer alloc.free(after_write);
-    try std.testing.expectEqualStrings("n\texit\tbytes\tlines\tcommand\n1\t2\t5\t1\tfalse\n", after_write);
     try expectNoTempFiles(folder.dir.dir);
 }
 
@@ -851,4 +937,204 @@ test "failed write cleans up its temp file and returns the underlying error" {
     var reader: std.Io.Reader = .fixed("blocked\n");
     try std.testing.expectError(error.DurablePathUnsafe, folder.save(1, &reader));
     try expectNoTempFiles(folder.dir.dir);
+}
+
+test "a symlink or a directory at the next number is counted, so the next save takes a free number" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "out" });
+    defer alloc.free(path);
+    var folder = try ResultFolder.init(alloc, path);
+    defer folder.deinit();
+    var one: std.Io.Reader = .fixed("one\n");
+    _ = try folder.save(1, &one);
+
+    try folder.dir.dir.symLink(io_mod.getIo(), "elsewhere", "2.txt", .{ .is_directory = false });
+    try std.testing.expectEqual(@as(u64, 3), try folder.nextNumber());
+    var three: std.Io.Reader = .fixed("three\n");
+    _ = try folder.save(3, &three);
+
+    try folder.dir.dir.createDir(io_mod.getIo(), "4.txt", .fromMode(0o700));
+    try std.testing.expectEqual(@as(u64, 5), try folder.nextNumber());
+    var five: std.Io.Reader = .fixed("five\n");
+    _ = try folder.save(5, &five);
+}
+
+test "appendIndex refuses an index over its size limit and leaves the index as it is" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "out" });
+    defer alloc.free(path);
+    var folder = try ResultFolder.initWithLimits(alloc, path, .{ .max_index_bytes = 64 });
+    defer folder.deinit();
+    try folder.dir.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = index_file_name,
+        .data = "n\texit\tbytes\tlines\tcommand\n1\t0\t0\t0\tlong command text that keeps the index over its limit\n",
+    });
+    const before = try folder.dir.dir.readFileAlloc(io_mod.getIo(), index_file_name, alloc, .limited(4096));
+    defer alloc.free(before);
+
+    try std.testing.expectError(error.IndexTooLarge, folder.appendIndex(.{
+        .n = 2,
+        .exit = .{ .code = 0 },
+        .bytes = 0,
+        .lines = 0,
+        .command = "echo",
+    }));
+    const after = try folder.dir.dir.readFileAlloc(io_mod.getIo(), index_file_name, alloc, .limited(4096));
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+/// Makes a FIFO named `name` in `folder`, as a program can with `mkfifo`.
+fn makeFifoIn(alloc: Allocator, folder: *const ResultFolder, name: []const u8) !void {
+    const path = try alloc.printSentinel("{s}/{s}", .{ folder.path, name }, 0);
+    defer alloc.free(path);
+    if (mkfifo(path, 0o600) != 0) return error.MkfifoFailed;
+}
+
+test "nextNumber does not wait on a FIFO at index.tsv, and refuses it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "out" });
+    defer alloc.free(path);
+    var folder = try ResultFolder.init(alloc, path);
+    defer folder.deinit();
+    try makeFifoIn(alloc, &folder, index_file_name);
+    try std.testing.expectError(error.DurablePathUnsafe, folder.nextNumber());
+}
+
+test "appendIndex does not wait on a FIFO at index.tsv, and refuses it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "out" });
+    defer alloc.free(path);
+    var folder = try ResultFolder.init(alloc, path);
+    defer folder.deinit();
+    try makeFifoIn(alloc, &folder, index_file_name);
+    try std.testing.expectError(error.DurablePathUnsafe, folder.appendIndex(.{
+        .n = 1,
+        .exit = .{ .code = 0 },
+        .bytes = 0,
+        .lines = 0,
+        .command = "echo",
+    }));
+}
+
+test "a FIFO at the next number does not block numbering, and the next save takes the number after it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "out" });
+    defer alloc.free(path);
+    var folder = try ResultFolder.init(alloc, path);
+    defer folder.deinit();
+    var one: std.Io.Reader = .fixed("one\n");
+    _ = try folder.save(1, &one);
+    try makeFifoIn(alloc, &folder, "2.txt");
+    try std.testing.expectEqual(@as(u64, 3), try folder.nextNumber());
+    var three: std.Io.Reader = .fixed("three\n");
+    _ = try folder.save(3, &three);
+}
+
+test "nextNumber numbers from the files alone when the index is over its size limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "out" });
+    defer alloc.free(path);
+    var folder = try ResultFolder.initWithLimits(alloc, path, .{ .max_index_bytes = 64 });
+    defer folder.deinit();
+    var one: std.Io.Reader = .fixed("one\n");
+    _ = try folder.save(1, &one);
+    try folder.dir.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = index_file_name,
+        .data = "n\texit\tbytes\tlines\tcommand\n9\t0\t0\t0\tlong command text that keeps the index over its limit\n",
+    });
+    try std.testing.expectEqual(@as(u64, 2), try folder.nextNumber());
+}
+
+test "opening a results folder removes leftover temp files of its own pattern, and only those" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "out" });
+    defer alloc.free(path);
+    {
+        var first = try ResultFolder.init(alloc, path);
+        first.deinit();
+    }
+    const io = io_mod.getIo();
+    const own_one = ".1.txt.tmp.0123456789abcdef0123456789abcdef";
+    const own_index = ".index.tsv.tmp.0123456789abcdef0123456789abcdef";
+    const own_link = ".2.txt.tmp.fedcba9876543210fedcba9876543210";
+    try tmp.dir.writeFile(io, .{ .sub_path = "out/" ++ own_one, .data = "partial\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "out/" ++ own_index, .data = "partial\n" });
+    try tmp.dir.symLink(io, "../outside.txt", "out/" ++ own_link, .{ .is_directory = false });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.txt", .data = "outside\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "out/.note.tmp.abcdef", .data = "kept\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "out/readme.txt", .data = "kept\n" });
+
+    var folder = try ResultFolder.init(alloc, path);
+    defer folder.deinit();
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "out/" ++ own_one, .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "out/" ++ own_index, .{}));
+    const link = try tmp.dir.statFile(io, "out/" ++ own_link, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, link.kind);
+    const outside = try tmp.dir.readFileAlloc(io, "outside.txt", alloc, .limited(64));
+    defer alloc.free(outside);
+    try std.testing.expectEqualStrings("outside\n", outside);
+    try tmp.dir.access(io, "out/.note.tmp.abcdef", .{});
+    try tmp.dir.access(io, "out/readme.txt", .{});
+}
+
+test "a leftover temp file is not counted in the folder's usage" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "out" });
+    defer alloc.free(path);
+    var folder = try ResultFolder.init(alloc, path);
+    defer folder.deinit();
+    try folder.dir.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = ".1.txt.tmp.0123456789abcdef0123456789abcdef",
+        .data = "a partial result that a crash left behind\n",
+    });
+    try std.testing.expectEqual(@as(u64, 0), try folder.folderUsageBytes());
+    try std.testing.expectEqual(@as(u64, 1), try folder.nextNumber());
+}
+
+test "a FIFO where the results folder should be is refused, and nothing waits on it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try alloc.printSentinel("{s}/out", .{root}, 0);
+    defer alloc.free(path);
+    if (mkfifo(path, 0o600) != 0) return error.MkfifoFailed;
+    try std.testing.expectError(error.DurablePathUnsafe, ResultFolder.init(alloc, path));
 }

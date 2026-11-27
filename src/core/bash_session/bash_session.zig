@@ -143,6 +143,9 @@ pub const Session = struct {
     /// The id of this session's last program, so a new program waits its
     /// turn and wait_more finds it. Owned.
     program_id: ?[]u8 = null,
+    /// Whether a call reported the end of `program_id`: its result, or the notice that
+    /// saved its output before the next program started. `setProgram` clears it.
+    program_end_delivered: bool = false,
     /// The folder the next program starts in, as the last saved state left it.
     /// Null means the workspace root. Owned.
     start_folder: ?[]u8 = null,
@@ -259,6 +262,7 @@ pub const Session = struct {
         const owned = try self.alloc.dupe(u8, id);
         if (self.program_id) |old| self.alloc.free(old);
         self.program_id = owned;
+        self.program_end_delivered = false;
     }
 
     /// The id of this session's last program, or null before one is set.
@@ -266,8 +270,16 @@ pub const Session = struct {
         return self.program_id;
     }
 
-    /// The folder the next program starts in, or null for the workspace root.
-    /// The slice is valid until the next `refreshStartFolder` or `deinit`.
+    /// Records that a call reported the end of the session's last program.
+    pub fn markProgramEndDelivered(self: *Session) void {
+        self.program_end_delivered = true;
+    }
+
+    /// Whether a call reported the end of the session's last program.
+    pub fn programEndDelivered(self: *const Session) bool {
+        return self.program_end_delivered;
+    }
+
     /// The folder a program's `$FX_OUT` names when its host gives none: `out/` in
     /// the session folder. It is made 0700 on the first call, and removing the
     /// session folder removes it. The caller owns the result.
@@ -282,6 +294,8 @@ pub const Session = struct {
         return path;
     }
 
+    /// The folder the next program starts in, or null for the workspace root.
+    /// The slice is valid until the next `refreshStartFolder` or `deinit`.
     pub fn startFolder(self: *const Session) ?[]const u8 {
         return self.start_folder;
     }

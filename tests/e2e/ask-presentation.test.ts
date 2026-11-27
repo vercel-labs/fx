@@ -1616,6 +1616,40 @@ describe("fx ask with experimental.bash_tool", () => {
     expect(readFileSync(join(results, "index.tsv"), "utf8")).toBe("n\texit\tbytes\tlines\tcommand\n1\t0\t6\t1\techo hello\n");
   }, TIMEOUT);
 
+  test("a program that ends after its still-running result, with no wait, is saved before the next program, and the next result says so", async () => {
+    const root = createRoot();
+    const marker = join(root.workspace, "old-ended");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-old", "bash", { command: "sleep 31; echo old-output; touch old-ended" }),
+      // The model's next call comes after the old program has ended, so the call starts with no program running.
+      async () => {
+        while (!existsSync(marker)) await Bun.sleep(100);
+        await Bun.sleep(1_000);
+        return fakeGatewayToolCall("bash-new", "bash", { command: "echo new-output" });
+      },
+      fakeGatewayFinalText("Both results read.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Run two programs."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: 120_000,
+    });
+
+    expect(result.code).toBe(0);
+    expect(toolResultText(gateway.requests[1]!.body, "bash-old")).toContain("[still running");
+    expect(bashResultText(gateway.requests[2]!.body, "bash-new")).toBe(
+      "[exit 0, 1 line, 11 B, $FX_OUT/2.txt]\nnew-output\n[the last program ended after its last result: exit 0, 1 line, 11 B, $FX_OUT/1.txt]",
+    );
+    const results = sessionResults(root.home);
+    expect(readFileSync(join(results, "1.txt"), "utf8")).toBe("old-output\n");
+    expect(readFileSync(join(results, "2.txt"), "utf8")).toBe("new-output\n");
+    expect(readFileSync(join(results, "index.tsv"), "utf8")).toBe(
+      "n\texit\tbytes\tlines\tcommand\n1\t0\t11\t1\tsleep 31; echo old-output; touch old-ended\n2\t0\t11\t1\techo new-output\n",
+    );
+  }, 120_000);
+
   test("a long bash result is a preview that names its hidden lines and its file, and a later program reads that file whole", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([

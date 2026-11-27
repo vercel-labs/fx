@@ -15,9 +15,6 @@ const Allocator = std.mem.Allocator;
 /// The most bytes the head and the tail each keep, unless the inline budget needs more.
 pub const keep_min_bytes: usize = 64 * 1024;
 
-/// The bytes one read from the replay hands to the folder at a time.
-const chunk_bytes: usize = 4096;
-
 /// The first bytes of an output, its last bytes, and its counts, fed one chunk at a time.
 pub const Keep = struct {
     alloc: Allocator,
@@ -91,7 +88,7 @@ pub const Replay = union(enum) {
 
 /// A reader of the whole output that feeds `keep` with every byte it hands on. It takes
 /// the replay a frame at a time, so a large output is not decoded byte by byte.
-pub const ReplayReader = struct {
+const ReplayReader = struct {
     replay: *command_replay_store.Reader,
     keep: *Keep,
     alloc: Allocator,
@@ -160,7 +157,7 @@ pub const Output = struct {
     }
 };
 
-pub const Request = struct {
+const Request = struct {
     alloc: Allocator,
     /// The results folder `$FX_OUT` named, or null when the host gives none.
     folder_path: ?[]const u8,
@@ -462,6 +459,109 @@ test "a saved file whose index line cannot be written is kept, and the output sa
     const index = try bed.read(alloc, "index.tsv");
     defer alloc.free(index);
     try std.testing.expectEqualStrings("n\texit\tbytes\tlines\tcommand\n", index);
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+/// Makes a FIFO named `name` in `dir_path`, as a program can with `mkfifo`.
+fn makeFifo(alloc: Allocator, dir_path: []const u8, name: []const u8) !void {
+    const path = try alloc.printSentinel("{s}/{s}", .{ dir_path, name }, 0);
+    defer alloc.free(path);
+    if (mkfifo(path, 0o600) != 0) return error.MkfifoFailed;
+}
+
+fn writeIndexFile(dir_path: []const u8, text: []const u8) !void {
+    var dir = try std.Io.Dir.cwd().openDir(std.testing.io, dir_path, .{});
+    defer dir.close(std.testing.io);
+    try dir.writeFile(std.testing.io, .{ .sub_path = result_files.index_file_name, .data = text });
+}
+
+const small_index_text = "n\texit\tbytes\tlines\tcommand\n";
+const large_index_text = "n\texit\tbytes\tlines\tcommand\n1\t0\t1\t1\tlong command text that keeps the index over its limit\n";
+
+/// Turns `index.tsv` into a FIFO after the first number is picked, as a program can.
+fn fifoIndexAfterFirstNumber(folder: *result_files.ResultFolder, number: u64) void {
+    if (number != 1) return;
+    folder.dir.dir.deleteFile(std.testing.io, result_files.index_file_name) catch {};
+    makeFifo(std.testing.allocator, folder.path, result_files.index_file_name) catch {};
+}
+
+/// Writes an index larger than the test limit after the first number is picked.
+fn largeIndexAfterFirstNumber(folder: *result_files.ResultFolder, number: u64) void {
+    if (number != 1) return;
+    folder.dir.dir.writeFile(std.testing.io, .{
+        .sub_path = result_files.index_file_name,
+        .data = large_index_text,
+    }) catch {};
+}
+
+test "an index.tsv that becomes a FIFO after the number is picked is an index failure, and nothing waits on it" {
+    const alloc = std.testing.allocator;
+    var bed: FolderBed = try .init(alloc);
+    defer bed.deinit(alloc);
+    try std.Io.Dir.cwd().createDir(std.testing.io, bed.path, .fromMode(0o700));
+    try writeIndexFile(bed.path, small_index_text);
+    var request = requestFor(alloc, bed.path, .empty, "");
+    request.after_number = fifoIndexAfterFirstNumber;
+    var output = try save(request);
+    defer output.deinit();
+    try expectFile(output.saved, 1);
+    try std.testing.expect(output.index_missing);
+}
+
+test "a FIFO at index.tsv is not waited on, and the output says the results folder could not be read" {
+    const alloc = std.testing.allocator;
+    var bed: FolderBed = try .init(alloc);
+    defer bed.deinit(alloc);
+    try std.Io.Dir.cwd().createDir(std.testing.io, bed.path, .fromMode(0o700));
+    try makeFifo(alloc, bed.path, result_files.index_file_name);
+    var output = try save(requestFor(alloc, bed.path, .empty, "shown\n"));
+    defer output.deinit();
+    try expectNotSavedError(output.saved, "the results folder could not be read");
+    try std.testing.expectEqualStrings("shown\n", output.head);
+}
+
+test "an index over its size limit does not stop a save: the next file is written, and the result gives the index notice" {
+    const alloc = std.testing.allocator;
+    var bed: FolderBed = try .init(alloc);
+    defer bed.deinit(alloc);
+    try std.Io.Dir.cwd().createDir(std.testing.io, bed.path, .fromMode(0o700));
+    {
+        var dir = try std.Io.Dir.cwd().openDir(std.testing.io, bed.path, .{});
+        defer dir.close(std.testing.io);
+        try dir.writeFile(std.testing.io, .{ .sub_path = "1.txt", .data = "earlier\n" });
+    }
+    try writeIndexFile(bed.path, large_index_text);
+    var request = requestFor(alloc, bed.path, .empty, "");
+    request.limits.max_index_bytes = 64;
+    var output = try save(request);
+    defer output.deinit();
+    try expectFile(output.saved, 2);
+    try std.testing.expect(output.index_missing);
+    const file = try bed.read(alloc, "2.txt");
+    defer alloc.free(file);
+    try std.testing.expectEqualStrings("", file);
+    const index = try bed.read(alloc, "index.tsv");
+    defer alloc.free(index);
+    try std.testing.expectEqualStrings(large_index_text, index);
+}
+
+test "an index that grows past its size limit after the number is picked is an index failure, and the file stays" {
+    const alloc = std.testing.allocator;
+    var bed: FolderBed = try .init(alloc);
+    defer bed.deinit(alloc);
+    try std.Io.Dir.cwd().createDir(std.testing.io, bed.path, .fromMode(0o700));
+    try writeIndexFile(bed.path, small_index_text);
+    var request = requestFor(alloc, bed.path, .empty, "");
+    request.limits.max_index_bytes = 64;
+    request.after_number = largeIndexAfterFirstNumber;
+    var output = try save(request);
+    defer output.deinit();
+    try expectFile(output.saved, 1);
+    try std.testing.expect(output.index_missing);
+    const index = try bed.read(alloc, "index.tsv");
+    defer alloc.free(index);
+    try std.testing.expectEqualStrings(large_index_text, index);
 }
 
 /// Lets another writer take number 1, as a program writing `1.txt` itself would.
