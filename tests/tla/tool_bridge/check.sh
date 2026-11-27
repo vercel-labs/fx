@@ -18,6 +18,14 @@
 # random behaviors; SIM_RUNS sets how many (default 20000). The witness-*
 # configs show that an edit is applied, prompted, and refused as stale.
 #
+# AgentWait models `fx tool agent wait`, which has not landed. agent-design
+# must pass. agent-current-more shows that today `wait_more` yields while a
+# bridge call holds it, and agent-current-cancel and agent-current-hang that
+# today a wait whose program is gone never ends, so its bash call never
+# returns. agent-mutant-takes-mail shows why the wait leaves the mail in the
+# queue. The agent-witness-* configs show a canceled wait, a quiet wait, a
+# wait that ended on mail, and a held `wait_more`.
+#
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 set -eu
 
@@ -45,6 +53,15 @@ ToolEdit witness-prompted NeverPrompted
 ToolEdit witness-stale NeverStale
 ToolEdit simulate-ideal simulate $sim
 ToolEdit simulate-nonideal simulate $sim
+AgentWait agent-design -
+AgentWait agent-current-more NoYieldWhileHeld
+AgentWait agent-current-cancel temporal
+AgentWait agent-current-hang temporal
+AgentWait agent-mutant-takes-mail NoMailLost
+AgentWait agent-witness-canceled NeverCanceled
+AgentWait agent-witness-quiet NeverQuiet
+AgentWait agent-witness-mail NeverMailAfterWait
+AgentWait agent-witness-held NeverHeldOnMore
 EOT
 
 # The driver: the design-bridge state graph walked on the real harness,
