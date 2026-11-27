@@ -10059,7 +10059,7 @@ test.skipIf(!tmuxAvailable())(
       expect(cancelledIndex).toBeGreaterThanOrEqual(0);
       expect(resumed).toContain("▪ Cancelled");
       expect(countOccurrences(resumed, "What can fx do differently?")).toBe(1);
-      expect(resumed).not.toContain("system: cancelled");
+      expect(resumed).not.toContain("⊘ Cancelled");
       expect(resumed).not.toContain("Cancelling");
       expect(resumed).not.toContain("Interrupted by user after completing");
       expect(resumed).not.toContain("<turn_aborted>");
@@ -11030,6 +11030,7 @@ async function launchFx(
   args: string,
   name: string,
   extraEnv: Record<string, string> = {},
+  size: { width?: number; height?: number } = {},
 ) {
   const stderrPath = join(fixture.root, `${name}-stderr.log`);
   writeFileSync(stderrPath, "");
@@ -11038,15 +11039,15 @@ async function launchFx(
     cwd: fixture.workspace,
     env: { ...gatewayEnv(fixture.home, gateway), ...extraEnv },
     stderrPath,
-    width: 100,
-    height: 32,
+    width: size.width ?? 100,
+    height: size.height ?? 32,
   });
   await session.waitForComposer(TIMEOUT);
   return { session, stderrPath };
 }
 
 /// Kills fx the way the test names it and waits for the process to go.
-async function endFx(session: TmuxSession, signal: "SIGKILL" | "SIGHUP") {
+async function endFx(session: TmuxSession, signal: "SIGKILL" | "SIGHUP" | "SIGINT") {
   const pid = session.processPid();
   process.kill(pid, signal);
   const deadline = Date.now() + 10_000;
@@ -11083,8 +11084,8 @@ test.skipIf(!tmuxAvailable())(
       const pane = await active.waitForText("RESUMED_ANSWER_7310", TIMEOUT);
       expect(pane).toContain("Resuming the interrupted request");
       // The killed turn reads as stopped, not as a failure.
-      expect(pane).toContain("system: fx stopped before this turn finished");
-      expect(pane).not.toContain("system: failed");
+      expect(pane).toContain("⚠ fx stopped before this turn finished");
+      expect(pane).not.toContain("✗ Failed");
       // The note is for the model; the transcript never shows it.
       expect(pane).not.toContain(RESUME_NOTE);
       const resumed = gateway.requests.slice(before).find((request) => request.body.includes(RESUME_NOTE));
@@ -11092,6 +11093,69 @@ test.skipIf(!tmuxAvailable())(
       // The model sees the interrupted prompt before the note.
       expect(resumed!.body).toContain("Plan the trip.");
       await active.waitForComposer(TIMEOUT);
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+// 12 rows lets the resume handoff and the resent request's note land in the same few frames,
+// so the short screen makes the note push rows off.
+test.skipIf(!tmuxAvailable())(
+  "a crash resume in a short terminal keeps every earlier row in the terminal history",
+  async () => {
+    const answer = "SHORT_RESUME_ANSWER_7310";
+    const fixture = resumeFixture("fx-short-resume-history-");
+    let reached: () => void = () => {};
+    const inFlight = new Promise<void>((resolve) => (reached = resolve));
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText(answer);
+      if (body.includes("Plan the trip.")) {
+        let done = 0;
+        for (let step = 1; step <= 3; step += 1) {
+          if (body.includes(`step-${step}`)) done = step;
+        }
+        if (done >= 3) {
+          reached();
+          return new Promise<Response>(() => {});
+        }
+        return fakeShellRun(`short-resume-step-${done + 1}`, `echo step-${done + 1}`);
+      }
+      return fakeGatewayFinalText("UNEXPECTED");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      const first = await launchFx(fixture, gateway, "", "first", {}, { width: 100, height: 12 });
+      active = first.session;
+      await active.sendText("Plan the trip.");
+      await inFlight;
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      const second = await launchFx(fixture, gateway, "-c", "second", {}, { width: 100, height: 12 });
+      active = second.session;
+      await active.waitForText(answer, TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      const scrollback = await active.waitForStableScrollback((s) => s.includes(answer));
+      const expectedRows = [
+        "* session resumed: Plan the trip.",
+        "┃ Plan the trip.",
+        "● Ran echo · 3 calls",
+        "⚠ fx stopped before this turn finished",
+        "* session: Resuming the interrupted request",
+        answer,
+      ];
+      let previousIndex = -1;
+      for (const row of expectedRows) {
+        expect(countOccurrences(scrollback, row)).toBe(1);
+        const index = scrollback.indexOf(row);
+        expect(index).toBeGreaterThan(previousIndex);
+        previousIndex = index;
+      }
       expect(readFileSync(second.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();
@@ -11420,11 +11484,155 @@ test.skipIf(!tmuxAvailable())(
       const pane = await active.capturePane();
       expect(pane).not.toContain("crashed fx twice");
       // A closed window reads as stopped, not as cancelled.
-      expect(pane).toContain("system: fx stopped before this turn finished");
-      expect(pane).not.toContain("system: cancelled");
+      expect(pane).toContain("⚠ fx stopped before this turn finished");
+      expect(pane).not.toContain("⊘ Cancelled");
       expect(readFileSync(third.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
+);
+
+const NORMAL_TTY_FLAGS = ["isig", "icanon", "echo"];
+const CLOSE_RECORDED_MARK = "fx-close-recorded";
+const FULL_TRANSCRIPT_FOOTER = "esc close · pgup/pgdn scroll";
+
+/// The flags of `stty -a` that are on. A raw tty has them off.
+function enabledTtyFlags(sttyOutput: string): string[] {
+  const words = new Set(sttyOutput.split(/\s+/));
+  return NORMAL_TTY_FLAGS.filter((flag) => words.has(flag));
+}
+
+function alternateScreenOn(session: TmuxSession): boolean {
+  const state = execFileSync(
+    "tmux",
+    ["display-message", "-p", "-t", `${session.name}:0.0`, "#{alternate_on}"],
+    { encoding: "utf8" },
+  ).trim();
+  return state === "1";
+}
+
+/// Starts fx in a wrapper that writes the tty mode to `ttyAfterPath` once fx
+/// exits, then prints CLOSE_RECORDED_MARK into the pane, which the test waits
+/// for. The pane stays open, so its screen can be read after the exit.
+async function launchFxRecordingTty(
+  fixture: ReturnType<typeof resumeFixture>,
+  gateway: ReturnType<typeof startFakeGateway>,
+  name: string,
+) {
+  const stderrPath = join(fixture.root, `${name}-stderr.log`);
+  const ttyAfterPath = join(fixture.root, `${name}-tty-after.txt`);
+  const wrapperPath = join(fixture.root, `${name}-wrapper.sh`);
+  const tmpPath = `${ttyAfterPath}.tmp`;
+  writeFileSync(stderrPath, "");
+  writeFileSync(
+    wrapperPath,
+    [
+      "#!/bin/sh",
+      shellQuote(FX_BIN),
+      "status=$?",
+      `/bin/stty -a > ${shellQuote(tmpPath)}`,
+      `/bin/mv ${shellQuote(tmpPath)} ${shellQuote(ttyAfterPath)}`,
+      `echo ${CLOSE_RECORDED_MARK}`,
+      'exit "$status"',
+      "",
+    ].join("\n"),
+  );
+  const session = await TmuxSession.create({
+    cmd: `/bin/sh ${shellQuote(wrapperPath)}`,
+    cwd: fixture.workspace,
+    env: gatewayEnv(fixture.home, gateway),
+    stderrPath,
+    width: 100,
+    height: 32,
+    remainOnExit: true,
+  });
+  await session.waitForComposer(TIMEOUT);
+  return { session, stderrPath, ttyAfterPath };
+}
+
+/// Sends `signal` to fx, the wrapper's one child, and waits for the wrapper
+/// to record the tty mode, which it does only after fx has exited.
+async function signalFxRecordingTty(
+  launch: Awaited<ReturnType<typeof launchFxRecordingTty>>,
+  signal: NodeJS.Signals,
+) {
+  const wrapper = launch.session.processPid();
+  const children = execFileSync("pgrep", ["-P", String(wrapper)], { encoding: "utf8" })
+    .trim()
+    .split("\n");
+  if (children.length !== 1) throw new Error(`expected one child of wrapper ${wrapper}, saw ${children.length}`);
+  process.kill(Number(children[0]), signal);
+  await launch.session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT);
+}
+
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+  test.skipIf(!tmuxAvailable())(
+    `an outside ${signal} leaves the terminal in normal mode and the transcript screen, and the request in flight resumes`,
+    async () => {
+      const fixture = resumeFixture(`fx-close-${signal.toLowerCase()}-`);
+      const prompt = `Keep this on ${signal}.`;
+      const { gateway, heldAtLeast } = holdingGateway(prompt);
+      const sessions: TmuxSession[] = [];
+      try {
+        const first = await launchFxRecordingTty(fixture, gateway, "first");
+        sessions.push(first.session);
+        await first.session.sendText(prompt);
+        await heldAtLeast(1);
+        await first.session.sendKeys("C-o");
+        await first.session.waitForText(FULL_TRANSCRIPT_FOOTER, TIMEOUT);
+        expect(alternateScreenOn(first.session)).toBe(true);
+
+        await signalFxRecordingTty(first, signal);
+        expect(enabledTtyFlags(readFileSync(first.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
+        expect(alternateScreenOn(first.session)).toBe(false);
+
+        const before = gateway.requests.length;
+        const second = await launchFx(fixture, gateway, "-c", "second");
+        sessions.push(second.session);
+        await heldAtLeast(2);
+        const resumed = gateway.requests.slice(before).find((request) => request.body.includes(RESUME_NOTE));
+        expect(resumed?.body).toContain(prompt);
+        expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+      } finally {
+        for (const session of sessions) await session.kill();
+        gateway.stop();
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 3,
+  );
+}
+
+test.skipIf(!tmuxAvailable())(
+  "an outside SIGINT is a closed window too: two closes in flight still resume without asking",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-close-int-");
+    const { gateway, heldAtLeast, held } = holdingGateway("Keep going on interrupt.");
+    const sessions: TmuxSession[] = [];
+    try {
+      const first = await launchFx(fixture, gateway, "", "first");
+      sessions.push(first.session);
+      await first.session.sendText("Keep going on interrupt.");
+      await heldAtLeast(1);
+      await endFx(first.session, "SIGINT");
+
+      const second = await launchFx(fixture, gateway, "-c", "second");
+      sessions.push(second.session);
+      await heldAtLeast(2);
+      await endFx(second.session, "SIGINT");
+
+      const third = await launchFx(fixture, gateway, "-c", "third");
+      sessions.push(third.session);
+      await third.session.waitForPane((pane) => pane.includes("crashed fx twice") || held() >= 3, TIMEOUT);
+      expect(await third.session.capturePane()).not.toContain("crashed fx twice");
+      await heldAtLeast(3);
+      expect(readFileSync(third.stderrPath, "utf8")).toBe("");
+    } finally {
+      for (const session of sessions) await session.kill();
       gateway.stop();
       rmSync(fixture.root, { recursive: true, force: true });
     }

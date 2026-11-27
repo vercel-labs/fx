@@ -1902,7 +1902,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     // The notice wraps at the pane's width.
     expect(scrollback.replace(/\s+/g, " ")).toContain("Asking the model to do it in smaller steps, at low effort.");
     expect(scrollback).not.toContain("did not run them");
-    expect(scrollback).not.toContain("response hit provider length limit");
+    expect(scrollback).not.toContain("The response hit the provider's length limit and may be incomplete.");
     expect(scrollback).not.toContain("UnknownToolLifecycleIdentity");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
     await session!.sendText("Confirm a later prompt is still usable.");
@@ -3440,7 +3440,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session!.sendText("Trigger restricted provider.");
       // The reason goes to the transcript; the status line says what to do.
-      await session!.waitForText("API access denied · HTTP 403 · Provider: wafer", TIMEOUT);
+      await session!.waitForText("⚠ Your team has restricted access to this provider.", TIMEOUT);
       await session!.waitForText("The provider rejected this request · press Esc", TIMEOUT);
       await session!.sendKeys("Escape");
       await session!.waitForPane(
@@ -3450,10 +3450,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests.length).toBe(1);
-      expect(countOccurrences(scrollback, "API access denied · HTTP 403 · Provider: wafer")).toBe(1);
-      expect(scrollback).toContain(
-        "no_providers_available: Your team has restricted access to this",
-      );
+      const restrictedNotice = "⚠ Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer";
+      const flatScrollback = scrollback.replace(/\s+/g, " ");
+      expect(countOccurrences(flatScrollback, restrictedNotice)).toBe(1);
+      expect(scrollback).not.toContain("API access denied");
       expect(scrollback).not.toContain('{"error"');
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -3694,7 +3694,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.requests.length).toBe(4);
       expect(scrollback).not.toContain("Try again later");
-      expect(scrollback).not.toContain("request failed");
+      expect(scrollback).not.toContain("Request failed");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -3761,7 +3761,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.requests).toHaveLength(2);
       // The provider's reason showed once, while the picker was up.
-      expect(countOccurrences(scrollback, "credit_card_required")).toBe(1);
+      expect(countOccurrences(scrollback.replace(/\s+/g, " "), "Buy credits to use AI Gateway.")).toBe(1);
+      // The HTTP code row shows only in Ctrl+O, not in the compact scrollback.
+      expect(scrollback).not.toContain("credit_card_required");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT * 2,
@@ -4465,9 +4467,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.requests).toHaveLength(3);
       expect(scrollback).toContain("What can fx do differently?");
-      expect(scrollback).not.toContain("system: cancelled");
+      expect(scrollback).not.toContain("⊘ Cancelled");
       expect(scrollback).not.toContain("Cancelling");
-      expect(scrollback).not.toContain("request failed: ModelError");
+      expect(scrollback).not.toContain("Request failed: ModelError");
       expect(scrollback).not.toContain("must not send");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -4809,10 +4811,75 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // The status row never becomes transcript.
       expect(scrollback).not.toContain("Gateway error ·");
       expect(scrollback).not.toContain("What should fx do?");
-      expect(scrollback).not.toContain("request failed: ModelError");
+      expect(scrollback).not.toContain("Request failed: ModelError");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
+  );
+
+  test(
+    "TUI names the model in turn context, announces /model switches in <fx-context-update>, and keeps frozen instructions identical",
+    async () => {
+      const modelB = "openai/gpt-5.4";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-model-identity-",
+        [
+          fakeGatewayFinalText("TUI_MODEL_TURN_1"),
+          fakeGatewayFinalText("TUI_MODEL_TURN_2"),
+          fakeGatewayFinalText("TUI_MODEL_TURN_3"),
+        ],
+        {
+          models: [
+            { id: MODEL, type: "language", tags: ["tool-use"] },
+            { id: modelB, type: "language", tags: ["tool-use"] },
+          ],
+        },
+      );
+
+      await session!.sendText("First model turn.");
+      await session!.waitForPane((pane) => pane.includes("TUI_MODEL_TURN_1") && turnSettled(pane), TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+
+      await session!.sendText(`/model ${modelB}`);
+      await session!.waitForText(`Switched to ${modelB}`, TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+
+      await session!.sendText("Second model turn.");
+      await session!.waitForPane((pane) => pane.includes("TUI_MODEL_TURN_2") && turnSettled(pane), TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+
+      await session!.sendText("Third model turn.");
+      await session!.waitForPane((pane) => pane.includes("TUI_MODEL_TURN_3") && turnSettled(pane), TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+
+      expect(queuedGateway.requests).toHaveLength(3);
+      const parseReq = (body: string) => JSON.parse(body) as { prompt: Array<{ role: string; content: unknown; providerOptions?: unknown }> };
+      const leadingSystem = (req: ReturnType<typeof parseReq>) => {
+        const firstNonSystem = req.prompt.findIndex((m) => m.role !== "system");
+        return req.prompt.slice(0, firstNonSystem < 0 ? req.prompt.length : firstNonSystem);
+      };
+      const req1 = parseReq(queuedGateway.requests[0]!.body);
+      const req2 = parseReq(queuedGateway.requests[1]!.body);
+      const req3 = parseReq(queuedGateway.requests[2]!.body);
+
+      const sys1 = leadingSystem(req1);
+      const sys2 = leadingSystem(req2);
+      const sys3 = leadingSystem(req3);
+      expect(JSON.stringify(sys2)).toBe(JSON.stringify(sys1));
+      expect(JSON.stringify(sys3)).toBe(JSON.stringify(sys1));
+
+      const turnCtx1 = sys1.map((m) => contentText(m.content)).find((text) => text.includes("<fx-turn-context>")) ?? "";
+      expect(turnCtx1).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${MODEL}\\n`));
+
+      const latestUser2 = contentText(req2.prompt.filter((m) => m.role === "user").at(-1)?.content);
+      expect(latestUser2).toContain("<fx-context-update>");
+      expect(latestUser2).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelB}\\n`));
+
+      const latestUser3 = contentText(req3.prompt.filter((m) => m.role === "user").at(-1)?.content);
+      expect(latestUser3).not.toContain("<fx-context-update>");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
   );
 
   test(
@@ -7697,7 +7764,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       await waitForCondition(() => hold.cancelled, "stream cancellation");
       expect(afterFirst).toContain("▪ Cancelled");
-      expect(afterFirst).not.toContain("system: cancelled");
+      expect(afterFirst).not.toContain("⊘ Cancelled");
       expect(afterFirst).not.toContain("Cancelling");
       expect(session.isPaneAlive()).toBe(true);
 
@@ -7719,7 +7786,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(
         countOccurrences(scrollback, "What can fx do differently?"),
       ).toBe(1);
-      expect(scrollback).not.toContain("system: cancelled");
+      expect(scrollback).not.toContain("⊘ Cancelled");
       expect(scrollback).not.toContain("Cancelling");
       expect(countOccurrences(trace, "source=input_active_stream")).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

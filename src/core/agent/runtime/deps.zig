@@ -284,7 +284,7 @@ pub const AgentRuntimeDeps = struct {
     /// seconds to stop holds neither the turn's end nor the next prompt.
     /// Hosts without steering leave it unset.
     stop_steering_detached_commands: ?*const fn (ctx: *anyopaque, turn_id: u64) anyerror!void = null,
-    append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
+    append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8, messages: *std.ArrayList(ChatMessage)) anyerror!void,
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
     snapshot_mcp_definition: ?*const fn (*anyopaque, Allocator, []const u8, types.McpToolBinding) anyerror!@import("../../tooling/tool_mcp_runtime.zig").DefinitionSnapshot = null,
@@ -438,6 +438,12 @@ pub const AgentRuntimeDeps = struct {
 
     pub fn pushContextNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
         if (self.push_context_notice) |push| return push(self.ctx, text);
+        return self.push_system_notice(self.ctx, text);
+    }
+
+    /// A warning in the transcript where the host shows one, else the plain system notice.
+    pub fn pushWarningNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
+        if (self.push_interactive_notice) |push| return push(self.ctx, .{ .topic = "", .tone = .warning, .body = text });
         return self.push_system_notice(self.ctx, text);
     }
 
