@@ -28,6 +28,7 @@ const scripts = [
   "test-native-core-image-framing.mjs",
   "test-native-host-tool-frame-limit.mjs",
   "test-native-core-cancel-before-fetch.mjs",
+  "test-native-core-session-switch-during-fetch.mjs",
   "test-native-core-cancel.mjs",
   "test-native-host-tool-late-settle.mjs",
   "test-default-import.mjs",
