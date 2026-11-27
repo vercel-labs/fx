@@ -1648,10 +1648,18 @@ test "streamed presentation preserves ANSI OSC 8 code fence and table spans" {
     const test_paths_module = try alloc.print("-Mtest_paths={s}", .{test_paths_path});
     defer alloc.free(test_paths_module);
 
+    // `debug_trace.zig` reads `trace_log` from `build_options`; the nested
+    // compile is a fx build with the trace log on.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build_options.zig", .data = "pub const trace_log = true;\n" });
+    const build_options_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "build_options.zig");
+    defer alloc.free(build_options_path);
+    const build_options_module = try alloc.print("-Mbuild_options={s}", .{build_options_path});
+    defer alloc.free(build_options_module);
+
     const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
     defer alloc.free(cwd);
     const result = try std.process.run(alloc, std.testing.io, .{
-        .argv = &.{ "zig", "test", "-lc", "--dep", "test_paths", "-Mroot=src/main.zig", test_paths_module, "--test-filter", ansi_span_test_name },
+        .argv = &.{ "zig", "test", "-lc", "--dep", "test_paths", "--dep", "build_options", "-Mroot=src/main.zig", test_paths_module, build_options_module, "--test-filter", ansi_span_test_name },
         .cwd = .{ .path = cwd },
         .environ_map = &environ,
         .stdout_limit = .limited(64 * 1024),
