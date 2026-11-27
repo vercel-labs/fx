@@ -453,7 +453,14 @@ describe("fx mcp", () => {
         },
       },
     }));
-    const wait = `for i in $(seq 1 100); do [ -e "${marker}.ready" ] && break; sleep 0.2; done; sleep 2`;
+    // Wait until the second process has started, then until `show` says the server is ready with its list refused. Each wait
+    // has a deadline and says which one ran out.
+    const wait = [
+      `for i in $(seq 1 150); do [ -e "${marker}.ready" ] && break; sleep 0.2; done`,
+      `[ -e "${marker}.ready" ] || { echo "WAIT_FAILED the second process never started"; exit 1; }`,
+      `for i in $(seq 1 150); do "${FX_BIN}" mcp show web 2>&1 | grep -q "ready, tool list refused" && exit 0; sleep 0.2; done`,
+      `echo "WAIT_FAILED show never said ready with its list refused"; exit 1`,
+    ].join("; ");
     const activeGateway = startFakeGateway([
       fakeGatewayToolCall("search_down", "toolbox", { search: "web tools", server: "web" }),
       fakeGatewayToolCall("wait_back", "shell", { action: "run", command: wait }),
@@ -470,13 +477,14 @@ describe("fx mcp", () => {
     expect(asked.code).toBe(0);
     expect(existsSync(`${marker}.ready`)).toBe(true);
     const told = activeGateway.requests[4]?.body ?? "";
+    expect(told).not.toContain("WAIT_FAILED");
     // The first search met the crash and says it. The two after the server is back say the refusal and not the crash.
     expect(told.split("MCP server 'web' is unavailable: its process exited").length - 1).toBeLessThanOrEqual(1);
     expect(told.split("MCP server 'web' is unavailable: a field is written twice").length - 1).toBeGreaterThanOrEqual(2);
   }, 120_000);
 
   // The `/mcp` list gives each row the words of its status that fit: under 33 columns the whole words of a refused list
-  // do not, so a row says its kind in fewer, and a cut never takes the word that says it.
+  // do not, so a row says its kind in fewer. At the widths this test uses, from 27 columns, no cut takes the word that says it.
   test.skipIf(!tmuxAvailable())("the /mcp list says a refused and an unavailable tool list in rows that fit at 30, 33, 60 and 200 columns", async () => {
     const refused = startModernMcpHttpFixture("list_http_403");
     const waiting = startModernMcpHttpFixture("list_http_503");

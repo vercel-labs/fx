@@ -1572,7 +1572,7 @@ pub const Runtime = struct {
         switch (event.kind) {
             // A failed attempt ends the waits for tools with its reason; the
             // engine keeps trying, so a later request may still get them.
-            .phase => |phase| if (phase == .backoff or phase == .failed) {
+            .phase => |phase| if (explainsFailure(phase)) {
                 r.endToolWaiters(i, .failed);
                 // The request that checks a new login failed to get an answer. Not a refusal,
                 // unless the server's 401 stands (`checkFailed`).
@@ -1643,7 +1643,7 @@ pub const Runtime = struct {
                     "its reply was larger than fx reads in one message, so fx dropped it";
             }
             if (result == .ended and result.ended.outcome == .transport_failed) {
-                const down = if (r.enginePhase(index)) |p| p == .backoff or p == .failed else false;
+                const down = if (r.enginePhase(index)) |p| explainsFailure(p) else false;
                 if (down) result.ended.why = r.failureText(req.alloc, index) catch null;
             }
             // The server sent something fx could not read: a 2xx body that is no JSON-RPC message,
