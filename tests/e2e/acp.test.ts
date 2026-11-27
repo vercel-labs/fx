@@ -21,7 +21,7 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { FX_BIN, fxChildEnv, HAS_API_KEY, providerVersionTestEnv, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, HAS_API_KEY, pinnedClientVersions, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import {
   AUTO_EXA_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
@@ -766,11 +766,11 @@ class AcpClient {
       }
     }
     const proc = nodeSpawn(FX_BIN, args, {
-      env: localCreditsEnv(providerVersionTestEnv({
+      env: localCreditsEnv({
         ...inheritedEnv,
         NO_COLOR: "1",
         PATH: inheritedEnv.PATH ?? "",
-      })),
+      }),
       cwd: opts?.cwd ?? REPO_ROOT,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -1576,6 +1576,22 @@ function createPromptTerminalBoundary(root: string) {
       FX_TEST_ACP_PROMPT_TERMINAL_READY: terminalReady,
       FX_TEST_ACP_PROMPT_REAP_READY: reapReady,
       FX_TEST_ACP_PROMPT_RELEASE: release,
+    },
+  };
+}
+
+function createPromptPermissionBoundary(root: string) {
+  const permissionReady = join(root, "permission.ready");
+  const reapReady = join(root, "permission-reap.ready");
+  const release = join(root, "permission.release");
+  return {
+    permissionReady,
+    reapReady,
+    release,
+    env: {
+      FX_TEST_ACP_PERMISSION_READY: permissionReady,
+      FX_TEST_ACP_PROMPT_REAP_READY: reapReady,
+      FX_TEST_ACP_PERMISSION_RELEASE: release,
     },
   };
 }
@@ -7664,6 +7680,202 @@ describe("acp: model-independent", () => {
       }
     },
     LIVE_TIMEOUT,
+  );
+
+  test(
+    "ACP EOF refuses a permission request that begins after end of input",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-permission-after-eof-");
+      const target = join(root.workspace, "never-written.txt");
+      const boundary = createPromptPermissionBoundary(root.root);
+      const gateway = startFakeGateway([
+        fileToolCall("after_eof_perm_1", target, "blocked\n"),
+        finalText("unexpected post-permission completion"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            ...boundary.env,
+          },
+        });
+        await startAutoSession(client);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
+        sendPrompt(client, 5, "Write a file that requires permission.");
+        await waitForPath(boundary.permissionReady, 5_000);
+
+        client.endStdin();
+        await waitForPath(boundary.reapReady, 5_000);
+        releasePromptBoundary(boundary);
+
+        expect(await client.waitForExit(5_000)).toBe(0);
+        expect(client.stderr).toBe("");
+        expect(
+          client.rawLines.some((line) => JSON.parse(line).method === "session/request_permission"),
+        ).toBe(false);
+        expect(existsSync(target)).toBe(false);
+      } finally {
+        releasePromptBoundary(boundary);
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP session/close refuses a permission request that begins after cancel",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-permission-after-close-");
+      const blockedTarget = join(root.workspace, "blocked-by-close.txt");
+      const allowedTarget = join(root.workspace, "after-close.txt");
+      const boundary = createPromptPermissionBoundary(root.root);
+      const gateway = startDynamicFakeGateway((body) => {
+        if (body.includes("AFTER_CLOSE")) {
+          if (!body.includes("after_close_write")) {
+            return fileToolCall("after_close_write", allowedTarget, "ALLOWED\n");
+          }
+          return finalText("wrote after close");
+        }
+        return fileToolCall("during_close_write", blockedTarget, "BLOCKED\n");
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            ...boundary.env,
+          },
+        });
+        const sessionId = await startAutoSession(client);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
+        sendPrompt(client, 5, "Write a file while session/close arrives.");
+        await waitForPath(boundary.permissionReady, 5_000);
+
+        client.send({
+          jsonrpc: "2.0",
+          id: 6,
+          method: "session/close",
+          params: { sessionId },
+        });
+        await waitForPath(boundary.reapReady, 5_000);
+        releasePromptBoundary(boundary);
+
+        const closeResp = await readResponse(client, 6, 5_000);
+        expect(closeResp.error).toBeUndefined();
+        expect(
+          client.rawLines.some((line) => JSON.parse(line).method === "session/request_permission"),
+        ).toBe(false);
+        expect(existsSync(blockedTarget)).toBe(false);
+
+        const nextSession = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 7) as any;
+        expect(nextSession.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "ask" }, 8);
+        client.setPermissionOption("allow_once");
+        const nextPrompt = await runPrompt(client, "AFTER_CLOSE", 5_000);
+        expect(nextPrompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(readFileSync(allowedTarget, "utf8")).toBe("ALLOWED\n");
+
+        client.endStdin();
+        expect(await client.waitForExit(5_000)).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        releasePromptBoundary(boundary);
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP permission request answered before EOF completes before exit",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-permission-before-eof-");
+      const target = join(root.workspace, "approved.txt");
+      const gateway = startFakeGateway([
+        fileToolCall("before_eof_perm_1", target, "APPROVED\n"),
+        finalText("permission answered before eof"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startAutoSession(client);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
+        client.setPermissionOption("allow_once");
+
+        const result = await runPrompt(client, "Write a file with permission.", 5_000);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(readFileSync(target, "utf8")).toBe("APPROVED\n");
+        expect(
+          client.rawLines.some((line) => JSON.parse(line).method === "session/request_permission"),
+        ).toBe(true);
+
+        client.endStdin();
+        expect(await client.waitForExit(5_000)).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP session/cancel leaves subsequent prompts able to request and answer permission",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-permission-after-cancel-");
+      const target = join(root.workspace, "after-cancel.txt");
+      const gateway = startDynamicFakeGateway((body) => {
+        if (body.includes("SERVE_AFTER_CANCEL")) {
+          if (!body.includes("after_cancel_write")) {
+            return fileToolCall("after_cancel_write", target, "SERVED\n");
+          }
+          return finalText("served after cancel");
+        }
+        return new Promise<Response>(() => {});
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const sessionId = await startAutoSession(client);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
+
+        sendPrompt(client, 5, "CANCEL_FIRST_TURN");
+        await waitForCondition("cancelled turn reaches gateway", () => gateway.requests.length === 1);
+        const cancelResp = await client.request("session/cancel", { sessionId }, 6) as any;
+        expect(cancelResp.error).toBeUndefined();
+        const firstOutcome = await readResponse(client, 5, 5_000);
+        expect(firstOutcome.result.stopReason).toBe("cancelled");
+
+        client.setPermissionOption("allow_once");
+        const secondOutcome = await runPrompt(client, "SERVE_AFTER_CANCEL", 5_000);
+        expect(secondOutcome.promptResult.result.stopReason).toBe("end_turn");
+        expect(readFileSync(target, "utf8")).toBe("SERVED\n");
+        expect(
+          client.rawLines.some((line) => JSON.parse(line).method === "session/request_permission"),
+        ).toBe(true);
+
+        client.endStdin();
+        expect(await client.waitForExit(5_000)).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
   );
 
   test(
@@ -16070,7 +16282,7 @@ describe("acp: model catalog authentication", () => {
           expect(request.tokenAuth).toBe("xai-grok-cli");
           expect(request.authenticateResponse).toBe("authenticate-response");
           expect(request.clientIdentifier).toBe("fx");
-          expect(request.clientVersion).toBe("1.0.6");
+          expect(request.clientVersion).toBe(pinnedClientVersions.grok);
           expect(request.modelOverride).toBe("grok-4.20");
           expect(request.grokUserId).toBe("acct_grok_acp");
         }

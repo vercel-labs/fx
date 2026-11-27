@@ -198,11 +198,16 @@ pub const Journal = struct {
     }
 
     /// Whether the progress just sent at `now_ms`, a save of kind `kind`, is
-    /// where the turn yields. Only the save right before a model request can
-    /// be, and the first request of a prompt always goes out, so each prompt
-    /// makes progress however late it starts.
-    pub fn yieldsAt(self: *Journal, now_ms: i64, kind: QuiesceKind) bool {
-        return quiesce.step(&self.quiesce, .{ .boundary = .{ .now_ms = now_ms, .kind = kind } }) == .yield;
+    /// where the turn yields: its time limit has passed, or its host asked it
+    /// to stop (`stop_requested`, from `libfx/yield`). Only the save right
+    /// before a model request can be, and the first request of a prompt always
+    /// goes out, so each prompt makes progress however late it starts.
+    pub fn yieldsAt(self: *Journal, now_ms: i64, kind: QuiesceKind, stop_requested: bool) bool {
+        return quiesce.step(&self.quiesce, .{ .boundary = .{
+            .now_ms = now_ms,
+            .stop_requested = stop_requested,
+            .kind = kind,
+        } }) == .yield;
     }
 
     /// Keeps `checkpoint`, the progress a yield stopped at, as the pending
@@ -1003,6 +1008,24 @@ test "a progress places the follow-up its turn runs" {
     // Nothing is left to settle when the turn ends.
     try session.endUnplaced(alloc, alloc, "session");
     try std.testing.expect(std.mem.find(u8, capture.frames.items, "input_withdrawn") == null);
+}
+
+test "a host's stop request yields the turn at the request save after its first" {
+    const alloc = std.testing.allocator;
+    var capture: TestCapture = .{};
+    defer capture.frames.deinit(alloc);
+    var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
+    var session: Journal = .{ .writer = &writer };
+    defer session.deinit(alloc);
+
+    session.startYieldClock(null);
+    // The prompt's first request goes out, and a compaction or another save
+    // never stops the turn.
+    try std.testing.expect(!session.yieldsAt(0, .request, true));
+    try std.testing.expect(!session.yieldsAt(0, .compaction, true));
+    try std.testing.expect(!session.yieldsAt(0, .other, true));
+    try std.testing.expect(!session.yieldsAt(0, .request, false));
+    try std.testing.expect(session.yieldsAt(0, .request, true));
 }
 
 test "a follow-up whose turn ended before its request is withdrawn, so it never runs again" {

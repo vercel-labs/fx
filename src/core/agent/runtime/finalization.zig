@@ -33,6 +33,7 @@ pub const TurnFinalizationGuard = struct {
         open,
         emitted,
         fatal,
+        yielded,
     };
 
     deps: *const AgentRuntimeDeps,
@@ -180,6 +181,15 @@ pub const TurnFinalizationGuard = struct {
                 .{ self.turn_id, @errorName(err) },
             );
         };
+    }
+
+    /// Leaves a turn that yielded open: its host resumes the same turn, and
+    /// that run reports how it ends (`tests/tla/recovery/Resume.tla`
+    /// Relaunch). The terminal leases this run took are still released.
+    pub fn leaveOpenForResume(self: *TurnFinalizationGuard) void {
+        if (self.state != .open) return;
+        self.cleanup_agent_terminal_leases();
+        self.state = .yielded;
     }
 
     pub fn finish(

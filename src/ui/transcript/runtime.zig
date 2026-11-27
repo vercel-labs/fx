@@ -7896,9 +7896,10 @@ pub const TranscriptRuntime = struct {
     fn transcriptWindowDropHold(self: *TranscriptRuntime, alloc: Allocator) !TranscriptWindowDropHold {
         if (self.fullTranscriptActive()) return .all;
         // A resumed transcript not painted yet, or painted and handed off
-        // with no anchor yet: everything it holds is on screen or about to
-        // be. A resume flow released before the first paint holds the same
-        // drops until that paint (`unpainted_resume_hold`).
+        // with an anchor of the prepared flow's rows, not the entries':
+        // everything it holds is on screen or about to be. A resume flow
+        // released before the first paint holds the same drops until that
+        // paint (`unpainted_resume_hold`).
         if (self.notebook.pending_resume_source != null or self.resume_handoff_repaint_pending or self.unpainted_resume_hold) return .all;
         const history = switch (self.transcript_commit_state) {
             .invalid => return .none,
@@ -11981,14 +11982,19 @@ pub const TranscriptRuntime = struct {
             self.notebook.last_rendered_cols = transition.target_layout.terminal_cols;
             self.resume_handoff_repaint_pending = pending_resume_bytes > 0;
             if (pending_resume_bytes > 0) {
-                self.invalidateTranscriptAnchor("resume publication retained source handoff");
                 if (transition.target_flow_owned) {
+                    self.invalidateTranscriptAnchor("resume publication retained source handoff");
                     debug_trace.logf(
                         "session",
                         "pending resume flow dropped reason=superseded bytes={d}",
                         .{pending_resume_bytes},
                     );
                 } else {
+                    // The anchor stays, so rows the next frame adds scroll the
+                    // old top into scrollback instead of painting over it
+                    // (`src/core/app/app_render_runtime.zig` "a notice right
+                    // after resumed history is handed off leaves every history
+                    // row in scrollback").
                     debug_trace.logf(
                         "session",
                         "resume historical flow committed bytes={d}",
@@ -14971,7 +14977,7 @@ test "stable resume publication starts a fresh retained source epoch" {
     try std.testing.expectEqual(@as(usize, 0), runtime.pendingResumeFlow().len);
     try std.testing.expectEqualStrings(retained_flow, runtime.notebook.transcript.items);
     try std.testing.expectEqual(
-        TranscriptCommitDiagnosticState.invalid,
+        TranscriptCommitDiagnosticState.stable,
         runtime.transcriptCommitDiagnostic().state,
     );
 

@@ -301,6 +301,8 @@ fn writeLines(w: *std.Io.Writer, fx_version: []const u8, git_commit: []const u8,
     try writeJsonStr(fx_version, w);
     try w.writeAll(",\"git_commit\":");
     try writeJsonStr(git_commit, w);
+    try w.writeAll(",\"update_channel\":");
+    try writeJsonStr(build_options.update_channel, w);
     if (utc) |text| try writeTime(w, "written_at", text, now_ms);
     try w.writeAll(",\"notice\":");
     try writeJsonStr(trace_report.notice_text, w);
@@ -352,6 +354,7 @@ test "crash panic record is two JSON lines the reader takes" {
     try std.testing.expectEqual(@as(i64, 1), header.get("format_version").?.integer);
     try std.testing.expectEqualStrings("0.0.17", header.get("fx_version").?.string);
     try std.testing.expectEqualStrings("abc1234", header.get("git_commit").?.string);
+    try std.testing.expectEqualStrings(build_options.update_channel, header.get("update_channel").?.string);
     try std.testing.expectEqualStrings("2023-11-14T22:13:20.123Z", header.get("written_at").?.string);
     try std.testing.expectEqual(@as(i64, 1_700_000_000_123), header.get("written_at_ms").?.integer);
     try std.testing.expectEqualStrings(trace_report.notice_text, header.get("notice").?.string);

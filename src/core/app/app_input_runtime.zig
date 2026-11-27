@@ -979,8 +979,13 @@ pub fn Runtime(comptime App: type) type {
             // first, as Esc, in `routeAgentsMenuInput`.
             if (resolved == .open_agent_list) {
                 if (comptime @hasDecl(App, "openAgentsMenu")) {
-                    if (app.shell.fullTranscriptActive()) return .done;
-                    if (!app_agents_runtime.Runtime(App).hasAnotherAgent(app)) return .done;
+                    if (agentsMenuRefusal(app)) |reason| {
+                        // The key is gone, and the trace is the only record:
+                        // the footer shows the switch key itself only once
+                        // another agent exists.
+                        debug_trace.logf("input", "open_agent_list refused reason={s}", .{reason});
+                        return .done;
+                    }
                     dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
                     // The list sets the draft aside itself, so the model
                     // picker's goes back to the composer first.
@@ -1769,6 +1774,15 @@ pub fn Runtime(comptime App: type) type {
         fn submitAgentsMenuSelection(app: *App) !bool {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
             return app_agents_runtime.Runtime(App).submitMenu(app);
+        }
+
+        /// Why Ctrl+X opens no agent list as the app is now, the reason its
+        /// trace line names, or null when it opens one: the full transcript
+        /// owns the screen, or there is no other agent to switch to.
+        fn agentsMenuRefusal(app: *App) ?[]const u8 {
+            if (app.shell.fullTranscriptActive()) return "full_transcript";
+            if (!app_agents_runtime.Runtime(App).hasAnotherAgent(app)) return "no_other_agent";
+            return null;
         }
 
         fn agentsMenuActive(app: *App) bool {
@@ -12829,6 +12843,8 @@ const FakeSubmitApp = struct {
     on_subagent_screen: bool = false,
     /// Works those submits opened.
     opened_turn_works: usize = 0,
+    /// Whether fx waits to restart for an upgrade, which holds a submit.
+    upgrader: struct { restart: auto_upgrade.RestartWait = .none } = .{},
 
     pub fn slashRegistry(_: *const FakeSubmitApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
@@ -13403,6 +13419,31 @@ test "app_input_runtime submit resolves slash completion through core command sp
     try std.testing.expect(app.last_prompt == null);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "app_input_runtime submit holds a prompt while the upgrade restart waits, and names Ctrl+G only while it cancels" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "after the restart");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    app.upgrader.restart = .waiting;
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+    try std.testing.expect(app.last_prompt == null);
+    try std.testing.expect(app.agent().submission.pending == null);
+    try std.testing.expectEqualStrings("after the restart", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(std.mem.endsWith(u8, app.notice_body.items, "; send this after the restart, or press Ctrl+G to cancel it"));
+
+    // Once the held turns are let go, Ctrl+G no longer cancels the restart.
+    app.upgrader.restart = .releasing;
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+    try std.testing.expect(app.last_prompt == null);
+    try std.testing.expect(app.agent().submission.pending == null);
+    try std.testing.expectEqualStrings("after the restart", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(std.mem.endsWith(u8, app.notice_body.items, "; send this after the restart"));
+    try std.testing.expect(std.mem.find(u8, app.notice_body.items, "Ctrl+G") == null);
+    try std.testing.expectEqual(@as(usize, 2), app.notice_count);
 }
 
 test "app_input_runtime idle submit commits its frame before credential preflight" {

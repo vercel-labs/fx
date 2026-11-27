@@ -633,6 +633,15 @@ pub fn readConversationMetadata(
 ) !?session_codec.DecodedSessionMetadata {
     const bytes = (try readConversationMetadataBytes(alloc, dir)) orelse return null;
     defer alloc.free(bytes);
+    return decodeConversationMetadata(alloc, bytes);
+}
+
+/// The conversation metadata in `session.json` bytes, or null when they hold
+/// another format. The caller owns the decoded value.
+pub fn decodeConversationMetadata(
+    alloc: Allocator,
+    bytes: []const u8,
+) !?session_codec.DecodedSessionMetadata {
     if (!try isConversationMetadata(alloc, bytes)) return null;
     return session_codec.decodeSessionMetadata(alloc, bytes) catch |err| switch (err) {
         error.SessionMetadataTooLarge => error.InvalidSessionFormat,
@@ -640,7 +649,9 @@ pub fn readConversationMetadata(
     };
 }
 
-fn readConversationMetadataBytes(alloc: Allocator, dir: *io_mod.VerifiedDir) !?[]u8 {
+/// `session.json` as the conversation check reads it, or null when it is
+/// missing or too large. The caller owns the bytes.
+pub fn readConversationMetadataBytes(alloc: Allocator, dir: *io_mod.VerifiedDir) !?[]u8 {
     const bytes = readManagedFileAlloc(
         alloc,
         dir,

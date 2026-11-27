@@ -5,7 +5,7 @@ const hold_marker = @import("../core/shared/hold_marker.zig");
 const test_markers = @import("../core/shared/test_markers.zig");
 
 const Controls = struct {
-    terminal_ready_path: []const u8,
+    ready_path: []const u8,
     reap_ready_path: []const u8,
     release_path: []const u8,
 };
@@ -13,12 +13,11 @@ const Controls = struct {
 // Only tests set these controls, such as `tests/e2e/acp.test.ts`, so the
 // libfx artifacts leave them out.
 pub fn pauseAfterTerminalWrite() void {
-    if (comptime build_options.libfx) return;
-    const control = controls() orelse return;
-    hold_marker.write(control.terminal_ready_path, "terminal_response_written") catch return;
-    while (!pathExists(control.release_path)) {
-        io_mod.sleep(std.time.ns_per_ms);
-    }
+    pauseAt(terminalControls(), "terminal_response_written");
+}
+
+pub fn pauseBeforePermissionInsert() void {
+    pauseAt(permissionControls(), "permission_ready");
 }
 
 /// What a Zig test runs after a request's registry entry is inserted and
@@ -45,13 +44,22 @@ pub fn pauseBeforeRequestWrite(kind: []const u8, request_id: u64) void {
 
 pub fn noteReapBeforeJoin() void {
     if (comptime build_options.libfx) return;
-    const control = controls() orelse return;
+    const control = terminalControls() orelse permissionControls() orelse return;
     // The marker only tells a test that the reap came first, and nothing
     // waits here, so fx goes on when it cannot be written.
     hold_marker.write(control.reap_ready_path, "reap_before_join") catch {};
 }
 
-fn controls() ?Controls {
+fn pauseAt(maybe_control: ?Controls, marker: []const u8) void {
+    if (comptime build_options.libfx) return;
+    const control = maybe_control orelse return;
+    hold_marker.write(control.ready_path, marker) catch return;
+    while (!pathExists(control.release_path)) {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
+fn terminalControls() ?Controls {
     return controlsFromPaths(
         io_mod.getenvAbsolutePath("FX_TEST_ACP_PROMPT_TERMINAL_READY"),
         io_mod.getenvAbsolutePath("FX_TEST_ACP_PROMPT_REAP_READY"),
@@ -59,13 +67,21 @@ fn controls() ?Controls {
     );
 }
 
+fn permissionControls() ?Controls {
+    return controlsFromPaths(
+        io_mod.getenvAbsolutePath("FX_TEST_ACP_PERMISSION_READY"),
+        io_mod.getenvAbsolutePath("FX_TEST_ACP_PROMPT_REAP_READY"),
+        io_mod.getenvAbsolutePath("FX_TEST_ACP_PERMISSION_RELEASE"),
+    );
+}
+
 fn controlsFromPaths(
-    terminal_ready_path: ?[]const u8,
+    ready_path: ?[]const u8,
     reap_ready_path: ?[]const u8,
     release_path: ?[]const u8,
 ) ?Controls {
     return .{
-        .terminal_ready_path = terminal_ready_path orelse return null,
+        .ready_path = ready_path orelse return null,
         .reap_ready_path = reap_ready_path orelse return null,
         .release_path = release_path orelse return null,
     };

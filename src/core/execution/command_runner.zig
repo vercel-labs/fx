@@ -5977,7 +5977,10 @@ test "timeout terminates redirected descendant after setsid" {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "escaped-timeout.pid" });
+    // The command runs in `workspace` and names its files relative to it, so a quote
+    // or a space in the checkout path cannot break the command text.
+    const pid_name = "escaped-timeout.pid";
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, pid_name });
     defer alloc.free(pid_path);
     const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
@@ -5990,7 +5993,7 @@ test "timeout terminates redirected descendant after setsid" {
             " time.sleep(30)\n" ++
             "else:\n" ++
             " while True: time.sleep(1)'",
-        .{pid_path},
+        .{pid_name},
     );
     defer alloc.free(command);
 
@@ -6017,7 +6020,8 @@ test "timeout terminates double-forked descendant after setsid" {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "double-fork-timeout.pid" });
+    const pid_name = "double-fork-timeout.pid";
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, pid_name });
     defer alloc.free(pid_path);
     const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
@@ -6032,7 +6036,7 @@ test "timeout terminates double-forked descendant after setsid" {
             " time.sleep(30)\n" ++
             "else:\n" ++
             " while True: time.sleep(1)'",
-        .{pid_path},
+        .{pid_name},
     );
     defer alloc.free(command);
 
@@ -6059,7 +6063,8 @@ test "timeout terminates environment-sanitized double-fork descendants" {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "env-clear-timeout.pids" });
+    const pid_name = "env-clear-timeout.pids";
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, pid_name });
     defer alloc.free(pid_path);
     const command = try alloc.print(
         "/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -c 'import os,time\n" ++
@@ -6074,7 +6079,7 @@ test "timeout terminates environment-sanitized double-fork descendants" {
             "  os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
             "  time.sleep(30)\n" ++
             "while True: time.sleep(1)'",
-        .{pid_path},
+        .{pid_name},
     );
     defer alloc.free(command);
 
@@ -6188,7 +6193,8 @@ test "natural command completion keeps a daemon that detached after setsid" {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "escaped-child.pid" });
+    const pid_name = "escaped-child.pid";
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, pid_name });
     defer alloc.free(pid_path);
     // Natural cleanup stops the child while it is still in the command
     // session, so the parent waits for readiness after setsid and redirection.
@@ -6208,7 +6214,7 @@ test "natural command completion keeps a daemon that detached after setsid" {
             " os.close(ready_w)\n" ++
             " if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
             " os.close(ready_r)'",
-        .{pid_path},
+        .{pid_name},
     );
     defer alloc.free(command);
 
@@ -6234,7 +6240,8 @@ test "natural command completion keeps a double-forked daemon and its children" 
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "daemon.pids" });
+    const pid_name = "daemon.pids";
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, pid_name });
     defer alloc.free(pid_path);
     // The daemon keeps every inherited descriptor except the output streams,
     // like CLIs that spawn a detached background server and a browser child.
@@ -6258,7 +6265,7 @@ test "natural command completion keeps a double-forked daemon and its children" 
             "os.close(ready_w)\n" ++
             "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
             "print(\"DAEMON-STARTED\")'",
-        .{pid_path},
+        .{pid_name},
     );
     defer alloc.free(command);
 
@@ -6287,7 +6294,8 @@ test "natural command completion returns while a detached daemon keeps command o
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "output-holder.pid" });
+    const pid_name = "output-holder.pid";
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, pid_name });
     defer alloc.free(pid_path);
     // The daemon keeps a duplicate of the output pipe on a high descriptor,
     // so end of file never arrives while it runs.
@@ -6307,7 +6315,7 @@ test "natural command completion returns while a detached daemon keeps command o
             "os.close(ready_w)\n" ++
             "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
             "print(\"BEFORE-EXIT\", flush=True)'",
-        .{pid_path},
+        .{pid_name},
     );
     defer alloc.free(command);
 
@@ -6338,7 +6346,8 @@ test "natural command completion keeps a detached daemon that hides its descript
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "hidden-daemon.pid" });
+    const pid_name = "hidden-daemon.pid";
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, pid_name });
     defer alloc.free(pid_path);
     // Like ssh-agent, the daemon turns off Linux process inspection, then it
     // closes every descriptor. Neither may decide whether it survives.
@@ -6357,7 +6366,7 @@ test "natural command completion keeps a detached daemon that hides its descript
             "os.close(ready_w)\n" ++
             "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
             "time.sleep(0.1)'",
-        .{pid_path},
+        .{pid_name},
     );
     defer alloc.free(command);
 
@@ -6464,7 +6473,8 @@ test "natural command completion stops a same-session process that left the proc
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "own-group.pid" });
+    const pid_name = "own-group.pid";
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, pid_name });
     defer alloc.free(pid_path);
     // A process group kill cannot reach this child, so only the session
     // rule stops it. It ignores SIGHUP: the kernel's hang-up of an orphaned group could end it.
@@ -6483,7 +6493,7 @@ test "natural command completion stops a same-session process that left the proc
             " os._exit(0)\n" ++
             "os.close(ready_w)\n" ++
             "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)'",
-        .{pid_path},
+        .{pid_name},
     );
     defer alloc.free(command);
 
@@ -6509,7 +6519,8 @@ test "natural completion keeps its exit when the deadline passes during the outp
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "drain-deadline.pid" });
+    const pid_name = "drain-deadline.pid";
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, pid_name });
     defer alloc.free(pid_path);
     const timeout_ms: usize = 3_000;
     // The command exits 500 ms before its deadline while a detached daemon
@@ -6536,7 +6547,7 @@ test "natural completion keeps its exit when the deadline passes during the outp
             "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
             "time.sleep(max(0.0, {d}/1000.0 - time.time()))\n" ++
             "sys.stdout.write(\"FINISHED-BEFORE-DEADLINE\"); sys.stdout.flush()'",
-        .{ pid_path, exit_at_ms },
+        .{ pid_name, exit_at_ms },
     );
     defer alloc.free(command);
 
@@ -6574,7 +6585,8 @@ test "natural completion stops waiting on a detached daemon that keeps writing" 
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "chatty-daemon.pid" });
+    const pid_name = "chatty-daemon.pid";
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, pid_name });
     defer alloc.free(pid_path);
     // The daemon writes to the command's output every 5 ms, so the pipes
     // never reach end of file and no read waits a whole poll.
@@ -6594,7 +6606,7 @@ test "natural completion stops waiting on a detached daemon that keeps writing" 
             "os.close(ready_w)\n" ++
             "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
             "print(\"COMMAND-DONE\", flush=True)'",
-        .{pid_path},
+        .{pid_name},
     );
     defer alloc.free(command);
 
@@ -6641,7 +6653,8 @@ test "natural completion ends live delivery of drained output at a cancel" {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "burst-daemon.pid" });
+    const pid_name = "burst-daemon.pid";
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, pid_name });
     defer alloc.free(pid_path);
     // After the command exits, the daemon writes 200 lines at once, and the
     // reader takes 20 ms per line and cancels at the 20th.
@@ -6660,7 +6673,7 @@ test "natural completion ends live delivery of drained output at a cancel" {
             "os.close(ready_w)\n" ++
             "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
             "print(\"COMMAND-DONE\", flush=True)'",
-        .{pid_path},
+        .{pid_name},
     );
     defer alloc.free(command);
 
@@ -6725,7 +6738,8 @@ test "natural completion keeps complete output when a cancel follows only daemon
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "late-daemon.pid" });
+    const pid_name = "late-daemon.pid";
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, pid_name });
     defer alloc.free(pid_path);
     // The daemon writes once after the command exits, and that output
     // triggers the cancel, so only daemon output is left unread.
@@ -6744,7 +6758,7 @@ test "natural completion keeps complete output when a cancel follows only daemon
             "os.close(ready_w)\n" ++
             "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
             "print(\"COMMAND-DONE\", flush=True)'",
-        .{pid_path},
+        .{pid_name},
     );
     defer alloc.free(command);
 
@@ -6869,9 +6883,11 @@ test "cancellation preserves grace and removes an escaped descendant" {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "escaped-cancel.pid" });
+    const pid_name = "escaped-cancel.pid";
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, pid_name });
     defer alloc.free(pid_path);
-    const term_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "escaped-cancel.term" });
+    const term_name = "escaped-cancel.term";
+    const term_path = try std.Io.Dir.path.join(alloc, &.{ workspace, term_name });
     defer alloc.free(term_path);
     const command = try alloc.print(
         "python3 -c 'import os,signal,time\n" ++
@@ -6889,7 +6905,7 @@ test "cancellation preserves grace and removes an escaped descendant" {
             " while True: time.sleep(1)\n" ++
             "else:\n" ++
             " while True: time.sleep(1)'",
-        .{ pid_path, term_path },
+        .{ pid_name, term_name },
     );
     defer alloc.free(command);
 
@@ -7038,16 +7054,17 @@ test "runtime cancellation observed at the timeout deadline stays graceful" {
         defer tmp.cleanup();
         const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
         defer alloc.free(workspace);
-        const term_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "tie.term" });
+        // The trap sits inside single quotes, so a quoted path would end them at a
+        // quote in the checkout path. The command names its file relative to `workspace`.
+        const term_name = "tie.term";
+        const term_path = try std.Io.Dir.path.join(alloc, &.{ workspace, term_name });
         defer alloc.free(term_path);
-        const quoted_term = try shellQuote(alloc, term_path);
-        defer alloc.free(quoted_term);
         // `wait` lets the trap run as soon as TERM arrives. A shell defers it
         // while a foreground `sleep` runs, and a `sleep` that starts after
         // fx's last look at the process tree outlasts the grace period.
         const command = try alloc.print(
             "trap 'printf TERM > {s}; sleep 3; exit 130' TERM; printf 'TIE-READY\n'; while :; do sleep 1 & wait $!; done",
-            .{quoted_term},
+            .{term_name},
         );
         defer alloc.free(command);
 
@@ -7143,13 +7160,11 @@ test "supervisor fallback force remains timeout dominant" {
     defer alloc.free(workspace);
     const term_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "fallback.term" });
     defer alloc.free(term_path);
-    const quoted_term = try shellQuote(alloc, term_path);
-    defer alloc.free(quoted_term);
-    const command = try alloc.print(
-        "trap 'printf TERM > {s}; exit 130' TERM; printf 'FALLBACK-BLOCK\n'; while :; do sleep 1; done",
-        .{quoted_term},
-    );
-    defer alloc.free(command);
+    // This test asserts that the file is absent, so the trap must write to the
+    // absolute path in whatever folder a login shell profile leaves the command.
+    // The path travels in the environment, which needs no quoting inside the trap.
+    const environment = [_]EnvironmentVariable{.{ .name = "FX_TEST_TERM", .value = term_path }};
+    const command = "trap 'printf TERM > \"$FX_TEST_TERM\"; exit 130' TERM; printf 'FALLBACK-BLOCK\n'; while :; do sleep 1; done";
 
     const timeout_ms: usize = 2000;
     const started_ms = io_mod.milliTimestamp();
@@ -7181,6 +7196,7 @@ test "supervisor fallback force remains timeout dominant" {
         .on_output_chunk = DelayAfterOutput.onChunk,
         .timeout_ms = timeout_ms,
         .timeout_started_ms = started_ms,
+        .extra_environment = &environment,
     }, alloc, command, workspace)) |value| {
         returned_result = value;
     } else |err| {

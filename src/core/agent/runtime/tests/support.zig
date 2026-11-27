@@ -703,6 +703,16 @@ pub const FakeAgentRuntimeDeps = struct {
     enable_turn_yield_marks: bool = true,
     /// Returned by `mark_turn_yielded` instead of marking.
     turn_yield_mark_error: ?anyerror = null,
+    /// What `hold_for_restart` returns; null is a host with no hold.
+    restart_hold_end: ?AgentRuntimeDeps.RestartHoldEnd = null,
+    /// How many times a turn held for a restart.
+    restart_holds: usize = 0,
+    /// The stop request a `go_on` hold clears, as a cancelled restart does
+    /// (`WorkerRuntime.cancelYield`).
+    restart_yield_flag: ?*std.atomic.Value(bool) = null,
+    /// `recovery_record_writes` when the turn held, so a test can see the
+    /// writes after it.
+    recovery_record_writes_at_hold: usize = 0,
     /// Returned by every session writer check; null confirms the writer.
     session_writer_error: ?anyerror = null,
     session_writer_checks: usize = 0,
@@ -877,6 +887,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .ask_out_of_credits = askOutOfCredits,
             .save_recovery_record = if (self.enable_recovery_record) saveRecoveryRecord else null,
             .mark_turn_yielded = if (self.enable_turn_yield_marks) markTurnYielded else null,
+            .hold_for_restart = if (self.restart_hold_end != null) holdForRestart else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
             .model_catalog_failure = catalogFailure,
@@ -1111,6 +1122,15 @@ pub const FakeAgentRuntimeDeps = struct {
             if (std.mem.eql(u8, line, "capture:settle")) settles += 1;
         }
         self.settles_when_marked = settles;
+    }
+
+    fn holdForRestart(raw: *anyopaque) AgentRuntimeDeps.RestartHoldEnd {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.restart_holds += 1;
+        self.recovery_record_writes_at_hold = self.recovery_record_writes;
+        const end = self.restart_hold_end.?;
+        if (end == .go_on) if (self.restart_yield_flag) |flag| flag.store(false, .seq_cst);
+        return end;
     }
 
     fn askOutOfCredits(raw: *anyopaque) !runtime_deps.OutOfCreditsChoice {

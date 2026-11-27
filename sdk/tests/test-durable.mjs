@@ -1396,6 +1396,41 @@ for (const tool of ["lookup", "send"]) {
   });
 }
 
+for (const tool of ["lookup", "send"]) {
+  test(`a hand-off during a ${tool} call yields the turn after the call, and another agent continues it, each step once`, async () => {
+    const durability = await durabilityFor();
+    const cutoffs = [];
+    const onEvent = (event) => { if (event.type === "session.handoff" || event.type === "session.deadline") cutoffs.push(event.type); };
+    const first = createFxAgent(agentOptions(durability, { onEvent }));
+    const second = createFxAgent(agentOptions(durability, { onEvent }));
+    const held = gate(tool);
+    const before = requests.length;
+    const runsBefore = runs.filter(([name]) => name === tool).length;
+    const session = first.session();
+    const turn = session.prompt(`use ${tool}`);
+    await held.started;
+    const handedOff = first.handOff();
+    gates.delete(tool);
+    held.open();
+    await handedOff;
+    // Another process continues the turn. On local() the queue went with the
+    // first agent's World, so a resume asks for it; elsewhere it finds the
+    // turn already going on, or ended.
+    void second.session(session.id).resume().result.catch(() => {});
+    const { result } = await collect(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(runs.filter(([name]) => name === tool).length - runsBefore, 1, "the call ran once");
+    const sent = requests.slice(before);
+    assert.equal(sent.length, 2, "each model step ran once");
+    assert.ok(sent.every((prompt) => !JSON.stringify(prompt).includes(resumeNotice)), "a yield is not an interruption");
+    const lines = await readLines(first.session(session.id).stream(0), 32);
+    assert.equal(lines.filter((line) => line.type === "turn_yield").length, 1);
+    assert.deepEqual(cutoffs, [], "nothing was cut off");
+    await first.close();
+    await second.close();
+  });
+}
+
 // A call the resume answers as possibly run ends on the session stream, once,
 // with what the model heard, so a viewer never shows it running for good.
 function assertEndedAsPossiblyRun(lines, id) {
