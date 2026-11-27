@@ -76,7 +76,12 @@ const bulkySteps = 24;
 // An image prompt's text ends with a marker per image, which the scripts
 // ignore.
 function scriptText(prompt) {
-  return lastUserText(prompt).replace(/(\n\[Image #\d+\])+$/u, "");
+  const text = lastUserText(prompt).replace(/(\n\[Image #\d+\])+$/u, "");
+  // A resumed request ends with the resume notice; a "keep using the tool" turn
+  // is still scripted by its own prompt, so its resumed request calls the tool too.
+  const asked = prompt.filter(isPrompt).at(-2);
+  if (text === "Resuming from unexpected session interruption." && asked && textOf(asked) === "keep using the tool") return "keep using the tool";
+  return text;
 }
 function framesFor(prompt) {
   const text = scriptText(prompt);
@@ -2510,6 +2515,90 @@ test("a resume after the host stopped the turn itself does not count that stop a
   await again.close();
   assert.deepEqual(resumeCounts(died.events), [0, 1], "a resume without the stop counts its death");
   assertContiguous(died.events);
+});
+
+// Every state a memory store took, as a crash after that append would leave it.
+function statesOf(store) {
+  const states = [];
+  const append = store.append.bind(store);
+  store.append = async (input) => {
+    const out = await append(input);
+    states.push({
+      events: decodeRecord(input.data),
+      records: store.records.map((record) => ({ ...record, data: record.data.slice() })),
+      checkpoint: store.checkpoint && { through: store.checkpoint.through, data: store.checkpoint.data.slice() },
+    });
+    return out;
+  };
+  return states;
+}
+
+// A memory store holding a state's records and checkpoint.
+async function reopened(state) {
+  const copy = createMemoryPersistence();
+  copy.records.push(...state.records);
+  if (state.checkpoint) await copy.saveCheckpoint(state.checkpoint);
+  return copy;
+}
+
+test("a turn that crashed twice, yielded at its deadline and was snapshotted, ends with crash_loop at its next crash", async () => {
+  const failed = (error) => error.code === "crash_loop" && /crashed fx three times/.test(error.message);
+  // The process died while the turn's call ran.
+  const first = createMemoryPersistence();
+  const firstStates = statesOf(first);
+  const origin = await createFxEngine(options(sourceBackend, undefined, { persistence: first, tools: [lookup] }));
+  await run(origin, "keep using the tool");
+  await origin.close();
+  const running = firstStates.find((state) => state.events.some((event) => event.type === "tool_intent"));
+  assert.ok(running, "the call's intent was stored");
+
+  // The first resume counts that death; the process died right after storing the count.
+  const second = await reopened(running);
+  const secondStates = statesOf(second);
+  const firstResume = await createFxEngine(options(targetBackend, undefined, { persistence: second, tools: [lookup] }));
+  const turn1 = firstResume.resume();
+  for await (const _ of turn1) {}
+  assert.equal((await turn1.result).stopReason, "end_turn");
+  await firstResume.close();
+  const counted1 = secondStates.find((state) => state.events.some((event) => event.type === "turn_resumed"));
+  assert.ok(counted1, "the first resume stored its count");
+
+  // The second resume yields at its deadline, after its first request, and the
+  // yield is snapshotted.
+  const third = await reopened(counted1);
+  const secondResume = await createFxEngine(options(targetBackend, undefined, { persistence: third, tools: [lookup], checkpointAfterBytes: 0 }));
+  const turn2 = secondResume.resume({ yieldAt: Date.now() });
+  for await (const _ of turn2) {}
+  assert.equal((await turn2.result).stopReason, "yielded");
+  await secondResume.close();
+  for (let wait = 0; wait < 100 && !third.checkpoint; wait += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(third.checkpoint, "the yield saved a snapshot holding the open turn");
+  const snapshot = {
+    records: third.records.map((record) => ({ ...record, data: record.data.slice() })),
+    checkpoint: { through: third.checkpoint.through, data: third.checkpoint.data.slice() },
+  };
+
+  // The resume from the snapshot does not count the yield, and the process died
+  // right after storing that count.
+  const fourth = await reopened(snapshot);
+  const fourthStates = statesOf(fourth);
+  const afterYield = await createFxEngine(options(targetBackend, undefined, { persistence: fourth, tools: [lookup] }));
+  const turn3 = afterYield.resume();
+  for await (const _ of turn3) {}
+  assert.equal((await turn3.result).stopReason, "end_turn");
+  await afterYield.close();
+  const counted2 = fourthStates.find((state) => state.events.some((event) => event.type === "turn_resumed"));
+  assert.ok(counted2, "the resume from the snapshot stored its count");
+
+  // The next resume is the third crash: the guard ends the turn, and no request goes out.
+  const fifth = await reopened(counted2);
+  const before = requests.length;
+  const guarded = await createFxEngine(options(targetBackend, undefined, { persistence: fifth, tools: [lookup] }));
+  const turn4 = guarded.resume();
+  await assert.rejects((async () => { for await (const _ of turn4) {} })(), failed);
+  await assert.rejects(turn4.result, failed);
+  assert.equal(requests.length - before, 0, "the guard sends no model request");
+  await guarded.close();
 });
 
 try {

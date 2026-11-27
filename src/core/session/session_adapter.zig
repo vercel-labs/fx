@@ -1942,24 +1942,13 @@ pub fn hasInterruptedTurn(store: *Store, alloc: Allocator, workspace: []const u8
     return last.turn == state.last_turn and (last.reason == .crash or last.reason == .closed);
 }
 
-/// How long the closer waits for a lock before it skips what it holds. Mirrors
-/// `request_recovery.zig`'s `close_wait_ms`, which the closer also uses.
-const close_wait_ms: u64 = 1_000;
-
-fn lockWithin(mutex: *std.Io.Mutex, ms: u64) bool {
-    var waited_ms: u64 = 0;
-    while (!mutex.tryLock()) {
-        if (waited_ms >= ms) return false;
-        io_mod.getIo().sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
-        waited_ms += 5;
-    }
-    return true;
-}
-
 /// The sessions with an open v2 turn in this process, for the closer. Each
 /// links itself through `open_node`, so registering never allocates. A
-/// session takes this lock after its own; the closer takes it first and
-/// waits on each session only `close_wait_ms`, so the two cannot deadlock.
+/// session takes this lock after its own; the closer takes it first and waits
+/// on each session's mutex and on the blob write lock only `io_mod.close_wait_ms`,
+/// so the two cannot deadlock. Below the write lock, the append still takes the
+/// session manager's own lock and the blob host's mutex, which this module does
+/// not bound.
 var open_registry_mutex: std.Io.Mutex = .init;
 var open_registry: std.DoublyLinkedList = .{};
 
@@ -1989,7 +1978,7 @@ fn unregisterOpenTurn(session: *Session) void {
 /// many turns it marked.
 pub fn closeOpenTurns() usize {
     const io = io_mod.getIo();
-    if (!lockWithin(&open_registry_mutex, close_wait_ms)) {
+    if (!io_mod.lockWithin(&open_registry_mutex, io_mod.close_wait_ms)) {
         debug_trace.logf("session", "event=sessions_v2_closing_skipped reason=registry_busy", .{});
         return 0;
     }
@@ -2337,6 +2326,11 @@ pub const Session = struct {
     fn write(self: *Session, events: []const sm.Event) sm.AppendError!u64 {
         self.host.write_lock.lockUncancelable(io_mod.getIo());
         defer self.host.write_lock.unlock(io_mod.getIo());
+        return self.writeHeld(events);
+    }
+
+    /// `write`'s body, for a caller that already holds `host.write_lock`.
+    fn writeHeld(self: *Session, events: []const sm.Event) sm.AppendError!u64 {
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
         const a = scratch.allocator();
@@ -3180,13 +3174,18 @@ pub const Session = struct {
     /// whether it wrote the mark.
     fn markClosing(self: *Session) bool {
         const io = io_mod.getIo();
-        if (!lockWithin(&self.mutex, close_wait_ms)) {
+        if (!io_mod.lockWithin(&self.mutex, io_mod.close_wait_ms)) {
             debug_trace.logf("session", "event=sessions_v2_closing_skipped session={s} reason=session_busy", .{self.id()});
             return false;
         }
         defer self.mutex.unlock(io);
         if (!self.turn_open or self.turn_stale or self.turn_closing_marked) return false;
-        _ = self.write(&.{.{ .item = .{ .type = closing_type, .data = "{}" } }}) catch |err| {
+        if (!io_mod.lockWithin(&self.host.write_lock, io_mod.close_wait_ms)) {
+            debug_trace.logf("session", "event=sessions_v2_closing_skipped session={s} reason=write_busy", .{self.id()});
+            return false;
+        }
+        defer self.host.write_lock.unlock(io);
+        _ = self.writeHeld(&.{.{ .item = .{ .type = closing_type, .data = "{}" } }}) catch |err| {
             debug_trace.logf("session", "event=sessions_v2_closing_failed session={s} err={s}", .{ self.id(), @errorName(err) });
             return false;
         };
@@ -9020,6 +9019,26 @@ test "closing an open turn marks it once, and the turn stays open and commits" {
     try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, s.id(), closing_type));
     try s.commitTurn(assistantTurn("work", "done"), types.ConversationLanguage.default());
     try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, s.id(), closing_type));
+}
+
+test "closing skips a session whose write lock is held, within the close bound" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
+    const io = io_mod.getIo();
+    // Held by this thread: a closer that waited without a bound would never return.
+    s.host.write_lock.lockUncancelable(io);
+    const started_ms = io_mod.awakeMilliTimestamp();
+    const marked = s.markClosing();
+    const waited_ms = io_mod.awakeMilliTimestamp() - started_ms;
+    s.host.write_lock.unlock(io);
+    try testing.expect(!marked);
+    try testing.expect(waited_ms < 5 * @as(i64, @intCast(io_mod.close_wait_ms)));
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, s.id(), closing_type));
 }
 
 test "a crashed turn that holds a closing mark counts no crash" {

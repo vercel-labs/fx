@@ -204,8 +204,9 @@ fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
             .message = "Image prompts are unavailable for the selected model",
         } },
         // The guard's notice is the message; `crash_loop` tells a client why.
+        // A server error code: the request's parameters were fine.
         error.CrashLoop => .{ .rpc_error = .{
-            .code = ErrorCode.invalid_params,
+            .code = ErrorCode.crash_loop,
             .message = recovery_rules.crash_loop_notice,
             .data = .{ .code = "crash_loop" },
         } },
@@ -4604,7 +4605,7 @@ test "ACP ends a turn stopped at the crash-loop guard with the notice and its co
     const outcome = try promptExecutionFailure(error.CrashLoop);
     switch (outcome) {
         .rpc_error => |rpc_error| {
-            try std.testing.expectEqual(ErrorCode.invalid_params, rpc_error.code);
+            try std.testing.expectEqual(ErrorCode.crash_loop, rpc_error.code);
             try std.testing.expectEqualStrings(recovery_rules.crash_loop_notice, rpc_error.message);
             try std.testing.expectEqualStrings("crash_loop", rpc_error.data.?.code);
             try std.testing.expect(rpc_error.data.?.model == null);

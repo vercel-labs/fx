@@ -453,9 +453,10 @@ pub fn parseSnapshot(bytes: []const u8) LoadError!Snapshot {
 }
 
 /// Writes the turn that yielded, for a version 2 snapshot: its id, when the
-/// host gave one, and its progress as a `turn_progress` carries it.
-pub fn writeOpenTurn(writer: *std.Io.Writer, turn_id: ?[]const u8, progress: session_codec.RecoveryCheckpoint) !void {
-    return writeOpenTurnWith(writer, turn_id, progress, null);
+/// host gave one, its progress as a `turn_progress` carries it, and the
+/// deaths its `turn_resumed` counted (`crashes`), when there are any.
+pub fn writeOpenTurn(writer: *std.Io.Writer, turn_id: ?[]const u8, progress: session_codec.RecoveryCheckpoint, crashes: u8) !void {
+    return writeOpenTurnWith(writer, turn_id, progress, crashes, null);
 }
 
 /// Like `writeOpenTurn`, but names the images `stored` holds instead of
@@ -466,8 +467,9 @@ pub fn writeOpenTurnNamingImages(
     turn_id: ?[]const u8,
     progress: session_codec.RecoveryCheckpoint,
     stored: *const session_codec.StoredImages,
+    crashes: u8,
 ) !bool {
-    try writeOpenTurnWith(writer, turn_id, progress, stored);
+    try writeOpenTurnWith(writer, turn_id, progress, crashes, stored);
     return session_codec.checkpointNamesImages(progress, null, stored);
 }
 
@@ -475,6 +477,7 @@ fn writeOpenTurnWith(
     writer: *std.Io.Writer,
     turn_id: ?[]const u8,
     progress: session_codec.RecoveryCheckpoint,
+    crashes: u8,
     stored: ?*const session_codec.StoredImages,
 ) !void {
     try writer.writeByte('{');
@@ -484,6 +487,9 @@ fn writeOpenTurnWith(
         try std.json.Stringify.value(id, .{}, writer);
         try writer.writeByte(',');
     }
+    // Only a turn that counted a death writes the key, so an older fx reads the
+    // same bytes it always did, and a reader that ignores it still reads the turn.
+    if (crashes > 0) try writer.print("\"crashes\":{d},", .{crashes});
     try writer.writeAll("\"progress\":");
     if (stored) |names|
         try session_codec.writeRecoveryCheckpointNamingImages(writer, progress, .{ .stored = names })
@@ -528,7 +534,7 @@ pub const Folded = struct {
     /// after: it continues without being told it was interrupted.
     yielded: bool = false,
     /// The abrupt deaths the newest `turn_resumed` counted for the open turn,
-    /// or 0. A snapshot does not keep the count, so a turn it holds starts at 0.
+    /// or 0. A snapshot keeps it as the open turn's `crashes` key.
     open_crashes: u8 = 0,
     cursor: Cursor,
 
@@ -726,6 +732,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
         if (progress != .object) return error.InvalidJournal;
         open = progress;
         open_id = try turnIdOf(value.object.get("turnId"));
+        crashes = try snapshotCrashesOf(value.object);
         yielded = true;
     }
     for (parsed.array.items) |value| {
@@ -1054,6 +1061,14 @@ fn crashesOf(data: std.json.Value) LoadError!u8 {
     if (data != .object) return error.InvalidJournal;
     const count = try integerField(data.object, "crashes");
     return std.math.cast(u8, count) orelse error.InvalidJournal;
+}
+
+/// The deaths a snapshot's open turn keeps, zero when it keeps none (a turn
+/// that never counted one, or a snapshot from before the key existed).
+fn snapshotCrashesOf(object: std.json.ObjectMap) LoadError!u8 {
+    const value = object.get("crashes") orelse return 0;
+    if (value != .integer or value.integer < 0) return error.InvalidJournal;
+    return std.math.cast(u8, value.integer) orelse error.InvalidJournal;
 }
 
 /// A current compaction summary stands for every turn before it.
@@ -1855,7 +1870,7 @@ test "a snapshot where a turn yielded restores the turn, and the events after it
     defer progress.deinit(alloc);
     var open_out: std.Io.Writer.Allocating = .init(alloc);
     defer open_out.deinit();
-    try writeOpenTurn(&open_out.writer, "turn-y", progress);
+    try writeOpenTurn(&open_out.writer, "turn-y", progress, 0);
     const snapshot = try encodeSnapshot(alloc, 5, 2, "turn-a", open_out.written(), "checkpoint-bytes");
     defer alloc.free(snapshot);
     const parsed = try parseSnapshot(snapshot);
@@ -1907,13 +1922,44 @@ test "a snapshot where a turn yielded restores the turn, and the events after it
     try std.testing.expectEqual(parsed.turn + 1, ended.cursor.turn);
 }
 
+test "a journal snapshot of a yielded turn keeps its open turn's crash count" {
+    const alloc = std.testing.allocator;
+    var progress = try testProgress(alloc, "keep going");
+    defer progress.deinit(alloc);
+    const yielded = try testJournal(alloc, &.{
+        .{ .turn_progress = .{ .checkpoint = progress } },
+        .{ .turn_resumed = 2 },
+        .turn_yielded,
+    });
+    defer alloc.free(yielded);
+    var folded = try fold(alloc, yielded);
+    defer folded.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 2), folded.open_crashes);
+
+    var open_out: std.Io.Writer.Allocating = .init(alloc);
+    defer open_out.deinit();
+    try writeOpenTurn(&open_out.writer, "turn-y", progress, folded.open_crashes);
+    const snapshot = try encodeSnapshot(alloc, 3, 1, "turn-a", open_out.written(), "checkpoint-bytes");
+    defer alloc.free(snapshot);
+    const parsed = try parseSnapshot(snapshot);
+    const base: Base = .{
+        .cursor = .{ .next_seq = parsed.seq + 1, .turn = parsed.turn },
+        .last_turn_id = parsed.last_turn_id,
+        .open_turn = parsed.open_turn,
+    };
+    var restored = try foldFrom(alloc, "[]", base);
+    defer restored.deinit(alloc);
+    try std.testing.expect(restored.yielded);
+    try std.testing.expectEqual(@as(u8, 2), restored.open_crashes);
+}
+
 test "a snapshot's open turn that is cut short, empty, or not a turn is refused" {
     const alloc = std.testing.allocator;
     var progress = try testProgress(alloc, "keep going");
     defer progress.deinit(alloc);
     var open_out: std.Io.Writer.Allocating = .init(alloc);
     defer open_out.deinit();
-    try writeOpenTurn(&open_out.writer, null, progress);
+    try writeOpenTurn(&open_out.writer, null, progress, 0);
     const snapshot = try encodeSnapshot(alloc, 5, 2, null, open_out.written(), "");
     defer alloc.free(snapshot);
     // A quiet snapshot stays version 1; one with an open turn is version 2.
@@ -2233,7 +2279,7 @@ test "a yielded snapshot names its open turn's stored images" {
 
     var open_out: std.Io.Writer.Allocating = .init(alloc);
     defer open_out.deinit();
-    try std.testing.expect(try writeOpenTurnNamingImages(&open_out.writer, "turn-y", progress, &stored));
+    try std.testing.expect(try writeOpenTurnNamingImages(&open_out.writer, "turn-y", progress, &stored, 0));
     try std.testing.expect(std.mem.find(u8, open_out.written(), "yielded-turn") == null);
     const snapshot = try encodeSnapshotNamingImages(alloc, 5, 2, null, open_out.written(), "");
     defer alloc.free(snapshot);

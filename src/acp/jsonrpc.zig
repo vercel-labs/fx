@@ -51,6 +51,8 @@ pub const ErrorCode = struct {
     pub const invalid_request: i64 = -32600;
     pub const method_not_found: i64 = -32601;
     pub const invalid_params: i64 = -32602;
+    /// A turn stopped at the crash-loop guard (`recovery.crash_loop_notice`).
+    pub const crash_loop: i64 = -32001;
     pub const internal_error: i64 = -32603;
 };
 
@@ -435,6 +437,11 @@ const ChunkedTestSource = struct {
     }
 };
 
+test "the crash-loop error code is an implementation-defined server error, not invalid params" {
+    try std.testing.expect(ErrorCode.crash_loop >= -32099 and ErrorCode.crash_loop <= -32000);
+    try std.testing.expect(ErrorCode.crash_loop != ErrorCode.invalid_params);
+}
+
 test "Reader accepts an exact fragmented frame" {
     const alloc = std.testing.allocator;
     var source = ChunkedTestSource{
@@ -620,13 +627,13 @@ test "Writer Frame formats protocol lines" {
         try (Writer.Frame{ .error_response = .{
             .id = .{ .integer = 8 },
             .err = .{
-                .code = ErrorCode.invalid_params,
+                .code = ErrorCode.crash_loop,
                 .message = "This turn crashed fx three times, so fx stopped it. Send a message to go on.",
                 .data = .{ .code = "crash_loop" },
             },
         } }).write(&out.writer);
         try std.testing.expectEqualStrings(
-            "{\"jsonrpc\":\"2.0\",\"id\":8,\"error\":{\"code\":-32602,\"message\":\"This turn crashed fx three times, so fx stopped it. Send a message to go on.\",\"data\":{\"code\":\"crash_loop\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":8,\"error\":{\"code\":-32001,\"message\":\"This turn crashed fx three times, so fx stopped it. Send a message to go on.\",\"data\":{\"code\":\"crash_loop\"}}}\n",
             out.writer.buffered(),
         );
     }

@@ -1187,6 +1187,27 @@ pub fn sleep(ns: u64) void {
     getIo().sleep(.{ .nanoseconds = @intCast(ns) }, .real) catch {};
 }
 
+/// How long a closer waits for a lock before it skips what it holds, so fx's
+/// close path always reaches its exit (`session_adapter.closeOpenTurns`,
+/// `request_recovery.closeActive`).
+pub const close_wait_ms: u64 = 1_000;
+
+/// Tries `mutex` for up to `ms` milliseconds, polling every 5 ms, and reports
+/// whether it got the lock. The poll counts its own 5 ms steps rather than
+/// reading the clock, so a sleep that fails and returns early only makes the
+/// loop spin faster; it still ends after `ms / 5` tries.
+pub fn lockWithin(mutex: *std.Io.Mutex, ms: u64) bool {
+    var waited_ms: u64 = 0;
+    while (!mutex.tryLock()) {
+        if (waited_ms >= ms) return false;
+        // Dropped on purpose: the bound is the poll's own count, not the clock,
+        // so a failed sleep cannot stretch the wait (RULES R3.1).
+        getIo().sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
+        waited_ms += 5;
+    }
+    return true;
+}
+
 /// Reads terminal attributes. Every errno is an error, including the EBADF
 /// that `std.posix.tcgetattr` treats as unreachable.
 pub fn tcgetattr(fd: std.posix.fd_t) std.posix.TermiosGetError!std.posix.termios {

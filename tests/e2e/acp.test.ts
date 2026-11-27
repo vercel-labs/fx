@@ -3114,6 +3114,7 @@ describe("acp: model-independent", () => {
         launch = await restartFx(sessionId, 30);
         continueTurn(launch, 32);
         const stopped = await readResponse(launch.client, 32, TIMEOUT) as any;
+        expect(stopped.error.code).toBe(-32001);
         expect(stopped.error.message).toBe(stopNotice);
         expect(stopped.error.data).toEqual({ code: "crash_loop" });
         expect(gateway.requests).toHaveLength(3);

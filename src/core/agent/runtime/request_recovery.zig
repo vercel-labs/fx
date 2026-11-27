@@ -243,11 +243,11 @@ pub const RequestRecovery = struct {
     /// the next launch resumes them without counting a death
     /// (`tests/tla/recovery/Resume.tla` NoFalseCrash). Main, its
     /// subagents and other instances can each have a request in flight.
-    /// Waits at most `close_wait_ms` for each lock. Returns how many records
+    /// Waits at most `io_mod.close_wait_ms` for each lock. Returns how many records
     /// were written.
     pub fn closeActive() usize {
         const io = io_mod.getIo();
-        if (!lockWithin(&registry_mutex, close_wait_ms)) {
+        if (!io_mod.lockWithin(&registry_mutex, io_mod.close_wait_ms)) {
             debug_trace.logf("recovery", "closing skipped every request reason=registry_busy", .{});
             return 0;
         }
@@ -265,7 +265,7 @@ pub const RequestRecovery = struct {
     /// record was written.
     fn close(self: *RequestRecovery) bool {
         const io = io_mod.getIo();
-        if (!lockWithin(&self.mutex, close_wait_ms)) {
+        if (!io_mod.lockWithin(&self.mutex, io_mod.close_wait_ms)) {
             // Its record stays as it was, so the next launch counts a death.
             debug_trace.eventf("recovery", "closing_skipped", self.trace_ctx, "reason=request_busy", .{});
             return false;
@@ -295,7 +295,7 @@ pub const RequestRecovery = struct {
     /// turn ends with the process. Called on the request's own thread.
     pub fn closeForYield(self: *RequestRecovery) bool {
         const io = io_mod.getIo();
-        if (!lockWithin(&self.mutex, close_wait_ms)) {
+        if (!io_mod.lockWithin(&self.mutex, io_mod.close_wait_ms)) {
             debug_trace.eventf("recovery", "closing_skipped", self.trace_ctx, "reason=request_busy", .{});
             return false;
         }
@@ -774,18 +774,6 @@ pub const RequestRecovery = struct {
         io_mod.getIo().sleep(.fromNanoseconds(@as(i96, ms) * std.time.ns_per_ms), .awake) catch {};
     }
 };
-
-const close_wait_ms: u64 = 1_000;
-
-fn lockWithin(mutex: *std.Io.Mutex, ms: u64) bool {
-    var waited_ms: u64 = 0;
-    while (!mutex.tryLock()) {
-        if (waited_ms >= ms) return false;
-        io_mod.getIo().sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
-        waited_ms += 5;
-    }
-    return true;
-}
 
 /// The requests `closeActive` closes: every running request that keeps a
 /// record, in every agent of the process. Each links itself through its own

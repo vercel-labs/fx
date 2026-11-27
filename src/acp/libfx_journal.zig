@@ -100,6 +100,9 @@ pub const Journal = struct {
     /// The abrupt deaths the journal's events count for the pending resume's
     /// turn (`journal.Folded.open_crashes`). Zero without a pending resume.
     pending_resume_crashes: u8 = 0,
+    /// The abrupt deaths the open turn's events count, as the fold reads them,
+    /// so a snapshot of the turn keeps them. Zero without an open turn.
+    open_crashes: u8 = 0,
     /// The host keeps an image store: events and snapshots name the images
     /// in `stored_images` instead of holding their bytes.
     image_store: bool = false,
@@ -337,6 +340,7 @@ pub const Journal = struct {
             .turn_progress => self.progress_open = true,
             .turn_committed, .turn_progress_cleared => {
                 self.progress_open = false;
+                self.open_crashes = 0;
                 self.last_turn_id = self.open_turn_id;
                 self.open_turn_id = .{};
                 // A turn's steers end with it.
@@ -479,6 +483,7 @@ pub const Journal = struct {
     /// a barrier: the host stores it before fx reruns or sends anything.
     pub fn noteResumed(self: *Journal, alloc: Allocator, session_id: []const u8, crashes: u8) !void {
         try self.appendMarked(alloc, session_id, .{ .turn_resumed = crashes }, true);
+        self.open_crashes = crashes;
     }
 };
 
@@ -748,6 +753,7 @@ pub fn open(
         .writer = writer,
         .cursor = folded.cursor,
         .progress_open = folded.open_turn != null,
+        .open_crashes = folded.open_crashes,
         .pending_follow_ups = try dupePendingInputs(session_alloc, folded.pending_follow_ups),
         .follow_ups_waiting = folded.pending_follow_ups.len,
         .open_turn_id = TurnId.of(folded.open_turn_id),
