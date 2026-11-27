@@ -329,6 +329,7 @@ pub const PromptRunResult = struct {
     session_id: []u8 = &.{},
     tool_calls: []ToolCallRecord = &.{},
     step_count: usize = 0,
+    model_steps: usize = 0,
     /// Owned slug of the provider that served the last gateway request;
     /// empty when the provider did not report routing metadata.
     resolved_provider: []u8 = &.{},
@@ -711,6 +712,7 @@ const AskContext = struct {
     tool_call_records_mutex: std.Io.Mutex = .init,
     web_search_progress_mutex: std.Io.Mutex = .init,
     step_count: usize = 0,
+    model_step_count: usize = 0,
     /// The usage of every main turn that has ended. The agent keeps only the
     /// running turn's, and each turn starts it over, so the run's total is
     /// kept here (`takeTurnUsage`).
@@ -2187,6 +2189,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .session_id = session_id,
         .tool_calls = tool_calls,
         .step_count = ctx.step_count,
+        .model_steps = ctx.model_step_count,
         .error_code = ctx.typed_error_code,
         .auth_failure = ctx.auth_failure,
         .recovery = ctx.last_recovery_status,
@@ -2225,6 +2228,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .context_enabled = ctx.context_enabled,
         .image_folder_rules = true,
         .finalize_turn = finalizeTurn,
+        .report_model_step = reportModelStep,
         .take_steering_boundary = takeSteeringBoundary,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
@@ -3406,6 +3410,11 @@ fn writeRawAssistantBytes(ctx: *AskContext, text: []const u8) !void {
         @intCast(@min(trailing, 2));
 }
 
+fn reportModelStep(raw_ctx: *anyopaque, _: usize) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.model_step_count += 1;
+}
+
 fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.output_mode.isTerminal()) {
@@ -4216,7 +4225,7 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     }
     try out.writer.writeAll(",\"session_id\":");
     try std.json.Stringify.value(result.session_id, .{}, &out.writer);
-    try out.writer.print(",\"steps\":{d}", .{result.step_count});
+    try out.writer.print(",\"steps\":{d},\"model_steps\":{d}", .{ result.step_count, result.model_steps });
     try out.writer.writeAll(",\"tool_calls\":[");
     for (result.tool_calls, 0..) |tc, i| {
         if (i > 0) try out.writer.writeAll(",");
@@ -5998,14 +6007,14 @@ test "stdin prompt errors keep exact structured names" {
     const overflow = try renderErrorJsonResult(alloc, "PromptResourceLimitExceeded", 1);
     defer alloc.free(overflow);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptResourceLimitExceeded\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"model_steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptResourceLimitExceeded\"}\n",
         overflow,
     );
 
     const read_failure = try renderErrorJsonResult(alloc, "PromptInputReadFailed", 1);
     defer alloc.free(read_failure);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"model_steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
         read_failure,
     );
 }
@@ -6022,7 +6031,7 @@ test "image preparation failure has stable text and JSON contracts" {
     const json = try renderErrorJsonResult(alloc, @errorName(error.ImagePreparationFailed), 1);
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ImagePreparationFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"model_steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ImagePreparationFailed\"}\n",
         json,
     );
 }
@@ -6051,7 +6060,7 @@ test "unresolved image capability has actionable text and stable JSON code" {
     );
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ModelImageCapabilityUnavailable\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"model_steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ModelImageCapabilityUnavailable\"}\n",
         json,
     );
 }
@@ -6082,7 +6091,7 @@ test "stdin read failure has distinct text and JSON output contracts" {
         try runWithDeps(alloc, &.{"--json"}, testConfig(), deps),
     );
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"model_steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
         stdout_capture.bytes.items,
     );
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
@@ -8114,7 +8123,7 @@ test "ask JSON lists each subagent with its own usage in the shape of the result
     });
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[]," ++
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"model_steps\":0,\"tool_calls\":[]," ++
             "\"usage\":{\"input_tokens\":1,\"output_tokens\":2}," ++
             "\"subagents\":[{\"name\":\"alpha\",\"id\":\"child_a\",\"usage\":{\"input_tokens\":7000,\"output_tokens\":70,\"cache_read_tokens\":700,\"cache_write_tokens\":0}}," ++
             "{\"name\":null,\"id\":\"child_b\",\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}]}\n",
@@ -8132,7 +8141,7 @@ test "ask JSON has no subagents field when no subagent worked" {
     defer alloc.free(json);
     try std.testing.expect(std.mem.find(u8, json, "subagents") == null);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"model_steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
         json,
     );
 }
@@ -8151,6 +8160,7 @@ test "render final JSON preserves shape escaping order and newline" {
         .session_id = try alloc.dupe(u8, "123"),
         .tool_calls = tool_calls,
         .step_count = 2,
+        .model_steps = 2,
     };
     defer result.deinit(alloc);
 
@@ -8158,7 +8168,7 @@ test "render final JSON preserves shape escaping order and newline" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"hello \\\"zig\\\"\\n\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model-x\",\"resolved_provider\":null,\"session_id\":\"123\",\"steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
+        "{\"output\":\"hello \\\"zig\\\"\\n\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model-x\",\"resolved_provider\":null,\"session_id\":\"123\",\"steps\":2,\"model_steps\":2,\"tool_calls\":[{\"name\":\"read_file\",\"status\":\"success\"}],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
         json,
     );
 }
@@ -8175,7 +8185,7 @@ test "render final JSON emits empty tool call array" {
     defer alloc.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"model_steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n",
         json,
     );
 }
@@ -8921,7 +8931,7 @@ test "json run with missing API key prints diagnostic then final object" {
     try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expectEqualStrings("fx ask: " ++ credentials.missing_credential_message ++ "\n", stderr_capture.bytes.items);
     try std.testing.expectEqualStrings(
-        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"MissingCredentials\"}\n",
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"model_steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"MissingCredentials\"}\n",
         stdout_capture.bytes.items,
     );
 }
@@ -9080,8 +9090,8 @@ test "default fx ask preserves project context gathering error mappings" {
         json: ?[]const u8,
     }{
         .{ .err = error.OutOfMemory, .json = null },
-        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"NoSpaceLeft\"}\n" },
-        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"WriteFailed\"}\n" },
+        .{ .err = error.NoSpaceLeft, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"model_steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"NoSpaceLeft\"}\n" },
+        .{ .err = error.WriteFailed, .json = "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"model_steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"WriteFailed\"}\n" },
     };
 
     for (cases) |case| {
@@ -9135,7 +9145,7 @@ test "quiet suppresses streaming while quiet json captures final output" {
     const json_exit = try runWithDeps(alloc, &.{ "--quiet", "--json", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup));
     try std.testing.expectEqual(@as(u8, 0), json_exit);
     try std.testing.expect(std.mem.startsWith(u8, stdout_capture.bytes.items, "{\"output\":\"assistant text\",\"final_output\":\"\",\"exit_code\":0,\"model\":\"model\",\"resolved_provider\":null,\"session_id\":\""));
-    try std.testing.expect(std.mem.endsWith(u8, stdout_capture.bytes.items, "\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n"));
+    try std.testing.expect(std.mem.endsWith(u8, stdout_capture.bytes.items, "\",\"steps\":0,\"model_steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null}}\n"));
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
 
@@ -9267,6 +9277,37 @@ test "fx ask raw output still propagates prompt failure" {
     );
     try std.testing.expectEqualStrings("partial résumé", stdout_capture.bytes.items);
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
+}
+
+test "CLI counts model steps apart from tool starts" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .raw;
+
+    const deps = agentRuntimeDeps(&ctx);
+    const report_model_step = deps.report_model_step orelse return error.TestExpectedEqual;
+    report_model_step(deps.ctx, 1);
+    report_model_step(deps.ctx, 2);
+    try deps.push_tool_lifecycle(deps.ctx, .{
+        .authoritative_started = .{
+            .id = .{ .turn_id = 1, .call_id = "read_1" },
+            .reconciles_provisional_call_id = null,
+            .tool_name = "read_file",
+            .activity_kind = .read,
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 2), ctx.model_step_count);
+    try std.testing.expectEqual(@as(usize, 1), ctx.step_count);
 }
 
 test "CLI tagged stream routes source output rendering and diagnostics by mode" {

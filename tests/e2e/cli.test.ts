@@ -31,6 +31,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySse,
+  startDynamicFakeGateway,
   startFakeGateway,
   tokenPassCatalog,
 } from "./tmux-helpers";
@@ -447,6 +448,7 @@ TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw
 Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
 JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Subagent usage and dollar spend are excluded.
 JSON subagents appears only when a subagent did work in this request. It lists each one in the order it first ran, with its name, id, and usage in the same shape, counted for this request alone. fx session <session_id>/<name> reads one and prints the same id.
+JSON \`steps\` counts the tool calls the agent started. JSON \`model_steps\` counts its model requests, the unit that the \`max_agent_steps\` limit counts.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
@@ -5748,7 +5750,7 @@ describe("cli: ask success", () => {
         expect(jsonResult.code).toBe(1);
         expect(jsonResult.stderr).toBe("");
         expect(jsonResult.stdout).toBe(
-          '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
+          '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"model_steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
         );
       } finally {
         cleanupIsolatedTestHome(home);
@@ -6548,6 +6550,100 @@ describe("cli: ask success", () => {
       } finally {
         cleanupIsolatedTestHome(home);
       }
+    },
+    60_000,
+  );
+});
+
+describe("cli: ask model_steps", () => {
+  const READ_FILES = ["a.txt", "b.txt", "c.txt"];
+
+  function parallelReads(prefix: string, paths: string[]) {
+    return fakeGatewaySse([
+      ...paths.map((path, index) => ({
+        type: "tool-call",
+        toolCallId: `${prefix}_${index}`,
+        toolName: "read_file",
+        input: { path },
+      })),
+      { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+    ]);
+  }
+
+  async function askJson(reply: (completion: number) => Response, extraEnv: Record<string, string> = {}) {
+    const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-model-steps-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    for (const file of READ_FILES) writeFileSync(join(workspace, file), `${file} body\n`);
+    let completions = 0;
+    const gateway = startDynamicFakeGateway(() => reply(++completions), {
+      models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "Read the files."], {
+        cwd: realpathSync(workspace),
+        timeoutMs: 60_000,
+        env: {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "ask-model-steps-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_TEST_SKIP_ONBOARDING: "1",
+          FX_E2E_DISABLE_DOTENV: "1",
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_PERMISSION_MODE: "full-access",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          ...extraEnv,
+        },
+      });
+      return { code: result.code, json: JSON.parse(result.stdout), requests: gateway.requestCount() };
+    } finally {
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  test(
+    "steps counts tool starts and model_steps counts model requests",
+    async () => {
+      const run = await askJson((completion) =>
+        completion === 1 ? parallelReads("read", READ_FILES) : fakeGatewayFinalText("DONE"),
+      );
+      expect(run.code).toBe(0);
+      expect(run.requests).toBe(2);
+      expect(run.json.steps).toBe(3);
+      expect(run.json.model_steps).toBe(2);
+    },
+    60_000,
+  );
+
+  test(
+    "model_steps counts the turns that FX_MAX_AGENT_STEPS limits, while steps counts tool starts",
+    async () => {
+      const run = await askJson(
+        (completion) => parallelReads(`round${completion}`, READ_FILES.slice(0, 2)),
+        { FX_MAX_AGENT_STEPS: "3" },
+      );
+      expect(run.requests).toBe(3);
+      expect(run.json.steps).toBe(6);
+      expect(run.json.model_steps).toBe(3);
+    },
+    60_000,
+  );
+
+  test(
+    "model_steps is 1 for a plain answer with no tool call",
+    async () => {
+      const run = await askJson(() => fakeGatewayFinalText("hello"));
+      expect(run.code).toBe(0);
+      expect(run.json.steps).toBe(0);
+      expect(run.json.model_steps).toBe(1);
     },
     60_000,
   );

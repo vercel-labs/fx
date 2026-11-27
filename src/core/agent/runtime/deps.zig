@@ -418,6 +418,9 @@ pub const AgentRuntimeDeps = struct {
     /// content failures as permission rejections.
     record_tool_call_failed: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, model_output: []const u8, command_result_json: ?[]const u8) anyerror!void = null,
     report_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) void = null,
+    /// Called as each step of this agent's own loop begins, with its 1-based
+    /// index. A subagent builds its own deps, so its steps never reach a host.
+    report_model_step: ?*const fn (ctx: *anyopaque, step_index: usize) void = null,
     report_inner_tool_usage: ?*const fn (ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void = null,
     // Accent for the +N / -N counts in a committed file's status line.
     // Captured by value at construction; that is safe only while the marker
