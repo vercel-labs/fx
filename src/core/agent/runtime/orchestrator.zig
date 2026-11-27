@@ -10504,6 +10504,7 @@ fn processQueuedPromptLoop(
                                 &finish_trace,
                                 malformed_tool_call_failed_notice,
                                 "malformed_tool_call",
+                                null,
                             );
                             return;
                         }
@@ -10651,8 +10652,7 @@ fn processQueuedPromptLoop(
                         diagnostic,
                     );
                 }
-                finish_trace.finish(if (finish_reason == .provider_error) "provider_error" else "content_filter");
-                return error.ModelError;
+                return finishProviderFailureTurn(finalization, &finish_trace, finish_reason);
             }
 
             // Only a complete response finishes the request; the terminal
@@ -10824,8 +10824,7 @@ fn processQueuedPromptLoop(
                     if (completion.content) |content| content.len else 0,
                     completion.tool_calls.len,
                 });
-                finish_trace.finish(if (finish_reason == .provider_error) "provider_error" else "content_filter");
-                return error.ModelError;
+                return finishProviderFailureTurn(finalization, &finish_trace, finish_reason);
             },
             .invalid_completion => {
                 try pushTerminalAutoRetryStatusIfNeeded(
@@ -10842,6 +10841,7 @@ fn processQueuedPromptLoop(
                 } else {
                     debug_trace.eventf("agent", "provider_tool_finish_missing_calls", step_ctx, "finish_reason={s}", .{finish_reason.label()});
                 }
+                finalization.error_kind = .invalid_completion;
                 finish_trace.finish("invalid_tool_finish");
                 return error.ModelError;
             },
@@ -11308,6 +11308,7 @@ fn processQueuedPromptLoop(
                     &finish_trace,
                     try emptyReplyNotice(arena, provider_reason, empty_reply_follow_up),
                     "empty_reply",
+                    null,
                 );
                 return;
             }
@@ -14022,6 +14023,7 @@ fn processQueuedPromptLoop(
                 &finish_trace,
                 repeated_malformed_arguments_notice,
                 "repeated_malformed_tool_arguments",
+                null,
             );
             return;
         }
@@ -14046,6 +14048,7 @@ fn processQueuedPromptLoop(
                 &finish_trace,
                 repeated_terminal_validation_notice,
                 "terminal_validation_retry",
+                null,
             );
             return;
         }
@@ -14075,6 +14078,7 @@ fn processQueuedPromptLoop(
                 &finish_trace,
                 repeated_shell_execution_failure_notice,
                 "repeated_shell_execution_failure",
+                null,
             );
             return;
         }
@@ -14247,7 +14251,27 @@ fn processQueuedPromptLoop(
         &finish_trace,
         config.step_limit_notice,
         "step_limit",
+        .step_limit,
     );
+}
+
+fn providerFailureErrorKind(finish_reason: types.ProviderFinishReason) ?types.TurnErrorKind {
+    return switch (finish_reason) {
+        .provider_error => .provider_error,
+        .content_filter => .content_filter,
+        .stop, .length, .tool_calls, .other => null,
+    };
+}
+
+fn finishProviderFailureTurn(
+    finalization: *TurnFinalizationGuard,
+    finish_trace: *PromptFinishTrace,
+    finish_reason: types.ProviderFinishReason,
+) anyerror {
+    const error_kind = providerFailureErrorKind(finish_reason);
+    finalization.error_kind = error_kind;
+    finish_trace.finish(if (error_kind) |kind| kind.label() else finish_reason.label());
+    return error.ModelError;
 }
 
 fn finishFailedTurnWithNotice(
@@ -14261,9 +14285,11 @@ fn finishFailedTurnWithNotice(
     finish_trace: *PromptFinishTrace,
     notice: []const u8,
     trace_outcome: []const u8,
+    error_kind: ?types.TurnErrorKind,
 ) !void {
     try deps.push_text(deps.ctx, .{ .operational = notice });
     try deps.push_text(deps.ctx, .{ .operational = "\n" });
+    finalization.error_kind = error_kind;
     if (stop_state.retained_candidate != null) {
         const assistant_text = try runtime_finalization.stopTerminalText(
             arena,
@@ -14606,8 +14632,53 @@ test "eb03: UserTurn carries job.input_id in turn-piece writes, checkpoints, and
         &trace,
         "notice text",
         "failed_notice",
+        null,
     );
     try std.testing.expectEqual(@as(usize, 1), notice_fake.history_turns.items.len);
     try std.testing.expectEqual(@as(?u64, 64), notice_fake.history_turns.items[0].assistant.user.input_id);
     try std.testing.expectEqual(@as(?u64, 64), notice_fake.finish_user_input_id);
+}
+
+test "providerFailureErrorKind maps only provider failure finish reasons" {
+    try std.testing.expectEqual(@as(?types.TurnErrorKind, .provider_error), providerFailureErrorKind(.provider_error));
+    try std.testing.expectEqual(@as(?types.TurnErrorKind, .content_filter), providerFailureErrorKind(.content_filter));
+    try std.testing.expectEqual(@as(?types.TurnErrorKind, null), providerFailureErrorKind(.stop));
+    try std.testing.expectEqual(@as(?types.TurnErrorKind, null), providerFailureErrorKind(.length));
+    try std.testing.expectEqual(@as(?types.TurnErrorKind, null), providerFailureErrorKind(.tool_calls));
+    try std.testing.expectEqual(@as(?types.TurnErrorKind, null), providerFailureErrorKind(.other));
+}
+
+test "finishFailedTurnWithNotice leaves error_kind unset when push_text fails" {
+    const support = @import("tests/support.zig");
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var fake = support.FakeAgentRuntimeDeps.init(alloc);
+    defer fake.deinit();
+    var deps = fake.deps();
+    deps.push_text = struct {
+        fn fail(_: *anyopaque, _: runtime_deps.TextEmission) anyerror!void {
+            return error.BrokenPipe;
+        }
+    }.fail;
+    var guard = TurnFinalizationGuard.init(&deps, 12, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, "/tmp"));
+    defer guard.deinit();
+    var summary = runtime_telemetry.TurnSummaryAccumulator.init(0, "p");
+    var stop_state: CommonStopState = .{};
+    var trace: runtime_finalization.PromptFinishTrace = .{ .ctx = .{} };
+    const job: QueuedPrompt = .{
+        .turn_id = 12,
+        .prompt = @constCast("p"),
+        .images = &.{},
+        .model = @constCast("gateway/model"),
+        .api_key = @constCast("key"),
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+    };
+    try std.testing.expectError(
+        error.BrokenPipe,
+        finishFailedTurnWithNotice(&deps, &guard, arena_state.allocator(), job, &.{}, &summary, &stop_state, &trace, "notice", "step_limit", .step_limit),
+    );
+    try std.testing.expectEqual(@as(?types.TurnErrorKind, null), guard.error_kind);
 }

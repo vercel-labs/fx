@@ -41,6 +41,7 @@ pub const TurnFinalizationGuard = struct {
     lifecycle: LifecycleContext,
     state: State = .open,
     outcome: ?types.TurnPresentationOutcome = null,
+    error_kind: ?types.TurnErrorKind = null,
     compacted_execution: execution_memory.CompactedExecutionBoundary = .{},
     /// The runtime context this turn captured for the session, if it did.
     /// Every save of the turn carries it, so a streamed turn keeps one prefix
@@ -226,6 +227,13 @@ pub const TurnFinalizationGuard = struct {
             }
             return err;
         };
+        if (outcome == .failed) {
+            if (self.error_kind) |kind| {
+                if (self.deps.record_turn_error_kind) |record| {
+                    record(self.deps.ctx, kind);
+                }
+            }
+        }
         self.state = .emitted;
         self.outcome = outcome;
 

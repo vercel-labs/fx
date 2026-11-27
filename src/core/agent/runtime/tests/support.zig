@@ -640,6 +640,7 @@ pub const FakeAgentRuntimeDeps = struct {
     },
     stream_output_token_error: ?anyerror = null,
     fail_status_finished: bool = false,
+    recorded_error_kind: ?types.TurnErrorKind = null,
     command_replay_output: ?[]const u8 = null,
     command_replay_capability: ?*session_child_store.SessionChildCapability = null,
     last_file_request_allocators_distinct: bool = false,
@@ -846,6 +847,7 @@ pub const FakeAgentRuntimeDeps = struct {
             else
                 null,
             .finalize_turn = finalizeTurn,
+            .record_turn_error_kind = recordTurnErrorKind,
             .release_agent_terminal_lease = releaseAgentTerminalLease,
             .turn_ends_by_explicit_cancel = if (self.steering_detached_explicit_cancel != null) turnEndsByExplicitCancel else null,
             .stop_steering_detached_commands = if (self.steering_detached_explicit_cancel != null) stopSteeringDetachedCommands else null,
@@ -1041,6 +1043,11 @@ pub const FakeAgentRuntimeDeps = struct {
             .gateway_team = team_copy,
             .gateway_team_label = if (team) |value| try alloc.dupe(u8, value) else null,
         };
+    }
+
+    fn recordTurnErrorKind(raw: *anyopaque, kind: types.TurnErrorKind) void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.recorded_error_kind = kind;
     }
 
     fn takeSteeringBoundary(
