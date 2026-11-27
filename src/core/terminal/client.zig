@@ -2087,6 +2087,29 @@ const late_fork_command = "read -r _ < ./" ++ GoSignal.name ++
     "; exec sleep 60";
 const launched_byte = "printf x > ./" ++ LaunchSignal.name ++ "; ";
 
+/// The late child no tree kill can reach: `late.py` forks it and exits at once,
+/// so its parent is gone and no process of the recorded tree or the shell's
+/// lineage leads to it. It leads its own process group, ignores the hangup,
+/// and holds the terminal as its input and error output. Only the sweep of the
+/// terminal's session can end it. It says that it started on the `alive` pipe.
+const orphaned_late_command = "read -r _ < ./" ++ GoSignal.name ++
+    "; python3 ./late.py ./" ++ LifeSignal.late_child ++
+    "; printf x > ./" ++ LaunchSignal.name ++ "; exec sleep 60";
+
+fn writeLateScript(fixture: *LiveTerminalFixture) !void {
+    try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "late.py", .data =
+        \\import os, signal, sys
+        \\if os.fork() == 0:
+        \\    os.setpgid(0, 0)
+        \\    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        \\    open("late.pid", "w").write(str(os.getpid()))
+        \\    life = os.open(sys.argv[1], os.O_WRONLY)
+        \\    os.write(life, b"x")
+        \\    signal.alarm(30); signal.pause()
+        \\    os._exit(0)
+    });
+}
+
 fn readPid(fixture: *LiveTerminalFixture, name: []const u8) !std.posix.pid_t {
     const bytes = try fixture.tmp.dir.readFileAlloc(
         std.testing.io,
@@ -2099,11 +2122,19 @@ fn readPid(fixture: *LiveTerminalFixture, name: []const u8) !std.posix.pid_t {
 }
 
 test "closing owned terminals for exit ends a child the shell started after the process tree was recorded" {
-    try expectExitEndsLateChild(.drains_first);
+    try expectExitEndsLateChild(.drains_first, .forked);
 }
 
 test "closing owned terminals for exit ends a late child when the terminal's output ended first" {
-    try expectExitEndsLateChild(.ends_first);
+    try expectExitEndsLateChild(.ends_first, .forked);
+}
+
+test "closing owned terminals for exit ends an orphaned late child that ignores the hangup" {
+    try expectExitEndsLateChild(.drains_first, .orphaned);
+}
+
+test "closing owned terminals for exit ends an orphaned late child when the terminal's output ended first" {
+    try expectExitEndsLateChild(.ends_first, .orphaned);
 }
 
 /// Where the terminal's output ends relative to the late child. macOS ends it
@@ -2112,7 +2143,11 @@ test "closing owned terminals for exit ends a late child when the terminal's out
 /// does.
 const OutputEnds = enum { drains_first, ends_first };
 
-fn expectExitEndsLateChild(output: OutputEnds) !void {
+/// `forked`: the shell starts it in its own process group, and a tree kill
+/// that reads the tree again can find it. `orphaned`: no tree kill can.
+const LateChild = enum { forked, orphaned };
+
+fn expectExitEndsLateChild(output: OutputEnds, late_child: LateChild) !void {
     var fixture: LiveTerminalFixture = undefined;
     try fixture.init();
     defer fixture.deinit();
@@ -2133,7 +2168,13 @@ fn expectExitEndsLateChild(output: OutputEnds) !void {
     try alive.init(fixture.home, LifeSignal.late_child);
     defer alive.deinit();
 
-    const session_id = try fixture.start(late_fork_command);
+    const session_id = switch (late_child) {
+        .forked => try fixture.start(late_fork_command),
+        .orphaned => blk: {
+            try writeLateScript(&fixture);
+            break :blk try fixture.start(orphaned_late_command);
+        },
+    };
     defer alloc.free(session_id);
     ExitGate.arm(&go, &forked, &alive, session_id);
     defer ExitGate.disarm();
