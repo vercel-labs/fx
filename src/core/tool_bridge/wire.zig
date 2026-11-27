@@ -60,11 +60,18 @@ pub const Operation = union(enum) {
     edit: capability_mod.EditRequest,
     /// `fx tool write PATH`: the whole content of a file.
     write: capability_mod.WriteRequest,
+    skill_list,
+    skill_open: capability_mod.SkillOpenRequest,
+    agent_message: capability_mod.AgentMessageRequest,
+    agent_wait,
+    agent_status: ?[]const u8,
+    agent_stop: []const u8,
+    agent_close: []const u8,
 
     /// The lookup this operation is, or null for a change or a call.
     pub fn lookup(self: Operation) ?capability_mod.Lookup {
         return switch (self) {
-            .call, .edit, .write => null,
+            .call, .edit, .write, .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => null,
             .list => |server| .{ .list = server },
             .search => |query| .{ .search = query },
             .help => |tool| .{ .help = tool },
@@ -77,6 +84,13 @@ pub const Operation = union(enum) {
             .call => |value| value.tool,
             .edit => |value| value.path,
             .write => |value| value.path,
+            .skill_list => "skill list",
+            .skill_open => |value| value.name,
+            .agent_message => |value| value.agent,
+            .agent_wait => "agent wait",
+            .agent_status => |agent| agent orelse "agent status",
+            .agent_stop => |agent| agent,
+            .agent_close => |agent| agent,
             .list, .search, .help => |text| text,
         };
     }
@@ -119,6 +133,24 @@ pub fn parseRequest(arena: Allocator, line: []const u8) RequestError!Request {
         .help => .{ .help = try nonEmptyString(object, "tool") },
         .edit => .{ .edit = .{ .path = try nonEmptyString(object, "path"), .blocks = try parseEditBlocks(arena, object) } },
         .write => .{ .write = .{ .path = try nonEmptyString(object, "path"), .content = try stringField(object, "content") } },
+        .skill_list => .skill_list,
+        .skill_open => .{ .skill_open = .{
+            .name = try nonEmptyString(object, "name"),
+            .resource = try optionalNonEmptyString(object, "resource"),
+        } },
+        .agent_message => .{ .agent_message = .{
+            .agent = try nonEmptyString(object, "agent"),
+            .message = try nonEmptyString(object, "message"),
+            .instructions = try optionalNonEmptyString(object, "instructions"),
+            .model = try optionalNonEmptyString(object, "model"),
+            .effort = try optionalNonEmptyString(object, "effort"),
+            .profile = try optionalNonEmptyString(object, "profile"),
+            .report = try optionalReport(object),
+        } },
+        .agent_wait => .agent_wait,
+        .agent_status => .{ .agent_status = try optionalNonEmptyString(object, "agent") },
+        .agent_stop => .{ .agent_stop = try nonEmptyString(object, "agent") },
+        .agent_close => .{ .agent_close = try nonEmptyString(object, "agent") },
     };
     return .{
         .version = @intCast(version.integer),
@@ -137,6 +169,18 @@ fn nonEmptyString(object: std.json.ObjectMap, key: []const u8) RequestError![]co
     const text = try stringField(object, key);
     if (text.len == 0) return error.MalformedRequest;
     return text;
+}
+
+fn optionalNonEmptyString(object: std.json.ObjectMap, key: []const u8) RequestError!?[]const u8 {
+    const value = object.get(key) orelse return null;
+    if (value == .null) return null;
+    if (value != .string or value.string.len == 0) return error.MalformedRequest;
+    return value.string;
+}
+
+fn optionalReport(object: std.json.ObjectMap) RequestError!?capability_mod.AgentReport {
+    const raw = (try optionalNonEmptyString(object, "report")) orelse return null;
+    return capability_mod.AgentReport.parse(raw) orelse error.MalformedRequest;
 }
 
 /// The blocks of an edit line: one to `edit_blocks.max_blocks`, each with a
@@ -187,6 +231,24 @@ pub fn writeRequest(writer: *std.Io.Writer, token: mcp_call.Token, operation: Op
             try writeField(writer, "path", value.path);
             try writeField(writer, "content", value.content);
         },
+        .skill_list, .agent_wait => {},
+        .skill_open => |value| {
+            try writeField(writer, "name", value.name);
+            if (value.resource) |resource| try writeField(writer, "resource", resource);
+        },
+        .agent_message => |value| {
+            try writeField(writer, "agent", value.agent);
+            try writeField(writer, "message", value.message);
+            if (value.instructions) |instructions| try writeField(writer, "instructions", instructions);
+            if (value.model) |model| try writeField(writer, "model", model);
+            if (value.effort) |effort| try writeField(writer, "effort", effort);
+            if (value.profile) |profile| try writeField(writer, "profile", profile);
+            if (value.report) |report| try writeField(writer, "report", report.name());
+        },
+        .agent_status => |maybe_agent| {
+            if (maybe_agent) |agent| try writeField(writer, "agent", agent);
+        },
+        .agent_stop, .agent_close => |agent| try writeField(writer, "agent", agent),
     }
     try writer.writeAll("}\n");
 }
@@ -417,5 +479,65 @@ test "a write line needs its content field" {
         "{\"v\":1,\"token\":\"\",\"op\":\"write\",\"path\":\"f\"}",
         "{\"v\":1,\"token\":\"\",\"op\":\"write\",\"path\":\"f\",\"content\":3}",
         "{\"v\":1,\"token\":\"\",\"op\":\"write\",\"content\":\"x\"}",
+    }) |line| try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
+}
+
+test "skill and agent lines round-trip with every optional field, and none are lookups" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const token: mcp_call.Token = @splat(0x73);
+    const ops = [_]Operation{
+        .skill_list,
+        .{ .skill_open = .{ .name = "zig" } },
+        .{ .skill_open = .{ .name = "zig", .resource = "SKILL.md" } },
+        .{ .agent_message = .{ .agent = "worker", .message = "check \"quotes\"\nline2" } },
+        .{ .agent_message = .{
+            .agent = "worker",
+            .message = "go",
+            .instructions = "be brief",
+            .model = "claude-sonnet",
+            .effort = "high",
+            .profile = "reviewer",
+            .report = .every_turn,
+        } },
+        .agent_wait,
+        .{ .agent_status = null },
+        .{ .agent_status = "worker" },
+        .{ .agent_stop = "worker" },
+        .{ .agent_close = "worker" },
+    };
+
+    for (ops) |op| {
+        try std.testing.expect(op.lookup() == null);
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try writeRequest(&out.writer, token, op);
+        const line = out.written();
+        try std.testing.expectEqual(@as(u8, '\n'), line[line.len - 1]);
+        const parsed = try parseRequest(arena, line[0 .. line.len - 1]);
+        try std.testing.expectEqualDeep(op, parsed.operation);
+    }
+}
+
+test "malformed skill and agent lines are rejected" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{
+        "{\"v\":1,\"token\":\"\",\"op\":\"skill_open\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"skill_open\",\"name\":\"\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"skill_open\",\"name\":\"zig\",\"resource\":\"\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"skill_open\",\"name\":\"zig\",\"resource\":3}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"agent_message\",\"agent\":\"w\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"agent_message\",\"agent\":\"\",\"message\":\"hi\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"agent_message\",\"agent\":\"w\",\"message\":\"\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"agent_message\",\"agent\":\"w\",\"message\":\"hi\",\"report\":\"bogus\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"agent_message\",\"agent\":\"w\",\"message\":\"hi\",\"model\":\"\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"agent_status\",\"agent\":\"\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"agent_status\",\"agent\":4}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"agent_stop\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"agent_stop\",\"agent\":\"\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"agent_close\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"agent_close\",\"agent\":\"\"}",
     }) |line| try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
 }

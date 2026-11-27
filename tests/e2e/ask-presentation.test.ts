@@ -1876,7 +1876,7 @@ describe("fx ask with experimental.bash_tool", () => {
 
     expect(result.code).toBe(3);
     expect(result.stderr).toContain(
-      "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.",
+      "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, before that bash call returns.",
     );
     expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("print('a')\n");
   }, TIMEOUT);
@@ -2604,7 +2604,7 @@ describe("fx tool and fx mcp call without MCP servers", () => {
     expect(shown).toContain("socket=[] token=[]");
     expect(shown).toContain("exit=3");
     expect(shown).toContain(
-      "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.",
+      "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, before that bash call returns.",
     );
     expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("print('a')\n");
   }, TIMEOUT);
@@ -3017,6 +3017,44 @@ describe("slice 4 break-it: results as files", () => {
     const contents = dirs.map((id) => readFileSync(join(resultsRoot, id, "1.txt"), "utf8")).sort();
     expect(contents[0]).toContain("child-out\nCHILD_FX_OUT=");
     expect(contents[1]).toContain("parent-out\nPARENT_FX_OUT=");
+  }, TIMEOUT);
+});
+
+describe("slice 6: fx tool skill and agent bridge", () => {
+  const BASH_SETTING = ["--config", "experimental.bash_tool=true"];
+
+  test("bash program runs fx tool skill list and fx tool agent status against the fake gateway", async () => {
+    const root = createRoot();
+    mkdirSync(join(root.workspace, ".fx", "skills", "demo"), { recursive: true });
+    writeFileSync(
+      join(root.workspace, ".fx", "skills", "demo", "SKILL.md"),
+      "---\nname: demo\ndescription: Demo skill description\n---\n\nDEMO_INSTRUCTIONS\n",
+    );
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("b_tools", "bash", {
+        command: `${JSON.stringify(FX_BIN)} tool skill list && echo "---OPEN---" && ${JSON.stringify(FX_BIN)} tool skill open demo && echo "---STATUS---" && ${JSON.stringify(FX_BIN)} tool agent status`,
+      }),
+      fakeGatewayFinalText("Bridge skill and agent done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "List skills and agent status."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = (JSON.parse(toolResultText(gateway.requests[1]!.body, "b_tools")) as { value: string }).value;
+    expect(out).toContain("$FX_OUT/1.txt");
+    expect(out).toContain("demo\tDemo skill description");
+    expect(out).toContain("---OPEN---");
+    expect(out).toContain("DEMO_INSTRUCTIONS");
+    expect(out).not.toContain("<skill_content");
+    expect(out).not.toContain("</skill_content>");
+    expect(out).toContain("---STATUS---");
+    expect(out).toContain('"ok":true');
+    expect(out).toContain("No subagents yet.");
   }, TIMEOUT);
 });
 

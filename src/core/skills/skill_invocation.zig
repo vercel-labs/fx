@@ -50,7 +50,7 @@ const TestLoadHook = struct {
 };
 
 const LoadOptions = struct {
-    mode: enum { chunk, whole } = .chunk,
+    mode: enum { chunk, whole, raw_whole } = .chunk,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     test_after_candidate_validation: if (@import("builtin").is_test) ?TestLoadHook else void =
         if (@import("builtin").is_test) null else {},
@@ -580,10 +580,37 @@ pub fn loadWholeByLocation(
     max_tool_result_bytes: ?usize,
     cancel_flag: ?*std.atomic.Value(bool),
 ) !ExecuteResult {
+    return loadWholeByLocationWithMode(alloc, catalog, location, resource, limits, max_tool_result_bytes, cancel_flag, .whole);
+}
+
+/// Reads a skill or one of its resources whole through the same checked path
+/// as `loadWholeByLocation`, returning the file's raw text without the model
+/// `<skill_content>` wrapper.
+pub fn loadWholeRawByLocation(
+    alloc: Allocator,
+    catalog: Catalog,
+    location: []const u8,
+    resource: ?[]const u8,
+    limits: context_limits.Values,
+    cancel_flag: ?*std.atomic.Value(bool),
+) !ExecuteResult {
+    return loadWholeByLocationWithMode(alloc, catalog, location, resource, limits, null, cancel_flag, .raw_whole);
+}
+
+fn loadWholeByLocationWithMode(
+    alloc: Allocator,
+    catalog: Catalog,
+    location: []const u8,
+    resource: ?[]const u8,
+    limits: context_limits.Values,
+    max_tool_result_bytes: ?usize,
+    cancel_flag: ?*std.atomic.Value(bool),
+    mode: @FieldType(LoadOptions, "mode"),
+) !ExecuteResult {
     for (catalog.skills) |skill| {
         if (!std.mem.eql(u8, skill.path, location)) continue;
         return loadByIdentityWithOptions(alloc, catalog, skill.name, location, resource, 0, limits, max_tool_result_bytes, .{
-            .mode = .whole,
+            .mode = mode,
             .cancel_flag = cancel_flag,
         });
     }
@@ -795,7 +822,7 @@ fn loadByIdentityWithOptions(
     if (!skill_runtime.resourceIsSkillFile(resource_path)) {
         try revalidatePrimaryIdentity(alloc, candidate.skillFile(), skill.*);
     }
-    if (options.mode == .whole) {
+    if (options.mode == .whole or options.mode == .raw_whole) {
         if (resource_read.observed_bytes > resource_read.bytes.len) {
             return attachOwnedDiscoveryNotice(alloc, try contextLimitFailure(alloc, try formatSkillFileBlocked(
                 alloc,
@@ -820,6 +847,14 @@ fn loadByIdentityWithOptions(
                 limits.skill_chunk_bytes,
                 0,
             )), &discovery_notice, max_tool_result_bytes);
+        }
+        if (options.mode == .raw_whole) {
+            const raw = try alloc.dupe(u8, resource_read.bytes);
+            if (discovery_notice) |notice| {
+                alloc.free(notice);
+                discovery_notice = null;
+            }
+            return .{ .loaded = .{ .model_output = raw, .complete = true } };
         }
         var full: std.Io.Writer.Allocating = .init(alloc);
         defer full.deinit();

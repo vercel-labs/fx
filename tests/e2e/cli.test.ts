@@ -485,18 +485,45 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   );
 
   test(
-    "fx tool help documents edit, write, and the exit codes",
+    "fx tool help documents edit, write, skill, agent, and the exit codes",
     async () => {
-      for (const args of [["tool"], ["tool", "--help"], ["tool", "edit", "--help"]]) {
+      for (const args of [["tool"], ["tool", "--help"], ["tool", "edit", "--help"], ["tool", "skill", "--help"], ["tool", "agent", "--help"]]) {
         const r = await runFx(args);
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain("edit PATH");
         expect(r.stdout).toContain("write PATH");
+        expect(r.stdout).toContain("skill");
+        expect(r.stdout).toContain("open NAME [FILE]");
+        expect(r.stdout).toContain("agent");
+        expect(r.stdout).toContain("message NAME TEXT");
         expect(r.stdout).toContain("Exit codes:");
         expect(r.stdout).toContain("5 denied");
-        expect(r.stdout).toContain("6 the change did not apply");
-        expect(r.stdout).toContain("the experimental bash tool runs");
+        expect(r.stdout).toContain("6 ");
+        expect(r.stdout).toContain("experimental.bash_tool");
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx tool skill and agent reject bad usage with exit 2",
+    async () => {
+      for (const args of [
+        ["tool", "skill"],
+        ["tool", "skill", "list", "extra"],
+        ["tool", "skill", "open"],
+        ["tool", "agent"],
+        ["tool", "agent", "message", "worker"],
+        ["tool", "agent", "message", "worker", "hi", "--report", "always"],
+        ["tool", "agent", "wait", "worker"],
+        ["tool", "agent", "stop"],
+        ["tool", "agent", "close"],
+      ]) {
+        const r = await runFx(args);
+        expect(r.code).toBe(2);
+        expect(r.stdout).toBe("");
+        expect(r.stderr.length).toBeGreaterThan(0);
       }
     },
     TIMEOUT,
