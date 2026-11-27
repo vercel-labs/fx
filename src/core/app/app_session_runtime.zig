@@ -4718,6 +4718,21 @@ pub fn Runtime(comptime App: type) type {
             return holds_previous;
         }
 
+        /// A stored or sidecar title is outside text, so the notice shows it
+        /// as the transcript shows prose: a control byte or invalid UTF-8
+        /// shows as its escape, and emoji joiners stay. The sink copies the
+        /// body.
+        fn appendStoredTitleNotice(app: *App, sink: anytype, topic: []const u8, title: []const u8) !void {
+            var body: std.ArrayList(u8) = .empty;
+            defer body.deinit(app.alloc);
+            try text_utils.appendTerminalSafeText(app.alloc, &body, title);
+            try sink.appendNotice(.{
+                .topic = topic,
+                .tone = .neutral,
+                .body = body.items,
+            });
+        }
+
         fn writeResumeNotice(
             app: *App,
             sink: anytype,
@@ -4725,11 +4740,7 @@ pub fn Runtime(comptime App: type) type {
             notice: ResumeNotice,
         ) !void {
             switch (notice) {
-                .session => try sink.appendNotice(.{
-                    .topic = "session resumed",
-                    .tone = .neutral,
-                    .body = display.title,
-                }),
+                .session => try appendStoredTitleNotice(app, sink, "session resumed", display.title),
                 .upgrade => |upgrade| {
                     var body: std.Io.Writer.Allocating = .init(app.alloc);
                     defer body.deinit();
@@ -4743,11 +4754,7 @@ pub fn Runtime(comptime App: type) type {
                     });
                 },
                 .fork => |source_id| {
-                    try sink.appendNotice(.{
-                        .topic = "session forked",
-                        .tone = .neutral,
-                        .body = display.title,
-                    });
+                    try appendStoredTitleNotice(app, sink, "session forked", display.title);
                     // Plain lines, and the command alone on its own, so
                     // selecting that line copies only the command. The blank
                     // line keeps a row between it and the input box while it
@@ -10385,6 +10392,50 @@ test "interactive session resume uses the live transition and shared restore pat
     try std.testing.expect(!app.agent().session_persistence.session_picker.active);
 
     try std.testing.expect(app.agent().session_persistence.subagent_host != null);
+}
+
+test "a resumed session's notice shows a stored title's escapes as text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("fix\x1b]2;owned\x07 the \u{202e} parser\u{0085} now team \u{1f469}\u{200d}\u{1f4bb}") },
+        .assistant = @constCast("saved response"),
+    } }};
+    const saved_session_id = try writeSessionFixture(&app, &history);
+    defer alloc.free(saved_session_id);
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
+    try Runtime(TestApp).openSessionPicker(&app, (&app).agent());
+    try waitForSessionPickerLoad(&app);
+
+    try std.testing.expect(try Runtime(TestApp).resumeSelectedSession(&app, (&app).agent()));
+
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
+    const body = app.notices.items[0];
+    // A stored title is outside text: its escape bytes never reach the screen.
+    try std.testing.expect(std.mem.findScalar(u8, body, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, body, 0x07) == null);
+    try std.testing.expect(text_utils.isTerminalSafeText(body));
+    // The escape shows as its visible text, and the emoji keeps its joiner.
+    try std.testing.expect(std.mem.find(u8, body, "\\x1b]2;owned\\x07") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\u{1f469}\u{200d}\u{1f4bb}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\\u{200d}") == null);
+    try std.testing.expect(std.mem.find(u8, body, "fix") != null);
+    try std.testing.expect(std.mem.find(u8, body, "parser") != null);
 }
 
 test "interactive session resume preserves the current writer when the target is unavailable" {

@@ -95,6 +95,30 @@ function sessionIdFromHome(home: string): string {
   return onlySessionId(home);
 }
 
+/// The log line's checksum, as the manager writes it.
+function crc32c(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (0x82f63b78 & -(crc & 1));
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/// Stores `title` as the session's title, as `/rename` does. The title is
+/// outside text, so a test can store bytes a terminal cannot type.
+function setStoredTitle(home: string, id: string, title: string): void {
+  const logPath = join(sessionDir(home, id), "log.jsonl");
+  const lines = readFileSync(logPath, "utf8").split("\n");
+  const at = lines.findIndex((line) => line.includes('"key":"title"'));
+  expect(at).toBeGreaterThanOrEqual(0);
+  const line = lines[at]!;
+  const valueAt = line.indexOf('"value":') + '"value":'.length;
+  const payload = line.slice(0, valueAt) + JSON.stringify(title);
+  lines[at] = `${payload},"crc":"${crc32c(Buffer.from(payload)).toString(16).padStart(8, "0")}"}`;
+  writeFileSync(logPath, lines.join("\n"), { mode: 0o600 });
+}
+
 /// Session `id`'s log.
 function logOf(home: string, id: string): string {
   return join(sessionDir(home, id), "log.jsonl");
@@ -5024,6 +5048,81 @@ test.skipIf(!tmuxAvailable())(
       if (contender) await contender.kill();
       ownerGateway.stop();
       contenderGateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a resumed session's notice shows a stored title's escapes as text and keeps an emoji joined",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-title-safe-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    const workspaceRoot = realpathSync(workspace);
+    const firstMarker = "TITLE_SAFE_FIRST_TURN_DONE";
+    // A stored title is outside text: an OSC that would set the terminal's
+    // title, then a joined emoji.
+    const savedTitle = "fix\u001b]2;owned\u0007 the parser, team \u{1f469}\u200d\u{1f4bb}";
+    const gateway = startFakeGateway([fakeGatewayFinalText(firstMarker)]);
+    let active: TmuxSession | null = null;
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(FX_BIN),
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 40,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Save the title fixture.");
+      await active.waitForText(firstMarker, TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+
+      // A stored title is outside text: it can hold bytes the terminal cannot
+      // type, so the test writes the title the log records.
+      const sessionId = sessionIdFromHome(home);
+      setStoredTitle(home, sessionId, savedTitle);
+
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: `${shellQuote(FX_BIN)} --resume ${sessionId}`,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 40,
+      });
+      await active.waitForComposer(TIMEOUT);
+      const scrollback = await waitForScrollbackMarkers(
+        active,
+        [firstMarker, "* session resumed:"],
+        TIMEOUT,
+      );
+      // The notice shows the stored title's escape as text, and the emoji
+      // keeps its joiner.
+      expect(scrollback).toContain(
+        "* session resumed: fix\\x1b]2;owned\\x07 the parser, team \u{1f469}\u200d\u{1f4bb}",
+      );
+      expect(scrollback).not.toContain("\\u{200d}");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
       rmSync(root, { recursive: true, force: true });
     }
   },
