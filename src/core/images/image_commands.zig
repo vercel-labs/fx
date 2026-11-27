@@ -11,6 +11,16 @@ const registered_entities = @import("../input/registered_entities.zig");
 const InsertImageResult = enum { inserted, rejected, input_full };
 const ImageSourceLifetime = enum { retained, temporary };
 
+/// `no_image` covers an empty clipboard and an unsupported platform alike, so a
+/// caller can try text next. `handled` means a notice was already shown.
+pub const ClipboardImageResult = enum { attached, no_image, handled };
+
+const ClipboardImageAttempt = union(enum) {
+    attached,
+    handled,
+    missing_image: enum { empty, unsupported },
+};
+
 fn writeInputFullNotice(app: anytype) !void {
     try app.writeDomainNotice(.{
         .topic = "images",
@@ -92,22 +102,46 @@ pub fn Commands(comptime App: type) type {
             return image_attachments.loadClipboardImageAttachment(app.alloc);
         }
 
-        pub fn attachClipboard(app: *App) !void {
+        fn attemptClipboardImage(app: *App) !ClipboardImageAttempt {
             var loaded = loadClipboardImage(app) catch |err| {
-                if (err == error.NoClipboardImage) {
-                    try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "no image found on clipboard" }, true);
-                } else if (err != error.Unsupported) {
-                    const line = try app.alloc.print("failed to paste clipboard image: {s}", .{@errorName(err)});
-                    defer app.alloc.free(line);
-                    try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
-                }
-                return;
+                if (err == error.NoClipboardImage) return .{ .missing_image = .empty };
+                if (err == error.Unsupported) return .{ .missing_image = .unsupported };
+                const line = try app.alloc.print("failed to paste clipboard image: {s}", .{@errorName(err)});
+                defer app.alloc.free(line);
+                try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
+                return .handled;
             };
             defer loaded.deinit(app.alloc);
             switch (try insertImageAtCursor(App, app, loaded.takeAttachment(), .temporary)) {
-                .inserted => app.shell.render_requests.request(.footer),
-                .rejected => {},
-                .input_full => try writeInputFullNotice(app),
+                .inserted => {
+                    app.shell.render_requests.request(.footer);
+                    return .attached;
+                },
+                .rejected => return .handled,
+                .input_full => {
+                    try writeInputFullNotice(app);
+                    return .handled;
+                },
+            }
+        }
+
+        pub fn attachClipboardImage(app: *App) !ClipboardImageResult {
+            return switch (try attemptClipboardImage(app)) {
+                .attached => .attached,
+                .handled => .handled,
+                .missing_image => .no_image,
+            };
+        }
+
+        /// The `/paste` command: image only, with a notice when the clipboard has none.
+        pub fn attachClipboard(app: *App) !void {
+            switch (try attemptClipboardImage(app)) {
+                .attached, .handled => {},
+                .missing_image => |reason| {
+                    if (reason == .empty) {
+                        try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "no image found on clipboard" }, true);
+                    }
+                },
             }
         }
 
@@ -204,6 +238,12 @@ const FakeApp = struct {
     notice_count: usize = 0,
     capture_error: ?anyerror = null,
     snapshot_dir: ?[]const u8 = null,
+    clipboard_text_reads: usize = 0,
+
+    pub fn readClipboardText(self: *FakeApp, _: std.mem.Allocator) !?[]u8 {
+        self.clipboard_text_reads += 1;
+        return null;
+    }
 
     fn deinit(self: *FakeApp) void {
         self.clearPendingImages(&self.main_agent);
@@ -999,4 +1039,16 @@ test "attachClipboard is silent on unsupported platforms" {
 
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+}
+
+test "attachClipboard never reads clipboard text" {
+    if (@import("builtin").target.os.tag == .macos) return;
+
+    const alloc = std.testing.allocator;
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try Commands(FakeApp).attachClipboard(&app);
+
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_text_reads);
 }

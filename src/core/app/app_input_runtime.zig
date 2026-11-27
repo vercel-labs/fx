@@ -235,6 +235,27 @@ pub fn Runtime(comptime App: type) type {
         pub const installPromptHistory = history_rt.installPromptHistory;
         pub const loadAndInstallPromptHistory = history_rt.loadAndInstallPromptHistory;
 
+        fn readClipboardText(app: *App) !?[]u8 {
+            // Test apps supply a fake reader so tests never read the real clipboard.
+            if (comptime @hasDecl(App, "readClipboardText")) return app.readClipboardText(app.alloc);
+            if (comptime @hasDecl(App, "clipboard")) return app.clipboard().readText(app.alloc);
+            return null;
+        }
+
+        /// Ctrl+V found no image: paste the clipboard text, or say there is none.
+        fn pasteClipboardTextOrNotice(app: *App, agent: *AppAgent, max_input_len: usize) !void {
+            const maybe_text = try readClipboardText(app);
+            defer if (maybe_text) |owned| app.alloc.free(owned);
+            const text: []const u8 = maybe_text orelse "";
+            if (text.len == 0) {
+                debug_trace.logf("input", "ctrl+v clipboard empty", .{});
+                try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "no image or text found on clipboard" }, true);
+                return;
+            }
+            debug_trace.logf("input", "ctrl+v clipboard text bytes={d}", .{text.len});
+            try paste_rt.insertClipboardText(app, agent, text, max_input_len);
+        }
+
         fn insertComposerSliceBounded(
             app: *App,
             agent: *AppAgent,
@@ -1568,7 +1589,10 @@ pub fn Runtime(comptime App: type) type {
                         debug_trace.logf("input", "image attach skipped reason=model_picker_borrows_composer", .{});
                         return;
                     }
-                    try image_commands.Commands(App).attachClipboard(app);
+                    switch (try image_commands.Commands(App).attachClipboardImage(app)) {
+                        .attached, .handled => {},
+                        .no_image => try pasteClipboardTextOrNotice(app, agent, max_input_len),
+                    }
                 },
                 24 => {
                     return;
@@ -3989,6 +4013,8 @@ const RoutingFakeApp = struct {
     suspend_count: usize = 0,
     workspace_access: app_workspace_runtime.Access = .{},
     clipboard_image_reads: usize = 0,
+    clipboard_text: ?[]const u8 = null,
+    clipboard_text_reads: usize = 0,
 
     pub fn slashRegistry(_: *const RoutingFakeApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
@@ -4001,6 +4027,12 @@ const RoutingFakeApp = struct {
     pub fn loadClipboardImageAttachment(self: *RoutingFakeApp) !image_attachments.ClipboardImageAttachment {
         self.clipboard_image_reads += 1;
         return error.NoClipboardImage;
+    }
+
+    pub fn readClipboardText(self: *RoutingFakeApp, alloc: std.mem.Allocator) !?[]u8 {
+        self.clipboard_text_reads += 1;
+        const text = self.clipboard_text orelse return null;
+        return try alloc.dupe(u8, text);
     }
 
     fn init(alloc: std.mem.Allocator) !RoutingFakeApp {
@@ -10495,6 +10527,94 @@ test "app_input_runtime ctrl+v reads the clipboard through the app's reader" {
 
     try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
     try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
+}
+
+test "app_input_runtime ctrl+v pastes clipboard text when the clipboard has no image" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.clipboard_text = "hello";
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+    try std.testing.expectEqualStrings("hello", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
+    try std.testing.expectEqual(@as(usize, 1), app.clipboard_text_reads);
+}
+
+test "app_input_runtime ctrl+v pastes long clipboard text as a pasted block" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const long_text = try alloc.alloc(u8, paste_blocks.large_paste_char_threshold + 1);
+    defer alloc.free(long_text);
+    for (long_text, 0..) |*byte, index| byte.* = if (index % 100 == 99) '\n' else 'x';
+    app.clipboard_text = long_text;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+    const blocks = app.input_runtime.entities.pasted_blocks.items;
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings(long_text, blocks[0].text);
+    const input = app.input_runtime.edit_state.input.items;
+    try std.testing.expect(std.mem.find(u8, input, "[Pasted text #") != null);
+    try std.testing.expect(input.len < long_text.len);
+}
+
+test "app_input_runtime ctrl+v with an empty clipboard shows one notice" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const notices_before = app.notice_write_count;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.clipboard_text_reads);
+    try std.testing.expectEqual(notices_before + 1, app.notice_write_count);
+}
+
+test "app_input_runtime ctrl+v filters control bytes like a bracketed paste" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.clipboard_text = "a\x1b[31mb";
+    const notices_before = app.notice_write_count;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+    try std.testing.expectEqualStrings("a[31mb", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(notices_before, app.notice_write_count);
+}
+
+test "app_input_runtime ctrl+v rejects clipboard text with invalid utf-8" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.clipboard_text = "a\xffb";
+    const notices_before = app.notice_write_count;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(notices_before + 1, app.notice_write_count);
+    try std.testing.expectEqualStrings(
+        "Pasted text contains unsupported bytes and was not added to the draft.",
+        app.notice_body.items,
+    );
+}
+
+test "app_input_runtime ctrl+v keeps the clipboard untouched while the model picker borrows the composer" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.clipboard_text = "clip";
+    try enterRoutingShortcutEffortStage(&app, "draft", "draft".len);
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_image_reads);
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_text_reads);
 }
 
 test "app_input_runtime decision paste start clears pending ctrl-c and esc gestures" {

@@ -8,6 +8,7 @@ const io_mod = @import("../shared/io.zig");
 pub const clipboard = host.Clipboard{
     .copy_fn = copyToClipboard,
     .copy_file_fn = copy_file_to_clipboard,
+    .read_text_fn = read_clipboard_text,
 };
 
 pub const secret_store = native_secret_store.provider;
@@ -45,7 +46,7 @@ fn copyToClipboard(_: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
         return error.CopyFailed;
     };
     if (!copySucceeded(term)) {
-        logUnsuccessfulTerm(term);
+        logUnsuccessfulTerm("copy", term);
         return error.CopyFailed;
     }
     return true;
@@ -226,10 +227,103 @@ fn copy_file_to_clipboard(_: ?*anyopaque, alloc: std.mem.Allocator, path: []cons
     return error.CopyFailed;
 }
 
+const max_clipboard_text_bytes: usize = 16 * 1024 * 1024;
+const clipboard_read_timeout_seconds = 2;
+
+// Stdout is drained before the child is waited on: a child that fills the pipe
+// cannot exit until it is read, so waiting first would time out large text.
+fn collect_clipboard_stdout(
+    alloc: std.mem.Allocator,
+    child: *std.process.Child,
+    deadline: std.Io.Clock.Timestamp,
+) ![]u8 {
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(1) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(alloc, io_mod.getIo(), multi_reader_buffer.toStreams(), &.{child.stdout.?});
+    defer multi_reader.deinit();
+
+    const stdout_reader = multi_reader.reader(0);
+    while (multi_reader.fill(64, .{ .deadline = deadline })) |_| {
+        if (stdout_reader.buffered().len > max_clipboard_text_bytes) return error.StreamTooLong;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |fill_err| return fill_err,
+    }
+    try multi_reader.checkAnyError();
+
+    return multi_reader.toOwnedSlice(0);
+}
+
+fn kill_clipboard_read_child(child: *std.process.Child) void {
+    if (child.id == null) return;
+    _ = kill_and_wait_clipboard_process(child) catch |cleanup_err| {
+        debug_trace.logf("host", "clipboard text read cleanup failed err={s}", .{@errorName(cleanup_err)});
+    };
+}
+
+const ClipboardReadResult = struct {
+    term: std.process.Child.Term,
+    text: []u8,
+};
+
+fn run_clipboard_read(
+    alloc: std.mem.Allocator,
+    argv: []const []const u8,
+    deadline: std.Io.Clock.Timestamp,
+) !ClipboardReadResult {
+    var child = try std.process.spawn(io_mod.getIo(), .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer child.kill(io_mod.getIo());
+    defer close_clipboard_process_streams(&child);
+
+    const text = collect_clipboard_stdout(alloc, &child, deadline) catch |err| {
+        kill_clipboard_read_child(&child);
+        return err;
+    };
+    errdefer alloc.free(text);
+    const term = wait_for_clipboard_process(&child, deadline) catch |err| {
+        kill_clipboard_read_child(&child);
+        return err;
+    };
+    return .{ .term = term, .text = text };
+}
+
+// Returns null on every failure: a clipboard without text, a missing tool, or a
+// timeout all leave the caller with the same choice, to tell the person.
+fn read_clipboard_text(_: ?*anyopaque, alloc: std.mem.Allocator) host.ClipboardError!?[]u8 {
+    const argv = clipboardReadCommand(builtin.target.os.tag) orelse return null;
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromSeconds(clipboard_read_timeout_seconds),
+    });
+    const result = run_clipboard_read(alloc, argv, deadline) catch |err| {
+        debug_trace.logf("host", "clipboard text read failed err={s}", .{@errorName(err)});
+        return null;
+    };
+    if (!copySucceeded(result.term)) {
+        alloc.free(result.text);
+        logUnsuccessfulTerm("text read", result.term);
+        return null;
+    }
+    return result.text;
+}
+
 fn clipboardCommand(os_tag: std.Target.Os.Tag) ?[]const []const u8 {
     return switch (os_tag) {
         .macos => &.{"pbcopy"},
         .linux => &.{ "xclip", "-selection", "clipboard" },
+        else => null,
+    };
+}
+
+fn clipboardReadCommand(os_tag: std.Target.Os.Tag) ?[]const []const u8 {
+    return switch (os_tag) {
+        .macos => &.{"pbpaste"},
+        .linux => &.{ "xclip", "-selection", "clipboard", "-o" },
         else => null,
     };
 }
@@ -241,13 +335,24 @@ fn copySucceeded(term: std.process.Child.Term) bool {
     };
 }
 
-fn logUnsuccessfulTerm(term: std.process.Child.Term) void {
+fn logUnsuccessfulTerm(operation: []const u8, term: std.process.Child.Term) void {
     switch (term) {
-        .exited => |code| debug_trace.logf("host", "clipboard copy failed exit_code={d}", .{code}),
-        .signal => |signal| debug_trace.logf("host", "clipboard copy failed term=signal signal={d}", .{@backingInt(signal)}),
-        .stopped => |signal| debug_trace.logf("host", "clipboard copy failed term=stopped signal={d}", .{@backingInt(signal)}),
-        .unknown => |status| debug_trace.logf("host", "clipboard copy failed term=unknown status={d}", .{status}),
+        .exited => |code| debug_trace.logf("host", "clipboard {s} failed exit_code={d}", .{ operation, code }),
+        .signal => |signal| debug_trace.logf("host", "clipboard {s} failed term=signal signal={d}", .{ operation, @backingInt(signal) }),
+        .stopped => |signal| debug_trace.logf("host", "clipboard {s} failed term=stopped signal={d}", .{ operation, @backingInt(signal) }),
+        .unknown => |status| debug_trace.logf("host", "clipboard {s} failed term=unknown status={d}", .{ operation, status }),
     }
+}
+
+test "native clipboard selects the platform read command" {
+    try std.testing.expectEqualSlices([]const u8, &.{"pbpaste"}, clipboardReadCommand(.macos).?);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "xclip", "-selection", "clipboard", "-o" },
+        clipboardReadCommand(.linux).?,
+    );
+    try std.testing.expect(clipboardReadCommand(.windows) == null);
+    try std.testing.expect(clipboardReadCommand(.wasi) == null);
 }
 
 test "native clipboard selects the platform command" {
