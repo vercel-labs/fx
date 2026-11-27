@@ -2548,15 +2548,15 @@ pub fn placementAsApproved(
     return placed.ctx;
 }
 
-/// Refuses a shell run that fx must not start, before any prompt: a run the
-/// fields make impossible away from this machine, or any run while the sandbox
-/// config is invalid or its provider cannot run.
 /// LOG-01: one trace line for a refusal that stops a shell run before it starts. It names the site and
 /// the refusal text fx gives the model. The command itself is never traced.
 pub fn traceRefusal(site: []const u8, text: []const u8) void {
     debug_trace.logf("permission", "event=shell_refused site={s} reason={f}", .{ site, text_utils.terminalSafe(text) });
 }
 
+/// Refuses a shell run that fx must not start, before any prompt: a run the
+/// fields make impossible away from this machine, or any run while the sandbox
+/// config is invalid or its provider cannot run.
 fn commandCallRefusal(input: Input, arena: Allocator, call: ToolCall) !?[]const u8 {
     if (comptime host_target.is_wasm) return null;
     const active = input.sandbox_policy orelse return null;

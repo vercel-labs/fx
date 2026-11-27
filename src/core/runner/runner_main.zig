@@ -673,13 +673,13 @@ fn refuseProfileArgument(arena: Allocator, stderr: *std.Io.Writer, profile: []co
     return exit_did_not_run;
 }
 
-/// N28: pending records were cleared without a bring-back, because the sandbox was replaced or its
-/// record was reset (V4). It is printed once per run, after the push.
 /// N30: the noun for the stopped runs N28 counts.
 fn stoppedRunNoun(count: usize) []const u8 {
     return if (count == 1) "run" else "runs";
 }
 
+/// N28: pending records were cleared without a bring-back, because the sandbox was replaced or its
+/// record was reset (V4). It is printed once per run, after the push.
 fn noteCleared(arena: Allocator, stderr: *std.Io.Writer, count: usize) void {
     if (count == 0) return;
     const line = arena.print("fx: files from {d} earlier stopped {s} were not brought back, because the sandbox was replaced or its record was reset\n", .{ count, stoppedRunNoun(count) }) catch return;
