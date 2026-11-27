@@ -56,6 +56,7 @@ const allowlist: AllowRule[] = [
   rule("src/core/execution/command_runner.zig", "(?:runForegroundSessionBootstrap|writeForegroundSessionReplaceFailure)", /stdio_acquisition_write/, "subprocess_protocol_transport", "foreground command bootstrap protocol"),
   rule("src/core/terminal/native_session.zig", "(?:acceptMarker|runLauncher)", /fixed_descriptor/, "subprocess_protocol_transport", "private native launcher PTY and control descriptors"),
   rule("src/core/shared/darwin_process_spawn.zig", "process_spawn_inheriting_fd", /fixed_descriptor/, "subprocess_protocol_transport", "child stdio and witness file-action mapping"),
+  rule("src/core/mcp_host/owner.zig", "serveInternal", /fixed_descriptor/, "subprocess_protocol_transport", "detached MCP owner ready byte on its spawn pipe"),
   rule("src/core/app/app_entry_runtime.zig", "(?:writeRealStdout|writeRealStderr)", /stdio_acquisition_write/, "noninteractive_output", "post-terminal handoff or failure output"),
   rule("src/core/upgrade/upgrade_runtime.zig", "progressWait", /stdio_(?:acquisition|write)/, "noninteractive_output", "upgrade progress output"),
   rule("src/core/cli/cli_ask.zig", "(?:writeRealStdout|writeRealStderr)", /stdio_acquisition_write/, "noninteractive_output", "workflow CLI output"),
