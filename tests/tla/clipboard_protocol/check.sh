@@ -31,5 +31,6 @@ PasteEvents PasteEvents-no_exit_mode_reset ModeOffAfterExit -deadlock
 PasteEvents PasteEvents-paste_attach_in_modal NoImageOutsideComposer -deadlock
 PasteEvents PasteEvents-listing_while_busy_accepted OneRequestAtATime -deadlock
 PasteEvents PasteEvents-no_reply_deadline temporal -deadlock
+PasteEvents PasteEvents-rearm_after_denial DeniedStaysOff -deadlock
 PasteEvents PasteEvents-current-today temporal -deadlock
 CHECKS

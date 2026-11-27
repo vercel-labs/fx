@@ -7,8 +7,10 @@ stateDiagram-v2
     ReadingMimeList --> IdleWithPasteModeOn: Decision prompt or empty/unknown list (no read; notice or drop)
 
     WaitingForReply --> ReceivingPayload: Terminal starts reply with OK
-    WaitingForReply --> IdleWithPasteModeOn: Terminal denies (EPERM) or reply times out (notice)
+    WaitingForReply --> IdleWithPasteModeOn: Reply times out (notice)
+    WaitingForReply --> DeniedPasteModeOff: Terminal denies (EPERM); mode 5522 off for session and notice asks to paste again
     ReceivingPayload --> IdleWithPasteModeOn: Payload finishes (image attached or text pasted) or stalls (notice)
+    DeniedPasteModeOff --> DeniedPasteModeOff: Later pastes arrive as bracketed text paste to current owner; re-arms and resumes keep mode off
 
     IdleWithPasteModeOn --> BusyReadOpen: You press Ctrl+V (a read is open)
     BusyReadOpen --> IdleWithPasteModeOn: Ctrl+V read finishes, or incoming paste listing dropped with busy notice
@@ -16,6 +18,7 @@ stateDiagram-v2
     IdleWithPasteModeOn --> Suspended: You press Ctrl+Z (paste events turned off)
     Suspended --> IdleWithPasteModeOn: You resume fx (paste events turned back on)
     IdleWithPasteModeOn --> Exited: Normal exit, signal, or hangup (paste events turned off)
+    DeniedPasteModeOff --> Exited: Normal exit, signal, or hangup (paste events stay off)
     Exited --> [*]
 
     ReceivingPayload --> WrongOwnerText: Mutant paste_uses_current_owner routes text after owner key change [breaks PasteTextToRecordedOwner]
@@ -23,6 +26,7 @@ stateDiagram-v2
     ReadingMimeList --> ModalImageAttach: Mutant paste_attach_in_modal requests image in modal [breaks NoImageOutsideComposer]
     BusyReadOpen --> OverlappingReadAccepted: Mutant listing_while_busy_accepted accepts paste while read open [breaks OneRequestAtATime]
     WaitingForReply --> HungWaitingForReply: Mutant no_reply_deadline stalls forever [breaks EveryPasteEventSettles]
+    DeniedPasteModeOff --> RearmedAfterDenial: Mutant rearm_after_denial turns mode 5522 back on after denial [breaks DeniedStaysOff]
 
     note right of WrongOwnerText
         Shortest broken path (paste_uses_current_owner):
@@ -47,6 +51,11 @@ stateDiagram-v2
     note right of HungWaitingForReply
         Shortest broken path (no_reply_deadline):
         IdleWithPasteModeOn -> ReadingMimeList -> WaitingForReply -> HungWaitingForReply (terminal stalls)
+    end note
+
+    note right of RearmedAfterDenial
+        Shortest broken path (rearm_after_denial):
+        IdleWithPasteModeOn -> ReadingMimeList -> WaitingForReply -> DeniedPasteModeOff (EPERM) -> RearmedAfterDenial (re-arm or resume)
     end note
 
     note right of ImageDroppedToday
