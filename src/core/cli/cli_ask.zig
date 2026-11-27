@@ -3671,7 +3671,17 @@ fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const 
 fn onCommandOutputChunk(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId, _: command_output_content.Stream, chunk: []const u8) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.output_mode.isTerminal()) return;
-    try ctx.writeStderr(chunk);
+    // R4.6: command output is untrusted and stderr is usually a terminal.
+    // Every escape byte becomes visible text, so a chunk boundary inside a
+    // sequence cannot leave one live.
+    if (text_utils.isTerminalSafeText(chunk)) {
+        try ctx.writeStderr(chunk);
+    } else {
+        var safe: std.ArrayList(u8) = .empty;
+        defer safe.deinit(ctx.alloc);
+        try text_utils.appendTerminalSafeText(ctx.alloc, &safe, chunk);
+        try ctx.writeStderr(safe.items);
+    }
     if (chunk.len > 0) ctx.command_output_line_open = chunk[chunk.len - 1] != '\n';
 }
 
@@ -9614,6 +9624,29 @@ test "CLI command output completion terminates only an open display line" {
     try pushCommandOutputComplete(&ctx, null);
     try std.testing.expectEqualStrings(
         "no-final\nwith-final\n",
+        stderr_capture.bytes.items,
+    );
+}
+
+test "CLI nonterminal command output shows escape sequences as text" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .quiet;
+
+    try onCommandOutputChunk(&ctx, null, .stdout, "x \x1b]0;canary\x07 y \x1b[?7777h \xc2\x9d\n");
+    try onCommandOutputChunk(&ctx, null, .stdout, "plain caf\xc3\xa9\n");
+    try std.testing.expectEqualStrings(
+        "x \\x1b]0;canary\\x07 y \\x1b[?7777h \\u{009d}\nplain caf\xc3\xa9\n",
         stderr_capture.bytes.items,
     );
 }
