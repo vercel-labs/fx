@@ -3,6 +3,7 @@ const agents = @import("../agents/agents.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
+const wait_card = @import("../agent/wait_card.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
@@ -256,6 +257,29 @@ test "chord unregistered command text is unknown and never routed" {
     try std.testing.expect(parsed == .unknown);
     const status = command_router.parse(builtin_commands.slash_registry, "/status");
     try std.testing.expectEqual(ChordCommandRoute.run_now, chordCommandRoute(status));
+}
+
+/// What a keystroke means while the wait card holds the keys. The card's own
+/// keys arrive as question actions; every other control byte belongs to its
+/// own handler (Ctrl+O, Ctrl+P, Ctrl+X, Esc), and typed text is ignored so it
+/// never reaches the view's agent.
+pub const WaitCardKey = union(enum) {
+    choose: usize,
+    run: void,
+    cancel: void,
+    ignore: void,
+    pass_through: void,
+};
+
+pub fn waitCardKey(byte: u8, action: ?question_prompt.Action) WaitCardKey {
+    if (action) |typed| switch (typed) {
+        .cancel => return .cancel,
+        .submit => return .run,
+        .select_ordinal => |index| return .{ .choose = index },
+        else => {},
+    };
+    if (byte < 0x20) return .pass_through;
+    return .ignore;
 }
 
 pub fn Runtime(comptime App: type) type {
@@ -678,6 +702,9 @@ pub fn Runtime(comptime App: type) type {
         /// question, transcript, agents, pickers, menus, and an open model
         /// picker all keep their own keys.
         fn composerOwnsKeyboard(app: *App, agent: *AppAgent) bool {
+            if (comptime @hasField(AppAgent, "wait_card_prompt")) {
+                if (agent.wait_card_prompt.isActive()) return false;
+            }
             if (comptime @hasField(App, "trust")) {
                 if (app.trust.asking()) return false;
             }
@@ -991,6 +1018,10 @@ pub fn Runtime(comptime App: type) type {
             defer announceSlashMenuOpened(app, agent, slash_menu_was_visible);
             if (try routeActivePasteByte(app, byte)) return;
 
+            // The Enter beside the keystroke that answered a card must not
+            // submit the draft the card hid; any other key is its own.
+            if (dropEnterAfterCardAnswer(app, agent, byte)) return;
+
             if (byte != 3 and byte != 0x1b) disarmCtrlCExit(app, "raw_input");
 
             // Non-escape input disarms the pending double-Escape clear.
@@ -1166,6 +1197,25 @@ pub fn Runtime(comptime App: type) type {
 
             if (try full_transcript_rt.routeComposerAction(app, agents.screenAgentOf(app), resolved)) return .done;
 
+            if (comptime @hasField(AppAgent, "wait_card_prompt")) {
+                const card = &agents.screenAgentOf(app).wait_card_prompt;
+                if (card.isActive() and !agentsMenuActive(app)) {
+                    switch (resolved) {
+                        .history_up, .cursor_up => {
+                            card.moveChoice(-1);
+                            app.shell.render_requests.request(.modal);
+                            return .done;
+                        },
+                        .history_down, .cursor_down => {
+                            card.moveChoice(1);
+                            app.shell.render_requests.request(.modal);
+                            return .done;
+                        },
+                        else => {},
+                    }
+                }
+            }
+
             if (composer_shortcut) |action| {
                 try routeComposerShortcutAction(app, agents.screenAgentOf(app), action, max_input_len);
                 return .done;
@@ -1334,6 +1384,27 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return true;
             }
+            if (comptime @hasField(AppAgent, "wait_card_prompt")) {
+                const card = &agent.wait_card_prompt;
+                if (card.isActive()) {
+                    switch (waitCardKey(byte, raw.question_action)) {
+                        .choose => |index| {
+                            if (card.choiceAt(index)) |choice| _ = try answerWaitCard(app, choice);
+                        },
+                        .run => {
+                            if (card.highlighted()) |choice| _ = try answerWaitCard(app, choice);
+                        },
+                        .cancel => _ = try answerWaitCard(app, .cancel),
+                        // The card keeps the keys, as a lent question does, and
+                        // says what it dropped (R3.8; the trace carries no text).
+                        .ignore => debug_trace.logf("input", "wait card dropped key reason=card_holds_keys", .{}),
+                        // Ctrl+O, Ctrl+P, Ctrl+X and the rest keep their own
+                        // meanings while the card shows.
+                        .pass_through => return false,
+                    }
+                    return true;
+                }
+            }
             if (approvalOwnsCurrentSurface(app, agent)) {
                 if (byte >= 0x80) {
                     if (agent.approval_prompt.isAmending()) {
@@ -1392,6 +1463,48 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return true;
             }
+            return false;
+        }
+
+        /// Drops the one Enter that follows a card's answer, and only while the
+        /// view's own composer would take it. A prompt, the agent list or a
+        /// picker that opened in the meantime owns that Enter: after the card's
+        /// "Sign in", for example, the person's first Enter belongs to the
+        /// sign-in picker, not to the draft the card hid. Any key spends the
+        /// guard, so a later Enter is always the person's own.
+        pub fn dropEnterAfterCardAnswer(app: *App, agent: *AppAgent, byte: u8) bool {
+            if (comptime !@hasField(App, "wait_card_enter_guard")) return false;
+            const held_enter = app.wait_card_enter_guard.dropEnter(byte);
+            if (!held_enter) return false;
+            if (!composerOwnsKeys(app, agent)) return false;
+            debug_trace.logf("input", "wait card enter dropped reason=draft_after_answer", .{});
+            return true;
+        }
+
+        /// Whether an Enter now would be the view's own: no prompt, no agent
+        /// list and no picker holds the keys. Ctrl+C is not this question: an
+        /// existing question prompt and the out-of-credits picker both cancel
+        /// on it (`src/ui/input/runtime.zig:141`), so the card cancels too.
+        fn composerOwnsKeys(app: *App, agent: *AppAgent) bool {
+            if (agent.approval_prompt.isActive() or agent.question_prompt.isActive()) return false;
+            if (comptime @hasField(AppAgent, "wait_card_prompt")) {
+                if (agent.wait_card_prompt.isActive()) return false;
+            }
+            if (provider_picker_runtime.Runtime(App).hasQuery(app)) return false;
+            if (inlinePickerTakesEnter(app)) return false;
+            return !agentsMenuActive(app);
+        }
+
+        /// Whether an inline completion picker holds Enter: the `/model` list a
+        /// card's "Change model" opens, the `@` file list and the `/` menu each
+        /// select a row with it, so that Enter is theirs.
+        fn inlinePickerTakesEnter(app: *App) bool {
+            if (completion_rt.hasModelQuery(app) or completion_rt.hasFileQuery(app)) return true;
+            return app.input_runtime.picker.activeInlineSlashQuery(&app.input_runtime.edit_state) != null;
+        }
+
+        fn answerWaitCard(app: *App, choice: wait_card.Choice) !bool {
+            if (comptime @hasDecl(App, "answerWaitCard")) return app.answerWaitCard(choice);
             return false;
         }
 
@@ -3220,6 +3333,16 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeInterrupt(app, "menu");
                 return;
             }
+            // Esc on the wait card ends that subagent's turn, and touches
+            // nothing of the view's own agent.
+            if (comptime @hasField(AppAgent, "wait_card_prompt")) {
+                if (agent.wait_card_prompt.isActive()) {
+                    _ = try answerWaitCard(app, .cancel);
+                    _ = disarmEscapeClear(app);
+                    _ = disarmEscapeInterrupt(app, "wait_card");
+                    return;
+                }
+            }
             // Esc answers `/fork`'s question: fork without the subagents (D97).
             if (try answerForkQuestionOnEscape(app, agent)) {
                 _ = disarmEscapeClear(app);
@@ -3441,6 +3564,30 @@ pub fn Runtime(comptime App: type) type {
         }
     };
 }
+test "wait card: digits choose, Enter runs, Esc and Ctrl+C cancel, and control keys pass through" {
+    const Key = WaitCardKey;
+    const question = question_prompt.Action;
+    try std.testing.expectEqual(std.meta.Tag(Key).choose, std.meta.activeTag(waitCardKey('2', .{ .select_ordinal = 1 })));
+    switch (waitCardKey('2', .{ .select_ordinal = 1 })) {
+        .choose => |index| try std.testing.expectEqual(@as(usize, 1), index),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(std.meta.Tag(Key).run, std.meta.activeTag(waitCardKey('\r', question.submit)));
+    // Ctrl+C is `.cancel` for the card exactly as it is for a question prompt
+    // and the out-of-credits picker: the decoder maps byte 3 to it
+    // (`src/ui/input/runtime.zig:141`), so the card changes no meaning.
+    try std.testing.expectEqual(std.meta.Tag(Key).cancel, std.meta.activeTag(waitCardKey(3, question.cancel)));
+    // Esc is the terminal's own byte and cancels through the decoded action;
+    // every other control byte keeps its own meaning.
+    try std.testing.expectEqual(std.meta.Tag(Key).pass_through, std.meta.activeTag(waitCardKey(0x1b, null)));
+    try std.testing.expectEqual(std.meta.Tag(Key).pass_through, std.meta.activeTag(waitCardKey(0x0f, null)));
+    try std.testing.expectEqual(std.meta.Tag(Key).pass_through, std.meta.activeTag(waitCardKey(0x10, null)));
+    try std.testing.expectEqual(std.meta.Tag(Key).pass_through, std.meta.activeTag(waitCardKey(0x18, null)));
+    // Typed text never reaches the view's agent.
+    try std.testing.expectEqual(std.meta.Tag(Key).ignore, std.meta.activeTag(waitCardKey('a', null)));
+    try std.testing.expectEqual(std.meta.Tag(Key).ignore, std.meta.activeTag(waitCardKey(0xc3, null)));
+}
+
 const ApprovalCancelEvent = enum {
     request_cancel,
 };
