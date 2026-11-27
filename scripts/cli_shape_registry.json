@@ -253,6 +253,14 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_SESSION_PICKER_LOAD_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SESSION_PICKER_LOAD_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SESSION_WRITE_HELD": {
       "job": "test",
       "stability": "internal"
