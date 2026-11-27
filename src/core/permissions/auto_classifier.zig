@@ -3793,7 +3793,7 @@ test "automatic review forwards usage for initial and retry completions" {
     }, null, 1_000);
     var outcome = try reviewer.review(std.testing.allocator, .{
         .review_turn = .{
-            .model = "openai/gpt-5",
+            .model = "provider/model-a",
             .pending_assistant = .{ .role = .assistant, .tool_calls = &.{.{
                 .id = "target",
                 .name = "run_command",
