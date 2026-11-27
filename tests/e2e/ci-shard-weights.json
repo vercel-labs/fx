@@ -10,7 +10,7 @@
   { "file": "compaction-policy.test.ts", "weight": 1 },
   { "file": "provider-compaction.test.ts", "weight": 6 },
   { "file": "config-persistence.test.ts", "weight": 64 },
-  { "file": "configured-providers.test.ts", "weight": 3 },
+  { "file": "configured-providers.test.ts", "weight": 10 },
   { "file": "context-limits-live.test.ts", "weight": 1 },
   { "file": "doctor.test.ts", "weight": 20 },
   { "file": "file-tool-paths.test.ts", "weight": 6 },

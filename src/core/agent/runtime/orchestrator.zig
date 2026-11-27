@@ -9899,16 +9899,17 @@ fn processQueuedPromptLoop(
             stream_result_set = true;
             noteSettledCall(deps, finalization, &held_live_call, stream_ctx.raw_text.items.len > 0, settledCallRecord(job.provider.label(), gateway_model, gateway_wait_started_ms, &stream_result, config.cancel_flag));
             const first_failure = streamFailure(stream_result);
+            const renews_on_replay = first_failure != null and first_failure.?.renews_credential_on_replay;
             const auth_replay = auth_transition.decideAuthReplay(.{
                 .authentication_rejected = first_failure != null and first_failure.?.kind == .unauthorized,
-                .refreshable = if (job.credential_source) |source| credentials.sourceRefreshable(source) else false,
+                .refreshable = renews_on_replay or (if (job.credential_source) |source| credentials.sourceRefreshable(source) else false),
                 .delivery_safe = stream_ctx.interruption_source_or("").len == 0 and
                     !stream_ctx.saw_tool_start and
                     streamCompletion(stream_result).tool_calls.len == 0,
                 .already_replayed = auth_retry_used,
             });
             if (auth_replay == .refresh_and_replay) {
-                if (try renewRejectedCredentialForJob(
+                const renewed = renews_on_replay or try renewRejectedCredentialForJob(
                     deps,
                     std.heap.c_allocator,
                     &job,
@@ -9916,7 +9917,8 @@ fn processQueuedPromptLoop(
                     &active_api_key,
                     &owned_refreshed_api_key,
                     step_ctx,
-                )) {
+                );
+                if (renewed) {
                     auth_retry_used = true;
                     var replay_delivery = runtime_gateway_step.DeliveryCertainty.init();
                     var replay_evidence: runtime_gateway_step.AttemptEvidence = .{};

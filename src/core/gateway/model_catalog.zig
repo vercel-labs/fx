@@ -176,6 +176,9 @@ pub const Provider = struct {
     refresh_interval_ms: ?i64 = null,
     /// The fetch sets `FetchInput.connected` once its request has a connection.
     reports_connection: bool = false,
+    /// True when fetching this catalog can run a sign-in helper, so startup
+    /// waits for the first frame (`RULES.md` R2.2).
+    fetch_starts_helper: bool = false,
 
     /// Returns owned catalog entries; the caller frees them with `freeModelCatalog`.
     pub fn fetch(self: Provider, alloc: Allocator, input: FetchInput) Allocator.Error!ProviderResult {

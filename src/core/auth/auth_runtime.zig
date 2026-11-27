@@ -2081,7 +2081,7 @@ pub const StatusSnapshot = struct {
                 .interactive => credentials.missing_grok_interactive_credential_message,
             },
             .host_managed => automatic_help,
-            .configured => "The configured provider credential is unavailable. Check its auth environment variable in settings.json; no other provider was selected.",
+            .configured => "The configured provider credential is unavailable. Check the connection's auth in ~/.fx/settings.json; no other provider was selected.",
         };
     }
 

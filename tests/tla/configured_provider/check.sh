@@ -54,6 +54,26 @@
 #   sends   a changed binding sends the history to the new one   HistoryStaysOnItsBinding
 #   strict  an edit outside the binding refuses the resume      UnchangedBindingResumes
 #
+# ConfiguredAuth.tla: the `command` auth type (`src/core/auth/command_token.zig`,
+# `command_auth.zig`, `command_helper.zig`, and
+# `src/gateway/configured_transport.zig`), where a helper program prints a
+# connection's token. configured-auth-design-a.cfg
+# runs the helper for every request; configured-auth-design-b.cfg and its
+# deep variant keep one token per connection and run at most one helper per
+# connection. Both must pass. The two today configs are fx before the change:
+# the token comes from an environment variable (TokenFromHelper), and the
+# first 401 ends the request (RejectedOnlyAfterRefresh). The simulate configs
+# are random runs of design b with and without bad events.
+#
+#   no-single-flight  two helper runs at once for one connection    OneRunPerConnection
+#   refresh-loop      a 401 runs the helper again and again         RefreshCapped
+#   resend-same       a 401 resends the refused token               ResendHasNewToken
+#   send-expired      a token fx knows has expired is sent          NoExpiredTokenSent
+#   no-deadline       a helper that hangs is never stopped          RequestSettles
+#   orphan-helper     a cancel leaves the helper running            NoOrphanRun
+#   shared-cache      a request sends another connection's token    TokenStaysWithItsConnection
+#   silent-failure    a failed request does not say why             FailureSaysSo
+#
 # tests/tla/drivers/configured_provider/driver.ts runs the built fx along
 # these models.
 #
@@ -102,4 +122,20 @@ ConfiguredResume configured-resume -
 ConfiguredResume configured-resume-today ChangedBindingSaysSo
 ConfiguredResume configured-resume-mutation-sends HistoryStaysOnItsBinding
 ConfiguredResume configured-resume-mutation-strict UnchangedBindingResumes
+
+ConfiguredAuth configured-auth-design-a -
+ConfiguredAuth configured-auth-design-b -
+ConfiguredAuth configured-auth-design-b-deep -
+ConfiguredAuth configured-auth-today TokenFromHelper
+ConfiguredAuth configured-auth-today-revoked RejectedOnlyAfterRefresh
+ConfiguredAuth configured-auth-mutation-no-single-flight OneRunPerConnection
+ConfiguredAuth configured-auth-mutation-refresh-loop RefreshCapped
+ConfiguredAuth configured-auth-mutation-resend-same ResendHasNewToken
+ConfiguredAuth configured-auth-mutation-send-expired NoExpiredTokenSent
+ConfiguredAuth configured-auth-mutation-no-deadline temporal
+ConfiguredAuth configured-auth-mutation-orphan-helper NoOrphanRun
+ConfiguredAuth configured-auth-mutation-shared-cache TokenStaysWithItsConnection
+ConfiguredAuth configured-auth-mutation-silent-failure FailureSaysSo
+ConfiguredAuth configured-auth-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
+ConfiguredAuth configured-auth-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
 VERDICTS

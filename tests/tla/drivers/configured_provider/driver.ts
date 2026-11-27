@@ -25,12 +25,23 @@
 //              paths, through lab.zig, which owns the clock. After every step
 //              the module's wait and its verdict on the deadline must match
 //              the model's next state.
+//   auth-walk  Walks the pure planner src/core/auth/command_token.zig along every
+//              edge of ConfiguredAuth.tla's state graph, then seeded random paths,
+//              through lab_auth.zig. After every step the planner's state (each
+//              request's phase, reason, token, and refreshes, and each connection's
+//              cache, runs, waiters, and generations) must match the model's next
+//              state.
+//   auth       Runs `fx ask` sessions with a command-auth helper (`fake-helper.ts`)
+//              against a local fake server (fresh, revoked, refused twice, helper
+//              exits non-zero, helper prints garbage, near-expiry, and helper hang
+//              past fx's timeout) and has TLC replay each run's ordered log through
+//              ConfiguredAuth.tla (`ConfiguredAuthTrace.tla`).
 //
 // --self-check also replays the observations through the model of fx before
 // the change (Bug = "today"), which must reject them, expects a tampered
 // expectation to be rejected, and plants bugs in a copy of
-// request_deadlines.zig, each of which the walks must catch. --stress N adds
-// one session of N tool steps.
+// request_deadlines.zig and command_token.zig, each of which the walks must catch.
+// --stress N adds one session of N tool steps.
 //
 // Usage (from the repository root, after zig build):
 //   bun tests/tla/drivers/configured_provider/driver.ts
@@ -38,6 +49,8 @@
 //   bun tests/tla/drivers/configured_provider/driver.ts request --random 200 --seed 7 --jobs 8
 //   bun tests/tla/drivers/configured_provider/driver.ts request --random 0 --stress 1000
 //   bun tests/tla/drivers/configured_provider/driver.ts resume --self-check
+//   bun tests/tla/drivers/configured_provider/driver.ts auth-walk --self-check
+//   bun tests/tla/drivers/configured_provider/driver.ts auth --self-check
 //
 // Exit codes: 0 everything accepted (and every self-check rejected), 1 a run
 // the model cannot produce, 2 a toolchain, build, or harness failure.
@@ -58,9 +71,9 @@ function option(name: string, fallback: number): number {
   return value;
 }
 
-const parts = ["request", "catalog", "resume", "deadlines"].filter((part) => process.argv.includes(part));
+const parts = ["request", "catalog", "resume", "deadlines", "auth-walk", "auth"].filter((part) => process.argv.includes(part));
 const options = {
-  parts: parts.length > 0 ? parts : ["request", "catalog", "resume", "deadlines"],
+  parts: parts.length > 0 ? parts : ["request", "catalog", "resume", "deadlines", "auth-walk", "auth"],
   selfCheck: process.argv.includes("--self-check"),
   random: option("--random", 60),
   seed: option("--seed", 1),
@@ -697,12 +710,13 @@ type LabState = { phase: string; clock: number; quiet: number; cause: string; wa
 
 const BOUNDS = { Connect: 1, Head: 2, Stall: 2, MaxClock: 4 };
 const deadlinesModule = join(REPO_ROOT, "src", "gateway", "request_deadlines.zig");
+const deadlinesLab = join(TLA_ROOT, "drivers", "configured_provider", "lab.zig");
 
-function buildLab(moduleSource: string, out: string, name: string): string | null {
+function buildLab(labFile: string, depName: string, moduleSource: string, out: string, name: string): string | null {
   const bin = join(out, name);
   const build = Bun.spawnSync(
-    ["zig", "build-exe", "-O", "ReleaseSafe", "--dep", "request_deadlines",
-      `-Mroot=${join(TLA_ROOT, "drivers", "configured_provider", "lab.zig")}`, `-Mrequest_deadlines=${moduleSource}`,
+    ["zig", "build-exe", "-O", "ReleaseSafe", "--dep", depName,
+      `-Mroot=${labFile}`, `-M${depName}=${moduleSource}`,
       "--name", name, `-femit-bin=${bin}`],
     { cwd: REPO_ROOT, stdout: "pipe", stderr: "pipe" },
   );
@@ -723,11 +737,19 @@ async function loadGraph(out: string): Promise<Graph | null> {
     console.log(`TLC failed on ConfiguredDeadlines.tla (exit ${run.exitCode}); see ${join(dir, "tlc.log")}`);
     return null;
   }
+  const graph = parseDotGraph(join(dir, "graph.dot"));
+  if (!graph) return null;
+  console.log(`deadlines: graph of ${graph.states.size} states, ${run.durationMs} ms`);
+  return graph;
+}
+
+// Reads a graph TLC dumped with `-dump dot,actionlabels`: its states and edges.
+function parseDotGraph(path: string): Graph | null {
   const states = new Map<string, Model>();
   const next = new Map<string, Edge[]>();
   let init = "";
   const unescape = (label: string) => label.replace(/\\(.)/g, (_, char) => (char === "n" ? "\n" : char));
-  for (const line of readFileSync(join(dir, "graph.dot"), "utf8").split("\n")) {
+  for (const line of readFileSync(path, "utf8").split("\n")) {
     const edge = /^(-?\d+) -> (-?\d+) \[label="(\w+)"/.exec(line);
     if (edge) {
       if (!next.has(edge[1]!)) next.set(edge[1]!, []);
@@ -745,7 +767,6 @@ async function loadGraph(out: string): Promise<Graph | null> {
     if (/style\s*=\s*filled/.test(node[3]!)) init = node[1]!;
   }
   if (!init) return null;
-  console.log(`deadlines: graph of ${states.size} states, ${run.durationMs} ms`);
   return { states, next, init };
 }
 
@@ -837,7 +858,7 @@ async function deadlinesPart(out: string): Promise<number> {
     console.log(`REJECTED: deadlines: ${deadlinesModule} does not exist, so fx has no per-connection bounds to walk`);
     return 1;
   }
-  const lab = buildLab(deadlinesModule, out, "configured_deadlines_lab");
+  const lab = buildLab(deadlinesLab, "request_deadlines", deadlinesModule, out, "configured_deadlines_lab");
   const graph = await loadGraph(out);
   if (!lab || !graph) return 2;
   const walks = walksOf(graph);
@@ -873,7 +894,7 @@ async function deadlinesPart(out: string): Promise<number> {
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, "request_deadlines.zig"), source.replace(mutant.target, mutant.planted));
       const name = `configured_deadlines_lab_mutant_${index}`;
-      const bin = buildLab(join(dir, "request_deadlines.zig"), out, name);
+      const bin = buildLab(deadlinesLab, "request_deadlines", join(dir, "request_deadlines.zig"), out, name);
       const mutated = bin ? runLab(bin, walks, out, name) : null;
       const rejected = mutated !== null && mismatchesOf(walks, graph, mutated, false).length > 0;
       console.log(`self-check: deadlines that ${mutant.name} ${rejected ? "rejected" : "NOT rejected"}`);
@@ -886,13 +907,586 @@ async function deadlinesPart(out: string): Promise<number> {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// auth-walk: the pure command-auth planner, checked against ConfiguredAuth.tla.
+
+type Token = { conn: string; gen: number };
+type AuthOp = { op: string; r?: string; c?: string };
+type AuthRequestView = { phase: string; reason: string; gen: number; refreshes: number };
+type AuthConnView = { cache: number; cache_expired: boolean; runs: number; waiters: number; issued: number; valid_from: number };
+type AuthView = { requests: Record<string, AuthRequestView>; conns: Record<string, AuthConnView> };
+type AuthResult = AuthView & { error: string | null };
+type AuthRun = { results: AuthResult[] } | { failure: string };
+type AuthCase = { requests: string[]; label: string; graph: Graph; walks: Hop[][]; results: AuthResult[] };
+type Mutant = { name: string; target: string; planted: string };
+
+const AUTH_CONNS = ["c1", "c2"];
+const AUTH_MAX_GEN = 2;
+const AUTH_CASES = [
+  { requests: ["r1", "r2"], label: "same-connection" },
+  { requests: ["r1", "r3"], label: "two-connections" },
+];
+// Each model action, by its label, and the lab op that replays it. A helper
+// that fails and a helper that times out end a run the same way.
+const AUTH_ACTION_OPS: Record<string, string> = {
+  Begin: "need", Replay: "replay", HelperPrints: "printed", HelperFails: "run_ended", Deadline: "run_ended",
+  Accept: "accept", Reject: "reject", Revoke: "revoke", Expire: "expire", Cancel: "cancel",
+};
+const REJECT_PHASES = ["replay", "failed"];
+const authModule = join(REPO_ROOT, "src", "core", "auth", "command_token.zig");
+const authLab = join(TLA_ROOT, "drivers", "configured_provider", "lab_auth.zig");
+const AUTH_MUTANTS: Mutant[] = [
+  { name: "starts a second helper run while one runs", target: "if (state.running) return .wait;", planted: "if (false) return .wait;" },
+  { name: "sends a token it knows has expired", target: "if (state.cached != 0 and !state.cached_expired) return .{ .send = state.cached };", planted: "if (state.cached != 0) return .{ .send = state.cached };" },
+  { name: "refused keeps the refused token", target: "if (sent != 0 and state.cached == sent) {", planted: "if (sent != 0 and state.cached == sent and false) {" },
+  { name: "keeps a helper nobody waits on", target: "if (state.waiters == 0 and state.running) {", planted: "if (false) {" },
+];
+
+const connOf = (r: string): string => (r === "r3" ? "c2" : "c1");
+const requestState = (t: Model, r: string): string => JSON.stringify([t.phase[r], t.refreshes[r], t.used[r], t.reason[r]]);
+
+async function loadAuthGraph(out: string, requests: string[], label: string): Promise<Graph | null> {
+  const dir = join(out, `auth-graph-${label}`);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "Driver.cfg"), ["INIT Init", "NEXT Next", "CONSTANTS", `    Requests = ${set(requests)}`,
+    `    MaxGen = ${AUTH_MAX_GEN}`, "    Design = \"b\"", "    Bug = \"none\"", "    Nonideal = TRUE", "CHECK_DEADLOCK FALSE", ""].join("\n"));
+  const run = await runTlc(dir, "ConfiguredAuth", "Driver.cfg", ["ConfiguredAuth.tla"], tlaDir, ["-dump", "dot,actionlabels", "graph"]);
+  if (run.exitCode !== 0) {
+    console.log(`TLC failed on ConfiguredAuth.tla (exit ${run.exitCode}); see ${join(dir, "tlc.log")}`);
+    return null;
+  }
+  const graph = parseDotGraph(join(dir, "graph.dot"));
+  if (!graph) {
+    console.log(`auth-walk ${label}: the graph has no initial state`);
+    return null;
+  }
+  console.log(`auth-walk ${label}: graph of ${graph.states.size} states, ${run.durationMs} ms`);
+  return graph;
+}
+
+// The lab ops for the request rows that changed from `from` to `to`.
+function requestSteps(from: Model, to: Model, requests: string[]): AuthOp[] {
+  const steps: AuthOp[] = [];
+  for (const r of requests) {
+    if (from.phase[r] === "idle" && to.phase[r] !== "idle") steps.push({ op: "need", r });
+    if (from.phase[r] === "replay" && (to.phase[r] === "sending" || to.phase[r] === "waiting")) steps.push({ op: "replay", r });
+    if (from.phase[r] === "sending" && to.phase[r] === "done") steps.push({ op: "accept", r });
+    if (from.phase[r] === "sending" && REJECT_PHASES.includes(to.phase[r]) && requestState(from, r) !== requestState(to, r)) {
+      steps.push({ op: "reject", r });
+    }
+    if (to.phase[r] === "cancelled" && from.phase[r] !== "cancelled") steps.push({ op: "cancel", r });
+  }
+  return steps;
+}
+
+// A waiter on connection c that failed in this step: only a run ending does that.
+function failedWaiterOn(from: Model, to: Model, requests: string[], c: string): boolean {
+  return requests.some((r) => from.phase[r] === "waiting" && to.phase[r] === "failed" && connOf(r) === c);
+}
+
+// The lab ops for the connection rows that changed. HelperPrints and Cancel
+// also lower a run count, so a run ends only when no token was printed and a
+// waiter failed.
+function connSteps(from: Model, to: Model, requests: string[]): AuthOp[] {
+  const steps: AuthOp[] = [];
+  const fresh: Token[] = to.expired.filter((token: Token) =>
+    !from.expired.some((old: Token) => JSON.stringify(old) === JSON.stringify(token)));
+  for (const c of AUTH_CONNS) {
+    if (to.issued[c] > from.issued[c]) steps.push({ op: "printed", c });
+    if (to.runs[c] < from.runs[c] && to.issued[c] === from.issued[c] && failedWaiterOn(from, to, requests, c)) {
+      steps.push({ op: "run_ended", c });
+    }
+    if (to.valid_from[c] !== from.valid_from[c]) steps.push({ op: "revoke", c });
+    if (fresh.some((token) => token.conn === c)) steps.push({ op: "expire", c });
+  }
+  return steps;
+}
+
+// The one lab op that takes `from` to `to`, when the states differ by exactly
+// one step and that step is the one the label names. Otherwise null.
+function authOp(from: Model, to: Model, label: string, requests: string[]): AuthOp | null {
+  const found = [...requestSteps(from, to, requests), ...connSteps(from, to, requests)];
+  if (found.length !== 1 || found[0]!.op !== AUTH_ACTION_OPS[label]) return null;
+  return found[0]!;
+}
+
+// What the model says the planner must show after reaching state `t`.
+function authExpected(t: Model, requests: string[]): AuthView {
+  const requestViews: Record<string, AuthRequestView> = {};
+  for (const r of requests) {
+    requestViews[r] = { phase: t.phase[r], reason: t.reason[r], gen: t.used[r].gen, refreshes: t.refreshes[r] };
+  }
+  const connViews: Record<string, AuthConnView> = {};
+  for (const c of AUTH_CONNS) {
+    const cache: Token = t.cache[c];
+    connViews[c] = {
+      cache: cache.gen,
+      cache_expired: cache.gen > 0 && t.expired.some((token: Token) => token.conn === cache.conn && token.gen === cache.gen),
+      runs: t.runs[c],
+      waiters: requests.filter((r) => t.phase[r] === "waiting" && connOf(r) === c).length,
+      issued: t.issued[c],
+      valid_from: t.valid_from[c],
+    };
+  }
+  return { requests: requestViews, conns: connViews };
+}
+
+function runAuthLab(bin: string, walks: Hop[][], graph: Graph, requests: string[], out: string, name: string): AuthRun {
+  const lines: string[] = [];
+  for (const [w, walk] of walks.entries()) {
+    lines.push(JSON.stringify({ op: "walk" }));
+    for (const [i, hop] of walk.entries()) {
+      const op = authOp(graph.states.get(hop.from)!, graph.states.get(hop.to)!, hop.label, requests);
+      if (!op) return { failure: `auth-walk: walk ${w} step ${i} (${hop.label}) has no lab op for the model's step` };
+      lines.push(JSON.stringify(op));
+    }
+  }
+  const opsPath = join(out, `${name}.ops.jsonl`);
+  const resultsPath = join(out, `${name}.results.jsonl`);
+  writeFileSync(opsPath, `${lines.join("\n")}\n`);
+  const run = Bun.spawnSync([bin, opsPath, resultsPath], { stdout: "pipe", stderr: "pipe" });
+  if (run.exitCode !== 0) {
+    return { failure: `${name} exited ${run.exitCode}:\n${new TextDecoder().decode(run.stderr).slice(0, 2000)}` };
+  }
+  const results = readFileSync(resultsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as AuthResult);
+  if (results.length !== lines.length) return { failure: `${name} wrote ${results.length} results for ${lines.length} ops` };
+  return { results };
+}
+
+// Every field the model states, paired with the value the module reported.
+function authPairs(expected: AuthView, real: AuthResult): Array<[string, unknown, unknown]> {
+  const pairs: Array<[string, unknown, unknown]> = [];
+  for (const [r, view] of Object.entries(expected.requests)) {
+    for (const [field, model] of Object.entries(view)) {
+      pairs.push([`requests.${r}.${field}`, model, (real.requests[r] as Record<string, unknown>)[field]]);
+    }
+  }
+  for (const [c, view] of Object.entries(expected.conns)) {
+    for (const [field, model] of Object.entries(view)) {
+      pairs.push([`conns.${c}.${field}`, model, (real.conns[c] as Record<string, unknown>)[field]]);
+    }
+  }
+  pairs.push(["error", null, real.error]);
+  return pairs;
+}
+
+function firstAuthMismatch(t: Model, real: AuthResult, requests: string[], tamper: boolean): string | null {
+  const expected = authExpected(t, requests);
+  if (tamper) expected.conns.c1!.runs = expected.conns.c1!.runs === 0 ? 1 : 0;
+  for (const [field, model, got] of authPairs(expected, real)) {
+    if (model !== got) return `${field}: model ${JSON.stringify(model)}, module ${JSON.stringify(got)}`;
+  }
+  return null;
+}
+
+// The first mismatch of each walk. The reset result of each walk is skipped.
+function authMismatches(walks: Hop[][], graph: Graph, results: AuthResult[], requests: string[], tamper: boolean): string[] {
+  const found: string[] = [];
+  let r = 0;
+  walks.forEach((walk, w) => {
+    r += 1;
+    let reported = false;
+    walk.forEach((hop, i) => {
+      const real = results[r++]!;
+      if (reported) return;
+      const mismatch = firstAuthMismatch(graph.states.get(hop.to)!, real, requests, tamper);
+      if (!mismatch) return;
+      reported = true;
+      found.push(`walk ${w} step ${i} (${walk.slice(0, i + 1).map((x) => x.label).join(" > ")}): ${mismatch}`);
+    });
+  });
+  return found;
+}
+
+function authMutantRejected(out: string, source: string, mutant: Mutant, index: number, first: AuthCase): boolean {
+  const dir = join(out, `auth-mutant-${index}`);
+  mkdirSync(dir, { recursive: true });
+  const copy = join(dir, "command_token.zig");
+  writeFileSync(copy, source.replace(mutant.target, mutant.planted));
+  const name = `configured_auth_lab_mutant_${index}`;
+  const bin = buildLab(authLab, "command_token", copy, out, name);
+  if (!bin) return false;
+  const run = runAuthLab(bin, first.walks, first.graph, first.requests, out, name);
+  if ("failure" in run) {
+    console.log(run.failure);
+    return false;
+  }
+  return authMismatches(first.walks, first.graph, run.results, first.requests, false).length > 0;
+}
+
+function authSelfCheck(out: string, first: AuthCase): number {
+  const tampered = authMismatches(first.walks, first.graph, first.results, first.requests, true).length > 0;
+  console.log(`self-check: auth-walk, tampered expectation ${tampered ? "rejected" : "NOT rejected"}`);
+  const source = readFileSync(authModule, "utf8");
+  let caught = tampered;
+  for (const [index, mutant] of AUTH_MUTANTS.entries()) {
+    if (!source.includes(mutant.target)) {
+      console.log(`self-check: the target for "${mutant.name}" is gone from command_token.zig`);
+      caught = false;
+      continue;
+    }
+    const rejected = authMutantRejected(out, source, mutant, index, first);
+    console.log(`self-check: auth-walk that ${mutant.name} ${rejected ? "rejected" : "NOT rejected"}`);
+    caught &&= rejected;
+  }
+  return caught ? 0 : 1;
+}
+
+async function authWalkPart(out: string): Promise<number> {
+  if (!existsSync(authModule)) {
+    console.log(`REJECTED: auth-walk: ${authModule} does not exist`);
+    return 1;
+  }
+  const lab = buildLab(authLab, "command_token", authModule, out, "configured_auth_lab");
+  if (!lab) return 2;
+  const cases: AuthCase[] = [];
+  let mismatching = false;
+  for (const { requests, label } of AUTH_CASES) {
+    const graph = await loadAuthGraph(out, requests, label);
+    if (!graph) return 2;
+    const walks = walksOf(graph);
+    const run = runAuthLab(lab, walks, graph, requests, out, `configured_auth_lab-${label}`);
+    if ("failure" in run) {
+      console.log(run.failure);
+      return 2;
+    }
+    const mismatches = authMismatches(walks, graph, run.results, requests, false);
+    const steps = walks.reduce((sum, walk) => sum + walk.length, 0);
+    console.log(`auth-walk ${label}: ${walks.length} walks, ${steps} steps, ${mismatches.length} mismatching walks`);
+    for (const line of mismatches.slice(0, 3)) console.log(`  ${line}`);
+    mismatching ||= mismatches.length > 0;
+    cases.push({ requests, label, graph, walks, results: run.results });
+  }
+  const walked = new Set(cases.flatMap((c) => c.walks.flat().map((hop) => hop.label)));
+  for (const label of Object.keys(AUTH_ACTION_OPS)) {
+    if (!walked.has(label)) {
+      console.log(`auth-walk: action ${label} was never walked`);
+      return 1;
+    }
+  }
+  if (mismatching) return 1;
+  if (options.selfCheck) return authSelfCheck(out, cases[0]!);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// auth: end-to-end runs of `fx ask` with a command-auth helper, checked
+// against ConfiguredAuth.tla through ConfiguredAuthTrace.tla.
+
+type AuthHelperStep =
+  | { kind: "token"; expires_at_offset_s?: number }
+  | { kind: "fail"; exit_code?: number; stderr?: string }
+  | { kind: "garbage" }
+  | { kind: "hang"; delay_ms: number };
+
+type AuthScenario = {
+  id: string;
+  valid_from: number;
+  steps: AuthHelperStep[];
+  near_expiry?: boolean;
+  timeout_ms?: number;
+  expect_exit: number;
+  expect_error?: string;
+  expect_auth_http_status?: number;
+  expect_helper_runs?: number;
+  expect_model_requests?: number;
+};
+
+type AuthLogEvent =
+  | { kind: "helper_start"; run: number }
+  | { kind: "helper_printed"; run: number; gen: number }
+  | { kind: "helper_failed"; run: number }
+  | { kind: "model_request"; r: "r1" | "r2"; gen: number; accepted: boolean };
+
+type AuthObs = { act: string; r: string; c: string; gen: number; reason: string };
+
+type AuthRunResult = {
+  scenario: AuthScenario;
+  log: AuthLogEvent[];
+  observations: AuthObs[];
+  exit: number;
+  error: string | null;
+  authHttpStatus: number | null;
+  tail: string;
+  verdict: Verdict;
+  tlcDir: string;
+};
+
+const AUTH_SCENARIOS: AuthScenario[] = [
+  { id: "fresh", valid_from: 1, steps: [{ kind: "token" }], expect_exit: 0, expect_helper_runs: 1, expect_model_requests: 2 },
+  { id: "revoked", valid_from: 2, steps: [{ kind: "token" }, { kind: "token" }], expect_exit: 0, expect_helper_runs: 2, expect_model_requests: 3 },
+  { id: "refused_twice", valid_from: 3, steps: [{ kind: "token" }, { kind: "token" }], expect_exit: 1, expect_auth_http_status: 401, expect_helper_runs: 2, expect_model_requests: 2 },
+  { id: "helper_exits_nonzero", valid_from: 1, steps: [{ kind: "fail", exit_code: 3, stderr: "no session" }], expect_exit: 1, expect_error: "ConfiguredCommandAuthFailed", expect_helper_runs: 1, expect_model_requests: 0 },
+  { id: "helper_garbage", valid_from: 1, steps: [{ kind: "garbage" }], expect_exit: 1, expect_error: "ConfiguredCommandAuthFailed", expect_helper_runs: 1, expect_model_requests: 0 },
+  { id: "near_expiry", valid_from: 1, steps: [{ kind: "token", expires_at_offset_s: 10 }, { kind: "token" }], near_expiry: true, expect_exit: 0, expect_helper_runs: 2, expect_model_requests: 2 },
+  { id: "helper_hangs", valid_from: 1, steps: [{ kind: "hang", delay_ms: 60_000 }], timeout_ms: 45_000, expect_exit: 1, expect_error: "ConfiguredCommandAuthFailed", expect_helper_runs: 1, expect_model_requests: 0 },
+];
+
+function obsValue(obs: AuthObs): string {
+  return `[act |-> ${str(obs.act)}, r |-> ${str(obs.r)}, c |-> ${str(obs.c)}, gen |-> ${obs.gen}, reason |-> ${str(obs.reason)}]`;
+}
+
+function authTraceConstants(bug: string): string[] {
+  return ['Requests = {"r1", "r2"}', "MaxGen = 3", 'Design = "b"', `Bug = ${str(bug)}`, "Nonideal = TRUE"];
+}
+
+function buildAuthObservations(
+  scenario: AuthScenario,
+  log: AuthLogEvent[],
+  fxResult: { exit: number; error: string | null; authHttpStatus: number | null },
+): AuthObs[] {
+  const obs: AuthObs[] = [];
+  const phase: Record<"r1" | "r2", "idle" | "waiting" | "sending" | "replay" | "done" | "failed"> = { r1: "idle", r2: "idle" };
+  const refreshes: Record<"r1" | "r2", number> = { r1: 0, r2: 0 };
+  let pendingHelper = false;
+  let hasCache = false;
+  let cacheExpired = false;
+  let lastRequest: "r1" | "r2" = "r1";
+
+  const nextRequest = (): "r1" | "r2" => (phase.r1 === "idle" || phase.r1 === "replay" ? "r1" : "r2");
+
+  for (const event of log) {
+    if (event.kind === "helper_start") {
+      const r = nextRequest();
+      if (phase[r] === "idle") {
+        if (scenario.near_expiry && hasCache && !cacheExpired && r === "r2") {
+          obs.push({ act: "Expire", r: "-", c: "c1", gen: 0, reason: "-" });
+          cacheExpired = true;
+        }
+        obs.push({ act: "Begin", r, c: "-", gen: 0, reason: "-" });
+      } else {
+        obs.push({ act: "Replay", r, c: "-", gen: 0, reason: "-" });
+      }
+      phase[r] = "waiting";
+      pendingHelper = true;
+      lastRequest = r;
+    } else if (event.kind === "helper_printed") {
+      obs.push({ act: "HelperPrints", r: "-", c: "c1", gen: 0, reason: "-" });
+      pendingHelper = false;
+      hasCache = true;
+      cacheExpired = false;
+      for (const rk of ["r1", "r2"] as const) {
+        if (phase[rk] === "waiting") phase[rk] = "sending";
+      }
+      if (event.gen < scenario.valid_from) {
+        obs.push({ act: "Revoke", r: "-", c: "c1", gen: 0, reason: "-" });
+      }
+    } else if (event.kind === "helper_failed") {
+      obs.push({ act: "HelperFails", r: "-", c: "c1", gen: 0, reason: "-" });
+      pendingHelper = false;
+      for (const rk of ["r1", "r2"] as const) {
+        if (phase[rk] === "waiting") phase[rk] = "failed";
+      }
+    } else if (event.kind === "model_request") {
+      const r = event.r;
+      lastRequest = r;
+      if (phase[r] === "idle") {
+        obs.push({ act: "Begin", r, c: "-", gen: 0, reason: "-" });
+        phase[r] = "sending";
+      } else if (phase[r] === "replay") {
+        obs.push({ act: "Replay", r, c: "-", gen: 0, reason: "-" });
+        phase[r] = "sending";
+      }
+      obs.push({ act: "Sent", r, c: "-", gen: event.gen, reason: "-" });
+      if (event.accepted) {
+        obs.push({ act: "Accept", r, c: "-", gen: 0, reason: "-" });
+        phase[r] = "done";
+        obs.push({ act: "Ended", r, c: "-", gen: 0, reason: "none" });
+      } else {
+        obs.push({ act: "Reject", r, c: "-", gen: 0, reason: "-" });
+        hasCache = false;
+        if (refreshes[r] === 0) {
+          refreshes[r] = 1;
+          phase[r] = "replay";
+        } else {
+          phase[r] = "failed";
+        }
+      }
+    }
+  }
+
+  if (pendingHelper && fxResult.error === "ConfiguredCommandAuthFailed") {
+    obs.push({ act: "Deadline", r: "-", c: "c1", gen: 0, reason: "-" });
+    pendingHelper = false;
+    phase[lastRequest] = "failed";
+  }
+
+  if (phase[lastRequest] !== "done") {
+    const reason = fxResult.error === "ConfiguredCommandAuthFailed" ? "helper"
+      : fxResult.authHttpStatus === 401 ? "rejected"
+      : "unknown";
+    obs.push({ act: "Ended", r: lastRequest, c: "-", gen: 0, reason });
+  }
+  return obs;
+}
+
+async function runAuth(fixtures: any, scenario: AuthScenario, out: string): Promise<AuthRunResult> {
+  const fakeHelperPath = join(REPO_ROOT, "tests/tla/drivers/configured_provider/fake-helper.ts");
+  const log: AuthLogEvent[] = [];
+  let activeRequest: "r1" | "r2" = "r1";
+  let unexpectedAuth = false;
+
+  const f = fixtures.createConfiguredProviderFixture(
+    (body: any) => {
+      const req = f.requests.at(-1)!;
+      const match = /^Bearer tok-(\d+)$/.exec(req.authorization ?? "");
+      if (!match) {
+        unexpectedAuth = true;
+        return new Response("missing or unexpected bearer token", { status: 401 });
+      }
+      const gen = Number(match[1]);
+      const r = activeRequest;
+      const accepted = gen >= scenario.valid_from;
+      log.push({ kind: "model_request", r, gen, accepted });
+      if (!accepted) {
+        return Response.json({ error: { message: "unauthorized" } }, { status: 401 });
+      }
+      if (r === "r1") {
+        activeRequest = "r2";
+        return fixtures.toolCompletion(body.model, "read_file", { path: "note.txt" }, "call-1");
+      }
+      return fixtures.completion(body.model, "DONE");
+    },
+    {
+      "/helper": (body: any) => {
+        if (body.event === "start") log.push({ kind: "helper_start", run: body.run });
+        else if (body.event === "printed") log.push({ kind: "helper_printed", run: body.run, gen: body.gen });
+        else if (body.event === "failed") log.push({ kind: "helper_failed", run: body.run });
+        return Response.json({ ok: true });
+      },
+    },
+  );
+
+  const runDir = mkdtempSync(join(out, `auth-run-${scenario.id}-`));
+  try {
+    writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+    const baseUrl = f.settings.providers.local.base_url as string;
+    const helperUrl = `${new URL(baseUrl).origin}/helper`;
+    writeFileSync(join(runDir, "scenario.json"), JSON.stringify({ server_url: helperUrl, steps: scenario.steps }));
+
+    f.settings.providers.local = {
+      protocol: "openai-chat-completions",
+      base_url: baseUrl,
+      auth: { type: "command", command: [process.execPath, fakeHelperPath, runDir] },
+      model_metadata: { "local-model": { context_window: 262144, max_output_tokens: 8192, supports_tool_use: true } },
+    };
+    f.save();
+
+    const child = Bun.spawn([binary, "ask", "--json", "--no-save", "Read note.txt"], {
+      cwd: f.workspace,
+      env: testEnvironment({ HOME: f.home, FX_SOUND: "0", NO_COLOR: "1" }),
+      stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    });
+    const timer = setTimeout(() => child.kill(9), scenario.timeout_ms ?? 30_000);
+    const [stdout, stderr, exit] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    clearTimeout(timer);
+
+    let error: string | null = null;
+    let authHttpStatus: number | null = null;
+    try {
+      const parsed = JSON.parse(stdout.trim());
+      error = parsed.error ?? null;
+      authHttpStatus = parsed.auth_failure?.http_status ?? null;
+    } catch {
+      error = "unreadable_output";
+    }
+
+    const observations = buildAuthObservations(scenario, log, { exit, error, authHttpStatus });
+    writeJson(join(out, `auth-${scenario.id}.json`), {
+      scenario: scenario.id,
+      raw_log: log,
+      observations,
+      fx: { exit, error, auth_http_status: authHttpStatus, tail: `${stdout}\n${stderr}`.slice(-300) },
+    });
+
+    const helperStarts = log.filter((e) => e.kind === "helper_start").length;
+    const modelRequests = log.filter((e) => e.kind === "model_request").length;
+    const expectedOk =
+      !unexpectedAuth &&
+      exit === scenario.expect_exit &&
+      (scenario.expect_error === undefined || error === scenario.expect_error) &&
+      (scenario.expect_auth_http_status === undefined || authHttpStatus === scenario.expect_auth_http_status) &&
+      (scenario.expect_helper_runs === undefined || helperStarts === scenario.expect_helper_runs) &&
+      (scenario.expect_model_requests === undefined || modelRequests === scenario.expect_model_requests);
+
+    const trace = await runTrace("ConfiguredAuth", observations.map(obsValue).join(", "), authTraceConstants("none"), out, `auth-${scenario.id}`);
+    return {
+      scenario,
+      log,
+      observations,
+      exit,
+      error,
+      authHttpStatus,
+      tail: `${stdout}\n${stderr}`.slice(-300),
+      verdict: expectedOk ? trace.verdict : "REJECTED",
+      tlcDir: trace.dir,
+    };
+  } finally {
+    f.close();
+  }
+}
+
+async function authTraceSelfCheck(out: string, runs: AuthRunResult[]): Promise<number> {
+  for (const run of runs) {
+    const today = await runTrace("ConfiguredAuth", run.observations.map(obsValue).join(", "), authTraceConstants("today"), out, `auth-today-${run.scenario.id}`);
+    console.log(`self-check, auth ${run.scenario.id} against Bug = "today": ${today.verdict} (must be REJECTED)`);
+    if (today.verdict !== "REJECTED") return today.verdict === "TOOL_ERROR" ? 2 : 1;
+  }
+
+  const revoked = runs.find((r) => r.scenario.id === "revoked")!;
+  const replayAt = revoked.observations.findIndex((o) => o.act === "Replay");
+  const tamperedResend: AuthObs[] = [
+    ...revoked.observations.slice(0, replayAt + 1),
+    { act: "Sent", r: "r1", c: "-", gen: 1, reason: "-" },
+  ];
+  const resendVerdict = await runTrace("ConfiguredAuth", tamperedResend.map(obsValue).join(", "), authTraceConstants("none"), out, "auth-tamper-resend");
+  console.log(`self-check, auth replay sends refused generation again: ${resendVerdict.verdict} (must be REJECTED)`);
+  if (resendVerdict.verdict !== "REJECTED") return resendVerdict.verdict === "TOOL_ERROR" ? 2 : 1;
+
+  const tamperedSecondRun: AuthObs[] = [
+    { act: "Begin", r: "r1", c: "-", gen: 0, reason: "-" },
+    { act: "Begin", r: "r2", c: "-", gen: 0, reason: "-" },
+    { act: "HelperPrints", r: "-", c: "c1", gen: 0, reason: "-" },
+    { act: "HelperPrints", r: "-", c: "c1", gen: 0, reason: "-" },
+  ];
+  const secondRunVerdict = await runTrace("ConfiguredAuth", tamperedSecondRun.map(obsValue).join(", "), authTraceConstants("none"), out, "auth-tamper-second-run");
+  console.log(`self-check, auth helper runs a second time while one runs: ${secondRunVerdict.verdict} (must be REJECTED)`);
+  if (secondRunVerdict.verdict !== "REJECTED") return secondRunVerdict.verdict === "TOOL_ERROR" ? 2 : 1;
+  return 0;
+}
+
+async function authPart(out: string): Promise<number> {
+  const fixtures = await targetModule("fixtures/chat-completions.ts");
+  const fast = AUTH_SCENARIOS.filter((s) => s.id !== "helper_hangs");
+  const slow = AUTH_SCENARIOS.filter((s) => s.id === "helper_hangs");
+  const runs = [
+    ...(await pool(fast.length, Math.min(options.jobs, fast.length), (i) => runAuth(fixtures, fast[i]!, out))),
+    ...(await pool(slow.length, 1, (i) => runAuth(fixtures, slow[i]!, out))),
+  ];
+  for (const run of runs) {
+    console.log(`auth ${run.scenario.id}: ${run.verdict} (TLC work ${run.tlcDir})`);
+    if (run.verdict === "TOOL_ERROR") return 2;
+    if (run.verdict === "REJECTED") {
+      const mismatch = await firstMismatch(run.observations, async (prefix) =>
+        (await runTrace("ConfiguredAuth", prefix.map(obsValue).join(", "), authTraceConstants("none"), out, `auth-mismatch-${run.scenario.id}`)).verdict);
+      console.log(`first observation the model cannot produce (${run.scenario.id}): ${JSON.stringify(mismatch)}`);
+      console.log(`evidence (${run.scenario.id}): exit=${run.exit} error=${run.error} auth_http_status=${run.authHttpStatus} log=${JSON.stringify(run.log)} tail=${JSON.stringify(run.tail)}`);
+      return 1;
+    }
+  }
+  if (options.selfCheck) return authTraceSelfCheck(out, runs);
+  return 0;
+}
+
 async function main(): Promise<number> {
-  if (!existsSync(binary)) {
+  if (options.parts.some((part) => ["request", "catalog", "resume", "auth"].includes(part)) && !existsSync(binary)) {
     console.log(`TOOL_ERROR: missing ${binary}; run zig build first`);
     return 2;
   }
   const out = outDir("configured_provider");
-  const run: Record<string, (out: string) => Promise<number>> = { request: requestPart, catalog: catalogPart, resume: resumePart, deadlines: deadlinesPart };
+  const run: Record<string, (out: string) => Promise<number>> = {
+    request: requestPart, catalog: catalogPart, resume: resumePart, deadlines: deadlinesPart, "auth-walk": authWalkPart, auth: authPart,
+  };
   let worst = 0;
   for (const part of options.parts) worst = Math.max(worst, await run[part]!(out));
   console.log(`${worst === 0 ? "ACCEPTED" : worst === 1 ? "REJECTED" : "TOOL_ERROR"}; output in ${out}`);

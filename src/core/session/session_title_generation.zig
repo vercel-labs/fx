@@ -181,8 +181,14 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
 
     var sent = try send(alloc, request, token.bytes, deadline);
     defer sent.deinit(alloc);
-    if (request.shared_sign_in) |sign_in| {
-        if (rejectedAsStale(sent, sign_in)) {
+    if (rejectedAsStale(sent, request.shared_sign_in)) {
+        if (renewsOnReplay(sent)) {
+            debug_trace.logf("session", "event=title_generation replay=command_auth", .{});
+            sent.deinit(alloc);
+            // Keeps the deferred deinit safe if the next send fails.
+            sent = .{ .unavailable = .{ .reason = .cancelled } };
+            sent = try send(alloc, request, token.bytes, deadline);
+        } else if (request.shared_sign_in) |sign_in| {
             if (try auth_runtime.storedReplacement(alloc, sign_in, token.bytes)) |replacement| {
                 token.adopt(alloc, replacement);
                 debug_trace.logf("session", "event=title_generation replay=stored_credential", .{});
@@ -229,21 +235,31 @@ const Sent = union(enum) {
     }
 };
 
-/// Whether the gateway rejected the request with 401, which a token another
-/// fx process already replaced can explain (tests/tla/session_title/
-/// SessionTitle.tla TitleGivesUpOnlyWhenUnrecoverable). The title has no tools
-/// and shows nothing while it streams, so sending it again is always safe.
-fn rejectedAsStale(sent: Sent, sign_in: auth_runtime.SharedSignIn) bool {
-    const failure = switch (sent) {
+fn sentFailure(sent: Sent) ?stream_provider.Failure {
+    return switch (sent) {
         .result => |result| switch (result) {
             .failed => |failed| failed,
-            .completed => return false,
+            .completed => null,
         },
-        .unavailable => return false,
+        .unavailable => null,
     };
+}
+
+fn renewsOnReplay(sent: Sent) bool {
+    const failure = sentFailure(sent) orelse return false;
+    return failure.renews_credential_on_replay;
+}
+
+/// Whether the gateway rejected the request with 401, which a token another
+/// fx process already replaced (or a connection whose helper refreshes on the
+/// next send) can explain (`tests/tla/session_title/SessionTitle.tla`
+/// TitleGivesUpOnlyWhenUnrecoverable). The title has no tools and shows
+/// nothing while it streams, so sending it again is always safe.
+fn rejectedAsStale(sent: Sent, sign_in: ?auth_runtime.SharedSignIn) bool {
+    const failure = sentFailure(sent) orelse return false;
     return auth_transition.decideAuthReplay(.{
         .authentication_rejected = failure.kind == .unauthorized,
-        .refreshable = credentials.sourceRefreshable(sign_in.source),
+        .refreshable = failure.renews_credential_on_replay or if (sign_in) |shared| credentials.sourceRefreshable(shared.source) else false,
         .delivery_safe = true,
         .already_replayed = false,
     }) == .refresh_and_replay;
@@ -881,6 +897,60 @@ test "run sends the stored token of a shared sign-in, and replays a 401 only wit
     var other_team: SharedLoginGateway = .{ .home = &home, .accepted = "launch-token" };
     try expectTitle(try run(alloc, other_team.titleRequest(&cancelled, "team-a")));
     try std.testing.expectEqual(@as(usize, 1), other_team.sends);
+}
+
+test "run replays a marked 401 once without a shared sign-in" {
+    const alloc = std.testing.allocator;
+    const MarkedProvider = struct {
+        sends: usize = 0,
+        reject_all: bool = false,
+
+        fn stream(raw: ?*anyopaque, a: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            self.sends += 1;
+            if (self.reject_all or self.sends == 1) {
+                return .{ .failed = .{
+                    .kind = .unauthorized,
+                    .http_status = .unauthorized,
+                    .detail = try a.dupe(u8, "unauthorized"),
+                    .renews_credential_on_replay = true,
+                    .ownership = .owned,
+                } };
+            }
+            return .{ .completed = .{ .completion = .{
+                .content = try a.dupe(u8, "Fix the renderer"),
+                .finish_reason = .stop,
+            }, .ownership = .owned } };
+        }
+    };
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    {
+        var provider: MarkedProvider = .{};
+        try expectTitle(try run(alloc, .{
+            .stream_provider = .{ .context = &provider, .stream_fn = MarkedProvider.stream },
+            .model = "test/title",
+            .api_key = "",
+            .credential_source = .configured,
+            .prompt_excerpt = "fix the renderer",
+            .cancel_flag = &cancelled,
+        }));
+        try std.testing.expectEqual(@as(usize, 2), provider.sends);
+    }
+    {
+        var provider: MarkedProvider = .{ .reject_all = true };
+        const outcome = try run(alloc, .{
+            .stream_provider = .{ .context = &provider, .stream_fn = MarkedProvider.stream },
+            .model = "test/title",
+            .api_key = "",
+            .credential_source = .configured,
+            .prompt_excerpt = "fix the renderer",
+            .cancel_flag = &cancelled,
+        });
+        try std.testing.expectEqual(FailureReason.provider_failure, outcome.unavailable.reason);
+        try std.testing.expectEqual(@as(usize, 2), provider.sends);
+    }
 }
 
 test "run frees every stored token when an allocation fails" {

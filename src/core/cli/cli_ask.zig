@@ -12,6 +12,7 @@ const ui_render = @import("../../ui/render.zig");
 const ui_terminal = @import("../../ui/terminal/terminal.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const command_auth = @import("../auth/command_auth.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
@@ -1578,6 +1579,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             options.settings_overrides,
         );
     defer startup.deinit(alloc);
+    defer command_auth.shutdown();
     applyAskThemeChoice(startup.theme);
     cfg.provider_set.definitions = startup.configured_providers.definitions;
     // Bind gateway chat traffic to a per-process connection pool and warm one

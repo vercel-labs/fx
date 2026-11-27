@@ -545,6 +545,10 @@ pub const Failure = struct {
     retry_after_seconds: ?u64 = null,
     /// The response's own status, so messages name the code it sent.
     http_status: ?std.http.Status = null,
+    /// The connection gets a new credential on its next send (a custom
+    /// connection whose token comes from its command helper), so a 401 replay
+    /// needs no stored-credential renewal.
+    renews_credential_on_replay: bool = false,
     ownership: ResultOwnership = .borrowed,
 };
 

@@ -1083,6 +1083,9 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "startMcpHostServers")) {
                 if (snapshot.reasons.contains(.first_frame)) App.startMcpHostServers(app);
             }
+            if (comptime @hasDecl(App, "noteFirstFrameForModelCache")) {
+                if (snapshot.reasons.contains(.first_frame)) App.noteFirstFrameForModelCache(app);
+            }
             if (comptime @hasDecl(App, "notePendingFrameCommitted")) {
                 if (result.pending_prompt_presented) {
                     App.notePendingFrameCommitted(app, agent);
