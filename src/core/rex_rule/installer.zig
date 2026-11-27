@@ -2,6 +2,7 @@
 //! hands back its outcome when the app asks for it. `start` does no disk work.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const apply = @import("apply.zig");
@@ -32,6 +33,11 @@ pub const Installer = struct {
     pub fn start(self: *Installer, alloc: std.mem.Allocator, args: StartArgs) void {
         if (self.started) return;
         self.started = true;
+        if (comptime builtin.single_threaded) {
+            // A single-threaded build, such as a WASM surface, has no thread to run the attempt on.
+            self.immediate = .none;
+            return;
+        }
         const maybe_job = Job.create(alloc, args) catch |err| {
             debug_trace.logf(trace_scope, "installer did not start error={s}", .{@errorName(err)});
             self.immediate = .none;
@@ -63,6 +69,7 @@ pub const Installer = struct {
 
     /// Cancels the attempt, kills a running `rex` child, and joins the thread. Fast.
     pub fn stopForProcessExit(self: *Installer) void {
+        if (comptime builtin.single_threaded) return;
         const job = self.job orelse return;
         job.cancel.store(true, .release);
         if (job.thread) |thread| {

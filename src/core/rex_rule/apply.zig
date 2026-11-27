@@ -42,6 +42,7 @@ const state_name = "state.json";
 const backup_name_prefix = "init.lua.backup-";
 const added_key = "added";
 const gave_up_key = "gave_up";
+const created_init_key = "created_init";
 const owner_write_mode = 0o200;
 const private_file_mode = std.Io.File.Permissions.fromMode(0o600);
 const private_dir_mode = std.Io.File.Permissions.fromMode(0o700);
@@ -118,6 +119,8 @@ const Files = struct {
 const State = struct {
     added: []const []const u8 = &.{},
     gave_up: []const []const u8 = &.{},
+    /// Config folders whose init.lua fx created, so removing the rule may delete it.
+    created_init: []const []const u8 = &.{},
 };
 
 fn readState(a: std.mem.Allocator, path: []const u8) !State {
@@ -140,7 +143,8 @@ fn parseState(a: std.mem.Allocator, bytes: []const u8) !State {
     };
     const added = (try stringList(a, object, added_key)) orelse return .{};
     const gave_up = (try stringList(a, object, gave_up_key)) orelse return .{};
-    return .{ .added = added, .gave_up = gave_up };
+    const created_init = (try stringList(a, object, created_init_key)) orelse return .{};
+    return .{ .added = added, .gave_up = gave_up, .created_init = created_init };
 }
 
 fn stringList(a: std.mem.Allocator, object: std.json.ObjectMap, key: []const u8) !?[]const []const u8 {
@@ -161,7 +165,11 @@ fn stringList(a: std.mem.Allocator, object: std.json.ObjectMap, key: []const u8)
 
 fn saveState(a: std.mem.Allocator, path: []const u8, state: State) !void {
     var out: std.Io.Writer.Allocating = .init(a);
-    try std.json.Stringify.value(.{ .added = state.added, .gave_up = state.gave_up }, .{}, &out.writer);
+    try std.json.Stringify.value(.{
+        .added = state.added,
+        .gave_up = state.gave_up,
+        .created_init = state.created_init,
+    }, .{}, &out.writer);
     try writeReplacingPrivate(a, path, out.written());
 }
 
@@ -378,6 +386,11 @@ fn addRuleEdits(edit: *Edit, paths: Paths, pid: u32, observed: Observed, state: 
     const a = edit.alloc;
     const files = edit.files;
     try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), files.config_dir);
+    // The person may have made their own fx.lua since fx looked, so look again before
+    // writing: fx never writes over a file it does not own.
+    if (try observeFxLua(a, files.fx_lua_path) != observed.fx_lua) {
+        return traced(.skipped, "fx.lua changed while fx worked");
+    }
     edit.fx_lua_created = observed.fx_lua == .missing;
     try writeFxLua(a, files, paths);
     if (edit.original) |bytes| try writeBackup(a, files.state_dir, bytes);
@@ -413,6 +426,9 @@ fn addRuleEdits(edit: *Edit, paths: Paths, pid: u32, observed: Observed, state: 
     switch (verdict) {
         .trusted => {
             next_state.added = try withEntry(a, state.added, files.config_dir);
+            if (edit.original == null and edit.init_written) {
+                next_state.created_init = try withEntry(a, state.created_init, files.config_dir);
+            }
             saveStateLogged(a, files.state_path, next_state);
             if (edit.init_written) return traced(.added, "rule added");
             return traced(.verified, "rule already in place");
@@ -435,7 +451,8 @@ fn addRuleEdits(edit: *Edit, paths: Paths, pid: u32, observed: Observed, state: 
 /// during the attempt. Only fx's line is taken out of the text that is there now.
 fn rollback(edit: *Edit) void {
     if (edit.init_written) {
-        removeOwnLine(edit.alloc, edit.files.init_path) catch |err| traceStep("remove our line", err);
+        const fx_created_init = edit.original == null;
+        removeOwnLine(edit.alloc, edit.files.init_path, fx_created_init) catch |err| traceStep("remove our line", err);
     }
     if (edit.fx_lua_created) {
         deleteIfPresent(edit.files.fx_lua_path) catch |err| traceStep("delete fx.lua", err);
@@ -444,8 +461,9 @@ fn rollback(edit: *Edit) void {
 }
 
 /// Takes fx's line out of init.lua as it is now. Leaves the file alone when the
-/// line is gone or the file is no longer plain text.
-fn removeOwnLine(a: std.mem.Allocator, init_path: []const u8) !void {
+/// line is gone or the file is no longer plain text. An emptied file is deleted
+/// only when fx created it; the person's own empty file stays.
+fn removeOwnLine(a: std.mem.Allocator, init_path: []const u8, fx_created_init: bool) !void {
     const bytes = switch (try readPlain(a, init_path, plan.max_init_bytes)) {
         .file => |file| file.bytes,
         else => {
@@ -459,7 +477,7 @@ fn removeOwnLine(a: std.mem.Allocator, init_path: []const u8) !void {
     }
     const buf = try a.alloc(u8, bytes.len);
     const next = plan.removeLine(bytes, buf);
-    if (next.len == 0) return deleteIfPresent(init_path);
+    if (next.len == 0 and fx_created_init) return deleteIfPresent(init_path);
     try io_mod.writeFileAtomic(a, init_path, next);
 }
 
@@ -486,8 +504,9 @@ fn removeRuleEdits(
 
     const buf = try a.alloc(u8, original.len);
     const removed = plan.removeLine(original, buf);
-    if (removed.len == 0) {
-        // Our line was the whole file, so the file goes back to missing. There is no file left to check.
+    if (removed.len == 0 and contains(state.created_init, files.config_dir)) {
+        // fx created the file and our line was all of it, so the file goes back to
+        // missing. There is no file left to check.
         try deleteIfPresent(files.init_path);
     } else {
         try io_mod.writeFileAtomic(a, files.init_path, removed);
@@ -496,12 +515,15 @@ fn removeRuleEdits(
         }
     }
 
-    if (fx_lua == .ours) {
+    // Look at fx.lua again: the person may have replaced it with their own since fx looked.
+    const fx_lua_still_ours = (observeFxLua(a, files.fx_lua_path) catch .foreign) == .ours;
+    if (fx_lua == .ours and fx_lua_still_ours) {
         deleteIfPresent(files.fx_lua_path) catch |err| traceStep("delete fx.lua", err);
     }
     _ = reloadRex(rex, "after the removal");
     var next_state = state;
     next_state.added = try withoutEntry(a, state.added, files.config_dir);
+    next_state.created_init = try withoutEntry(a, state.created_init, files.config_dir);
     saveStateLogged(a, files.state_path, next_state);
     return traced(.removed, "rule removed");
 }
@@ -564,6 +586,7 @@ const testing = std.testing;
 const test_pid: u32 = 4242;
 const original_text = "-- mine\n";
 const user_line = "-- added by the user\n";
+const foreign_fx_lua_text = "-- the person's own fx.lua\n";
 const max_test_bytes: usize = 64 * 1024;
 
 const FakeRex = struct {
@@ -574,6 +597,8 @@ const FakeRex = struct {
     check_mode: CheckMode = .always_ok,
     /// A user edit the next check makes to init.lua once it has read fx's line.
     user_edit: UserEdit = .none,
+    /// A path where the next check writes the person's own fx.lua, once.
+    foreign_fx_lua_at: ?[]const u8 = null,
     null_answers: NullAnswers = .never,
     reload_ok: bool = true,
     reloaded: bool = false,
@@ -623,6 +648,10 @@ const FakeRex = struct {
             .fail_on_our_line => std.mem.find(u8, text, plan.require_line) == null,
         };
         self.editDuringCheck(init_path, text);
+        if (self.foreign_fx_lua_at) |path| {
+            writeTestFile(path, foreign_fx_lua_text) catch @panic("foreign fx.lua failed to write");
+            self.foreign_fx_lua_at = null;
+        }
         return verdict;
     }
 
@@ -988,6 +1017,58 @@ test "rex apply: a foreign fx.lua is skipped" {
     try expectFile(a, fx_lua, foreign);
     try expectFile(a, init, original_text);
     try testing.expectEqual(@as(usize, 0), rex_state.reload_calls);
+}
+
+test "rex apply: an fx.lua the person writes while fx works is not written over" {
+    var fx = try Fixture.create();
+    defer fx.deinit();
+    const a = fx.alloc();
+    const p = fx.paths;
+    const init = try pathIn(a, p.config_dir, init_name);
+    const fx_lua = try pathIn(a, p.config_dir, fx_lua_name);
+    try makeDir(p.config_dir);
+    try writeTestFile(init, original_text);
+    // observe sees no fx.lua; the person writes one during its check.
+    var rex_state: FakeRex = .{ .pid = test_pid, .before = .no_rule, .after = .trusted, .foreign_fx_lua_at = fx_lua };
+
+    try testing.expectEqual(Outcome.skipped, run(a, rex_state.rex(), p, test_pid, true));
+    try expectFile(a, fx_lua, foreign_fx_lua_text);
+    try expectFile(a, init, original_text);
+    try testing.expectEqual(@as(usize, 0), rex_state.reload_calls);
+}
+
+test "rex apply: the person's empty init.lua stays when the setting is turned off" {
+    var fx = try Fixture.create();
+    defer fx.deinit();
+    const a = fx.alloc();
+    const p = fx.paths;
+    const init = try pathIn(a, p.config_dir, init_name);
+    const fx_lua = try pathIn(a, p.config_dir, fx_lua_name);
+    try makeDir(p.config_dir);
+    try writeTestFile(init, "");
+    var rex_state: FakeRex = .{ .pid = test_pid, .before = .no_rule, .after = .trusted };
+
+    try testing.expectEqual(Outcome.added, run(a, rex_state.rex(), p, test_pid, true));
+    try testing.expectEqual(plan.LineState.ours, plan.scanLine(try readTestFile(a, init)));
+    try testing.expectEqual(Outcome.removed, run(a, rex_state.rex(), p, test_pid, false));
+    try expectFile(a, init, "");
+    try testing.expect(!fileExists(fx_lua));
+}
+
+test "rex apply: a rollback keeps the person's empty init.lua" {
+    var fx = try Fixture.create();
+    defer fx.deinit();
+    const a = fx.alloc();
+    const p = fx.paths;
+    const init = try pathIn(a, p.config_dir, init_name);
+    const fx_lua = try pathIn(a, p.config_dir, fx_lua_name);
+    try makeDir(p.config_dir);
+    try writeTestFile(init, "");
+    var rex_state: FakeRex = .{ .pid = test_pid, .before = .no_rule, .after = .trusted, .check_mode = .fail_on_our_line };
+
+    try testing.expectEqual(Outcome.rolled_back, run(a, rex_state.rex(), p, test_pid, true));
+    try expectFile(a, init, "");
+    try testing.expect(!fileExists(fx_lua));
 }
 
 test "rex apply: a rule the user removed stays removed" {
