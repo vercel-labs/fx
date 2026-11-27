@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv } from "../evals/eval-helpers";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
@@ -40,10 +40,14 @@ let root: string | null = null;
 let stderrPath: string | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
 let fixtureImagePath: string | null = null;
+let ptyFx: ReturnType<typeof Bun.spawn> | null = null;
 
 afterEach(async () => {
   await session?.kill();
   session = null;
+  ptyFx?.kill();
+  await ptyFx?.exited;
+  ptyFx = null;
   gateway?.stop();
   gateway = null;
   if (root) rmSync(root, { recursive: true, force: true });
@@ -1262,6 +1266,106 @@ tmuxTest(
     await waitForGatewayRequest(4);
     expect(finalUserText(3)).toBe("DELETE_OK");
     expectCleanRuntime(active);
+  },
+  TIMEOUT,
+);
+
+const ONE_PIXEL_PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const CLIPBOARD_IMAGE_REQUEST = "\x1b[?5522$p\x1b]5522;type=read;aW1hZ2UvcG5n\x1b\\";
+
+function visibleText(output: string): string {
+  return output
+    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-9;?<>=]*[ -\/]*[@-~]/g, "");
+}
+
+async function waitForOutput(check: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await Bun.sleep(20);
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
+// tmux keeps the kitty clipboard protocol (OSC 5522) from the pane, so this
+// test is the terminal itself: it runs fx on its own pty and answers the way
+// Ghostty 1.4 and kitty answer over SSH.
+test(
+  "Ctrl+V over SSH attaches the image the terminal sends with OSC 5522",
+  async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-terminal-clipboard-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
+    gateway = startFakeGateway([fakeGatewayFinalText("clipboard image received")], {
+      models: [{
+        id: FAKE_GATEWAY_MODEL,
+        type: "language",
+        tags: ["vision", "file-input", "tool-use"],
+        context_window: 200_000,
+        max_tokens: 8_000,
+      }],
+    });
+
+    let output = "";
+    ptyFx = Bun.spawn([FX_BIN], {
+      cwd: workspace,
+      env: fxChildEnv({
+        HOME: home,
+        TERM: "xterm-256color",
+        NO_COLOR: "1",
+        // fx is on the far side of SSH, so the terminal must send the image.
+        SSH_CONNECTION: "203.0.113.7 52144 198.51.100.9 22",
+        TMUX: undefined,
+        AI_GATEWAY_API_KEY: "fake-terminal-clipboard-key",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+      }),
+      terminal: {
+        cols: 112,
+        rows: 32,
+        data(terminal, chunk) {
+          const text = Buffer.from(chunk).toString("latin1");
+          output += text;
+          // Answer the queries every terminal answers.
+          if (text.includes("\x1b[6n")) terminal.write("\x1b[32;1R");
+          if (text.includes("\x1b[c")) terminal.write("\x1b[?62;22;52c");
+        },
+      },
+    });
+    const terminal = ptyFx.terminal!;
+    await waitForOutput(() => visibleText(output).includes("Run /help for commands"), "the composer");
+
+    const beforeRequest = output.length;
+    terminal.write("\x16");
+    await waitForOutput(
+      () => output.slice(beforeRequest).includes(CLIPBOARD_IMAGE_REQUEST),
+      "the clipboard request",
+    );
+    terminal.write("\x1b[?5522;2$y");
+    terminal.write("\x1b]5522;type=read:status=OK\x1b\\");
+    terminal.write(`\x1b]5522;type=read:status=DATA:mime=aW1hZ2UvcG5n;${ONE_PIXEL_PNG_BASE64}\x1b\\`);
+    terminal.write("\x1b]5522;type=read:status=DONE\x1b\\");
+    await waitForOutput(() => visibleText(output).includes("[Image 1]"), "the image badge");
+
+    terminal.write(" describe");
+    terminal.write("\r");
+    await waitForGatewayRequest();
+
+    expect(finalUserText()).toBe("[Image #1] describe");
+    expect(userParts().filter((part) => part.type === "file")).toHaveLength(1);
+    // No byte of the reply reached the composer or the screen.
+    expect(visibleText(output)).not.toContain("status=");
+    expect(visibleText(output)).not.toContain(ONE_PIXEL_PNG_BASE64.slice(0, 16));
+    expect(ptyFx.exitCode).toBeNull();
   },
   TIMEOUT,
 );

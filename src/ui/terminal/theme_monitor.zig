@@ -1,4 +1,5 @@
 const std = @import("std");
+const clipboard_protocol = @import("clipboard_protocol.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const mode_rearm = @import("mode_rearm.zig");
 const theme_protocol = @import("theme_protocol.zig");
@@ -28,6 +29,11 @@ pub const FeedResult = union(enum) {
     pending,
     consumed,
     forward: ForwardBytes,
+    /// A clipboard reply packet starts (`clipboard_protocol`). Its body and
+    /// terminator follow and belong to the clipboard reader.
+    clipboard_packet,
+    /// The terminal answered the clipboard protocol's mode query.
+    clipboard_mode: clipboard_protocol.ModeSupport,
 };
 
 pub const QueryRequest = enum {
@@ -130,6 +136,23 @@ pub const Monitor = struct {
             std.mem.startsWith(u8, light_response, candidate))
         {
             return .pending;
+        }
+
+        // Clipboard replies share the ESC prefix with every other terminal
+        // reply, so the monitor that sees replies first hands them off.
+        switch (clipboard_protocol.classifyReplyStart(candidate)) {
+            .none => {},
+            .pending => return .pending,
+            .packet => {
+                self.candidate_len = 0;
+                self.candidate_deadline_ms = 0;
+                return .clipboard_packet;
+            },
+            .mode => |support| {
+                self.candidate_len = 0;
+                self.candidate_deadline_ms = 0;
+                return .{ .clipboard_mode = support };
+            },
         }
 
         switch (theme_protocol.classifyPrimaryDeviceAttributes(candidate)) {
@@ -424,7 +447,7 @@ test "theme monitor settles the notification after a background query timeout" {
     for ("\x1b]11;rgb:ffff/ffff/ffff\x1b\\") |byte| {
         try std.testing.expect(switch (monitor.feed(byte, background_response_timeout_ms + 1)) {
             .pending, .consumed => true,
-            .forward => false,
+            .forward, .clipboard_packet, .clipboard_mode => false,
         });
     }
     try std.testing.expect(monitor.takeSettledUpdate() == null);
@@ -459,7 +482,7 @@ test "theme monitor consumes OSC 11 long after query timeout without forwarding"
     for ("\x1b]11;rgb:0000/0000/0000\x07") |byte| {
         try std.testing.expect(switch (monitor.feed(byte, late_ms)) {
             .pending, .consumed => true,
-            .forward => false,
+            .forward, .clipboard_packet, .clipboard_mode => false,
         });
     }
     try std.testing.expect(monitor.takeSettledUpdate() == null);
@@ -509,7 +532,7 @@ test "theme monitor forwards malformed primary device attributes" {
             forwarded_len += bytes.len;
         },
         .pending => {},
-        .consumed => return error.TestExpectedForward,
+        .consumed, .clipboard_packet, .clipboard_mode => return error.TestExpectedForward,
     };
 
     try std.testing.expectEqualStrings("\x1b[?;c", forwarded[0..forwarded_len]);
@@ -627,13 +650,13 @@ test "theme monitor forwards a full malformed OSC candidate without dropping its
     for (candidate) |byte| {
         try std.testing.expect(switch (monitor.feed(byte, 1)) {
             .pending => true,
-            .consumed, .forward => false,
+            .consumed, .forward, .clipboard_packet, .clipboard_mode => false,
         });
     }
 
     const forwarded = switch (monitor.feed('y', 1)) {
         .forward => |bytes| bytes,
-        .pending, .consumed => return error.TestExpectedForward,
+        .pending, .consumed, .clipboard_packet, .clipboard_mode => return error.TestExpectedForward,
     };
     try std.testing.expectEqual(@as(usize, max_candidate_bytes + 1), forwarded.slice().len);
     try std.testing.expectEqual(@as(u8, 'y'), forwarded.slice()[max_candidate_bytes]);
@@ -695,4 +718,50 @@ test "theme monitor settles a rearm answer for an unchanged theme" {
     try std.testing.expect(!update.light);
     try std.testing.expectEqual(@as(u8, 0x1c), update.rgb.?.r);
     try std.testing.expect(monitor.takeQueryRequest(6) == null);
+}
+
+test "theme monitor hands clipboard replies to the clipboard reader" {
+    var monitor = Monitor{};
+    monitor.start();
+
+    const packet_prefix = "\x1b]5522;";
+    for (packet_prefix[0 .. packet_prefix.len - 1]) |byte| {
+        try std.testing.expect(monitor.feed(byte, 0) == .pending);
+    }
+    try std.testing.expect(monitor.feed(packet_prefix[packet_prefix.len - 1], 0) == .clipboard_packet);
+    try std.testing.expect(!monitor.hasPendingInput());
+
+    const mode_report = "\x1b[?5522;2$y";
+    for (mode_report[0 .. mode_report.len - 1]) |byte| {
+        try std.testing.expect(monitor.feed(byte, 1) == .pending);
+    }
+    try std.testing.expectEqual(
+        FeedResult{ .clipboard_mode = .supported },
+        monitor.feed(mode_report[mode_report.len - 1], 1),
+    );
+    try std.testing.expect(!monitor.hasPendingInput());
+}
+
+test "theme monitor keeps forwarding OSC 52 and fencing beside clipboard replies" {
+    var monitor = Monitor{};
+    monitor.start();
+    for (dark_response) |byte| _ = monitor.feed(byte, 0);
+    try std.testing.expectEqual(QueryRequest.response_fence, monitor.takeQueryRequest(0).?);
+
+    for ("\x1b[?5522;0$y") |byte| _ = monitor.feed(byte, 1);
+    for (response_fence) |byte| _ = monitor.feed(byte, 2);
+    try std.testing.expectEqual(QueryRequest.background, monitor.takeQueryRequest(3).?);
+
+    const osc52 = "\x1b]52;c;dGV4dA==\x07";
+    var forwarded: [osc52.len]u8 = undefined;
+    var forwarded_len: usize = 0;
+    for (osc52) |byte| switch (monitor.feed(byte, 4)) {
+        .forward => |bytes| {
+            @memcpy(forwarded[forwarded_len..][0..bytes.len], bytes.slice());
+            forwarded_len += bytes.len;
+        },
+        .pending => {},
+        .consumed, .clipboard_packet, .clipboard_mode => return error.TestExpectedForward,
+    };
+    try std.testing.expectEqualStrings(osc52, forwarded[0..forwarded_len]);
 }

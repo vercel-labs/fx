@@ -1,6 +1,7 @@
 //! The standard variables that describe the user's terminal: `NO_COLOR`
 //! (no-color.org) and `TERM=dumb`. Every output path asks these, so help,
-//! `fx ask`, and the interactive session agree.
+//! `fx ask`, and the interactive session agree. `SSH_CONNECTION`, `SSH_TTY`,
+//! and `TMUX` say where the terminal is: on another machine, or behind tmux.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -16,6 +17,12 @@ pub fn noColorValue(value: ?[]const u8) bool {
 pub fn dumbTerminalValue(value: ?[]const u8) bool {
     const term = value orelse return false;
     return std.mem.eql(u8, term, "dumb");
+}
+
+/// sshd sets `SSH_CONNECTION` for every session and `SSH_TTY` when it
+/// allocates a terminal.
+pub fn sshSessionValues(connection: ?[]const u8, tty: ?[]const u8) bool {
+    return nonEmpty(connection) or nonEmpty(tty);
 }
 
 pub fn noColor() bool {
@@ -58,6 +65,23 @@ fn terminalColumns(fd: std.posix.fd_t) ?usize {
     return @intCast(ws.col);
 }
 
+/// Whether fx runs over SSH, so the user's terminal and clipboard are on
+/// another machine.
+pub fn sshSession() bool {
+    return sshSessionValues(io_mod.getenv("SSH_CONNECTION"), io_mod.getenv("SSH_TTY"));
+}
+
+/// Whether fx runs inside tmux, which answers or drops many terminal queries
+/// itself.
+pub fn insideTmux() bool {
+    return nonEmpty(io_mod.getenv("TMUX"));
+}
+
+fn nonEmpty(value: ?[]const u8) bool {
+    const set = value orelse return false;
+    return set.len > 0;
+}
+
 test "NO_COLOR counts only when it is set to something" {
     try std.testing.expect(noColorValue("1"));
     try std.testing.expect(noColorValue("0"));
@@ -70,4 +94,11 @@ test "only TERM=dumb is a dumb terminal" {
     try std.testing.expect(!dumbTerminalValue("xterm-256color"));
     try std.testing.expect(!dumbTerminalValue("dumb-ish"));
     try std.testing.expect(!dumbTerminalValue(null));
+}
+
+test "either SSH variable marks an SSH session" {
+    try std.testing.expect(sshSessionValues("10.0.0.2 52144 10.0.0.9 22", null));
+    try std.testing.expect(sshSessionValues(null, "/dev/pts/3"));
+    try std.testing.expect(!sshSessionValues("", ""));
+    try std.testing.expect(!sshSessionValues(null, null));
 }

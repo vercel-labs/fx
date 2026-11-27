@@ -62,6 +62,7 @@ const app_profile_runtime = @import("core/app/app_profile_runtime.zig");
 const app_instances_runtime = @import("core/app/app_instances_runtime.zig");
 const profiles = @import("core/profiles/profiles.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
+const terminal_clipboard_runtime = @import("core/app/terminal_clipboard_runtime.zig");
 const app_callbacks = @import("core/app/app_callbacks.zig");
 const app_commands = @import("core/app/app_commands.zig");
 const trace_report = @import("core/app/trace_report.zig");
@@ -453,6 +454,16 @@ const App = struct {
     const AgentsAppRuntime = app_agents_runtime.Runtime(Self);
     const InstancesAppRuntime = app_instances_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
+    const TerminalClipboardAppRuntime = terminal_clipboard_runtime.Runtime(Self);
+
+    /// Ctrl+V and `/paste` call this where fx cannot read the clipboard itself.
+    pub fn requestTerminalClipboardImage(self: *Self) !void {
+        if (comptime host_target.is_wasm) {
+            return;
+        } else {
+            try TerminalClipboardAppRuntime.request(self);
+        }
+    }
 
     pub fn contextRegistry(self: *const Self) context_contract.Registry {
         var registry = default_context_registry;
@@ -3448,6 +3459,7 @@ const App = struct {
 
         try self.collectThemeFacts();
         self.collectBracketedPasteFacts();
+        if (comptime !host_target.is_wasm) try TerminalClipboardAppRuntime.collectFacts(self);
 
         if (comptime !host_target.is_wasm) {
             UpgradeAppRuntime.collectUpgradeFacts(self);
@@ -3903,11 +3915,15 @@ const App = struct {
     }
 
     fn handleThemeMonitorByte(self: *App, byte: u8) !void {
-        switch (self.terminal_input_runtime.terminal_theme_monitor.feed(
-            byte,
-            io_mod.milliTimestamp(),
-        )) {
+        const now_ms = io_mod.milliTimestamp();
+        switch (self.terminal_input_runtime.terminal_theme_monitor.feed(byte, now_ms)) {
             .pending, .consumed => {},
+            .clipboard_packet => self.terminal_input_runtime.terminal_clipboard_reader.beginPacket(self.alloc, now_ms),
+            .clipboard_mode => |support| self.terminal_input_runtime.terminal_clipboard_reader.noteModeReport(
+                self.alloc,
+                support,
+                now_ms,
+            ),
             .forward => |forwarded| {
                 for (forwarded.slice()) |forwarded_byte| {
                     try self.handleAfterThemeMonitorByte(forwarded_byte);
@@ -3931,6 +3947,16 @@ const App = struct {
                 .theme_monitor => try self.handleAfterThemeMonitorByte(byte),
             }
             return;
+        }
+
+        // A clipboard reply takes its bytes before anything else, so none of
+        // it reaches the composer. A byte it declines is ordinary input.
+        if (self.terminal_input_runtime.terminal_clipboard_reader.ownsInput()) {
+            if (self.terminal_input_runtime.terminal_clipboard_reader.feedOwnedByte(
+                self.alloc,
+                byte,
+                io_mod.milliTimestamp(),
+            )) return;
         }
 
         switch (ui_input.terminalInputOwner(
