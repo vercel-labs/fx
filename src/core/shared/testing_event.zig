@@ -9,7 +9,7 @@ const limit_ms: u32 = 5000;
 
 /// Whether `event` is set within `ms`. The wait ends when the event is set, so
 /// a thread that gets there quickly costs the test no time.
-fn setWithin(event: *std.Io.Event, ms: u32) bool {
+pub fn setWithin(event: *std.Io.Event, ms: u32) bool {
     event.waitTimeout(io_mod.getIo(), .{ .duration = .{
         .clock = .awake,
         .raw = .fromMilliseconds(ms),

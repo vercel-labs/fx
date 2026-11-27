@@ -210,6 +210,10 @@ pub fn run(
         .subagent_id = trace_context.subagent_id,
     };
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
+    // A turn no screen shows asks through the prompter its host passed in,
+    // which lives only as long as this run.
+    if (turn.hosted_worker == null) turn.host_prompter = routed_config.tool_context.permission_prompter;
+    defer turn.host_prompter = null;
     turn.workspace_capture = config.workspace_capture;
     turn.capture_cancel = cancel;
     turn.beginTurn() catch |err| {
@@ -1042,7 +1046,7 @@ fn pushLiveText(raw: *anyopaque, emission: agent_runtime.TextEmission) !void {
         .assistant_source => {},
         .assistant_rendered => |text| context.turn.appendLiveText(text),
         .assistant_restarted => |text| context.turn.appendLiveText(text),
-        .operational => |text| context.turn.appendLiveText(text),
+        .operational, .turn_failure, .saved_reply => |text| context.turn.appendLiveText(text),
     }
 }
 fn pushLiveNotice(raw: *anyopaque, text: []const u8) !void {

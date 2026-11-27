@@ -1099,13 +1099,18 @@ pub fn commandApprovalFitsInline(
     layout: types.Layout,
     banner_row_count: usize,
 ) !bool {
-    const picker_rows = try approval_ui.inlineApprovalPanelRowsForCommand(
+    // A command with no room for even one column cannot fit inline; the review
+    // screen shows it instead.
+    const picker_rows = approval_ui.inlineApprovalPanelRowsForCommand(
         alloc,
         label,
         command,
         layout.cols,
         layout.rows,
-    );
+    ) catch |err| switch (err) {
+        error.CommandDoesNotFit => return false,
+        else => return err,
+    };
     const banner_rows: u16 = @intCast(@min(banner_row_count, std.math.maxInt(u16)));
     const measurement = SurfaceFooterMeasurement{
         .input_visible = false,
@@ -1122,13 +1127,18 @@ fn inlineApprovalPanelRowsForRequest(
     width: u16,
     terminal_rows: u16,
 ) !u16 {
+    // The review screen replaces the inline panel for a command that cannot be
+    // laid out at this width, so the footer reserves no picker rows for it.
     return approval_ui.inlineApprovalPanelRowsForCommand(
         alloc,
         request.label,
         request.command,
         width,
         terminal_rows,
-    );
+    ) catch |err| switch (err) {
+        error.CommandDoesNotFit => 0,
+        else => return err,
+    };
 }
 
 pub noinline fn measureSurfaceFooter(
@@ -2647,6 +2657,53 @@ test "command approval fit includes the steering banner" {
         null,
         layout,
         1,
+    ));
+}
+
+test "zero-width command approval footer sizing reserves no inline rows" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var prompt = ApprovalPrompt{};
+    defer prompt.deinit(alloc);
+    try std.testing.expect(try prompt.syncRequest(alloc, .{
+        .label = "shell.run printf short",
+        .command = "printf short",
+    }));
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 30,
+            .cols = 1,
+            .content_bottom = 26,
+            .divider_top_row = 27,
+            .input_row = 28,
+            .divider_bottom_row = 29,
+            .hint_row = 30,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 10,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    var measured = try measureSurfaceFooter(
+        alloc,
+        &shell,
+        prompt.projection(),
+        surfaceTestContext(&input),
+    );
+    defer measured.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 0), measured.picker_rows);
+
+    const request = prompt.request.?.view();
+    try std.testing.expect(!try commandApprovalFitsInline(
+        alloc,
+        request.label,
+        request.command,
+        shell.layout,
+        0,
     ));
 }
 

@@ -256,6 +256,7 @@ fn initFailure(deps: RunDeps, launch: *cli_surface.InteractiveLaunch, alloc: All
         error.RecordingFileTooBig,
         error.RecordingAccessDenied,
         error.RecordingReadOnly,
+        error.RecordingPathUnsafe,
         => {
             writeStderr(deps, recordingStartMessage(err));
             return .{ .exit = 1 };
@@ -688,6 +689,7 @@ fn recordingStartMessage(err: anyerror) []const u8 {
         error.RecordingFileTooBig => "fx: unable to start terminal recording: a file-size limit was reached.\n",
         error.RecordingAccessDenied => "fx: unable to start terminal recording: permission denied.\n",
         error.RecordingReadOnly => "fx: unable to start terminal recording: the disk is read-only.\n",
+        error.RecordingPathUnsafe => "fx: unable to start terminal recording: FX_RECORD must name a regular file, not a FIFO, device, or folder. Unset FX_RECORD, or name a regular file.\n",
         else => "fx: unable to start terminal recording.\n",
     };
 }
@@ -2087,6 +2089,7 @@ test "app entry says why a terminal recording could not start" {
         .{ .init_error = error.RecordingFileTooBig, .message = "fx: unable to start terminal recording: a file-size limit was reached.\n" },
         .{ .init_error = error.RecordingAccessDenied, .message = "fx: unable to start terminal recording: permission denied.\n" },
         .{ .init_error = error.RecordingReadOnly, .message = "fx: unable to start terminal recording: the disk is read-only.\n" },
+        .{ .init_error = error.RecordingPathUnsafe, .message = "fx: unable to start terminal recording: FX_RECORD must name a regular file, not a FIFO, device, or folder. Unset FX_RECORD, or name a regular file.\n" },
     };
     for (cases) |case| {
         var capture = TestCapture.init(.{ .interactive = .{} });

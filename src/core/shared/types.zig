@@ -2524,6 +2524,16 @@ pub const ProviderCompletionDisposition = enum {
     interrupted,
     provider_failure,
     invalid_completion,
+    /// The turn stopped at the agent step limit. No model request has this
+    /// disposition: only the step-limit finish passes it, so a host can tell
+    /// the stop from every other failed turn.
+    step_limited,
+    /// The turn ended as failed and fx saved it, so the history holds its
+    /// prompt, its tool calls, and the notice. No model request has this
+    /// disposition: `TurnFinalizationGuard.finish` sets it for a failed finish
+    /// that carries a finished prompt and no disposition of its own, so a host
+    /// can tell the turn from one fx left out of the history.
+    kept_failure,
 };
 
 pub fn allToolCallsProviderExecuted(tool_calls: []const ToolCall) bool {
@@ -3204,6 +3214,21 @@ pub const ToolPermissionDenialReason = enum {
     review_unavailable,
     policy_denied,
     permission_required,
+};
+
+/// Why a tool's approval was needed and could not be asked for. A prompter
+/// that cannot ask fails with `error.PermissionPromptUnavailable`, or, when it
+/// knows why, with the error `permission_prompter.unavailableCause` maps back
+/// to one of these. A refusal without a cause says noninteractive mode.
+pub const ApprovalUnavailableCause = enum {
+    /// The prompt the request belongs to ended or was cancelled.
+    prompt_closed,
+    /// The agent that asked was stopped.
+    stopped,
+    /// Too many approval requests are open.
+    requests_full,
+    /// The client cannot show approval prompts.
+    client_unavailable,
 };
 
 pub const ToolPermissionDecision = enum {

@@ -105,6 +105,9 @@ pub const PermissionOutcome = struct {
     execution_authority: ?ToolExecutionAuthority = null,
     human_approval: HumanApprovalProvenance = .none,
     denial_reason: ?types.ToolPermissionDenialReason = null,
+    /// For a `permission_required` outcome whose prompter knew why it could not
+    /// ask. Null says noninteractive mode.
+    approval_unavailable: ?types.ApprovalUnavailableCause = null,
     requirement: ?PermissionRequirement = null,
     tool_failure: ?[]const u8 = null,
     feedback: ?[]const u8 = null,

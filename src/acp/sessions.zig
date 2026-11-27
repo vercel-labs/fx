@@ -1106,10 +1106,9 @@ fn sameSessionId(active_session_id: []const u8, requested_session_id: []const u8
 /// the cancel flag, and the pending outbound requests of a kept child, such as
 /// an MCP elicitation, which end cancelled as they do after `session/cancel`.
 ///
-/// A child that waits on an approval is stopped, as the reload always did,
-/// since in ACP an approval reaches no client and the wait would last until
-/// the child's turn ends (#1722 changes that). Its work ends interrupted and
-/// owes its report. The other children go on.
+/// A child that waits on an approval is not stopped. The prompt's end closes
+/// its open subagent requests (`closeSubagentAsks`), so the wait is refused
+/// and the child goes on to its report. The other children go on too.
 ///
 /// What the reload may not do to a working child is destroy the MCP host its
 /// tool context holds. So a session with no working subagent swaps its host
@@ -1130,12 +1129,6 @@ fn reloadActiveSession(
     const active = &state.active_session.?;
     const session_id = active.session_id;
     server.cancelAndReapActivePrompt(state);
-    if (state.subagent_host) |subagents| {
-        const interrupted = subagents.interruptApprovalWaits();
-        if (interrupted > 0) {
-            debug_trace.logf("acp", "event=reload_interrupted_approval_waits session={s} count={d} reason=approval_reaches_no_client", .{ session_id, interrupted });
-        }
-    }
     const previous_host = active.mcp_host;
     const subagents_working = if (state.subagent_host) |subagents| !subagents.quiet() else false;
     const in_place = subagents_working and previous_host != null;
@@ -2222,7 +2215,7 @@ pub fn writeProviderConfigOption(
     current: model_provider.ProviderId,
     definitions: []const @import("../core/config/configured_provider.zig").Definition,
 ) !void {
-    try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
+    try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model_config\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(current.label(), w);
     try w.writeAll(",\"options\":[{\"value\":\"gateway\",\"name\":\"Vercel AI Gateway\"},{\"value\":\"codex\",\"name\":\"Codex subscription\"}");
     if (comptime !host_target.is_wasm) {
@@ -2312,7 +2305,7 @@ pub fn fastConfigState(state: *server.ServerState) ?bool {
 }
 
 pub fn writeFastConfigOption(w: *std.Io.Writer, current: bool) !void {
-    try w.writeAll("{\"id\":\"fast\",\"name\":\"Fast Mode\",\"description\":\"Uses the model's fast lane\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
+    try w.writeAll("{\"id\":\"fast\",\"name\":\"Fast Mode\",\"description\":\"Uses the model's fast lane\",\"category\":\"model_config\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(if (current) "true" else "false", w);
     try w.writeAll(",\"options\":[{\"value\":\"false\",\"name\":\"off\"},{\"value\":\"true\",\"name\":\"on\"}]}");
 }
@@ -2348,7 +2341,7 @@ pub fn ultrafastConfigState(state: *server.ServerState) ?bool {
 }
 
 pub fn writeUltrafastConfigOption(w: *std.Io.Writer, current: bool) !void {
-    try w.writeAll("{\"id\":\"ultrafast\",\"name\":\"Ultrafast Mode\",\"description\":\"Uses the model's ultrafast Gateway lane\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
+    try w.writeAll("{\"id\":\"ultrafast\",\"name\":\"Ultrafast Mode\",\"description\":\"Uses the model's ultrafast Gateway lane\",\"category\":\"model_config\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(if (current) "true" else "false", w);
     try w.writeAll(",\"options\":[{\"value\":\"false\",\"name\":\"off\"},{\"value\":\"true\",\"name\":\"on\"}]}");
 }
@@ -2450,6 +2443,36 @@ test "formatIso8601 produces known timestamp" {
     const result = try formatIso8601(alloc, 0);
     defer alloc.free(result);
     try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", result);
+}
+
+// ACP clients take the first option with category `model` as the model
+// picker (`tests/tla/acp/AcpConfigCategories.tla` ModelPickerFirst).
+test "only the model option uses the model config category" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("[");
+    try writeProviderConfigOption(&out.writer, .gateway, &.{});
+    try out.writer.writeAll(",");
+    try writeModelConfigOption(&out.writer, "example/model", null);
+    try out.writer.writeAll(",");
+    try writeFastConfigOption(&out.writer, true);
+    try out.writer.writeAll(",");
+    try writeUltrafastConfigOption(&out.writer, false);
+    try out.writer.writeAll("]");
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer parsed.deinit();
+    const expected = [_]struct { id: []const u8, category: []const u8 }{
+        .{ .id = "provider", .category = "model_config" },
+        .{ .id = "model", .category = "model" },
+        .{ .id = "fast", .category = "model_config" },
+        .{ .id = "ultrafast", .category = "model_config" },
+    };
+    try std.testing.expectEqual(expected.len, parsed.value.array.items.len);
+    for (expected, parsed.value.array.items) |want, item| {
+        try std.testing.expectEqualStrings(want.id, item.object.get("id").?.string);
+        try std.testing.expectEqualStrings(want.category, item.object.get("category").?.string);
+    }
 }
 
 test "writeModelConfigOption produces valid json with single model fallback" {

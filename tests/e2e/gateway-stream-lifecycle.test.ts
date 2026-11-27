@@ -2538,6 +2538,77 @@ describe("gateway stream lifecycle", () => {
     }
   }, 60_000);
 
+  test("a workspace outside HOME lists no skills from folders above its repository or itself", async () => {
+    const root = createFixtureRoot("skill-walk-boundary");
+    const tracePath = join(root.root, "trace.log");
+    const writeSkill = (base: string, name: string) => {
+      const directory = join(base, ".agents", "skills", name);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(
+        join(directory, "SKILL.md"),
+        `---\nname: ${name}\ndescription: ${name} fixture\n---\n\nbody\n`,
+      );
+    };
+    const gitInit = (directory: string) => {
+      mkdirSync(directory, { recursive: true });
+      const result = Bun.spawnSync(["git", "init", "-q", "--template=", directory], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          HOME: root.home,
+          GIT_CONFIG_NOSYSTEM: "1",
+          LC_ALL: "C",
+        },
+      });
+      if (result.exitCode !== 0) {
+        throw new Error(`git init failed: ${result.stderr.toString()}`);
+      }
+    };
+    // The fixture's HOME is beside these two workspaces, not above them.
+    const repository = join(root.root, "top", "mid", "repo");
+    gitInit(repository);
+    writeSkill(join(root.root, "top"), "walk-above-repository");
+    writeSkill(repository, "walk-repository");
+    const plainParent = join(root.root, "plain");
+    const plainWorkspace = join(plainParent, "workspace");
+    writeSkill(plainParent, "walk-above-workspace");
+    writeSkill(plainWorkspace, "walk-workspace");
+    // A repository under HOME keeps loading the folders up to HOME.
+    const homeRepository = join(root.home, "projects", "repo");
+    gitInit(homeRepository);
+    writeSkill(join(root.home, "projects"), "walk-above-home-repository");
+
+    const gateway = startGateway(() => fakeGatewayFinalText("SKILL_WALK_DONE"));
+    const firstRequest = async (cwd: string) => {
+      const index = gateway.requestCount();
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Say done."],
+        {
+          cwd,
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_SOUND: "0" },
+          timeoutMs: 30_000,
+        },
+      );
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("SKILL_WALK_DONE");
+      return gateway.requests[index]!.body;
+    };
+    try {
+      const inRepository = await firstRequest(repository);
+      expect(advertisedSkillOpenKeys(inRepository, "walk-repository")).toHaveLength(1);
+      expect(advertisedSkillOpenKeys(inRepository, "walk-above-repository")).toEqual([]);
+
+      const inPlainWorkspace = await firstRequest(plainWorkspace);
+      expect(advertisedSkillOpenKeys(inPlainWorkspace, "walk-workspace")).toHaveLength(1);
+      expect(advertisedSkillOpenKeys(inPlainWorkspace, "walk-above-workspace")).toEqual([]);
+
+      const inHomeRepository = await firstRequest(homeRepository);
+      expect(advertisedSkillOpenKeys(inHomeRepository, "walk-above-home-repository")).toHaveLength(1);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("skill_symlink_authorities setting admits external skill links", async () => {
     const root = createFixtureRoot("skill-symlink-authorities");
     const tracePath = join(root.root, "trace.log");
@@ -5440,6 +5511,45 @@ describe("gateway stream lifecycle", () => {
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("ask accepts the requested script when a non-English request quotes English", async () => {
+    const translated = "잠금 파일이 다시 손상되었습니다. 즉시 확인하겠습니다.";
+    for (const [label, prompt] of [
+      ["vietnamese", "Dịch nội dung sau sang tiếng Hàn. The lockfile is broken again."],
+      ["indonesian", "Terjemahkan ke bahasa Korea. The lockfile is broken again."],
+      // Each accent is a base letter and a combining mark.
+      ["vietnamese-decomposed", "Di\u0323ch giu\u0301p. The lockfile is broken again."],
+      // "we" is a Dutch word, and the English list leaves it out.
+      ["dutch", "Kunnen we dit vandaag nog oplossen? The lockfile is broken again."],
+      // "can" is English only in "can't": a name with a Turkish ending is not.
+      ["turkish-name", "Bunu Can'a Korece yaz. The lockfile is broken again."],
+      // A no-break space between words, written as an escape.
+      ["indonesian-no-break-spaces", "Terjemahkan\u00a0ke\u00a0bahasa\u00a0Korea. The lockfile is broken again."],
+      // A line break other than LF ends the request's own clause.
+      ["indonesian-carriage-return", "Terjemahkan ke bahasa Korea\rThe lockfile is broken again."],
+      ["indonesian-line-separator", "Terjemahkan ke bahasa Korea\u2028Why is the lockfile broken again?"],
+    ] as const) {
+      const root = createFixtureRoot(`response-language-${label}`);
+      const gateway = startGateway(() => fakeGatewayFinalText(translated));
+      try {
+        const result = await runFx(["ask", "--json", "--auto", "--no-save", prompt], {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+          timeoutMs: 15_000,
+        });
+
+        expect({ label, code: result.code, stderr: result.stderr }).toEqual({ label, code: 0, stderr: "" });
+        expect(parseAskJson(result.stdout).output).toBe(translated);
+        expect(gateway.requestCount()).toBe(1);
+        expect(gateway.requests[0]!.body).not.toContain(
+          "The previous candidate used a different language",
+        );
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
     }
   });
 

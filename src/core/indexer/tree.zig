@@ -65,6 +65,11 @@ pub const Tree = struct {
     cap_reached: bool,
     skipped_overlong: usize,
     skipped_names: []const []const u8,
+    /// The entries left out because their name is in `skipped_names`,
+    /// relative to the root and sorted bytewise, so a listing can say what it
+    /// left out. Only a plain scan skips by name; nothing below a skipped
+    /// folder is read, so nothing there is listed here.
+    skipped: []const []const u8 = &.{},
     /// Sorted by path, files before folders with the same path.
     entries: []const Entry,
     folders: []const FolderStamp,

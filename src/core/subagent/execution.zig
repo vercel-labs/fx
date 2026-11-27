@@ -23,6 +23,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -89,6 +90,104 @@ test "a hosted run's turn context leaves saving to the child's own agent" {
     try std.testing.expectError(error.SessionCommitFailed, turn.commit("work-1", saved));
     try std.testing.expect(!turn.committed);
 }
+
+test "out of memory while a subagent asks for approval is out of memory, not an unavailable approval" {
+    var turn = TurnContext.initHosted(std.testing.allocator, 8);
+    defer turn.deinit();
+    var phase_context: u8 = 0;
+    turn.child_id = "child_a";
+    turn.phase_context = &phase_context;
+    turn.phase_fn = acceptPhase;
+    var host_context: u8 = 0;
+    turn.host_prompter = .{ .context = &host_context, .request_fn = AllocatingHostPrompter.request };
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
+    const call: types.ToolCall = .{ .id = "call_1", .name = "shell", .arguments_json = "{}" };
+    const request: permission_request.PermissionRequest = .{ .label = "run a command" };
+    try std.testing.expectError(error.OutOfMemory, turn.askHost(failing.allocator(), request, call, null, null, "child_a", "work_1"));
+}
+
+fn acceptPhase(_: *anyopaque, _: []const u8, _: []const u8, _: child_state.Phase) anyerror!void {}
+
+/// A host prompter that allocates its answer, as a real one may, so an
+/// allocator that is out of memory fails it.
+const AllocatingHostPrompter = struct {
+    fn request(
+        _: *anyopaque,
+        alloc: Allocator,
+        _: permission_request.PermissionRequest,
+        _: types.ToolCall,
+        _: ?*const @import("../output/diff.zig").FileReview,
+        _: ?[]const types.PermissionGrant,
+    ) anyerror!permission_request.OwnedPermissionResponse {
+        const scratch = try alloc.alloc(u8, 1);
+        alloc.free(scratch);
+        return permission_request.OwnedPermissionResponse.init(alloc, .once, null);
+    }
+};
+
+test "out of memory while a subagent's approval phase changes is out of memory, not an unavailable approval" {
+    var turn = TurnContext.initHosted(std.testing.allocator, 8);
+    defer turn.deinit();
+    turn.child_id = "child_a";
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
+    var phase: AllocatingPhase = .{ .alloc = failing.allocator() };
+    turn.phase_context = &phase;
+    turn.phase_fn = AllocatingPhase.apply;
+    var host_context: u8 = 0;
+    turn.host_prompter = .{ .context = &host_context, .request_fn = AllocatingHostPrompter.request };
+    const call: types.ToolCall = .{ .id = "call_1", .name = "shell", .arguments_json = "{}" };
+    const request: permission_request.PermissionRequest = .{ .label = "run a command" };
+    try std.testing.expectError(error.OutOfMemory, turn.askHost(std.testing.allocator, request, call, null, null, "child_a", "work_1"));
+}
+
+test "a failed phase restore after an answer is the error the approval returns" {
+    var turn = TurnContext.initHosted(std.testing.allocator, 8);
+    defer turn.deinit();
+    turn.child_id = "child_a";
+    var phase_context: u8 = 0;
+    turn.phase_context = &phase_context;
+    turn.phase_fn = RefusingRestorePhase.apply;
+    var host_context: u8 = 0;
+    turn.host_prompter = .{ .context = &host_context, .request_fn = AllocatingHostPrompter.request };
+    const call: types.ToolCall = .{ .id = "call_1", .name = "shell", .arguments_json = "{}" };
+    const request: permission_request.PermissionRequest = .{ .label = "run a command" };
+    try std.testing.expectError(error.CommitFailed, turn.askHost(std.testing.allocator, request, call, null, null, "child_a", "work_1"));
+}
+
+test "a failed phase restore does not hide the approval's own out-of-memory error" {
+    var turn = TurnContext.initHosted(std.testing.allocator, 8);
+    defer turn.deinit();
+    turn.child_id = "child_a";
+    var phase_context: u8 = 0;
+    turn.phase_context = &phase_context;
+    turn.phase_fn = RefusingRestorePhase.apply;
+    var host_context: u8 = 0;
+    turn.host_prompter = .{ .context = &host_context, .request_fn = AllocatingHostPrompter.request };
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
+    const call: types.ToolCall = .{ .id = "call_1", .name = "shell", .arguments_json = "{}" };
+    const request: permission_request.PermissionRequest = .{ .label = "run a command" };
+    try std.testing.expectError(error.OutOfMemory, turn.askHost(failing.allocator(), request, call, null, null, "child_a", "work_1"));
+}
+
+/// A phase function that allocates, as the owner's does when it loads the
+/// child's state, so an out-of-memory allocator fails the phase change.
+const AllocatingPhase = struct {
+    alloc: Allocator,
+
+    fn apply(raw: *anyopaque, _: []const u8, _: []const u8, _: child_state.Phase) anyerror!void {
+        const self: *AllocatingPhase = @ptrCast(@alignCast(raw));
+        const scratch = try self.alloc.alloc(u8, 1);
+        self.alloc.free(scratch);
+    }
+};
+
+/// A phase function that takes the child to awaiting approval but refuses to
+/// take it back to running.
+const RefusingRestorePhase = struct {
+    fn apply(_: *anyopaque, _: []const u8, _: []const u8, phase: child_state.Phase) anyerror!void {
+        if (phase == .running) return error.PhaseRefused;
+    }
+};
 
 test "child compaction preserves work identity and permits final commit" {
     const alloc = std.testing.allocator;
@@ -280,6 +379,16 @@ pub const TurnContext = struct {
     live_authority: ?*authority_mod.Resolver = null,
     approval_registry: ?*approval_registry_mod.Registry = null,
     approval_worker_route: ?approval_registry_mod.WorkerRoute = null,
+    /// For a turn no screen shows, in fx acp and fx ask: the prompter its
+    /// host handed the run. A permission request goes to it on this turn's
+    /// thread; with none, the request fails at once with
+    /// `error.PermissionPromptUnavailable` rather than waiting on a worker
+    /// nobody reads.
+    host_prompter: ?permission_prompter.Prompter = null,
+    /// Where the host hears each of this turn's calls start and end, when it
+    /// shows them: fx acp ends the card a permission request announced with
+    /// the call's real status. Set for the length of one run.
+    tool_activity_sink: ?runtime_deps.ToolActivityRecorder = null,
     child_id: ?[]const u8 = null,
     /// The name the parent gave the child, such as `reviewer`, or null for a
     /// one-off. Borrowed for the turn.
@@ -489,6 +598,7 @@ pub const TurnContext = struct {
         const self: *TurnContext = @ptrCast(@alignCast(raw));
         const child_id = self.child_id orelse return error.ChildNotAttached;
         const work_id = self.active_work_id orelse return error.StaleRequest;
+        if (self.hosted_worker == null) return self.askHost(alloc, request, call, review, grant_offer, child_id, work_id);
         const prepared = approval_registry_mod.preparedRequestFingerprint(request);
         const grant = types.PermissionGrant{
             .tool_name = @constCast(call.name),
@@ -509,6 +619,62 @@ pub const TurnContext = struct {
             review,
             .{ .context = &context, .observe_fn = PermissionObservation.observe },
         );
+    }
+
+    /// Asks the host's prompter, which answers on this thread. A subagent that
+    /// cannot be asked fails with `error.PermissionPromptUnavailable`, which
+    /// says noninteractive mode (fx ask gives subagents no prompter), or with
+    /// the error that names why when the host's prompter knows: the prompt is
+    /// closed, the subagent was stopped, too many requests are open, or the
+    /// client cannot be reached. Admission turns each into an outcome that
+    /// says approval was required and could not be asked, where a denial
+    /// would say the person refused. Nothing runs, and the trace says why.
+    /// Out of memory is no refusal: it comes out as `error.OutOfMemory`, and
+    /// the turn fails as any allocation failure does.
+    ///
+    /// The request is already one wait for the subagent's observer: the
+    /// admission prompter that called this began it. The host's prompter is a
+    /// copy that holds the same observer, so the copy forgets it, and an
+    /// approval is one wait, not two nested (`sdk/README.md` hooks).
+    fn askHost(
+        self: *TurnContext,
+        alloc: Allocator,
+        request: permission_request.PermissionRequest,
+        call: types.ToolCall,
+        review: ?*const @import("../output/diff.zig").FileReview,
+        grant_offer: ?[]const types.PermissionGrant,
+        child_id: []const u8,
+        work_id: []const u8,
+    ) !permission_request.OwnedPermissionResponse {
+        var host = self.host_prompter orelse {
+            debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=no_host_prompter", .{ child_id, work_id });
+            return error.PermissionPromptUnavailable;
+        };
+        host.observer = null;
+        self.transitionPhase(work_id, .awaiting_approval) catch |err| {
+            debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=phase err={s}", .{ child_id, work_id, @errorName(err) });
+            return if (err == error.OutOfMemory) err else error.PermissionPromptUnavailable;
+        };
+        const answer = host.request(alloc, request, call, review, grant_offer);
+        // The phase goes back to running on every path. When the approval
+        // succeeded, a failed restore is the turn's error and the answer is
+        // freed. When the approval already failed, its error stays, and the
+        // restore failure is only traced.
+        self.transitionPhase(work_id, .running) catch |restore_err| {
+            debug_trace.logf("subagent", "approval phase not restored child_id={s} work_id={s} err={s}", .{ child_id, work_id, @errorName(restore_err) });
+            if (answer) |response| {
+                var owned = response;
+                owned.deinit();
+                return restore_err;
+            } else |_| {}
+        };
+        return answer catch |err| {
+            debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=host err={s}", .{ child_id, work_id, @errorName(err) });
+            // The error that names the cause passes through, and so does out
+            // of memory, which names no cause but is no refusal either. Any
+            // other failure of the host's prompter names none.
+            return if (err == error.OutOfMemory or permission_prompter.unavailableCause(err) != null) err else error.PermissionPromptUnavailable;
+        };
     }
 
     const PermissionObservation = struct {
@@ -562,11 +728,15 @@ pub const TurnContext = struct {
     }
 
     fn recordToolActivity(
-        _: *anyopaque,
-        _: []const u8,
-        _: []const u8,
-        _: runtime_deps.ToolActivityPhase,
-    ) !void {}
+        raw: *anyopaque,
+        call_id: []const u8,
+        tool_name: []const u8,
+        phase: runtime_deps.ToolActivityPhase,
+    ) !void {
+        const self: *TurnContext = @ptrCast(@alignCast(raw));
+        const sink = self.tool_activity_sink orelse return;
+        try sink.record(call_id, tool_name, phase);
+    }
 
     pub fn registerApproval(
         self: *TurnContext,
@@ -597,7 +767,6 @@ pub const TurnContext = struct {
             try self.transitionPhase(work_id, .running);
             return err;
         };
-        debug_trace.eventf("subagent", "approval_wait_registered", .{}, "child={s} work_id={s}", .{ child_id, work_id });
     }
 
     fn transitionPhase(

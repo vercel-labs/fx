@@ -2381,6 +2381,7 @@ fn availableModelCapabilities(raw_ctx: *anyopaque, model: []const u8) model_capa
 fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []const u8) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx.?));
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
+    if (!bundle.capabilities.authoritative_model_catalog) return .no_catalog;
     const catalog_provider = bundle.model_catalog orelse return .no_catalog;
     _ = ctx.capability_resolver.resolveWithin(
         ctx.alloc,
@@ -3356,7 +3357,7 @@ fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
             .terminal, .terminal_no_color => try ctx.presenter.?.pushText(text),
             .quiet, .json, .raw => {},
         },
-        .operational => |text| switch (ctx.output_mode) {
+        .operational, .turn_failure, .saved_reply => |text| switch (ctx.output_mode) {
             .terminal, .terminal_no_color => try ctx.presenter.?.pushText(text),
             .quiet, .json, .raw => try ctx.writeStderr(text),
         },

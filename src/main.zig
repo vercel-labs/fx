@@ -115,6 +115,7 @@ const agent_frame = @import("core/shared/agent_frame.zig");
 const subagent_tool_host = @import("core/subagent/tool_host.zig");
 const types = @import("core/shared/types.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
+const clipboard_read_mod = @import("core/images/clipboard_read.zig");
 const permissions = @import("core/permissions/permissions.zig");
 const command_runner = @import("core/execution/command_runner.zig");
 const command_admission = @import("core/permissions/command_admission.zig");
@@ -642,6 +643,8 @@ const App = struct {
     should_exit: bool = false,
     input_runtime: InputRuntime = .{},
     terminal_input_runtime: TerminalInputRuntime = .{},
+    /// The clipboard image read for /paste and Ctrl+V, off the input loop.
+    clipboard_read: clipboard_read_mod.Runtime = .{},
     /// The main conversation's own state.
     main_agent: agents.Agent = .{},
     /// The agent the main loop is working for. Null means main, so `App` can
@@ -1108,6 +1111,8 @@ const App = struct {
         self.file_index.requestStop();
         WorkspaceAppRuntime.requestStop(self);
         main_agent.managed_executions.terminateForProcessExit();
+        // Kills an osascript still exporting the clipboard and joins its worker.
+        self.clipboard_read.deinit(self.alloc);
         shutdown_trace.mark("background_stops_requested");
         // Terminals belong to this process and end with it, with no prompt.
         // Subagents share this client, so theirs end here too. Ending them
@@ -1207,6 +1212,7 @@ const App = struct {
         };
         self.terminal_client.deinit();
         main_agent.managed_executions.deinit();
+        self.clipboard_read.deinit(self.alloc);
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
         self.credits_lookup.deinit();
@@ -3495,6 +3501,7 @@ const App = struct {
         InputSubmitRuntime.collectPendingSubmissionFacts(self, self.screenAgent());
         try InputSubmitRuntime.collectLaunchPromptFacts(self, max_prompt_history);
         InputAppRuntime.collectFilePickerFacts(self, self.screenAgent());
+        if (comptime !host_target.is_wasm) try InputAppRuntime.collectClipboardImageFacts(self);
 
         try self.collectThemeFacts();
         self.collectBracketedPasteFacts();
@@ -5676,6 +5683,7 @@ test {
     _ = @import("core/agent/runtime/tool_admission.zig");
     _ = @import("core/agent/runtime/prompt_context.zig");
     _ = @import("core/agent/runtime/runtime_context.zig");
+    _ = @import("core/permissions/permission_prompter.zig");
     _ = @import("core/app/app_agent_runtime.zig");
     _ = @import("core/app/app_auth_runtime.zig");
     _ = auth_runtime;
@@ -5773,6 +5781,10 @@ test {
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/mcp_host/kept_sign_outs.zig");
+    _ = @import("core/auth/secret.zig");
+    _ = @import("core/auth/subscription_session.zig");
+    _ = @import("core/auth/browser_callback.zig");
+    _ = @import("core/shared/testing_allocator.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/workspace_capture.zig");
     _ = @import("core/workspace/capture_store.zig");
@@ -5800,10 +5812,12 @@ test {
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");
     _ = @import("core/hosts/host.zig");
+    _ = @import("core/hosts/native_keychain_reply_tests.zig");
     _ = @import("core/hooks/common.zig");
     _ = @import("core/hooks/definitions.zig");
     _ = @import("core/hooks/prompt.zig");
     _ = @import("core/hooks/runtime.zig");
+    _ = @import("core/images/clipboard_read.zig");
     _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_commands.zig");
     _ = @import("core/shared/input_loop_guard.zig");
@@ -6141,6 +6155,77 @@ fn addTestChildAgent(app: *App, id: []const u8) !*app_agents_runtime.ChildAgent 
     errdefer app.alloc.free(child.id);
     try app.child_agents.append(app.alloc, child);
     return child;
+}
+
+test "a clipboard read finds the agent that asked: on screen, hidden with its own draft and transcript, or gone" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    try app.shell.notebook.transcript.appendSlice(alloc, "main text\n");
+
+    const Draft = @import("core/input/composer_stash.zig").State;
+    const Seen = struct {
+        runs: usize = 0,
+        draft: ?*Draft = null,
+        agent: ?*agents.Agent = null,
+        transcript_empty: bool = false,
+
+        fn run(seen: *@This(), a: *App, draft: ?*Draft) anyerror!void {
+            seen.runs += 1;
+            seen.draft = draft;
+            seen.agent = a.screenAgent();
+            seen.transcript_empty = a.shell.notebook.transcript.items.len == 0;
+        }
+    };
+
+    var on_screen: Seen = .{};
+    try std.testing.expect(try App.AgentsAppRuntime.withAgentDraft(&app, &app.main_agent, &on_screen, Seen.run));
+    try std.testing.expect(on_screen.draft == null);
+    try std.testing.expect(on_screen.agent == &app.main_agent);
+
+    var hidden: Seen = .{};
+    try std.testing.expect(try App.AgentsAppRuntime.withAgentDraft(&app, &child.agent, &hidden, Seen.run));
+    try std.testing.expect(hidden.draft == &child.screen.draft);
+    try std.testing.expect(hidden.agent == &child.agent);
+    try std.testing.expect(hidden.transcript_empty);
+    try std.testing.expect(app.screenAgent() == &app.main_agent);
+    try std.testing.expectEqualStrings("main text\n", app.shell.notebook.transcript.items);
+
+    const stranger: u8 = 0;
+    var gone: Seen = .{};
+    try std.testing.expect(!try App.AgentsAppRuntime.withAgentDraft(&app, &stranger, &gone, Seen.run));
+    try std.testing.expectEqual(@as(usize, 0), gone.runs);
+}
+
+fn noClipboardImageForTest(_: ?*anyopaque, _: Allocator, _: image_attachments.CaptureBudget) anyerror!image_attachments.ClipboardImageAttachment {
+    return error.NoClipboardImage;
+}
+
+test "closing the agent that asked makes its clipboard read finish without it" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    app.clipboard_read.loader = .{ .load = noClipboardImageForTest };
+    defer app.clipboard_read.deinit(alloc);
+    const child = try addTestChildAgent(&app, "child-1");
+
+    try std.testing.expectEqual(clipboard_read_mod.Start.started, try app.clipboard_read.start(alloc, &child.agent));
+    App.AgentsAppRuntime.dropHosted(&app, child);
+
+    var waited_ms: usize = 0;
+    const finished = while (true) : (waited_ms += 1) {
+        if (app.clipboard_read.take()) |taken| break taken;
+        try std.testing.expect(waited_ms < 10_000);
+        io_mod.sleep(std.time.ns_per_ms);
+    };
+    var owned = finished;
+    defer owned.outcome.deinit(alloc);
+    try std.testing.expect(owned.requester == null);
 }
 
 /// Puts a prompt in `agent`'s queue as a submit does, for tests. The queue

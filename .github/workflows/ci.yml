@@ -127,6 +127,8 @@ jobs:
 
       - name: Walk fx ask turns along the malformed tool call model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/malformed.ts --self-check
+      - name: Walk fx ask turns along the response language model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/response_language.ts --self-check
 
       - name: Walk fx ask turns along the output limit model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/output_limit.ts --self-check
@@ -536,6 +538,8 @@ jobs:
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 4 --hooks
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 6 --backend wasm
           bun tests/tla/drivers/drive-steer.mjs faults --walks 8 --seed 8 --stream-lag 400
+          TLA2TOOLS_JAR="$jar" bun tests/tla/drivers/sdk/ui-order.ts
+          TLA2TOOLS_JAR="$jar" bun tests/tla/drivers/sdk/ui-order.ts --fuzz 20 --seed 3
 
       - name: Test libfx on a World
         run: |

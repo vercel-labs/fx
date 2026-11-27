@@ -7443,7 +7443,13 @@ fn permissionDeniedModelOutput(
             if (outcome.auto_review_result) |result| result.rationale else null,
             outcome.auto_review_failure,
         ),
-        .user_denied, .auto_denied, .policy_denied, .permission_required => tool_result_errors.toolPermissionDeniedJson(
+        // An approval a prompter could not ask for says why, where the plain
+        // refusal says noninteractive mode.
+        .permission_required => if (outcome.approval_unavailable) |cause|
+            tool_result_errors.toolApprovalUnavailableJson(alloc, tool_name, cause)
+        else
+            tool_result_errors.toolPermissionDeniedJson(alloc, tool_name, reason),
+        .user_denied, .auto_denied, .policy_denied => tool_result_errors.toolPermissionDeniedJson(
             alloc,
             tool_name,
             reason,
@@ -8966,8 +8972,8 @@ fn processQueuedPromptLoop(
                     // connection fx could not make.
                     const failure = if (deps.model_catalog_failure) |catalog_failure| catalog_failure(deps.ctx) else null;
                     if (try catalogUnreachableImageLine(overlay_arena, failure, model_catalog.serviceName(job.provider))) |line| {
-                        try deps.push_text(deps.ctx, .{ .operational = line });
-                        try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                        try deps.push_text(deps.ctx, .{ .turn_failure = line });
+                        try deps.push_text(deps.ctx, .{ .turn_failure = "\n" });
                     }
                     return error.ModelImageCapabilityUnavailable;
                 },
@@ -10301,7 +10307,7 @@ fn processQueuedPromptLoop(
                             continue;
                         }
                         stream_ctx.drop_staged_response_language_candidate();
-                        try deps.push_system_notice(deps.ctx, response_language_failure_notice);
+                        try deps.pushTurnFailureNotice(response_language_failure_notice);
                         finish_trace.finish("response_language_mismatch");
                         return error.ResponseLanguageMismatch;
                     },
@@ -10446,6 +10452,7 @@ fn processQueuedPromptLoop(
                                 &finish_trace,
                                 malformed_tool_call_failed_notice,
                                 "malformed_tool_call",
+                                null,
                             );
                             return;
                         }
@@ -10552,7 +10559,7 @@ fn processQueuedPromptLoop(
                     attempt_completion.tool_calls.len,
                 });
                 if (attempt_completion.provider_failure_cause == .non_retryable) {
-                    try deps.push_system_notice(deps.ctx, diagnostic.view());
+                    try deps.pushTurnFailureNotice(diagnostic.view());
                     restorePromptAfterTerminalFailure(deps, job, config);
                     const failed_assistant_source = stream_ctx.interruption_source_or("");
                     if (stop_state.retained_candidate == null and
@@ -10787,6 +10794,8 @@ fn processQueuedPromptLoop(
                 finish_trace.finish("invalid_tool_finish");
                 return error.ModelError;
             },
+            // Only a finish passes these; a completion never has them.
+            .step_limited, .kept_failure => unreachable,
         }
         if (successful_vision_mode == .required and completion.tool_calls.len == 0) {
             try pushTerminalAutoRetryStatusIfNeeded(
@@ -11250,13 +11259,14 @@ fn processQueuedPromptLoop(
                     &finish_trace,
                     try emptyReplyNotice(arena, provider_reason, empty_reply_follow_up),
                     "empty_reply",
+                    null,
                 );
                 return;
             }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {
-                    try deps.push_text(deps.ctx, .{ .operational = rendered });
+                    try deps.push_text(deps.ctx, .{ .saved_reply = rendered });
                 }
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
@@ -11309,7 +11319,7 @@ fn processQueuedPromptLoop(
             stop_state.retained_candidate = history_text;
             stop_state.latest_partial = null;
             if (!has_content) {
-                try deps.push_text(deps.ctx, .{ .operational = rendered });
+                try deps.push_text(deps.ctx, .{ .saved_reply = rendered });
             }
             try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
@@ -13964,6 +13974,7 @@ fn processQueuedPromptLoop(
                 &finish_trace,
                 repeated_malformed_arguments_notice,
                 "repeated_malformed_tool_arguments",
+                null,
             );
             return;
         }
@@ -13988,6 +13999,7 @@ fn processQueuedPromptLoop(
                 &finish_trace,
                 repeated_terminal_validation_notice,
                 "terminal_validation_retry",
+                null,
             );
             return;
         }
@@ -14017,6 +14029,7 @@ fn processQueuedPromptLoop(
                 &finish_trace,
                 repeated_shell_execution_failure_notice,
                 "repeated_shell_execution_failure",
+                null,
             );
             return;
         }
@@ -14189,6 +14202,7 @@ fn processQueuedPromptLoop(
         &finish_trace,
         config.step_limit_notice,
         "step_limit",
+        .step_limited,
     );
 }
 
@@ -14203,9 +14217,10 @@ fn finishFailedTurnWithNotice(
     finish_trace: *PromptFinishTrace,
     notice: []const u8,
     trace_outcome: []const u8,
+    disposition: ?types.ProviderCompletionDisposition,
 ) !void {
-    try deps.push_text(deps.ctx, .{ .operational = notice });
-    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+    try deps.push_text(deps.ctx, .{ .turn_failure = notice });
+    try deps.push_text(deps.ctx, .{ .turn_failure = "\n" });
     if (stop_state.retained_candidate != null) {
         const assistant_text = try runtime_finalization.stopTerminalText(
             arena,
@@ -14222,7 +14237,7 @@ fn finishFailedTurnWithNotice(
             summary_accumulator,
             assistant_text,
             .failed,
-            null,
+            disposition,
             finish_trace,
             trace_outcome,
             null,
@@ -14242,7 +14257,7 @@ fn finishFailedTurnWithNotice(
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     try deps.propagate_history_turn(deps.ctx, turn);
-    try finalization.finish(.failed, null, .{
+    try finalization.finish(.failed, disposition, .{
         .turn = try types.dupeHistoryTurn(std.heap.c_allocator, turn),
         .summary = completed_summary,
     });
@@ -14548,6 +14563,7 @@ test "eb03: UserTurn carries job.input_id in turn-piece writes, checkpoints, and
         &trace,
         "notice text",
         "failed_notice",
+        null,
     );
     try std.testing.expectEqual(@as(usize, 1), notice_fake.history_turns.items.len);
     try std.testing.expectEqual(@as(?u64, 64), notice_fake.history_turns.items[0].assistant.user.input_id);

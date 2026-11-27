@@ -1,8 +1,8 @@
 #!/bin/sh
 # Model-checks DurableSession.tla, DurableHandOff.tla, PromptIntake.tla,
-# ImageStore.tla, DurableSteer.tla and AgentRouting.tla with TLC, confirms
-# each witness is violated, and writes the state graphs the drivers in
-# ../drivers/ walk against the code.
+# ImageStore.tla, DurableSteer.tla, AgentRouting.tla and UiStreamOrder.tla with
+# TLC, confirms each witness is violated, and writes the state graphs the
+# drivers in ../drivers/ walk against the code.
 #
 # Needs Java 11+ and tla2tools.jar:
 #   brew install openjdk
@@ -21,6 +21,7 @@
 #   bun ../drivers/drive-agents.mjs   # AgentRouting
 #   bun ../drivers/drive-steer.mjs ideal && bun ../drivers/drive-steer.mjs faults   # DurableSteer
 #   bun ../drivers/drive-tenants.mjs   # TenantIsolation
+#   bun ../drivers/sdk/ui-order.ts   # UiStreamOrder, with TLC checking each run
 set -eu
 cd "$(dirname "$0")"
 
@@ -74,6 +75,9 @@ for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoAct
         echo "== witness $witness NOT reached" >&2; status=1
     fi
 done
+# UiStreamOrder.tla: the order a viewer sees a session's UI lines in, which
+# check-ui-order.sh checks with its planted mutations.
+./check-ui-order.sh || status=1
 # DurableHandOff.tla: a host hands one worker's process off, as on SIGTERM
 # (agent.handOff()). The lookup graph is the one drive.mjs handoff walks; the
 # send config adds a freeze and a call with effects.
@@ -279,4 +283,20 @@ for pair in "TrustBody:Invariant OnlySentRuns is violated" "ShareName:Invariant 
         echo "== tenant witness $witness NOT reached" >&2; status=1
     fi
 done
+
+# QueueRecovery.tla: restart recovery on a World the app shares with the
+# Workflow SDK. QueueRecovery is libfx as it is and must pass. NoNamespace is
+# libfx before its sessions recorded their queue namespace: recovery sends
+# them to the Workflow SDK, which fails them. NoBareAck records it but has a
+# route that refuses a recovery message when no agent is named "default",
+# which the World delivers again. ../drivers/sdk/queue-recovery.ts checks
+# runs of the real SDK against it through QueueRecoveryTrace.tla.
+echo "== QueueRecovery"
+# shellcheck source=../lib/tlc.sh
+. ../lib/tlc.sh
+tlc_verdicts <<'VERDICTS' || status=1
+QueueRecovery QueueRecovery -
+QueueRecovery QueueRecovery-NoNamespace LibfxRunsNotFailed
+QueueRecovery QueueRecovery-NoBareAck RecoveryAckedFirstTime
+VERDICTS
 exit "$status"

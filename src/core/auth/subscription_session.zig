@@ -39,7 +39,7 @@ pub const DeleteOutcome = enum {
 };
 
 pub fn refreshDeadlineMs(expires_at_ms: i64) i64 {
-    return @max(expires_at_ms - expiry_skew_ms, 0);
+    return @max(expires_at_ms -| expiry_skew_ms, 0);
 }
 
 /// `invalid_session` and `unavailable` are error literals such as
@@ -155,7 +155,8 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
                 return error.InsecureAuthFile;
             }
 
-            const bytes = io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes) catch |err| return session_presence.storageError(spec.auth_file_name, err);
+            var wiping: secret.Wiping = .init(alloc);
+            const bytes = io_mod.readFileToEnd(wiping.allocator(), &file, max_auth_file_bytes) catch |err| return session_presence.storageError(spec.auth_file_name, err);
             defer secret.zeroAndFree(alloc, bytes);
             return parse(alloc, bytes) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -215,7 +216,8 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
         }
 
         pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+            var wiping: secret.Wiping = .init(alloc);
+            var parsed = try std.json.parseFromSlice(std.json.Value, wiping.allocator(), bytes, .{});
             defer parsed.deinit();
             if (parsed.value != .object) return invalid_session;
             const object = parsed.value.object;
@@ -242,7 +244,8 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
         /// can always be loaded again.
         pub fn stringify(alloc: Allocator, session: Session) ![]u8 {
             if (!types.validCredentialAccountId(session.account_id)) return invalid_session;
-            var out: std.Io.Writer.Allocating = .init(alloc);
+            var wiping: secret.Wiping = .init(alloc);
+            var out: std.Io.Writer.Allocating = .init(wiping.allocator());
             errdefer out.deinit();
             try out.writer.writeAll("{\"version\":1,\"access_token\":");
             try std.json.Stringify.value(session.access_token, .{}, &out.writer);
@@ -319,6 +322,65 @@ test "subscription auth session round trips without exposing token fields to str
 test "subscription session refresh deadline keeps a one minute safety margin" {
     try std.testing.expectEqual(@as(i64, 40_000), refreshDeadlineMs(100_000));
     try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(10_000));
+    try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(0));
+    try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(-1));
+    try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(std.math.minInt(i64) + expiry_skew_ms));
+    try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(std.math.minInt(i64) + expiry_skew_ms - 1));
+    try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(std.math.minInt(i64)));
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64) - expiry_skew_ms), refreshDeadlineMs(std.math.maxInt(i64)));
+}
+
+test "subscription session reads an out-of-range stored expiry as expired" {
+    // The auth file's expiry is any JSON integer, so the smallest i64 has to
+    // read as expired rather than overflow when the margin is subtracted.
+    const alloc = std.testing.allocator;
+    var session = try TestStore.parse(alloc,
+        \\{"version":1,"access_token":"access","refresh_token":"refresh","expires_at_ms":-9223372036854775808,"account_id":"acct"}
+    );
+    defer session.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), session.expires_at_ms);
+    try std.testing.expect(session.expired(0));
+}
+
+fn fuzzStoredExpiry(_: void, smith: *std.testing.Smith) !void {
+    // The margin matters at both edges of i64 and around zero, so those are
+    // drawn as often as anywhere else.
+    const expires_at_ms: i64 = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+        0 => smith.value(i64),
+        1 => std.math.minInt(i64) + smith.valueRangeAtMost(i64, 0, 2 * expiry_skew_ms),
+        2 => std.math.maxInt(i64) - smith.valueRangeAtMost(i64, 0, 2 * expiry_skew_ms),
+        else => smith.valueRangeAtMost(i64, -2 * expiry_skew_ms, 2 * expiry_skew_ms),
+    };
+    const now_ms = smith.valueRangeAtMost(i64, 0, std.math.maxInt(i64));
+    const deadline = refreshDeadlineMs(expires_at_ms);
+    const want: i64 = if (expires_at_ms >= expiry_skew_ms) expires_at_ms - expiry_skew_ms else 0;
+    try std.testing.expectEqual(want, deadline);
+
+    // The same answer after the expiry is saved and read back.
+    const alloc = std.testing.allocator;
+    var session = TestStore.Session{
+        .access_token = try alloc.dupe(u8, "access"),
+        .refresh_token = try alloc.dupe(u8, "refresh"),
+        .expires_at_ms = expires_at_ms,
+        .account_id = try alloc.dupe(u8, "acct"),
+    };
+    defer session.deinit(alloc);
+    const encoded = try TestStore.stringify(alloc, session);
+    defer secret.zeroAndFree(alloc, encoded);
+    var decoded = try TestStore.parse(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(expires_at_ms, decoded.expires_at_ms);
+    try std.testing.expectEqual(deadline <= now_ms, decoded.expired(now_ms));
+    // An expiry that has passed reads as expired, and one more than the
+    // margin ahead does not.
+    if (expires_at_ms <= now_ms) try std.testing.expect(decoded.expired(now_ms));
+    if (expires_at_ms > now_ms and expires_at_ms - now_ms > expiry_skew_ms) try std.testing.expect(!decoded.expired(now_ms));
+}
+
+test "a stored subscription expiry reads as expired or live on fuzzed values" {
+    try std.testing.fuzz({}, fuzzStoredExpiry, .{
+        .corpus = &(@import("fuzz_seed").slices(.{""}) ++ @import("fuzz_corpus").subscription_expiry.*),
+    });
 }
 
 test "subscription session refuses to save an account ID it could not load" {
@@ -331,4 +393,45 @@ test "subscription session refuses to save an account ID it could not load" {
     };
     defer session.deinit(alloc);
     try std.testing.expectError(error.InvalidTestAuthSession, TestStore.stringify(alloc, session));
+}
+
+test "saving and loading a subscription session gives back no block that still holds its tokens" {
+    const testing_allocator = @import("../shared/testing_allocator.zig");
+    // A short token, and one long enough to outgrow a buffer that grows.
+    var long: [1200]u8 = @splat('x');
+    @memcpy(long[0.."SECRET_MARK".len], "SECRET_MARK");
+    for ([_][]const u8{ "SECRET_MARK", &long }) |token| {
+        const session: TestStore.Session = .{
+            .access_token = @constCast(token),
+            .refresh_token = @constCast(token),
+            .expires_at_ms = 1234,
+            .account_id = @constCast("acct_test"),
+        };
+        {
+            var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+            const alloc = scan.allocator();
+            const text = try TestStore.stringify(alloc, session);
+            var loaded = try TestStore.parse(alloc, text);
+            secret.zeroAndFree(alloc, text);
+            loaded.deinit(alloc);
+            try scan.expectWiped();
+        }
+        {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const text = try TestStore.stringify(std.testing.allocator, session);
+            defer secret.zeroAndFree(std.testing.allocator, text);
+            var file = try tmp.dir.createFile(std.testing.io, "test-auth.json", .{
+                .truncate = true,
+                .permissions = std.Io.File.Permissions.fromMode(0o600),
+            });
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, text);
+            var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+            const alloc = scan.allocator();
+            var loaded = (try TestStore.loadFromDir(alloc, &tmp.dir)).?;
+            loaded.deinit(alloc);
+            try scan.expectWiped();
+        }
+    }
 }

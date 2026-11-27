@@ -42,6 +42,7 @@ pub const Result = struct {
     candidate_incomplete: bool = false,
     candidate_cap_reached: bool = false,
     skipped_overlong: usize = 0,
+    skipped_by_name: tool_files.SkippedByName = .{},
 };
 
 /// Owned-in-arena summary of a grep search count pass.
@@ -53,6 +54,7 @@ pub const CountResult = struct {
     candidate_incomplete: bool = false,
     candidate_cap_reached: bool = false,
     skipped_overlong: usize = 0,
+    skipped_by_name: tool_files.SkippedByName = .{},
 };
 
 /// Collects literal line matches below a directory root. Returned slices are
@@ -211,6 +213,7 @@ const CandidateStats = struct {
     incomplete: bool = false,
     cap_reached: bool = false,
     skipped_overlong: usize = 0,
+    skipped_by_name: tool_files.SkippedByName = .{},
 
     fn fromListing(listing: tool_files.Listing) CandidateStats {
         return .{
@@ -219,6 +222,7 @@ const CandidateStats = struct {
             .incomplete = listing.incomplete,
             .cap_reached = listing.cap_reached,
             .skipped_overlong = listing.skipped_overlong,
+            .skipped_by_name = listing.skipped_by_name,
         };
     }
 };
@@ -232,6 +236,7 @@ fn finishMatches(arena: Allocator, matches: *std.ArrayList(Match), truncated_rea
         .candidate_incomplete = stats.incomplete,
         .candidate_cap_reached = stats.cap_reached,
         .skipped_overlong = stats.skipped_overlong,
+        .skipped_by_name = stats.skipped_by_name,
     };
 }
 
@@ -242,6 +247,7 @@ fn finishCount(result: CountResult, stats: CandidateStats) CountResult {
     out.candidate_incomplete = stats.incomplete;
     out.candidate_cap_reached = stats.cap_reached;
     out.skipped_overlong += stats.skipped_overlong;
+    out.skipped_by_name = stats.skipped_by_name;
     return out;
 }
 
@@ -640,7 +646,7 @@ fn scanLines(
                 // The line is longer than the buffer. Take what is buffered,
                 // up to the last whole UTF-8 sequence, and keep reading it.
                 const buffered = reader.buffered();
-                const piece = buffered[0 .. buffered.len - incompleteUtf8Tail(buffered)];
+                const piece = buffered[0 .. buffered.len - text_utils.incompleteUtf8Tail(buffered)];
                 if (!isLineText(display_path, piece)) return .not_text;
                 try long.add(scratch, piece, pattern, case_insensitive);
                 reader.toss(piece.len);
@@ -723,19 +729,6 @@ const LongLine = struct {
         }
     }
 };
-
-/// Number of bytes at the end of `bytes` that start a UTF-8 sequence the
-/// buffer cut short, at most 3.
-fn incompleteUtf8Tail(bytes: []const u8) usize {
-    var back: usize = 1;
-    while (back <= @min(3, bytes.len)) : (back += 1) {
-        const byte = bytes[bytes.len - back];
-        if (byte & 0b1100_0000 == 0b1000_0000) continue;
-        const needed = std.unicode.utf8ByteSequenceLength(byte) catch return 0;
-        return if (needed > back) back else 0;
-    }
-    return 0;
-}
 
 fn isLineText(display_path: []const u8, line: []const u8) bool {
     if (text_utils.isModelSafeText(line)) return true;

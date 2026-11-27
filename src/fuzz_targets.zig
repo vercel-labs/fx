@@ -5,9 +5,13 @@
 //! file imported here and an entry in the registry.
 
 test {
+    _ = @import("acp/command_output_text.zig");
     _ = @import("acp/jsonrpc.zig");
     _ = @import("acp/mcp_servers.zig");
     _ = @import("builtins/context.zig");
+    _ = @import("acp/prompt.zig");
+
+    _ = @import("acp/server.zig");
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/agent/presentation/inline_render.zig");
     _ = @import("core/auth/credentials.zig");
@@ -16,8 +20,11 @@ test {
     _ = @import("core/agent/runtime/execution_memory.zig");
     _ = @import("core/agent/runtime/orchestrator.zig");
     _ = @import("core/agent/runtime/parallel_execution.zig");
+    _ = @import("core/agent/runtime/response_language.zig");
     _ = @import("core/agent/runtime/vision_contracts.zig");
     _ = @import("core/agent/worker_runtime.zig");
+    _ = @import("core/auth/oauth.zig");
+    _ = @import("core/auth/grok_oauth.zig");
     _ = @import("core/cli/cli_flags.zig");
     _ = @import("core/config/configured_provider.zig");
     _ = @import("core/app/app_agents_runtime.zig");
@@ -28,6 +35,10 @@ test {
     _ = @import("core/app/host_record.zig");
     _ = @import("core/config/tool_placement.zig");
     _ = @import("core/gateway/token_pass_memory.zig");
+    _ = @import("core/auth/chatgpt_oauth.zig");
+    _ = @import("core/auth/grok_oauth.zig");
+    _ = @import("core/auth/subscription_session.zig");
+    _ = @import("core/images/clipboard_read.zig");
     _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_data.zig");
     _ = @import("core/images/image_route.zig");
@@ -45,6 +56,7 @@ test {
     _ = @import("core/mcp_host/owner_wire.zig");
     _ = @import("core/mcp_host/runtime.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
+    _ = @import("core/permissions/auto_classifier.zig");
     _ = @import("core/session/session_adapter.zig");
     _ = @import("core/profiles/profiles.zig");
     _ = @import("core/profiles/started_with.zig");
@@ -71,6 +83,7 @@ test {
     _ = @import("core/workspace/capture_retention.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/tool_call_metrics.zig");
+    _ = @import("core/workspace/tool_files.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/openai_codex.zig");

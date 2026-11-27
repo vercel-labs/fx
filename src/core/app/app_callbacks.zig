@@ -1013,6 +1013,10 @@ pub fn Bindings(comptime App: type) type {
         fn resolveSubagentModelOverride(ctx: ?*anyopaque, alloc: Allocator, raw_model: []const u8) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx.?));
             const app = appOf(agent);
+            // Checked before any cached list is read, so a provider whose catalog
+            // is not authoritative never rejects an override.
+            if (comptime !@hasDecl(App, "providerSet")) return .no_catalog;
+            if (!app.providerSet().select(provider_runtime.providerOf(app, agent)).capabilities.authoritative_model_catalog) return .no_catalog;
             if (comptime @hasDecl(App, "resolveModelCapabilitiesForRequest")) {
                 // Wait out a still-loading catalog so early delegation does not
                 // skip matching. Only cancellation maps to passthrough.
@@ -1454,6 +1458,7 @@ pub fn Bindings(comptime App: type) type {
                 .assistant_restarted => |text| try app_worker_runtime.Runtime(App).pushEvent(app, agent, .{
                     .assistant_presentation = .{ .attempt_restart = @constCast(text) },
                 }),
+                .turn_failure, .saved_reply => |text| try app_worker_runtime.Runtime(App).pushText(app, agent, text),
                 // The same text, marked once it shows, so the main screen
                 // draws the turn's later calls below it.
                 .operational => |text| {
