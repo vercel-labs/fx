@@ -22,6 +22,7 @@ const turn_capture = @import("../workspace/turn_capture.zig");
 const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
+const session_picker_test_controls = @import("session_picker_test_controls.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
 const types = @import("../shared/types.zig");
@@ -612,6 +613,7 @@ pub const SessionPickerLoad = struct {
 
     fn threadMain(task: *Task) void {
         defer task.done.store(true, .release);
+        session_picker_test_controls.holdCatalogLoad(&task.cancel_requested);
         const started = io_mod.nanoTimestamp();
         const summaries = session_adapter.listSummaries(
             task.store,

@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
@@ -88,19 +90,40 @@ describe("TUI custom connection errors", () => {
   test.skipIf(!tmuxAvailable())("resume: /resume names a session's changed connection", async () => {
     const f = fixture();
     let tui: TmuxSession | null = null;
+    const held = join(f.home, "picker-load.held");
+    const release = join(f.home, "picker-load.release");
     try {
       const first = await runFx(["ask", "--json", "first turn"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
       if (first.code !== 0) throw new Error(first.stdout + first.stderr);
       f.settings.providers.local.protocol = "anthropic-messages";
       f.save();
-      tui = await TmuxSession.create({ cwd: f.workspace, env: f.env, width: 220, height: 30 });
+      tui = await TmuxSession.create({
+        cwd: f.workspace,
+        env: {
+          ...f.env,
+          FX_TEST_SESSION_PICKER_LOAD_HELD: held,
+          FX_TEST_SESSION_PICKER_LOAD_RELEASE: release,
+        },
+        width: 220,
+        height: 30,
+      });
       await tui.waitForComposer(15000);
       await tui.sendText("/resume");
+      await tui.waitForPane((pane) => pane.includes("Loading sessions…") && existsSync(held), 15000);
+      writeFileSync(release, "");
+      await tui.waitForPane(
+        (pane) =>
+          pane.includes("Sessions 1") &&
+          pane.includes("first turn") &&
+          pane.includes("enter resume"),
+        15000,
+      );
       // The only saved session is selected, so Enter opens it.
       await tui.sendKeys("Enter");
       await tui.waitForText("This session's custom connection changed in ~/.fx/settings.json after the session was saved", 15000);
       expect(f.requests).toHaveLength(1);
     } finally {
+      if (!existsSync(release)) writeFileSync(release, "");
       await tui?.kill();
       f.close();
     }
