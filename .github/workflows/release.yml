@@ -82,6 +82,7 @@ jobs:
       # Keep release evidence long enough to serve as the main control for
       # manual PGSO comparisons.
       evidence-retention-days: 90
+      embed-google-client-secret: true
 
   build-linux-x86_64:
     needs: check-version
@@ -94,6 +95,7 @@ jobs:
       FX_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.FX_GOOGLE_OAUTH_CLIENT_SECRET }}
     with:
       evidence-retention-days: 90
+      embed-google-client-secret: true
 
   package-linux:
     needs: [check-version, build-linux-aarch64, build-linux-x86_64]
@@ -239,6 +241,7 @@ jobs:
       # Keep release evidence long enough to serve as the main control for
       # manual PGSO comparisons.
       evidence-retention-days: 90
+      embed-google-client-secret: true
 
   sign-macos-arm64:
     needs: [check-version, build-macos-arm64]

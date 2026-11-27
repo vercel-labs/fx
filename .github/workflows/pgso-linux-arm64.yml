@@ -11,6 +11,10 @@ on:
         description: Days to keep the qualified aggregate evidence
         type: number
         default: 14
+      embed-google-client-secret:
+        description: Build fx's Google OAuth client secret into the binaries (release runs only)
+        type: boolean
+        default: false
     outputs:
       artifact-id:
         description: Qualified PGSO evidence artifact ID
@@ -118,7 +122,8 @@ jobs:
 
       - name: Build immutable seed artifacts
         env:
-          FX_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.FX_GOOGLE_OAUTH_CLIENT_SECRET }}
+          # Only release runs ask for it; pull_request runs build without it.
+          FX_GOOGLE_OAUTH_CLIENT_SECRET: ${{ inputs.embed-google-client-secret && secrets.FX_GOOGLE_OAUTH_CLIENT_SECRET || '' }}
         run: |
           python3 -m scripts.pgso build \
             --llvm-bin "${{ steps.setup.outputs.llvm-bin }}" \

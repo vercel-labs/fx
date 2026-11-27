@@ -377,6 +377,8 @@ fn pollBrowserToken(
         cancel_flag,
         deadline,
     ) catch |err| {
+        // The exchange error is what the caller needs; a failed reply to the
+        // browser page changes nothing for it.
         if (accepted) |*callback| callback.respond(.failed) catch {};
         return err;
     };
@@ -585,6 +587,8 @@ pub fn runLoginWithOptions(
             stdin_url.clear();
         }
         switch (runtime.pollTransition(alloc)) {
+            // The callback listener and the pasted URL have no event to wait on
+            // together, so the wait polls both; 50 ms is fast enough to feel instant.
             .none => try io_mod.getIo().sleep(.fromMilliseconds(50), .awake),
             .succeeded => |completion| {
                 var owned = completion;

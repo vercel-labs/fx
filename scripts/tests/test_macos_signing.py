@@ -40,6 +40,23 @@ SECRET_NAMES = (
 )
 
 
+GOOGLE_CLIENT_SECRET_ONLY = (
+    "    secrets:\n"
+    "      FX_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.FX_GOOGLE_OAUTH_CLIENT_SECRET }}\n"
+)
+
+
+def assert_pgso_caller_passes_only_google_client_secret(test: unittest.TestCase, caller: str) -> None:
+    """A PGSO caller may pass fx's Google OAuth client secret, which the
+    release binaries are built with, and no other secret: signing secrets
+    stay in the signing jobs."""
+    test.assertEqual(1, caller.count("secrets:"))
+    test.assertIn(GOOGLE_CLIENT_SECRET_ONLY, caller)
+    test.assertEqual(1, caller.count("${{ secrets."))
+    for secret_name in SECRET_NAMES:
+        test.assertNotIn(secret_name, caller)
+
+
 class MacosSigningScriptTests(unittest.TestCase):
     def write_tool(self, root: pathlib.Path, name: str, body: str) -> pathlib.Path:
         path = root / name
@@ -647,7 +664,7 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         arm64_caller = release.split("  build-macos-arm64:\n", 1)[1].split(
             "\n  sign-macos-arm64:\n", 1
         )[0]
-        self.assertNotIn("secrets:", arm64_caller)
+        assert_pgso_caller_passes_only_google_client_secret(self, arm64_caller)
         self.assertNotIn("package_release", arm64_caller)
         sign_release = release.split("  sign-macos-arm64:\n", 1)[1].split(
             "\n  release:\n", 1
@@ -745,7 +762,7 @@ class LinuxReleaseWorkflowTests(unittest.TestCase):
                 caller = self.release_job(job)
                 self.assertIn(f"uses: ./.github/workflows/{workflow_path.name}", caller)
                 self.assertIn("evidence-retention-days: 90", caller)
-                self.assertNotIn("secrets:", caller)
+                assert_pgso_caller_passes_only_google_client_secret(self, caller)
                 workflow = workflow_path.read_text(encoding="utf-8")
                 triggers = workflow.split("\njobs:\n", 1)[0]
                 self.assertIn("  workflow_call:\n", triggers)
