@@ -224,7 +224,7 @@ pub const Line = struct {
 /// before `fork_seq` belong to the source and are skipped.
 pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) error{OutOfMemory}!void {
     switch (line.body) {
-        .session_created, .item, .snapshot, .closed => {},
+        .session_created, .item, .snapshot, .closed, .input_accepted, .input_delivered, .input_withdrawn => {},
         .turn_started => |t| {
             state.open_turn = t.turn;
             state.last_turn = @max(state.last_turn, t.turn);
@@ -269,6 +269,9 @@ pub const Event = union(enum) {
     set: schema.Body.Setting,
     child_spawned: schema.Body.WorkItem,
     child_finished: schema.Body.Finished,
+    input_accepted: schema.Body.InputAccepted,
+    input_delivered: schema.Body.InputRef,
+    input_withdrawn: schema.Body.InputRef,
 };
 
 /// One completed piece of a turn: fx's data, and the blobs it refers to.
@@ -325,6 +328,9 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
                 if (!std.mem.eql(u8, open, c.work_id)) return error.InvalidTransition;
                 break :blk .{ .child_finished = c };
             },
+            .input_accepted => |a| .{ .input_accepted = a },
+            .input_delivered => |r| .{ .input_delivered = r },
+            .input_withdrawn => |r| .{ .input_withdrawn = r },
         };
     }
 }
@@ -488,7 +494,7 @@ fn randomEvent(random: std.Random) Event {
     const values = [_][]const u8{ "\"v1\"", "{\"m\":\"v2\"}", "[1, 2]", "null" };
     const data = [_]?[]const u8{ null, "{\"name\":\"n\"}", "null" };
     const outcomes = [_]schema.Outcome{ .ok, .failed, .cancelled, .interrupted };
-    return switch (random.uintLessThan(u8, 9)) {
+    return switch (random.uintLessThan(u8, 12)) {
         0 => .turn_started,
         1 => .{ .item = .{ .type = "assistant", .data = "{\"text\":\"piece\"}" } },
         2 => .{ .compacted = "{\"summary\":\"s\"}" },
@@ -506,6 +512,9 @@ fn randomEvent(random: std.Random) Event {
             .outcome = outcomes[random.uintLessThan(usize, outcomes.len)],
             .data = data[random.uintLessThan(usize, data.len)],
         } },
+        8 => .{ .input_accepted = .{ .id = 1, .text = "queued" } },
+        9 => .{ .input_delivered = .{ .id = 1 } },
+        10 => .{ .input_withdrawn = .{ .id = 1 } },
         else => .turn_started,
     };
 }
@@ -515,7 +524,7 @@ fn specValid(open: bool, event: Event) ?bool {
     return switch (event) {
         .turn_started => !open,
         .item, .turn_committed, .turn_interrupted => open,
-        .compacted, .set => true,
+        .compacted, .set, .input_accepted, .input_delivered, .input_withdrawn => true,
         .child_spawned, .child_finished => null, // not in TurnLifecycle
     };
 }
@@ -698,4 +707,110 @@ test "snapshot state round trips" {
     try testing.expect(decoded.eql(&state));
     try testing.expectEqualStrings("null", decoded.usage.?);
     try testing.expectEqual(@as(?[]u8, null), decoded.prefs);
+}
+
+test "item outside a turn is still refused" {
+    var state: State = .{};
+    defer state.deinit(testing.allocator);
+    var one: [1]schema.Body = undefined;
+    try testing.expectError(error.InvalidTransition, plan(&state, &.{.{ .item = .{ .type = "assistant", .data = "{}" } }}, &one));
+}
+
+test "older reader: a log with input_accepted, input_delivered, and input_withdrawn folds to the same turn state" {
+    const base_lines = [_][]const u8{
+        "{\"v\":1,\"seq\":2,\"ts\":10,\"kind\":\"turn_started\",\"turn\":1",
+        "{\"v\":1,\"seq\":3,\"ts\":11,\"kind\":\"item\",\"turn\":1,\"type\":\"user\",\"data\":{\"text\":\"hi\"}",
+        "{\"v\":1,\"seq\":4,\"ts\":12,\"kind\":\"turn_committed\",\"turn\":1",
+        "{\"v\":1,\"seq\":5,\"ts\":13,\"kind\":\"turn_started\",\"turn\":2",
+        "{\"v\":1,\"seq\":6,\"ts\":14,\"kind\":\"item\",\"turn\":2,\"type\":\"user\",\"data\":{\"text\":\"next\"}",
+        "{\"v\":1,\"seq\":7,\"ts\":15,\"kind\":\"turn_interrupted\",\"turn\":2,\"reason\":\"cancel\"",
+    };
+    const with_inputs = [_][]const u8{
+        "{\"v\":1,\"seq\":2,\"ts\":10,\"kind\":\"input_accepted\",\"id\":1,\"text\":\"later\"",
+        "{\"v\":1,\"seq\":3,\"ts\":11,\"kind\":\"turn_started\",\"turn\":1",
+        "{\"v\":1,\"seq\":4,\"ts\":12,\"kind\":\"input_accepted\",\"id\":2,\"text\":\"steer\"",
+        "{\"v\":1,\"seq\":5,\"ts\":13,\"kind\":\"item\",\"turn\":1,\"type\":\"user\",\"data\":{\"text\":\"hi\"}",
+        "{\"v\":1,\"seq\":6,\"ts\":14,\"kind\":\"input_delivered\",\"id\":2",
+        "{\"v\":1,\"seq\":7,\"ts\":15,\"kind\":\"turn_committed\",\"turn\":1",
+        "{\"v\":1,\"seq\":8,\"ts\":16,\"kind\":\"input_withdrawn\",\"id\":1",
+        "{\"v\":1,\"seq\":9,\"ts\":17,\"kind\":\"turn_started\",\"turn\":2",
+        "{\"v\":1,\"seq\":10,\"ts\":18,\"kind\":\"item\",\"turn\":2,\"type\":\"user\",\"data\":{\"text\":\"next\"}",
+        "{\"v\":1,\"seq\":11,\"ts\":19,\"kind\":\"turn_interrupted\",\"turn\":2,\"reason\":\"cancel\"",
+    };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var base_state: State = .{};
+    defer base_state.deinit(testing.allocator);
+    for (base_lines) |raw| {
+        const h = try schema.parseHeader(raw);
+        if (h.kind) |k| {
+            const body = try schema.parseBody(arena.allocator(), k, raw[h.len..]);
+            try apply(testing.allocator, &base_state, 0, .{ .seq = h.seq, .offset = 0, .body = body });
+        }
+    }
+
+    var with_state: State = .{};
+    defer with_state.deinit(testing.allocator);
+    var recognized_inputs: usize = 0;
+    for (with_inputs) |raw| {
+        const h = try schema.parseHeader(raw);
+        if (h.kind) |k| {
+            if (std.mem.startsWith(u8, h.kind_name, "input_")) recognized_inputs += 1;
+            const body = try schema.parseBody(arena.allocator(), k, raw[h.len..]);
+            try apply(testing.allocator, &with_state, 0, .{ .seq = h.seq, .offset = 0, .body = body });
+        } else {
+            with_state.last_seq = h.seq;
+            with_state.clean_exit = false;
+        }
+    }
+
+    try testing.expectEqual(base_state.open_turn, with_state.open_turn);
+    try testing.expectEqual(base_state.last_turn, with_state.last_turn);
+    try testing.expectEqual(base_state.committed, with_state.committed);
+    try testing.expectEqual(base_state.interrupted, with_state.interrupted);
+    try testing.expectEqual(base_state.last_interrupted, with_state.last_interrupted);
+    try testing.expectEqual(base_state.last_compaction_seq, with_state.last_compaction_seq);
+    try testing.expectEqual(base_state.compaction_offset, with_state.compaction_offset);
+    try testing.expectEqual(@as(usize, 4), recognized_inputs);
+}
+
+test "input_accepted, input_delivered, and input_withdrawn plan and apply inside and outside turns without changing turn state" {
+    var state: State = .{};
+    defer state.deinit(testing.allocator);
+    var out: [3]schema.Body = undefined;
+
+    try plan(&state, &.{
+        .{ .input_accepted = .{ .id = 1, .text = "queued" } },
+        .{ .input_delivered = .{ .id = 1 } },
+        .{ .input_withdrawn = .{ .id = 2 } },
+    }, &out);
+    for (out, 1..) |body, seq| {
+        try apply(testing.allocator, &state, 0, .{ .seq = seq, .offset = 0, .body = body });
+    }
+    try testing.expectEqual(@as(?u64, null), state.open_turn);
+    try testing.expectEqual(@as(u64, 0), state.last_turn);
+    try testing.expectEqual(@as(u64, 0), state.committed);
+    try testing.expectEqual(@as(u64, 0), state.interrupted);
+    try testing.expectEqual(@as(?Interruption, null), state.last_interrupted);
+    try testing.expectEqual(@as(u64, 3), state.last_seq);
+
+    try apply(testing.allocator, &state, 0, .{ .seq = 4, .offset = 0, .body = .{ .turn_started = .{ .turn = 1 } } });
+    try testing.expectEqual(@as(?u64, 1), state.open_turn);
+
+    try plan(&state, &.{
+        .{ .input_accepted = .{ .id = 3, .text = "steer" } },
+        .{ .input_delivered = .{ .id = 3 } },
+        .{ .input_withdrawn = .{ .id = 4 } },
+    }, &out);
+    for (out, 5..) |body, seq| {
+        try apply(testing.allocator, &state, 0, .{ .seq = seq, .offset = 0, .body = body });
+    }
+    try testing.expectEqual(@as(?u64, 1), state.open_turn);
+    try testing.expectEqual(@as(u64, 1), state.last_turn);
+    try testing.expectEqual(@as(u64, 0), state.committed);
+    try testing.expectEqual(@as(u64, 0), state.interrupted);
+    try testing.expectEqual(@as(?Interruption, null), state.last_interrupted);
+    try testing.expectEqual(@as(u64, 7), state.last_seq);
 }

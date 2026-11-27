@@ -101,7 +101,7 @@ const shell_properties = [_]model_tool_schema.Property{
     .{ .name = "profile", .json_type = .string, .shape = &.{ .enum_values = &.{ "clean", "user" } }, .description = "For run: clean skips the user's startup files." },
     .{ .name = "shell", .json_type = .object, .shape = &.{ .object = &shell_executable_schema }, .description = "For run with tty=true: use this shell instead of the default." },
     .{ .name = "tty", .json_type = .boolean, .description = "For run: give the command a terminal, for interactive programs." },
-    .{ .name = "yield_time_ms", .json_type = .integer, .description = "For run and interact: how long to wait for output before returning. run waits up to 30000 (the default), interact up to 300000 (default 5000)." },
+    .{ .name = "yield_time_ms", .json_type = .integer, .description = "For run and interact: how long to wait for output before returning. run waits up to 300000 (default 30000), interact up to 300000 (default 5000). For a command you expect to run longer than 30000 ms, set yield_time_ms to a little more than its expected time." },
     .{ .name = "timeout_ms", .json_type = .integer, .description = "For run: kill the command after this long. Only when asked for a deadline." },
     .{ .name = "reload", .json_type = .boolean, .description = "For run: reload the user's startup files first, such as after installing a tool." },
     .{ .name = "session_id", .json_type = .string, .description = "For interact and stop." },
@@ -193,7 +193,7 @@ const subagent_description =
 // take, and the test below keeps these properties in step with it. The
 // decoder also owns every length limit, so the schema does not repeat them.
 const subagent_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "message", "wait", "status", "stop", "close" } } },
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "message", "wait", "status", "stop", "close" } }, .description = "wait blocks you, and the user cannot talk to you meanwhile. When nothing is left to do but wait, end your turn with a short status instead: each report starts your next turn. A subagent may still wait, since the end of its turn sends its report." },
     .{ .name = "agent", .json_type = .string, .description = "For message, stop, and close, optional for status: a lowercase name. As a subagent, \"parent\" is the agent that started you." },
     .{ .name = "message", .json_type = .string, .description = "For message: its task, or a message for its turn." },
     .{ .name = "instructions", .json_type = .string, .description = "For message: system instructions for this child." },
@@ -847,9 +847,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "a84217167d9345c518d346ab58d3e117b92ac636b5272af02720011c6aa99a99"
+            "39ab0d0fb9aa3e8811e4874d2cfce9dcfd0fd92f706ac1b7da1f5a56927186e6"
         else
-            "8b6048d8bf6145c7a37a2bc376d13d4b2cfae304b179a2bd1d2e464a138d87a1",
+            "4d81e7b55d64ef239ea329049dcb05c9f76d453cdc04518ce482613ee2be55d6",
         &actual_hex,
     );
 }
@@ -971,7 +971,8 @@ test "shell advertises only run interact and stop" {
         "Only when asked for a deadline",
         "Never rerun it",
         "check it is ready in that call",
-        "run waits up to 30000 (the default), interact up to 300000 (default 5000)",
+        "run waits up to 300000 (default 30000), interact up to 300000 (default 5000)",
+        "set yield_time_ms to a little more than its expected time",
         "run it with tty=true",
     }) |guidance| {
         try std.testing.expect(std.mem.find(u8, schema_json, guidance) != null);

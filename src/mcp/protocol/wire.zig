@@ -129,14 +129,38 @@ pub fn decode(input: []const u8) DecodeError!Message {
     return .{ .response = .{ .id = response_id, .body = .{ .failure = try failureOf(failure.?) } } };
 }
 
+fn envelopeIndex(comptime name: []const u8) usize {
+    for (envelope_fields, 0..) |field, index| if (std.mem.eql(u8, field, name)) return index;
+    @compileError("not an envelope field: " ++ name);
+}
+
+const envelope_index_id = envelopeIndex("id");
+const envelope_index_method = envelopeIndex("method");
+const envelope_index_params = envelopeIndex("params");
+
 /// The id of a line `decode` refused that is shaped like a response: an
 /// object with no `method` and an id the client could have issued. The
 /// request it names fails with it.
+///
+/// The id counts when it is a top-level member read before the line went
+/// wrong, whatever went wrong after it: servers write `jsonrpc`, `id`, then
+/// `result`, so a result that is cut, nested too deep, not UTF-8 or written
+/// twice still has its id. It does not count when
+///   - it comes after the bad part, or is nested in another value;
+///   - the line spells `id` twice, or goes wrong inside its own `id`: two ids
+///     name nothing, as `decode` refuses them;
+///   - the line goes wrong inside its `method` or `params`, which only a
+///     request or notification has. Its id is the server's own, and it may be
+///     the number of a request that fx has in flight.
 pub fn responseId(input: []const u8) ?RequestId {
     var found: [envelope_fields.len]?[]const u8 = undefined;
-    objectFields(input, &envelope_fields, &found) catch return null;
-    if (found[2] != null) return null;
-    return ownId(found[1]) catch null;
+    var failed_in: ?usize = null;
+    scanFields(input, &envelope_fields, &found, &failed_in) catch {
+        const request_only = [_]usize{ envelope_index_id, envelope_index_method, envelope_index_params };
+        for (request_only) |field| if (failed_in == field) return null;
+    };
+    if (found[envelope_index_method] != null) return null;
+    return ownId(found[envelope_index_id]) catch null;
 }
 
 /// Finds the fields listed in `names` in the JSON object `object` and stores
@@ -146,8 +170,17 @@ pub fn responseId(input: []const u8) ?RequestId {
 /// however each is spelled, is an error, so a message can't say two things at
 /// once.
 pub fn objectFields(object: []const u8, names: []const []const u8, out: []?[]const u8) DecodeError!void {
+    var failed_in: ?usize = null;
+    return scanFields(object, names, out, &failed_in);
+}
+
+/// `objectFields`, which also says where it stopped. After an error `out` still holds every value read before it, and
+/// `failed_in` is the index in `names` of the wanted field whose value it was reading, or whose second copy it found.
+/// It is null when the line went wrong anywhere else.
+fn scanFields(object: []const u8, names: []const []const u8, out: []?[]const u8, failed_in: *?usize) DecodeError!void {
     std.debug.assert(names.len == out.len);
     @memset(out, null);
+    failed_in.* = null;
     var stack: [scan_stack_bytes]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&stack);
     var scanner: std.json.Scanner = .initCompleteInput(fba.allocator(), object);
@@ -155,6 +188,7 @@ pub fn objectFields(object: []const u8, names: []const []const u8, out: []?[]con
 
     if ((try nextToken(&scanner)) != .object_begin) return error.NotAnObject;
     while (true) {
+        failed_in.* = null;
         const before = scanner.cursor;
         var token = try nextToken(&scanner);
         if (token == .object_end) break;
@@ -166,15 +200,19 @@ pub fn objectFields(object: []const u8, names: []const []const u8, out: []?[]con
         };
         // The key as written, quotes included: the first quote after the last value and the comma.
         const key_token = if (escaped) object[std.mem.findScalarPos(u8, object, before, '"') orelse return error.InvalidJson .. scanner.cursor] else key;
+        const wanted = for (names, 0..) |name, index| {
+            if (if (escaped) spells(key_token, name) else std.mem.eql(u8, key, name)) break index;
+        } else null;
+        failed_in.* = wanted;
         _ = scanner.peekNextTokenType() catch return error.InvalidJson;
         const start = scanner.cursor;
         try skip(&scanner);
-        for (names, out) |name, *slot| {
-            if (if (escaped) !spells(key_token, name) else !std.mem.eql(u8, key, name)) continue;
-            if (slot.* != null) return error.DuplicateField;
-            slot.* = object[start..scanner.cursor];
+        if (wanted) |index| {
+            if (out[index] != null) return error.DuplicateField;
+            out[index] = object[start..scanner.cursor];
         }
     }
+    failed_in.* = null;
     if ((try nextToken(&scanner)) != .end_of_document) return error.InvalidJson;
 }
 
@@ -686,6 +724,81 @@ test "a refused line shaped like a response still names its request" {
     // A request, a null or foreign id, and a line that isn't an object name none.
     for ([_][]const u8{ "{\"id\":3,\"method\":\"ping\",\"jsonrpc\":\"1.0\"}", "{\"id\":null}", "{\"id\":-1}", "[3]", "not json" }) |line|
         try testing.expectEqual(@as(?RequestId, null), responseId(line));
+}
+
+/// `prefix`, then `depth` nested arrays and their closers, so a line nested past the scanner's stack.
+fn nestedLine(alloc: std.mem.Allocator, prefix: []const u8, depth: usize) std.mem.Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, prefix);
+    try out.appendNTimes(alloc, '[', depth);
+    try out.appendNTimes(alloc, ']', depth);
+    try out.append(alloc, '}');
+    return out.toOwnedSlice(alloc);
+}
+
+test "a line refused after its id still names its request, whatever the bad part is" {
+    const alloc = testing.allocator;
+    const deep = try nestedLine(alloc, "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":", 5000);
+    defer alloc.free(deep);
+    const lines = [_][]const u8{
+        // Not JSON after the id, bytes that are not UTF-8, a line cut short, and one nested past the scanner's stack.
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[nope]}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"text\":\"\xff\xfe\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"te",
+        deep,
+        // A repeated key after the id, plain or written with an escape, and a bad key of no meaning.
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{},\"result\":{}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{},\"r\\u0065sult\":{}}",
+        "{\"id\":3,\"_meta\":nope,\"result\":{}}",
+        // An id the server wrote as a string, or with an escape in its name.
+        "{\"jsonrpc\":\"2.0\",\"id\":\"3\",\"result\":{\"x\":nope}}",
+        "{\"jsonrpc\":\"2.0\",\"i\\u0064\":3,\"result\":nope}",
+        // A whole object with something after it.
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}} trailing",
+    };
+    for (lines) |line| {
+        if (decode(line)) |_| return error.TestUnexpectedResult else |_| {}
+        try testing.expectEqual(@as(?RequestId, 3), responseId(line));
+    }
+}
+
+test "an id read before the bad part is kept when a method comes after it, because fx cannot know that one will" {
+    // The scan stops at the first thing that goes wrong, so the `method` after the bad `x` is never read. This line looks
+    // like a reply with a broken extra key, and fx cannot tell it from one: it keeps the id. A server's own request that
+    // is broken this way before its `method` can therefore end fx's request of the same number, and that is accepted.
+    try testing.expectEqual(@as(?RequestId, 3), responseId("{\"id\":3,\"x\":nope,\"method\":\"ping\"}"));
+    // A `method` read before the bad part shows a request or notification, whose id is the server's own.
+    try testing.expectEqual(@as(?RequestId, null), responseId("{\"id\":3,\"method\":\"ping\",\"x\":nope}"));
+    try testing.expectEqual(@as(?RequestId, null), responseId("{\"method\":\"ping\",\"id\":3,\"x\":nope}"));
+}
+
+test "guard: a refused line names no request unless its id is the top-level one read before the bad part" {
+    for ([_][]const u8{
+        // The id comes after the bad part, or no id was read.
+        "{\"jsonrpc\":\"2.0\",\"result\":{\"x\":nope},\"id\":3}",
+        "{\"jsonrpc\":\"2.0\",\"result\":nope}",
+        // Only a nested id was read, before the bad part or after a whole value.
+        "{\"jsonrpc\":\"2.0\",\"result\":{\"id\":3,\"x\":nope}}",
+        "{\"jsonrpc\":\"2.0\",\"result\":{\"id\":3},\"x\":nope}",
+        "{\"jsonrpc\":\"2.0\",\"meta\":[{\"id\":3}],\"result\":nope}",
+        // Two ids, however they are written, name nothing, and neither does a second one that is broken.
+        "{\"id\":3,\"id\":3,\"result\":nope}",
+        "{\"id\":3,\"i\\u0064\":4,\"result\":{}}",
+        "{\"id\":3,\"id\":nope}",
+        // A request's or notification's own part: its method was read, or the bad part is its method or params.
+        "{\"id\":3,\"method\":\"ping\",\"x\":nope}",
+        "{\"id\":3,\"method\":nope}",
+        "{\"id\":3,\"params\":{\"a\":nope},\"method\":\"x\"}",
+        // An id the client could not have issued.
+        "{\"id\":null,\"result\":nope}",
+        "{\"id\":-1,\"result\":nope}",
+        "{\"id\":{\"a\":1},\"result\":nope}",
+        "{\"id\":nope}",
+        "[3,nope]",
+        "not json",
+        "",
+    }) |line| try testing.expectEqual(@as(?RequestId, null), responseId(line));
 }
 
 test "a key whose last escaped piece is a field name does not match it" {

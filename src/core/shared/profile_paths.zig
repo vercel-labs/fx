@@ -208,9 +208,14 @@ pub fn traceLogPath(alloc: Allocator, home: []const u8) ![]u8 {
 
 pub const diagnostics_dir_name = "diagnostics";
 pub const last_shutdown_report_file_name = "last-shutdown.json";
+pub const last_crash_report_file_name = "last-crash.jsonl";
 
 pub fn lastShutdownReportPath(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{ diagnostics_dir_name, last_shutdown_report_file_name });
+}
+
+pub fn lastCrashReportPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return rootPath(alloc, home, &.{ diagnostics_dir_name, last_crash_report_file_name });
 }
 
 pub fn recordingsDir(alloc: Allocator, home: []const u8) ![]u8 {

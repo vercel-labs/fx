@@ -100,8 +100,7 @@ pub fn parseArgs(
         return options;
     }
 
-    // An older name, such as `statusLine.context`, means its current one.
-    const key = settings_keys.currentPath(words[1]);
+    const key = words[1];
     if (key.len == 0) return wordsProblem(problem, "the key is empty");
     if (settings_keys.unknownPart(key)) |part| {
         unknown_key.* = part;
@@ -324,7 +323,7 @@ pub const OverrideProblem = union(enum) {
 /// from `text`.
 pub fn parseOverride(text: []const u8, problem: *OverrideProblem) error{InvalidConfigOverride}!config_runtime.SettingOverride {
     const at = std.mem.findScalar(u8, text, '=') orelse return overrideProblem(problem, .malformed);
-    const key = settings_keys.currentPath(text[0..at]);
+    const key = text[0..at];
     const value = text[at + 1 ..];
     if (key.len == 0) return overrideProblem(problem, .malformed);
     if (settings_keys.unknownPart(key)) |part| return overrideProblem(problem, .{ .unknown = part });
@@ -535,7 +534,7 @@ fn string(value: []const u8) Effective {
 
 fn integer(arena: Allocator, value: usize) Allocator.Error!Effective {
     if (std.math.cast(i64, value)) |fits| return .{ .value = .{ .integer = fits } };
-    return .{ .value = .{ .number_string = try std.fmt.allocPrint(arena, "{d}", .{value}) } };
+    return .{ .value = .{ .number_string = try arena.print("{d}", .{value}) } };
 }
 
 /// The entries `fx config get` looks a key up in when no scope is chosen.
@@ -703,8 +702,8 @@ test "config args default to list and take scope, origin, and json flags" {
     try std.testing.expect(listed.show_origin);
     try std.testing.expectEqual(output_contracts.OutputFormat.json, listed.format);
 
-    // An older name means its current one.
-    const got = try parseForTest(&.{ "get", "statusLine.context", "--global" });
+    // Keys are the current names.
+    const got = try parseForTest(&.{ "get", "status_line.context", "--global" });
     try std.testing.expectEqualStrings("status_line.context", got.key.?);
     try std.testing.expectEqual(settings_entries.Scope.global, got.scope);
 }
@@ -727,7 +726,7 @@ test "config set and unset take a key, and set takes a value" {
     try std.testing.expectEqualStrings("fast_mode", set.key.?);
     try std.testing.expectEqualStrings("on", set.value.?);
 
-    const unset = try parseForTest(&.{ "unset", "statusLine.context", "--json" });
+    const unset = try parseForTest(&.{ "unset", "status_line.context", "--json" });
     try std.testing.expectEqual(Action.unset, unset.action);
     try std.testing.expect(unset.value == null);
 
@@ -748,7 +747,7 @@ test "config set turns each value into the patch the save path writes" {
     try std.testing.expectEqual(false, fast.patch.fast_mode.?);
     try std.testing.expect(!fast.value.?.bool);
 
-    const status = try changeForTest(&.{ "set", "statusLine.workspace", "true" }, &problem);
+    const status = try changeForTest(&.{ "set", "status_line.workspace", "true" }, &problem);
     try std.testing.expectEqual(settings_store.StatuslineItem.workspace, status.patch.statusline_item.?.item);
 
     const steps = try changeForTest(&.{ "set", "max_agent_steps", "0" }, &problem);
@@ -760,7 +759,7 @@ test "config set turns each value into the patch the save path writes" {
     const channel = try changeForTest(&.{ "set", "update_channel", "dev" }, &problem);
     try std.testing.expectEqualStrings("dev", channel.value.?.string);
 
-    const removed = try changeForTest(&.{ "unset", "notifications.max" }, &problem);
+    const removed = try changeForTest(&.{ "unset", "sound.max" }, &problem);
     try std.testing.expectEqualStrings("sound.max", removed.patch.remove.?);
     try std.testing.expect(removed.value == null);
 }
@@ -791,7 +790,7 @@ test "--config takes key=value with the keys and checks of config set" {
     const fast = try parseOverride("fast_mode=on", &problem);
     try std.testing.expectEqualStrings("fast_mode", fast.key);
     try std.testing.expect(fast.value.bool);
-    const status = try parseOverride("statusLine.context=false", &problem);
+    const status = try parseOverride("status_line.context=false", &problem);
     try std.testing.expectEqualStrings("status_line.context", status.key);
 
     const cases = [_]struct { text: []const u8, message: []const u8 }{
@@ -815,14 +814,14 @@ test "every key config set writes is a plain setting in the list" {
         try std.testing.expect(settings_keys.unknownPart(name) == null);
         const dot = comptime std.mem.findScalar(u8, name, '.');
         const key = settings_keys.find(name[0 .. dot orelse name.len]).?;
-        try std.testing.expect(!key.map and key.where != .retired and key.renamed_to == null);
+        try std.testing.expect(!key.map and key.where != .retired);
     }
 }
 
 test "config get names the part of a key that isn't a setting" {
     var unknown: ?settings_keys.UnknownPart = null;
     var problem: ?[]const u8 = null;
-    try std.testing.expectError(error.UnknownConfigSetting, parseArgs(&.{ "get", "statusLine.contxt" }, &unknown, &problem));
+    try std.testing.expectError(error.UnknownConfigSetting, parseArgs(&.{ "get", "status_line.contxt" }, &unknown, &problem));
     try std.testing.expectEqualStrings("contxt", unknown.?.name);
     try std.testing.expectEqualStrings("status_line", unknown.?.parent.?);
 }
@@ -993,11 +992,11 @@ test "every plain setting is resolved or deliberately shown from the files" {
             .retired => continue,
             else => {},
         }
-        if (key.kind == .refused or key.renamed_to != null) continue;
+        if (key.kind == .refused) continue;
         if (key.kind == .switches) {
             for (key.children) |child| {
                 var buf: [96]u8 = undefined;
-                const path = try std.fmt.bufPrint(&buf, "{s}.{s}", .{ key.name, child });
+                const path = try std.mem.print(&buf, "{s}.{s}", .{ key.name, child });
                 try std.testing.expect(inList(&resolved_keys, path) or inList(&files_only_keys, key.name));
             }
             continue;

@@ -1,0 +1,20 @@
+[
+  {
+    "description": "The owner serves without taking the lock, so two copies of the server run (OneOwner)",
+    "old": "    /\\ owners >= 1 /\\ lock = None\n",
+    "new": "    /\\ owners >= 1\n",
+    "invariant": "OneOwner"
+  },
+  {
+    "description": "A 2025 question, which names no call, shows in a session that may not be its caller",
+    "old": "       ELSE /\\ q' = \"declined\"\n            /\\ qTo' = None",
+    "new": "       ELSE /\\ q' = \"shown\"\n            /\\ qTo' \\in Sessions",
+    "invariant": "QuestionToCaller"
+  },
+  {
+    "description": "The idle timer counts only the session whose quiet armed it, so another session's call is cut",
+    "old": "    /\\ IF phase = \"ready\" /\\ Quiet\n",
+    "new": "    /\\ IF phase = \"ready\" /\\ QuietFor(armed)\n",
+    "invariant": "IdleEndsNothing"
+  }
+]

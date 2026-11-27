@@ -1568,9 +1568,7 @@ fn evaluateWebFetchRuleset(rules: []const types.PermissionRule, pattern: []const
 
     var matched: ?RuleDecision = null;
     for (rules) |rule| {
-        if (!std.mem.eql(u8, rule.permission, web_fetch_permission)) continue;
-        if (!isCanonicalWebFetchDomainPattern(rule.pattern)) continue;
-        if (!std.mem.eql(u8, rule.pattern, pattern)) continue;
+        if (!webFetchRuleApplies(rule, pattern)) continue;
         matched = switch (rule.action) {
             .allow => .allow,
             .ask => .ask,
@@ -1580,12 +1578,57 @@ fn evaluateWebFetchRuleset(rules: []const types.PermissionRule, pattern: []const
     return matched;
 }
 
+/// Whether `rule` decides a web_fetch call whose target is the canonical `domain:<host>` `target`.
+/// An allow matches only its exact canonical host, so a broad allow never authorizes a host.
+/// A deny or ask matches through the same permission and pattern wildcards as other tools,
+/// so `"*"`, `"web_fetch"`, and `domain:*` restrict every host they cover. Its `domain:`
+/// pattern is compared lowercased with one trailing dot removed, as the target is.
+fn webFetchRuleApplies(rule: types.PermissionRule, target: []const u8) bool {
+    if (rule.action == .allow) {
+        return std.mem.eql(u8, rule.permission, web_fetch_permission) and
+            isCanonicalWebFetchDomainPattern(rule.pattern) and
+            std.mem.eql(u8, rule.pattern, target);
+    }
+    if (!ruleMatchesPermission(rule.permission, web_fetch_permission, null)) return false;
+    if (std.mem.eql(u8, rule.pattern, "*")) return true;
+    var buf: [max_web_fetch_domain_pattern_len]u8 = undefined;
+    const pattern = normalizedWebFetchDomainPattern(rule.pattern, &buf) orelse return false;
+    return wildcardMatch(pattern, target);
+}
+
+/// The longest host name, without its trailing dot, plus the `domain:` prefix.
+const max_web_fetch_domain_pattern_len = "domain:".len + 253;
+
+/// Writes a `domain:` pattern into `buf` with its host lowercased and one trailing dot removed,
+/// the same host rule the fetch target uses. Returns null when `pattern` is not a `domain:`
+/// pattern or does not fit `buf`.
+fn normalizedWebFetchDomainPattern(pattern: []const u8, buf: []u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, pattern, "domain:")) return null;
+    const host = stripOneRootDot(pattern["domain:".len..]);
+    const len = "domain:".len + host.len;
+    if (len > buf.len) return null;
+    @memcpy(buf[0.."domain:".len], "domain:");
+    for (host, 0..) |char, index| {
+        buf["domain:".len + index] = std.ascii.toLower(char);
+    }
+    return buf[0..len];
+}
+
+/// Counts web_fetch rules that can never decide a fetch, so `/allowlist` can warn about them.
+/// An allow is ignored unless its pattern is an exact canonical `domain:<host>`. A deny or ask
+/// is ignored unless its pattern is `*` or a `domain:` pattern that fits the buffer. A `domain:`
+/// pattern is checked only for length, so a `domain:` deny that matches no host is not counted.
 pub fn webFetchRuleWarningCount(rules: []const types.PermissionRule) usize {
     var count: usize = 0;
+    var buf: [max_web_fetch_domain_pattern_len]u8 = undefined;
     for (rules) |rule| {
         if (!std.mem.eql(u8, rule.permission, web_fetch_permission)) continue;
-        if (isCanonicalWebFetchDomainPattern(rule.pattern)) continue;
-        count += 1;
+        const never_applies = switch (rule.action) {
+            .allow => !isCanonicalWebFetchDomainPattern(rule.pattern),
+            .ask, .deny => !std.mem.eql(u8, rule.pattern, "*") and
+                normalizedWebFetchDomainPattern(rule.pattern, &buf) == null,
+        };
+        if (never_applies) count += 1;
     }
     return count;
 }
@@ -2624,6 +2667,171 @@ test "web_fetch malformed hand edited rules warn without disabling unrelated per
 
     try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
     try std.testing.expectEqual(@as(usize, 1), webFetchRuleWarningCount(rules.rules));
+}
+
+test "web_fetch star deny refuses every domain" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("*"), .pattern = @constCast("*"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch rule deny refuses every domain" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("*"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch rule ask asks for every domain" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("*"), .action = .ask },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.ask, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch domain wildcard deny refuses matching domains" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:*"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch domain allow overrides an earlier broad deny for its host only" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("*"), .pattern = @constCast("*"), .action = .deny },
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:example.com"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.allow, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.org", .none));
+}
+
+test "web_fetch broad deny after a domain allow wins for that host" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:example.com"), .action = .allow },
+        .{ .permission = @constCast("*"), .pattern = @constCast("*"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "wildcard permission domain allow does not authorize web_fetch" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("*"), .pattern = @constCast("domain:example.com"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "wildcard permission star allow does not authorize web_fetch" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("*"), .pattern = @constCast("*"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch warning counts only ignored broad allows" {
+    var deny_ask_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("*"), .action = .deny },
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("*"), .action = .ask },
+    };
+    try std.testing.expectEqual(@as(usize, 0), webFetchRuleWarningCount(&deny_ask_buf));
+
+    var allow_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("*"), .action = .allow },
+    };
+    try std.testing.expectEqual(@as(usize, 1), webFetchRuleWarningCount(&allow_buf));
+}
+
+test "web_fetch warning counts a URL pattern deny that can never match" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("https://example.com/*"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(@as(usize, 1), webFetchRuleWarningCount(rules.rules));
+    try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch deny matches its domain pattern without regard to case" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:Example.COM"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(@as(usize, 0), webFetchRuleWarningCount(rules.rules));
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch deny drops one trailing dot from its domain pattern" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:example.com."), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(@as(usize, 0), webFetchRuleWarningCount(rules.rules));
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch ask matches an uppercase wildcard domain pattern" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:EXAMPLE.*"), .action = .ask },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(@as(usize, 0), webFetchRuleWarningCount(rules.rules));
+    try std.testing.expectEqual(RuleDecision.ask, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch deny whose domain pattern is too long never applies and is warned" {
+    const alloc = std.testing.allocator;
+    var long_pattern: [max_web_fetch_domain_pattern_len + 1]u8 = undefined;
+    @memcpy(long_pattern[0.."domain:".len], "domain:");
+    @memset(long_pattern["domain:".len..], 'a');
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = &long_pattern, .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(@as(usize, 1), webFetchRuleWarningCount(rules.rules));
+    try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch allow with uppercase letters still authorizes nothing" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:Example.com"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(@as(usize, 1), webFetchRuleWarningCount(rules.rules));
+    try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
 }
 
 test "permissionRulePatternForGrant preserves explicit command environment identity" {

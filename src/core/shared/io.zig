@@ -504,6 +504,19 @@ pub fn getenv(key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The value of `key` when it is an absolute path, else null. A test control
+/// reads its file path with this: the absolute file calls take no other kind,
+/// and a relative path would crash fx or put a file in the workspace.
+pub fn getenvAbsolutePath(key: []const u8) ?[]const u8 {
+    return absolutePath(getenv(key));
+}
+
+/// `value` when it is an absolute path, else null.
+pub fn absolutePath(value: ?[]const u8) ?[]const u8 {
+    const path = value orelse return null;
+    return if (std.Io.Dir.path.isAbsolute(path)) path else null;
+}
+
 /// The environment array libc holds now, valid only until the process next
 /// changes its environment.
 fn liveLibcEnviron() ?RawEnviron {
@@ -622,6 +635,35 @@ pub fn readFileToEndZ(alloc: std.mem.Allocator, file: *std.Io.File, max_bytes: u
     const result = try alloc.realloc(data, data.len + 1);
     result[data.len] = 0;
     return result[0..data.len :0];
+}
+
+/// What reading a file at a path found. `unreadable` covers a failed open or
+/// read, and any path that is not a regular file, such as a FIFO, a device, or
+/// a directory.
+pub const FileRead = union(enum) {
+    missing,
+    unreadable,
+    too_large,
+    bytes: []const u8,
+};
+
+/// Reads the regular file at the absolute `path`, up to `max_bytes`, and returns
+/// its bytes in `alloc`. A file of exactly `max_bytes` is too large, as with
+/// `readFileToEnd`. The open is `openExistingReadOnlyRegularFile`, which refuses
+/// a FIFO or another special file before it opens the path, and checks the
+/// opened file again. A symbolic link is followed, as the crash and shutdown
+/// readers did before. An allocation failure reads as unreadable.
+pub fn readRegularFile(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) FileRead {
+    var file = openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), path, .follow) catch |err| return switch (err) {
+        error.FileNotFound => .missing,
+        else => .unreadable,
+    };
+    defer file.close(getIo());
+    const bytes = readFileToEnd(alloc, &file, max_bytes) catch |err| return switch (err) {
+        error.StreamTooLong => .too_large,
+        else => .unreadable,
+    };
+    return .{ .bytes = bytes };
 }
 
 // Called from hundreds of sites; one out-of-line copy keeps each call small.
@@ -932,11 +974,20 @@ const LockFileMode = enum {
     owner_writable,
 };
 
+/// The group and other write bits.
+const others_write_bits = 0o022;
+
 /// Whether a group or other write bit is set: the one rule for state an
 /// older fx release left readable by others, which fx reads only while no
 /// one else can change it (D61 in `tests/tla/session_manager/system-design.md`).
 pub fn othersCanWrite(permissions: std.Io.File.Permissions) bool {
-    return permissions.toMode() & 0o022 != 0;
+    return permissions.toMode() & others_write_bits != 0;
+}
+
+/// `permissions` with the bits `othersCanWrite` checks cleared.
+pub fn withoutOthersWrite(permissions: std.Io.File.Permissions) std.Io.File.Permissions {
+    const mode = permissions.toMode();
+    return .fromMode(mode & ~@as(@TypeOf(mode), others_write_bits));
 }
 
 /// A regular file only its owner can write, though others may read it.
@@ -1545,6 +1596,15 @@ test "libc environment lookups follow a host that grows the environment" {
     try std.testing.expectEqualStrings("live", cloned.get("FX_IO_LIVE_ENV_150").?);
 }
 
+test "only an absolute path counts as a path from the environment" {
+    try std.testing.expectEqualStrings("/tmp/held", absolutePath("/tmp/held").?);
+    try std.testing.expect(absolutePath(null) == null);
+    try std.testing.expect(absolutePath("") == null);
+    try std.testing.expect(absolutePath("held") == null);
+    try std.testing.expect(absolutePath("./held") == null);
+    try std.testing.expect(absolutePath("../held") == null);
+}
+
 test "readFileToEnd: file under cap returns full content" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1569,6 +1629,59 @@ test "readFileToEnd: file at exact cap returns error.StreamTooLong" {
     } else |err| {
         try std.testing.expectEqual(error.StreamTooLong, err);
     }
+}
+
+const fifo_c = struct {
+    extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+};
+
+test "readRegularFile reads a regular file under the cap and reports one at the cap as too large" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "small", .data = "hello" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "at-cap", .data = "abcd" });
+    const dir = try dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const small = try std.Io.Dir.path.join(arena.allocator(), &.{ dir, "small" });
+    const at_cap = try std.Io.Dir.path.join(arena.allocator(), &.{ dir, "at-cap" });
+
+    switch (readRegularFile(arena.allocator(), small, 16)) {
+        .bytes => |bytes| try std.testing.expectEqualStrings("hello", bytes),
+        else => return error.TestExpectedBytes,
+    }
+    try std.testing.expect(std.meta.activeTag(readRegularFile(arena.allocator(), at_cap, 4)) == .too_large);
+}
+
+test "readRegularFile reports a missing path as missing and a directory as unreadable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "folder");
+    const dir = try dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const missing = try std.Io.Dir.path.join(arena.allocator(), &.{ dir, "absent" });
+    const folder = try std.Io.Dir.path.join(arena.allocator(), &.{ dir, "folder" });
+
+    try std.testing.expect(std.meta.activeTag(readRegularFile(arena.allocator(), missing, 16)) == .missing);
+    try std.testing.expect(std.meta.activeTag(readRegularFile(arena.allocator(), folder, 16)) == .unreadable);
+}
+
+test "readRegularFile refuses a FIFO at once instead of waiting for a writer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fifo = try std.Io.Dir.path.join(arena.allocator(), &.{ dir, "fifo" });
+    const fifo_z = try arena.allocator().allocSentinel(u8, fifo.len, 0);
+    @memcpy(fifo_z, fifo);
+    try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(fifo_z, 0o600));
+
+    try std.testing.expect(std.meta.activeTag(readRegularFile(arena.allocator(), fifo, 1024)) == .unreadable);
 }
 
 test "readFileToEnd: file over cap returns error.StreamTooLong" {

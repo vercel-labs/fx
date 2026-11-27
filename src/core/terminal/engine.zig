@@ -10,10 +10,15 @@ const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const checkpoint_schema_revision: u16 = 3;
+/// The newest checkpoint revision this fx reads. `Grid.checkpointRevision`
+/// picks the one a checkpoint is written as.
+pub const checkpoint_schema_revision: u16 = checkpoint_escape_intermediate_revision;
 const checkpoint_legacy_revision: u16 = 1;
 /// The first revision that saves the cells a last-column character replaced.
 const checkpoint_last_column_revision: u16 = 3;
+/// The first revision that can save a parser inside an escape with
+/// intermediate bytes (`State.escape_intermediate`).
+const checkpoint_escape_intermediate_revision: u16 = 4;
 const checkpoint_magic = "FXTE";
 
 pub fn supportsCheckpointRevision(revision: u16) bool {
@@ -155,12 +160,15 @@ pub const FeedStats = struct {
     }
 };
 
+/// Checkpoints save the state as its integer, so a new state goes last.
 const State = enum {
     normal,
     escape,
     csi,
     osc,
     dcs,
+    /// After ESC and its intermediate bytes, such as ESC (, until the final byte.
+    escape_intermediate,
 };
 
 const SavedCursor = struct {
@@ -676,6 +684,17 @@ pub const Grid = struct {
                     try self.dispatchEscape(b);
                     i += 1;
                 },
+                .escape_intermediate => {
+                    if (display_width.isEscapeIntermediate(b)) {
+                        i += 1;
+                        continue;
+                    }
+                    self.state = .normal;
+                    // A final byte ends the sequence, which has no effect here:
+                    // a charset designation such as ESC ( B is ignored. Any
+                    // other byte also ends it and is read again as input.
+                    if (display_width.isEscapeFinal(b)) i += 1;
+                },
                 .csi => {
                     if ((b == '?' or b == '>' or b == '<' or b == '=') and
                         self.csi_param_count == 0 and
@@ -816,7 +835,10 @@ pub const Grid = struct {
                 self.state = .normal;
             },
             '\\' => self.state = .normal,
-            else => self.state = .normal,
+            else => self.state = if (display_width.isEscapeIntermediate(byte))
+                .escape_intermediate
+            else
+                .normal,
         }
     }
 
@@ -2180,6 +2202,16 @@ pub const Grid = struct {
         return owned;
     }
 
+    /// The revision `checkpointPayload` writes, which the envelope must name:
+    /// the oldest one that holds this state. An fx from before revision four
+    /// cannot restore a revision four checkpoint, and without an exact raw
+    /// journal it loses the screen, so only a checkpoint taken inside an
+    /// escape with intermediate bytes uses it (R3.5).
+    pub fn checkpointRevision(self: Grid) u16 {
+        if (self.state == .escape_intermediate) return checkpoint_escape_intermediate_revision;
+        return checkpoint_last_column_revision;
+    }
+
     /// Serialize all bounded terminal state. The durable store owns cursor
     /// anchoring and wraps these opaque bytes in its checkpoint envelope.
     pub fn checkpointPayload(self: Grid, alloc: Allocator) ![]u8 {
@@ -2187,7 +2219,7 @@ pub const Grid = struct {
         var encoder = CheckpointEncoder.init(alloc);
         errdefer encoder.deinit();
         try encoder.bytes(checkpoint_magic);
-        try encoder.int(u16, checkpoint_schema_revision);
+        try encoder.int(u16, self.checkpointRevision());
         try encodeGridState(&encoder, self);
         return encoder.finish();
     }
@@ -2914,6 +2946,10 @@ fn decodeGridState(
         2 => .csi,
         3 => .osc,
         4 => .dcs,
+        5 => if (revision >= checkpoint_escape_intermediate_revision)
+            .escape_intermediate
+        else
+            return error.InvalidEngineCheckpoint,
         else => return error.InvalidEngineCheckpoint,
     };
     for (&grid.csi_params) |*param| param.* = try decoder.int(u16);
@@ -4214,6 +4250,109 @@ test "partial CSI across feed boundaries" {
     try g.feed("\x1b[2;");
     try g.feed("3Hx");
     try expectRow(g, 2, "  x");
+}
+
+test "escapes with intermediate bytes, such as charset designations, print nothing" {
+    const cases = [_]struct { bytes: []const u8, row: []const u8 }{
+        // `tput sgr0` on xterm terminfo.
+        .{ .bytes = "A\x1b(B\x1b[mC", .row = "AC" },
+        // ncurses line drawing; the designation is ignored, not applied.
+        .{ .bytes = "\x1b(0lqqk\x1b(B end", .row = "lqqk end" },
+        .{ .bytes = "A\x1b F C", .row = "A C" },
+        .{ .bytes = "A\x1b$(BC", .row = "AC" },
+        .{ .bytes = "A\x1b#8C", .row = "AC" },
+    };
+    for (cases) |case| {
+        var g = try Grid.init(testing.allocator, 12, 1);
+        defer g.deinit();
+        try g.feed(case.bytes);
+        try expectRow(g, 1, case.row);
+        try testing.expect(g.atControlSequenceBoundary());
+    }
+}
+
+test "a charset designation gives the same state however the output is split into reads" {
+    const bytes = "A\x1b(B\x1b[31mC";
+    var whole = try Grid.init(testing.allocator, 8, 1);
+    defer whole.deinit();
+    try whole.feed(bytes);
+    try expectRow(whole, 1, "AC");
+    const expected = try whole.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(expected);
+
+    for (1..bytes.len) |split| {
+        var parts = try Grid.init(testing.allocator, 8, 1);
+        defer parts.deinit();
+        try parts.feed(bytes[0..split]);
+        try parts.feed(bytes[split..]);
+        try expectRow(parts, 1, "AC");
+        const actual = try parts.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(actual);
+        try testing.expectEqualSlices(u8, expected, actual);
+    }
+}
+
+test "a byte that ends no escape ends ESC ( and is read as input" {
+    var g = try Grid.init(testing.allocator, 8, 2);
+    defer g.deinit();
+    try g.feed("A\x1b(\nB\x1b(\x1b[31mC");
+    try expectRow(g, 1, "A");
+    try expectRow(g, 2, "BC");
+    try testing.expect(g.cellAt(2, 2).?.style.fg.eql(.{ .indexed = 1 }));
+}
+
+/// Whether fx before revision four accepts the payload's revision: one to
+/// three, as its `supportsCheckpointRevision` did.
+fn readableBeforeRevisionFour(payload: []const u8) bool {
+    const revision = std.mem.readInt(u16, payload[4..6], .little);
+    return revision >= 1 and revision <= 3;
+}
+
+test "a checkpoint outside ESC ( is revision three, which fx before revision four reads" {
+    const outputs = [_][]const u8{ "plain", "A\x1b(B", "\x1b", "\x1b[2;", "\x1b]8;;https://e", "\xe7\x95" };
+    for (outputs) |output| {
+        var live = try Grid.init(testing.allocator, 8, 1);
+        defer live.deinit();
+        try live.feed(output);
+        // fx before revision four decodes only the states up to `dcs`.
+        try testing.expect(@backingInt(live.state) <= @backingInt(State.dcs));
+        try testing.expectEqual(@as(u16, 3), live.checkpointRevision());
+        const payload = try live.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(payload);
+        try testing.expect(readableBeforeRevisionFour(payload));
+
+        var restored = try Grid.restoreCheckpoint(testing.allocator, payload);
+        defer restored.deinit();
+        const repeated = try restored.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(repeated);
+        try testing.expectEqualSlices(u8, payload, repeated);
+    }
+}
+
+test "a checkpoint inside ESC ( is revision four and restores the escape" {
+    var live = try Grid.init(testing.allocator, 8, 1);
+    defer live.deinit();
+    try live.feed("A\x1b(");
+    try testing.expectEqual(@as(u16, 4), live.checkpointRevision());
+    const payload = try live.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+    try testing.expect(!readableBeforeRevisionFour(payload));
+    var restored = try Grid.restoreCheckpoint(testing.allocator, payload);
+    defer restored.deinit();
+    try live.feed("BC");
+    try restored.feed("BC");
+    try expectRow(restored, 1, "AC");
+    const expected = try live.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(expected);
+    const actual = try restored.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualSlices(u8, expected, actual);
+
+    // fx before revision four never saved this state.
+    const revision_three = try testing.allocator.dupe(u8, payload);
+    defer testing.allocator.free(revision_three);
+    std.mem.writeInt(u16, revision_three[4..6], 3, .little);
+    try testing.expectError(error.InvalidEngineCheckpoint, Grid.restoreCheckpoint(testing.allocator, revision_three));
 }
 
 test "CAN and SUB cancel partial CSI and OSC parser state" {
