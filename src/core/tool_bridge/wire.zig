@@ -22,6 +22,7 @@ const std = @import("std");
 const capability_mod = @import("capability.zig");
 const edit_blocks = @import("edit_blocks.zig");
 const json_depth = @import("../shared/json_depth.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const mcp_call = @import("core.zig");
 
 const Allocator = std.mem.Allocator;
@@ -35,6 +36,8 @@ pub const token_env = "FX_MCP_CALL_TOKEN";
 pub const max_request_bytes: usize = 1024 * 1024;
 /// The longest reply header line the client reads.
 pub const max_header_bytes: usize = 4 * 1024;
+/// The longest reply notice the bridge sends, after it is encoded as one terminal-safe line.
+pub const max_notice_bytes: usize = 1024;
 /// Deepest nesting a request line may have, counted on its raw text once the
 /// line has parsed, before any field is read or written back. The envelope
 /// object is level 1, so `arguments` keeps the depth `json_depth.max_depth`
@@ -297,11 +300,23 @@ pub const Header = struct {
     status: Status,
     reason: ?Reason = null,
     bytes: u64,
+    /// A one-line diagnostic for stderr, already bounded by `boundedNotice`.
+    notice: ?[]const u8 = null,
 };
+
+/// The notice as the bridge sends it: terminal-safe, one line, and at most
+/// `max_notice_bytes`, cut on a token boundary with "...".
+pub fn boundedNotice(arena: Allocator, raw: []const u8) error{OutOfMemory}![]const u8 {
+    return (try text_utils.encodeTerminalSafeInline(arena, raw, max_notice_bytes)).bytes;
+}
 
 pub fn writeHeader(writer: *std.Io.Writer, header: Header) std.Io.Writer.Error!void {
     try writer.print("{{\"v\":{d},\"status\":\"{s}\"", .{ mcp_call.protocol_version, @tagName(header.status) });
     if (header.reason) |reason| try writer.print(",\"reason\":\"{s}\"", .{@tagName(reason)});
+    if (header.notice) |notice| {
+        try writer.writeAll(",\"notice\":");
+        try std.json.Stringify.value(notice, .{}, writer);
+    }
     try writer.print(",\"bytes\":{d}}}\n", .{header.bytes});
 }
 
@@ -325,10 +340,15 @@ pub fn parseHeader(arena: Allocator, line: []const u8) HeaderError!Header {
         if (raw != .string) return error.MalformedReply;
         break :blk std.meta.stringToEnum(Reason, raw.string) orelse return error.MalformedReply;
     } else null;
+    const notice: ?[]const u8 = if (value.object.get("notice")) |raw| blk: {
+        if (raw != .string) return error.MalformedReply;
+        break :blk raw.string;
+    } else null;
     return .{
         .status = std.meta.stringToEnum(Status, status.string) orelse return error.MalformedReply,
         .reason = reason,
         .bytes = @intCast(bytes.integer),
+        .notice = notice,
     };
 }
 
@@ -405,6 +425,45 @@ test "a reply header round-trips and rejects another version" {
     try std.testing.expectEqual(@as(u64, 12), header.bytes);
     try std.testing.expectError(error.UnsupportedReply, parseHeader(arena, "{\"v\":2,\"status\":\"ok\",\"bytes\":0}"));
     try std.testing.expectError(error.MalformedReply, parseHeader(arena, "{\"v\":1,\"status\":\"maybe\",\"bytes\":0}"));
+}
+
+test "a reply header round-trips with and without a notice" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try writeHeader(&out.writer, .{ .status = .ok, .bytes = 5, .notice = "a \"quoted\" note" });
+    const with_notice = out.written();
+    const parsed = try parseHeader(arena, with_notice[0 .. with_notice.len - 1]);
+    try std.testing.expectEqualStrings("a \"quoted\" note", parsed.notice orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(@as(u64, 5), parsed.bytes);
+
+    var plain: std.Io.Writer.Allocating = .init(arena);
+    try writeHeader(&plain.writer, .{ .status = .ok, .bytes = 5 });
+    const without = plain.written();
+    const bare = try parseHeader(arena, without[0 .. without.len - 1]);
+    try std.testing.expect(bare.notice == null);
+}
+
+test "a reply header refuses a notice that is not a string" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectError(error.MalformedReply, parseHeader(arena, "{\"v\":1,\"status\":\"ok\",\"bytes\":0,\"notice\":7}"));
+}
+
+test "a notice is cut to the bound and encoded as one terminal-safe line" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var raw: std.Io.Writer.Allocating = .init(arena);
+    try raw.writer.writeAll("\x1b[31m\nnote ");
+    try raw.writer.splatByteAll('a', 3000);
+    const bounded = try boundedNotice(arena, raw.written());
+    try std.testing.expect(bounded.len <= max_notice_bytes);
+    try std.testing.expect(std.mem.findScalar(u8, bounded, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, bounded, '\n') == null);
+    try std.testing.expect(std.mem.endsWith(u8, bounded, "..."));
 }
 
 test "an edit line keeps its path and its blocks in order, quotes and newlines included" {

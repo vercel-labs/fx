@@ -111,6 +111,8 @@ pub const CallOutcome = struct {
     status: CallStatus,
     /// The tool's data for `ok` and `tool_error`, or what failed.
     bytes: []const u8,
+    /// A one-line diagnostic for stderr, set only by a handler that has one.
+    notice: ?[]const u8 = null,
 };
 
 /// A question about the MCP tools themselves: `fx mcp call list`, `search`,

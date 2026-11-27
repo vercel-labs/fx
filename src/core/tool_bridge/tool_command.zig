@@ -431,8 +431,9 @@ fn callFailure(err: *Writer, command: Command, call_err: anyerror) !u8 {
     }
 }
 
-/// Shows the bridge's reply: the data on `out` for a change that applied, and
-/// anything else on `err`, after the command's name. Returns the exit code.
+/// Shows the bridge's reply: the data on `out` for a reply that worked, with
+/// its notice on `err` after the data, and anything else on `err`, after the
+/// command's name. Returns the exit code.
 fn printReply(arena: Allocator, out: *Writer, err: *Writer, command: Command, reply: client.Reply) !u8 {
     switch (reply.header.status) {
         .ok => {
@@ -443,6 +444,7 @@ fn printReply(arena: Allocator, out: *Writer, err: *Writer, command: Command, re
                 .edit, .write => try out.writeByte('\n'),
                 else => if (reply.bytes.len > 0 and reply.bytes[reply.bytes.len - 1] != '\n') try out.writeByte('\n'),
             }
+            if (reply.header.notice) |notice| try client.writeSafeLine(arena, err, notice);
             return client.exit.ok;
         },
         .tool_error => return refusal(arena, err, command, reply.bytes, client.exit.tool_error),
@@ -775,6 +777,20 @@ test "skill and agent replies end with one newline, and add none when the reply 
         _ = try send(arena, std.testing.io, &out.writer, &err.writer, .agent_wait, "", test_bridge, fake.caller());
         try std.testing.expectEqualStrings("done\n", out.written());
     }
+}
+
+test "fx tool prints a reply's notice on stderr, after its data on stdout" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .ok, .bytes = 13, .notice = "outside text" }, .bytes = "zig\tZig help\n" } };
+
+    const code = try send(arena, std.testing.io, &out.writer, &err.writer, .skill_list, "", test_bridge, fake.caller());
+    try std.testing.expectEqual(client.exit.ok, code);
+    try std.testing.expectEqualStrings("zig\tZig help\n", out.written());
+    try std.testing.expectEqualStrings("outside text\n", err.written());
 }
 
 test "parse reads skill and agent verbs with options, and rejects bad usage" {
