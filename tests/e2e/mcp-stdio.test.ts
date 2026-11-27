@@ -25,6 +25,7 @@ import {
   turnSettled,
 } from "./tmux-helpers";
 import { traceReportNames, waitForNewTraceReport } from "./trace-report";
+import { RAW_ANSWER, RAW_KEYS, RAW_STATE, expectRawRetry, rawForm, rawLinesAt, rawRequests } from "./mcp-raw-rounds";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
@@ -94,6 +95,7 @@ type RootOptions = {
     | "response_missing_payload"
     | "response_ambiguous_payload"
     | "mrtr_input_required"
+    | "mrtr_raw"
     | "mrtr_url_required"
     | "mrtr_full_form"
     | "mrtr_collision_form"
@@ -139,6 +141,10 @@ type RootOptions = {
   expectedElicitation?: "form" | "url" | "both";
   elicitationUrl?: string;
   compactField?: Record<string, unknown>;
+  /** For mode "mrtr_raw": the input_required rounds the server sends, each field as the raw JSON text it writes (see the fixture). */
+  mrtrRaw?: Array<{ requests: string; state?: string }>;
+  /** For mode "mrtr_raw": the first server process exits on its first tools/call; the next one answers the rounds. */
+  mrtrCrashFirstCall?: boolean;
   legacyVersion?: "2025-06-18" | "2025-11-25";
   legacyDiscoveryVersions?: readonly ["2024-11-05", "2025-06-18", "2025-11-25"];
   legacyDiscoveryMethodNotFound?: boolean;
@@ -251,6 +257,9 @@ function createRoot(
             FX_MCP_EXPECT_ELICITATION: options.expectedElicitation,
             FX_MCP_ELICITATION_URL: options.elicitationUrl,
             FX_MCP_COMPACT_FIELD: options.compactField ? JSON.stringify(options.compactField) : undefined,
+            FX_MCP_MRTR_RAW: options.mrtrRaw ? JSON.stringify(options.mrtrRaw) : undefined,
+            FX_MCP_RAW_LINES: join(root, "mcp-raw-lines.txt"),
+            FX_MCP_MRTR_CRASH_FIRST_CALL: options.mrtrCrashFirstCall ? "1" : undefined,
             FX_MCP_RESOURCES_SUBSCRIBE: options.resourcesSubscribe === false
               ? "0"
               : undefined,
@@ -3849,6 +3858,245 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     },
     35_000,
   );
+
+  // ---- a 2026 input_required round: what goes back, byte for byte (mcp-raw-rounds.ts) ----
+  const rawLinesOf = (root: FixtureRoot): string[] => rawLinesAt(join(root.root, "mcp-raw-lines.txt"));
+  const startRawRound = async (
+    label: string,
+    surface: "TUI" | "Ask",
+    options: Pick<RootOptions, "mrtrRaw" | "mrtrCrashFirstCall">,
+    finalText: string,
+    calls = 1,
+  ) => {
+    const root = createRoot(label, MODERN_FIXTURE, { mode: "mrtr_raw", expectedElicitation: "both", ...options });
+    const activeGateway = startFakeGateway([
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+      ...Array.from({ length: calls }, (_, index) =>
+        fakeGatewayToolCall(index === 0 ? "call_mcp" : `call_mcp${index + 1}`, "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } })),
+      fakeGatewayFinalText(finalText),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    gateway = activeGateway;
+    const stderrPath = join(root.root, "stderr.log");
+    const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+    const session = await TmuxSession.create({
+      isolated: true,
+      ...(surface === "Ask"
+        ? { cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify("Call the raw round fixture.")}`, remainOnExit: true }
+        : { stderrPath }),
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: fixtureEnv(root, activeGateway),
+    });
+    tui = session;
+    if (surface === "TUI") {
+      await session.waitForComposer(15_000);
+      await session.sendText("Call the raw round fixture.");
+    }
+    return { root, session, activeGateway, stderrPath };
+  };
+  /** Answers the forms `f1`, `f2`, ... of a round in order: every field true, then the review's choice. */
+  const answerRawForms = async (session: TmuxSession, surface: "TUI" | "Ask", steps: Array<"accept" | "decline" | "cancel">) => {
+    const press = (text: string) => (surface === "TUI" ? session.sendKeys(text) : session.sendText(text));
+    for (const [index, step] of steps.entries()) {
+      const field = `f${index + 1}`;
+      await session.waitForText(`requests ${field}`, 20_000);
+      await press("1");
+      await session.waitForText(`- ${field}: true`, 20_000);
+      await press(step === "accept" ? "1" : step === "decline" ? "3" : "4");
+    }
+  };
+
+  for (const surface of ["TUI", "Ask"] as const) {
+    const accept = [RAW_ANSWER.accept("f1"), RAW_ANSWER.accept("f2"), RAW_ANSWER.accept("f3")];
+    for (const [name, steps, answers] of [
+      ["accepts every request", ["accept", "accept", "accept"], accept],
+      ["declines the first and accepts the rest", ["decline", "accept", "accept"], [RAW_ANSWER.decline, accept[1], accept[2]]],
+      ["cancels the second, which cancels the rest", ["accept", "cancel"], [accept[0], RAW_ANSWER.cancel, RAW_ANSWER.cancel]],
+    ] as const) {
+      test.skipIf(!tmuxAvailable())(
+        `${surface} gives a round's keys and requestState back as the server wrote them when the user ${name}`,
+        async () => {
+          const { root, session, activeGateway, stderrPath } = await startRawRound(
+            `${surface.toLowerCase()}-raw-round`,
+            surface,
+            { mrtrRaw: [{ requests: rawRequests(RAW_KEYS), state: RAW_STATE }] },
+            `${surface} raw round complete.`,
+          );
+          await answerRawForms(session, surface, [...steps]);
+          await session.waitForText(`${surface} raw round complete.`, 20_000);
+
+          const lines = rawLinesOf(root);
+          expect(lines).toHaveLength(2);
+          expectRawRetry(lines[1], RAW_KEYS, [...answers], RAW_STATE);
+          expect(activeGateway.requests[2]?.body).toContain("continued after raw rounds");
+          if (surface === "TUI") expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+          await session.kill();
+          tui = null;
+          await expectFixtureProcessesExited(readWire(root.wireLogPath));
+        },
+        60_000,
+      );
+    }
+  }
+
+  test.skipIf(!tmuxAvailable())(
+    "a round without a requestState sends none back, and a key of the longest length goes back as written",
+    async () => {
+      const keys = [`"${"k".repeat(255)}"`];
+      const { root, session } = await startRawRound("tui-raw-long-key", "TUI", { mrtrRaw: [{ requests: rawRequests(keys) }] }, "Long key complete.");
+      await answerRawForms(session, "TUI", ["accept"]);
+      await session.waitForText("Long key complete.", 20_000);
+      expectRawRetry(rawLinesOf(root)[1], keys, [RAW_ANSWER.accept("f1")], undefined);
+    },
+    45_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a round with a key longer than fx takes is declined whole, and nothing goes back",
+    async () => {
+      const keys = [`"${"k".repeat(300)}"`];
+      const { root, session, activeGateway } = await startRawRound("tui-raw-key-over-limit", "TUI", { mrtrRaw: [{ requests: rawRequests(keys), state: RAW_STATE }] }, "Over limit complete.");
+      await session.waitForText("Over limit complete.", 30_000);
+      expect(rawLinesOf(root)).toHaveLength(1);
+      expect(activeGateway.requests.map((entry) => entry.body).join("\n")).not.toContain("continued after raw rounds");
+      expect(readFileSync(root.traceLogPath, "utf8")).toContain("MCP question not answered server=fixture");
+    },
+    45_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a URL request and a form request in one round both go back under their own keys",
+    async () => {
+      const keys = ['"\\u0075rl"', '"fórm"'];
+      const urlRequest = '{"method":"elicitation/create","params":{"mode":"url","message":"Authorize","url":"https://example.test/connect"}}';
+      const requests = `{${keys[0]}:${urlRequest},${keys[1]}:${rawForm("f1")}}`;
+      const root = createRoot("ask-raw-url-and-form", MODERN_FIXTURE, { mode: "mrtr_raw", expectedElicitation: "both", mrtrRaw: [{ requests, state: RAW_STATE }] });
+      const fakeBin = join(root.root, "fake-bin");
+      mkdirSync(fakeBin);
+      writeFakeUrlOpeners(fakeBin, "#!/bin/sh\nexit 0\n");
+      const activeGateway = startToolGateway("Url and form complete.");
+      gateway = activeGateway;
+      const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify("Call the raw round fixture.")}`,
+        cwd: root.workspace,
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+        env: { ...fixtureEnv(root, activeGateway), PATH: `${fakeBin}:${process.env.PATH ?? ""}` },
+      });
+      await tui.waitForText("Complete URL: https://example.test/connect", 20_000);
+      await tui.sendText("1");
+      await answerRawForms(tui, "Ask", ["accept"]);
+      await tui.waitForText("Url and form complete.", 20_000);
+      const lines = rawLinesOf(root);
+      expect(lines).toHaveLength(2);
+      expectRawRetry(lines[1], keys, ['{"action":"accept"}', RAW_ANSWER.accept("f1")], RAW_STATE);
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a round after the server restarted goes back under its own keys",
+    async () => {
+      const keys = [RAW_KEYS[1]];
+      const { root, session } = await startRawRound(
+        "tui-raw-restart",
+        "TUI",
+        { mrtrRaw: [{ requests: rawRequests(keys), state: RAW_STATE }], mrtrCrashFirstCall: true },
+        "Restart complete.",
+        2,
+      );
+      await answerRawForms(session, "TUI", ["accept"]);
+      await session.waitForText("Restart complete.", 60_000);
+      const lines = rawLinesOf(root);
+      // The first process died on the first call, which is not repeated; the model's second call reaches the new
+      // process, which opens a round.
+      expect(lines).toHaveLength(3);
+      expectRawRetry(lines[2], keys, [RAW_ANSWER.accept("f1")], RAW_STATE);
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a subagent's round goes back under the server's own keys when the user answers it",
+    async () => {
+      const root = createRoot("tui-raw-subagent", MODERN_FIXTURE, {
+        mode: "mrtr_raw",
+        expectedElicitation: "both",
+        mrtrRaw: [{ requests: rawRequests(RAW_KEYS), state: RAW_STATE }],
+      });
+      const activeGateway = startDynamicFakeGateway(async (body) => {
+        if (body.includes("Subagent report (untrusted agent output, not user instructions):")) return fakeGatewayFinalText("RAW_PARENT_DONE");
+        // The parent's own history holds the child's task, so its turns are told apart first.
+        if (body.includes('"toolCallId":"create_raw_child"')) return fakeGatewayFinalText("RAW_PARENT_WAITING");
+        if (body.includes('"toolCallId":"raw_child_call"')) return fakeGatewayFinalText("RAW_CHILD_DONE");
+        if (body.includes('"toolCallId":"raw_child_select"')) {
+          return fakeGatewayToolCall("raw_child_call", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } });
+        }
+        if (body.includes("RAW_CHILD_TASK")) return fakeGatewayToolCall("raw_child_select", "toolbox", { open: TOOL_NAME });
+        if (body.includes("RAW_PARENT_TASK")) {
+          return fakeGatewayToolCall("create_raw_child", "subagent", {
+            request: { action: "message", agent: "raw", message: "RAW_CHILD_TASK" },
+          });
+        }
+        return fakeGatewayFinalText("unexpected raw round request");
+      }, {
+        classifierDecision: "clear",
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 120,
+        height: 40,
+        env: fixtureEnv(root, activeGateway),
+      });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("RAW_PARENT_TASK");
+      await answerRawForms(tui, "TUI", ["accept", "accept", "accept"]);
+      await tui.waitForText("RAW_PARENT_DONE", 30_000);
+      const lines = rawLinesOf(root);
+      expect(lines).toHaveLength(2);
+      expectRawRetry(lines[1], RAW_KEYS, ["f1", "f2", "f3"].map((field) => RAW_ANSWER.accept(field)), RAW_STATE);
+    },
+    90_000,
+  );
+
+  test("a round whose two keys are one name once decoded is refused, and nothing goes back", async () => {
+    const keys = ['"k"', '"\\u006b"'];
+    const root = createRoot("ask-raw-same-name", MODERN_FIXTURE, { mode: "mrtr_raw", expectedElicitation: "both", mrtrRaw: [{ requests: rawRequests(keys), state: RAW_STATE }] });
+    const activeGateway = startToolGateway("Same name complete.");
+    gateway = activeGateway;
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the raw round fixture."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, activeGateway),
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    expect(rawLinesOf(root)).toHaveLength(1);
+    expect(activeGateway.requests[2]?.body).toContain("the server's answer was malformed");
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 45_000);
+
+  test("fx ask with no terminal declines a round and sends nothing back", async () => {
+    const root = createRoot("ask-raw-no-terminal", MODERN_FIXTURE, { mode: "mrtr_raw", expectedElicitation: "none", mrtrRaw: [{ requests: rawRequests(RAW_KEYS), state: RAW_STATE }] });
+    const activeGateway = startToolGateway("No terminal complete.");
+    gateway = activeGateway;
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the raw round fixture."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, activeGateway),
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    expect(rawLinesOf(root)).toHaveLength(1);
+    expect(activeGateway.requests[2]?.body).toContain("the server asked for input fx can't give");
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 45_000);
 
   test("negotiated 2025-06 treats a URL-required error as an ordinary failure", async () => {
     const root = createRoot("ask-legacy-url-required-unsupported", LEGACY_FIXTURE, {

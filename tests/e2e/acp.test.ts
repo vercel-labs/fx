@@ -30,6 +30,7 @@ import {
   toolShapesWithoutDescriptions,
 } from "./conditional-guidance-oracle";
 import { LineQueue } from "./line-queue";
+import { RAW_ANSWER, RAW_KEYS, RAW_STATE, expectRawRetry, rawLinesAt, rawRequests } from "./mcp-raw-rounds";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { paddedPng, pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { childLines, childWork, copyV1Fixture, logLines, savedSessionIds, savedText, sessionDir } from "./saved-sessions";
@@ -6932,6 +6933,63 @@ describe("acp: model-independent", () => {
     },
     LIVE_TIMEOUT,
   );
+
+  // A 2026 round's keys and requestState go back as the server wrote them, whatever the editor answers
+  // (mcp-raw-rounds.ts has the bytes).
+  for (const [name, answers, steps] of [
+    ["accepts every request", [RAW_ANSWER.accept("f1"), RAW_ANSWER.accept("f2"), RAW_ANSWER.accept("f3")], ["accept", "accept", "accept"]],
+    ["declines the first and accepts the rest", [RAW_ANSWER.decline, RAW_ANSWER.accept("f2"), RAW_ANSWER.accept("f3")], ["decline", "accept", "accept"]],
+    ["cancels the second, which cancels the rest", [RAW_ANSWER.accept("f1"), RAW_ANSWER.cancel, RAW_ANSWER.cancel], ["accept", "cancel"]],
+  ] as const) {
+    test(
+      `ACP gives a round's keys and requestState back as the server wrote them when the client ${name}`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-mcp-raw-round-");
+        const pidPath = join(root.root, "mcp-raw-round.pid");
+        const rawLines = join(root.root, "mcp-raw-lines.txt");
+        const gateway = startFakeGateway([
+          fakeGatewayToolCall("select_raw", "toolbox", { open: MCP_TOOL_NAME }),
+          fakeGatewayToolCall("call_raw", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "acp-raw" } }),
+          finalText("ACP raw round complete"),
+        ]);
+        const asked: string[] = [];
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          await client.request("initialize", { protocolVersion: 1, clientCapabilities: { elicitation: { form: {} } } }, 1);
+          const created = await client.request("session/new", {
+            cwd: root.workspace,
+            mcpServers: [acpStdioServer("unused", pidPath, "mrtr_raw", {
+              FX_MCP_EXPECT_ELICITATION: "form",
+              FX_MCP_MRTR_RAW: JSON.stringify([{ requests: rawRequests(RAW_KEYS), state: RAW_STATE }]),
+              FX_MCP_RAW_LINES: rawLines,
+            })],
+          }, 2) as any;
+          expect(created.error).toBeUndefined();
+          await client.readLine();
+          await client.request("session/set_mode", { modeId: "auto" }, 3);
+          client.setElicitationHandler((params) => {
+            const field = /Question (f\d)/.exec(String(params.message))?.[1] ?? "";
+            asked.push(field);
+            const step = steps[asked.length - 1] ?? "cancel";
+            return step === "accept" ? { action: "accept", content: { [field]: true } } : { action: step };
+          });
+
+          const prompt = await runPrompt(client, "Call the supplied raw round MCP tool.", TIMEOUT);
+          expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+          expect(asked).toEqual(["f1", "f2", "f3"].slice(0, steps.length));
+          const lines = rawLinesAt(rawLines);
+          expect(lines).toHaveLength(2);
+          expectRawRetry(lines[1], RAW_KEYS, [...answers], RAW_STATE);
+        } finally {
+          await client?.close();
+          if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      LIVE_TIMEOUT,
+    );
+  }
 
   // A server writes a form's keys and enum values as JSON text, and may spell a
   // character with an escape. fx shows the form with the characters decoded,

@@ -10,6 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
+import { RAW_ANSWER, RAW_KEYS, RAW_STATE, expectRawRetry, rawRequests } from "./mcp-raw-rounds";
 import { startIdleDropProxy, type IdleDrop } from "./fixtures/idle-drop-proxy";
 import {
   startContentLengthMcpHttpFixture,
@@ -980,6 +981,34 @@ describe("modern MCP Streamable HTTP", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     30_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "the TUI gives an HTTP round's keys and requestState back as the server wrote them",
+    async () => {
+      fixture = startModernMcpHttpFixture("mrtr_raw", undefined, 0, [{ requests: rawRequests(RAW_KEYS), state: RAW_STATE }]);
+      const root = createRoot("tui-mrtr-raw", fixture);
+      gateway = startToolGateway("HTTP raw round complete.");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 120,
+        height: 40,
+        env: fixtureEnv(root, gateway),
+      });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Call the HTTP MCP fixture.");
+      for (const field of ["f1", "f2", "f3"]) {
+        await tui.waitForText(`requests ${field}`, 20_000);
+        await tui.sendKeys("1");
+        await tui.waitForText(`- ${field}: true`, 20_000);
+        await tui.sendKeys("1");
+      }
+      await tui.waitForText("HTTP raw round complete.", 20_000);
+      expect(fixture.rawCalls).toHaveLength(2);
+      expectRawRetry(fixture.rawCalls[1], RAW_KEYS, ["f1", "f2", "f3"].map((field) => RAW_ANSWER.accept(field)), RAW_STATE);
+    },
+    60_000,
   );
 
   test("mixed SSE delimiters complete across chunks without waiting for EOF", async () => {
