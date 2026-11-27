@@ -1744,7 +1744,7 @@ pub fn Runtime(comptime App: type) type {
                 // Only instances hold their queued work, so a subagent's runs.
                 if (child.agent.role == .subagent and worker.queuedPromptCount() > 0) return true;
             }
-            return deliveriesPending(app);
+            return deliveriesPending(app, null);
         }
 
         /// Whether a subagent runs work, has work queued, or holds events
@@ -1759,11 +1759,17 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Whether a child's report or a hand-off waits for the main loop to
-        /// deliver it (`takePosts`).
-        fn deliveriesPending(app: *App) bool {
+        /// deliver it (`takePosts`): any report, or only `host`'s when given.
+        /// A hand-off does not name its host, so every one counts.
+        fn deliveriesPending(app: *App, host: ?*subagent_tool_host.Runtime) bool {
             app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
             defer app.child_handoffs.mutex.unlock(io_mod.getIo());
-            return app.child_handoffs.posts.items.len > 0 or app.child_handoffs.reports.items.len > 0;
+            if (app.child_handoffs.posts.items.len > 0) return true;
+            const wanted = host orelse return app.child_handoffs.reports.items.len > 0;
+            for (app.child_handoffs.reports.items) |report| {
+                if (report.host == wanted) return true;
+            }
+            return false;
         }
 
         /// Logs the work each agent still holds as fx exits for an upgrade's
@@ -1835,11 +1841,33 @@ pub fn Runtime(comptime App: type) type {
             if (turnInFlight(screen)) return 0;
             var count: usize = 0;
             for (app.child_agents.items) |child| {
-                if (child.agent.role != .subagent) continue;
-                if (ownerOf(app, hostOf(app, child)) != screen) continue;
-                if (turnInFlight(&child.agent) or resultPending(app, child)) count += 1;
+                if (ownSubagentWorking(app, screen, child)) count += 1;
             }
             return count;
+        }
+
+        fn ownSubagentWorking(app: *App, owner: @TypeOf(agents.screenAgentOf(app)), child: *ChildAgent) bool {
+            return child.agent.role == .subagent and
+                ownerOf(app, hostOf(app, child)) == owner and
+                (turnInFlight(&child.agent) or resultPending(app, child));
+        }
+
+        /// Whether the agent on screen waits on its subagents: one works or
+        /// holds an unapplied result, its host stays busy until the report is
+        /// posted, or the report is not handed over yet. Main loop only.
+        pub fn screenSubagentsWorking(app: *App) bool {
+            const screen = agents.screenAgentOf(app);
+            for (app.child_agents.items) |child| {
+                if (ownSubagentWorking(app, screen, child)) return true;
+            }
+            const host: ?*subagent_tool_host.Runtime = if (comptime agents.hasAgentField(App, "session_persistence")) screen.session_persistence.subagent_host else null;
+            const own_host = host orelse return false;
+            return !own_host.quiet() or deliveriesPending(app, own_host);
+        }
+
+        /// Main loop only.
+        pub fn screenWorkGoing(app: *App) bool {
+            return turnInFlight(agents.screenAgentOf(app)) or screenSubagentsWorking(app);
         }
 
         /// The activity row for an agent on screen whose turn ended while its

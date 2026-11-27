@@ -904,7 +904,8 @@ const App = struct {
         NotificationAppRuntime.queue(self, notification);
     }
 
-    pub fn notificationPresentationFinished(self: *App) void {
+    /// Plays turn-end cues once the reply is shown and the work on screen is done.
+    fn releaseHeldNotifications(self: *App) void {
         NotificationAppRuntime.presentationFinished(self);
     }
 
@@ -966,6 +967,14 @@ const App = struct {
 
     pub fn anySubagentWorking(self: *App) bool {
         return AgentsAppRuntime.anySubagentWorking(self);
+    }
+
+    pub fn screenSubagentsWorking(self: *App) bool {
+        return AgentsAppRuntime.screenSubagentsWorking(self);
+    }
+
+    pub fn screenWorkGoing(self: *App) bool {
+        return AgentsAppRuntime.screenWorkGoing(self);
     }
 
     /// Logs the queued work fx drops as it exits for an upgrade's restart.
@@ -3126,7 +3135,7 @@ const App = struct {
     pub fn pacerFinish(ctx: *anyopaque, finished: types.FinishedPrompt) anyerror!assistant_pacer.FinishResult {
         const self: *App = @ptrCast(@alignCast(ctx));
         const result = try app_callbacks.Bindings(App).finishPromptPresentation(self, self.screenAgent(), finished);
-        if (result == .committed) self.notificationPresentationFinished();
+        if (result == .committed) self.releaseHeldNotifications();
         return result;
     }
 
@@ -3597,6 +3606,7 @@ const App = struct {
         // its own context.
         try AgentsAppRuntime.tickChildren(self, {}, tickAgentInContext);
         AgentsAppRuntime.noteFinishedTurns(self);
+        self.releaseHeldNotifications();
         AgentsAppRuntime.settleChildRuns(self);
         AgentsAppRuntime.settleLentQuestion(self);
         AgentsAppRuntime.lendPrompt(self);
@@ -5910,6 +5920,32 @@ test "the busiest agent wins herdr's state: an approval over work, work over idl
     app.instances.first_open = false;
     try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
     app.main_agent.worker.worker_processing = false;
+}
+
+test "the screen's subagents count as working until their host is quiet" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+
+    // Only the fields `quiet` reads are set: a busy child keeps the host open.
+    var busy_host: subagent_tool_host.Runtime = undefined;
+    busy_host.admission_mutex = .init;
+    busy_host.pending = .empty;
+    busy_host.busy = .empty;
+    defer {
+        for (busy_host.busy.items) |id| alloc.free(id);
+        busy_host.busy.deinit(alloc);
+    }
+    try busy_host.busy.append(alloc, try alloc.dupe(u8, "reviewer"));
+    app.main_agent.session_persistence.subagent_host = &busy_host;
+    defer app.main_agent.session_persistence.subagent_host = null;
+
+    try std.testing.expect(app.screenSubagentsWorking());
+    alloc.free(busy_host.busy.swapRemove(0));
+    try std.testing.expect(!app.screenSubagentsWorking());
 }
 
 test "an upgrade waits for agents that need the user, stops instances between steps, and lets subagents finish" {
