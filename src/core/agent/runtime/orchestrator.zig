@@ -8413,6 +8413,58 @@ test "compaction activity transaction settles only after publication and preserv
     }
 }
 
+/// What `processQueuedPromptLoop` hands back or frees on every exit. A `defer`
+/// body is emitted again at each of the loop's `try` and `return` points, so
+/// these two scopes keep that work in one out-of-line call each.
+const LoopExitScope = struct {
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    within_turn_suffix_out: *std.ArrayList(ChatMessage),
+    local_grants: *std.ArrayList(PermissionGrant),
+    local_grants_out: *std.ArrayList(PermissionGrant),
+    turn_file_mutation_denials: *runtime_tool_admission.TurnFileMutationDenials,
+    turn_review_cache: *runtime_tool_admission.TurnReviewCache,
+    terminal_validation_retry: *runtime_tool_admission.TerminalValidationRetryState,
+    shell_execution_failure_retry: *runtime_tool_admission.ShellExecutionFailureRetryState,
+    identical_failure_escalation: *runtime_tool_admission.IdenticalFailureEscalationState,
+    completed_tool_names: *std.ArrayList([]u8),
+    completed_tool_names_out: *std.ArrayList([]u8),
+    context_delivery_state: *context_contract.DeliveryState,
+
+    /// Runs last declared first, as the separate defers did.
+    noinline fn release(self: *const LoopExitScope) void {
+        self.context_delivery_state.deinit(self.arena);
+        self.completed_tool_names_out.* = self.completed_tool_names.*;
+        self.identical_failure_escalation.deinit(self.arena);
+        self.shell_execution_failure_retry.deinit(self.arena);
+        self.terminal_validation_retry.deinit(self.arena);
+        self.turn_review_cache.deinit(self.arena);
+        self.turn_file_mutation_denials.deinit(self.arena);
+        self.local_grants_out.* = self.local_grants.*;
+        self.within_turn_suffix_out.* = self.within_turn_suffix.*;
+    }
+};
+
+/// The turn's results, copied back to the caller on exit. It starts once the
+/// loop's own copies exist, so an earlier failure leaves the caller's alone.
+const LoopResultScope = struct {
+    owned_refreshed_api_key: *?[]u8,
+    summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
+    summary_accumulator_out: *runtime_telemetry.TurnSummaryAccumulator,
+    finish_trace: *PromptFinishTrace,
+    finish_trace_out: *PromptFinishTrace,
+    interrupted_persisted: *bool,
+    interrupted_persisted_out: *bool,
+
+    /// Runs last declared first, as the separate defers did.
+    noinline fn release(self: *const LoopResultScope) void {
+        self.interrupted_persisted_out.* = self.interrupted_persisted.*;
+        self.finish_trace_out.* = self.finish_trace.*;
+        self.summary_accumulator_out.* = self.summary_accumulator.*;
+        if (self.owned_refreshed_api_key.*) |key| secret.zeroAndFree(std.heap.c_allocator, key);
+    }
+};
+
 fn processQueuedPromptLoop(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -8446,19 +8498,12 @@ fn processQueuedPromptLoop(
     var image_route_state = image_route.step(.{}, .{ .turn_started = request_capabilities.image_input_support }).state;
     const history_messages = history_messages_ptr.*;
     var within_turn_suffix = within_turn_suffix_ptr.*;
-    defer within_turn_suffix_ptr.* = within_turn_suffix;
     var local_grants = local_grants_ptr.*;
-    defer local_grants_ptr.* = local_grants;
     var turn_file_mutation_denials: runtime_tool_admission.TurnFileMutationDenials = .{};
-    defer turn_file_mutation_denials.deinit(arena);
     var turn_review_cache: runtime_tool_admission.TurnReviewCache = .{};
-    defer turn_review_cache.deinit(arena);
     var terminal_validation_retry: runtime_tool_admission.TerminalValidationRetryState = .{};
-    defer terminal_validation_retry.deinit(arena);
     var shell_execution_failure_retry: runtime_tool_admission.ShellExecutionFailureRetryState = .{};
-    defer shell_execution_failure_retry.deinit(arena);
     var identical_failure_escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
-    defer identical_failure_escalation.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var active_compaction_handoff: ?ChatMessage = null;
     var active_compaction_history_tail: []const ChatMessage = &.{};
@@ -8472,12 +8517,28 @@ fn processQueuedPromptLoop(
     // Request-token calibration lives on the agent so the first request of a
     // new turn still calibrates from the previous turn's exact usage.
     var completed_tool_names = completed_tool_names_ptr.*;
-    defer completed_tool_names_ptr.* = completed_tool_names;
-    var context_delivery_state: context_contract.DeliveryState = if (deps.context_enabled)
-        try context_contract.DeliveryState.initFromSnapshot(arena, job.context_snapshot)
-    else
-        .{};
-    defer context_delivery_state.deinit(arena);
+    // Starts empty so the scope below can own it before the first `try`; an
+    // empty state frees nothing, as when the context is off.
+    var context_delivery_state: context_contract.DeliveryState = .{};
+    const exit_scope: LoopExitScope = .{
+        .arena = arena,
+        .within_turn_suffix = &within_turn_suffix,
+        .within_turn_suffix_out = within_turn_suffix_ptr,
+        .local_grants = &local_grants,
+        .local_grants_out = local_grants_ptr,
+        .turn_file_mutation_denials = &turn_file_mutation_denials,
+        .turn_review_cache = &turn_review_cache,
+        .terminal_validation_retry = &terminal_validation_retry,
+        .shell_execution_failure_retry = &shell_execution_failure_retry,
+        .identical_failure_escalation = &identical_failure_escalation,
+        .completed_tool_names = &completed_tool_names,
+        .completed_tool_names_out = completed_tool_names_ptr,
+        .context_delivery_state = &context_delivery_state,
+    };
+    defer exit_scope.release();
+    if (deps.context_enabled) {
+        context_delivery_state = try context_contract.DeliveryState.initFromSnapshot(arena, job.context_snapshot);
+    }
     // Files saved notes delivered that changed since; their current rules
     // are delivered again when a tool call reaches them.
     var replaced_note_sources: std.ArrayList([]const u8) = .empty;
@@ -8541,13 +8602,19 @@ fn processQueuedPromptLoop(
     };
     var active_api_key: []const u8 = job.api_key;
     var owned_refreshed_api_key: ?[]u8 = null;
-    defer if (owned_refreshed_api_key) |key| secret.zeroAndFree(std.heap.c_allocator, key);
     var summary_accumulator = summary_accumulator_ptr.*;
-    defer summary_accumulator_ptr.* = summary_accumulator;
     var finish_trace = finish_trace_ptr.*;
-    defer finish_trace_ptr.* = finish_trace;
     var interrupted_persisted = interrupted_persisted_ptr.*;
-    defer interrupted_persisted_ptr.* = interrupted_persisted;
+    const result_scope: LoopResultScope = .{
+        .owned_refreshed_api_key = &owned_refreshed_api_key,
+        .summary_accumulator = &summary_accumulator,
+        .summary_accumulator_out = summary_accumulator_ptr,
+        .finish_trace = &finish_trace,
+        .finish_trace_out = finish_trace_ptr,
+        .interrupted_persisted = &interrupted_persisted,
+        .interrupted_persisted_out = interrupted_persisted_ptr,
+    };
+    defer result_scope.release();
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
     // The last reply stopped for `other` with nothing in it and was answered
@@ -9627,18 +9694,27 @@ fn processQueuedPromptLoop(
                         debug_trace.logf("recovery", "unreadable reply limit reached, ending the turn err={s}", .{@errorName(err)});
                         break :blk null;
                     }
+                    if (evidence.cause == .unnamed_os_error and request_recovery.unnamedOsErrorEndsRequest()) {
+                        debug_trace.logf("recovery", "unnamed OS error limit reached, ending the turn err={s}", .{@errorName(err)});
+                        break :blk null;
+                    }
                     break :blk evidence;
                 } else null;
                 const failure_cause: types.ModelRecoveryCause = if (network_failure) |evidence|
                     switch (evidence.cause) {
                         // Saved sessions name only causes every version reads.
-                        .transport_interrupted, .unreadable_reply => .network_interrupted,
+                        .transport_interrupted, .unreadable_reply, .unnamed_os_error => .network_interrupted,
                         .connectivity_lost => .connectivity_lost,
                         .stream_stalled => .provider_stream_timeout,
                     }
                 else
                     recovery_cause;
-                const failure_diagnostic = types.ModelFailureDiagnostic.init(@errorName(err));
+                const unnamed_os_error = if (gateway_attempt_evidence.network_failure) |evidence|
+                    evidence.cause == .unnamed_os_error
+                else
+                    false;
+                // Its name says nothing; /trace has the errno (`os_errors.zig`).
+                const failure_diagnostic = types.ModelFailureDiagnostic.init(if (unnamed_os_error) "OS error, see /trace" else @errorName(err));
                 const failure_tool_evidence = settledAttemptToolEvidence(
                     deps.tool_registry,
                     preserved_tool_evidence,

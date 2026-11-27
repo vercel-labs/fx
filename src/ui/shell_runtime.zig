@@ -544,6 +544,14 @@ pub fn applyResizeWithLayout(
     return resize_runtime.applyResizeWithLayout(shell, metrics, new_layout, settled);
 }
 
+pub fn normalizeStartCursor(layout: Layout, position: CursorPosition) CursorPosition {
+    if (layout.rows == 0) return .{ .row = 1, .col = 1 };
+    var row = @min(@max(position.row, 1), layout.rows);
+    const col = if (layout.cols == 0) 1 else @min(@max(position.col, 1), layout.cols);
+    if (col > 1 and row < layout.rows) row += 1;
+    return .{ .row = row, .col = 1 };
+}
+
 fn syncUpdatesEnabledForValues(override: ?[]const u8, term: ?[]const u8) bool {
     if (override) |value| {
         if (std.ascii.eqlIgnoreCase(value, "0") or
@@ -844,6 +852,32 @@ test "TerminalState.read returns 0 when the terminal hangs up" {
 
 test "reconstructive paint re-emits a full transcript in order" {
     try @import("resize_tests.zig").testReconstructiveFullTranscriptReplay();
+}
+
+test "normalizeStartCursor bounds out-of-range terminal replies" {
+    const layout = Layout{
+        .rows = 49,
+        .cols = 146,
+        .content_bottom = 45,
+        .divider_top_row = 46,
+        .input_row = 47,
+        .divider_bottom_row = 48,
+        .hint_row = 49,
+    };
+    try std.testing.expectEqual(CursorPosition{ .row = 1, .col = 1 }, normalizeStartCursor(layout, .{ .row = 0, .col = 1 }));
+    try std.testing.expectEqual(CursorPosition{ .row = 1, .col = 1 }, normalizeStartCursor(layout, .{ .row = 1, .col = 1 }));
+    try std.testing.expectEqual(CursorPosition{ .row = 11, .col = 1 }, normalizeStartCursor(layout, .{ .row = 10, .col = 5 }));
+    try std.testing.expectEqual(CursorPosition{ .row = 49, .col = 1 }, normalizeStartCursor(layout, .{ .row = 49, .col = 5 }));
+    try std.testing.expectEqual(CursorPosition{ .row = 49, .col = 1 }, normalizeStartCursor(layout, .{ .row = 60000, .col = 1 }));
+    try std.testing.expectEqual(CursorPosition{ .row = 49, .col = 1 }, normalizeStartCursor(layout, .{ .row = 60000, .col = 8 }));
+
+    var one_col = layout;
+    one_col.cols = 1;
+    try std.testing.expectEqual(CursorPosition{ .row = 10, .col = 1 }, normalizeStartCursor(one_col, .{ .row = 10, .col = 5 }));
+
+    var zero_rows = layout;
+    zero_rows.rows = 0;
+    try std.testing.expectEqual(CursorPosition{ .row = 1, .col = 1 }, normalizeStartCursor(zero_rows, .{ .row = 60000, .col = 1 }));
 }
 
 test {

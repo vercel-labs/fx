@@ -95,9 +95,14 @@ jobs:
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/web_fetch_dns/check.sh design-b design-a
       - name: Model-check terminal hang-up
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/terminal_hangup/check.sh design-a design-b
+      - name: Model-check how the TUI ends on an outside signal
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/tui_close/check.sh design-a design-b
 
       - name: Model-check CLI hang-up
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/cli_hangup/check.sh design-a design-b
+
+      - name: Model-check the terminal lifecycle
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/terminal/check.sh TerminalLifecycle
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -147,6 +152,13 @@ jobs:
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/web_fetch_dns/
       - name: Walk fx along the terminal hang-up model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/terminal_hangup/
+      - name: Install tmux
+        run: |
+          command -v tmux >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y tmux; }
+          tmux -V
+
+      - name: Walk the TUI's close paths along their model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/tui_close/
 
       - name: Walk fx along the CLI hang-up model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/cli_hangup/
