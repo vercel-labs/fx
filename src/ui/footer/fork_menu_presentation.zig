@@ -3,6 +3,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const input_presentation = @import("input_presentation.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const ui_render = @import("../render.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
@@ -21,9 +22,6 @@ const header_subtitle = "Select a prompt to fork before";
 const empty_prompt_label = "(empty prompt)";
 /// Minimum text columns required before showing the prompt number gutter.
 const min_text_cols_with_number: u16 = 4;
-/// Upper bound for copying a prompt's non-blank lines into a stack scratch buffer
-/// when skipping blank-only lines; three wrapped rows never need more than this.
-const compact_prompt_scratch_bytes: usize = 1024;
 
 /// The keys the prompt list takes, strictly widest to narrowest.
 pub const list_hint_variants = [_][]const u8{
@@ -94,47 +92,6 @@ fn isBlankSlice(bytes: []const u8) bool {
     return true;
 }
 
-fn hasBlankLine(bytes: []const u8) bool {
-    var pos: usize = 0;
-    while (pos <= bytes.len) {
-        const nl = std.mem.findScalarPos(u8, bytes, pos, '\n') orelse bytes.len;
-        if (isBlankSlice(bytes[pos..nl])) return true;
-        if (nl == bytes.len) break;
-        pos = nl + 1;
-    }
-    return false;
-}
-
-/// Returns `prompt` unchanged when it has no blank-only lines, `empty_prompt_label`
-/// when it is blank-only, or a compacted copy in `scratch` with blank-only lines
-/// removed so multi-line prompts show real text instead of empty gaps and lone `…`.
-fn promptSource(prompt: []const u8, scratch: *[compact_prompt_scratch_bytes]u8) []const u8 {
-    if (isBlankSlice(prompt)) return empty_prompt_label;
-    if (!hasBlankLine(prompt)) return prompt;
-
-    var out_len: usize = 0;
-    var pos: usize = 0;
-    while (pos <= prompt.len) {
-        const nl = std.mem.findScalarPos(u8, prompt, pos, '\n') orelse prompt.len;
-        const line_end = if (nl > pos and prompt[nl - 1] == '\r') nl - 1 else nl;
-        const line = prompt[pos..line_end];
-        if (!isBlankSlice(line)) {
-            if (out_len > 0) {
-                if (out_len >= scratch.len) break;
-                scratch[out_len] = '\n';
-                out_len += 1;
-            }
-            const copy_len = @min(line.len, scratch.len - out_len);
-            @memcpy(scratch[out_len..][0..copy_len], line[0..copy_len]);
-            out_len += copy_len;
-            if (out_len >= scratch.len) break;
-        }
-        if (nl == prompt.len) break;
-        pos = nl + 1;
-    }
-    return if (out_len == 0) empty_prompt_label else scratch[0..out_len];
-}
-
 fn trimTruncatedTail(layout: *MessageLayout) void {
     if (!layout.truncated or layout.row_count == 0) return;
     const last = layout.rows[layout.row_count - 1];
@@ -143,8 +100,10 @@ fn trimTruncatedTail(layout: *MessageLayout) void {
     layout.rows[layout.row_count - 1] = last[0..end];
 }
 
-fn promptLayout(prompt: []const u8, scratch: *[compact_prompt_scratch_bytes]u8, text_width: u16, row_limit: u16) MessageLayout {
-    const source = promptSource(prompt, scratch);
+/// The prompt's wrapped rows; the shared layout skips its blank lines, and a
+/// prompt with no text, such as an image-only one, shows `empty_prompt_label`.
+fn promptLayout(prompt: []const u8, text_width: u16, row_limit: u16) MessageLayout {
+    const source = if (isBlankSlice(prompt)) empty_prompt_label else prompt;
     var layout = render_input.steering_message_layout(source, text_width, false, row_limit);
     trimTruncatedTail(&layout);
     return layout;
@@ -158,10 +117,9 @@ const Lines = struct {
 
     fn measure(projection: ForkMenuProjection, text_width: u16) Lines {
         var lines: Lines = .{};
-        var scratch: [compact_prompt_scratch_bytes]u8 = undefined;
         for (projection.points, 0..) |point, index| {
             if (index == projection.selected) lines.selected_start = lines.total;
-            lines.total += promptLayout(point.prompt, &scratch, text_width, max_prompt_lines).row_count;
+            lines.total += promptLayout(point.prompt, text_width, max_prompt_lines).row_count;
             if (index == projection.selected) lines.selected_end = lines.total;
         }
         return lines;
@@ -227,8 +185,7 @@ const QuestionLayout = struct {
             };
         }
 
-        var scratch: [compact_prompt_scratch_bytes]u8 = undefined;
-        const full_prompt = promptLayout(projection.points[projection.selected].prompt, &scratch, columns.question_width, max_prompt_lines);
+        const full_prompt = promptLayout(projection.points[projection.selected].prompt, columns.question_width, max_prompt_lines);
         if (rem == 1) {
             return .{
                 .prompt_start = 0,
@@ -342,10 +299,8 @@ fn composeQuestionRow(
     if (layout.show_header and row_index == 0) return composeHeaderRow(alloc, null, width);
 
     if (layout.prompt_rows > 0 and row_index >= layout.prompt_start and row_index < layout.prompt_start + layout.prompt_rows) {
-        var scratch: [compact_prompt_scratch_bytes]u8 = undefined;
         const prompt_wrapped = promptLayout(
             projection.points[projection.selected].prompt,
-            &scratch,
             layout.columns.question_width,
             layout.prompt_rows,
         );
@@ -414,9 +369,8 @@ pub fn composeForkMenuRow(
 
     const line = listWindowStart(projection, list) + (row_index - list.first_item_row);
     var first: usize = 0;
-    var scratch: [compact_prompt_scratch_bytes]u8 = undefined;
     for (projection.points, 0..) |point, index| {
-        const layout = promptLayout(point.prompt, &scratch, list.columns.text_width, max_prompt_lines);
+        const layout = promptLayout(point.prompt, list.columns.text_width, max_prompt_lines);
         if (line < first + layout.row_count) {
             const style = if (index == projection.selected) ui_render.selected_completion_style else ui_render.dim_style;
             return composeStyledLayoutRow(alloc, list.columns.indent, style, list.columns, index, line == first, layout, line - first);
@@ -667,6 +621,24 @@ test "fork menu skips blank lines and labels empty prompts" {
         const line = try gridRow(grid, alloc, row_index);
         defer alloc.free(line);
         try std.testing.expectEqualStrings(exp, line);
+    }
+}
+
+test "fork menu marks a long prompt with a blank line as cut on a very wide window" {
+    const alloc = std.testing.allocator;
+    // Width 600: 594 text columns, so the prompt's 1300 letters need more than the
+    // two rows left after "intro", and the 1500 CJK cells need more than two too.
+    const ascii = "intro\n\n" ++ text_utils.repeat("y", 1300);
+    const cjk = "intro\n\n" ++ text_utils.repeat("界", 750);
+    for ([_][]const u8{ ascii, cjk }) |prompt| {
+        const points = [_]ForkPoint{.{ .turn = 1, .prompt = @constCast(prompt) }};
+        const projection: ForkMenuProjection = .{ .points = &points, .selected = 0, .window_start = 0 };
+        try std.testing.expectEqual(@as(u16, 5), menuRowCount(projection, 600, max_inline_rows));
+        const last = try testRow(projection, 4, 600, max_inline_rows);
+        defer alloc.free(last.text);
+        try std.testing.expect(std.mem.endsWith(u8, last.text, "…"));
+        try std.testing.expect(std.unicode.utf8ValidateSlice(last.text));
+        try std.testing.expect(std.mem.find(u8, last.text, "\\x") == null);
     }
 }
 

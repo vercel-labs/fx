@@ -800,27 +800,28 @@ pub fn composeEffortMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bo
         return warning;
     }
 
-    const variants = [_][]const u8{
-        "↑↓ navigate     enter use     esc close",
-        "↑↓ navigate  enter use  esc close",
-        "↑↓ move  enter  esc",
-        "enter use  esc close",
-        "enter esc",
-    };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
     try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
+    try row_text.appendClipped(alloc, &row, widestFittingHint(&use_hint_variants, width), width);
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
+}
+
+/// The keys of a menu whose Enter uses the highlighted entry, strictly widest to narrowest.
+const use_hint_variants = [_][]const u8{
+    "↑↓ navigate     enter use     esc close",
+    "↑↓ navigate  enter use  esc close",
+    "↑↓ move  enter use  esc",
+    "enter use  esc close",
+    "enter esc",
+};
+
+fn widestFittingHint(variants: []const []const u8, width: u16) []const u8 {
+    for (variants) |candidate| {
+        if (display_width.visibleWidth(candidate) <= width) return candidate;
+    }
+    return variants[variants.len - 1];
 }
 
 pub fn composeSettingsMenuHintRow(
@@ -982,25 +983,10 @@ fn composeCatalogMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool,
 }
 
 pub fn composeSlashMenuHintRow(alloc: Allocator, width: u16) !std.ArrayList(u8) {
-    const variants = [_][]const u8{
-        "↑↓ navigate     enter use     esc close",
-        "↑↓ navigate  enter use  esc close",
-        "↑↓ move  enter  esc",
-        "enter use  esc close",
-        "enter esc",
-    };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
     try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
+    try row_text.appendClipped(alloc, &row, widestFittingHint(&use_hint_variants, width), width);
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
@@ -1015,6 +1001,28 @@ test "slash menu hint keeps navigation and selection controls width safe" {
     defer narrow.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, narrow.items, "enter esc") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow.items) <= 12);
+}
+
+test "slash and effort menu hints keep 'use' while it fits and reach every variant" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { width: u16, hint: []const u8 }{
+        .{ .width = 32, .hint = "↑↓ move  enter use  esc" },
+        .{ .width = 23, .hint = "↑↓ move  enter use  esc" },
+        .{ .width = 22, .hint = "enter use  esc close" },
+        .{ .width = 20, .hint = "enter use  esc close" },
+        .{ .width = 19, .hint = "enter esc" },
+    };
+    for (cases) |case| {
+        var slash = try composeSlashMenuHintRow(alloc, case.width);
+        defer slash.deinit(alloc);
+        var effort = try composeEffortMenuHintRow(alloc, case.width, false);
+        defer effort.deinit(alloc);
+        for ([_][]const u8{ slash.items, effort.items }) |row| {
+            const start = std.mem.find(u8, row, case.hint) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row) <= case.width);
+            try std.testing.expect(start > 0);
+        }
+    }
 }
 
 pub fn composeVisibleInputRows(

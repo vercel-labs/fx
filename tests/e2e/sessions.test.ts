@@ -2010,6 +2010,69 @@ async function forkMenuRows(session: TmuxSession) {
     .filter((row) => row.text.startsWith("Fork prompt"));
 }
 
+/// The rows between the two rules around the open inline menu, and the hint row below them.
+function inlineMenu(grid: string[]) {
+  const rules = grid.flatMap((line, index) => (/^─{10,}$/.test(line) ? [index] : []));
+  const top = rules.at(-2)!;
+  const bottom = rules.at(-1)!;
+  return { rows: grid.slice(top + 1, bottom), hint: grid[bottom + 1] ?? "" };
+}
+
+const forkLayoutTest = "/fork shows a counted header and numbered prompts without blank rows, holds Shift+Tab, and keeps fork in a narrow hint";
+test.skipIf(!tmuxAvailable())(forkLayoutTest, async () => {
+  const fixture = createFixture("fx-v2-app-fork-layout-");
+  const longPrompt = "Fork layout two is a long prompt that wraps past the end of one row in an eighty column window";
+  const gateway = replyToLatest([
+    ["Fork layout one.", "LAYOUT_ONE"],
+    [longPrompt, "LAYOUT_TWO"],
+    ["Fork layout four after blanks", "LAYOUT_THREE"],
+  ]);
+  try {
+    const app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "auto" });
+    await app.session.resizeWindow(80, 24);
+    await app.session.sendText("Fork layout one.");
+    await app.session.waitForPane((pane) => pane.includes("LAYOUT_ONE") && turnSettled(pane), TIMEOUT);
+    await app.session.sendText(longPrompt);
+    await app.session.waitForPane((pane) => pane.includes("LAYOUT_TWO") && turnSettled(pane), TIMEOUT);
+    await app.session.pasteText("Fork layout three\n\n\nFork layout four after blanks");
+    await app.session.sendKeys("Enter");
+    await app.session.waitForPane((pane) => pane.includes("LAYOUT_THREE") && turnSettled(pane), TIMEOUT);
+    await app.session.waitForStableComposer();
+
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    const wide = inlineMenu(await app.session.capturePaneGrid());
+    expect(wide.rows[0]).toBe("Fork 3  Select a prompt to fork before");
+    expect(wide.rows[1]).toBe("");
+    expect(wide.rows).toContain("  1  Fork layout one.");
+    expect(wide.rows.some((row) => row.startsWith("  2  Fork layout two is a long prompt"))).toBe(true);
+    expect(wide.rows.some((row) => /^ {5}\S/.test(row) && !row.includes("Fork layout four"))).toBe(true);
+    expect(wide.rows).toContain("  3  Fork layout three");
+    expect(wide.rows).toContain("     Fork layout four after blanks");
+    expect(wide.rows.slice(2).filter((row) => row.trim() === "" || row.trim() === "…")).toEqual([]);
+    expect(wide.hint).toBe("↑↓ navigate     enter fork     esc close");
+
+    // Shift+Tab with the menu open must not switch the permission mode behind it.
+    await app.session.sendKeys("BTab");
+    await app.session.sendKeys("Escape");
+    const closed = await app.session.waitForPane((pane) => !pane.includes("enter fork"), TIMEOUT);
+    expect(closed).toMatch(/^auto · /m);
+    expect(closed).not.toContain("Full access enabled");
+
+    await app.session.resizeWindow(32, 18);
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    const narrow = inlineMenu(await app.session.capturePaneGrid());
+    expect(narrow.rows[0]).toBe("Fork 3");
+    expect(narrow.hint).toBe("↑↓ move  enter fork  esc");
+    await app.session.sendKeys("Escape");
+    await app.session.waitForPane((pane) => !pane.includes("enter fork"), TIMEOUT);
+    await quitApp(app);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
 
 
 const forkTest = "/fork starts a session before a chosen prompt and leaves the source as it was";

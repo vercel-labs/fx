@@ -1176,6 +1176,8 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     } else if (forkMenuActive(screen_agent)) {
                         debug_trace.logf("input", "shift+tab ignored reason=fork_menu_active", .{});
+                    } else if (app.input_runtime.effort_menu.active) {
+                        debug_trace.logf("input", "shift+tab ignored reason=effort_menu_active", .{});
                     } else {
                         try app_permission_runtime.Runtime(App).toggleMode(app, screen_agent);
                     }
@@ -1185,7 +1187,11 @@ pub fn Runtime(comptime App: type) type {
                         runtime_profile.allows(App, .durable_sessions))
                     {
                         const screen_agent = agents.screenAgentOf(app);
-                        if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or forkMenuActive(screen_agent)) return .done;
+                        if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app)) return .done;
+                        if (forkMenuActive(screen_agent)) {
+                            debug_trace.logf("input", "open_all_sessions ignored reason=fork_menu_active", .{});
+                            return .done;
+                        }
                         if (try refuseSessionActionWithDraft(app, screen_agent, "submit or clear the draft before switching sessions")) return .done;
                         dismissActiveMenusThenRedraw(app, screen_agent);
                         try app_session_runtime.Runtime(App).openAllSessionPicker(app, screen_agent);
@@ -9527,6 +9533,25 @@ test "app_input_runtime ctrl+t closes the open effort menu and cycles from the l
     try std.testing.expectEqual(routing_cycle_efforts[2], app.agent().effort);
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
     try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+}
+
+test "app_input_runtime shift+tab leaves the permission mode alone while the effort menu is open" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.permission_engine.mode = .auto;
+    app.setGatewayControls("test/model", &routing_cycle_efforts, false);
+    try app.input_runtime.effort_menu.open(
+        alloc,
+        "test/model",
+        app.resolvedModelCapabilities("test/model"),
+        app.agent().effort,
+    );
+
+    _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(&app, .toggle_permission_mode, null, null, null, false, 4096);
+
+    try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
+    try std.testing.expect(app.input_runtime.effort_menu.active);
 }
 
 test "app_input_runtime blocks shift+tab, ctrl+r, and stray edits while fork menu or its question is open" {
