@@ -51,7 +51,8 @@ if [ "$channel_known" = true ] && git merge-base --is-ancestor "$channel_sha" "$
   decide true "the channel names ${channel_sha}; moving it to ${build_sha}"
 fi
 if [ -z "$main_sha" ]; then
-  echo "::error::main's newest commit is needed to decide, and it could not be read" >&2
+  # Workflow commands go to stdout, the channel GitHub documents for them.
+  echo "::error::main's newest commit is needed to decide, and it could not be read"
   exit 1
 fi
 if [ "$main_sha" = "$build_sha" ]; then

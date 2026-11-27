@@ -198,7 +198,7 @@ jobs:
           if [ -z "$CURRENT_SHA" ]; then
             echo "::warning::could not read a commit from dev.json; only main's newest commit may replace it"
           fi
-          MAIN_SHA=$(git ls-remote origin refs/heads/main | cut -f1) || MAIN_SHA=""
+          MAIN_SHA=$(timeout 60 git ls-remote origin refs/heads/main | cut -f1) || MAIN_SHA=""
           # The rule comes from this workflow's own commit, since the build's
           # checkout can be older than the script.
           git show "${GITHUB_SHA}:scripts/dev-channel-forward.sh" > "$RUNNER_TEMP/dev-channel-forward.sh"
@@ -209,8 +209,6 @@ jobs:
         if: steps.forward.outputs.move == 'true'
         run: |
           set -euo pipefail
-          echo "updated=false" >> "$GITHUB_OUTPUT"
-
           VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
           jq -n --arg version "$VERSION" --arg commit "$RELEASE_SHA" \
             '{version: $version, commit: $commit}' > /tmp/dev.json
