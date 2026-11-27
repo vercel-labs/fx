@@ -3291,6 +3291,8 @@ fn requestAcpPermission(
         "session/request_permission",
         params.writer.buffered(),
     ) catch |err| {
+        // Out of memory is no refusal: the turn fails as any allocation does.
+        if (err == error.OutOfMemory) return err;
         // A subagent's refusal names why nobody could be asked; the parent's
         // own turn fails with the write's error.
         return if (ctx.subagent != null) error.PermissionPromptClientUnavailable else err;
@@ -3343,8 +3345,11 @@ fn writeSubagentMeta(writer: *std.Io.Writer, asker: SubagentAsker) !void {
 }
 
 fn writeValidatedToolArguments(alloc: Allocator, writer: *std.Io.Writer, arguments_json: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch
-        return error.InvalidToolArgumentsJson;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| return switch (err) {
+        // Out of memory says nothing about the arguments.
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidToolArgumentsJson,
+    };
     defer parsed.deinit();
     try std.json.Stringify.value(parsed.value, .{}, writer);
 }
@@ -5377,6 +5382,16 @@ test "ACP permission arguments are validated and reserialized before emission" {
     try std.testing.expectEqual(@as(usize, 0), malformed.written().len);
 }
 
+test "out of memory while a subagent's tool arguments are checked is out of memory, not invalid arguments" {
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        writeValidatedToolArguments(failing.allocator(), &out.writer, "{\"path\":\"README.md\"}"),
+    );
+}
+
 test "acp exposes web_search progress updates" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -6309,6 +6324,54 @@ test "out of memory while a subagent asks for approval is out of memory, not an 
     var stop = std.atomic.Value(bool).init(false);
     const asker: SubagentAsker = .{ .child_id = "child_a", .work_id = "work_1", .name = "writer", .stop = &stop };
     try std.testing.expectError(error.OutOfMemory, beginSubagentRequest(&state, asker));
+}
+
+/// Asks for a subagent's permission with the client's frames written through
+/// `write_fn`, which receives every frame the request writes.
+fn askSubagentWithWriter(context: ?*anyopaque, write_fn: jsonrpc.Writer.WriteFn) anyerror!permission_request.OwnedPermissionResponse {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = jsonrpc.Writer.initCallback(context, write_fn);
+    state.subagent_asks_open = true;
+    state.subagent_cards_open = true;
+    var stop = std.atomic.Value(bool).init(false);
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .state = &state,
+        .session_id = "session_1",
+        .subagent = .{ .child_id = "child_a", .work_id = "work_1", .name = "writer", .stop = &stop },
+    };
+    defer ctx.deinitPublishedToolCalls();
+    const call: ToolCall = .{ .id = "call_1", .name = "write_file", .arguments_json = "{}" };
+    return requestAcpPermission(&ctx, alloc, .{ .label = "write a file" }, call, null, null);
+}
+
+/// Writes every frame but the permission request, which it fails with out of
+/// memory from a failing allocator.
+fn failRequestFrameOutOfMemory(context: ?*anyopaque, bytes: []const u8) anyerror!void {
+    if (std.mem.find(u8, bytes, "session/request_permission") == null) return;
+    const failing: *std.testing.FailingAllocator = @ptrCast(@alignCast(context.?));
+    const scratch = try failing.allocator().alloc(u8, 1);
+    failing.allocator().free(scratch);
+}
+
+/// Writes every frame but the permission request, which it fails with a
+/// broken pipe.
+fn failRequestFrameBrokenPipe(_: ?*anyopaque, bytes: []const u8) anyerror!void {
+    if (std.mem.find(u8, bytes, "session/request_permission") == null) return;
+    return error.BrokenPipe;
+}
+
+test "out of memory while a subagent's permission request is written is out of memory, not an unavailable client" {
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, askSubagentWithWriter(&failing, failRequestFrameOutOfMemory));
+}
+
+test "a failed write of a subagent's permission request is an unavailable client, not out of memory" {
+    try std.testing.expectError(error.PermissionPromptClientUnavailable, askSubagentWithWriter(null, failRequestFrameBrokenPipe));
 }
 
 test "a subagent's card carries its child id and ends once with its call's status" {
