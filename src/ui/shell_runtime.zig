@@ -258,7 +258,10 @@ pub const TerminalState = struct {
         if (comptime builtin.target.os.tag == .wasi) {
             return std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{out});
         }
-        return std.posix.read(self.stdin_fd, out);
+        return std.posix.read(self.stdin_fd, out) catch |err| {
+            if (ui_terminal.terminalGone(self.stdin_fd, err)) return 0;
+            return err;
+        };
     }
 
     pub fn pollInput(self: TerminalState, timeout_ms: i32) !PollResult {
@@ -280,7 +283,8 @@ pub const TerminalState = struct {
         return .{
             .readable = (revents & std.posix.POLL.IN) != 0,
             .hung_up = (revents & std.posix.POLL.HUP) != 0,
-            .has_error = (revents & std.posix.POLL.ERR) != 0,
+            // macOS sets POLLNVAL when session teardown revokes the tty (`tests/tla/terminal_hangup/TerminalHangup.tla` `NoSpin`).
+            .has_error = (revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0,
         };
     }
 };
@@ -725,6 +729,124 @@ test "enableRawMode preserves carriage return input" {
     var buf: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try std.posix.read(pty.slave, &buf));
     try std.testing.expectEqual(@as(u8, '\r'), buf[0]);
+}
+
+test "pollInput reports a revoked or closed descriptor as closed" {
+    if (comptime builtin.target.os.tag == .wasi) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "closed-poll", .{});
+    defer file.close(std.testing.io);
+
+    const floor: c_int = @intCast(@min((try std.posix.getrlimit(.NOFILE)).cur -| 1, 900));
+    var closed = std.c.fcntl(file.handle, std.posix.F.DUPFD, floor);
+    if (closed < 0) closed = std.c.dup(file.handle);
+    try std.testing.expect(closed >= 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.close(closed));
+
+    const terminal = TerminalState{ .stdin_fd = closed };
+    const poll_result = try terminal.pollInput(0);
+    try std.testing.expect(poll_result.closed());
+}
+
+test "TerminalState.read returns 0 when the terminal hangs up" {
+    if (!supports_test_pty) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+
+    const ioctl_sctty: c_int = switch (builtin.target.os.tag) {
+        .macos => 0x20007461,
+        .linux => @intCast(std.os.linux.T.IOCSCTTY),
+        else => unreachable,
+    };
+    const pty = try TestPty.open();
+    defer pty.close();
+
+    const res_pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    errdefer {
+        _ = std.c.close(res_pipe[0]);
+        _ = std.c.close(res_pipe[1]);
+    }
+    const done_pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    errdefer {
+        _ = std.c.close(done_pipe[0]);
+        _ = std.c.close(done_pipe[1]);
+    }
+
+    const p1 = std.c.fork();
+    if (p1 < 0) return error.Unexpected;
+    if (p1 == 0) {
+        _ = std.c.close(pty.master);
+        _ = std.c.close(res_pipe[0]);
+        _ = std.c.close(done_pipe[1]);
+        _ = std.c.setsid();
+        _ = std.c.ioctl(pty.slave, ioctl_sctty, @as(c_int, 0));
+
+        const orphan_pipe = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch std.c._exit(2);
+        const p2 = std.c.fork();
+        if (p2 < 0) std.c._exit(2);
+        if (p2 == 0) {
+            const p3 = std.c.fork();
+            if (p3 < 0) std.c._exit(2);
+            if (p3 == 0) {
+                _ = std.c.close(orphan_pipe[1]);
+                _ = std.c.setpgid(0, 0);
+                var wait_byte: [1]u8 = undefined;
+                while (true) {
+                    const r = std.c.read(orphan_pipe[0], &wait_byte, 1);
+                    if (r == 0) break;
+                    if (r < 0 and std.posix.errno(r) == .INTR) continue;
+                    break;
+                }
+                _ = std.c.close(orphan_pipe[0]);
+
+                const terminal = TerminalState{ .stdin_fd = pty.slave };
+                var buf: [16]u8 = undefined;
+                const msg: []const u8 = if (terminal.read(&buf)) |n|
+                    if (n == 0) "OK" else "NONZERO"
+                else |err|
+                    @errorName(err);
+                _ = std.c.write(res_pipe[1], msg.ptr, msg.len);
+                std.c._exit(0);
+            }
+            std.c._exit(0);
+        }
+        _ = std.c.close(orphan_pipe[0]);
+        _ = std.c.close(orphan_pipe[1]);
+        _ = std.c.close(res_pipe[1]);
+        var st: c_int = 0;
+        _ = std.c.waitpid(p2, &st, 0);
+        var wait_done: [1]u8 = undefined;
+        while (true) {
+            const r = std.c.read(done_pipe[0], &wait_done, 1);
+            if (r == 0) break;
+            if (r < 0 and std.posix.errno(r) == .INTR) continue;
+            break;
+        }
+        _ = std.c.close(done_pipe[0]);
+        std.c._exit(0);
+    }
+
+    _ = std.c.close(res_pipe[1]);
+    _ = std.c.close(done_pipe[0]);
+
+    var msg_buf: [64]u8 = undefined;
+    var msg_len: usize = 0;
+    while (msg_len < msg_buf.len) {
+        const n = std.c.read(res_pipe[0], msg_buf[msg_len..].ptr, msg_buf.len - msg_len);
+        if (n == 0) break;
+        if (n < 0) {
+            if (std.posix.errno(n) == .INTR) continue;
+            break;
+        }
+        msg_len += @intCast(n);
+    }
+    _ = std.c.close(res_pipe[0]);
+    _ = std.c.close(done_pipe[1]);
+    var st: c_int = 0;
+    _ = std.c.waitpid(p1, &st, 0);
+
+    try std.testing.expectEqualStrings("OK", msg_buf[0..msg_len]);
 }
 
 test "reconstructive paint re-emits a full transcript in order" {

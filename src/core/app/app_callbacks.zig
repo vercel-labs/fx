@@ -413,6 +413,11 @@ pub fn Bindings(comptime App: type) type {
                     if (agent.session_persistence.v2 != null) agentMarkTurnYielded else null
                 else
                     null,
+                // Only a host that upgrades itself restarts, so only it holds a turn.
+                .hold_for_restart = if (comptime agents.hasAgentField(App, "session_persistence") and runtime_profile.allows(App, .auto_upgrade))
+                    if (agent.session_persistence.v2 != null) agentHoldForRestart else null
+                else
+                    null,
                 .propagate_grant = agentPropagateGrant,
                 .push_event = agentPushEvent,
                 .push_text = agentPushText,
@@ -439,6 +444,7 @@ pub fn Bindings(comptime App: type) type {
                     agentAskOutOfCredits
                 else
                     null,
+                .continue_selection = if (comptime provider_runtime.supported(App)) agentContinueSelection else null,
                 .stored_sign_in_resumed = if (comptime @hasDecl(@TypeOf(agent.worker), "markBeganWork"))
                     agentStoredSignInResumed
                 else
@@ -924,11 +930,12 @@ pub fn Bindings(comptime App: type) type {
             try app.cooperativeTransportPulse(agent);
         }
 
-        fn agentFinalizeTurn(ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, _: ?types.ProviderCompletionDisposition) !void {
+        fn agentFinalizeTurn(ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             try agent.worker.pushTurnFinished(std.heap.c_allocator, .{
                 .turn_id = turn_id,
                 .outcome = outcome,
+                .disposition = disposition,
             });
         }
 
@@ -1052,6 +1059,16 @@ pub fn Bindings(comptime App: type) type {
                 return app.providerSet().select(provider_runtime.providerOf(app, agent)).fallbackModelCapabilities(model);
             }
             return model_capabilities.capabilitiesForModel(model);
+        }
+
+        /// The provider and model a continuing request uses, taken from the
+        /// worker's own copy once (`ViewWaits.tla` PickForItsWaitOnly).
+        fn agentContinueSelection(ctx: *anyopaque, alloc: std.mem.Allocator) anyerror!?agent_runtime.CurrentSelection {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            // A test fake may keep no worker copy: it has none to take.
+            if (comptime !@hasDecl(@TypeOf(agent.worker), "takeContinueSelection")) return null;
+            const selection = agent.worker.takeContinueSelection() orelse return null;
+            return .{ .provider = selection.provider, .model = try alloc.dupe(u8, selection.modelText()) };
         }
 
         fn agentAvailableModelCapabilities(ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities {
@@ -1379,6 +1396,11 @@ pub fn Bindings(comptime App: type) type {
         fn agentMarkTurnYielded(ctx: *anyopaque) anyerror!void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).markTurnYielded(agent);
+        }
+
+        fn agentHoldForRestart(ctx: *anyopaque) agent_runtime.AgentRuntimeDeps.RestartHoldEnd {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            return agent.worker.holdForRestart();
         }
 
         fn agentRecordUsage(ctx: *anyopaque, usage: types.Usage) anyerror!void {
@@ -1766,6 +1788,16 @@ pub fn Bindings(comptime App: type) type {
                 if (comptime @hasField(InputRuntime, "model_picker_draft")) {
                     if (app.input_runtime.model_picker_draft != null) return;
                 }
+                // A picker this agent's own worker opened changes that agent's
+                // model, so the choice reaches the subagent that waits, not
+                // the one on screen (`tests/tla/subagent/ViewWaits.tla`
+                // ActionReachesOwner).
+                if (comptime @hasField(App, "model_choice_target")) {
+                    if (agent.role == .subagent) app.model_choice_target = agent;
+                }
+                // The picker borrows the composer as its query box; the
+                // person's draft goes back when the pick or the close is done.
+                if (comptime @hasField(App, "input_runtime")) app.input_runtime.stashModelPickerDraft();
                 try input_completion_runtime.CompletionRuntime(App).openCurrentModelPicker(app);
             }
         }

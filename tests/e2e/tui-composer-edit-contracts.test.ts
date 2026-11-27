@@ -1340,6 +1340,7 @@ async function startFxOnPty(): Promise<void> {
       FX_MODEL: FAKE_GATEWAY_MODEL,
       FX_AUTO_UPGRADE: "0",
       FX_SOUND: "0",
+      FX_TEST_SKIP_WORKSPACE_TRUST: "1",
     }),
     terminal: {
       cols: 112,

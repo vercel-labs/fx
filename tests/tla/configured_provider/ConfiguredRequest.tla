@@ -4,8 +4,14 @@
 (* (src/core/config/configured_provider.zig, src/gateway/) over one live   *)
 (* session: which effort level and which request fields reach the wire,    *)
 (* the notice for a configured effort the model does not offer, and the    *)
-(* one resend of a reply that ran out of output tokens with nothing        *)
-(* usable (src/core/agent/runtime/orchestrator.zig).                       *)
+(* request after a reply that ran out of output tokens with nothing        *)
+(* usable, which carries fx's note to take a smaller step                  *)
+(* (src/core/agent/runtime/orchestrator.zig,                               *)
+(* src/core/agent/runtime/output_limit.zig). Two notes in a row are the    *)
+(* most: the third cut reply in a row ends the turn. The first cut of a    *)
+(* turn raises an output limit fx chose itself for the rest of the turn,   *)
+(* and a note's request reasons at `low` when the request that was cut did *)
+(* not already.                                                            *)
 (*                                                                         *)
 (* A model's metadata may declare:                                         *)
 (*   declared  its effort levels, in the order the settings list them      *)
@@ -55,10 +61,15 @@ VARIABLES
     phase,       \* "idle" between turns, "waiting" for a reply
     sent,        \* every request of the session, in order
     notices,     \* ignored-effort notices shown in the session
-    raised,      \* this turn already resent with fx's own output limit
-    resent       \* the request being answered is a resend
+    raised,      \* this turn raised fx's own output limit after a cut
+    resent,      \* the request being answered carries a note after a cut
+    lowered,     \* the request being answered reasons at `low` after a cut
+    cuts         \* cut replies in a row in this turn
 
-vars == <<def, configured, loaded, phase, sent, notices, raised, resent>>
+vars == <<def, configured, loaded, phase, sent, notices, raised, resent, lowered, cuts>>
+
+\* output_limit.max_notes_in_a_row
+MaxNotes == 2
 
 \* A fragment names a field fx owns.
 NamesOwned(d) ==
@@ -74,6 +85,8 @@ InitWith(d, c) ==
     /\ notices = 0
     /\ raised = FALSE
     /\ resent = FALSE
+    /\ lowered = FALSE
+    /\ cuts = 0
 
 Init == \E d \in Definitions, c \in Efforts : InitWith(d, c)
 
@@ -87,6 +100,8 @@ Reset(d, c) ==
     /\ notices' = 0
     /\ raised' = FALSE
     /\ resent' = FALSE
+    /\ lowered' = FALSE
+    /\ cuts' = 0
 
 \* The levels fx offers for the model.
 Offered == IF Bug = "today" THEN {} ELSE Range(def.declared)
@@ -140,15 +155,17 @@ Send(e, r, again) ==
     /\ notices' = Noticed(again)
     /\ raised' = r
     /\ resent' = again
+    /\ lowered' = (again /\ e = "low" /\ Wire(configured) # "low")
     /\ phase' = "waiting"
 
 Ends ==
     /\ phase' = "idle"
-    /\ UNCHANGED <<sent, notices, raised, resent>>
+    /\ UNCHANGED <<sent, notices, raised, resent, lowered>>
 
 StartTurn ==
     /\ loaded = "ok"
     /\ phase = "idle"
+    /\ cuts' = 0
     /\ Send(configured, FALSE, FALSE)
     /\ UNCHANGED <<def, configured, loaded>>
 
@@ -157,18 +174,22 @@ LowReasonsLess(e) ==
     /\ "low" \in Offered
     /\ e \notin Offered \/ Position(def.declared, "low") < Position(def.declared, e)
 
+\* A cut reply: up to two in a row get a note; the third ends the turn.
+\* no_cap: every cut gets one. resend_again: a request already at `low`
+\* after a cut is lowered again.
 Cut ==
-    LET raise == ~resent /\ ~raised /\ ~def.limit
-        lower == (~resent \/ Bug = "resend_again") /\ LowReasonsLess(configured)
-    IN IF raise \/ lower \/ (Bug = "resend_same" /\ ~resent)
-          THEN Send(IF lower THEN "low" ELSE configured, raised \/ raise, TRUE)
-          ELSE Ends
+    LET raise == ~raised /\ ~def.limit
+        lower == (~lowered \/ Bug = "resend_again") /\ LowReasonsLess(configured)
+    IN /\ cuts' = cuts + 1
+       /\ IF cuts < MaxNotes \/ Bug = "no_cap"
+             THEN Send(IF lower THEN "low" ELSE configured, raised \/ raise, TRUE)
+             ELSE Ends
 
 Reply(kind) ==
     /\ phase = "waiting"
     /\ UNCHANGED <<def, configured, loaded>>
-    /\ CASE kind = "answer" -> Ends
-         [] kind = "tool" -> Send(configured, raised, FALSE)
+    /\ CASE kind = "answer" -> Ends /\ UNCHANGED cuts
+         [] kind = "tool" -> Send(configured, raised, FALSE) /\ cuts' = 0
          [] kind = "cut" -> Cut
 
 Next == StartTurn \/ \E kind \in Kinds : Reply(kind)
@@ -192,6 +213,8 @@ TypeOK ==
     /\ notices \in Nat
     /\ raised \in BOOLEAN
     /\ resent \in BOOLEAN
+    /\ lowered \in BOOLEAN
+    /\ cuts \in Nat
 
 \* Settings whose fragment names a field fx owns never send a request.
 NothingSentWhenRejected == loaded = "rejected" => sent = <<>>
@@ -233,18 +256,21 @@ LimitInConfiguredField ==
     \A i \in DOMAIN sent :
         sent[i].field = (IF sent[i].limit = "none" THEN "none" ELSE def.field)
 
-\* A resend differs from the request it repeats.
-ResendDiffers ==
+\* Two notes in a row are the most: the third cut reply in a row ends the
+\* turn.
+AtMostTwoNotesInARow ==
     \A i \in DOMAIN sent :
-        sent[i].resend =>
-            (i > 1 /\ (sent[i].effort # sent[i - 1].effort \/ sent[i].limit # sent[i - 1].limit))
+        (i > 2 /\ sent[i].resend /\ sent[i - 1].resend) => ~sent[i - 2].resend
 
-\* A resend's own reply is never resent.
-NoResendOfResend ==
-    \A i \in DOMAIN sent : (i > 1 /\ sent[i].resend) => ~sent[i - 1].resend
+\* A request that reasons at `low` after a cut is never followed by another:
+\* the next note goes back to the configured effort.
+NeverLowTwiceInARow ==
+    \A i \in DOMAIN sent :
+        (i > 1 /\ sent[i].resend /\ sent[i - 1].resend /\ sent[i - 1].effort = "low" /\ Wire(configured) # "low")
+            => sent[i].effort = Wire(configured)
 
-\* A resend changes the effort only to `low`.
+\* A note's request changes the effort only to `low`.
 ResendLowersOnlyToLow ==
     \A i \in DOMAIN sent :
-        (i > 1 /\ sent[i].resend) => sent[i].effort \in {sent[i - 1].effort, "low"}
+        sent[i].resend => sent[i].effort \in {Wire(configured), "low"}
 =============================================================================

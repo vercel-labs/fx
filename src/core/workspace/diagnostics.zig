@@ -11,6 +11,7 @@ const render_metrics = @import("render_metrics.zig");
 const auto_review_metrics = @import("auto_review_metrics.zig");
 const compactor = @import("../compactor/compactor.zig");
 const model_catalog_metrics = @import("model_catalog_metrics.zig");
+const output_limit_metrics = @import("output_limit_metrics.zig");
 const io_mod = @import("../shared/io.zig");
 
 pub const NetworkCall = network_metrics.NetworkCall;
@@ -46,6 +47,21 @@ pub const AutoReviewAttempt = auto_review_metrics.Attempt;
 pub const AutoReviewAttemptResult = auto_review_metrics.AttemptResult;
 pub const auto_review_recent_capacity = auto_review_metrics.recent_capacity;
 pub const auto_review_held_capacity = auto_review_metrics.held_capacity;
+pub const OutputLimitStop = output_limit_metrics.Stop;
+pub const OutputLimitRecord = output_limit_metrics.Record;
+pub const OutputLimitAction = output_limit_metrics.Action;
+pub const output_limit_stop_capacity = output_limit_metrics.ring_capacity;
+
+/// Records a reply cut off at its output limit, and what fx did next, so
+/// `/trace` lists it as a problem without FX_TRACE.
+pub fn recordOutputLimitStop(stop: OutputLimitRecord) void {
+    output_limit_metrics.record(stop);
+}
+
+/// Copies the newest kept output-limit stops, oldest first.
+pub fn snapshotOutputLimitStops(out: []OutputLimitStop) usize {
+    return output_limit_metrics.snapshot(out);
+}
 
 pub fn snapshotCompactionEvents(out: []CompactionEvent) usize {
     return compactor.snapshotTrace(out);
@@ -191,6 +207,7 @@ pub fn resetSession() void {
     compactor.resetTrace();
     model_catalog_metrics.reset();
     auto_review_metrics.reset();
+    output_limit_metrics.reset();
 }
 
 pub fn resetForTest() void {
