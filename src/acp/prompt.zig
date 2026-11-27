@@ -3,6 +3,7 @@ const observation = @import("../core/agent/runtime/observation.zig");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const skill_contract = @import("../core/skills/skill_contract.zig");
 const std_builtin = @import("builtin");
+const continuation = @import("../core/continuation/continuation.zig");
 const command_admission = @import("../core/permissions/command_admission.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const credentials = @import("../core/auth/credentials.zig");
@@ -1410,7 +1411,7 @@ pub fn handlePromptWithInputId(
 
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
     defer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
-    var continued_turn: ?worker_runtime.ContinuedTurn = null;
+    var continued_turn: ?continuation.Stop = null;
     var recovery_resume: ?types.RecoveryResume = null;
     // A native resume takes its turn out of the history until `beginTurn`
     // writes it. Any error before that puts the turn back and drops the
@@ -1480,7 +1481,7 @@ pub fn handlePromptWithInputId(
         );
         // The log holds the turn's own pieces; the continuation writes only the notice.
         v2.setContinuesYielded(&entry.execution);
-        continued_turn = if (found.yielded) .yielded else .stopped;
+        continued_turn = if (found.yielded) .yielded else .interrupted;
         // No age is passed, so a turn of any age continues at once.
         recovery_resume = .{ .record = found.record, .stale = false };
     } else if (prompt_input.continue_recovery) {

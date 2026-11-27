@@ -149,6 +149,7 @@ const tool_runtime = @import("core/tooling/tool_runtime.zig");
 const web_fetch_runtime = @import("core/tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("core/tooling/web_search_runtime.zig");
 const worker_runtime = @import("core/agent/worker_runtime.zig");
+const continuation = @import("core/continuation/continuation.zig");
 const question_prompt = @import("core/agent/question_prompt.zig");
 const gateway_client = @import("gateway/client.zig");
 const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
@@ -1660,7 +1661,7 @@ const App = struct {
         agent: *agents.Agent,
         checkpoint: *const session_codec.RecoveryCheckpoint,
         resumed: types.RecoveryResume,
-        kind: worker_runtime.ContinuedTurn,
+        kind: continuation.Stop,
     ) !void {
         // The same project instructions the turn sent before the restart, so
         // the prompt before each signed thinking block is unchanged. This runs

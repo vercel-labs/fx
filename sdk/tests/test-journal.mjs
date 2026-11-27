@@ -536,6 +536,28 @@ test("a crash before a response's calls are stored asks the model again", async 
   assert.equal(toolResults(requests[0]).length, 0, "no call is answered: none was recorded");
 });
 
+test("a crash between a finished tool step and the next request resumes with no confirmed-tool prompt", async () => {
+  const journal = eventJournal();
+  const agent = await createFxEngine(options(sourceBackend, journal));
+  assert.equal((await run(agent, "use the tool")).text, "tool said beta");
+  await agent.close();
+  // The process died after the call's result, before the progress that starts
+  // the next request. Its tool state is confirmed, as a provider-run call's is
+  // once its result is admitted.
+  const step = journal.events.findIndex((event) => event.type === "tool_result");
+  const next = journal.events.findIndex((event, index) => index > step && event.type === "turn_progress");
+  const crashed = eventJournal(journal.events.slice(0, next + 1));
+  crashed.events.at(-1).data.tool_state = "confirmed";
+  const resumed = await createFxEngine(options(targetBackend, crashed));
+  requests.length = 0;
+  const turn = resumed.resume();
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
+  const continuePrompt = "Continue from the confirmed tool result above without repeating the tool.";
+  assert.equal(requests[0].filter((message) => message.role === "user" && textOf(message) === continuePrompt).length, 0, "the model is not told to continue from a confirmed tool");
+});
+
 test("resume continues a crashed turn and tells the model", async () => {
   const journal = eventJournal();
   const agent = await createFxEngine(options(sourceBackend, journal));

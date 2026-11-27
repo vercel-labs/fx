@@ -30,10 +30,16 @@ pub const Answer = enum {
     may_have_partly_run,
 };
 
+/// Whether a call's result was recorded as it finished.
+pub const Recorded = enum { recorded, unrecorded };
+
 /// A call keeps the result recorded as it finished. Any other may have
 /// partly run, so the model decides whether to run it again (RULES.md R3.3).
-pub fn answer(recorded: bool) Answer {
-    return if (recorded) .recorded else .may_have_partly_run;
+pub fn answer(recorded: Recorded) Answer {
+    return switch (recorded) {
+        .recorded => .recorded,
+        .unrecorded => .may_have_partly_run,
+    };
 }
 
 pub const Notice = enum {
@@ -43,13 +49,16 @@ pub const Notice = enum {
     resumed,
 };
 
+/// Whether a turn already holds fx's resume notice.
+pub const Told = enum { told, untold };
+
 /// The notice a turn that `stop` ended reads when it goes on. A yield is the
 /// host's own pause, so the turn goes on as if it never stopped. A turn reads
 /// the notice once: one that already holds it keeps that one where the model
 /// first saw it, so each later request still extends the one before it
 /// (`tests/tla/durable/Resumption.tla` AtMostOneNotice).
-pub fn notice(stop: Stop, already_told: bool) Notice {
-    if (already_told) return .none;
+pub fn notice(stop: Stop, told: Told) Notice {
+    if (told == .told) return .none;
     return switch (stop) {
         .interrupted => .resumed,
         .yielded => .none,
@@ -64,18 +73,18 @@ pub const resume_notice = "Resuming from unexpected session interruption.";
 pub const unfinished_call_output = "fx stopped while this tool was running, so it may have partly run. Check its effects before running it again.";
 
 test "continuation: a recorded call keeps its result and any other may have partly run" {
-    try std.testing.expectEqual(Answer.recorded, answer(true));
-    try std.testing.expectEqual(Answer.may_have_partly_run, answer(false));
+    try std.testing.expectEqual(Answer.recorded, answer(.recorded));
+    try std.testing.expectEqual(Answer.may_have_partly_run, answer(.unrecorded));
 }
 
 test "continuation: an interrupted turn reads the resume notice once" {
-    try std.testing.expectEqual(Notice.resumed, notice(.interrupted, false));
-    try std.testing.expectEqual(Notice.none, notice(.interrupted, true));
+    try std.testing.expectEqual(Notice.resumed, notice(.interrupted, .untold));
+    try std.testing.expectEqual(Notice.none, notice(.interrupted, .told));
 }
 
 test "continuation: a yielded turn reads no notice" {
-    try std.testing.expectEqual(Notice.none, notice(.yielded, false));
-    try std.testing.expectEqual(Notice.none, notice(.yielded, true));
+    try std.testing.expectEqual(Notice.none, notice(.yielded, .untold));
+    try std.testing.expectEqual(Notice.none, notice(.yielded, .told));
 }
 
 test "continuation: the texts the model reads are pinned byte for byte" {
