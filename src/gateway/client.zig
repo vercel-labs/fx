@@ -679,6 +679,9 @@ fn fetchGatewayJsonAtUrlCore(
 /// than growing memory without bound.
 const max_gateway_json_bytes: usize = 16 * 1024 * 1024;
 
+/// std's zstd decoder asserts that its buffer holds a window and one block.
+const zstd_decompress_buffer_bytes: usize = std.compress.zstd.default_window_len + std.compress.zstd.block_size_max;
+
 fn decodeGatewayJsonBody(
     alloc: std.mem.Allocator,
     encoding: std.http.ContentEncoding,
@@ -688,7 +691,7 @@ fn decodeGatewayJsonBody(
     if (encoding == .identity) return readGatewayJsonBody(alloc, raw_reader, max_bytes);
     const decompress_buffer: []u8 = switch (encoding) {
         .identity => unreachable,
-        .zstd => try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max),
+        .zstd => try alloc.alloc(u8, zstd_decompress_buffer_bytes),
         .deflate, .gzip => try alloc.alloc(u8, std.compress.flate.max_window_len),
         .compress => return error.UnsupportedCompressionMethod,
     };
@@ -3008,7 +3011,7 @@ fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchO
     const client_alloc = req.client.allocator;
     const decompress_buffer: []u8 = switch (response.head.content_encoding) {
         .identity => &.{},
-        .zstd => options.decompress_buffer orelse try client_alloc.alloc(u8, std.compress.zstd.default_window_len),
+        .zstd => options.decompress_buffer orelse try client_alloc.alloc(u8, zstd_decompress_buffer_bytes),
         .deflate, .gzip => options.decompress_buffer orelse try client_alloc.alloc(u8, std.compress.flate.max_window_len),
         .compress => return error.UnsupportedCompressionMethod,
     };
@@ -11618,6 +11621,34 @@ test "fetchWholeBodyOnOpenJob keeps the status of an error answer whose body is 
 test "fetchWholeBodyOnOpenJob accepts a complete chunked answer whose Content-Length is wrong" {
     const result = try fetchOneLoopbackAnswer("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nContent-Length: 4096\r\nConnection: close\r\n\r\nb\r\n{\"data\":[]}\r\n0\r\n\r\n", true);
     try std.testing.expectEqual(std.http.Status.ok, result.status);
+}
+
+test "fetchOnRequest decodes a zstd answer into the caller's writer" {
+    const alloc = std.testing.allocator;
+    // A raw-block zstd frame for {"data":[]}: magic, a single-segment header, then one last raw block.
+    const answer = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: 20\r\nConnection: close\r\n\r\n" ++
+        "\x28\xb5\x2f\xfd\x20\x0b\x59\x00\x00{\"data\":[]}";
+    var server = try raw_answer_testing.AnswerServer.start(alloc, answer);
+    const url = try server.url(alloc, "/v1/models");
+    defer alloc.free(url);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const options: std.http.Client.FetchOptions = .{
+        .location = .{ .url = url },
+        .method = .GET,
+        .headers = .{ .accept_encoding = .omit },
+        .redirect_behavior = .unhandled,
+        .response_writer = &out.writer,
+    };
+    var opened = try openRequestOnJob(fetchMethod(options), try fetchUri(options), fetchRequestOptions(options));
+    defer opened.deinit();
+    // std refuses a zstd answer unless the request itself accepts zstd; the Accept-Encoding header alone does not.
+    opened.request.accept_encoding[@backingInt(std.http.ContentEncoding.zstd)] = true;
+    const result = fetchOnRequest(&opened.request, options, false);
+    try server.finish();
+    const fetched = try result;
+    try std.testing.expectEqual(std.http.Status.ok, fetched.status);
+    try std.testing.expectEqualStrings("{\"data\":[]}", out.written());
 }
 
 fn readLoopbackGatewayRequest(zio: std.Io, stream: std.Io.net.Stream, fixture: *LoopbackGatewayFixture) !void {
