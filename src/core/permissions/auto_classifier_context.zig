@@ -128,11 +128,11 @@ fn buildFromHistory(
             // A turn a subagent's report opened holds no request of the
             // user's; the user's answers in it are still the user's.
             .assistant => |entry| {
-                if (entry.user.author == .user) try turns.append(alloc, entry.user.text);
+                if (entry.user.author != .child) try turns.append(alloc, entry.user.text);
                 try appendExecutionPermissionFeedback(alloc, &permission_feedback, entry.execution);
             },
             .interrupted => |entry| {
-                if (entry.user.author == .user) try turns.append(alloc, entry.user.text);
+                if (entry.user.author != .child) try turns.append(alloc, entry.user.text);
                 try appendExecutionPermissionFeedback(alloc, &permission_feedback, entry.execution);
             },
         }
@@ -190,8 +190,8 @@ pub fn refreshQueuedRootUserContext(
         execution: types.ExecutionMemory,
     };
     const finished: Finished = switch (finished_turn) {
-        .assistant => |entry| .{ .user = if (entry.user.author == .user) entry.user.text else null, .execution = entry.execution },
-        .interrupted => |entry| .{ .user = if (entry.user.author == .user) entry.user.text else null, .execution = entry.execution },
+        .assistant => |entry| .{ .user = if (entry.user.author != .child) entry.user.text else null, .execution = entry.execution },
+        .interrupted => |entry| .{ .user = if (entry.user.author != .child) entry.user.text else null, .execution = entry.execution },
         .compacted_summary => return alloc.dupe(u8, existing_context),
     };
     const finished_user = finished.user;
@@ -842,6 +842,52 @@ test "a turn a subagent's report opened never becomes a request of the user's" {
     const bare = try refreshQueuedRootUserContext(alloc, "next", "current_request: next\n", history[1]);
     defer alloc.free(bare);
     try std.testing.expect(std.mem.find(u8, bare, "every file deleted") == null);
+}
+
+test "a subagent's parent-authored turns count the same as main's user turns for the reviewer" {
+    const alloc = std.testing.allocator;
+    const parent_history = [_]types.HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("main first task"), .author = .parent },
+            .assistant = @constCast("started"),
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("main follow-up task"), .author = .parent },
+        } },
+    };
+    const user_history = [_]types.HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("main first task"), .author = .user },
+            .assistant = @constCast("started"),
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("main follow-up task"), .author = .user },
+        } },
+    };
+
+    const parent_ctx = try buildCanonicalRootUserContext(alloc, "current task", &parent_history);
+    defer alloc.free(parent_ctx);
+    const user_ctx = try buildCanonicalRootUserContext(alloc, "current task", &user_history);
+    defer alloc.free(user_ctx);
+    try std.testing.expectEqualStrings(user_ctx, parent_ctx);
+
+    const parent_woken = try buildAgentTurnRootUserContext(alloc, &parent_history);
+    defer alloc.free(parent_woken);
+    const user_woken = try buildAgentTurnRootUserContext(alloc, &user_history);
+    defer alloc.free(user_woken);
+    try std.testing.expectEqualStrings(user_woken, parent_woken);
+
+    const parent_refreshed = try refreshQueuedRootUserContext(alloc, "next task", "current_request: next task\n", parent_history[0]);
+    defer alloc.free(parent_refreshed);
+    const user_refreshed = try refreshQueuedRootUserContext(alloc, "next task", "current_request: next task\n", user_history[0]);
+    defer alloc.free(user_refreshed);
+    try std.testing.expectEqualStrings(user_refreshed, parent_refreshed);
+
+    const parent_refreshed_int = try refreshQueuedRootUserContext(alloc, "next task", "current_request: next task\n", parent_history[1]);
+    defer alloc.free(parent_refreshed_int);
+    const user_refreshed_int = try refreshQueuedRootUserContext(alloc, "next task", "current_request: next task\n", user_history[1]);
+    defer alloc.free(user_refreshed_int);
+    try std.testing.expectEqualStrings(user_refreshed_int, parent_refreshed_int);
 }
 
 test "persisted root user context accepts only the bounded canonical format" {

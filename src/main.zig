@@ -1788,20 +1788,6 @@ const App = struct {
         try RenderAppRuntime.flushRequestedFrame(@as(*Self, self), self.screenAgent());
     }
 
-    fn snapshotAndAdmitInteractivePromptWithSkillBindings(
-        self: *App,
-        agent: *agents.Agent,
-        prompt: []const u8,
-        skill_tokens: []const registered_entities.SkillTokenSpan,
-    ) !bool {
-        return self.snapshotAndAdmitInteractivePromptWithSkillBindingsAndAuthor(
-            agent,
-            prompt,
-            skill_tokens,
-            .user,
-        );
-    }
-
     fn snapshotAndAdmitInteractivePromptWithSkillBindingsAndAuthor(
         self: *App,
         agent: *agents.Agent,
@@ -5849,6 +5835,7 @@ test {
     _ = @import("core/execution/command_runner.zig");
     _ = @import("core/permissions/direct_command.zig");
     _ = @import("core/permissions/auto_classifier.zig");
+    _ = @import("core/permissions/auto_classifier_context.zig");
     _ = @import("core/permissions/command_admission.zig");
     _ = @import("core/mcp/tool_result.zig");
     _ = @import("core/mcp/tool_search.zig");

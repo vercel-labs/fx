@@ -2452,7 +2452,7 @@ pub const WorkerRuntime = struct {
         var index: usize = 0;
         while (index < self.queued_prompts.items.len) {
             const queued = self.queued_prompts.items[index];
-            if (queued.mail != .message and queued.author != .parent) {
+            if (queued.mail != .message and !(queued.author == .parent and queued.delivery.isSteering())) {
                 index += 1;
                 continue;
             }
@@ -7515,6 +7515,30 @@ test "a user's stop drops other agents' messages waiting in the queue, and keeps
     try std.testing.expectEqual(@as(usize, 2), runtime.queuedPromptCount());
     try std.testing.expectEqualStrings("a report", runtime.queued_prompts.items[0].prompt);
     try std.testing.expectEqualStrings("typed by the user", runtime.queued_prompts.items[1].prompt);
+}
+
+test "a user's stop keeps an ordinary parent prompt queued like main while dropping parent steering" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    var idle_parent = try makePrompt(alloc, "main ordinary task", "model");
+    idle_parent.author = .parent;
+    idle_parent.work_id = try alloc.dupe(u8, "work-1");
+    try runtime.admitInteractivePrompt(alloc, idle_parent);
+
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    var steer_parent = try makePrompt(alloc, "parent steer", "model");
+    steer_parent.author = .parent;
+    try runtime.postMail(alloc, steer_parent);
+
+    const drop = runtime.dropAgentMessages(alloc);
+    try std.testing.expectEqual(@as(usize, 1), drop.from_parent);
+    try std.testing.expectEqual(@as(usize, 1), drop.total);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+    try std.testing.expectEqualStrings("main ordinary task", runtime.queued_prompts.items[0].prompt);
 }
 
 test "a turn ended for an image or $skill is a hand-off, and an explicit cancel is not" {
