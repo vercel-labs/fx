@@ -353,6 +353,26 @@ fn codeCell(cell: []const u8) ?[]const u8 {
     return if (std.mem.findScalar(u8, inner, '`') == null) inner else null;
 }
 
+/// The most rows the names table in sh-fx.md may have. The test keeps them in fixed arrays.
+const max_names_table_rows: usize = 64;
+
+/// The parts of a names-table row split on `|`: the empty text before the first bar, the four
+/// cells, and the empty text after the last bar.
+const names_row_parts: usize = 6;
+
+/// Returns the trimmed cells of a names-table row, or null when the row has more or fewer parts.
+fn namesRowCells(line: []const u8) ?[names_row_parts][]const u8 {
+    var cells: [names_row_parts][]const u8 = undefined;
+    var count: usize = 0;
+    var parts = std.mem.splitScalar(u8, line, '|');
+    while (count < cells.len) : (count += 1) {
+        const part = parts.next() orelse return null;
+        cells[count] = std.mem.trim(u8, part, " ");
+    }
+    if (parts.next() != null) return null;
+    return cells;
+}
+
 test "the table of names in use today gives each name one valid new name" {
     const table = section(fx_spec.bytes, "Names in use today") orelse {
         std.debug.print("sh-fx.md has no \"Names in use today\" section\n", .{});
@@ -363,27 +383,25 @@ test "the table of names in use today gives each name one valid new name" {
     const agent_methods = field(meta.value, "agentMethods") orelse return error.TestUnexpectedResult;
     const client_methods = field(meta.value, "clientMethods") orelse return error.TestUnexpectedResult;
 
-    var olds: [64][]const u8 = undefined;
-    var news: [64][]const u8 = undefined;
+    var olds: [max_names_table_rows][]const u8 = undefined;
+    var news: [max_names_table_rows][]const u8 = undefined;
     var rows: usize = 0;
     var lines = std.mem.splitScalar(u8, table, '\n');
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, "|")) continue;
         if (std.mem.startsWith(u8, line, "| Today |") or std.mem.startsWith(u8, line, "| --- |")) continue;
-        var cells: [6][]const u8 = undefined;
-        var count: usize = 0;
-        var parts = std.mem.splitScalar(u8, line, '|');
-        while (parts.next()) |part| : (count += 1) {
-            if (count == cells.len) break;
-            cells[count] = std.mem.trim(u8, part, " ");
+        if (rows == max_names_table_rows) {
+            std.debug.print("sh-fx.md names table has more than {d} rows, which is more than this test holds\n", .{max_names_table_rows});
+            return error.TestUnexpectedResult;
         }
-        const old = if (count == cells.len) codeCell(cells[1]) else null;
-        const new = if (count == cells.len) codeCell(cells[3]) else null;
-        if (old == null or new == null or rows == olds.len) {
+        const cells = namesRowCells(line);
+        const old = if (cells) |row| codeCell(row[1]) else null;
+        const new = if (cells) |row| codeCell(row[3]) else null;
+        if (old == null or new == null) {
             std.debug.print("sh-fx.md has a malformed row in its names table: {s}\n", .{line});
             return error.TestUnexpectedResult;
         }
-        try checkNameRow(old.?, new.?, cells[2], agent_methods, client_methods, olds[0..rows], news[0..rows]);
+        try checkNameRow(old.?, new.?, cells.?[2], agent_methods, client_methods, olds[0..rows], news[0..rows]);
         olds[rows] = old.?;
         news[rows] = new.?;
         rows += 1;
