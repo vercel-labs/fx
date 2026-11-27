@@ -78,10 +78,13 @@ fn buildReviewPayload(
     _: []const u8,
     instructions: []const types.ChatMessage,
     messages: []const types.ChatMessage,
+    follow_up: []const types.ChatMessage,
     target_call_id: []const u8,
     deadline: std.Io.Clock.Timestamp,
     cancel_flag: *std.atomic.Value(bool),
 ) ![]u8 {
+    // This reviewer does not read stored answers, so it never gets read turns.
+    if (follow_up.len > 0) return error.ReadTurnsUnsupported;
     const runtime: *Runtime = @ptrCast(@alignCast(raw));
     const expanded = try vercel_protocol.expandPendingToolReviewMessages(
         alloc,
@@ -130,6 +133,7 @@ pub fn buildPayloadForTest(
         "",
         instructions,
         messages,
+        &.{},
         target_call_id,
         deadline,
         cancel_flag,

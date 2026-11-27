@@ -200,11 +200,14 @@ pub fn buildGatewayRequiredToolRequestBodyWithMaxOutputTokens(
     return buildGatewayRequestBodyWithSettings(alloc, tools_json, messages, .{}, "required", max_output_tokens);
 }
 
+/// `follow_up` holds the reviewer's own read turns. They follow the placeholder
+/// results for the pending call, and the whole history must still validate.
 pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     alloc: std.mem.Allocator,
     tools_json: []const u8,
     instructions: []const ChatMessage,
     messages: []const ChatMessage,
+    follow_up: []const ChatMessage,
     target_call_id: []const u8,
     options: model_capabilities.ResolvedProviderOptions,
     max_output_tokens: u32,
@@ -223,11 +226,14 @@ pub fn buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
     );
     defer alloc.free(expanded);
 
-    const prompt_len = try std.math.add(usize, instructions.len, expanded.len);
+    const expanded_end = try std.math.add(usize, instructions.len, expanded.len);
+    const prompt_len = try std.math.add(usize, expanded_end, follow_up.len);
     const prompt = try alloc.alloc(ChatMessage, prompt_len);
     defer alloc.free(prompt);
     @memcpy(prompt[0..instructions.len], instructions);
-    @memcpy(prompt[instructions.len..], expanded);
+    @memcpy(prompt[instructions.len..expanded_end], expanded);
+    @memcpy(prompt[expanded_end..], follow_up);
+    try validateToolMessageHistory(alloc, prompt);
 
     return buildGatewayRequestBodyValidated(
         alloc,
@@ -1866,6 +1872,7 @@ test "pending tool review closes the exact assistant step with synthetic pending
         "[]",
         &instructions,
         &messages,
+        &.{},
         "install",
         .{ .reasoning = types.ReasoningEffort.literal("minimal") },
         2048,
@@ -1890,6 +1897,67 @@ test "pending tool review closes the exact assistant step with synthetic pending
     try std.testing.expectError(
         error.InvalidGatewayHistory,
         buildGatewayRequestBody(std.testing.allocator, "[]", &messages),
+    );
+}
+
+test "pending tool review puts the reviewer's read turns after the placeholder results" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1000),
+    });
+    const instructions = [_]ChatMessage{.{ .role = .system, .content = "Review only install." }};
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "Install dependencies." },
+        .{ .role = .assistant, .tool_calls = &.{
+            .{ .id = "install", .name = "run_command", .arguments_json = "{\"command\":\"pnpm install\"}" },
+        } },
+    };
+    const read_calls = [_]types.ToolCall{
+        .{ .id = "read_1", .name = "read_prior_result", .arguments_json = "{\"handle\":\"answers-1\",\"start_byte\":1,\"byte_count\":100}" },
+    };
+    const read_turns = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &read_calls },
+        .{ .role = .tool, .content = "read-result-marker", .tool_call_id = "read_1", .tool_name = "read_prior_result" },
+    };
+
+    const body = try buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
+        std.testing.allocator,
+        "[]",
+        &instructions,
+        &messages,
+        &read_turns,
+        "install",
+        .{},
+        2048,
+        deadline,
+        &cancel,
+    );
+    defer std.testing.allocator.free(body);
+
+    const placeholder = std.mem.find(u8, body, "Tool call has not executed").?;
+    const read_call = std.mem.find(u8, body, "read_prior_result").?;
+    const read_result = std.mem.find(u8, body, "read-result-marker").?;
+    try std.testing.expect(placeholder < read_call);
+    try std.testing.expect(read_call < read_result);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "read-result-marker"));
+
+    // A read result without its call breaks the history, so the review fails closed.
+    const orphan_result = [_]ChatMessage{read_turns[1]};
+    try std.testing.expectError(
+        error.InvalidGatewayHistory,
+        buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
+            std.testing.allocator,
+            "[]",
+            &instructions,
+            &messages,
+            &orphan_result,
+            "install",
+            .{},
+            2048,
+            deadline,
+            &cancel,
+        ),
     );
 }
 
@@ -1927,6 +1995,7 @@ test "pending review and model requests enforce the same prompt lanes" {
                 "[]",
                 &.{instruction},
                 &messages,
+                &.{},
                 "read",
                 .{},
                 2048,
@@ -1959,6 +2028,7 @@ test "pending tool review rejects missing or duplicate target ids" {
             "[]",
             &instructions,
             &messages,
+            &.{},
             "duplicate",
             .{},
             2048,
@@ -1973,6 +2043,7 @@ test "pending tool review rejects missing or duplicate target ids" {
             "[]",
             &instructions,
             &messages,
+            &.{},
             "missing",
             .{},
             2048,

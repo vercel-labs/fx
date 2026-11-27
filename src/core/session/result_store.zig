@@ -477,6 +477,39 @@ pub fn readByRangeManaged(
     );
 }
 
+/// The whole stored text of one handle, for a review that reads it by handle.
+/// Fails with `ResultTooLarge` above `read_max_bytes`. The caller owns the text.
+pub fn readWholeManaged(
+    alloc: Allocator,
+    capability: *session_child_store.SessionChildCapability,
+    handle: []const u8,
+) ![]u8 {
+    try validateHandle(handle);
+    if (!capability.holdsBlobs()) {
+        // A file's size is checked before it is read.
+        const stat = try statManaged(capability, handle);
+        if (stat.size > read_max_bytes) return error.ResultTooLarge;
+    }
+    const text = try readStoredTextManaged(alloc, capability, handle);
+    if (text.len > read_max_bytes) {
+        alloc.free(text);
+        return error.ResultTooLarge;
+    }
+    return text;
+}
+
+/// `readWholeManaged` for a legacy tool-result folder, as `readByRange` opens one.
+pub fn readWhole(alloc: Allocator, result_dir: []const u8, handle: []const u8) ![]u8 {
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
+        alloc,
+        result_dir,
+        .tool_results,
+        .read_only,
+    );
+    defer capability.deinit();
+    return readWholeManaged(alloc, &capability, handle);
+}
+
 pub fn readForReplayManaged(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,

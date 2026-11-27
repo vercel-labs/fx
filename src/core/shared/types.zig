@@ -2061,6 +2061,12 @@ pub const ChatMessage = struct {
     /// counts too and fx's note for a cancelled question never does. Never
     /// saved or sent to a provider.
     user_answer: bool = false,
+    /// A question's result that fx stored outside the session behind a
+    /// preview (`ToolResultMemory.output_handle`), so its answers are not in
+    /// `content`. The security review reads them by handle before it takes
+    /// them as the user's words (`isStoredUserAnswer`). Never saved or sent
+    /// to a provider.
+    stored_user_answer: bool = false,
 };
 
 /// The tool that asks the user questions.
@@ -2095,6 +2101,17 @@ pub fn isUserAnswer(alloc: std.mem.Allocator, ran_tool: []const u8, status: ?Per
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     return try answeredQuestions(scratch.allocator(), output) != null;
+}
+
+/// Whether a result is a question's answers that fx stored behind a preview:
+/// the question tool ran (`ran_tool`, as for `isUserAnswer`), it did not
+/// fail, the model saw only a preview (`truncated`), and the whole output has
+/// a stored handle. fx saves a short result under a handle too, but the model
+/// sees all of it, so that result is not one.
+pub fn isStoredUserAnswer(ran_tool: []const u8, status: ?PersistedToolStatus, memory: ?ToolResultMemory) bool {
+    if (!std.mem.eql(u8, ran_tool, user_question_tool_name) or status == .failure) return false;
+    const stored = memory orelse return false;
+    return stored.truncated and stored.output_handle != null;
 }
 
 test "only a question's listed answers are the user's answer" {

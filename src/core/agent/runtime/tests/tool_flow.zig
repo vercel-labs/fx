@@ -7987,6 +7987,54 @@ test "a question's result is the user's answer, also when toolbox ran it" {
     }
 }
 
+test "a question's answers stored behind a preview are marked for the review only when they are answers" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var batch = runtime_tool_batch.StepBatchState{};
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    var completed_tool_names: std.ArrayList([]u8) = .empty;
+    const direct: ToolCall = .{ .id = "direct", .name = "ask_user_question", .arguments_json = "{}" };
+    const carried: ToolCall = .{ .id = "carried", .name = "ask_user_question", .arguments_json = "{}", .carried_by = "toolbox" };
+    const read: ToolCall = .{ .id = "read", .name = "read_file", .arguments_json = "{}" };
+    const preview = "[{\"question\":\"Batch decision 01?\",\"answer\":\"Yes\"}";
+    const answered = "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"}]";
+    const invalid = "(ask_user_question: invalid arguments; provide {questions})";
+    const stored: types.ToolResultMemory = .{
+        .output_handle = "answers-1",
+        .output_bytes = result_store.large_result_threshold_bytes + 128,
+        .stored_output_bytes = result_store.large_result_threshold_bytes + 128,
+        .truncated = true,
+    };
+    // Fx keeps a short result whole but still saves it with a handle.
+    const kept_whole: types.ToolResultMemory = .{
+        .output_handle = "answers-2",
+        .output_bytes = answered.len,
+        .stored_output_bytes = answered.len,
+    };
+    const cases = [_]struct {
+        call: ToolCall,
+        output: []const u8,
+        memory: ?types.ToolResultMemory = null,
+        status: ?types.PersistedToolStatus = null,
+        stored_answer: bool,
+    }{
+        .{ .call = direct, .output = preview, .memory = stored, .stored_answer = true },
+        .{ .call = carried, .output = preview, .memory = stored, .stored_answer = true },
+        .{ .call = direct, .output = preview, .memory = stored, .status = .failure, .stored_answer = false },
+        .{ .call = read, .output = preview, .memory = stored, .stored_answer = false },
+        .{ .call = direct, .output = answered, .memory = kept_whole, .stored_answer = false },
+        .{ .call = direct, .output = answered, .stored_answer = false },
+        .{ .call = direct, .output = ask_user_question.cancel_sentinel, .stored_answer = false },
+        .{ .call = carried, .output = invalid, .stored_answer = false },
+    };
+    for (cases) |case| {
+        try runtime_tool_batch.appendToolResultContent(arena, &suffix, &completed_tool_names, &batch, case.call, case.output, case.memory, .{ .status = case.status });
+        const message = suffix.items[suffix.items.len - 1];
+        try std.testing.expectEqual(case.stored_answer, message.stored_user_answer);
+    }
+}
+
 test "child live authority refresh denies the next tool action before execution" {
     const alloc = std.testing.allocator;
     const first_calls = [_]ToolCall{

@@ -94,7 +94,7 @@ fn reviewGatewayConfig(
     model: []const u8,
 ) !permission_auto_classifier.ParseOutcome {
     var local = config;
-    return permission_auto_classifier.Reviewer.withTransportModel(
+    var reviewer = permission_auto_classifier.Reviewer.withTransportModel(
         .{
             .context = @ptrCast(&local),
             .send_fn = sendGatewayReview,
@@ -103,7 +103,10 @@ fn reviewGatewayConfig(
         local.cancel_flag,
         permission_auto_classifier.Reviewer.default_timeout_ms,
         model,
-    ).review(alloc, request);
+    );
+    // Only the gateway chat reviewer reads the user's stored answers by handle.
+    reviewer.reads_stored_results = true;
+    return reviewer.review(alloc, request);
 }
 
 fn buildGatewayReview(
@@ -113,6 +116,7 @@ fn buildGatewayReview(
     tools_json: []const u8,
     instructions: []const types.ChatMessage,
     messages: []const types.ChatMessage,
+    follow_up: []const types.ChatMessage,
     target_call_id: []const u8,
     deadline: std.Io.Clock.Timestamp,
     cancel_flag: *std.atomic.Value(bool),
@@ -124,6 +128,7 @@ fn buildGatewayReview(
         tools_json,
         instructions,
         messages,
+        follow_up,
         target_call_id,
         .{
             .skip_cache_writes = vercel_model_policy.takesPromptCacheOptions(model),
@@ -311,6 +316,7 @@ const FakeStream = struct {
     saw_single_attempt_only: bool = true,
     saw_expected_model_only: bool = true,
     saw_required_tool_payload: bool = true,
+    saw_read_tool: bool = false,
     deadlines: [2]?std.Io.Clock.Timestamp = .{ null, null },
 
     fn execute(
@@ -332,6 +338,7 @@ const FakeStream = struct {
         self.saw_expected_model_only = self.saw_expected_model_only and std.mem.eql(u8, model, self.expected_model);
         self.saw_required_tool_payload = self.saw_required_tool_payload and
             std.mem.find(u8, payload, "permission_decision") != null;
+        self.saw_read_tool = self.saw_read_tool or std.mem.find(u8, payload, "\"name\":\"read_prior_result\"") != null;
         const outcome = self.outcomes[@min(self.calls, self.outcomes.len - 1)];
         self.calls += 1;
         return switch (outcome) {
@@ -425,6 +432,62 @@ fn testConfig(fake: *FakeStream, cancel_flag: ?*std.atomic.Value(bool)) GatewayC
     };
 }
 
+test "gateway review sends the read turns after the pending results" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1000),
+    });
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Review the pending call." }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "review_context_kind: normal\n" },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "call", .name = "shell", .arguments_json = "{}" }} },
+    };
+    const read_calls = [_]types.ToolCall{
+        .{ .id = "read_1", .name = "read_prior_result", .arguments_json = "{\"handle\":\"answers-1\",\"start_byte\":1,\"byte_count\":100}" },
+    };
+    const follow_up = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &read_calls },
+        .{ .role = .tool, .content = "read-result-marker", .tool_call_id = "read_1", .tool_name = "read_prior_result" },
+    };
+    var unused: u8 = 0;
+    const body = try buildGatewayReview(@ptrCast(&unused), std.testing.allocator, reviewer_model, "[]", &instructions, &messages, &follow_up, "call", deadline, &cancel);
+    defer std.testing.allocator.free(body);
+    const pending = std.mem.find(u8, body, "Tool call has not executed").?;
+    const read_call = std.mem.find(u8, body, "read_prior_result").?;
+    const read_result = std.mem.find(u8, body, "read-result-marker").?;
+    try std.testing.expect(pending < read_call);
+    try std.testing.expect(read_call < read_result);
+}
+
+fn unusedStoredRead(_: *anyopaque, _: Allocator, _: []const u8) anyerror![]u8 {
+    return error.StoredResultMissing;
+}
+
+test "gateway review offers the read tool only when the review has stored answers" {
+    var cancel = std.atomic.Value(bool).init(false);
+    var unused: u8 = 0;
+    const entries = [_]permission_auto_classifier.PriorToolResultEntry{.{
+        .tool_call_id = "ask",
+        .tool_name = "ask_user_question",
+        .content = "[{\"question\":\"Delete?\",\"answer\":\"Yes\"}]",
+        .user_answer = true,
+        .stored_answers = .{ .handle = "answers-1", .bytes = 40 },
+    }};
+    var with_answers = testRequest();
+    with_answers.prior_tool_results = .{ .entries = &entries };
+    with_answers.stored_results = .{ .context = @ptrCast(&unused), .read_fn = unusedStoredRead };
+    var fake = FakeStream{ .outcomes = &.{.valid} };
+    var held = try reviewGatewayConfig(testConfig(&fake, &cancel), std.testing.allocator, with_answers, reviewer_model);
+    defer held.deinit(std.testing.allocator);
+    try std.testing.expect(fake.saw_read_tool);
+
+    var plain = FakeStream{ .outcomes = &.{.valid} };
+    var cleared = try reviewGatewayConfig(testConfig(&plain, &cancel), std.testing.allocator, testRequest(), reviewer_model);
+    defer cleared.deinit(std.testing.allocator);
+    try std.testing.expect(!plain.saw_read_tool);
+}
+
 test "gateway review asks GPT-5.6 and later to skip cache writes" {
     var cancel = std.atomic.Value(bool).init(false);
     const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
@@ -443,7 +506,7 @@ test "gateway review asks GPT-5.6 and later to skip cache writes" {
         .{ .model = "anthropic/claude-haiku-5.5", .skip = false },
     }) |case| {
         var unused: u8 = 0;
-        const body = try buildGatewayReview(@ptrCast(&unused), std.testing.allocator, case.model, "[]", &instructions, &messages, "call", deadline, &cancel);
+        const body = try buildGatewayReview(@ptrCast(&unused), std.testing.allocator, case.model, "[]", &instructions, &messages, &.{}, "call", deadline, &cancel);
         defer std.testing.allocator.free(body);
         try std.testing.expectEqual(case.skip, std.mem.find(u8, body, "\"promptCacheOptions\":{\"mode\":\"explicit\"}") != null);
         // A review never asks the Gateway to cache.
@@ -470,7 +533,7 @@ test "gateway review sends Qwen its instructions as one system message" {
         .{ .model = "zai/glm-5.3", .systems = 2 },
     }) |case| {
         var unused: u8 = 0;
-        const body = try buildGatewayReview(@ptrCast(&unused), std.testing.allocator, case.model, "[]", &instructions, &messages, "call", deadline, &cancel);
+        const body = try buildGatewayReview(@ptrCast(&unused), std.testing.allocator, case.model, "[]", &instructions, &messages, &.{}, "call", deadline, &cancel);
         defer std.testing.allocator.free(body);
         try std.testing.expectEqual(case.systems, std.mem.count(u8, body, "{\"role\":\"system\""));
     }
