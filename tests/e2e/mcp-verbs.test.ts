@@ -454,12 +454,13 @@ describe("fx mcp", () => {
       },
     }));
     // Wait until the second process has started, then until `show` says the server is ready with its list refused. Each wait
-    // has a deadline and says which one ran out.
+    // has a deadline and says which one ran out. The failure word is written in two pieces so that only the output has it,
+    // not this command, which the model's request carries too.
     const wait = [
       `for i in $(seq 1 150); do [ -e "${marker}.ready" ] && break; sleep 0.2; done`,
-      `[ -e "${marker}.ready" ] || { echo "WAIT_FAILED the second process never started"; exit 1; }`,
+      `[ -e "${marker}.ready" ] || { echo "WAIT_FAIL""ED the second process never started"; exit 1; }`,
       `for i in $(seq 1 150); do "${FX_BIN}" mcp show web 2>&1 | grep -q "ready, tool list refused" && exit 0; sleep 0.2; done`,
-      `echo "WAIT_FAILED show never said ready with its list refused"; exit 1`,
+      `echo "WAIT_FAIL""ED show never said ready with its list refused"; exit 1`,
     ].join("; ");
     const activeGateway = startFakeGateway([
       fakeGatewayToolCall("search_down", "toolbox", { search: "web tools", server: "web" }),
