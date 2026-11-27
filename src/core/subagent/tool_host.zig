@@ -9444,10 +9444,6 @@ fn admissionFrom(
         .grants = snapshot.grants,
         .permission_state = snapshot.permission_state,
         .integration_names = snapshot.integrations,
-        .authority_generation = if (snapshot.mcp_view) |view|
-            mcp_access.authorityGeneration(view)
-        else
-            0,
         .mcp_view = snapshot.mcp_view,
     }) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,

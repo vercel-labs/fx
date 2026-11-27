@@ -5774,6 +5774,16 @@ fn consumeSseStreamTraced(
     const compaction_finish = finish_reason_holder == .other and std.mem.eql(u8, finish_raw.slice(), "compaction");
     if (finish_reason_holder == .stop or finish_reason_holder == .tool_calls or compaction_finish) {
         completion.provider_state_json = try replay.finish(completion.content orelse "", completion.tool_calls);
+    } else if (finish_reason_holder == .length) {
+        // fx runs the calls a cut reply finished, and the next request must
+        // carry their provider state, such as Gemini's thought signatures.
+        // A part the cut left open, or state over the size cap, cannot be
+        // replayed; the next request then goes without provider state, as a
+        // cut reply's always did, so a cut reply never fails here.
+        completion.provider_state_json = replay.finish(completion.content orelse "", completion.tool_calls) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
     }
 
     if (error_event_class) |class| {
@@ -8706,6 +8716,48 @@ test "consumeSseStream keeps each repeated-id call's replay part on its own id" 
             "{\"type\":\"tool-call\",\"toolCallId\":\"fx_call_2\",\"providerOptions\":{\"vertex\":{\"thoughtSignature\":\"sig-c\"}}}]",
         completion.provider_state_json.?,
     );
+}
+
+test "consumeSseStream keeps a cut reply's finished calls' provider state and drops the cut call" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\"done\",\"toolName\":\"edit_file\",\"input\":{\"path\":\"a\"},\"providerMetadata\":{\"vertex\":{\"thoughtSignature\":\"sig-done\"}}}\n\n" ++
+        "data: {\"type\":\"tool-input-start\",\"id\":\"cut\",\"toolName\":\"edit_file\"}\n\n" ++
+        "data: {\"type\":\"tool-input-delta\",\"id\":\"cut\",\"delta\":\"{\\\"path\\\":\\\"b\"}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"length\",\"raw\":\"MAX_TOKENS\"}}\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var completion = try consumeSseStream(alloc, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    try std.testing.expectEqual(types.ProviderFinishReason.length, completion.finish_reason.?);
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("done", completion.tool_calls[0].id);
+    try std.testing.expectEqualStrings(
+        "[{\"type\":\"tool-call\",\"toolCallId\":\"done\",\"providerOptions\":{\"vertex\":{\"thoughtSignature\":\"sig-done\"}}}]",
+        completion.provider_state_json.?,
+    );
+}
+
+test "consumeSseStream gives a cut reply no provider state when the cut left a part open" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data: {\"type\":\"reasoning-start\",\"id\":\"r1\",\"providerMetadata\":{\"vertex\":{\"thoughtSignature\":\"sig-open\"}}}\n\n" ++
+        "data: {\"type\":\"reasoning-delta\",\"id\":\"r1\",\"delta\":\"thinking\"}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"length\",\"raw\":\"MAX_TOKENS\"}}\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var completion = try consumeSseStream(alloc, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    try std.testing.expectEqual(types.ProviderFinishReason.length, completion.finish_reason.?);
+    try std.testing.expect(completion.provider_state_json == null);
 }
 
 test "consumeSseStream gives calls with missing, empty, blank, or oversized ids fx ids" {

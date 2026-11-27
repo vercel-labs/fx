@@ -886,6 +886,60 @@ fn hostToolArguments(
     return repaired.arguments_json;
 }
 
+/// Fails every frame, as a closed client pipe does.
+fn failEveryFrame(_: ?*anyopaque, _: []const u8) anyerror!void {
+    return error.BrokenPipe;
+}
+
+/// Fails only the permission request, so the other frames are written.
+fn failPermissionRequestFrame(_: ?*anyopaque, bytes: []const u8) anyerror!void {
+    if (std.mem.find(u8, bytes, "session/request_permission") == null) return;
+    return error.BrokenPipe;
+}
+
+test "a host tool request whose write fails leaves nothing in the outbound registry" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = jsonrpc.Writer.initCallback(null, failEveryFrame);
+
+    const result = try callHostTool(&state, alloc, "todo", "call_1", "{}", 1024, null);
+    try std.testing.expectEqualStrings("Host tool request failed", result.failure);
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+}
+
+test "a permission request whose write fails leaves nothing in the outbound registry" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = jsonrpc.Writer.initCallback(null, failPermissionRequestFrame);
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+
+    const call: ToolCall = .{ .id = "call_1", .name = "shell", .arguments_json = "{}" };
+    try std.testing.expectError(
+        error.BrokenPipe,
+        requestAcpPermission(&ctx, alloc, .{ .label = "run a command" }, call, null, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+}
+
+test "a journal flush whose write fails leaves nothing in the outbound registry" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = jsonrpc.Writer.initCallback(null, failEveryFrame);
+
+    try std.testing.expectError(error.JournalFlushFailed, flushJournal(&state, alloc, "session_1"));
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+}
+
 test "host tool arguments are sent as the types the tool's schema names" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -962,7 +1016,13 @@ fn callHostTool(
         .{ .integer = @intCast(outbound_id) },
         "libfx/tool_call",
         params.written(),
-    ) catch return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
+    ) catch {
+        // The client never got the request, so no answer comes. Forget it
+        // here: the errdefer above runs only on an error return, and a
+        // leftover entry would keep one of the outbound slots for good.
+        server.discardOutboundRequest(state, outbound_id);
+        return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
+    };
 
     var response = server.awaitOutboundResponse(state, outbound_id, .host_tool) orelse
         return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
