@@ -274,6 +274,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn routeComposerShortcutAction(app: *App, agent: *AppAgent, action: input_action.ShortcutAction, max_input_len: usize) !void {
+            if (forkMenuAsking(agent) and action != .redraw) {
+                debug_trace.logf("input", "fork question ignored shortcut={s} reason=not_an_answer", .{@tagName(action)});
+                return;
+            }
             switch (action) {
                 .move => |intent| {
                     switch (intent.kind) {
@@ -1006,16 +1010,22 @@ pub fn Runtime(comptime App: type) type {
             }
 
             if (resolved == .paste_start) {
+                const screen_agent = agents.screenAgentOf(app);
                 if (comptime runtime_profile.allows(App, .native_auth) and
                     @hasDecl(@TypeOf(app.auth), "signInCodeEntryActive"))
                 {
                     if (app.auth.signInCodeEntryActive()) {
-                        paste_rt.beginPaste(app, agents.screenAgentOf(app), max_input_len);
+                        paste_rt.beginPaste(app, screen_agent, max_input_len);
                         return .done;
                     }
                 }
-                dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
-                paste_rt.beginPaste(app, agents.screenAgentOf(app), max_input_len);
+                if (forkMenuAsking(screen_agent)) {
+                    debug_trace.logf("input", "fork question ignored action=paste_start reason=not_an_answer", .{});
+                    paste_rt.beginPaste(app, screen_agent, max_input_len);
+                    return .done;
+                }
+                dismissActiveMenusThenRedraw(app, screen_agent);
+                paste_rt.beginPaste(app, screen_agent, max_input_len);
                 return .done;
             }
 
@@ -1140,31 +1150,40 @@ pub fn Runtime(comptime App: type) type {
                 .mouse_pointer,
                 => {},
                 .clear_line => {
-                    dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
-                    if (draftHasState(app, agents.screenAgentOf(app))) {
-                        clearDraftState(app, agents.screenAgentOf(app), "clear_line");
+                    const screen_agent = agents.screenAgentOf(app);
+                    if (forkMenuAsking(screen_agent)) {
+                        debug_trace.logf("input", "fork question ignored action=clear_line reason=not_an_answer", .{});
+                        return .done;
+                    }
+                    dismissActiveMenusThenRedraw(app, screen_agent);
+                    if (draftHasState(app, screen_agent)) {
+                        clearDraftState(app, screen_agent, "clear_line");
                         app.shell.render_requests.request(.footer);
                     }
                 },
                 .toggle_permission_mode => {
+                    const screen_agent = agents.screenAgentOf(app);
                     if (cycleHelpMenuCategory(app, -1) or cycleSettingsMenuCategory(app, -1)) {
                         app.shell.render_requests.request(.footer);
-                    } else if (try toggleSessionPickerScopeIfActive(app, agents.screenAgentOf(app))) {
+                    } else if (try toggleSessionPickerScopeIfActive(app, screen_agent)) {
                         app.shell.render_requests.request(.footer);
                     } else if (cycleModelMenuProvider(app, -1) or cycleSkillsMenuSource(app, -1)) {
                         app.shell.render_requests.request(.footer);
+                    } else if (forkMenuActive(screen_agent)) {
+                        debug_trace.logf("input", "shift+tab ignored reason=fork_menu_active", .{});
                     } else {
-                        try app_permission_runtime.Runtime(App).toggleMode(app, agents.screenAgentOf(app));
+                        try app_permission_runtime.Runtime(App).toggleMode(app, screen_agent);
                     }
                 },
                 .open_all_sessions => {
                     if (comptime agents.hasAgentField(App, "session_persistence") and
                         runtime_profile.allows(App, .durable_sessions))
                     {
-                        if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app)) return .done;
-                        if (try refuseSessionActionWithDraft(app, agents.screenAgentOf(app), "submit or clear the draft before switching sessions")) return .done;
-                        dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
-                        try app_session_runtime.Runtime(App).openAllSessionPicker(app, agents.screenAgentOf(app));
+                        const screen_agent = agents.screenAgentOf(app);
+                        if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or forkMenuActive(screen_agent)) return .done;
+                        if (try refuseSessionActionWithDraft(app, screen_agent, "submit or clear the draft before switching sessions")) return .done;
+                        dismissActiveMenusThenRedraw(app, screen_agent);
+                        try app_session_runtime.Runtime(App).openAllSessionPicker(app, screen_agent);
                         app.shell.render_requests.request(.footer);
                     }
                 },
@@ -2149,6 +2168,11 @@ pub fn Runtime(comptime App: type) type {
             return agent.session_persistence.fork_menu.active();
         }
 
+        fn forkMenuAsking(agent: *AppAgent) bool {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            return agent.session_persistence.fork_menu.asking();
+        }
+
         fn helpMenuActive(app: *App) bool {
             return app.input_runtime.help_menu.active;
         }
@@ -2414,8 +2438,8 @@ pub fn Runtime(comptime App: type) type {
 
         fn dismissActiveMenusForComposerEdit(app: *App, agent: *AppAgent) bool {
             // The fork and effort menus read no query from the composer, so an
-            // edit closes them. The agent list searches with it instead.
-            const fork_menu_closed = cancelForkMenu(app, agent);
+            // edit closes them. The fork subagent question holds keys until answered.
+            const fork_menu_closed = !forkMenuAsking(agent) and cancelForkMenu(app, agent);
             const effort_menu_closed = cancelEffortMenu(app);
             return dismissAuthPickerForComposerEdit(app, agent) or fork_menu_closed or effort_menu_closed;
         }
@@ -9496,6 +9520,58 @@ test "app_input_runtime ctrl+t closes the open effort menu and cycles from the l
     try std.testing.expectEqual(routing_cycle_efforts[2], app.agent().effort);
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
     try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+}
+
+test "app_input_runtime blocks shift+tab, ctrl+r, and stray edits while fork menu or its question is open" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.permission_engine.mode = .auto;
+
+    const points = try alloc.alloc(session_adapter.Session.ForkPoint, 2);
+    points[0] = .{ .turn = 1, .prompt = try alloc.dupe(u8, "first") };
+    points[1] = .{ .turn = 2, .prompt = try alloc.dupe(u8, "second") };
+    app.agent().session_persistence.fork_menu = .{ .points = points, .selected = 1 };
+
+    // Shift+Tab must not toggle permission mode while /fork is open.
+    _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(&app, .toggle_permission_mode, null, null, null, false, 4096);
+    try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
+    try std.testing.expect(app.agent().session_persistence.fork_menu.active());
+
+    // Ctrl+R must not dismiss /fork or open the session picker.
+    _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(&app, .open_all_sessions, null, null, null, false, 4096);
+    try std.testing.expect(app.agent().session_persistence.fork_menu.active());
+    try std.testing.expect(!app.agent().session_persistence.session_picker.active);
+
+    // Attach a pending subagent question: Ctrl+U, Shift+Enter, and bracketed paste must keep the question active.
+    const children = try alloc.alloc(session_adapter.Child, 1);
+    children[0] = .{
+        .id = try alloc.dupe(u8, "kid"),
+        .work_id = try alloc.dupe(u8, "w1"),
+        .open = false,
+        .outcome = .ok,
+        .spawn_data = try alloc.dupe(u8, "{}"),
+        .finish_data = null,
+        .seq = 2,
+    };
+    app.agent().session_persistence.fork_menu.question = children;
+
+    // Ctrl+U (.clear_line and .delete_to_line_start)
+    _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(&app, .clear_line, null, null, null, false, 4096);
+    try std.testing.expect(app.agent().session_persistence.fork_menu.asking());
+    try feedRoutingBytes(&app, "\x15");
+    try std.testing.expect(app.agent().session_persistence.fork_menu.asking());
+
+    // Shift+Enter (.insert_newline)
+    _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(&app, .insert_newline, .insert_newline, null, null, false, 4096);
+    try std.testing.expect(app.agent().session_persistence.fork_menu.asking());
+
+    // Bracketed paste carrying 'n' must not close the question or answer it.
+    _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(&app, .paste_start, null, null, null, false, 4096);
+    try feedRoutingBytes(&app, "no thanks");
+    _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(&app, .paste_end, null, null, null, false, 4096);
+    try std.testing.expect(app.agent().session_persistence.fork_menu.asking());
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
 }
 
 test "app_input_runtime ctrl+c while the picker borrows the composer keeps the stashed draft and its image" {

@@ -2002,7 +2002,10 @@ async function forkMenuRows(session: TmuxSession) {
   const plain = lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
   const composer = plain.findLastIndex(isComposerLine);
   return plain
-    .map((text, index) => ({ text: text.trim(), selected: lines[index]!.includes("\x1b[1m") }))
+    .map((text, index) => ({
+      text: text.trim().replace(/^\d+\s+/, ""),
+      selected: lines[index]!.includes("\x1b[1m"),
+    }))
     .slice(composer + 1)
     .filter((row) => row.text.startsWith("Fork prompt"));
 }
@@ -2382,7 +2385,9 @@ async function forkMenuSelected(session: TmuxSession) {
   const plain = lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
   const composer = plain.findLastIndex(isComposerLine);
   for (let index = composer + 1; index < lines.length; index += 1) {
-    if (lines[index]!.includes("\x1b[1m")) return plain[index]!.trim();
+    const trimmed = plain[index]!.trim();
+    if (!lines[index]!.includes("\x1b[1m") || /^Fork(\s|$)/.test(trimmed)) continue;
+    return trimmed.replace(/^\d+\s+/, "");
   }
   return "";
 }

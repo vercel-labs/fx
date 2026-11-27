@@ -104,12 +104,19 @@ pub fn PasteEditRuntime(comptime App: type) type {
             return app.auth.signInCodeEntryActive();
         }
 
+        fn forkMenuAsking(agent: *const AppAgent) bool {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            return agent.session_persistence.fork_menu.asking();
+        }
+
         pub fn beginPaste(app: *App, agent: *AppAgent, max_input_len: usize) void {
             const owner: paste_framing.Owner = if (agent.question_prompt.isActive())
                 if (agent.question_prompt.isFreeformSelected()) .question_freeform else .decision_prompt
             else if (agent.approval_prompt.isAmending())
                 .approval_amendment
             else if (agent.approval_prompt.isActive())
+                .decision_prompt
+            else if (forkMenuAsking(agent))
                 .decision_prompt
             else if (authCodeEntryActive(app))
                 .auth_code
