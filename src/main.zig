@@ -5461,7 +5461,9 @@ test {
     _ = @import("core/tool_bridge/tool_bridge.zig");
     _ = @import("core/mcp_host/mcp_call_client.zig");
     _ = @import("core/bash_session/bash_session.zig");
+    _ = @import("core/bash_results/bash_results.zig");
     _ = @import("tools/bash/bash.zig");
+    _ = @import("tools/bash/program_output.zig");
     _ = @import("builtins/bash_tools.zig");
     _ = @import("core/mcp_host/verbs.zig");
     _ = @import("core/mcp_host/login_words.zig");
@@ -5649,6 +5651,7 @@ test {
     _ = @import("core/session/session_json.zig");
     _ = @import("core/session/session_store.zig");
     _ = @import("core/session/session_adapter.zig");
+    _ = @import("core/session/result_files.zig");
     _ = @import("core/session/v1_conversion.zig");
     _ = @import("core/session/session_catalog_cache.zig");
     _ = @import("core/session/session_layout.zig");

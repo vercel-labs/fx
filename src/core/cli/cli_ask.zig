@@ -1117,6 +1117,7 @@ const AskContext = struct {
             .terminal_client = &self.terminal_client,
             .managed_executions = &self.managed_executions,
             .bash_session = &self.bash_session,
+            .bash_results_folder = if (self.v2) |v2| .{ .context = v2, .resolve = session_adapter.Session.resolveBashResults } else null,
             .command_timeout_ms = self.command_timeout_ms,
             .web_fetch_runtime = &self.web_fetch_runtime,
             .web_fetch_artifact_store = self.session.webFetchArtifactStore(),

@@ -15,7 +15,7 @@ const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const tool_name = "bash";
 
 const bash_description = std.fmt.comptimePrint(
-    "Run one bash program in the workspace. Its variables, functions, aliases, shell options, and working folder carry over to the next program. Use it for all work: read files (cat, sed -n, head), search (rg, rg --files), change files only with edit PATH (SEARCH/REPLACE blocks on stdin) and write PATH (the whole file on stdin), never with sed -i, perl -pi, or a > redirect, so fx can show and undo each change, run tests and builds, and use git. A call waits up to {d} s. When the program is still running, send {s} as the whole program to wait for it; only one program runs at a time. Reach this session's MCP tools with fx mcp call. Long output keeps its start and end.",
+    "Run one bash program in the workspace. Its variables, functions, aliases, shell options, and working folder carry over to the next program. Use it for all work: read files (cat, sed -n, head), search (rg, rg --files), change files only with edit PATH (SEARCH/REPLACE blocks on stdin) and write PATH (the whole file on stdin), never with sed -i, perl -pi, or a > redirect, so fx can show and undo each change, run tests and builds, and use git. A call waits up to {d} s. When the program is still running, send {s} as the whole program to wait for it; only one program runs at a time. Reach this session's MCP tools with fx mcp call. Each program's full output is saved as $FX_OUT/N.txt and listed in $FX_OUT/index.tsv; a long one comes back as a preview, so read the rest with rg, sed, or jq instead of running the program again.",
     .{ bash_impl.program_yield_ms / 1000, bash_session.wait_word },
 );
 
@@ -153,7 +153,7 @@ test "the bash gateway schema stays byte exact" {
     std.crypto.hash.sha2.Sha256.hash(schema_json, &digest, .{});
     const actual_hex = std.fmt.bytesToHex(digest, .lower);
     try std.testing.expectEqualStrings(
-        "f7e31520770a6863719dddc47afc688f4e4e4b5a1a1244c263df6aeef171b649",
+        "8f24462bc59d6f7ba2ec3df8362986c8f87da652cf669a79b61ffce91a5393c2",
         &actual_hex,
     );
 }

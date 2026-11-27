@@ -52,6 +52,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const session_event = @import("session_event.zig");
+const result_files = @import("result_files.zig");
 const result_store = @import("result_store.zig");
 const session_log = @import("session_log.zig");
 const session_codec = @import("session_codec.zig");
@@ -77,8 +78,10 @@ const PieceKind = std.meta.Tag(Event);
 /// Folder of the side files older v2 sessions kept, under `~/.fx`; a
 /// session moves out of it on its first writable open (D47).
 pub const files_dir_name = profile_paths.session_files_dir_name;
-/// Folder of v2 sessions' hosted terminal state, under `~/.fx` (D45).
+/// Hosted terminal state of v2 sessions, under `~/.fx` (D45).
 pub const terminal_dir_name = profile_paths.terminal_dir_name;
+/// Bash tool result files and index of v2 sessions, under `~/.fx` (S4-1).
+pub const results_dir_name = profile_paths.results_dir_name;
 /// The profile's home folder, opened for listing: creating `~/.fx` in it
 /// syncs it, and Linux cannot sync a folder opened any other way (`O_PATH`).
 fn openHome(home: []const u8) !io_mod.VerifiedDir {
@@ -267,9 +270,28 @@ pub const Store = struct {
         return io_mod.openOrCreateVerifiedPrivateDir(&fx, name);
     }
 
-    /// The folders of `id` outside the manager: its terminal state (D45)
-    /// and a side folder not yet moved (D47).
-    const outside_folders = [_][]const u8{ terminal_dir_name, files_dir_name };
+    /// The folders of `id` outside the manager: its terminal state (D45),
+    /// a side folder not yet moved (D47), and bash tool result files (S4-1).
+    const outside_folders = [_][]const u8{ terminal_dir_name, files_dir_name, results_dir_name };
+
+    /// Creates `~/.fx/results/{id}` with mode `0700` and returns its absolute
+    /// path. Caller owns the returned slice.
+    pub fn resultFolderPath(store: *Store, alloc: Allocator, session_id: []const u8) ![]u8 {
+        var folder = try store.openResultFolder(alloc, session_id);
+        defer folder.deinit();
+        return alloc.dupe(u8, folder.path);
+    }
+
+    /// Creates or opens `~/.fx/results/{id}` with mode `0700` as a `ResultFolder`.
+    pub fn openResultFolder(store: *Store, alloc: Allocator, session_id: []const u8) !result_files.ResultFolder {
+        try session_layout.validateSessionId(session_id);
+        var root = try store.makeProfileFolder(results_dir_name);
+        defer root.close();
+        var dir = try io_mod.openOrCreateVerifiedPrivateDir(&root, session_id);
+        errdefer dir.close();
+        const abs_path = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
+        return result_files.ResultFolder.fromVerifiedDir(alloc, abs_path, dir, .{});
+    }
 
     /// Removes the folders of `id` outside the manager; `why` names the
     /// caller in the trace.
@@ -297,24 +319,31 @@ pub const Store = struct {
     fn copyFiles(store: *Store, from: []const u8, to: []const u8) bool {
         var complete = true;
         for (outside_folders) |root_name| {
-            var root = (store.openProfileFolder(root_name) catch |err| {
-                complete = copyFailed(from, err);
-                continue;
-            }) orelse continue;
-            defer root.close();
-            var source = (io_mod.openVerifiedPrivateDirIfPresent(&root, from) catch |err| {
-                complete = copyFailed(from, err);
-                continue;
-            }) orelse continue;
-            defer source.close();
-            var target = io_mod.openOrCreateVerifiedPrivateDir(&root, to) catch |err| {
-                complete = copyFailed(from, err);
-                continue;
-            };
-            defer target.close();
-            if (!copyTree(io_mod.openVerifiedPrivateDirIfPresent, &source, &target, 0)) complete = false;
+            if (!store.copyRootFolder(root_name, from, to)) complete = false;
         }
         return complete;
+    }
+
+    /// Copies `from`'s bash tool result files (`results/{from}`) to `to`.
+    fn copyResultFiles(store: *Store, from: []const u8, to: []const u8) bool {
+        return store.copyRootFolder(results_dir_name, from, to);
+    }
+
+    /// Copies `from` to `to` inside a single outside folder root `root_name`.
+    fn copyRootFolder(store: *Store, root_name: []const u8, from: []const u8, to: []const u8) bool {
+        var root = (store.openProfileFolder(root_name) catch |err| {
+            return copyFailed(from, err);
+        }) orelse return true;
+        defer root.close();
+        var source = (io_mod.openVerifiedPrivateDirIfPresent(&root, from) catch |err| {
+            return copyFailed(from, err);
+        }) orelse return true;
+        defer source.close();
+        var target = io_mod.openOrCreateVerifiedPrivateDir(&root, to) catch |err| {
+            return copyFailed(from, err);
+        };
+        defer target.close();
+        return copyTree(io_mod.openVerifiedPrivateDirIfPresent, &source, &target, 0);
     }
 
     /// Finds folders outside the manager whose session is gone, except young
@@ -1937,6 +1966,9 @@ pub const Session = struct {
     /// `~/.fx/session-files/{id}`, owned: where an older session kept its
     /// side files, read once by the move (D47).
     files_path: []u8,
+    /// This session's bash results folder, `~/.fx/results/{id}`, owned. Made by
+    /// `bashResultsPath` on first use, and freed with the session.
+    results_path: ?[]u8 = null,
     /// The session's blobs, shared with every capability over it (D44).
     host: *BlobHost,
     capability: ?session_child_store.SessionChildCapability = null,
@@ -2334,6 +2366,7 @@ pub const Session = struct {
         if (self.instructions) |value| alloc.free(value);
         if (self.first_title) |value| alloc.free(value);
         alloc.free(self.files_path);
+        if (self.results_path) |path| alloc.free(path);
         alloc.destroy(self);
     }
 
@@ -2368,6 +2401,32 @@ pub const Session = struct {
         defer self.alloc.free(terminal_path);
         self.capability = try session_child_store.SessionChildCapability.initBlobs(self.alloc, self.host.blobs(), terminal_path, .writable);
         return &self.capability.?;
+    }
+
+    /// The absolute path of this session's bash results folder, made on the first
+    /// call and kept until the session closes.
+    pub fn bashResultsPath(self: *Session) ![]const u8 {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.results_path == null) self.results_path = try self.resultFolderPath(self.alloc);
+        return self.results_path.?;
+    }
+
+    /// `tool_dispatch.BashResultsFolder.resolve` for a v2 session.
+    pub fn resolveBashResults(context: *anyopaque) anyerror![]const u8 {
+        const self: *Session = @ptrCast(@alignCast(context));
+        return self.bashResultsPath();
+    }
+
+    /// Creates `~/.fx/results/{id}` with mode `0700` and returns its absolute
+    /// path. Caller owns the returned slice.
+    pub fn resultFolderPath(self: *const Session, alloc: Allocator) ![]u8 {
+        return self.store.resultFolderPath(alloc, self.id());
+    }
+
+    /// Creates or opens `~/.fx/results/{id}` with mode `0700` as a `ResultFolder`.
+    pub fn openResultFolder(self: *const Session, alloc: Allocator) !result_files.ResultFolder {
+        return self.store.openResultFolder(alloc, self.id());
     }
 
     // -- turns ---------------------------------------------------------------
@@ -3807,6 +3866,9 @@ pub const Session = struct {
         const copy = try init(alloc, self.store, handle, false);
         errdefer copy.destroyInner();
         try copy.openMoved();
+        if (!self.store.copyResultFiles(self.id(), copy.id())) {
+            debug_trace.logf("session", "event=sessions_v2_fork_results_incomplete source={s} fork={s}", .{ self.id(), copy.id() });
+        }
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const state = try handle.state(arena.allocator());
@@ -14722,4 +14784,160 @@ test "forkSession copies side folders, never a link, and reports when one is ski
     defer testing.allocator.free(top);
     try testing.expectEqualStrings("top", top);
     try testing.expectError(error.FileNotFound, dir.access(io, "link", .{ .follow_symlinks = false }));
+}
+
+test "Session.fork copies results/ only (skipping links) and leaves terminal/ and session-files/ untouched" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const io = io_mod.getIo();
+    var model = "m".*;
+    const source = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer source.close();
+    try source.commitTurn(assistantTurn("q1", "a1"), types.ConversationLanguage.default());
+    try source.commitTurn(assistantTurn("q2", "a2"), types.ConversationLanguage.default());
+    {
+        var folder = try source.openResultFolder(testing.allocator);
+        defer folder.deinit();
+        var r1: std.Io.Reader = .fixed("out-1\n");
+        _ = try folder.save(1, &r1);
+        var r2: std.Io.Reader = .fixed("out-2\n");
+        _ = try folder.save(2, &r2);
+        try folder.appendIndex(.{ .n = 1, .exit = .{ .code = 0 }, .bytes = 6, .lines = 1, .command = "echo 1" });
+        try folder.appendIndex(.{ .n = 2, .exit = .{ .code = 0 }, .bytes = 6, .lines = 1, .command = "echo 2" });
+        try folder.dir.dir.symLink(io, "/etc/hosts", "link", .{});
+    }
+    {
+        var fx = try io_mod.openOrCreateVerifiedPrivateDirFromDir(t.tmp.dir, ".fx");
+        defer fx.close();
+        for ([_][]const u8{ terminal_dir_name, files_dir_name }) |root_name| {
+            var root = try io_mod.openOrCreateVerifiedPrivateDir(&fx, root_name);
+            defer root.close();
+            var owner = try io_mod.openOrCreateVerifiedPrivateDir(&root, source.id());
+            defer owner.close();
+            try owner.dir.writeFile(io, .{ .sub_path = "keep.txt", .data = "src", .flags = .{ .permissions = .fromMode(0o600) } });
+        }
+    }
+
+    const forked = try source.fork(testing.allocator, .{ .before_turn = 2, .workspace = "/w", .host = .app });
+    defer forked.close();
+    try testing.expect(pathExists(&t, &.{ ".fx", results_dir_name, forked.id(), "1.txt" }));
+    try testing.expect(pathExists(&t, &.{ ".fx", results_dir_name, forked.id(), "2.txt" }));
+    try testing.expect(pathExists(&t, &.{ ".fx", results_dir_name, forked.id(), result_files.index_file_name }));
+    try testing.expect(!pathExists(&t, &.{ ".fx", results_dir_name, forked.id(), "link" }));
+    try testing.expect(!pathExists(&t, &.{ ".fx", terminal_dir_name, forked.id() }));
+    try testing.expect(!pathExists(&t, &.{ ".fx", files_dir_name, forked.id() }));
+}
+
+test "the bash results folder is kept once per session and differs between sessions" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const first = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer first.close();
+    const second = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer second.close();
+    const first_path = try first.bashResultsPath();
+    try testing.expect(std.mem.endsWith(u8, first_path, first.id()));
+    try testing.expectEqual(first_path.ptr, (try first.bashResultsPath()).ptr);
+    try testing.expect(!std.mem.eql(u8, first_path, try second.bashResultsPath()));
+}
+
+test "forkSession copies results/ and skips symlinks" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const io = io_mod.getIo();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    {
+        var folder = try t.store.openResultFolder(testing.allocator, id);
+        defer folder.deinit();
+        var r1: std.Io.Reader = .fixed("out-1\n");
+        _ = try folder.save(1, &r1);
+        try folder.appendIndex(.{ .n = 1, .exit = .{ .code = 0 }, .bytes = 6, .lines = 1, .command = "echo 1" });
+        try folder.dir.dir.symLink(io, "/etc/hosts", "link", .{});
+    }
+
+    var forked = try forkSession(&t.store, testing.allocator, id);
+    defer forked.deinit(testing.allocator);
+    try testing.expect(!forked.files_complete);
+    const copy = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", results_dir_name, forked.id });
+    defer testing.allocator.free(copy);
+    var dir = try t.tmp.dir.openDir(io, copy, .{});
+    defer dir.close(io);
+    const out1 = try dir.readFileAlloc(io, "1.txt", testing.allocator, .limited(64));
+    defer testing.allocator.free(out1);
+    try testing.expectEqualStrings("out-1\n", out1);
+    const idx = try dir.readFileAlloc(io, result_files.index_file_name, testing.allocator, .limited(256));
+    defer testing.allocator.free(idx);
+    try testing.expectEqualStrings("n\texit\tbytes\tlines\tcommand\n1\t0\t6\t1\techo 1\n", idx);
+    try testing.expectError(error.FileNotFound, dir.access(io, "link", .{ .follow_symlinks = false }));
+}
+
+test "unsaved session removal removes results/<id> and keeps saved sessions" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+
+    const unsaved = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var unsaved_closed = false;
+    errdefer if (!unsaved_closed) unsaved.close();
+    const unsaved_id = try testing.allocator.dupe(u8, unsaved.id());
+    defer testing.allocator.free(unsaved_id);
+    const unsaved_path = try unsaved.resultFolderPath(testing.allocator);
+    defer testing.allocator.free(unsaved_path);
+    try testing.expect(std.Io.Dir.path.isAbsolute(unsaved_path));
+    unsaved.close();
+    unsaved_closed = true;
+    try testing.expect(!pathExists(&t, &.{ ".fx", results_dir_name, unsaved_id }));
+
+    const saved = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const saved_id = try testing.allocator.dupe(u8, saved.id());
+    defer testing.allocator.free(saved_id);
+    {
+        var folder = try saved.openResultFolder(testing.allocator);
+        defer folder.deinit();
+        var r1: std.Io.Reader = .fixed("kept\n");
+        _ = try folder.save(1, &r1);
+    }
+    try saved.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    saved.close();
+    try testing.expect(pathExists(&t, &.{ ".fx", results_dir_name, saved_id }));
+}
+
+test "doctor sweep counts and removes orphan results/<id> while keeping saved sessions" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    const saved_id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(saved_id);
+    s.close();
+
+    var saved_folder = try t.store.openResultFolder(testing.allocator, saved_id);
+    saved_folder.deinit();
+    const orphan_id = "20261126T000000Z-orphan01";
+    var orphan_folder = try t.store.openResultFolder(testing.allocator, orphan_id);
+    orphan_folder.deinit();
+
+    const future_ms = io_mod.milliTimestamp() + orphan_min_age_ms + 10_000;
+    var counted = try doctor(&t.store, testing.allocator, 64, future_ms, .count);
+    defer counted.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), counted.removable);
+    try testing.expect(pathExists(&t, &.{ ".fx", results_dir_name, orphan_id }));
+
+    var removed = try doctor(&t.store, testing.allocator, 64, future_ms, .remove);
+    defer removed.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), removed.removed);
+    try testing.expect(!pathExists(&t, &.{ ".fx", results_dir_name, orphan_id }));
+    try testing.expect(pathExists(&t, &.{ ".fx", results_dir_name, saved_id }));
 }

@@ -97,6 +97,7 @@ const Context = struct {
         result.worker = self.turn.workerRuntime();
         result.session = self.turn.sessionRuntime();
         result.bash_session = &self.turn.bash_session;
+        result.bash_results_folder = self.turn.bashResultsFolder();
         result.cancel_flag = self.cancel;
         result.permission_mode = self.admission.permission_mode;
         result.permission_grants = self.admission.grants;

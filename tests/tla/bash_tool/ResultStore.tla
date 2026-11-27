@@ -1,20 +1,27 @@
 ---------------------------- MODULE ResultStore ----------------------------
 (***************************************************************************)
 (* One agent's bash session and its result store, for the one bash tool    *)
-(* design behind the experimental.bash_tool setting. The session part has  *)
-(* landed (src/core/bash_session/bash_session.zig and                      *)
-(* src/tools/bash/bash.zig): one program at a time, wait_more, and the     *)
-(* saved bash state. The result store, the numbered result files and their *)
-(* index, has not landed yet.                                              *)
+(* design behind the experimental.bash_tool setting                        *)
+(* (src/core/bash_session/bash_session.zig and src/tools/bash/bash.zig):   *)
+(* one program at a time, wait_more, the saved bash state, and the result  *)
+(* files in $FX_OUT.                                                       *)
 (*                                                                         *)
 (* The model sends programs. One runs at a time; a program sent while      *)
-(* another runs is refused and never starts. Every result is saved as the  *)
-(* next numbered file with one index line: a program's full output when it *)
-(* ends, and each fx command result it saves while it runs (mcp, skill,    *)
-(* subagent, web). The client waits a bounded time for the program it      *)
-(* sent; when the program outlives that, the model sends wait_more, which  *)
-(* waits for the same program and never runs it again. A preview reaches   *)
-(* the model only after the output it shows is saved.                      *)
+(* another runs is refused and never starts. When a program ends, fx saves *)
+(* its full output as the next numbered file, then adds its index line,    *)
+(* and only then is its result ready. The next number is one more than the *)
+(* highest number already in the folder, files and index both, so a number *)
+(* is never used twice, even after fx stops between the two writes. A      *)
+(* folder with no room left saves nothing, and the result says so. The     *)
+(* client waits a bounded time for the program it sent; when the program   *)
+(* outlives that, the model sends wait_more, which waits for the same      *)
+(* program and never runs it again. A preview reaches the model only after *)
+(* the output it shows is saved and indexed.                               *)
+(*                                                                         *)
+(* fx can stop at any step, for example on a crash or a quit, and the      *)
+(* session resumes in a new fx process. The files and the index stay. A    *)
+(* program that was running, or whose output was not yet indexed, is not   *)
+(* shown. This model does not cover the bash state across a resume.        *)
 (*                                                                         *)
 (* Each program is its own process. It loads the bash state the last       *)
 (* program saved, and its EXIT trap saves the state again with an atomic   *)
@@ -29,14 +36,17 @@
 (* program starts from a fresh state, and its result says the saved state  *)
 (* was lost.                                                               *)
 (*                                                                         *)
-(* The server ends a program in three steps, as the code does: it saves    *)
-(* the output, makes the result ready, and then clears its running marker. *)
+(* The server ends a program in steps, as the code does: the program ends, *)
+(* fx writes its file, then its index line, which makes the result ready,  *)
+(* and then it clears its running marker.                                  *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
     Programs,     \* the programs the model may send, each once
-    MaxFx,        \* fx command results one program may save
+    Room,         \* how many result files the folder holds before it is full
+    MaxRestarts,  \* how many times fx may stop and resume
+    Faults,       \* TRUE: a file or an index line can fail to be written (FileFails, IndexFails)
     Mutation      \* "none", or one planted defect named in check.sh
 
 None == "none"
@@ -44,12 +54,20 @@ None == "none"
 VARIABLES
     sent,      \* programs fx accepted
     current,   \* the server's current or last program, or None
-    phase,     \* the server: "idle", "run", or "saved" (marker not yet cleared)
+    phase,     \* the server: "idle", "run", "ended", "filed", or "saved" (marker not yet cleared)
     ready,     \* the program whose result waits for a client, or None
     waiting,   \* the program a client waits for, or None
     shown,     \* programs whose preview reached the model
-    store,     \* the saved results in order, each [kind, prog]
-    index,     \* the index lines in order: result numbers
+    files,     \* the result files in the folder, each [n, prog]
+    indexed,   \* the numbers that have an index line
+    unsaved,   \* programs whose output found no room
+    fullNoticed, \* programs whose result says their output was not saved
+    saveFailed, \* programs whose output could not be written as a file
+    indexFailed, \* programs whose file is saved, but its index line could not be written
+    failNoticed, \* programs whose result says their output could not be saved
+    indexNoticed, \* programs whose result says their index line could not be written
+    stopped,   \* programs fx stopped before their result was ready
+    restarts,  \* how many times fx stopped and resumed
     runs,      \* how many times each program ran
     saves,     \* how many times a program saved the bash state
     torn,      \* the saved bash state is half-written
@@ -60,11 +78,11 @@ VARIABLES
     damaged,   \* a program left the session's files damaged after its save
     lost,      \* programs that started from a fresh state after a heal
     lostNoticed, \* programs whose result says the saved state was lost
-    unreported, \* a loss of saved state that no result has reported yet
-    fxSaved    \* fx command results the current program saved
+    unreported \* a loss of saved state that no result has reported yet
 
 stateVars == <<saves, torn, how, savedBy, refused, noticed, damaged, lost, lostNoticed, unreported>>
-vars == <<sent, current, phase, ready, waiting, shown, store, index, runs, fxSaved, stateVars>>
+storeVars == <<files, indexed, unsaved, fullNoticed, stopped, restarts, saveFailed, indexFailed, failNoticed, indexNoticed>>
+vars == <<sent, current, phase, ready, waiting, shown, runs, storeVars, stateVars>>
 
 \* The running marker the client reads: the program until the server clears it.
 Running == IF phase = "idle" THEN None ELSE current
@@ -76,8 +94,16 @@ Init ==
     /\ ready = None
     /\ waiting = None
     /\ shown = {}
-    /\ store = <<>>
-    /\ index = <<>>
+    /\ files = {}
+    /\ indexed = {}
+    /\ unsaved = {}
+    /\ fullNoticed = {}
+    /\ saveFailed = {}
+    /\ indexFailed = {}
+    /\ failNoticed = {}
+    /\ indexNoticed = {}
+    /\ stopped = {}
+    /\ restarts = 0
     /\ runs = [p \in Programs |-> 0]
     /\ saves = 0
     /\ torn = FALSE
@@ -89,12 +115,15 @@ Init ==
     /\ lost = {}
     /\ lostNoticed = {}
     /\ unreported = FALSE
-    /\ fxSaved = 0
 
-\* Saving a result appends it and its index line.
-Save(kind, p) ==
-    /\ store' = Append(store, [kind |-> kind, prog |-> p])
-    /\ index' = IF Mutation = "skip-index" /\ kind = "fx" THEN index ELSE Append(index, Len(store) + 1)
+Numbers == {f.n : f \in files}
+Max(S) == IF S = {} THEN 0 ELSE CHOOSE m \in S : \A x \in S : x <= m
+
+\* One more than the highest number in the folder, files and index both.
+NextNumber == 1 + Max(IF Mutation = "number-from-index" THEN indexed ELSE Numbers \cup indexed)
+
+\* p's output is saved, and its index line names it.
+Indexed(p) == \E f \in files : f.prog = p /\ f.n \in indexed
 
 \* The model sends p while no marker is set. A result nobody read stays
 \* saved and unread. fx first heals the session's files: when a program
@@ -109,14 +138,13 @@ Send(p) ==
     /\ runs' = [runs EXCEPT ![p] = @ + 1]
     /\ ready' = None
     /\ waiting' = p
-    /\ fxSaved' = 0
     /\ IF damaged
        THEN /\ damaged' = (Mutation = "skip-heal")
             /\ lost' = lost \cup {p}
             /\ lostNoticed' = IF Mutation = "silent-heal" THEN lostNoticed ELSE lostNoticed \cup {p}
             /\ unreported' = (Mutation = "silent-heal")
        ELSE UNCHANGED <<damaged, lost, lostNoticed, unreported>>
-    /\ UNCHANGED <<shown, store, index, saves, torn, how, savedBy, refused, noticed>>
+    /\ UNCHANGED <<shown, storeVars, saves, torn, how, savedBy, refused, noticed>>
 
 \* After its save, the last program damages the session's files: its EXIT
 \* trap or a child it left behind removes the folder or puts a FIFO there.
@@ -126,7 +154,7 @@ Damage ==
     /\ ~damaged
     /\ damaged' = TRUE
     /\ unreported' = TRUE
-    /\ UNCHANGED <<sent, current, phase, ready, waiting, shown, store, index, runs, fxSaved,
+    /\ UNCHANGED <<sent, current, phase, ready, waiting, shown, runs, storeVars,
                    saves, torn, how, savedBy, refused, noticed, lost, lostNoticed>>
 
 \* fx cannot make a fresh session folder for the next program, so that call
@@ -136,29 +164,19 @@ HealFails ==
     /\ phase = "idle"
     /\ damaged
     /\ damaged' = (Mutation # "forget-on-fail")
-    /\ UNCHANGED <<sent, current, phase, ready, waiting, shown, store, index, runs, fxSaved,
+    /\ UNCHANGED <<sent, current, phase, ready, waiting, shown, runs, storeVars,
                    saves, torn, how, savedBy, refused, noticed, lost, lostNoticed, unreported>>
-
-\* The running program saves one fx command result.
-SaveFx ==
-    /\ phase = "run"
-    /\ fxSaved < MaxFx
-    /\ Save("fx", current)
-    /\ fxSaved' = fxSaved + 1
-    /\ UNCHANGED <<sent, current, phase, ready, waiting, shown, runs, stateVars>>
 
 \* The program ends: normally ("ok"), with exit ("exit"), or killed
 \* ("killed"), for example by a cancel or its timeout. fx saves its output in
-\* every case, and then its result is ready. Its EXIT trap saves the bash
+\* every case, in the next two steps. Its EXIT trap saves the bash
 \* state unless it is killed. The state file is replaced with an atomic
 \* rename, so a kill never leaves it half-written. When the new state is
 \* over the size cap (big), the trap keeps the last complete state and
 \* writes a notice into the program's output.
 Finish(kind, big) ==
     /\ phase = "run"
-    /\ Save("output", current)
-    /\ phase' = "saved"
-    /\ ready' = current
+    /\ phase' = "ended"
     /\ how' = [how EXCEPT ![current] = kind]
     /\ IF kind = "killed" \/ (kind = "exit" /\ Mutation = "exit-skips-save")
        THEN /\ saves' = saves
@@ -175,30 +193,98 @@ Finish(kind, big) ==
             /\ savedBy' = savedBy \cup {current}
             /\ torn' = FALSE
             /\ UNCHANGED <<refused, noticed>>
-    /\ UNCHANGED <<sent, current, waiting, shown, runs, fxSaved, damaged, lost, lostNoticed, unreported>>
+    /\ UNCHANGED <<sent, current, ready, waiting, shown, runs, storeVars, damaged, lost, lostNoticed, unreported>>
+
+\* In the code, a bash call takes File and Index for a program that ended after its
+\* last result, before its own Send (bash.zig settleLastProgram). A session that stops
+\* first is a stop (Restart), and its program's result is never shown.
+\* fx writes the ended program's output as the next numbered file, with an
+\* atomic rename. A folder with no room saves nothing: the result is ready
+\* at once and says the output was not saved (RULES.md R3.8).
+File ==
+    /\ phase = "ended"
+    /\ IF Cardinality(files) < Room
+       THEN /\ files' = files \cup {[n |-> NextNumber, prog |-> current]}
+            /\ phase' = "filed"
+            /\ UNCHANGED <<ready, unsaved, fullNoticed>>
+       ELSE /\ unsaved' = unsaved \cup {current}
+            /\ fullNoticed' = IF Mutation = "silent-full" THEN fullNoticed ELSE fullNoticed \cup {current}
+            /\ phase' = "saved"
+            /\ ready' = current
+            /\ UNCHANGED files
+    /\ UNCHANGED <<sent, current, waiting, shown, runs, indexed, stopped, restarts, saveFailed, indexFailed, failNoticed, indexNoticed, stateVars>>
+
+\* fx replaces the index with one that adds the file's line, with an atomic
+\* rename, and the result is ready.
+Index ==
+    /\ phase = "filed"
+    /\ indexed' = IF Mutation = "skip-index" THEN indexed
+                   ELSE indexed \cup {f.n : f \in {g \in files : g.prog = current}}
+    /\ phase' = "saved"
+    /\ ready' = current
+    /\ UNCHANGED <<sent, current, waiting, shown, runs, files, unsaved, fullNoticed, stopped, restarts, saveFailed, failNoticed, indexFailed, indexNoticed, stateVars>>
+
+\* fx cannot write the ended program's output as a file: a link or a directory a
+\* program left at the number the folder picked refuses the publish, so no file is
+\* written. The result is ready at once and says the output was not saved (RULES.md R3.8).
+\* A folder with no room is File's full case: the folder refuses before it writes a name,
+\* so this fault can only reach a folder with room.
+FileFails ==
+    /\ Faults
+    /\ phase = "ended"
+    /\ Cardinality(files) < Room
+    /\ saveFailed' = saveFailed \cup {current}
+    /\ failNoticed' = failNoticed \cup {current}
+    /\ phase' = "saved"
+    /\ ready' = current
+    /\ UNCHANGED <<sent, current, waiting, shown, runs, files, indexed, unsaved, fullNoticed, indexFailed, indexNoticed, stopped, restarts, stateVars>>
+
+\* fx saves the file, but cannot write its index line: a directory is at index.tsv.
+\* The file stays with no index line, and the result is ready and says so (RULES.md R3.8).
+IndexFails ==
+    /\ Faults
+    /\ phase = "filed"
+    /\ indexFailed' = indexFailed \cup {current}
+    /\ indexNoticed' = IF Mutation = "silent-index" THEN indexNoticed ELSE indexNoticed \cup {current}
+    /\ phase' = "saved"
+    /\ ready' = current
+    /\ UNCHANGED <<sent, current, waiting, shown, runs, files, indexed, unsaved, fullNoticed, saveFailed, failNoticed, stopped, restarts, stateVars>>
 
 \* The server clears its running marker.
 Clear ==
     /\ phase = "saved"
     /\ phase' = "idle"
-    /\ UNCHANGED <<sent, current, ready, waiting, shown, store, index, runs, fxSaved, stateVars>>
+    /\ UNCHANGED <<sent, current, ready, waiting, shown, runs, storeVars, stateVars>>
+
+\* fx stops at any step, and the session resumes in a new fx process. The
+\* files and the index stay. A program that had not reached "saved" is never
+\* shown; a result that was ready but unread stays saved.
+Restart ==
+    /\ restarts < MaxRestarts
+    /\ restarts' = restarts + 1
+    /\ stopped' = IF phase \in {"run", "ended", "filed"} THEN stopped \cup {current} ELSE stopped
+    /\ phase' = "idle"
+    /\ current' = None
+    /\ ready' = None
+    /\ waiting' = None
+    /\ UNCHANGED <<sent, shown, runs, files, indexed, unsaved, fullNoticed, saveFailed, indexFailed, failNoticed, indexNoticed, stateVars>>
 
 \* The waiting client shows the model its program's result.
 Show ==
     /\ waiting # None
     /\ \/ ready = waiting
-       \/ Mutation = "show-before-save" /\ phase = "run" /\ current = waiting
+       \/ Mutation = "show-before-save" /\ phase \in {"ended", "filed"} /\ current = waiting
     /\ shown' = shown \cup {waiting}
     /\ waiting' = None
     /\ ready' = None
-    /\ UNCHANGED <<sent, current, phase, store, index, runs, fxSaved, stateVars>>
+    /\ UNCHANGED <<sent, current, phase, runs, storeVars, stateVars>>
 
 \* The client's wait ends first; the model hears the program still runs.
 GiveUp ==
     /\ waiting # None
     /\ ready # waiting
     /\ waiting' = None
-    /\ UNCHANGED <<sent, current, phase, ready, shown, store, index, runs, fxSaved, stateVars>>
+    /\ UNCHANGED <<sent, current, phase, ready, shown, runs, storeVars, stateVars>>
 
 \* wait_more waits for the last program, running or ready.
 WaitMore ==
@@ -207,23 +293,28 @@ WaitMore ==
     /\ waiting' = current
     /\ runs' = IF Mutation = "rerun-on-wait" /\ phase = "run"
                THEN [runs EXCEPT ![current] = @ + 1] ELSE runs
-    /\ UNCHANGED <<sent, current, phase, ready, shown, store, index, fxSaved, stateVars>>
+    /\ UNCHANGED <<sent, current, phase, ready, shown, storeVars, stateVars>>
 
 Next ==
     \/ \E p \in Programs : Send(p)
-    \/ SaveFx
     \/ \E big \in BOOLEAN : Finish("ok", big) \/ Finish("exit", big)
     \/ Finish("killed", FALSE)
+    \/ File
+    \/ Index
+    \/ FileFails
+    \/ IndexFails
     \/ Clear
     \/ Show
     \/ GiveUp
     \/ WaitMore
     \/ Damage
     \/ HealFails
+    \/ Restart
 
 Spec ==
     /\ Init /\ [][Next]_vars
-    /\ WF_vars(Finish("ok", FALSE)) /\ WF_vars(Clear) /\ WF_vars(Show) /\ WF_vars(WaitMore)
+    /\ WF_vars(Finish("ok", FALSE)) /\ WF_vars(File) /\ WF_vars(Index)
+    /\ WF_vars(Clear) /\ WF_vars(Show) /\ WF_vars(WaitMore)
 
 -----------------------------------------------------------------------------
 \* Rules.
@@ -231,7 +322,7 @@ Spec ==
 TypeOK ==
     /\ sent \subseteq Programs
     /\ current \in Programs \cup {None}
-    /\ phase \in {"idle", "run", "saved"}
+    /\ phase \in {"idle", "run", "ended", "filed", "saved"}
     /\ ready \in Programs \cup {None}
     /\ waiting \in Programs \cup {None}
     /\ shown \subseteq sent
@@ -245,7 +336,16 @@ TypeOK ==
     /\ lost \subseteq sent
     /\ lostNoticed \subseteq sent
     /\ unreported \in BOOLEAN
-    /\ fxSaved \in 0..MaxFx
+    /\ \A f \in files : f.n \in Nat /\ f.prog \in sent
+    /\ indexed \subseteq Nat
+    /\ unsaved \subseteq sent
+    /\ fullNoticed \subseteq sent
+    /\ saveFailed \subseteq sent
+    /\ indexFailed \subseteq sent
+    /\ failNoticed \subseteq sent
+    /\ indexNoticed \subseteq sent
+    /\ stopped \subseteq sent
+    /\ restarts \in 0..MaxRestarts
 
 \* A program runs at most once, whatever the client and the model do.
 RunOnce == \A p \in Programs : runs[p] <= 1
@@ -254,16 +354,23 @@ RunOnce == \A p \in Programs : runs[p] <= 1
 \* ready while it runs.
 OneAtATime ==
     /\ ready # None => ready = current
-    /\ phase = "run" => ready = None
+    /\ phase \in {"run", "ended", "filed"} => ready = None
 
-\* Every preview the model saw shows output that is saved.
+\* Every preview the model saw shows output that is saved and indexed, or
+\* its result said the folder had no room.
 SavedBeforeShown ==
-    \A p \in shown : \E i \in 1..Len(store) : store[i] = [kind |-> "output", prog |-> p]
+    \A p \in shown :
+        Indexed(p) \/ (p \in unsaved /\ p \in fullNoticed)
+        \/ (p \in saveFailed /\ p \in failNoticed) \/ (p \in indexFailed /\ p \in indexNoticed)
 
-\* The index has one line per saved result, in the order they were saved.
-IndexMatchesStore ==
-    /\ Len(index) = Len(store)
-    /\ \A i \in 1..Len(index) : index[i] = i
+\* A number names one result, so a path the model saw never shows other output.
+NoReuse == \A f, g \in files : f.n = g.n => f = g
+
+\* An index line always names a file that is there.
+IndexNamesFile == indexed \subseteq Numbers
+
+\* Output that found no room is never dropped silently (RULES.md R3.8).
+FullNoticed == unsaved \subseteq fullNoticed
 
 \* The saved bash state is never half-written, so the next program always
 \* loads a complete one.
@@ -289,12 +396,26 @@ LossNoticed == lost \subseteq lostNoticed
 \* earlier heal failed (RULES.md R3.8).
 ReportedBeforeRun == phase = "run" => ~unreported
 
-\* A saved result is never changed or removed.
-StoreAppendOnly == [][SubSeq(store', 1, Len(store)) = store]_vars
+\* A saved result file or index line is never changed or removed.
+StoreAppendOnly == [][files \subseteq files' /\ indexed \subseteq indexed']_vars
 
-\* Every program fx accepted has its output saved in the end.
+\* Every program fx accepted has its output saved and indexed in the end,
+\* unless the folder had no room or fx stopped before its result was ready.
 EverySentIsSaved ==
     \A p \in Programs :
-        p \in sent ~> \E i \in 1..Len(store) : store[i] = [kind |-> "output", prog |-> p]
+        p \in sent ~> (Indexed(p) \/ p \in unsaved \/ p \in stopped \/ p \in saveFailed \/ p \in indexFailed)
+
+-----------------------------------------------------------------------------
+\* Witnesses: each must be violated, to show TLC reaches that case.
+
+\* A file whose index line fx never wrote, because it stopped between them.
+OrphanWitness == ~(phase = "idle" /\ \E f \in files : f.n \notin indexed)
+
+\* A program whose output found no room.
+FullWitness == unsaved = {}
+
+\* After fx stopped between a file and its index line, a later result got
+\* a higher number and reached the model.
+ResumeWitness == ~(\E f, g \in files : f.n \notin indexed /\ g.n > f.n /\ g.prog \in shown)
 
 =============================================================================

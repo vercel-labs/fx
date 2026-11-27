@@ -11716,6 +11716,49 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP bash results start with the header, and the saved file holds the program's output",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-bash-result-");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { bash_tool: true } }));
+      const gateway = startDynamicFakeGateway((body) => {
+        if (body.includes('"toolCallId":"acp_echo"')) return finalText("ACP_ECHO_DONE");
+        if (body.includes("Echo once for the header.")) {
+          return fakeGatewayToolCall("acp_echo", "bash", { command: "echo acp-hello" });
+        }
+        return finalText("ACP_OTHER");
+      });
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine(); // consume session/update notification
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const run = await runPrompt(client, "Echo once for the header.", 60_000);
+        expect(run.promptResult.result.stopReason).toBe("end_turn");
+
+        const echoRequest = gateway.requests.find((request) => request.body.includes('"toolCallId":"acp_echo"'));
+        expect(echoRequest).toBeDefined();
+        expect(acpToolResultText(echoRequest!.body, "acp_echo")).toBe("[exit 0, 1 line, 10 B, $FX_OUT/1.txt]\nacp-hello\n");
+        const [session] = readdirSync(join(root.home, ".fx", "results"));
+        expect(readFileSync(join(root.home, ".fx", "results", session!, "1.txt"), "utf8")).toBe("acp-hello\n");
+
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  test(
     "ACP sessions start with a fresh bash state: a new session does not see the last one's variables",
     async () => {
       const root = createIsolatedRoot("fx-acp-bash-fresh-");

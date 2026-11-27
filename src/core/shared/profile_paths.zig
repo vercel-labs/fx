@@ -14,6 +14,8 @@ const hosts_dir_name = "hosts";
 pub const session_files_dir_name = "session-files";
 /// Hosted terminal state of v2 sessions, one folder per session id (D45).
 pub const terminal_dir_name = "terminal";
+/// Bash tool result files and index of v2 sessions, one folder per session id.
+pub const results_dir_name = "results";
 pub const prompt_history_file_name = "history.jsonl";
 pub const backups_dir_name = "backups";
 pub const mcp_credentials_dir_name = "mcp-credentials";

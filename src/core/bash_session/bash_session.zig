@@ -143,6 +143,9 @@ pub const Session = struct {
     /// The id of this session's last program, so a new program waits its
     /// turn and wait_more finds it. Owned.
     program_id: ?[]u8 = null,
+    /// Whether a call reported the end of `program_id`: its result, or the notice that
+    /// saved its output before the next program started. `setProgram` clears it.
+    program_end_delivered: bool = false,
     /// The folder the next program starts in, as the last saved state left it.
     /// Null means the workspace root. Owned.
     start_folder: ?[]u8 = null,
@@ -259,11 +262,36 @@ pub const Session = struct {
         const owned = try self.alloc.dupe(u8, id);
         if (self.program_id) |old| self.alloc.free(old);
         self.program_id = owned;
+        self.program_end_delivered = false;
     }
 
     /// The id of this session's last program, or null before one is set.
     pub fn program(self: *const Session) ?[]const u8 {
         return self.program_id;
+    }
+
+    /// Records that a call reported the end of the session's last program.
+    pub fn markProgramEndDelivered(self: *Session) void {
+        self.program_end_delivered = true;
+    }
+
+    /// Whether a call reported the end of the session's last program.
+    pub fn programEndDelivered(self: *const Session) bool {
+        return self.program_end_delivered;
+    }
+
+    /// The folder a program's `$FX_OUT` names when its host gives none: `out/` in
+    /// the session folder. It is made 0700 on the first call, and removing the
+    /// session folder removes it. The caller owns the result.
+    pub fn outFolder(self: *const Session, io: std.Io, alloc: std.mem.Allocator) ![]u8 {
+        const dir = self.dir orelse return error.SessionNotPrepared;
+        const path = try alloc.print("{s}/out", .{dir});
+        errdefer alloc.free(path);
+        std.Io.Dir.cwd().createDir(io, path, .fromMode(0o700)) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        return path;
     }
 
     /// The folder the next program starts in, or null for the workspace root.
@@ -1036,6 +1064,27 @@ test "the script quotes the session folder, keeps the header, and installs the s
     try std.testing.expectEqualStrings("__fx_status='/tmp/a'\\''b/save-status'", lines.next().?);
     try std.testing.expect(std.mem.find(u8, script, "trap '{ __fx_save; } 2>/dev/null' EXIT\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, script, "\\builtin trap '{ __fx_save; } 2>/dev/null' EXIT\n"));
+}
+
+test "the no-save folder is out/ in the session folder, made on first use, and removed with it" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    var session = Session.init(alloc);
+    defer _ = session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables, test_fx_binary);
+    const out = try session.outFolder(io, alloc);
+    defer alloc.free(out);
+    const want = try alloc.print("{s}/out", .{session.dir.?});
+    defer alloc.free(want);
+    try std.testing.expectEqualStrings(want, out);
+    var made = try std.Io.Dir.cwd().openDir(io, out, .{});
+    made.close(io);
+    _ = session.deinit(io);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openDir(io, out, .{}));
 }
 
 test "the bash script keeps the reviewed bytes" {

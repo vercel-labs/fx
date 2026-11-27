@@ -1,0 +1,50 @@
+[
+  {
+    "id": "number-from-index",
+    "breaks": "The next number ignores the result files, so after fx stops between a file and its index line the next number is taken. The save refuses it and the retry gets the same number, so the result is not saved (result_files.zig nextNumber, publish).",
+    "file": "src/core/session/result_files.zig",
+    "find": "if (parseResultFileNumber(entry.name)) |n| {\n                max_n = @max(max_n, n);",
+    "replace": "if (parseResultFileNumber(entry.name)) |n| {\n                _ = n;",
+    "expect": "ConformsToSpec"
+  },
+  {
+    "id": "overwrite",
+    "breaks": "The next number is the highest one in use, so a save asks for a number that is taken. The save refuses it, and the retry asks for the same number, so the result is not saved (result_files.zig nextNumber, publish).",
+    "file": "src/core/session/result_files.zig",
+    "find": "return std.math.add(u64, max_n, 1);",
+    "replace": "return @max(max_n, 1);",
+    "expect": "ConformsToSpec"
+  },
+  {
+    "id": "index-before-file",
+    "breaks": "A save that keeps the whole output reports a file that was never written, so its index line names a file that is not there (result_files.zig save, the branch without a cut).",
+    "file": "src/core/session/result_files.zig",
+    "find": "            try writeSlicesNew(self.alloc, &self.dir, file_name, &slices);\n            return .{ .saved = .{",
+    "replace": "            _ = slices;\n            return .{ .saved = .{",
+    "expect": "IndexNamesFile"
+  },
+  {
+    "id": "silent-full",
+    "breaks": "A result whose output finds no room is not saved, and its text drops the notice that says so (bash_results.zig writeHeader).",
+    "file": "src/core/bash_results/bash_results.zig",
+    "find": "        .not_saved_full => try w.writeAll(\"not saved: the results folder is full\"),",
+    "replace": "        .not_saved_full => {},",
+    "expect": "FullNoticed"
+  },
+  {
+    "id": "index-drops-rows",
+    "breaks": "An index append rewrites index.tsv with only the new row, so the earlier rows are lost (result_files.zig appendIndex).",
+    "file": "src/core/session/result_files.zig",
+    "find": "if (bytes.len == 0) index_header else bytes",
+    "replace": "if (bytes.len == 0) index_header else index_header",
+    "expect": "StoreAppendOnly"
+  },
+  {
+    "id": "silent-index",
+    "breaks": "A result whose index line cannot be written is shown with its file but no notice that the line is missing (bash_results.zig writeIndexMissing).",
+    "file": "src/core/bash_results/bash_results.zig",
+    "find": "        .file => |number| try w.print(\"[the index line for this result was not written; the file is still {s}/{d}.txt]\", .{ shown_folder, number }),",
+    "replace": "        .file => |number| {\n            _ = number;\n        },",
+    "expect": "SavedBeforeShown"
+  }
+]

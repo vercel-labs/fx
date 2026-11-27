@@ -726,6 +726,7 @@ const AcpContext = struct {
             .terminal_client = &self.state.terminal_client,
             .managed_executions = &self.state.managed_executions,
             .bash_session = &self.state.bash_session,
+            .bash_results_folder = if (session.v2) |v2| .{ .context = v2, .resolve = session_adapter.Session.resolveBashResults } else null,
             .ephemeral_command_replay = self.state.managed_executions.replayStore(),
             .web_fetch_runtime = &self.state.web_fetch_runtime,
             .web_fetch_artifact_store = session.session_rt.webFetchArtifactStore(),
