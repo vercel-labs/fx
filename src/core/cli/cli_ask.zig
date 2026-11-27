@@ -3643,7 +3643,6 @@ fn pushCommandOutputComplete(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId) !vo
 fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.failed = true;
-    if (ctx.typed_error_code == null) ctx.typed_error_code = "ModelError";
     const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
     ctx.auth_failure = auth_failure;
     const message = if (auth_failure) |failure|

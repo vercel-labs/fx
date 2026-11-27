@@ -14114,17 +14114,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const elapsedMs = Date.now() - started;
 
       expect(result.timedOut).toBe(false);
-      expect(result.code).not.toBe(0);
+      expect(result.code).toBe(1);
       expect(elapsedMs).toBeLessThan(6_000);
       const json = parseAskJson(result.stdout);
-      expect(json.exit_code).not.toBe(0);
-      expect(typeof json.error).toBe("string");
-      expect(json.error!.length).toBeGreaterThan(0);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBeUndefined();
       expect(json.recovery).toEqual({
         state: "failed",
         attempt: 2,
         cause: "server",
       });
+      expect(result.stderr).toContain("fx ask: API request failed · HTTP 503 · provider temporarily unavailable");
       expect(gateway.requestCount()).toBe(2);
     } finally {
       gateway.stop();
@@ -14152,14 +14152,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const elapsedMs = Date.now() - started;
 
       expect(result.timedOut).toBe(false);
-      expect(result.code).not.toBe(0);
+      expect(result.code).toBe(1);
       expect(elapsedMs).toBeLessThan(6_000);
       const json = parseAskJson(result.stdout);
-      expect(json.exit_code).not.toBe(0);
+      expect(json.exit_code).toBe(1);
       expect(json.error).toBe("ModelError");
       expect(json.recovery?.state).toBe("failed");
       expect(json.recovery?.cause).toBe("server");
       expect(json.recovery?.attempt).toBe(2);
+      expect(result.stderr).toContain("[notice] ⚠ Provider unavailable · provider_error: always broken provider · stopped after 2 attempts");
       expect(gateway.requestCount()).toBe(2);
     } finally {
       gateway.stop();
