@@ -77,7 +77,9 @@ Remove(s, m) == SelectSeq(s, LAMBDA x : x # m)
 NoAnswer == [kind |-> "none", stop |-> "", delivery |-> "", code |-> 0]
 Ok(stop, delivery) == [kind |-> "ok", stop |-> stop, delivery |-> delivery, code |-> 0]
 Err(code) == [kind |-> "err", stop |-> "", delivery |-> "", code |-> code]
-NoTurn == [owner |-> "none", ctx |-> {}, group |-> {}]
+\* direct: a prompt sent while no turn ran started this turn, so its owner's
+\* answer has no delivery result.
+NoTurn == [owner |-> "none", ctx |-> {}, group |-> {}, direct |-> FALSE]
 
 \* The delivery of an answer that carries no sh.fx/delivery result: the answer
 \* of a prompt that starts its own turn, and of a prompt that is not a steer.
@@ -132,7 +134,7 @@ StartNext ==
              LET group == IF Rules THEN Range(late) ELSE {Head(late)} IN
              /\ running' = TRUE
              /\ phase' = "gen"
-             /\ cur' = [owner |-> Head(late), ctx |-> group, group |-> group]
+             /\ cur' = [owner |-> Head(late), ctx |-> group, group |-> group, direct |-> FALSE]
              /\ late' = IF Rules THEN <<>> ELSE Tail(late)
              /\ placed' = Place(group)
              /\ started' = Append(started, Head(late))
@@ -140,7 +142,7 @@ StartNext ==
       [] queue # <<>> ->
              /\ running' = TRUE
              /\ phase' = "gen"
-             /\ cur' = [owner |-> Head(queue), ctx |-> {Head(queue)}, group |-> {}]
+             /\ cur' = [owner |-> Head(queue), ctx |-> {Head(queue)}, group |-> {}, direct |-> FALSE]
              /\ queue' = Tail(queue)
              /\ placed' = Place({Head(queue)})
              /\ started' = Append(started, Head(queue))
@@ -159,7 +161,7 @@ Send(m) ==
        THEN \* Any prompt starts a turn when none runs.
             /\ running' = TRUE
             /\ phase' = "gen"
-            /\ cur' = [owner |-> m, ctx |-> {m}, group |-> {}]
+            /\ cur' = [owner |-> m, ctx |-> {m}, group |-> {}, direct |-> TRUE]
             /\ placed' = Place({m})
             /\ started' = Append(started, m)
             /\ UNCHANGED <<waiting, late, queue, answers>>
@@ -259,7 +261,7 @@ Cancel ==
             /\ CASE handed # <<>> ->
                         /\ running' = TRUE
                         /\ phase' = "gen"
-                        /\ cur' = [owner |-> Head(handed), ctx |-> Range(handed), group |-> Range(handed)]
+                        /\ cur' = [owner |-> Head(handed), ctx |-> Range(handed), group |-> Range(handed), direct |-> FALSE]
                         /\ late' = <<>>
                         /\ placed' = Place(Range(handed))
                         /\ started' = Append(started, Head(handed))
@@ -267,7 +269,7 @@ Cancel ==
                  [] queue # <<>> ->
                         /\ running' = TRUE
                         /\ phase' = "gen"
-                        /\ cur' = [owner |-> Head(queue), ctx |-> {Head(queue)}, group |-> {}]
+                        /\ cur' = [owner |-> Head(queue), ctx |-> {Head(queue)}, group |-> {}, direct |-> FALSE]
                         /\ queue' = Tail(queue)
                         /\ placed' = Place({Head(queue)})
                         /\ started' = Append(started, Head(queue))
@@ -301,6 +303,7 @@ Close ==
     /\ closed' = TRUE
     /\ answers' = [m \in Msgs |->
             IF running /\ m \in cur.ctx THEN Ok("cancelled", Delivery(cur, m))
+            \* Today fx refuses a late steer (libfx_steering.zig:398, :444), so this Ok is not fx's answer.
             ELSE IF m \in Range(waiting) \cup Range(late) \cup Range(queue)
             THEN (IF Rules THEN Err(-32800) ELSE Ok("cancelled", "dropped"))
             ELSE answers[m]]
@@ -353,6 +356,13 @@ DeliveryValues == \A m \in Msgs : answers[m].delivery \in {"", NoDelivery, "abso
 \* A steer is answered absorbed only after a model request held it.
 AbsorbedAfterRequest == \A m \in Msgs : answers[m].delivery = "absorbed" => placed[m] >= 1
 
+\* A prompt that starts its own turn, because none ran when it arrived, gets the
+\* normal answer of that turn with no delivery result.
+OwnerHasNoDelivery ==
+    [][(running /\ cur.direct) =>
+        ((answers[cur.owner].kind = "none" /\ answers'[cur.owner].kind # "none")
+         => answers'[cur.owner].delivery = NoDelivery)]_vars
+
 \* Queued prompts start their turns in the order fx received them.
 SentIndex(m) == CHOOSE k \in DOMAIN sent : sent[k] = m
 QueuedInOrder ==
@@ -372,10 +382,13 @@ ImageSteerRefused ==
     [][(running /\ "I" \in Msgs /\ "I" \notin Range(sent) /\ "I" \in Range(sent')) =>
            answers'["I"] = Err(-32602)]_vars
 
-\* A steer or queued prompt that leaves the pending lists without running is
-\* answered -32800. Only $/cancel_request and session/close take it out so.
+\* A steer or queued prompt that $/cancel_request or session/close takes out of
+\* the pending lists without running it is answered -32800. Other steps are not
+\* checked here: today a steer that arrives as the turn finishes fails with
+\* -32600 (StopInput), which AcpPromptDeliveryToday-withdraw does not check.
 PendingRefused ==
-    [][\A m \in Msgs :
+    [][((\E m \in Msgs : Withdraw(m)) \/ Close) =>
+        \A m \in Msgs :
         ((m \in Range(waiting) \cup Range(late) \cup Range(queue))
          /\ m \notin Range(waiting') \cup Range(late') \cup Range(queue')
          /\ m \notin cur'.ctx

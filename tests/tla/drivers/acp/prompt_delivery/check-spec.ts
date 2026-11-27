@@ -101,6 +101,13 @@ const MUTANTS: Mutant[] = [
     expect: "AnsweredOnce",
   },
   {
+    id: "owner-absorbed",
+    note: "a steer that starts its own turn is answered absorbed, not with no delivery result",
+    from: `    ELSE IF m = t.owner \\/ Kind(m) # "steer" THEN NoDelivery`,
+    to: `    ELSE IF Kind(m) # "steer" THEN NoDelivery`,
+    expect: "OwnerHasNoDelivery",
+  },
+  {
     id: "image-steer-waits",
     note: "a steer with an image waits like a text steer",
     from: `              [] m = "I" ->`,
@@ -111,7 +118,7 @@ const MUTANTS: Mutant[] = [
 ];
 
 const SPEC_FILES = ["AcpPromptDelivery.tla", "MCAcpPromptDelivery.tla", "MCAcpPromptDelivery.cfg", "MCAcpPromptDeliveryRefusals.cfg"];
-const ACTION_PROPERTIES = new Set(["AnsweredOnce", "ReplyEndContinues", "LateRunTogether", "ImageSteerRefused", "PendingRefused"]);
+const ACTION_PROPERTIES = new Set(["AnsweredOnce", "ReplyEndContinues", "LateRunTogether", "ImageSteerRefused", "PendingRefused", "OwnerHasNoDelivery"]);
 
 /// Checks a mutant against its target property alone, so a kill shows that
 /// property catches the mistake whichever one TLC would check first.
