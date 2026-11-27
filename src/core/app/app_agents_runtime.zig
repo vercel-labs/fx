@@ -2270,9 +2270,30 @@ pub fn Runtime(comptime App: type) type {
                 std.mem.print(buf, "{s} finished", .{name}) catch "";
         }
 
-        pub fn menuActive(app: *App) bool {
+        pub fn menuActive(app: *const App) bool {
             if (comptime !@hasField(App, "instances")) return false;
             return app.instances.agents_menu.open;
+        }
+
+        pub fn anyStashedDraft(app: *const App) bool {
+            if (comptime @hasField(App, "instances")) {
+                if (app.instances.agents_menu.draft) |*draft| {
+                    if (draft.hasDraft()) return true;
+                }
+            }
+            if (comptime @hasField(App, "main_screen")) {
+                if (app.main_screen.draft.hasDraft()) return true;
+            }
+            if (comptime @hasField(App, "child_agents")) {
+                for (app.child_agents.items) |child| {
+                    if (comptime @hasField(@TypeOf(child.*), "screen")) {
+                        if (child.screen.draft.hasDraft()) return true;
+                    }
+                    if (child.agent.pending_images.items.len > 0) return true;
+                    if (child.agent.submission.pending != null) return true;
+                }
+            }
+            return false;
         }
 
         /// Opens the agent list on the agent on screen, which Esc and Ctrl+X

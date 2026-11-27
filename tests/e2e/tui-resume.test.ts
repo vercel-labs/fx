@@ -19,6 +19,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  watch,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8740,6 +8741,116 @@ test.skipIf(!tmuxAvailable())(
       active = null;
     } finally {
       releaseTurn();
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "idle update auto-restart holds while Ctrl+P model picker is open and keeps the stashed draft",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-auto-picker-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const gateway = startFakeGateway([]);
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "100",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendLiteralText("PICKER_DRAFT");
+      await active.waitForPane((pane) => composerContains(pane, "PICKER_DRAFT"), TIMEOUT);
+      await active.sendKeys("C-p");
+      await active.waitForPane((pane) => pane.includes("Models") && !composerContains(pane, "PICKER_DRAFT"), TIMEOUT);
+
+      // Wait on a directory watch signal until auto-upgrade installs the new binary while the picker stays open.
+      if (statSync(installedFx).size >= 1024 * 1024) {
+        const installed = signal();
+        const deadline = AbortSignal.timeout(UPGRADE_TIMEOUT);
+        const onAbort = () => installed.fire();
+        deadline.addEventListener("abort", onAbort, { once: true });
+        const watcher = watch(installDir, () => {
+          if (statSync(installedFx).size < 1024 * 1024) installed.fire();
+        });
+        try {
+          if (statSync(installedFx).size < 1024 * 1024) installed.fire();
+          await installed.fired;
+        } finally {
+          deadline.removeEventListener("abort", onAbort);
+          watcher.close();
+        }
+        if (statSync(installedFx).size >= 1024 * 1024) {
+          throw new Error("Timed out waiting for background upgrade install while picker was open");
+        }
+      }
+      await active.waitForStableScrollback(
+        (scrollback) => scrollback.includes("Models") && !composerContains(scrollback, "PICKER_DRAFT"),
+        TIMEOUT,
+        300,
+      );
+      expect(relaunched()).toBe(false);
+      expect(await active.capturePane()).toContain("Models");
+
+      // Closing the picker restores the draft to the composer, which keeps holding the restart.
+      await active.sendKeys("Escape");
+      await active.waitForPane(
+        (pane) => composerContains(pane, "PICKER_DRAFT") && pane.includes("update ready: ctrl+g to reload"),
+        TIMEOUT,
+      );
+      await active.waitForStableScrollback(
+        (scrollback) => composerContains(scrollback, "PICKER_DRAFT") && scrollback.includes("update ready: ctrl+g to reload"),
+        TIMEOUT,
+        300,
+      );
+      expect(relaunched()).toBe(false);
+
+      const version = (await runFx(["--version"])).stdout.trim();
+      await active.sendKeys(Array.from({ length: "PICKER_DRAFT".length }, () => "BSpace").join(" "));
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, UPGRADE_TIMEOUT);
+      expect(relaunched()).toBe(true);
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
       if (active) {
         try {
           await active.sendText("/quit");

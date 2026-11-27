@@ -104,6 +104,26 @@ pub const Runtime = struct {
         return true;
     }
 
+    pub fn hasActiveMenu(self: *const Runtime) bool {
+        return self.help_menu.active or
+            self.settings_menu.active or
+            self.statusline_menu.active or
+            self.info_panel.active or
+            self.effort_menu.active or
+            self.usage_menu.active or
+            self.workspace_menu.active;
+    }
+
+    pub fn hasStashedDraft(self: *const Runtime) bool {
+        if (self.model_picker_draft) |*draft| {
+            if (draft.hasDraft()) return true;
+        }
+        if (self.card_model_picker_draft) |*draft| {
+            if (draft.hasDraft()) return true;
+        }
+        return false;
+    }
+
     pub fn composerStashView(self: *Runtime) composer_stash.State.ComposerView {
         return .{
             .edit = &self.edit_state,

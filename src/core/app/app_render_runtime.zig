@@ -2139,6 +2139,34 @@ pub fn Runtime(comptime App: type) type {
             return modelMenuActive(app) and !settingsMenuActive(app);
         }
 
+        pub fn anyMenuOrPickerActive(app: *const App, agent: *const AppAgent) bool {
+            if (shownTrustPrompt(app) != null) return true;
+            if (comptime @hasField(App, "input_runtime")) {
+                if (comptime @hasDecl(@FieldType(App, "input_runtime"), "hasActiveMenu")) {
+                    if (app.input_runtime.hasActiveMenu()) return true;
+                } else {
+                    if (helpMenuActive(app) or effortMenuActive(app) or settingsMenuActive(app)) return true;
+                }
+            }
+            if (modelMenuActive(app) or
+                skillsMenuActive(app) or
+                sessionMenuActive(app, agent) or
+                forkMenuActive(app, agent) or
+                agentsMenuActive(app))
+            {
+                return true;
+            }
+            if (comptime @hasField(App, "mcp")) {
+                if (app.mcp.host_menu.active) return true;
+            }
+            if (comptime @hasField(App, "auth")) {
+                if (comptime @hasDecl(@FieldType(App, "auth"), "pickerView")) {
+                    if (app.auth.pickerView().active) return true;
+                }
+            }
+            return false;
+        }
+
         fn activityProjection(app: *const App) activity_runtime.ActivityProjection {
             return shell_runtime.activityProjection(&app.shell);
         }

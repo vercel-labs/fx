@@ -729,6 +729,14 @@ const App = struct {
         return self.screen_owner orelse &self.main_agent;
     }
 
+    pub fn anyMenuOrPickerActive(self: *const Self, agent: *const agents.Agent) bool {
+        return RenderAppRuntime.anyMenuOrPickerActive(self, agent);
+    }
+
+    pub fn anyDraftNonEmpty(self: *const Self, agent: *const agents.Agent) bool {
+        return UpgradeAppRuntime.anyDraftNonEmpty(self, agent);
+    }
+
     pub fn init(
         alloc: Allocator,
         launch: *cli_surface.InteractiveLaunch,

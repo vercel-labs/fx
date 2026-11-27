@@ -58,6 +58,10 @@ pub const State = struct {
         self.* = .{};
     }
 
+    pub fn hasDraft(self: *const State) bool {
+        return self.edit.input.items.len > 0;
+    }
+
     pub fn deinit(self: *State, alloc: Allocator) void {
         self.edit.deinit(alloc);
         self.entities.deinit(alloc);

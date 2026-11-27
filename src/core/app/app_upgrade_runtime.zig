@@ -2,13 +2,16 @@ const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
+const app_render_runtime = @import("app_render_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const upgrade_helpers = @import("../upgrade/upgrade_helpers.zig");
-const editor_state = @import("../input/editor_state.zig");
+const composer_stash = @import("../input/composer_stash.zig");
+const core_input_runtime = @import("../input/runtime.zig");
 const paste_framing = @import("../input/paste_framing.zig");
+const workspace_trust = @import("../workspace_trust/workspace_trust.zig");
 
 pub const ApplyOutcome = enum {
     not_ready,
@@ -176,7 +179,7 @@ pub fn Runtime(comptime App: type) type {
         /// or another instance (`submission.pending`, every phase): it waits
         /// for a frame, for sign-in, or for the worker to take it, and lives
         /// only in memory until then.
-        fn submissionPending(app: *App) bool {
+        fn submissionPending(app: *const App) bool {
             if (comptime !agents.hasAgentField(App, "submission")) return false;
             if (app.main_agent.submission.pending != null) return true;
             if (comptime @hasField(App, "child_agents")) {
@@ -440,6 +443,28 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        pub fn anyDraftNonEmpty(app: *const App, agent: *const AppAgent) bool {
+            if (comptime @hasField(App, "input_runtime")) {
+                if (app.input_runtime.paste.active()) return true;
+                if (app.input_runtime.edit_state.input.items.len > 0) return true;
+                if (comptime @hasDecl(@FieldType(App, "input_runtime"), "hasStashedDraft")) {
+                    if (app.input_runtime.hasStashedDraft()) return true;
+                }
+            }
+            if (comptime agents.hasAgentField(App, "pending_images")) {
+                if (agent.pending_images.items.len > 0) return true;
+            }
+            if (submissionPending(app)) return true;
+            return app_agents_runtime.Runtime(App).anyStashedDraft(app);
+        }
+
+        fn menuOrPickerActive(app: *const App, agent: *const AppAgent) bool {
+            if (comptime @hasDecl(App, "anyMenuOrPickerActive")) {
+                return app.anyMenuOrPickerActive(agent);
+            }
+            return app_render_runtime.Runtime(App).anyMenuOrPickerActive(app, agent);
+        }
+
         fn isIdleForAutoRestart(
             app: *App,
             agent: *AppAgent,
@@ -470,6 +495,8 @@ pub fn Runtime(comptime App: type) type {
                 if (agent.stream.active) return false;
             }
             if (upgradeUnavailableNotice(app, agent) != null) return false;
+            if (anyDraftNonEmpty(app, agent)) return false;
+            if (menuOrPickerActive(app, agent)) return false;
             if (comptime @hasDecl(App, "needsUserElsewhere")) {
                 var name_buf: [32]u8 = undefined;
                 if (app.needsUserElsewhere(&name_buf) != null) return false;
@@ -571,11 +598,6 @@ const TestWorker = struct {
     }
 };
 
-const TestInputRuntime = struct {
-    edit_state: editor_state.State = .{},
-    paste: paste_framing.State = .{},
-};
-
 const TestTerminalInputRuntime = struct {
     terminal_action_pending: bool = false,
 
@@ -606,6 +628,12 @@ const TestToggle = struct {
 
 const TestSessionPersistence = struct {
     session_picker: struct { active: bool = false } = .{},
+    fork_menu: struct {
+        active_flag: bool = false,
+        pub fn active(self: *const @This()) bool {
+            return self.active_flag;
+        }
+    } = .{},
 };
 
 const TestManagedExecutions = struct {
@@ -618,9 +646,14 @@ const TestManagedExecutions = struct {
 
 const TestAuth = struct {
     api_key_entry: bool = false,
+    picker_active: bool = false,
 
     pub fn apiKeyEntryActive(self: *const TestAuth) bool {
         return self.api_key_entry;
+    }
+
+    pub fn pickerView(self: *const TestAuth) struct { active: bool = false } {
+        return .{ .active = self.picker_active };
     }
 };
 
@@ -662,8 +695,13 @@ const TestAgent = struct {
     upgrade_handoff: bool = false,
 };
 
+const TestScreenSlot = struct {
+    draft: composer_stash.State = .{},
+};
+
 const TestChild = struct {
     agent: TestAgent = .{},
+    screen: TestScreenSlot = .{},
 };
 
 const TestApp = struct {
@@ -672,8 +710,24 @@ const TestApp = struct {
     upgrader: TestUpgrader = .{},
     main_agent: TestAgent = .{},
     child_agents: std.ArrayList(*TestChild) = .empty,
-    input_runtime: TestInputRuntime = .{},
+    main_screen: TestScreenSlot = .{},
+    instances: struct {
+        agents_menu: struct {
+            open: bool = false,
+            draft: ?composer_stash.State = null,
+        } = .{},
+    } = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
     terminal_input_runtime: TestTerminalInputRuntime = .{},
+    trust: struct { prompt: ?workspace_trust.prompt.Prompt = null } = .{},
+    model_cache: struct { menu: struct { active: bool = false } = .{} } = .{},
+    skills: struct {
+        active: bool = false,
+        pub fn menuVisible(self: *const @This()) bool {
+            return self.active;
+        }
+    } = .{},
+    mcp: struct { host_menu: struct { active: bool = false } = .{} } = .{},
     auth: TestAuth = .{},
     subagents: TestSubagents = .{},
     terminal: TestTerminal = .{},
@@ -705,10 +759,14 @@ const TestApp = struct {
     cancel_handoff_count: usize = 0,
 
     fn deinit(self: *TestApp) void {
-        self.input_runtime.edit_state.deinit(self.alloc);
-        self.input_runtime.paste.deinit(self.alloc);
+        self.input_runtime.deinit(self.alloc);
+        self.main_screen.draft.deinit(self.alloc);
+        if (self.instances.agents_menu.draft) |*draft| draft.deinit(self.alloc);
         self.main_agent.pending_images.deinit(self.alloc);
-        for (self.child_agents.items) |child| child.agent.pending_images.deinit(self.alloc);
+        for (self.child_agents.items) |child| {
+            child.agent.pending_images.deinit(self.alloc);
+            child.screen.draft.deinit(self.alloc);
+        }
         self.notices.deinit(self.alloc);
         self.child_agents.deinit(self.alloc);
     }
@@ -1768,4 +1826,270 @@ test "app_upgrade_runtime auto-restart holds while an instance turn runs" {
             target.turn_running = false;
         }
     }.clear);
+}
+
+fn captureStashText(alloc: std.mem.Allocator, text: []const u8) !composer_stash.State {
+    var temp = core_input_runtime.Runtime{};
+    defer temp.deinit(alloc);
+    try temp.edit_state.input.appendSlice(alloc, text);
+    return composer_stash.State.capture(temp.composerStashView());
+}
+
+test "app_upgrade_runtime auto-restart holds while any menu, picker, or catalog is active" {
+    const cases = [_]struct {
+        open: *const fn (*TestApp) void,
+        close: *const fn (*TestApp) void,
+    }{
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.help_menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.help_menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.settings_menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.settings_menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.statusline_menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.statusline_menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.info_panel.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.info_panel.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.effort_menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.effort_menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.usage_menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.usage_menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.workspace_menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.input_runtime.workspace_menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.model_cache.menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.model_cache.menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.skills.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.skills.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.main_agent.session_persistence.session_picker.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.main_agent.session_persistence.session_picker.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.main_agent.session_persistence.fork_menu.active_flag = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.main_agent.session_persistence.fork_menu.active_flag = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.instances.agents_menu.open = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.instances.agents_menu.open = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.mcp.host_menu.active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.mcp.host_menu.active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.auth.picker_active = true;
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.auth.picker_active = false;
+                }
+            }.f,
+        },
+        .{
+            .open = struct {
+                fn f(a: *TestApp) void {
+                    a.trust.prompt = .{ .folder = "/tmp/workspace", .cover = .this_folder };
+                }
+            }.f,
+            .close = struct {
+                fn f(a: *TestApp) void {
+                    a.trust.prompt = null;
+                }
+            }.f,
+        },
+    };
+    for (cases) |case| {
+        var app = TestApp{ .alloc = std.testing.allocator };
+        defer app.deinit();
+        app.upgrader.state = .ready;
+        case.open(&app);
+        try expectAutoRestartHeldUntilCleared(&app, case.close);
+    }
+}
+
+test "app_upgrade_runtime auto-restart holds while any stashed or off-screen draft is non-empty" {
+    const alloc = std.testing.allocator;
+    {
+        var app = TestApp{ .alloc = alloc };
+        defer app.deinit();
+        app.upgrader.state = .ready;
+        app.input_runtime.model_picker_draft = try captureStashText(alloc, "ctrl+p draft");
+        try expectAutoRestartHeldUntilCleared(&app, struct {
+            fn clear(a: *TestApp) void {
+                if (a.input_runtime.model_picker_draft) |*d| d.deinit(a.alloc);
+                a.input_runtime.model_picker_draft = null;
+            }
+        }.clear);
+    }
+    {
+        var app = TestApp{ .alloc = alloc };
+        defer app.deinit();
+        app.upgrader.state = .ready;
+        app.input_runtime.card_model_picker_draft = try captureStashText(alloc, "card picker draft");
+        try expectAutoRestartHeldUntilCleared(&app, struct {
+            fn clear(a: *TestApp) void {
+                if (a.input_runtime.card_model_picker_draft) |*d| d.deinit(a.alloc);
+                a.input_runtime.card_model_picker_draft = null;
+            }
+        }.clear);
+    }
+    {
+        var app = TestApp{ .alloc = alloc };
+        defer app.deinit();
+        app.upgrader.state = .ready;
+        app.instances.agents_menu.draft = try captureStashText(alloc, "agents menu draft");
+        try expectAutoRestartHeldUntilCleared(&app, struct {
+            fn clear(a: *TestApp) void {
+                if (a.instances.agents_menu.draft) |*d| d.deinit(a.alloc);
+                a.instances.agents_menu.draft = null;
+            }
+        }.clear);
+    }
+    {
+        var app = TestApp{ .alloc = alloc };
+        defer app.deinit();
+        app.upgrader.state = .ready;
+        app.main_screen.draft = try captureStashText(alloc, "main off-screen draft");
+        try expectAutoRestartHeldUntilCleared(&app, struct {
+            fn clear(a: *TestApp) void {
+                a.main_screen.draft.deinit(a.alloc);
+            }
+        }.clear);
+    }
+    {
+        var app = TestApp{ .alloc = alloc };
+        defer app.deinit();
+        app.upgrader.state = .ready;
+        var child = TestChild{};
+        child.screen.draft = try captureStashText(alloc, "child off-screen draft");
+        try app.child_agents.append(alloc, &child);
+        try expectAutoRestartHeldUntilCleared(&app, struct {
+            fn clear(a: *TestApp) void {
+                a.child_agents.items[0].screen.draft.deinit(a.alloc);
+            }
+        }.clear);
+    }
 }
