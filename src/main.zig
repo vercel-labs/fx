@@ -1483,7 +1483,7 @@ const App = struct {
         author: types.MessageAuthor,
     ) !bool {
         try AgentAppRuntime.refreshProjectContext(self, agent);
-        if (author == .user) self.noteModelCatalogActivity();
+        self.noteModelCatalogActivity();
         agent.session.setConversationLanguageFromUserMessage(prompt);
 
         debug_trace.logf(
@@ -9060,6 +9060,7 @@ test "subagent first prompt from main queues .parent and saves an author item in
     defer fixture.deinit();
     const app = &fixture.app;
     app.context_enabled = false;
+    app.provider_selection.model_requests_blocked = true;
     defer {
         app.model_cache.deinit();
         app.token_pass_check.deinit();
