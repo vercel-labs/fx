@@ -1640,6 +1640,12 @@ export class TmuxSession {
     rmSync(this.exitStatusPath, { force: true });
   }
 
+  /// Closes the session's pane, as a closed terminal window does: tmux hangs
+  /// up the pane's program.
+  killPane(): void {
+    execFileSync("tmux", this.tmuxArgs(["kill-pane", "-t", this.name]), { stdio: "pipe" });
+  }
+
   /// The fx process's exit status once the pane has ended, or null.
   recordedExitStatus(): number | null {
     try {
