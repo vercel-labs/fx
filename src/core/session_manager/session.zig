@@ -1307,6 +1307,7 @@ fn acquireLock(env: *const Env, lock: storage.File, wait_ms: u64) OpenError!void
     const wait: lock_wait.Wait = .{ .budget_ms = wait_ms, .retry_ms = session_lock_retry_ms };
     const started = std.Io.Timestamp.now(io, .awake);
     var sleeps: u64 = 0;
+    // flock has no timed wait, so the wait polls a non-blocking try between short sleeps.
     while (true) : (sleeps += 1) {
         if (env.s.tryLock(lock) catch |io_err| return storage.ioFault(io_err)) return;
         const elapsed_ms = lock_wait.elapsedMs(started, std.Io.Timestamp.now(io, .awake));

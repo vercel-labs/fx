@@ -2013,8 +2013,9 @@ const api_tests = struct {
 
     /// `io` with sleeps that return at once and move a fake monotonic clock
     /// `factor` times as far as they asked, as a loaded machine or a
-    /// background process stretches every sleep. The copied vtable and the
-    /// clock are process storage, so one test uses it at a time.
+    /// background process stretches every sleep. It never waits in real time
+    /// (`RULES.md` R7.3). The copied vtable and the clock are process
+    /// storage, so one test uses it at a time.
     const SlowSleeps = struct {
         var vtable: std.Io.VTable = undefined;
         var awake_ns: i96 = 0;
@@ -2027,7 +2028,7 @@ const api_tests = struct {
         fn wrap(sleep_factor: i96) std.Io {
             vtable = io.vtable.*;
             vtable.now = now;
-            vtable.sleep = sleep;
+            vtable.sleep = fakeSleep;
             factor = sleep_factor;
             restart();
             return .{ .userdata = io.userdata, .vtable = &vtable };
@@ -2038,14 +2039,16 @@ const api_tests = struct {
             return io.vtable.now(userdata, clock);
         }
 
-        fn sleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+        fn fakeSleep(_: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
             switch (timeout) {
                 .duration => |duration| {
                     sleeps += 1;
                     if (sleeps > max_sleeps) return error.Canceled;
                     awake_ns += duration.raw.nanoseconds * factor;
                 },
-                .none, .deadline => return io.vtable.sleep(userdata, timeout),
+                // The lock waits sleep only for a duration; any other sleep is
+                // canceled, which ends the wait early and fails its test.
+                .none, .deadline => return error.Canceled,
             }
         }
 

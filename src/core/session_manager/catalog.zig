@@ -569,6 +569,7 @@ pub const Catalog = struct {
         const wait: lock_wait.Wait = .{ .budget_ms = env.options.lock_wait_ms, .retry_ms = index_lock_retry_ms };
         const started = std.Io.Timestamp.now(s.io, .awake);
         var sleeps: u64 = 0;
+        // flock has no timed wait, so the wait polls a non-blocking try between short sleeps.
         while (!(s.tryLock(file) catch |io_err| return storage.ioFault(io_err))) : (sleeps += 1) {
             const elapsed_ms = lock_wait.elapsedMs(started, std.Io.Timestamp.now(s.io, .awake));
             switch (lock_wait.afterFailedTry(wait, elapsed_ms, sleeps)) {
