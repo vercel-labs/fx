@@ -2022,7 +2022,6 @@ const Session = struct {
     /// the liveness pipe also makes the launcher kill the process group if
     /// the signal missed it.
     fn killForExit(self: *Session) void {
-        if (builtin.is_test) if (test_before_exit_kill) |hook| hook(self.id);
         if (self.isLive()) {
             _ = self.killTerminal();
             self.markLost();
@@ -2032,6 +2031,7 @@ const Session = struct {
             tree.deinit();
             self.exit_tree = null;
         }
+        if (builtin.is_test) if (test_before_session_end) |hook| hook(self.id);
         self.endLauncherSession();
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
@@ -4091,9 +4091,10 @@ pub var test_after_exit_record: if (builtin.is_test) ?*const fn (
     launcher_pid: ?std.posix.pid_t,
 ) void else void = if (builtin.is_test) null else {};
 
-/// Test builds only: a test sets it to run code at the start of the exit
-/// close's last step for a terminal, which gets the terminal's id.
-pub var test_before_exit_kill: if (builtin.is_test) ?*const fn (session_id: []const u8) void else void =
+/// Test builds only: a test sets it to run code once the exit close has killed
+/// a terminal's recorded processes and before it ends what is left in the
+/// terminal's session. It gets the terminal's id.
+pub var test_before_session_end: if (builtin.is_test) ?*const fn (session_id: []const u8) void else void =
     if (builtin.is_test) null else {};
 
 /// What happens to a terminal's launcher on the host's side.

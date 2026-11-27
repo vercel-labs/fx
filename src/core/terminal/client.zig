@@ -2013,9 +2013,9 @@ const ExitGate = struct {
     /// The first error a hook met, which the test returns.
     var failure: ?anyerror = null;
     var launcher: ?TestProcess = null;
-    /// Holds the close's last step until the host has decided what to do with
-    /// the ended launcher, so that step cannot run first and hide whether the
-    /// launcher was kept for it.
+    /// Holds the close before it ends the terminal's session until the host
+    /// has decided what to do with the ended launcher, so the close cannot run
+    /// first and hide whether the launcher was kept for it.
     var wait_for_launcher_decision = false;
 
     fn arm(
@@ -2033,12 +2033,12 @@ const ExitGate = struct {
         launcher = null;
         wait_for_launcher_decision = false;
         native_session.test_after_exit_record = &afterRecord;
-        native_session.test_before_exit_kill = &beforeKill;
+        native_session.test_before_session_end = &beforeSessionEnd;
     }
 
     fn disarm() void {
         native_session.test_after_exit_record = null;
-        native_session.test_before_exit_kill = null;
+        native_session.test_before_session_end = null;
         go = null;
         forked = null;
         alive = null;
@@ -2063,7 +2063,7 @@ const ExitGate = struct {
         };
     }
 
-    fn beforeKill(id: []const u8) void {
+    fn beforeSessionEnd(id: []const u8) void {
         if (!wait_for_launcher_decision) return;
         if (!std.mem.eql(u8, id, session_id[0..session_id_len])) return;
         LauncherWatch.waitFor(&LauncherWatch.decided, 15_000) catch |err| {
