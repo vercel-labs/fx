@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
     // Whether this is a libfx artifact, which leaves out what only the fx
     // binary uses, such as its E2E test controls.
     build_options.addOption(bool, "libfx", false);
+    build_options.addOption(bool, "trace_log", true);
     build_options.addOption(bool, "builtin_tools", true);
 
     const fuzz_corpora = readFuzzCorpora(b);
@@ -391,6 +392,8 @@ fn addWasmArtifact(
     wasm_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     wasm_options.addOption(WasmSurface, "wasm_surface", surface);
     wasm_options.addOption(bool, "libfx", true);
+    // A wasm host installs the environment, so `FX_TRACE*` can turn tracing on.
+    wasm_options.addOption(bool, "trace_log", true);
     wasm_options.addOption(bool, "builtin_tools", true);
 
     const wasm_root = switch (surface) {
@@ -438,6 +441,10 @@ fn addNapiArtifact(
     napi_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     napi_options.addOption(NapiSurface, "napi_surface", surface);
     napi_options.addOption(bool, "libfx", true);
+    // The addon never installs an environment, so `FX_TRACE*` cannot reach it
+    // (`sdk/tests/test-native-core-misuse.mjs` holds that), and the trace log
+    // would only add its formatting at every call site.
+    napi_options.addOption(bool, "trace_log", false);
     // libfx agents run only the host's tools, so the addon leaves fx's out.
     napi_options.addOption(bool, "builtin_tools", false);
 
