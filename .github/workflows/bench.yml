@@ -57,8 +57,42 @@ jobs:
           wget -q https://github.com/sharkdp/hyperfine/releases/download/v1.19.0/hyperfine_1.19.0_amd64.deb
           sudo dpkg -i hyperfine_1.19.0_amd64.deb
 
-      - name: Run benchmarks
-        run: ./benchmarks/startup.sh --ci
+      - name: Test the budget checker
+        run: python3 benchmarks/check_budgets_test.py
+
+      - name: Resolve the base commit to compare with
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request) base_sha="$PR_BASE_SHA" ;;
+            push) base_sha="$PUSH_BEFORE_SHA" ;;
+            *)
+              git fetch --no-tags --depth=1 origin main
+              base_sha="$(git rev-parse FETCH_HEAD)" ;;
+          esac
+          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::no base commit for a $EVENT_NAME event"
+            exit 1
+          fi
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Build the base commit's fx in its own folder
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          base_dir="$RUNNER_TEMP/base"
+          mkdir -p "$base_dir"
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git archive "$BASE_SHA" | tar -x -C "$base_dir"
+          cd "$base_dir"
+          zig build -Doptimize=ReleaseSafe
+
+      - name: Run benchmarks, the PR and base binaries in alternating rounds
+        run: ./benchmarks/startup.sh --ci --base-binary "$RUNNER_TEMP/base/zig-out/bin/fx"
 
       - name: Enforce latency budgets
         run: python3 benchmarks/check_budgets.py

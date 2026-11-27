@@ -2,13 +2,15 @@
 #
 # Startup latency benchmarks for fx.
 #
-# Measures wall-clock time for common CLI commands using hyperfine.
-# Results are written to benchmarks/results/ in JSON format for CI consumption.
+# Measures wall-clock time for common CLI commands using hyperfine. Each command
+# runs in rounds. With --base-binary, the base commit's fx and this build take
+# turns in each round on the same host, so benchmarks/check_budgets.py can
+# compare their means. Round results are written to benchmarks/results/rounds/.
 #
 # Usage:
-#   ./benchmarks/startup.sh              # run all benchmarks
-#   ./benchmarks/startup.sh --quick      # fewer iterations (20 runs)
-#   ./benchmarks/startup.sh --ci         # CI settings (100 runs, skip build)
+#   ./benchmarks/startup.sh                                 # this build, 100 runs
+#   ./benchmarks/startup.sh --quick                         # this build, 20 runs
+#   ./benchmarks/startup.sh --ci --base-binary <fx>         # CI: alternate with the base
 #
 # Requires: hyperfine (https://github.com/sharkdp/hyperfine)
 
@@ -17,6 +19,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FX_BIN="${REPO_ROOT}/zig-out/bin/fx"
 RESULTS_DIR="${REPO_ROOT}/benchmarks/results"
+ROUNDS_DIR="${RESULTS_DIR}/rounds"
+ALTERNATING_ROUNDS=5
 SESSION_FIXTURE_ROOT="${TMPDIR:-/tmp}/fx-session-list-benchmark-$$"
 SESSION_FIXTURE_HOME="${SESSION_FIXTURE_ROOT}/home"
 SESSION_FIXTURE_WORKSPACE="${SESSION_FIXTURE_ROOT}/workspace"
@@ -38,11 +42,34 @@ fi
 RUNS=100
 WARMUP=10
 SKIP_BUILD=false
+CI_MODE=false
+BASE_BIN=""
 SHELL_OPTS=(-N)
-case "${1:-}" in
-  --quick)  RUNS=20;  WARMUP=3 ;;
-  --ci)     RUNS=100; WARMUP=10; SKIP_BUILD=true ;;
-esac
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --quick) RUNS=20; WARMUP=3 ;;
+    --ci) RUNS=100; WARMUP=10; SKIP_BUILD=true; CI_MODE=true ;;
+    --base-binary) BASE_BIN="${2:?error: --base-binary needs a path}"; shift ;;
+    *) echo "error: unknown option $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [ "$CI_MODE" = true ] && [ -z "$BASE_BIN" ]; then
+  echo "error: --ci needs --base-binary: the budget compares this build with the base commit" >&2
+  exit 2
+fi
+
+ROUNDS=1
+if [ -n "$BASE_BIN" ]; then
+  if [ ! -x "$BASE_BIN" ]; then
+    echo "error: base binary not found at $BASE_BIN" >&2
+    exit 1
+  fi
+  ROUNDS=$ALTERNATING_ROUNDS
+fi
+ROUND_RUNS=$((RUNS / ROUNDS))
+ROUND_WARMUP=$((WARMUP / ROUNDS))
 
 if [ "$SKIP_BUILD" = false ]; then
   echo "Building fx (ReleaseSafe)..."
@@ -54,8 +81,8 @@ if [ ! -x "$FX_BIN" ]; then
   exit 1
 fi
 
-mkdir -p "$RESULTS_DIR"
-rm -f "${RESULTS_DIR}/tasks.json"
+rm -rf "$ROUNDS_DIR"
+mkdir -p "$ROUNDS_DIR"
 mkdir -p "$SESSION_FIXTURE_HOME" "$SESSION_FIXTURE_WORKSPACE" "$GENERAL_FIXTURE_HOME"
 mkdir -p "$GENERAL_FIXTURE_HOME/.fx"
 chmod 700 "$GENERAL_FIXTURE_HOME/.fx"
@@ -77,71 +104,53 @@ fi
 
 echo "=== fx startup benchmarks ==="
 echo "binary: $FX_BIN"
-echo "runs:   $RUNS (warmup: $WARMUP)"
+if [ -n "$BASE_BIN" ]; then
+  echo "base:   $BASE_BIN"
+fi
+echo "runs:   $RUNS in $ROUNDS round(s), warm-up $WARMUP"
 echo ""
 
-# Baseline: process launch floor on this host. This is reported for context;
-# the budget checker still enforces each fx command's raw wall-clock mean.
-echo "--- process baseline ---"
-HOME="$GENERAL_FIXTURE_HOME" hyperfine \
-  "${SHELL_OPTS[@]}" \
-  --runs "$RUNS" \
-  --warmup "$WARMUP" \
-  --export-json "${RESULTS_DIR}/baseline.json" \
-  --command-name "process baseline" \
-  "$TRUE_BIN"
+# measure ROUND SIDE NAME STEM HOME EXTRA_ENV COMMAND
+# One hyperfine run for one command on one side; the export keeps every run time.
+measure() {
+  local round=$1 side=$2 name=$3 stem=$4 home=$5 extra_env=$6 command=$7
+  mkdir -p "$ROUNDS_DIR/$side"
+  env HOME="$home" ${extra_env:+"$extra_env"} hyperfine \
+    "${SHELL_OPTS[@]}" \
+    --runs "$ROUND_RUNS" \
+    --warmup "$ROUND_WARMUP" \
+    --export-json "$ROUNDS_DIR/$side/$stem.$round.json" \
+    --command-name "$name" \
+    "$command"
+}
 
-echo ""
+# measure_side ROUND SIDE BINARY
+measure_side() {
+  local round=$1 side=$2 binary=$3
+  echo "--- round $round: $side ---"
+  measure "$round" "$side" "process baseline" process-baseline "$GENERAL_FIXTURE_HOME" "" "$TRUE_BIN"
+  measure "$round" "$side" "fx (startup)" startup "$GENERAL_FIXTURE_HOME" "FX_BENCH=1" "$binary"
+  measure "$round" "$side" "fx help" help "$GENERAL_FIXTURE_HOME" "" "$binary help"
+  measure "$round" "$side" "fx status --json" status "$GENERAL_FIXTURE_HOME" "" "$binary status --json"
+  measure "$round" "$side" "fx sessions --json" sessions "$SESSION_FIXTURE_HOME" "" "$binary sessions --json"
+  echo ""
+}
 
-# Benchmark 0: fx startup (CLI dispatch, no TTY needed)
-echo "--- fx (startup) ---"
-HOME="$GENERAL_FIXTURE_HOME" FX_BENCH=1 hyperfine \
-  "${SHELL_OPTS[@]}" \
-  --runs "$RUNS" \
-  --warmup "$WARMUP" \
-  --export-json "${RESULTS_DIR}/startup.json" \
-  --command-name "fx (startup)" \
-  "$FX_BIN"
+for ((round = 1; round <= ROUNDS; round++)); do
+  if [ -z "$BASE_BIN" ]; then
+    order=(pr)
+  elif ((round % 2 == 1)); then
+    order=(base pr)
+  else
+    order=(pr base)
+  fi
+  for side in "${order[@]}"; do
+    binary="$FX_BIN"
+    if [ "$side" = base ]; then
+      binary="$BASE_BIN"
+    fi
+    measure_side "$round" "$side" "$binary"
+  done
+done
 
-echo ""
-
-# Benchmark 1: fx help (minimal startup path)
-echo "--- fx help ---"
-HOME="$GENERAL_FIXTURE_HOME" hyperfine \
-  "${SHELL_OPTS[@]}" \
-  --runs "$RUNS" \
-  --warmup "$WARMUP" \
-  --export-json "${RESULTS_DIR}/help.json" \
-  --command-name "fx help" \
-  "$FX_BIN help"
-
-echo ""
-
-# Benchmark 2: fx status --json (config load + JSON serialize)
-echo "--- fx status --json ---"
-HOME="$GENERAL_FIXTURE_HOME" hyperfine \
-  "${SHELL_OPTS[@]}" \
-  --runs "$RUNS" \
-  --warmup "$WARMUP" \
-  --export-json "${RESULTS_DIR}/status.json" \
-  --command-name "fx status --json" \
-  "$FX_BIN status --json"
-
-echo ""
-
-# Benchmark 3: fx sessions --json (file I/O path)
-echo "--- fx sessions --json ---"
-HOME="$SESSION_FIXTURE_HOME" hyperfine \
-  "${SHELL_OPTS[@]}" \
-  --runs "$RUNS" \
-  --warmup "$WARMUP" \
-  --export-json "${RESULTS_DIR}/sessions.json" \
-  --command-name "fx sessions --json" \
-  "$FX_BIN sessions --json"
-
-echo ""
-
-# Combine results into a single summary for CI
-echo "--- summary ---"
-python3 "${REPO_ROOT}/benchmarks/summarize.py"
-python3 "${REPO_ROOT}/benchmarks/check_budgets.py"
+echo "Round results: $ROUNDS_DIR"

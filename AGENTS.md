@@ -415,7 +415,7 @@ The startup benchmark uses `FX_BENCH=1`, an environment variable that runs throu
 
 To measure the interactive launch up to the first frame, use `benchmarks/first_frame.py`. It drives fx on a pseudo-terminal and interleaves several `--binary` arguments for before-and-after comparisons.
 
-The budget is 2ms of raw wall-clock time for every command on the Linux CI runner, which is the authoritative product budget. Local macOS runs report raw means only, because process and dynamic-loader overhead there can exceed 2ms independently of fx. The process baseline is diagnostic only and is never subtracted.
+On the Linux CI runner, the budget is a same-host comparison, not a fixed time. `startup.sh --ci --base-binary` runs the base commit's fx and the PR's fx in five alternating rounds on the same runner, 100 runs per side per command. `benchmarks/check_budgets.py` fails a command when its PR mean is more than 15% above the base mean. A raw guard of 3ms per command is a loose limit that bounds slow creep across many changes; it is not the budget. A missing base result fails the check. Local macOS runs report raw means only, because process and dynamic-loader overhead there can exceed the guard independently of fx. The process baseline is diagnostic only and is never subtracted or compared.
 
 When adding features, consider their impact on startup latency. The `fx help` path is the baseline cold-start benchmark.
 
