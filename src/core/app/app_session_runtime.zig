@@ -13201,6 +13201,26 @@ test "cached session title drops control bytes before they reach the terminal" {
     try std.testing.expectEqualStrings("safe]2;ownedtail", app.terminalTitleLabelText());
 }
 
+test "cached session title keeps joins, direction marks and format characters" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    // A fork saves this cache and `/rename` compares it, so the data keeps
+    // every mark; only the draws drop the ones a title must not show.
+    const title = "join\u{200d}word\u{200c}lrm\u{200e}rlm\u{200f}alm\u{061c}end";
+    try Runtime(TestApp).setCachedSessionTitle(&app, (&app).agent(), title);
+    try std.testing.expectEqualStrings(title, Runtime(TestApp).cachedSessionTitle((&app).agent()).?);
+}
+
 test "terminal title uses the workspace basename and handles unnamed roots" {
     const cases = [_]struct { path: []const u8, folder: []const u8 }{
         .{ .path = "/projects/fx", .folder = "fx" },

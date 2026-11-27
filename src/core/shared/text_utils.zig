@@ -1398,6 +1398,8 @@ fn writeCodepointEscape(buf: *[12]u8, codepoint: u21) []const u8 {
 
 fn isNonPrintingCodepoint(codepoint: u21) bool {
     return (codepoint >= 0x80 and codepoint <= 0x9f) or
+        codepoint == 0x061c or
+        codepoint == 0x180e or
         (codepoint >= 0x200b and codepoint <= 0x200f) or
         (codepoint >= 0x2028 and codepoint <= 0x202e) or
         (codepoint >= 0x2060 and codepoint <= 0x206f) or
@@ -3043,6 +3045,14 @@ test "encodeTerminalSafe escapes UTF-8 C1 controls" {
 
     try std.testing.expectEqualStrings("\\u{0080}", encoded.bytes);
     try std.testing.expectEqual(@as(usize, 8), display_width.visibleWidth(encoded.bytes));
+}
+
+test "encodeTerminalSafe escapes the Arabic letter mark and the Mongolian vowel separator" {
+    var encoded = try encodeTerminalSafe(std.testing.allocator, "a\u{061c}b\u{180e}c", 64);
+    defer encoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("a\\u{061c}b\\u{180e}c", encoded.bytes);
+    try std.testing.expect(isTerminalSafe(encoded.bytes));
 }
 
 test "encodeTerminalSafe reserves a marker when source encoding is truncated" {

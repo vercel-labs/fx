@@ -29,7 +29,7 @@ import {
   tmuxAvailable,
   turnSettled,
 } from "./tmux-helpers";
-import { savedSessionIds } from "./saved-sessions";
+import { logLines, savedSessionIds } from "./saved-sessions";
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
@@ -1296,6 +1296,77 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(session.isAlive()).toBe(true);
       expect(await session.paneTitle()).toBe("");
       expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+      await session.kill();
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a renamed title drops bidi controls from the tab but keeps them in the saved session",
+    async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "fx-title-bidi-e2e-"));
+      workDirs.push(workDir);
+      const home = join(workDir, "home");
+      const workspace = join(workDir, "fx");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ sandbox: "none", permission: {} }),
+      );
+      const stderrPath = join(workDir, "stderr.log");
+      gateway = startFakeGateway([fakeGatewayFinalText("TITLE_BIDI_COMPLETE")]);
+
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-title-bidi-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: "openai/gpt-5",
+          FX_AUTO_UPGRADE: "0",
+          NO_COLOR: "1",
+        },
+        stderrPath,
+        width: 120,
+        height: 32,
+        isolated: true,
+        remainOnExit: true,
+      });
+      await session.waitForComposer(10_000);
+
+      // A session is saved once it has a turn, so start one before the rename.
+      await session.sendText("generate the release notes");
+      await session.waitForText("TITLE_BIDI_COMPLETE", 30_000);
+      await session.waitForStableComposer();
+
+      // U+202E is a bidi override, which the tab must not draw. U+200D joins
+      // the emoji, which the tab keeps byte for byte.
+      const joined = "\u{1F469}\u{200D}\u{1F4BB}";
+      const title = `Plan\u{202e} parser team ${joined}`;
+      await session.sendText(`/rename ${title}`);
+      await session.waitForText("renamed to", 10_000);
+      await session.waitForStableComposer();
+      await waitForPaneTitle(session, `Plan parser team ${joined}`, 5_000);
+      const tab = await session.paneTitle();
+      expect(tab).not.toContain("\u{202e}");
+      expect(tab).toContain(joined);
+
+      await session.sendText("/quit");
+      await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+      expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      // The saved title is data: it keeps the bidi override and the join as typed.
+      const id = savedSessionIds(home)[0]!;
+      const saved = (logLines(home, id) as any[])
+        .filter((line) => line.kind === "set" && line.key === "title")
+        .at(-1)?.value;
+      expect(saved).toBe(title);
       await session.kill();
       session = null;
     },
