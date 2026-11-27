@@ -17,6 +17,7 @@ import { FX_BIN, REPO_ROOT } from "../../evals/eval-helpers";
 import {
   DEFAULT_UNSET_ENV_KEYS,
   fakeGatewayTitleDefault,
+  fxChildEnv,
   isVolatileTokenStatusRow,
   TITLE_GENERATION_MARKER,
   TMUX_NO_CONFIG,
@@ -2320,9 +2321,7 @@ function preflightBinaryOnly(): void {
 }
 
 function testEnv(fixture: Fixture, manifest: RenderLabManifest): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  delete env.AI_GATEWAY_API_KEY;
-  delete env.VERCEL_OIDC_TOKEN;
+  const env: NodeJS.ProcessEnv = fxChildEnv();
   env.FX_DISABLE_KEYCHAIN = "1";
   env.FX_TEST_SKIP_ONBOARDING = "1";
   env.HOME = fixture.home;
@@ -2627,7 +2626,7 @@ function tmux(args: string[], env?: NodeJS.ProcessEnv): string {
   return execFileSync("tmux", args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-    env: env ? { ...process.env, ...env } : process.env,
+    env: env ?? process.env,
   });
 }
 
