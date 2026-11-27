@@ -2160,7 +2160,9 @@ test "a real session is empty once its last member is gone" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
-    // The leader starts a session and one member, and reports the member's pid.
+    // The leader starts a session and one member, and reports the member's
+    // pid. It does not collect the member, so once the member is killed it
+    // stays a zombie, and the leader says so when it sees the member ended.
     const script =
         \\import os, signal, sys
         \\os.setsid()
@@ -2170,7 +2172,8 @@ test "a real session is empty once its last member is gone" {
         \\    signal.alarm(30); signal.pause()
         \\    os._exit(0)
         \\sys.stdout.write("%d\n" % member); sys.stdout.flush()
-        \\os.close(1)
+        \\os.waitid(os.P_PID, member, os.WEXITED | os.WNOWAIT)
+        \\sys.stdout.write("ended\n"); sys.stdout.flush()
         \\signal.alarm(30); signal.pause()
     ;
     var leader = try std.process.spawn(io, .{
@@ -2188,14 +2191,12 @@ test "a real session is empty once its last member is gone" {
     const member_pid = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, line[0..line_len], "\n"), 10);
 
     try std.testing.expect(!try sessionIsEmpty(alloc, leader_pid));
-    // The member is a child of the leader, which does not collect it, so it
-    // stays as a zombie, and a zombie does not count.
     try std.posix.kill(member_pid, std.posix.SIG.KILL);
-    const deadline = io_mod.milliTimestamp() + 15_000;
-    while (!try sessionIsEmpty(alloc, leader_pid)) {
-        if (io_mod.milliTimestamp() > deadline) return error.TestTimedOut;
-        io_mod.sleep(10 * std.time.ns_per_ms);
-    }
+    try waitReadable(reports, 15_000);
+    const ended_len = try std.posix.read(reports, &line);
+    try std.testing.expectEqualStrings("ended\n", line[0..ended_len]);
+    // The member is a zombie now, which does not count.
+    try std.testing.expect(try sessionIsEmpty(alloc, leader_pid));
 }
 
 fn waitReadable(fd: std.posix.fd_t, timeout_ms: i32) !void {
