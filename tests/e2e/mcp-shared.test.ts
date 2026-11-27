@@ -394,10 +394,12 @@ describe("shared MCP servers", () => {
     expect(JSON.parse(result.stdout).output).toContain("READY_TRACE_DONE");
 
     const lines = readFileSync(tracePath, "utf8").split("\n").filter(Boolean);
-    const readyIdx = lines.findIndex((line) => line.includes("event=owner_ready"));
+    const readyIdx = lines.findIndex((line) => /\bevent=owner_ready(?:\s|$)/.test(line));
     const connectedIdx = lines.findIndex((line) => line.includes("owner connected socket="));
     expect(readyIdx, lines.join("\n")).toBeGreaterThanOrEqual(0);
     expect(connectedIdx, lines.join("\n")).toBeGreaterThan(readyIdx);
+    expect(lines.some((line) => /\bevent=owner_ready_eof(?:\s|$)/.test(line)), lines.join("\n")).toBe(false);
+    expect(lines.some((line) => /\bevent=owner_ready_dropped(?:\s|$)/.test(line)), lines.join("\n")).toBe(false);
 
     await expectExited([...serverPids(root.wire), ...ownerPids(root.fxHome)]);
   }, 120_000);

@@ -14,10 +14,12 @@
 //! and the `stop` flag end it the same way, and the engine's deinit stops
 //! every server it still runs.
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mcp = @import("../../mcp/mcp.zig");
 const core = @import("owner_core.zig");
+const owner_test_controls = @import("owner_test_controls.zig");
 const wire = @import("owner_wire.zig");
 const idle_control = @import("idle_control.zig");
 
@@ -855,6 +857,9 @@ fn serveInternal(
     std.Io.Dir.cwd().setFilePermissions(io, socket_path, .fromMode(0o600), .{ .follow_symlinks = false }) catch |err| {
         debug_trace.logf("mcp-owner", "owner socket not private reason=set mode err={s}", .{@errorName(err)});
     };
+    if (comptime builtin.is_test) {
+        if (owner_test_controls.on_listening_hook) |hook| hook(io);
+    }
     if (signal_stdout) signalReadyOnFd(io, std.posix.STDOUT_FILENO);
 
     var owner: Owner = .{ .io = io, .gpa = gpa, .stop = stop, .client_version = client_version };
