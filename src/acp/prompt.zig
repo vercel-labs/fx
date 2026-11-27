@@ -1416,9 +1416,11 @@ pub fn handlePromptWithInputId(
     // writes it. Any error before that puts the turn back and drops the
     // continuation's base.
     var native_taken: ?session_runtime.SessionRuntime.TakenTurn = null;
-    defer if (native_taken) |taken| {
-        session.session_rt.returnNewestTurn(taken);
-        session.v2.?.setContinuesYielded(null);
+    defer if (comptime server.has_v2_session_store) {
+        if (native_taken) |taken| {
+            session.session_rt.returnNewestTurn(taken);
+            session.v2.?.setContinuesYielded(null);
+        }
     };
     if (session.journal) |*journal| {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -1461,7 +1463,7 @@ pub fn handlePromptWithInputId(
                 .call_ids = prompt_input.rerun_call_ids,
             }, ctx.observer);
         };
-    } else if (prompt_input.continue_recovery and session.v2 != null) {
+    } else if (server.has_v2_session_store and prompt_input.continue_recovery and session.v2 != null) {
         // A native session continues the turn its log left open, as the same turn.
         const v2 = session.v2.?;
         const found = (try v2.interruptedRequest()) orelse return noInterruptedTurn();
@@ -1529,9 +1531,11 @@ pub fn handlePromptWithInputId(
         defer session.session_write_mutex.unlock(io_mod.getIo());
         try v2.beginTurn();
         // The turn is on disk now, so the taken copy is no longer needed.
-        if (native_taken) |taken| {
-            types.freeHistoryTurn(state.alloc, taken.turn);
-            native_taken = null;
+        if (comptime server.has_v2_session_store) {
+            if (native_taken) |taken| {
+                types.freeHistoryTurn(state.alloc, taken.turn);
+                native_taken = null;
+            }
         }
     }
 
