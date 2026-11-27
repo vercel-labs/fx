@@ -473,12 +473,11 @@ const AcpContext = struct {
     /// session's: a prompt and a switch of the provider never overlap.
     route: ?*ModelRoute = null,
 
-    /// A subagent's run: by the model's call id (owned), the order of the
-    /// latest of its calls that announced a card. A model repeats an id from
-    /// one reply to the next, so the id alone does not name a call, and it
-    /// numbers its calls alike in every run, so the order comes from the
-    /// session's count for the child, not from the run
-    /// (`tests/tla/acp/AcpChildApproval.tla` UniqueIds).
+    /// A subagent's run: by the call's id (owned), the order of the latest of
+    /// its calls that announced a card. A model repeats an id from one reply to
+    /// the next, so the id alone does not name a call, and it numbers its calls
+    /// alike in every run, so the order comes from the session's count for the
+    /// child, not from the run (`tests/tla/acp/AcpChildApproval.tla` UniqueIds).
     latest_call: std.StringHashMapUnmanaged(u32) = .empty,
 
     /// What this turn reads of the session's model route.
@@ -645,8 +644,8 @@ const AcpContext = struct {
     }
 
     /// A subagent's call announces a card: it takes the child's next order in
-    /// the session, and the model's id names it until a later call reuses the
-    /// id. The caller holds `subagent_cards_mutex`. Returns the card's id,
+    /// the session, and the call's id names it. The caller holds
+    /// `subagent_cards_mutex`. Returns the card's id,
     /// allocated in `arena`.
     fn startCall(self: *AcpContext, arena: Allocator, call_id: []const u8) ![]const u8 {
         const order = try server.nextSubagentCardOrderLocked(self.state, self.subagent.?.child_id);
@@ -6507,7 +6506,7 @@ test "a card the prompt's end closed shows no later update, and no card is annou
     // A call that asks now is refused, with no card.
     try std.testing.expectError(error.PermissionPromptClosed, ctx.announceSubagentCard(arena, call));
     try std.testing.expectEqual(@as(usize, 2), frames.frames.items.len);
-    // The next prompt opens the cards again, and the model's id names a new call.
+    // The next prompt opens the cards again, and the call's id names a new call.
     state.subagent_cards_open = true;
     try std.testing.expectEqualStrings("child_a:2:call_1", try ctx.announceSubagentCard(arena, call));
 }

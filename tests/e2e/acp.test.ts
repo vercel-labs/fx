@@ -14983,8 +14983,8 @@ describe("acp: subagent permission requests", () => {
         // allow, failed after a reject.
         expectCardEnds(messages, alphaCard, "completed");
         expectCardEnds(messages, betaCard, "failed");
-        // The parent's own cards keep the ids its model chose, and no two
-        // announced cards share an id.
+        // The parent's own cards keep their call ids, and no two announced
+        // cards share an id.
         expect(cardUpdates(messages, "call_alpha")).not.toHaveLength(0);
         const announced = messages
           .filter((message) => message.method === "session/update" && message.params?.update?.sessionUpdate === "tool_call")
@@ -15018,11 +15018,12 @@ describe("acp: subagent permission requests", () => {
         answer(second.id, "allow_once");
         await readMessagesUntil(messages, "the prompt's response", () => responseTo(messages, 69) !== undefined);
         expect(responseTo(messages, 69).result.stopReason).toBe("end_turn");
-        // Both calls are the model's call_1, in one run. Each card's id leads
-        // with the child id and the call's order in the run, and stays the
-        // same across the card's updates.
+        // Both calls are the model's call_1, in one run, so fx gives the
+        // second call its own id, fx_call_1. Each card's id leads with the
+        // child id and the call's order in the run, and stays the same across
+        // the card's updates.
         const childId = first.params._meta.fx.subagent.childId;
-        const ids = [`${childId}:1:call_1`, `${childId}:2:call_1`];
+        const ids = [`${childId}:1:call_1`, `${childId}:2:fx_call_1`];
         expect(first.params.toolCall.toolCallId).toBe(ids[0]);
         expect(second.params.toolCall.toolCallId).toBe(ids[1]);
         expect(first.params.toolCall.rawInput.path).toBe("alpha.txt");
@@ -15084,13 +15085,14 @@ describe("acp: subagent permission requests", () => {
         answer(permissionRequests(messages)[1].id, "allow_once");
         await readMessagesUntil(messages, "the second prompt's response", () => responseTo(messages, 92) !== undefined);
         expect(responseTo(messages, 92).result.stopReason).toBe("end_turn");
-        // Both runs are the same child's, and each model call is call_1: the
-        // second run's ids go on from the first run's.
+        // Both runs are the same child's, and each model call is call_1. The
+        // second run's call repeats that id, so fx gives it its own, fx_call_1,
+        // and the order goes on from the first run's.
         const [first, second] = permissionRequests(messages);
         const childId = first.params._meta.fx.subagent.childId;
         expect(second.params._meta.fx.subagent.childId).toBe(childId);
         expect(first.params.toolCall.toolCallId).toBe(`${childId}:1:call_1`);
-        expect(second.params.toolCall.toolCallId).toBe(`${childId}:2:call_1`);
+        expect(second.params.toolCall.toolCallId).toBe(`${childId}:2:fx_call_1`);
         expect(first.params.toolCall.rawInput.path).toBe("a.txt");
         expect(second.params.toolCall.rawInput.path).toBe("b.txt");
         expectCardEnds(messages, first.params.toolCall.toolCallId, "completed");

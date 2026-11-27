@@ -635,8 +635,9 @@ const PLANS: Plan[] = [
   {
     // One subagent's model numbers both of its writes call_1. Each call is
     // announced with a card of its own, whose id carries the call's order in
-    // its run, and each card is announced pending and ends once, with its
-    // own call's status.
+    // its run. fx gives the second call its own call id, fx_call_1, since the
+    // model repeated call_1. Each card is announced pending and ends once,
+    // with its own call's status.
     name: "repeated-call-id", group: "cards", children: ["alpha"], prompts: 1, oneRun: true, repeat: 3,
     setup(f) { f.writesTwice.add("alpha"); },
     async run(f, client, sessionId, obs) {
@@ -651,7 +652,7 @@ const PLANS: Plan[] = [
       expect(response.result?.stopReason === "end_turn", `end_turn, got ${JSON.stringify(response.result ?? response.error)}`);
       const childId = first.params?._meta?.fx?.subagent?.childId;
       const ids = [first, second].map((request) => request.params?.toolCall?.toolCallId);
-      expect(ids[0] === `${childId}:1:call_1` && ids[1] === `${childId}:2:call_1`, `ids led by the child id and the call's order, got ${JSON.stringify(ids)}`);
+      expect(ids[0] === `${childId}:1:call_1` && ids[1] === `${childId}:2:fx_call_1`, `ids led by the child id and the call's order, got ${JSON.stringify(ids)}`);
       expect(f.wrote("alpha") && existsSync(join(f.workspace, "alpha2.txt")), "both files written");
       checkCard(client, first, "completed");
       checkCard(client, second, "completed");
@@ -662,8 +663,9 @@ const PLANS: Plan[] = [
   },
   {
     // One subagent, two prompts: its model numbers its write call_1 in both
-    // runs, and the second run's card id goes on from the first run's, so no
-    // two ids in the session are alike. Each run's card ends once.
+    // runs. The second run's call repeats that id, so fx gives it fx_call_1,
+    // and the card id's order goes on from the first run's, so no two ids in
+    // the session are alike. Each run's card ends once.
     name: "second-run-same-child", group: "cards", children: ["alpha"], prompts: 2, runs: true, repeat: 3,
     setup(f) { f.twoRuns.add("alpha"); },
     async run(f, client, sessionId, obs) {
@@ -684,7 +686,7 @@ const PLANS: Plan[] = [
       const childId = first.params?._meta?.fx?.subagent?.childId;
       expect(second.params?._meta?.fx?.subagent?.childId === childId, "both runs are the same child's");
       const ids = [first, second].map((request) => request.params?.toolCall?.toolCallId);
-      expect(ids[0] === `${childId}:1:call_1` && ids[1] === `${childId}:2:call_1`, `the second run's id goes on from the first's, got ${JSON.stringify(ids)}`);
+      expect(ids[0] === `${childId}:1:call_1` && ids[1] === `${childId}:2:fx_call_1`, `the second run's id goes on from the first's, got ${JSON.stringify(ids)}`);
       const announced = [...client.cards.keys()];
       expect(new Set(announced).size === announced.length && announced.length === 2, `two cards in all, with two ids, got ${JSON.stringify(announced)}`);
       expect(f.wrote("alpha") && existsSync(join(f.workspace, "alpha2.txt")), "both files written");
