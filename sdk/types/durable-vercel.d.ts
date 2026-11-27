@@ -13,7 +13,7 @@ export interface VercelOptions {
    * frees its session this long after its last renewal. Without it, nothing is renewed: a function holds its session
    * for as long as Vercel Queues keeps the turn's message for it, and a function that died frees its session when the
    * queue delivers that message again, about a second after its process exits, or once the queue's hold on it runs
-   * out. At least 1000.
+   * out. From 1000 to 2147483647.
    */
   leaseMs?: number;
 }
