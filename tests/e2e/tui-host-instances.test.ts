@@ -40,7 +40,7 @@ function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean
   const rows: Array<{ name: string; selected: boolean }> = [];
   for (const line of paneEscapes.split("\n")) {
     const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
-    const row = /^ {2}(?:(fx \d+|main)|[\u251c\u2514] (\S+)) {2,}\S/.exec(plain);
+    const row = /^ {2}(?:(fx \d+|main)|(?:[\u2502 ] )?[\u251c\u2514] (\S+)) {2,}\S/.exec(plain);
     if (row) rows.push({ name: (row[1] ?? row[2])!, selected: line.includes("\x1b[1m") });
   }
   return rows;
@@ -60,6 +60,52 @@ async function waitForSelected(session: TmuxSession, name: string, ms = 10_000):
 
 // Directions follow the list's order: the instances as they started, each
 // followed by its own subagents. A number selects that fx instance.
+// Opens the agent list and selects `name`, an instance's or a subagent's row.
+// A subagent's row appears once its parent has started it, which can be a
+// moment after the parent's turn shows it did.
+async function showNamedAgent(session: TmuxSession, name: string) {
+  const deadline = Date.now() + 30_000;
+  await session.sendKeys("C-x");
+  await session.waitForText(LIST_HINT, 10_000);
+  // The list redraws as agents come, so its pane is the signal that a row a
+  // parent started a moment ago is drawn.
+  await session.waitForPane(
+    (value) => agentRows(value).some((row) => row.name === name),
+    Math.max(1, deadline - Date.now()),
+  );
+  const pane = await session.capturePaneEscapes();
+  const rows = agentRows(pane);
+  const from = rows.findIndex((row) => row.selected);
+  const to = rows.findIndex((row) => row.name === name);
+  if (from < 0 || to < 0) throw new Error(`no ${name} row in the agent list:\n${pane}`);
+  for (let step = 0; step < Math.abs(to - from); step += 1) await session.sendKeys(to > from ? "Down" : "Up");
+  await session.sendKeys("Enter");
+  await session.waitForPane((value) => !value.includes(LIST_HINT), 10_000);
+}
+
+// Opens the agent list and selects the row `name` that follows `anchor`, for a
+// host whose instances each have a subagent of the same name.
+async function showAgentAfter(session: TmuxSession, anchor: string, name: string) {
+  await session.sendKeys("C-x");
+  await session.waitForText(LIST_HINT, 10_000);
+  const rows = agentRows(await session.capturePaneEscapes());
+  const from = rows.findIndex((row) => row.selected);
+  const under = rows.findIndex((row) => row.name === anchor);
+  const to = under < 0 ? -1 : rows.findIndex((row, index) => index > under && row.name === name);
+  if (to < 0) throw new Error(`no ${name} row after ${anchor}`);
+  for (let step = 0; step < Math.abs(to - from); step += 1) await session.sendKeys(to > from ? "Down" : "Up");
+  await session.sendKeys("Enter");
+  await session.waitForPane((value) => !value.includes(LIST_HINT), 10_000);
+}
+
+// The person types the task on the subagent's own screen, so its turn is theirs
+// and its approval is answered there.
+async function typeChildTask(session: TmuxSession, agent: string, ready: string, task: string) {
+  await showNamedAgent(session, agent);
+  await session.waitForPane((pane) => pane.includes(ready), 30_000);
+  await session.sendText(task);
+}
+
 async function switchAgent(session: TmuxSession, target: "next" | "previous" | number) {
   await session.sendKeys("C-x");
   await session.waitForText(LIST_HINT, 10_000);
@@ -434,7 +480,11 @@ function held(): Gate {
 // - TYPED: main starts giver, task 1, and waits for `gates.later`, then ends
 //   its turn. The test types the next prompt, which names the work, while that
 //   turn runs, so fx takes it into the turn.
-function sameTurn(base: (body: string) => Response, gates: { later?: Gate; child?: Gate; childTask?: string }) {
+function sameTurn(base: (body: string) => Response, gates: { later?: Gate; child?: Gate; childTask?: string; boss?: Gate; typed?: boolean }) {
+  // A typed harness answers the ready token, so its fake must be typed too.
+  if (gates.typed && (base as { typed_child?: boolean }).typed_child !== true) {
+    throw new Error("sameTurn: typed needs grantRuns(…, true)");
+  }
   const give = (agent: string, profile: string, message: string, id: string) =>
     ({ type: "tool-call", toolCallId: id, toolName: "subagent", input: { request: { action: "message", agent, profile, message } } });
   const steps = (...calls: object[]) => fakeGatewaySse([...calls, { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } }]);
@@ -456,16 +506,22 @@ function sameTurn(base: (body: string) => Response, gates: { later?: Gate; child
   };
   return async (body: string): Promise<Response> => {
     const joined = userTexts(body).join("\n");
+    const latest = userTexts(body).at(-1) ?? "";
     const task = joined.match(/GRANT_TASK_(\d+) /)?.[1];
     if (task) {
       if (gates.child && task === gates.childTask && resultsSince(body, /GRANT_TASK_\d+ /) === 0) await gates.child.promise;
       return base(body);
     }
-    const boss = joined.match(/GRANT_BOSS_(\d+) RUN\[(.*?)\]/);
+    const boss = latest.match(/GRANT_BOSS_(\d+) RUN\[(.*?)\]/);
     if (boss) {
       const [, turn, what] = boss as unknown as [string, string, string];
       const done = resultsSince(body, /GRANT_BOSS_\d+ /);
-      if (done === 0) return shellRun(`boss_${turn}`, what);
+      if (done === 0) {
+        // Hold the lead's first request until the person is back on main, so
+        // its prompt is lent there and no prompt takes their keys.
+        await gates.boss?.promise;
+        return shellRun(`boss_${turn}`, what);
+      }
       if (done === 1) return steps(give("inner", "runner", `GRANT_TASK_${turn} RUN[${what}]`, `inner_${turn}`));
       return text(`boss_done_${turn}`, `GRANT_BOSS_DONE_${turn}`);
     }
@@ -489,20 +545,20 @@ function sameTurn(base: (body: string) => Response, gates: { later?: Gate; child
         }
         return text(`done_${turn}`, `GRANT_DONE_${turn}`);
       case "LATER":
-        if (results === 0) return steps(give(name!, "runner", `GRANT_TASK_${turn} ${taskKind}[${what}]`, `start_${turn}`));
+        if (results === 0) return steps(give(name!, "runner", gates.typed ? `GRANT_READY_${turn}` : `GRANT_TASK_${turn} ${taskKind}[${what}]`, `start_${turn}`));
         if (results === 1) await gates.later!.promise;
         return work(turn, kind!, what!, results - 1, typed.text.match(/THEN\[(.*?)\]/)?.[1]);
       case "BEFORE":
-        if (results === 0) return steps(give(name!, "runner", `GRANT_TASK_2 ${taskKind}[${what}]`, `start_${turn}`));
+        if (results === 0) return steps(give(name!, "runner", gates.typed ? `GRANT_READY_${turn}` : `GRANT_TASK_2 ${taskKind}[${what}]`, `start_${turn}`));
         return work(turn, kind!, what!, results - 1);
       case "PAIR":
-        if (results === 0) return steps(give("alpha", "runner", `GRANT_TASK_1 RUN[${what}]`, `alpha_${turn}`), give("beta", "runner", `GRANT_TASK_2 RUN[${what}]`, `beta_${turn}`));
+        if (results === 0) return steps(give("alpha", "runner", gates.typed ? `GRANT_READY_1` : `GRANT_TASK_1 RUN[${what}]`, `alpha_${turn}`), give("beta", "runner", `GRANT_TASK_2 RUN[${what}]`, `beta_${turn}`));
         return text(`done_${turn}`, `GRANT_DONE_${turn}`);
       case "BOSS":
-        if (results === 0) return steps(give(name!, "lead", `GRANT_BOSS_${turn} RUN[${what}]`, `start_${turn}`));
+        if (results === 0) return steps(give(name!, "lead", gates.typed ? `GRANT_READY_${turn}` : `GRANT_BOSS_${turn} RUN[${what}]`, `start_${turn}`));
         return text(`sent_${turn}`, `GRANT_SENT_${turn}`);
       default:
-        if (results === 0) return steps(give("giver", "runner", `GRANT_TASK_1 RUN[${what}]`, `giver_${turn}`));
+        if (results === 0) return steps(give("giver", "runner", gates.typed ? `GRANT_READY_${turn}` : `GRANT_TASK_1 RUN[${what}]`, `giver_${turn}`));
         if (results === 1) await gates.later!.promise;
         return text(`sent_${turn}`, `GRANT_SENT_${turn}`);
     }
@@ -603,12 +659,21 @@ async function resetSessionGrants(session: TmuxSession): Promise<{ before: strin
 // and `SUB[name]` makes main start that subagent with the task GRANT_TASK_<n>
 // instead of doing it itself. `finished` is filled with each subagent turn's
 // number when its report is sent.
-function grantRuns(finished: Set<string>) {
+function grantRuns(finished: Set<string>, typed_child = false) {
   const shell = shellRun;
-  return (body: string): Response => {
+  const run = (body: string): Response => {
     const results = resultsSince(body, /GRANT_TASK_\d+ /);
     const texts = userTexts(body);
-    const task = texts.join("\n").match(/GRANT_TASK_(\d+) (RUN|FILE|MCP)\[(.*?)\]/);
+    // A typed child's first turn only makes it ready: the person then types the
+    // task on that subagent's own screen, so its approval stays with them.
+    // Each turn is answered by the text the person just sent, so a child with
+    // several typed tasks answers the newest one.
+    const latest = texts.at(-1) ?? "";
+    if (typed_child && /GRANT_READY_\d+/.test(latest)) {
+      const ready = latest.match(/GRANT_READY_(\d+)/);
+      if (ready) return text(`child_ready_${ready[1]}`, `GRANT_CHILD_READY_${ready[1]}`);
+    }
+    const task = latest.match(/GRANT_TASK_(\d+) (RUN|FILE|MCP)\[(.*?)\]/);
     if (task) {
       const [, turn, kind, what] = task as unknown as [string, string, string, string];
       if (kind === "MCP") {
@@ -622,11 +687,11 @@ function grantRuns(finished: Set<string>) {
       return text(`sub_done_${turn}`, `GRANT_CHILD_DONE_${turn}`);
     }
     // A lead starts its own subagent once, and its turn ends there.
-    const nest = texts.join("\n").match(/GRANT_NEST_(\d+) RUN\[(.*?)\]/);
+    const nest = latest.match(/GRANT_NEST_(\d+) RUN\[(.*?)\]/);
     if (nest) {
       const [, turn, what] = nest as unknown as [string, string, string];
       if (body.includes(`nest_${turn}`)) return text(`nest_done_${turn}`, `GRANT_NEST_SENT_${turn}`);
-      return call(`nest_${turn}`, "subagent", { request: { action: "message", agent: "inner", profile: "runner", message: `GRANT_TASK_${turn} RUN[${what}]` } });
+      return call(`nest_${turn}`, "subagent", { request: { action: "message", agent: "inner", profile: "runner", message: typed_child ? `GRANT_READY_${turn}` : `GRANT_TASK_${turn} RUN[${what}]` } });
     }
     const typed = typedTurn(body);
     if (!typed) return text("ack", "GRANT_ACK");
@@ -638,15 +703,15 @@ function grantRuns(finished: Set<string>) {
     const [kind, what] = [work?.[1] ?? "RUN", work?.[2] ?? "true"];
     if (lead) {
       if (typed.results >= 1) return text(`sent_${turn}`, `GRANT_SENT_${turn}`);
-      return call(`start_${turn}`, "subagent", { request: { action: "message", agent: lead, profile: "lead", message: `GRANT_NEST_${turn} RUN[${what}]` } });
+      return call(`start_${turn}`, "subagent", { request: { action: "message", agent: lead, profile: "lead", message: typed_child ? `GRANT_READY_${turn}` : `GRANT_NEST_${turn} RUN[${what}]` } });
     }
     if (again) {
       if (typed.results >= 1) return text(`sent_${turn}`, `GRANT_SENT_${turn}`);
-      return call(`start_${turn}`, "subagent", { request: { action: "message", agent: again, message: `GRANT_TASK_${turn} ${kind}[${what}]` } });
+      return call(`start_${turn}`, "subagent", { request: { action: "message", agent: again, message: typed_child ? `GRANT_READY_${turn}` : `GRANT_TASK_${turn} ${kind}[${what}]` } });
     }
     if (sub) {
       if (typed.results >= 1) return text(`sent_${turn}`, `GRANT_SENT_${turn}`);
-      return call(`start_${turn}`, "subagent", { request: { action: "message", agent: sub, profile: "runner", message: `GRANT_TASK_${turn} ${kind}[${what}]` } });
+      return call(`start_${turn}`, "subagent", { request: { action: "message", agent: sub, profile: "runner", message: typed_child ? `GRANT_READY_${turn}` : `GRANT_TASK_${turn} ${kind}[${what}]` } });
     }
     if (kind === "MCP") {
       if (typed.results === 0) return call(`open_${turn}`, "toolbox", { open: "mcp_fixture_echo" });
@@ -657,6 +722,8 @@ function grantRuns(finished: Set<string>) {
     if (kind === "RUN") return shell(`run_${turn}`, what);
     return call(`write_${turn}`, "write_file", { path: `${what}.txt`, content: "GRANT\n" });
   };
+  run.typed_child = typed_child;
+  return run;
 }
 
 // Waits until `done()` holds, and fails with `what` when it does not.
@@ -1041,19 +1108,23 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     "a subagent's always approval of a command is kept: it is not asked again, nor is its sibling or main",
     async () => {
       const command = "echo RAN >> grant.log";
-      await withHost(grantRuns(new Set()), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+      await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
         writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
         const log = join(workspace, "grant.log");
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_1 SUB[alpha] RUN[${command}]`);
+        await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", `GRANT_TASK_1 RUN[${command}]`);
         await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
         await session.sendKeys("2");
         // Its second run comes at once after the first and is not asked.
         await waitUntil("the subagent's two runs", () => countLines(log) === 2, 30_000, session, () => `workspace: ${readdirSync(workspace).join(" ")}; log: ${existsSync(log) ? readFileSync(log, "utf8") : "none"}`);
 
         // A sibling runs the same command with no prompt.
+        await showNamedAgent(session, "main");
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_2 SUB[beta] RUN[${command}]`);
+        await typeChildTask(session, "beta", "GRANT_CHILD_READY_2", `GRANT_TASK_2 RUN[${command}]`);
+        await showNamedAgent(session, "main");
         await waitUntil("the sibling's two runs", () => countLines(log) === 4, 30_000, session);
 
         // So does main, which is in ask mode itself.
@@ -1074,10 +1145,11 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   test(
     "a subagent's always approval of a file change is kept: it is not asked again, nor is its sibling or main",
     async () => {
-      await withHost(grantRuns(new Set()), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
         writeProfile(home, "runner", { description: "Writes files", tools: ["write_file"], permission_mode: "ask" });
         await session.waitForComposer(15_000);
         await session.sendText("GRANT_1 SUB[alpha] FILE[grant-a]");
+        await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", "GRANT_TASK_1 FILE[grant-a]");
         await waitShows(session, "alpha's file prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes("Apply this change?"));
         await session.sendKeys("2");
         // Its second write comes at once after the first and is not asked.
@@ -1085,10 +1157,13 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         expect(existsSync(join(workspace, "grant-a-0.txt"))).toBe(true);
 
         await session.waitForComposer(15_000);
+        await showNamedAgent(session, "main");
         await session.sendText("GRANT_2 SUB[beta] FILE[grant-b]");
+        await typeChildTask(session, "beta", "GRANT_CHILD_READY_2", "GRANT_TASK_2 FILE[grant-b]");
         await waitUntil("the sibling's two writes", () => existsSync(join(workspace, "grant-b-1.txt")), 30_000, session);
 
         await session.waitForComposer(15_000);
+        await showNamedAgent(session, "main");
         await session.sendText("GRANT_3 FILE[grant-main]");
         await session.waitForPane((pane) => pane.includes("GRANT_DONE_3") && turnSettled(pane), 30_000);
         expect(existsSync(join(workspace, "grant-main.txt"))).toBe(true);
@@ -1106,23 +1181,27 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     async () => {
       const fixture = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
       const finished = new Set<string>();
-      await withHost(grantRuns(finished), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, session }) => {
+      await withHost(grantRuns(finished, true), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, session }) => {
         writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({
           mcp: { fixture: { type: "local", command: [process.execPath, fixture], enabled: true, environment: { FX_MCP_EXPECT_ELICITATION: "both" } } },
         }));
         writeProfile(home, "runner", { description: "Uses the fixture", tools: ["read_file", "mcp_select_tool"], mcp_servers: ["fixture"], permission_mode: "ask" });
         await session.waitForComposer(15_000);
         await session.sendText("GRANT_1 SUB[alpha] MCP[]");
+        await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", "GRANT_TASK_1 MCP[]");
         await session.waitForText("Subagent alpha needs permission", 45_000);
         await session.sendKeys("2");
         // Its second call comes at once after the first and is not asked.
         await waitUntil("the subagent's two calls", () => finished.has("1"), 45_000, session);
 
         await session.waitForComposer(15_000);
+        await showNamedAgent(session, "main");
         await session.sendText("GRANT_2 SUB[beta] MCP[]");
+        await typeChildTask(session, "beta", "GRANT_CHILD_READY_2", "GRANT_TASK_2 MCP[]");
         await waitUntil("the sibling's two calls", () => finished.has("2"), 45_000, session);
 
         await session.waitForComposer(15_000);
+        await showNamedAgent(session, "main");
         await session.sendText("GRANT_3 MCP[]");
         await session.waitForText("GRANT_DONE_3", 45_000);
       });
@@ -1134,20 +1213,30 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     "a nested subagent's always approval is kept: its parent subagent and main are not asked again",
     async () => {
       const command = "echo RAN >> grant.log";
-      await withHost(grantRuns(new Set()), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+      await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
         // `boss` may start subagents; `inner` runs the command.
         writeProfile(home, "lead", { description: "Starts a subagent and runs a command", tools: ["shell", "subagent"], permission_mode: "ask" });
         writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
         const log = join(workspace, "grant.log");
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_1 LEAD[boss] RUN[${command}]`);
+        // Boss's turn is the person's, so boss starts inner from it; inner's
+        // turn is the person's too, so its approval is answered on its screen.
+        await typeChildTask(session, "boss", "GRANT_CHILD_READY_1", `GRANT_NEST_1 RUN[${command}]`);
+        // Inner exists once boss's turn has started it.
+        await session.waitForPane((pane) => pane.includes("GRANT_NEST_SENT_1"), 30_000);
+        await typeChildTask(session, "inner", "GRANT_CHILD_READY_1", `GRANT_TASK_1 RUN[${command}]`);
         await waitShows(session, "inner's command prompt", (pane) => pane.includes("Subagent inner needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
         await session.sendKeys("2");
         await waitUntil("the nested subagent's two runs", () => countLines(log) === 2, 30_000, session, () => `workspace: ${readdirSync(workspace).join(" ")}`);
 
         // The subagent that started it runs the same command with no prompt.
         await session.waitForComposer(15_000);
+        await showNamedAgent(session, "main");
+        await session.waitForComposer(15_000);
         await session.sendText(`GRANT_2 AGAIN[boss] RUN[${command}]`);
+        await typeChildTask(session, "boss", "GRANT_CHILD_READY_2", `GRANT_TASK_2 RUN[${command}]`);
+        await showNamedAgent(session, "main");
         await waitUntil("the parent subagent's two runs", () => countLines(log) === 4, 30_000, session);
 
         // So does main, which is in ask mode itself.
@@ -1168,11 +1257,12 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     "a subagent's always approval stays in its instance: another instance's subagent still asks",
     async () => {
       const command = "echo RAN >> grant.log";
-      await withHost(grantRuns(new Set()), { instances: 2, env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+      await withHost(grantRuns(new Set(), true), { instances: 2, env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
         writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
         const log = join(workspace, "grant.log");
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_1 SUB[alpha] RUN[${command}]`);
+        await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", `GRANT_TASK_1 RUN[${command}]`);
         await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
         await session.sendKeys("2");
         await waitUntil("the first instance's subagent's two runs", () => countLines(log) === 2, 30_000, session);
@@ -1182,6 +1272,9 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_2 SUB[alpha] RUN[${command}]`);
+        await showAgentAfter(session, "fx 2", "alpha");
+        await session.waitForPane((pane) => pane.includes("GRANT_CHILD_READY_2"), 30_000);
+        await session.sendText(`GRANT_TASK_2 RUN[${command}]`);
         await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
         expect(countLines(log)).toBe(2);
         await session.sendKeys("1");
@@ -1199,12 +1292,13 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     "a subagent's one-time approval is not kept: its next run, and main's, ask again",
     async () => {
       const command = "echo RAN >> grant.log";
-      await withHost(grantRuns(new Set()), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+      await withHost(grantRuns(new Set(), true), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
         writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
         const log = join(workspace, "grant.log");
         const asking = (pane: string, who: string) => pane.includes(who) && pane.includes(COMMAND_APPROVAL_PROMPT);
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_1 SUB[alpha] RUN[${command}]`);
+        await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", `GRANT_TASK_1 RUN[${command}]`);
         await waitShows(session, "alpha's command prompt", (pane) => asking(pane, "Subagent alpha needs permission"));
         await session.sendKeys("1");
         // Its second run asks again once the first has run.
@@ -1215,6 +1309,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
 
         // Main asks too.
         await session.waitForComposer(15_000);
+        await showNamedAgent(session, "main");
         await session.sendText(`GRANT_2 RUN[${command}]`);
         await waitShows(session, "main's command prompt", (pane) => asking(pane, "") && !pane.includes("Subagent"));
         await session.sendKeys("1");
@@ -1232,11 +1327,17 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     async () => {
       const command = "echo RAN >> same.log";
       const gates = { later: held() };
-      await withHost(sameTurn(grantRuns(new Set()), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+      const child = held();
+      await withHost(sameTurn(grantRuns(new Set(), true), { later: gates.later, child, childTask: "1", typed: true }), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
         writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
         const log = join(workspace, "same.log");
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_1 LATER[alpha] RUN[${command}]`);
+        // The child's turn is the person's; its first request waits until they
+        // are back on main, so the prompt is lent there during main's turn.
+        await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", `GRANT_TASK_1 RUN[${command}]`);
+        await showNamedAgent(session, "main");
+        child.release();
         await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
         await session.sendKeys("2");
         await waitUntil("the subagent's two runs", () => countLines(log) === 2, 30_000, session);
@@ -1253,11 +1354,17 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       const granted = "echo RAN >> same.log";
       const other = "echo OTHER >> other.log";
       const gates = { later: held() };
-      await withHost(sameTurn(grantRuns(new Set()), gates), { env: { FX_PERMISSION_MODE: "auto" } }, async ({ home, workspace, session, classifierRequests }) => {
+      const child = held();
+      await withHost(sameTurn(grantRuns(new Set(), true), { later: gates.later, child, childTask: "1", typed: true }), { env: { FX_PERMISSION_MODE: "auto" } }, async ({ home, workspace, session, classifierRequests }) => {
         writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
         const log = join(workspace, "same.log");
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_1 LATER[alpha] RUN[${granted}] THEN[${other}]`);
+        // The child's turn is the person's; the visit happens before the
+        // subject event, and its request waits until the person is back.
+        await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", `GRANT_TASK_1 RUN[${granted}]`);
+        await showNamedAgent(session, "main");
+        child.release();
         await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
         await session.sendKeys("2");
         await waitUntil("the subagent's two runs", () => countLines(log) === 2, 30_000, session);
@@ -1281,11 +1388,17 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     async () => {
       const command = "echo RAN >> same.log";
       const gates = { later: held() };
-      await withHost(sameTurn(grantRuns(new Set()), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+      const child = held();
+      await withHost(sameTurn(grantRuns(new Set(), true), { later: gates.later, child, childTask: "1", typed: true }), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
         writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
         const log = join(workspace, "same.log");
         await session.waitForComposer(15_000);
-        await session.sendText(`GRANT_1 LATER[alpha] RUN[${command}]`);
+        await session.sendText(`GRANT_1 LATER[alpha] RUN[${command}]`)
+        // The child's turn is the person's; its first request waits until
+        // they are back on main, so the prompt is lent there.
+        await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", `GRANT_TASK_1 RUN[${command}]`);
+        await showNamedAgent(session, "main");
+        child.release();;
         await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
         await session.sendKeys("2");
         await waitUntil("the subagent's two runs", () => countLines(log) === 2, 30_000, session);
@@ -1334,10 +1447,16 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     "a subagent's always approval of a file change reaches main's running turn: main writes later in that turn with no prompt",
     async () => {
       const gates = { later: held() };
-      await withHost(sameTurn(grantRuns(new Set()), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+      const child = held();
+      await withHost(sameTurn(grantRuns(new Set(), true), { later: gates.later, child, childTask: "1", typed: true }), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
         writeProfile(home, "runner", { description: "Writes files", tools: ["write_file"], permission_mode: "ask" });
         await session.waitForComposer(15_000);
         await session.sendText("GRANT_1 LATER[alpha] FILE[same-a]");
+        // The child's turn is the person's; its first request waits until
+        // they are back on main, so the prompt is lent there.
+        await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", `GRANT_TASK_1 FILE[same-a]`);
+        await showNamedAgent(session, "main");
+        child.release();
         await waitShows(session, "alpha's file prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes("Apply this change?"));
         await session.sendKeys("2");
         await waitUntil("the subagent's two writes", () => existsSync(join(workspace, "same-a-1.txt")), 30_000, session);
@@ -1354,13 +1473,19 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       const fixture = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
       const finished = new Set<string>();
       const gates = { later: held() };
-      await withHost(sameTurn(grantRuns(finished), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, session }) => {
+      const child = held();
+      await withHost(sameTurn(grantRuns(finished, true), { later: gates.later, child, childTask: "1", typed: true }), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, session }) => {
         writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({
           mcp: { fixture: { type: "local", command: [process.execPath, fixture], enabled: true, environment: { FX_MCP_EXPECT_ELICITATION: "both" } } },
         }));
         writeProfile(home, "runner", { description: "Uses the fixture", tools: ["read_file", "mcp_select_tool"], mcp_servers: ["fixture"], permission_mode: "ask" });
         await session.waitForComposer(15_000);
         await session.sendText("GRANT_1 LATER[alpha] MCP[]");
+        // The child's turn is the person's; its first request waits until
+        // they are back on main, so the prompt is lent there.
+        await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", `GRANT_TASK_1 MCP[]`);
+        await showNamedAgent(session, "main");
+        child.release();
         await session.waitForText("Subagent alpha needs permission", 45_000);
         await session.sendKeys("2");
         await waitUntil("the subagent's two calls", () => finished.has("1"), 45_000, session);
@@ -1375,12 +1500,16 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     async () => {
       const finished = new Set<string>();
       const gates = { later: held() };
-      await withHost(sameTurn(grantRuns(finished), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+      const child = held();
+      await withHost(sameTurn(grantRuns(finished, true), { later: gates.later, child, childTask: "1", typed: true }), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
         useMcpFixture(home);
         // Main's commands do not wait: the call is made as soon as they start.
         writeFileSync(join(workspace, "go"), "");
         await session.waitForComposer(15_000);
         await session.sendText("GRANT_1 LATER[alpha] MCPCALL[]");
+        await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", `GRANT_TASK_1 MCP[]`);
+        await showNamedAgent(session, "main");
+        child.release();
         await session.waitForText("Subagent alpha needs permission", 45_000);
         await session.sendKeys("2");
         await waitUntil("the subagent's two calls", () => finished.has("1"), 45_000, session);
@@ -1402,10 +1531,14 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     async () => {
       const finished = new Set<string>();
       const gates = { child: held(), childTask: "2" };
-      await withHost(sameTurn(grantRuns(finished), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+      await withHost(sameTurn(grantRuns(finished, true), { ...gates, typed: true }), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
         useMcpFixture(home);
         await session.waitForComposer(15_000);
         await session.sendText("GRANT_1 BEFORE[alpha] MCPCALL[]");
+        // The child's turn is the person's; its first request waits until
+        // they are back on main, so the prompt is lent there.
+        await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", `GRANT_TASK_2 MCP[]`);
+        await showNamedAgent(session, "main");
         // Main's first command asks for itself, then runs and waits for `go`.
         await allowOnce(session, await waitShows(session, "main's command prompt", (pane) => pane.includes(COMMAND_APPROVAL_PROMPT) && !pane.includes("Subagent"), 45_000));
         // The subagent's approval comes while that command runs.
@@ -1432,10 +1565,14 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     async () => {
       const finished = new Set<string>();
       const gates = { later: held() };
-      await withHost(sameTurn(grantRuns(finished), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+      const child = held();
+      await withHost(sameTurn(grantRuns(finished, true), { later: gates.later, child, childTask: "1", typed: true }), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
         useMcpFixture(home);
         await session.waitForComposer(15_000);
         await session.sendText("GRANT_1 LATER[alpha] MCPCALL[]");
+        await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", `GRANT_TASK_1 MCP[]`);
+        await showNamedAgent(session, "main");
+        child.release();
         await session.waitForText("Subagent alpha needs permission", 45_000);
         await session.sendKeys("2");
         await waitUntil("the subagent's two calls", () => finished.has("1"), 45_000, session);
@@ -1489,12 +1626,15 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       const command = "echo RAN >> same.log";
       const finished = new Set<string>();
       const gates = { child: held(), childTask: "2" };
-      await withHost(sameTurn(grantRuns(finished), gates), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+      await withHost(sameTurn(grantRuns(finished, true), { ...gates, typed: true }), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
         writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
         const log = join(workspace, "same.log");
         await session.waitForComposer(15_000);
         // Alpha asks first; beta is running, with its first request held.
         await session.sendText(`GRANT_1 PAIR RUN[${command}]`);
+        // Beta is main-started and stays running across the grant, held at its
+        // first request; alpha's turn is the person's, answered on its screen.
+        await typeChildTask(session, "alpha", "GRANT_CHILD_READY_1", `GRANT_TASK_1 RUN[${command}]`);
         await waitShows(session, "alpha's command prompt", (pane) => pane.includes("Subagent alpha needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
         await session.sendKeys("2");
         await waitUntil("alpha's two runs", () => finished.has("1"), 30_000, session);
@@ -1511,12 +1651,18 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     "a lead subagent's always approval reaches the subagent it starts: inner is not asked",
     async () => {
       const command = "echo RAN >> same.log";
-      await withHost(sameTurn(grantRuns(new Set()), {}), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
+      const backOnMain = held();
+      await withHost(sameTurn(grantRuns(new Set(), true), { boss: backOnMain, typed: true }), { env: { FX_PERMISSION_MODE: "ask" } }, async ({ home, workspace, session }) => {
         writeProfile(home, "lead", { description: "Runs a command and starts a subagent", tools: ["shell", "subagent"], permission_mode: "ask" });
         writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
         const log = join(workspace, "same.log");
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_1 BOSS[boss] RUN[${command}]`);
+        // The lead's turn is the person's, typed on its own screen; its request
+        // then waits until the person is back on main.
+        await typeChildTask(session, "boss", "GRANT_CHILD_READY_1", `GRANT_BOSS_1 RUN[${command}]`);
+        await showNamedAgent(session, "main");
+        backOnMain.release();
         await waitShows(session, "boss's command prompt", (pane) => pane.includes("Subagent boss needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
         await session.sendKeys("2");
         // Boss runs it once, then inner runs it twice, with no prompt.
@@ -1532,12 +1678,18 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       const command = "echo RAN >> same.log";
       const trace = join(tmpdir(), `fx-same-turn-${process.pid}-${Date.now()}.log`);
       const gates = { later: held() };
+      const child = held();
       try {
-        await withHost(sameTurn(grantRuns(new Set()), gates), { env: { FX_PERMISSION_MODE: "ask", FX_TRACE_LOG: trace } }, async ({ home, workspace, session }) => {
+        await withHost(sameTurn(grantRuns(new Set(), true), { later: gates.later, child, childTask: "1", typed: true }), { env: { FX_PERMISSION_MODE: "ask", FX_TRACE_LOG: trace } }, async ({ home, workspace, session }) => {
           writeProfile(home, "runner", { description: "Runs one thing", tools: ["shell"], permission_mode: "ask" });
           const log = join(workspace, "same.log");
           await session.waitForComposer(15_000);
           await session.sendText(`GRANT_1 TYPED RUN[${command}]`);
+        // The child's turn is the person's; the visit happens before the
+        // subject event, and its request waits until the person is back.
+        await typeChildTask(session, "giver", "GRANT_CHILD_READY_1", `GRANT_TASK_1 RUN[${command}]`);
+        await showNamedAgent(session, "main");
+        child.release();
           await waitShows(session, "giver's command prompt", (pane) => pane.includes("Subagent giver needs permission") && pane.includes(COMMAND_APPROVAL_PROMPT));
           await session.sendKeys("2");
           await waitUntil("giver's two runs", () => countLines(log) === 2, 30_000, session);
@@ -2159,17 +2311,79 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
+    "a launched instance's subagent asks that instance's agent, not the person or main",
+    async () => {
+      // Every request: the text the turn's agent was last given, and whether the
+      // body carries the note an instance's agent gets when its child asks.
+      const requests: Array<{ note: boolean; first: boolean; second: boolean }> = [];
+      await withHost((body) => {
+        const latest = userTexts(body).at(-1) ?? "";
+        requests.push({
+          note: body.includes("I wait for your approval to run"),
+          first: body.includes("RULE_A_FIRST"),
+          second: body.includes("RULE_A_USER"),
+        });
+        if (latest.includes("I wait for your approval to run")) {
+          return call("rule_a_approve", "subagent", { request: { action: "approve", agent: "writer" } });
+        }
+        if (latest.includes("RULE_A_USER")) {
+          if (answered(body)) return text("rule_a_done", "RULE_A_DONE");
+          return call("rule_a_sub", "subagent", { request: { action: "message", agent: "writer", profile: "writer", message: "RULE_A_WRITE" } });
+        }
+        if (latest.includes("RULE_A_WRITE")) {
+          if (answered(body)) return text("rule_a_child_done", "RULE_A_CHILD_DONE");
+          return call("rule_a_write", "write_file", { path: "rule-a.txt", content: "RULE_A\n" });
+        }
+        return answerByLetter(body);
+      }, { instances: 2 }, async ({ home, workspace, session }) => {
+        writeProfile(home, "writer", { description: "Writes one file", tools: ["read_file", "write_file"], permission_mode: "ask" });
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        // Main's conversation gets its own marker, so each request can be
+        // classified by whose conversation it belongs to.
+        await session.waitForComposer(15_000);
+        await session.sendText("RULE_A_FIRST hello");
+        await session.waitForComposer(30_000);
+        await switchAgent(session, "next");
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        await session.waitForComposer(15_000);
+        // fx 2's agent starts the child with its real task, so the request is
+        // parent-routed: its agent answers, and no screen shows it.
+        await session.sendText("RULE_A_USER write the file");
+        await waitUntil("the child's write", () => existsSync(join(workspace, "rule-a.txt")), 30_000, session);
+        expect(readFileSync(join(workspace, "rule-a.txt"), "utf8")).toBe("RULE_A\n");
+        const second = await session.capturePane();
+        expect(second).not.toContain("needs permission");
+        // The first instance never sees the request either.
+        await switchAgent(session, 1);
+        const first = await session.capturePane();
+        expect(first).toContain("fx 1/2");
+        expect(first).not.toContain("needs permission");
+        expect(first).not.toContain("Subagent writer needs permission");
+        // The note went to the instance's agent: some request carries it, and the
+        // text that request's agent was last given is not one of main's turns.
+        const notes = requests.filter((entry) => entry.note);
+        expect(notes.length).toBeGreaterThan(0);
+        // The note reaches the launched instance's agent, and never main.
+        expect(notes.every((entry) => entry.second && !entry.first)).toBe(true);
+        expect(requests.some((entry) => entry.first && entry.note)).toBe(false);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a launched instance's subagent asks on that instance's screen, not the first's",
     async () => {
       await withHost((body) => {
         const texts = userTexts(body).join("\n");
+        if (texts.includes("TREE_READY") && !texts.includes("TREE_LEND_TASK")) return text("lend_ready", "TREE_CHILD_READY");
         if (texts.includes("TREE_LEND_TASK")) {
           if (answered(body)) return text("lend_child_done", "TREE_LEND_CHILD_DONE");
           return call("lend_write", "write_file", { path: "lent.txt", content: "TREE_LENT\n" });
         }
         if (texts.includes("TREE_LEND_USER")) {
           if (answered(body)) return text("lend_main_done", "TREE_LEND_MAIN_DONE");
-          return call("lend_sub", "subagent", { request: { action: "message", agent: "writer", profile: "writer", message: "TREE_LEND_TASK" } });
+          return call("lend_sub", "subagent", { request: { action: "message", agent: "writer", profile: "writer", message: "TREE_READY" } });
         }
         return answerByLetter(body);
       }, { instances: 2 }, async ({ home, workspace, session }) => {
@@ -2179,6 +2393,12 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("TREE_LEND_USER write the file");
+        // The writer's turn is the person's, typed on its own screen; its
+        // approval is then lent to the launched instance's screen.
+        await showAgentAfter(session, "fx 2", "writer");
+        await session.waitForPane((pane) => pane.includes("TREE_CHILD_READY"), 30_000);
+        await session.sendText("TREE_LEND_TASK write the file");
+        await showNamedAgent(session, "fx 2");
         // fx 2's own screen, shown by its conversation, holds its subagent's
         // approval, which replaces the footer while it waits.
         await session.waitForPane((pane) => pane.includes("TREE_LEND_USER") && pane.includes("Subagent writer needs permission"), 30_000);
