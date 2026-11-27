@@ -1321,6 +1321,9 @@ pub fn handlePromptWithInputId(
         .current_prompt_input = &prompt_input,
     };
     defer ctx.deinitPublishedToolCalls();
+    // Commands the prompt starts can outlive it and still hold `ctx`, which
+    // goes with this thread's stack.
+    defer state.managed_executions.retractOutputCtx(@ptrCast(&ctx));
 
     var hook_bridge: libfx_hooks.Bridge = undefined;
     if (session.observer_hooks) |hook_config| {

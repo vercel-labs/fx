@@ -116,7 +116,7 @@ const Context = struct {
         result.session_child_capability = self.turn.childCapability() catch null;
         result.interactive = false;
         result.output_chunk_ctx = self;
-        result.on_output_chunk = pushLiveOutputChunk;
+        result.on_output_chunk = discardOutputChunk;
         // A child's tool calls are no rows of the parent's, so neither are
         // the calls its commands make.
         result.nested_tool_lifecycle = null;
@@ -1145,19 +1145,10 @@ fn pushLiveEvent(raw: *anyopaque, event: worker_runtime.WorkerEvent) !void {
     worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
 }
 
-fn pushLiveOutputChunk(
-    raw: *anyopaque,
-    lifecycle_id: ?types.ToolLifecycleId,
-    stream: command_output_content.Stream,
-    text: []const u8,
-) anyerror!void {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    context.turn.appendLiveEvent(.{ .command_output = .{
-        .lifecycle_id = lifecycle_id,
-        .stream = stream,
-        .text = @constCast(text),
-    } });
-}
+/// Nothing reads a child's live output, and a command it starts can outlive this
+/// turn, and with it the `Context` that `output_chunk_ctx` points at, so the
+/// callback touches neither the context nor the chunk.
+fn discardOutputChunk(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_output_content.Stream, _: []const u8) anyerror!void {}
 
 test "a child's system prompt names it and who started it, then wraps the run's overlay" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

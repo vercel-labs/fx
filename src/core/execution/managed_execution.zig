@@ -281,8 +281,15 @@ const Entry = struct {
     replay_capture: ?*command_replay_store.Capture = null,
     replay_capability: ?*session_child_store.SessionChildCapability = null,
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
+    /// The callback the call that started the command lent it, and that call's
+    /// context. The context can die before the command does, so the worker
+    /// reaches it only through `forwardOutputChunk`, and the host takes it back
+    /// with `Runtime.retractOutputCtx`. Guarded by `output_sink_mutex`.
     output_chunk_ctx: ?*anyopaque = null,
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
+    output_sink_mutex: std.Io.Mutex = .init,
+    /// Whether the call lent a callback at all. Fixed when the entry is made.
+    forwards_output: bool = false,
     extra_environment: []const command_runner.EnvironmentVariable = &.{},
     output_handle: ?[]const u8 = null,
     output_framed_bytes: usize = 0,
@@ -389,6 +396,7 @@ const Entry = struct {
             .output_chunk_lifecycle_id = output_chunk_lifecycle_id,
             .output_chunk_ctx = input.output_chunk_ctx,
             .on_output_chunk = input.on_output_chunk,
+            .forwards_output = input.output_chunk_ctx != null and input.on_output_chunk != null,
             .extra_environment = extra_environment,
         };
         entry.started_ms = io_mod.milliTimestamp();
@@ -619,6 +627,35 @@ const Entry = struct {
         try self.appendBoundedOutput(chunk);
     }
 
+    /// What the command runner calls with each chunk. It passes the chunk on
+    /// to the host's callback while the host's context is lent, and drops it
+    /// after `retractOutputCtx`. The callback runs under `output_sink_mutex`,
+    /// so a retraction waits for a chunk that is already in the callback.
+    fn forwardOutputChunk(
+        raw: *anyopaque,
+        lifecycle_id: ?types.ToolLifecycleId,
+        stream: command_contract.CommandOutputStream,
+        text: []const u8,
+    ) anyerror!void {
+        const self: *Entry = @ptrCast(@alignCast(raw));
+        const zio = io_mod.getIo();
+        self.output_sink_mutex.lockUncancelable(zio);
+        defer self.output_sink_mutex.unlock(zio);
+        const callback = self.on_output_chunk orelse return;
+        const ctx = self.output_chunk_ctx orelse return;
+        try callback(ctx, lifecycle_id, stream, text);
+    }
+
+    fn retractOutputCtx(self: *Entry, ctx: *anyopaque) void {
+        const zio = io_mod.getIo();
+        self.output_sink_mutex.lockUncancelable(zio);
+        defer self.output_sink_mutex.unlock(zio);
+        if (self.output_chunk_ctx != ctx) return;
+        self.output_chunk_ctx = null;
+        self.on_output_chunk = null;
+        debug_trace.logf("managed-execution", "output callback retracted execution={s}", .{self.execution_id});
+    }
+
     fn workerMain(self: *Entry) void {
         self.start_gate.waitUncancelable(io_mod.getIo());
         const captured = switch (self.backend_state) {
@@ -631,8 +668,8 @@ const Entry = struct {
             .cancel_flag = &self.cancel,
             .force_cancel_flag = &self.force_cancel,
             .output_chunk_lifecycle_id = self.output_chunk_lifecycle_id,
-            .output_chunk_ctx = self.output_chunk_ctx,
-            .on_output_chunk = self.on_output_chunk,
+            .output_chunk_ctx = if (self.forwards_output) @ptrCast(self) else null,
+            .on_output_chunk = if (self.forwards_output) forwardOutputChunk else null,
             .accepted_output_chunk_ctx = self,
             .on_accepted_output_chunk = appendOutput,
             .callback_projection = .raw,
@@ -747,6 +784,20 @@ pub const Runtime = struct {
         self.replay_store.deinit();
         self.mutex.unlock(zio);
         self.* = undefined;
+    }
+
+    /// A host that lent a context to commands as `output_chunk_ctx` calls this
+    /// before the context goes away. When it returns, no command calls back
+    /// into the context and none is still inside its callback. Output the
+    /// commands print later is kept for the session and not streamed.
+    pub fn retractOutputCtx(self: *Runtime, ctx: *anyopaque) void {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        for (self.entries) |candidate| {
+            const entry = candidate orelse continue;
+            entry.retractOutputCtx(ctx);
+        }
     }
 
     pub fn generatedId(self: *Runtime, buffer: []u8) ![]const u8 {
@@ -3463,4 +3514,53 @@ test "terminal output keeps its head and tail through restore, refresh, and deli
     try std.testing.expectEqualStrings("gh", next.snapshot.output_delta);
     try std.testing.expect(!next.snapshot.output_truncated);
     try runtime.commitDelivery(next.snapshot.execution_id, next.reservation_id);
+}
+
+test "a command's later output no longer reaches a context its host retracted" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+
+    // Stands for a host context that lives on a thread's stack and goes away
+    // while the command it started runs on.
+    const Sink = struct {
+        gone: std.atomic.Value(bool) = .init(false),
+        calls_after_gone: std.atomic.Value(u32) = .init(0),
+
+        fn append(
+            raw: *anyopaque,
+            _: ?types.ToolLifecycleId,
+            _: command_contract.CommandOutputStream,
+            _: []const u8,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.gone.load(.seq_cst)) _ = self.calls_after_gone.fetchAdd(1, .seq_cst);
+        }
+    };
+    var sink: Sink = .{};
+    // A partial line is held back until the command ends, so it reaches the
+    // callback after the host is gone.
+    var input = StartCapturedInput{
+        .execution_id = "managed-retracted-sink",
+        .command = "printf 'held tail'; sleep 30",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = null,
+        .command_artifact_dir = null,
+        .yield_time_ms = 200,
+        .output_chunk_ctx = &sink,
+        .on_output_chunk = Sink.append,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    runtime.retractOutputCtx(&sink);
+    sink.gone.store(true, .seq_cst);
+    runtime.shutdown();
+    try std.testing.expectEqual(@as(u32, 0), sink.calls_after_gone.load(.seq_cst));
 }
