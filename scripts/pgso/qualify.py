@@ -159,7 +159,7 @@ def heavy_workload_samples(name: str) -> int:
     for plan in BENCHMARK_PLANS:
         if any(workload.name == name for workload in plan.workloads):
             return plan.minimum_samples
-    raise PgsoError(f"unknown heavy workload: {name}")
+    raise PgsoError(f"unknown heavy workload: {name!r}")
 
 
 def select_startup_commands(
@@ -1200,6 +1200,7 @@ def measure_heavy_workloads(
             raise PgsoError(
                 f"microbenchmark measurement requires Hyperfine: {plan.selector}"
             )
+        plan_samples = max(samples, plan.minimum_samples)
         for workload in plan.workloads:
 
             def measure_workload(attempt_logs: pathlib.Path) -> MeasurementResult:
@@ -1211,7 +1212,7 @@ def measure_heavy_workloads(
                         hyperfine_binary,
                         repo_root,
                         attempt_logs,
-                        max(samples, plan.minimum_samples),
+                        plan_samples,
                         timeout_s,
                     )
 
@@ -1240,7 +1241,7 @@ def measure_heavy_workloads(
                     control_binary=pair.control_binary,
                     candidate_binary=pair.candidate_binary,
                     argv=workload.argv,
-                    samples=samples,
+                    samples=plan_samples,
                     sample_runner=sample_runner,
                 )
 

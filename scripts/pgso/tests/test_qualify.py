@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -20,10 +21,12 @@ from scripts.pgso.qualify import (
     BenchmarkPair,
     EvidenceRecorder,
     _read_hyperfine_samples,
+    _round_runs,
     build_benchmark_pair,
     build_external_o2_control,
     build_profile_linked_benchmarks,
     compare_samples,
+    heavy_workload_samples,
     measure_alternating,
     measure_heavy_workloads,
     measure_startup,
@@ -880,6 +883,42 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertFalse(result.first_attempt.passed)
         self.assertEqual(200, len(exports))
         self.assertEqual(100, sum(path.parent == retry_logs for path in exports))
+
+    def test_a_heavy_floor_above_fifty_applies_without_hyperfine_too(self) -> None:
+        plans = tuple(
+            dataclasses.replace(plan, minimum_samples=60)
+            if plan.selector == "file_index"
+            else plan
+            for plan in BENCHMARK_PLANS
+        )
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run(argv, **_kwargs):
+            command = tuple(str(argument) for argument in argv)
+            calls.append(command)
+            return CommandResult(command, 0, "measured\n", "", 1.0)
+
+        with mock.patch("scripts.pgso.qualify.BENCHMARK_PLANS", plans):
+            result, _ = self.measure_one_heavy_workload(
+                fake_run, "file-index-100k", "file_index"
+            )
+
+        self.assertEqual(60, result.requested_samples)
+        self.assertEqual(120, len(calls))
+
+    def test_round_runs_split_any_count_into_blocks_of_at_most_ten(self) -> None:
+        self.assertEqual((10,) * 100, _round_runs(1_000))
+        self.assertEqual((5,) * 10, _round_runs(50))
+        uneven = _round_runs(1_005)
+        self.assertEqual(101, len(uneven))
+        self.assertEqual(1_005, sum(uneven))
+        self.assertEqual({9, 10}, set(uneven))
+
+    def test_heavy_workload_samples_come_from_the_plan(self) -> None:
+        self.assertEqual(50, heavy_workload_samples("file-index-100k"))
+        self.assertEqual(1_000, heavy_workload_samples("ui-activity"))
+        with self.assertRaisesRegex(PgsoError, r"unknown heavy workload: 'x\\x1b'"):
+            heavy_workload_samples("x\x1b")
 
     def test_ui_activity_measurement_requires_hyperfine(self) -> None:
         control = self.root / "heavy" / "control"
