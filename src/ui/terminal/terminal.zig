@@ -1,5 +1,37 @@
+const builtin = @import("builtin");
 const std = @import("std");
+const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
+
+/// Bounded re-poll delay when `EIO` surfaces before `POLLHUP`/`POLLNVAL`.
+pub const hangup_sign_wait_ms: i32 = 5;
+
+extern "c" fn tcgetpgrp(fd: std.posix.fd_t) std.posix.pid_t;
+extern "c" fn getpgrp() std.posix.pid_t;
+
+/// Whether `err` on terminal `fd` happened because the terminal hung up, was
+/// revoked, or no longer has fx's process group in the foreground
+/// (`tests/tla/terminal_hangup/TerminalHangup.tla` `GoneIsQuiet`).
+pub fn terminalGone(fd: std.posix.fd_t, err: anyerror) bool {
+    if (comptime builtin.target.os.tag == .wasi) return false;
+    if (err != error.InputOutput) return false;
+    // macOS XNU poll with events=0 reports no flags on a closed pty; POLL.OUT surfaces POLLHUP and POLLNVAL.
+    var fds = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.OUT,
+        .revents = 0,
+    }};
+    const gone_mask = std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL;
+    _ = std.posix.poll(&fds, 0) catch return false;
+    if ((fds[0].revents & gone_mask) != 0) return true;
+    const fg_pgid = tcgetpgrp(fd);
+    if (fg_pgid > 0 and fg_pgid != getpgrp()) return true;
+    // Error path only: teardown can raise EIO before POLLHUP/POLLNVAL appears (`tests/tla/terminal_hangup/TerminalHangup.tla` `GoneIsQuiet`).
+    io_mod.sleep(@as(u64, @intCast(hangup_sign_wait_ms)) * std.time.ns_per_ms);
+    fds[0].revents = 0;
+    _ = std.posix.poll(&fds, 0) catch return false;
+    return (fds[0].revents & gone_mask) != 0;
+}
 
 pub const interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[>1u\x1b[?2004h\x1b[?7l";
 const tmux_interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[?2004h\x1b[?7l";
@@ -140,4 +172,127 @@ test "interactive mode leaves native terminal scrollback enabled" {
         try std.testing.expect(std.mem.find(u8, sequence, "\x1b[?1002h") == null);
         try std.testing.expect(std.mem.find(u8, sequence, "\x1b[?1006h") == null);
     }
+}
+
+test "terminalGone returns true for InputOutput on a closed TestPty" {
+    const shell_runtime = @import("../shell_runtime.zig");
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |file| file.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+
+    master.?.close(io_mod.getIo());
+    master = null;
+    try std.testing.expect(terminalGone(slave.handle, error.InputOutput));
+}
+
+test "terminalGone returns false for InputOutput on an open TestPty" {
+    const shell_runtime = @import("../shell_runtime.zig");
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+
+    const pty = try shell_runtime.TestPty.open();
+    const master: std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer master.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+
+    try std.testing.expect(!terminalGone(slave.handle, error.InputOutput));
+}
+
+test "terminalGone returns false for non-InputOutput errors" {
+    const shell_runtime = @import("../shell_runtime.zig");
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |file| file.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+
+    master.?.close(io_mod.getIo());
+    master = null;
+    try std.testing.expect(!terminalGone(slave.handle, error.BrokenPipe));
+}
+
+test "terminalGone returns true when a foreign foreground group owns the terminal" {
+    const shell_runtime = @import("../shell_runtime.zig");
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+
+    const ioctl_sctty: c_int = switch (builtin.target.os.tag) {
+        .macos => 0x20007461,
+        .linux => @intCast(std.os.linux.T.IOCSCTTY),
+        else => unreachable,
+    };
+    const pty = try shell_runtime.TestPty.open();
+    const master: std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer master.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+
+    const res_pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    errdefer {
+        _ = std.c.close(res_pipe[0]);
+        _ = std.c.close(res_pipe[1]);
+    }
+    const done_pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    errdefer {
+        _ = std.c.close(done_pipe[0]);
+        _ = std.c.close(done_pipe[1]);
+    }
+
+    const p1 = std.c.fork();
+    if (p1 < 0) return error.Unexpected;
+    if (p1 == 0) {
+        _ = std.c.close(pty.master);
+        _ = std.c.close(res_pipe[0]);
+        _ = std.c.close(done_pipe[1]);
+        _ = std.c.setsid();
+        _ = std.c.ioctl(pty.slave, ioctl_sctty, @as(c_int, 0));
+
+        const p2 = std.c.fork();
+        if (p2 < 0) std.c._exit(2);
+        if (p2 == 0) {
+            _ = std.c.setpgid(0, 0);
+            const msg: []const u8 = if (terminalGone(pty.slave, error.InputOutput)) "OK" else "FAIL";
+            _ = std.c.write(res_pipe[1], msg.ptr, msg.len);
+            std.c._exit(0);
+        }
+        _ = std.c.close(res_pipe[1]);
+        var st: c_int = 0;
+        _ = std.c.waitpid(p2, &st, 0);
+        var wait_done: [1]u8 = undefined;
+        while (true) {
+            const r = std.c.read(done_pipe[0], &wait_done, 1);
+            if (r == 0) break;
+            if (r < 0 and std.posix.errno(r) == .INTR) continue;
+            break;
+        }
+        _ = std.c.close(done_pipe[0]);
+        std.c._exit(0);
+    }
+
+    _ = std.c.close(res_pipe[1]);
+    _ = std.c.close(done_pipe[0]);
+
+    var msg_buf: [16]u8 = undefined;
+    var msg_len: usize = 0;
+    while (msg_len < msg_buf.len) {
+        const n = std.c.read(res_pipe[0], msg_buf[msg_len..].ptr, msg_buf.len - msg_len);
+        if (n == 0) break;
+        if (n < 0) {
+            if (std.posix.errno(n) == .INTR) continue;
+            break;
+        }
+        msg_len += @intCast(n);
+    }
+    _ = std.c.close(res_pipe[0]);
+    _ = std.c.close(done_pipe[1]);
+    var st: c_int = 0;
+    _ = std.c.waitpid(p1, &st, 0);
+
+    try std.testing.expectEqualStrings("OK", msg_buf[0..msg_len]);
 }

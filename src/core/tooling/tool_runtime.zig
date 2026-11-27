@@ -459,10 +459,6 @@ pub fn executeToolCallAuthorized(
         execution_ctx.session_grants = authority.grants;
         execution_ctx.permission_rules = authority.rules;
         execution_ctx.advertised_dynamic_tool_names = authority.integrations;
-        execution_ctx.mcp_access = rebindMcpAuthorityGeneration(
-            execution_ctx.mcp_access,
-            authority.generation,
-        );
     } else {
         execution_ctx.session_grants = request.session_grants;
         execution_ctx.advertised_dynamic_tool_names =
@@ -725,21 +721,6 @@ pub fn executeHostToolCallAuthorized(
         request.call,
     );
     return toolExecutionResultFromDispatch(dispatched, .{});
-}
-
-fn rebindMcpAuthorityGeneration(
-    access: tool_mcp_runtime.Access,
-    authority_generation: u64,
-) tool_mcp_runtime.Access {
-    return switch (access) {
-        .scoped => |scope| .{ .scoped = .{
-            .captured = scope.captured,
-            .admission_authority_generation = scope.admission_authority_generation,
-            .live = scope.live,
-            .action_authority_generation = authority_generation,
-        } },
-        else => access,
-    };
 }
 
 fn containsName(values: []const []const u8, needle: []const u8) bool {
@@ -7395,10 +7376,9 @@ const McpFixture = struct {
         snapshot_rule_count: usize = 0,
     };
 
-    const AuthorityContext = struct {
+    const ScopedCallContext = struct {
         calls: usize = 0,
-        admission_generation: u64 = 0,
-        action_generation: u64 = 0,
+        captured: ?*const mcp_access_policy.View = null,
         expected_runtime_generation: ?u64 = null,
     };
 
@@ -7428,15 +7408,14 @@ const McpFixture = struct {
         return .{ .model_output = try arena.dupe(u8, "mcp ok") };
     }
 
-    fn callRecordingAuthority(raw_ctx: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
-        const ctx: *AuthorityContext = @ptrCast(@alignCast(raw_ctx));
+    fn callRecordingScope(raw_ctx: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
+        const ctx: *ScopedCallContext = @ptrCast(@alignCast(raw_ctx));
         const scope = switch (options.access) {
             .scoped => |value| value,
             else => return error.McpScopedAccessExpected,
         };
         ctx.calls += 1;
-        ctx.admission_generation = scope.admission_authority_generation;
-        ctx.action_generation = scope.action_authority_generation;
+        ctx.captured = scope.captured;
         ctx.expected_runtime_generation = options.expected_runtime_generation;
         return .{ .model_output = try arena.dupe(u8, "mcp ok") };
     }
@@ -7716,7 +7695,7 @@ test "an MCP call that finishes after a cancel is not a cancelled command" {
     try std.testing.expectEqual(false, result.cancelled);
 }
 
-test "MCP execution binds the last live action generation before transport" {
+test "MCP execution gives the transport the child's view and the expected generation, once" {
     const alloc = std.testing.allocator;
     var captured = mcp_access_policy.View{
         .runtime_generation = 1,
@@ -7726,27 +7705,14 @@ test "MCP execution binds the last live action generation before transport" {
         .tools = try alloc.alloc(mcp_access_policy.ToolIdentity, 0),
     };
     defer captured.deinit(alloc);
-    const UnusedLiveProvider = struct {
-        fn resolve(_: *anyopaque, _: Allocator) !tool_mcp_runtime.ResolvedLiveView {
-            return error.TestUnexpectedResult;
-        }
-    };
-    var marker: u8 = 0;
-    var authority = McpFixture.AuthorityContext{};
+    var recorded = McpFixture.ScopedCallContext{};
     var rt = TestRuntime{
-        .mcp_ctx = @ptrCast(&authority),
-        .mcp_call_tool = McpFixture.callRecordingAuthority,
+        .mcp_ctx = @ptrCast(&recorded),
+        .mcp_call_tool = McpFixture.callRecordingScope,
     };
     defer rt.deinit(alloc);
     var tool_ctx = rt.context();
-    tool_ctx.mcp_access = .{ .scoped = .{
-        .captured = &captured,
-        .admission_authority_generation = 17,
-        .live = .{
-            .context = @ptrCast(&marker),
-            .resolve_fn = UnusedLiveProvider.resolve,
-        },
-    } };
+    tool_ctx.mcp_access = .{ .scoped = .{ .captured = &captured } };
     const integrations = [_][]const u8{"mcp_fs_read"};
     const result = try executeToolCallAuthorized(tool_ctx, .{
         .call_allocator = alloc,
@@ -7775,16 +7741,9 @@ test "MCP execution binds the last live action generation before transport" {
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
     try std.testing.expectEqualStrings("mcp ok", result.model_output);
-    try std.testing.expectEqual(@as(usize, 1), authority.calls);
-    try std.testing.expectEqual(@as(u64, 17), authority.admission_generation);
-    try std.testing.expectEqual(@as(u64, 41), authority.action_generation);
-    try std.testing.expectEqual(@as(?u64, 73), authority.expected_runtime_generation);
-    const original_scope = switch (tool_ctx.mcp_access) {
-        .scoped => |scope| scope,
-        else => return error.McpScopedAccessExpected,
-    };
-    try std.testing.expectEqual(@as(u64, 17), original_scope.admission_authority_generation);
-    try std.testing.expectEqual(@as(u64, 0), original_scope.action_authority_generation);
+    try std.testing.expectEqual(@as(usize, 1), recorded.calls);
+    try std.testing.expectEqual(@as(?*const mcp_access_policy.View, &captured), recorded.captured);
+    try std.testing.expectEqual(@as(?u64, 73), recorded.expected_runtime_generation);
 }
 
 test "MCP dynamic tool preserves provider errors without leaking dispatch output" {

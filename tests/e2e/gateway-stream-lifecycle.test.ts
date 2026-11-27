@@ -12940,27 +12940,35 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
     }
   }
 
-  test("an empty reply cut short by the provider's default limit is asked again with a limit", async () => {
-    // A window this large bounds the retry at fx's full-window limit.
+  const EMPTY_CUT_NOTE = "before any text or tool call, likely while thinking. Think less and take one small step now";
+  const lastPromptOf = (body: { prompt: PromptMessage[] }) => JSON.stringify(body.prompt.at(-1));
+
+  test("an empty reply cut short by the provider's default limit gets a note and fx's limit", async () => {
+    // A window this large bounds the next requests at fx's full-window limit.
     const { result, json, bodies, trace } = await askWithReplies("empty-length-retry", [
       emptyLengthLimitedReply,
-      () => fakeGatewayFinalText("answered after the limit retry"),
+      () => fakeGatewayFinalText("answered after the note"),
     ], { context_window: 1_000_000 });
 
     expect(result.code).toBe(0);
-    expect(json.output).toContain("answered after the limit retry");
-    expect(json.final_output).toContain("answered after the limit retry");
+    expect(json.output).toContain("answered after the note");
+    expect(json.final_output).toContain("answered after the note");
     expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
-    expect(json.final_output).not.toContain("ran out of output tokens");
-    // The catalog names no limit, so only the retry sends one.
+    // The catalog names no limit, so only the request after the note sends
+    // one, and the note follows the request alone, without the reasoning.
     expect(bodies).toHaveLength(2);
     expect(bodies[0]!.maxOutputTokens).toBeUndefined();
     expect(bodies[1]!.maxOutputTokens).toBe(32_768);
-    expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with a higher limit.");
-    expect(trace).toContain("event=length_limited_resend");
+    expect(lastPromptOf(bodies[1]!)).toContain(EMPTY_CUT_NOTE);
+    expect(JSON.stringify(bodies[1]!.prompt)).not.toContain("thinking until the provider stops");
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "The reply reached its output limit before any text or tool call. Asking the model to take a smaller step. The next requests allow 32768 output tokens.",
+    );
+    expect(trace).toContain("event=output_limit_cut");
+    expect(trace).toContain("action=act_now");
   }, 40_000);
 
-  test("an empty reply's retry limit stays inside the model's known context window", async () => {
+  test("the limit after an empty reply's note stays inside the model's known context window", async () => {
     const { result, bodies } = await askWithReplies("empty-length-window", [
       emptyLengthLimitedReply,
       () => fakeGatewayFinalText("answered inside the window"),
@@ -12972,35 +12980,40 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
     expect(bodies[1]!.maxOutputTokens).toBe(8_192);
   }, 40_000);
 
-  test("an empty reply still cut short after the retry says so instead of Done.", async () => {
-    const { result, json, bodies } = await askWithReplies("empty-length-twice", [
+  test("an empty reply cut short three times in a row ends the turn and says so instead of Done.", async () => {
+    const { result, json, bodies } = await askWithReplies("empty-length-thrice", [
       emptyLengthLimitedReply,
       emptyLengthLimitedReply,
-      () => fakeGatewayFinalText("a third request must not be sent"),
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("a fourth request must not be sent"),
     ]);
 
-    expect(result.code).toBe(0);
-    expect(bodies).toHaveLength(2);
-    expect(json.final_output).toBe("The reply ran out of output tokens before any text.");
+    expect(result.code).toBe(1);
+    expect(bodies).toHaveLength(3);
+    expect(lastPromptOf(bodies[2]!)).toContain("again before any text or tool call");
+    expect(json.final_output ?? "").toBe("");
+    expect(result.stderr).toContain("tokens 3 times in a row before it was complete, so fx stopped the turn.");
     expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
   }, 40_000);
 
-  test("an empty reply cut short at the catalog's own limit is not asked again when that would repeat the request", async () => {
-    // No lower effort and no higher limit: a resend would be the same request.
+  test("an empty reply cut short at the catalog's own limit gets a note and keeps that limit", async () => {
+    // No higher limit and no lower effort: the note is what changes.
     const { result, json, bodies, trace } = await askWithReplies("empty-length-catalog-limit", [
       emptyLengthLimitedReply,
-      () => fakeGatewayFinalText("a retry must not be sent"),
+      () => fakeGatewayFinalText("answered after the note at the catalog limit"),
     ], { context_window: 200_000, max_tokens: 8_000 });
 
     expect(result.code).toBe(0);
-    expect(bodies).toHaveLength(1);
+    expect(json.final_output).toContain("answered after the note at the catalog limit");
+    expect(bodies).toHaveLength(2);
     expect(bodies[0]!.maxOutputTokens).toBe(8_000);
-    expect(json.final_output).toBe("The reply ran out of output tokens before any text.");
-    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
-    expect(trace).not.toContain("event=length_limited_resend");
+    expect(bodies[1]!.maxOutputTokens).toBe(8_000);
+    expect(lastPromptOf(bodies[1]!)).toContain(EMPTY_CUT_NOTE);
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("The next requests allow");
+    expect(trace).toContain("action=act_now");
   }, 40_000);
 
-  test("an empty reply cut short at the catalog's own limit is asked again once at low effort", async () => {
+  test("an empty reply cut short at the catalog's own limit gets a note and one step at low effort", async () => {
     const { result, json, bodies, trace } = await askWithReplies("empty-length-low-effort", [
       emptyLengthLimitedReply,
       () => fakeGatewayFinalText("answered at low effort"),
@@ -13013,16 +13026,46 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
     expect(result.code).toBe(0);
     expect(json.final_output).toContain("answered at low effort");
     expect(bodies).toHaveLength(2);
-    // The catalog's limit stays; only the effort changes.
+    // The catalog's limit stays; the effort changes, and the note goes along.
     expect(bodies[0]!.maxOutputTokens).toBe(8_000);
     expect(bodies[1]!.maxOutputTokens).toBe(8_000);
     expect(bodies[0]!.reasoning).toBeUndefined();
     expect(bodies[1]!.reasoning).toBe("low");
-    expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with low effort.");
-    expect(trace).toContain("event=length_limited_resend");
+    expect(lastPromptOf(bodies[1]!)).toContain(EMPTY_CUT_NOTE);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("Asking the model to take a smaller step, at low effort.");
+    expect(trace).toContain("event=output_limit_cut");
   }, 40_000);
 
-  test("a reply that spent its limit before a cut-off tool call is resent at low effort without running the call", async () => {
+  // The reply wrote part of its answer before the limit ran out.
+  const cutTextReply = (part: string) => () => fakeGatewaySse([
+    { type: "text-start", id: "cut_text" },
+    { type: "text-delta", id: "cut_text", delta: part },
+    { type: "text-end", id: "cut_text" },
+    {
+      type: "finish",
+      finishReason: { unified: "length", raw: "length" },
+      usage: { inputTokens: { total: 3 }, outputTokens: { total: 4096 } },
+    },
+  ]);
+
+  test("an answer cut at its output limit goes on from where it stopped and is saved whole", async () => {
+    const { result, json, bodies, trace } = await askWithReplies("cut-text-continue", [
+      cutTextReply("The first half of the answer"),
+      () => fakeGatewayFinalText(", and the second half."),
+    ], { context_window: 1_000_000 });
+
+    expect(result.code).toBe(0);
+    expect(json.final_output).toBe("The first half of the answer, and the second half.");
+    expect(bodies).toHaveLength(2);
+    // The cut text goes back to the model, then the note to go on from it.
+    expect(JSON.stringify(bodies[1]!.prompt.at(-2))).toContain("The first half of the answer");
+    expect(lastPromptOf(bodies[1]!)).toContain("Continue exactly where it stopped, without repeating it.");
+    expect(bodies[1]!.maxOutputTokens).toBe(32_768);
+    expect(result.stderr).toContain("Asking the model to continue from where it stopped.");
+    expect(trace).toContain("action=continue_text");
+  }, 40_000);
+
+  test("a reply that spent its limit before a cut-off tool call is asked for again in smaller steps at low effort without running the call", async () => {
     const { result, json, bodies, trace, cutCallRan } = await askWithReplies("cut-tool-call-resend", [
       cutToolCallReply,
       () => fakeGatewayToolCall("listed", "glob_files", { pattern: "*" }),
@@ -13042,19 +13085,22 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
     expect(bodies[1]!.reasoning).toBe("low");
     // The lower effort is for the resend only; the next step goes back.
     expect(bodies[2]!.reasoning).toBeUndefined();
-    // The cut-off call never reaches the model's history.
+    // The cut-off call never reaches the model's history; the note says why.
     expect(JSON.stringify(bodies[1])).not.toContain(CUT_CALL_SENTINEL);
-    expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with low effort.");
+    expect(JSON.stringify(bodies[1])).toContain("Your last reply reached the output limit of 8000 tokens before its tool call to shell was complete, so fx did not run it.");
+    expect(`${result.stdout}\n${result.stderr}`).toContain("Asking the model to do it in smaller steps, at low effort.");
     expect(result.stderr).not.toContain("did not run them");
-    expect(trace).toContain("event=length_limited_resend");
-    expect(trace).toContain("dropped_tool_calls=1");
+    expect(trace).toContain("event=output_limit_cut");
+    expect(trace).toContain("action=ask_smaller_steps");
+    expect(trace).toContain("cut_calls=1");
   }, 40_000);
 
-  test("a resent reply cut off again ends the turn without running either call", async () => {
+  test("a third reply cut off in a row ends the turn without running any of the calls", async () => {
     const { result, bodies, trace, cutCallRan } = await askWithReplies("cut-tool-call-twice", [
       cutToolCallReply,
       cutToolCallReply,
-      () => fakeGatewayFinalText("a third request must not be sent"),
+      cutToolCallReply,
+      () => fakeGatewayFinalText("a fourth request must not be sent"),
     ], {
       context_window: 1_050_000,
       max_tokens: 8_000,
@@ -13062,10 +13108,13 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
     });
 
     expect(result.code).toBe(1);
-    expect(bodies).toHaveLength(2);
+    expect(bodies).toHaveLength(3);
+    // Only the step after the first note reasons less.
     expect(bodies[1]!.reasoning).toBe("low");
+    expect(bodies[2]!.reasoning).toBeUndefined();
+    expect(JSON.stringify(bodies[2])).toContain("Your last reply reached the output limit of 8000 tokens again before its tool call to shell was complete");
     expect(cutCallRan).toBe(false);
-    expect(result.stderr).toContain("so I did not run them");
+    expect(result.stderr).toContain("The reply reached the output limit of 8000 tokens 3 times in a row before its tool calls were complete, so fx did not run them.");
     expect(result.stderr).not.toContain("preserved above");
     expect(trace).toContain("event=provider_completion_blocked");
   }, 40_000);
@@ -14945,7 +14994,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
     }
   });
 
-  test("default ask fails length-truncated tool completion without executing or continuing", async () => {
+  test("default ask ends a turn whose replies are cut off three times in a row without executing", async () => {
     const root = createFixtureRoot("default-length-tool");
     const tracePath = join(root.root, "trace.log");
     const sentinelPath = join(root.workspace, "command-must-not-run.txt");
@@ -14971,9 +15020,10 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       expect(json.output).not.toContain("did not run them");
       expect(json.tool_calls).toEqual([]);
       expect(result.stderr).toContain("response hit provider length limit");
-      expect(result.stderr).toContain("so I did not run them");
+      expect(result.stderr).toContain("3 times in a row before its tool calls were complete, so fx did not run them.");
       expect(existsSync(sentinelPath)).toBe(false);
-      expect(gateway.requestCount()).toBe(1);
+      // Two notes, then the third cut reply in a row ends the turn.
+      expect(gateway.requestCount()).toBe(3);
       expect(trace).toContain("event=provider_completion_blocked");
       expect(trace).toContain("outcome_kind=provider_length");
 
@@ -15013,7 +15063,8 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       expect(result.stdout).toContain("visible partial output");
       expect(result.stderr).toContain("response hit provider length limit");
       expect(existsSync(sentinelPath)).toBe(false);
-      expect(gateway.requestCount()).toBe(1);
+      // Two notes, then the third cut reply in a row ends the turn.
+      expect(gateway.requestCount()).toBe(3);
       expect(trace).toContain("event=provider_completion_blocked");
       expect(trace).toContain("finish_reason=length");
 
@@ -16220,6 +16271,13 @@ function messageCall(id: string, message: string) {
 
 const toolCallsFinish = { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } };
 
+// The text of the first marker a test hold wrote, or "" when the hold never
+// fired. A helper reads it before its fixture folder goes.
+function firstHeldMarker(heldMarker: string) {
+  const path = `${heldMarker}.1`;
+  return existsSync(path) ? readFileSync(path, "utf8") : "";
+}
+
 async function runStopMessage(
   label: string,
   main: (raw: string, state: StopMessageState) => Promise<Response | undefined>,
@@ -16266,16 +16324,17 @@ async function runStopMessage(
       },
       timeoutMs: 60_000,
     });
-    return { result, state };
+    return { result, state, heldMarker: firstHeldMarker(state.heldMarker) };
   } finally {
     writeFileSync(state.release, "");
     held.release("STOPMSG_FIRST_LATE");
     gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
   }
 }
 
 test("a message right after a stop starts the subagent's next turn", async () => {
-  const { result, state } = await runStopMessage("stop-then-message", async (raw, state) => {
+  const { result, state, heldMarker } = await runStopMessage("stop-then-message", async (raw, state) => {
     if (raw.includes("stopmsg-redirect")) {
       state.afterStop.push(raw);
       writeFileSync(state.release, "");
@@ -16293,7 +16352,7 @@ test("a message right after a stop starts the subagent's next turn", async () =>
     return undefined;
   });
   expect(state.afterStop.length).toBe(1);
-  expect(readFileSync(`${state.heldMarker}.1`, "utf8")).toContain("by=parent");
+  expect(heldMarker).toContain("by=parent");
   expect(toolResultText(state.afterStop[0]!, "stopmsg-stop")).toContain("Stopped worker: its turn ended");
   const message = toolResultText(state.afterStop[0]!, "stopmsg-redirect");
   expect(message).not.toContain("child_cancelled");
@@ -16398,6 +16457,7 @@ test("a wait that starts as a subagent's work ends with nothing to report still 
   } finally {
     writeFileSync(settleRelease, "");
     gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
   }
 }, 60_000);
 
@@ -16458,6 +16518,7 @@ test("a test hold set to a relative path is ignored", async () => {
   } finally {
     held.release("RELHOLD_TASK_LATE");
     gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
   }
 }, 60_000);
 
@@ -16516,16 +16577,17 @@ async function runCloseMessage(
       },
       timeoutMs: 60_000,
     });
-    return { result, state };
+    return { result, state, heldMarker: firstHeldMarker(state.heldMarker) };
   } finally {
     writeFileSync(state.release, "");
     held.release("CLOSEMSG_FIRST_LATE");
     gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
   }
 }
 
 test("a message to a subagent whose close is not written yet is refused", async () => {
-  const { result, state } = await runCloseMessage("close-then-message", async (raw, state) => {
+  const { result, state, heldMarker } = await runCloseMessage("close-then-message", async (raw, state) => {
     if (raw.includes("closemsg-message")) {
       state.afterMessage.push(raw);
       writeFileSync(state.release, "");
@@ -16544,7 +16606,7 @@ test("a message to a subagent whose close is not written yet is refused", async 
     return undefined;
   });
   expect(state.afterMessage.length).toBe(1);
-  expect(readFileSync(`${state.heldMarker}.1`, "utf8")).toContain("close_write child=");
+  expect(heldMarker).toContain("close_write child=");
   expect(toolResultText(state.afterMessage[0]!, "closemsg-close")).toContain("Closed worker");
   // The message was refused at once, not held behind the close, and no turn
   // started for the closed subagent.
@@ -16593,16 +16655,17 @@ async function runPublishGap(label: string, action: "stop" | "close") {
       },
       timeoutMs: 60_000,
     });
-    return { result, state };
+    return { result, state, heldMarker: firstHeldMarker(state.heldMarker) };
   } finally {
     writeFileSync(state.release, "");
     gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
   }
 }
 
 test("a stop right after a subagent's turn ended finds it not working", async () => {
-  const { result, state } = await runPublishGap("publish-gap-stop", "stop");
-  expect(readFileSync(`${state.heldMarker}.1`, "utf8")).toContain("publish child=");
+  const { result, state, heldMarker } = await runPublishGap("publish-gap-stop", "stop");
+  expect(heldMarker).toContain("publish child=");
   expect(state.childRequests).toBe(1);
   expect(state.answer).toContain("worker was not working.");
   expect(state.answer).not.toContain("Stopped");
@@ -16610,8 +16673,8 @@ test("a stop right after a subagent's turn ended finds it not working", async ()
 }, 90_000);
 
 test("a close right after a subagent's turn ended closes it as an idle one", async () => {
-  const { result, state } = await runPublishGap("publish-gap-close", "close");
-  expect(readFileSync(`${state.heldMarker}.1`, "utf8")).toContain("publish child=");
+  const { result, state, heldMarker } = await runPublishGap("publish-gap-close", "close");
+  expect(heldMarker).toContain("publish child=");
   expect(state.childRequests).toBe(1);
   expect(state.answer).toContain("Closed worker. A later message to worker starts a new one.");
   expect(state.answer).not.toContain("ending its turn");
@@ -16719,6 +16782,7 @@ async function runStartGap(label: string, options: { releaseWhenWaiting: boolean
   } finally {
     release();
     gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
   }
 }
 
