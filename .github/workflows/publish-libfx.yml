@@ -444,6 +444,50 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: libfx-package
+      # npm can take minutes to show a new version, so the comparison below
+      # failed with ETARGET for v0.0.17 and v0.0.18 and passed on a rerun.
+      # Only a version npm does not show yet is waited for, and only until
+      # the deadline.
+      - name: Wait for npm to show every published package
+        env:
+          LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          deadline_seconds=600
+          poll_interval_seconds=15
+          deadline=$((SECONDS + deadline_seconds))
+          names=()
+          for archive in libfx-package.tgz libfx-native/*.tgz; do
+            names+=("$(tar -xzOf "$archive" package/package.json | jq -r .name)")
+          done
+          while true; do
+            missing=()
+            for name in "${names[@]}"; do
+              status=0
+              output=$(npm view "${name}@${LIBFX_VERSION}" version --json --prefer-online --registry=https://registry.npmjs.org/ 2>/tmp/npm-view.err) || status=$?
+              if [ "$status" -eq 0 ] && [ "$(jq -r . <<<"$output" 2>/dev/null)" = "$LIBFX_VERSION" ]; then
+                continue
+              fi
+              code=$(jq -r '.error.code? // empty' <<<"$output" 2>/dev/null) || code=""
+              if [ "$status" -ne 0 ] && { [ "$code" = E404 ] || [ "$code" = ETARGET ]; }; then
+                missing+=("${name}@${LIBFX_VERSION}")
+                continue
+              fi
+              cat /tmp/npm-view.err >&2
+              echo "::error::npm view ${name}@${LIBFX_VERSION} failed with exit ${status} and code '${code}': ${output}"
+              exit 1
+            done
+            if [ "${#missing[@]}" -eq 0 ]; then
+              echo "npm shows ${names[*]} at ${LIBFX_VERSION}"
+              break
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::npm still does not show ${missing[*]} after ${deadline_seconds} seconds"
+              exit 1
+            fi
+            echo "npm does not show ${missing[*]} yet; checking again in ${poll_interval_seconds} seconds"
+            sleep "$poll_interval_seconds"
+          done
       # Byte-identical registry archives are the packages that already passed
       # the smoke test above, so comparing bytes is the whole verification.
       - name: Download and compare the immutable registry versions
