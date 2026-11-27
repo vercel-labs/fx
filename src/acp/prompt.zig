@@ -203,6 +203,13 @@ fn yieldedTurnStop(err: anyerror) ?TerminalOutcome {
     return if (err == error.TurnYielded) .{ .stop_reason = .yielded } else null;
 }
 
+fn noInterruptedTurn() TerminalOutcome {
+    return .{ .rpc_error = .{
+        .code = ErrorCode.invalid_params,
+        .message = "No interrupted turn to resume",
+    } };
+}
+
 /// Sent to the client when the content filter blocked a reply and every
 /// resend of it.
 const content_filter_refusal_text = "Blocked by the content filter. Change your request and send it again.";
@@ -1403,6 +1410,16 @@ pub fn handlePromptWithInputId(
 
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
     defer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
+    var continued_turn: ?worker_runtime.ContinuedTurn = null;
+    var recovery_resume: ?types.RecoveryResume = null;
+    // A native resume takes its turn out of the history until `beginTurn`
+    // writes it. Any error before that puts the turn back and drops the
+    // continuation's base.
+    var native_taken: ?session_runtime.SessionRuntime.TakenTurn = null;
+    defer if (native_taken) |taken| {
+        session.session_rt.returnNewestTurn(taken);
+        session.v2.?.setContinuesYielded(null);
+    };
     if (session.journal) |*journal| {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -1444,6 +1461,31 @@ pub fn handlePromptWithInputId(
                 .call_ids = prompt_input.rerun_call_ids,
             }, ctx.observer);
         };
+    } else if (prompt_input.continue_recovery and session.v2 != null) {
+        // A native session continues the turn its log left open, as the same turn.
+        const v2 = session.v2.?;
+        const found = (try v2.interruptedRequest()) orelse return noInterruptedTurn();
+        if (prompt_input.rerun_call_ids.len > 0) {
+            // A native log has no journal to answer a rerun from, so the ids are dropped.
+            debug_trace.logf("session", "event=acp_resume_rerun_ignored count={d}", .{prompt_input.rerun_call_ids.len});
+        }
+        native_taken = session.session_rt.takeNewestTurn() orelse return noInterruptedTurn();
+        const entry = switch (native_taken.?.turn) {
+            .interrupted => |value| value,
+            else => return noInterruptedTurn(),
+        };
+        recovery_checkpoint = try session_codec.stoppedTurnCheckpoint(
+            alloc,
+            entry,
+            session.provider,
+            session.model,
+            if (found.yielded) .yielded else .interrupted,
+        );
+        // The log holds the turn's own pieces; the continuation writes only the notice.
+        v2.setContinuesYielded(&entry.execution);
+        continued_turn = if (found.yielded) .yielded else .stopped;
+        // No age is passed, so a turn of any age continues at once.
+        recovery_resume = .{ .record = found.record, .stale = false };
     } else if (prompt_input.continue_recovery) {
         return .{
             .rpc_error = .{
@@ -1486,6 +1528,11 @@ pub fn handlePromptWithInputId(
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
         try v2.beginTurn();
+        // The turn is on disk now, so the taken copy is no longer needed.
+        if (native_taken) |taken| {
+            types.freeHistoryTurn(state.alloc, taken.turn);
+            native_taken = null;
+        }
     }
 
     var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
@@ -1554,6 +1601,8 @@ pub fn handlePromptWithInputId(
             .omission_summary = prompt_input.omission_summary,
         },
         .recovery_checkpoint = recovery_checkpoint,
+        .continuation = continued_turn,
+        .recovery_resume = recovery_resume,
         // An ACP client keeps what the turn sent before it stopped; an engine
         // in a new process says it holds none of it.
         .recovery_source_already_presented = recovery_checkpoint != null and !prompt_input.fresh_output,
