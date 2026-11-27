@@ -2036,7 +2036,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .mcp_access = ctx.mcp_access,
         .mcp_access_changed = ctx.mcp_access_changed,
         .mcp_input_responder = ctx.mcp_input_responder,
-        .mcp_permission_rules = mcpRulesOf(ctx),
+        .permission_rules = mcpRulesOf(ctx),
     };
 }
 
@@ -7475,7 +7475,7 @@ test "every MCP reader takes the host's rules outside full access and none in it
         rt.permission_mode = case.mode;
         const context = rt.context();
 
-        try std.testing.expectEqual(case.rules, typedDispatchContext(context, arena).mcp_permission_rules.rules.len);
+        try std.testing.expectEqual(case.rules, typedDispatchContext(context, arena).permission_rules.rules.len);
 
         permission_context.schema_rule_count = 99;
         _ = try resolveUnselectedMcpTool(context, arena, "mcp_fs_read");

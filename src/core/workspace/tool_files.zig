@@ -30,6 +30,17 @@ pub const Options = struct {
     include_hidden_in_repository: bool = false,
 };
 
+/// Hides the files a search's own deny rules cover. `hides` runs on scan workers, so
+/// `hides_fn` must be safe to call from several threads at once.
+pub const FileFilter = struct {
+    context: *const anyopaque,
+    hides_fn: *const fn (context: *const anyopaque, absolute_path: []const u8) bool,
+
+    pub fn hides(self: FileFilter, absolute_path: []const u8) bool {
+        return self.hides_fn(self.context, absolute_path);
+    }
+};
+
 pub const Listing = struct {
     /// Relative to the search root, sorted bytewise. Owned by the arena.
     files: []const []const u8,

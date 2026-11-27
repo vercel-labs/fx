@@ -69,7 +69,7 @@ pub fn collectDirectoryMatches(
     case_insensitive: bool,
     include: ?glob_pattern.Pattern,
 ) !Result {
-    return collectDirectoryMatchesWithIgnored(scratch, arena, workspace_root, absolute_root, pattern, case_insensitive, tool_files.default_skipped_names, include);
+    return collectDirectoryMatchesWithIgnored(scratch, arena, workspace_root, absolute_root, pattern, case_insensitive, tool_files.default_skipped_names, include, null);
 }
 
 pub fn collectDirectoryMatchesWithIgnored(
@@ -81,8 +81,9 @@ pub fn collectDirectoryMatchesWithIgnored(
     case_insensitive: bool,
     ignored_names: []const []const u8,
     include: ?glob_pattern.Pattern,
+    hidden: ?tool_files.FileFilter,
 ) !Result {
-    return collectDirectoryMatchesWithOptions(scratch, arena, workspace_root, absolute_root, pattern, case_insensitive, ignored_names, include, .{});
+    return collectDirectoryMatchesWithOptions(scratch, arena, workspace_root, absolute_root, pattern, case_insensitive, ignored_names, include, hidden, .{});
 }
 
 pub fn countDirectoryMatchesWithIgnored(
@@ -94,8 +95,9 @@ pub fn countDirectoryMatchesWithIgnored(
     case_insensitive: bool,
     ignored_names: []const []const u8,
     include: ?glob_pattern.Pattern,
+    hidden: ?tool_files.FileFilter,
 ) !CountResult {
-    return countDirectoryMatchesWithOptions(scratch, arena, workspace_root, absolute_root, pattern, case_insensitive, ignored_names, include, .{});
+    return countDirectoryMatchesWithOptions(scratch, arena, workspace_root, absolute_root, pattern, case_insensitive, ignored_names, include, hidden, .{});
 }
 
 fn collectDirectoryMatchesWithOptions(
@@ -107,12 +109,13 @@ fn collectDirectoryMatchesWithOptions(
     case_insensitive: bool,
     ignored_names: []const []const u8,
     include: ?glob_pattern.Pattern,
+    hidden: ?tool_files.FileFilter,
     list_options: tool_files.Options,
 ) !Result {
     const listing = try listCandidates(scratch, arena, workspace_root, absolute_root, ignored_names, list_options);
     var matches: std.ArrayList(Match) = .empty;
     errdefer matches.deinit(arena);
-    const truncated_reason = try scanCandidateList(scratch, arena, workspace_root, absolute_root, listing.files, pattern, case_insensitive, include, &matches);
+    const truncated_reason = try scanCandidateList(scratch, arena, workspace_root, absolute_root, listing.files, pattern, case_insensitive, include, hidden, &matches);
     return finishMatches(arena, &matches, truncated_reason, .fromListing(listing));
 }
 
@@ -125,11 +128,12 @@ fn countDirectoryMatchesWithOptions(
     case_insensitive: bool,
     ignored_names: []const []const u8,
     include: ?glob_pattern.Pattern,
+    hidden: ?tool_files.FileFilter,
     list_options: tool_files.Options,
 ) !CountResult {
     const listing = try listCandidates(scratch, arena, workspace_root, absolute_root, ignored_names, list_options);
     var count_result: CountResult = .{ .candidate_cap = listing.candidate_cap };
-    try countCandidateList(scratch, workspace_root, absolute_root, listing.files, pattern, case_insensitive, include, &count_result);
+    try countCandidateList(scratch, workspace_root, absolute_root, listing.files, pattern, case_insensitive, include, hidden, &count_result);
     return finishCount(count_result, .fromListing(listing));
 }
 
@@ -260,6 +264,7 @@ fn resolveCandidateFile(
     workspace_root: []const u8,
     provider_root: []const u8,
     candidate: []const u8,
+    hidden: ?tool_files.FileFilter,
     absolute_match_buf: []u8,
 ) !?CandidateFile {
     const absolute_match = joinAbsolutePathScratch(absolute_match_buf, provider_root, candidate) catch |err| {
@@ -271,12 +276,15 @@ fn resolveCandidateFile(
         return null;
     };
     if (entry_kind != .file and entry_kind != .sym_link) return null;
+    if (hidden) |filter| if (filter.hides(absolute_match)) return null;
 
     const read_path = resolveDirectoryEntryTarget(arena, workspace_root, absolute_match, entry_kind) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("core", "grep_files scan skipped path={s} err={s}", .{ absolute_match, @errorName(err) });
         return null;
     } orelse return null;
+    // A link is searched by what it points to, as `read_file` reads it.
+    if (hidden) |filter| if (entry_kind == .sym_link and filter.hides(read_path)) return null;
 
     return .{
         .display_path = absolute_match,
@@ -312,6 +320,7 @@ const ParallelScan = struct {
     case_insensitive: bool,
     mode: ScanMode,
     outcomes: []FileOutcome,
+    hidden: ?tool_files.FileFilter = null,
     /// Candidate resolution and per-file matches, one arena per worker over
     /// the thread-safe scratch allocator. Threads never share an arena: a
     /// shared `std.heap.ArenaAllocator` can hand one thread bytes that another
@@ -352,7 +361,7 @@ const ParallelScan = struct {
 
     fn scanOne(self: *ParallelScan, work: Allocator, index: usize) Allocator.Error!void {
         var absolute_match_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const candidate_file = try resolveCandidateFile(work, self.workspace_root, self.provider_root, self.files[index], absolute_match_buf[0..]) orelse return;
+        const candidate_file = try resolveCandidateFile(work, self.workspace_root, self.provider_root, self.files[index], self.hidden, absolute_match_buf[0..]) orelse return;
         switch (self.mode) {
             .matches => {
                 var local: std.ArrayList(Match) = .empty;
@@ -454,6 +463,7 @@ fn scanCandidateList(
     pattern: []const u8,
     case_insensitive: bool,
     include: ?glob_pattern.Pattern,
+    hidden: ?tool_files.FileFilter,
     matches: *std.ArrayList(Match),
 ) !?TruncatedReason {
     var work_state = std.heap.ArenaAllocator.init(scratch);
@@ -461,6 +471,7 @@ fn scanCandidateList(
     const work = work_state.allocator();
     const files = try selectCandidates(work, candidates, include);
     var scan = try initParallelScan(work, scratch, workspace_root, provider_root, files, pattern, case_insensitive, .matches);
+    scan.hidden = hidden;
     defer scan.deinit();
     runParallelScan(&scan);
     return mergeMatches(arena, &scan, matches);
@@ -490,6 +501,7 @@ fn countCandidateList(
     pattern: []const u8,
     case_insensitive: bool,
     include: ?glob_pattern.Pattern,
+    hidden: ?tool_files.FileFilter,
     count_result: *CountResult,
 ) !void {
     var work_state = std.heap.ArenaAllocator.init(scratch);
@@ -497,6 +509,7 @@ fn countCandidateList(
     const work = work_state.allocator();
     const files = try selectCandidates(work, candidates, include);
     var scan = try initParallelScan(work, scratch, workspace_root, provider_root, files, pattern, case_insensitive, .count);
+    scan.hidden = hidden;
     defer scan.deinit();
     runParallelScan(&scan);
     // A count needs every file.
@@ -1302,6 +1315,7 @@ test "grep_files path narrowing applies before candidate cap" {
         false,
         tool_files.default_skipped_names,
         null,
+        null,
         .{ .candidate_cap = 1 },
     );
 
@@ -1430,7 +1444,7 @@ test "grep search parallel scan matches single-threaded order and cap truncation
             try std.testing.expectEqual(2 * (position % 2) + 1, match.line_number);
         }
 
-        const counted = try countDirectoryMatchesWithIgnored(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, tool_files.default_skipped_names, null);
+        const counted = try countDirectoryMatchesWithIgnored(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, tool_files.default_skipped_names, null, null);
         try std.testing.expectEqual(@as(usize, 3000), counted.matching_lines);
         try std.testing.expectEqual(@as(usize, 1500), counted.matching_files);
     }
@@ -1486,4 +1500,36 @@ test "grep fails for running out of memory only before the cut" {
     before.out_of_memory_from = batch_files;
     var partial: std.ArrayList(Match) = .empty;
     try std.testing.expectError(error.OutOfMemory, mergeMatches(work, &before, &partial));
+}
+
+fn hidesSecretFolder(_: *const anyopaque, absolute_path: []const u8) bool {
+    return std.mem.find(u8, absolute_path, "/secret/") != null;
+}
+
+test "grep search leaves out files a filter hides, and links that lead to them" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const secret = try writeTempFile(alloc, &tmp, "secret/k.txt", "needle secret\n");
+    defer alloc.free(secret);
+    const open = try writeTempFile(alloc, &tmp, "src/a.txt", "needle open\n");
+    defer alloc.free(open);
+    try createSymlinkOrSkip(&tmp, "secret/k.txt", "alias.txt");
+    const unused_context: u8 = 0;
+    const filter: tool_files.FileFilter = .{ .context = &unused_context, .hides_fn = hidesSecretFolder };
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatchesWithIgnored(alloc, arena_state.allocator(), workspace, workspace, "needle", false, tool_files.default_skipped_names, null, filter);
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "src/a.txt"));
+
+    const counted = try countDirectoryMatchesWithIgnored(alloc, arena_state.allocator(), workspace, workspace, "needle", false, tool_files.default_skipped_names, null, filter);
+    try std.testing.expectEqual(@as(usize, 1), counted.matching_files);
+    try std.testing.expectEqual(@as(usize, 1), counted.matching_lines);
+
+    const unfiltered = try collectDirectoryMatchesWithIgnored(alloc, arena_state.allocator(), workspace, workspace, "needle", false, tool_files.default_skipped_names, null, null);
+    try std.testing.expectEqual(@as(usize, 3), unfiltered.matches.len);
 }

@@ -81,7 +81,7 @@ fn searchMcp(
         runtime_context,
         ctx.allocator,
         request,
-        ctx.mcp_permission_rules,
+        ctx.permission_rules,
         limits,
         ctx.mcp_access,
         ctx.cancel_flag,

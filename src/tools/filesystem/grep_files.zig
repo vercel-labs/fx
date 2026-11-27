@@ -9,7 +9,10 @@ const pathing = @import("../../core/workspace/pathing.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
+const permissions = @import("../../core/permissions/permissions.zig");
+const workspace_access = @import("../../core/workspace/workspace_access.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
+const types = @import("../../core/shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -173,6 +176,7 @@ const CollectDirectoryFn = *const fn (
     bool,
     []const []const u8,
     ?glob_pattern.Pattern,
+    ?tool_files.FileFilter,
 ) anyerror!grep_search.Result;
 const CollectFileFn = *const fn (
     Allocator,
@@ -191,6 +195,7 @@ const CountDirectoryFn = *const fn (
     bool,
     []const []const u8,
     ?glob_pattern.Pattern,
+    ?tool_files.FileFilter,
 ) anyerror!grep_search.CountResult;
 const CountFileFn = *const fn (
     Allocator,
@@ -268,12 +273,18 @@ fn searchGrepRoot(
     include_pattern: ?glob_pattern.Pattern,
     ops: CallOps,
 ) tool_dispatch.DispatchError!SearchOutcome {
+    const search_deny = permissions.SearchDeny.init(
+        ctx.permission_rules,
+        ctx.access_scope orelse workspace_access.AccessScope.primaryOnly(ctx.workspace_root),
+        "grep_files",
+    );
+    const hidden: ?tool_files.FileFilter = if (search_deny) |*deny| deny.filter() else null;
     return switch (root_stat.kind) {
         .directory => switch (input.mode) {
-            .count => .{ .count = ops.count_directory(ctx.scratch_allocator, arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern) catch |err| {
+            .count => .{ .count = ops.count_directory(ctx.scratch_allocator, arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern, hidden) catch |err| {
                 return searchFailure(ctx.allocator, absolute_root, "walk grep search root", err);
             } },
-            .matches, .files_with_matches => .{ .matches = ops.collect_directory(ctx.scratch_allocator, arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern) catch |err| {
+            .matches, .files_with_matches => .{ .matches = ops.collect_directory(ctx.scratch_allocator, arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern, hidden) catch |err| {
                 return searchFailure(ctx.allocator, absolute_root, "walk grep search root", err);
             } },
         },
@@ -816,6 +827,7 @@ fn failingCollectDirectory(
     _: bool,
     _: []const []const u8,
     _: ?glob_pattern.Pattern,
+    _: ?tool_files.FileFilter,
 ) anyerror!grep_search.Result {
     return error.InjectedWalkFailure;
 }
@@ -1490,4 +1502,60 @@ test "grep_files classifiers are read-only and reversible" {
 
     try std.testing.expect(readsOnly(erased));
     try std.testing.expect(!isIrreversible(erased));
+}
+
+fn denyRules(permission: []const u8, pattern: []const u8) [1]types.PermissionRule {
+    return .{.{ .permission = @constCast(permission), .pattern = @constCast(pattern), .action = .deny }};
+}
+
+test "grep_files leaves out files a deny rule covers when the search starts above them" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const secret = try writeTempFile(alloc, &tmp, "secret/k.txt", "needle secret\n");
+    defer alloc.free(secret);
+    const open = try writeTempFile(alloc, &tmp, "src/a.txt", "needle open\n");
+    defer alloc.free(open);
+    var rules = denyRules("grep", "secret/**");
+
+    var input = Input{
+        .pattern = try alloc.dupe(u8, "needle"),
+        .path = try alloc.dupe(u8, "."),
+        .include = null,
+        .case_insensitive = false,
+        .head_limit = output_cap,
+        .offset = 0,
+    };
+    defer input.deinit(alloc);
+    const erased = tool_dispatch.ToolInput{ .ptr = &input, .deinit_fn = noopInputDeinit };
+    const ctx = tool_dispatch.DispatchContext{
+        .allocator = alloc,
+        .scratch_allocator = alloc,
+        .workspace_root = workspace,
+        .permission_rules = .{ .rules = &rules },
+    };
+
+    var matches = try callWithOps(ctx, erased, .{});
+    defer matches.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, matches.success, "src/a.txt") != null);
+    try std.testing.expect(std.mem.find(u8, matches.success, "secret") == null);
+
+    input.mode = .count;
+    var counted = try callWithOps(ctx, erased, .{});
+    defer counted.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, counted.success, "[grep] count 1 matching lines in 1 files for needle"));
+
+    // A rule for another tool does not hide anything from this one.
+    var read_rules = denyRules("read", "secret/**");
+    input.mode = .matches;
+    var unaffected = try callWithOps(.{
+        .allocator = alloc,
+        .scratch_allocator = alloc,
+        .workspace_root = workspace,
+        .permission_rules = .{ .rules = &read_rules },
+    }, erased, .{});
+    defer unaffected.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, unaffected.success, "secret/k.txt") != null);
 }
