@@ -620,14 +620,6 @@ fn waitingClientGone(fd: posix.socket_t) bool {
     }
 }
 
-fn ownerIdForTokenLocked(token: mcp_call.Token) u32 {
-    for (bridge.state.owners) |slot| {
-        const owner = slot orelse continue;
-        if (std.crypto.timing_safe.eql(mcp_call.Token, owner.token, token)) return @backingInt(owner.id);
-    }
-    return 0;
-}
-
 /// Watches a served connection and reports its client leaving.
 const Watch = struct {
     fd: posix.socket_t,
@@ -784,10 +776,17 @@ fn admit(io: std.Io, stream: std.Io.net.Stream, request: wire.Request) ?Admitted
 
 /// Starts a request's follow wait. Called with `bridge.mutex` held.
 fn startWaitLocked(io: std.Io, token: mcp_call.Token) Waiting {
-    const owner_id = ownerIdForTokenLocked(token);
-    const registration = for (bridge.registrations.items) |item| {
-        if (@backingInt(item.owner) == owner_id) break item;
-    } else null;
+    const owner = mcp_call.ownerOf(bridge.state, token);
+    const owner_id: u32 = if (owner) |id| @backingInt(id) else 0;
+    var registration: ?*Registration = null;
+    if (owner) |id| {
+        for (bridge.registrations.items) |item| {
+            if (item.owner == id) {
+                registration = item;
+                break;
+            }
+        }
+    }
     if (registration) |item| item.waiters += 1;
     debug_trace.logf("mcp-call", "request waits for a shell call to follow its command owner={d}", .{owner_id});
     bridge.waiting_follows += 1;

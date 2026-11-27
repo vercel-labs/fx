@@ -387,7 +387,8 @@ fn replyOutcome(outcome: Outcome) ReplyOutcome {
 
 /// The owner whose token this is. Every registered token is compared in
 /// constant time, so the time taken says nothing about which one matched.
-fn ownerOf(state: State, token: Token) ?OwnerId {
+/// The owner that holds `token`, compared in constant time, or null when none does.
+pub fn ownerOf(state: State, token: Token) ?OwnerId {
     var found: ?OwnerId = null;
     for (state.owners) |slot| {
         const owner = slot orelse continue;

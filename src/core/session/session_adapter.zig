@@ -7351,7 +7351,7 @@ fn checkWorkspaceCapture(alloc: Allocator, payload: []const u8) error{ OutOfMemo
 }
 
 /// A call a command made through `fx mcp call`, saved in the open turn as it
-/// ends, while its shell call still runs. Its data is a
+/// ends, while the shell call that follows its command still runs. Its data is a
 /// `types.BridgeCallRecord`: the shell call's id, the request id, the tool's
 /// name, and how the call ended, never its arguments or its result. Replay
 /// gives it to the turn, and a resume shows its row in its shell call's
