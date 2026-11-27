@@ -9272,7 +9272,12 @@ fn processQueuedPromptLoop(
                     }
                 else
                     recovery_cause;
-                const failure_diagnostic = types.ModelFailureDiagnostic.init(@errorName(err));
+                const unnamed_os_error = if (gateway_attempt_evidence.network_failure) |evidence|
+                    evidence.cause == .unnamed_os_error
+                else
+                    false;
+                // Its name says nothing; /trace has the errno (`os_errors.zig`).
+                const failure_diagnostic = types.ModelFailureDiagnostic.init(if (unnamed_os_error) "OS error, see /trace" else @errorName(err));
                 const failure_tool_evidence = settledAttemptToolEvidence(
                     deps.tool_registry,
                     preserved_tool_evidence,

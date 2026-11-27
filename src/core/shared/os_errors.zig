@@ -4,10 +4,14 @@
 //! has no name for as `error.Unexpected`, and in release builds it does the
 //! same for an errno it treats as a bug, such as `EINVAL` from `recvmsg`. The
 //! errno is lost there, so a model request that fails this way says only
-//! "Unexpected". `wrap` checks each network read, write, receive, send, and
-//! DNS lookup: when one returns `error.Unexpected`, it notes the errno that
+//! "Unexpected". These calls run inside std, so no call site in fx can read
+//! the errno, and `wrap` checks them in the `std.Io` vtable instead: each
+//! network read, write, receive, send, and DNS lookup that std runs without
+//! a timeout. When one returns `error.Unexpected`, it notes the errno that
 //! the call left in libc's `errno` on the same thread, or no errno for a
-//! lookup. fx's own connect in `net_connect.zig` notes its errno here itself.
+//! lookup. A call with a timeout goes through std's batch path, which `wrap`
+//! does not see; fx makes none. fx's own connect in `net_connect.zig` notes
+//! its errno here itself.
 //!
 //! No open upstream issue asks std to keep this errno. The GitHub issue
 //! "Preserve platform error codes" (https://github.com/ziglang/zig/issues/2389)

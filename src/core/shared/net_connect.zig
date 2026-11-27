@@ -66,10 +66,7 @@ fn netConnectIp(
     const inner = wrapped_inner.?;
     const io: std.Io = .{ .userdata = userdata, .vtable = inner };
     // std doesn't implement connect timeouts yet; those stay with std.
-    if (options.timeout != .none or !std.options.networking) return inner.netConnectIp(userdata, address, options) catch |err| {
-        if (err == error.Unexpected) os_errors.note(io, .connect, os_errors.errnoAfterUnexpected());
-        return err;
-    };
+    if (options.timeout != .none or !std.options.networking) return inner.netConnectIp(userdata, address, options);
     unexpected_errno = 0;
     return connect(io, address, options) catch |err| {
         if (err == error.Unexpected) os_errors.note(io, .connect, unexpected_errno);

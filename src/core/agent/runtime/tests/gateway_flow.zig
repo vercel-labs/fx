@@ -8755,7 +8755,7 @@ test "processQueuedPrompt ends the turn after three OS errors Zig has no name fo
         &hooks,
         hooks.route_recovery_statuses.items.len - 1,
         .terminal_provider_error,
-        "⚠ Network interrupted · unexpected · stopped after 3 attempts",
+        "⚠ Network interrupted · OS error, see /trace · stopped after 3 attempts",
     );
 }
 
