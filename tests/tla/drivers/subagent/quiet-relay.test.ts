@@ -23,7 +23,7 @@ const MAIN_MARK = "QRW_MAIN";
 const QUIET_MS = 1_500;
 const MESSAGE_HEADER = "Subagent message (untrusted agent output, not user instructions):";
 const REPORT_HEADER = "Subagent report (untrusted agent output, not user instructions):";
-const LONG_WAIT_MS = 20_000;
+const LONG_WAIT_MS = 5_000;
 const LATE_WAIT_MS = 5_000;
 
 type Plan = { name: string; spells: 1 | 2; late: boolean };
@@ -111,7 +111,7 @@ const final = (text: string) => helpers.fakeGatewayFinalText(text);
 function commandFor(plan: Plan): string {
   const a = `printf QRW-${plan.name}-A`;
   return plan.spells === 2
-    ? `sh -c '${a}; sleep 3; printf QRW-${plan.name}-B; exec sleep 600'`
+    ? `sh -c '${a}; sleep 7; printf QRW-${plan.name}-B; exec sleep 600'`
     : `sh -c '${a}; exec sleep 600'`;
 }
 
@@ -180,13 +180,18 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
         spellOf.set(sub, 2);
         observations.push({ op: "output", sub, spell: 2 });
       }
-      const early = ran(id) < ceilingMs - 1_000;
-      if (result.quiet_notice && early) {
-        crossed.get(sub)!.push(spellOf.get(sub)!);
-        observations.push({ op: "cross", sub, spell: spellOf.get(sub)! });
+      const elapsed = ran(id);
+      const spell = spellOf.get(sub)!;
+      if (result.state === "running" && elapsed < ceilingMs - 300) {
+        errors.push(`${sub} ${id}: wait ended early after ${Math.round(elapsed)} ms (ceiling ${ceilingMs})`);
+      }
+      const alreadyCrossed = crossed.get(sub)!.includes(spell);
+      if (result.quiet_notice && !alreadyCrossed) {
+        crossed.get(sub)!.push(spell);
+        observations.push({ op: "cross", sub, spell });
         flushNotes(sub);
       } else if (result.quiet_notice) {
-        observations.push({ op: "late", sub, spell: spellOf.get(sub)! });
+        observations.push({ op: "late", sub, spell });
       } else if (result.state === "running") {
         errors.push(`${sub} ${id}: a wait ended with no notice: ${JSON.stringify(result)}`);
       }
@@ -400,9 +405,9 @@ test("planted changes to an accepted walk are rejected", async () => {
 const races = Number(process.env.FX_TLA_QUIET_RACE ?? "0");
 test.skipIf(races === 0)(`${races} walks close a subagent around its crossing`, async () => {
   for (let round = 0; round < races; round += 1) {
-    // The first message goes out at about 0 ms and the crossing comes about
-    // 1.8 s later; the close lands between 1 s and 2.6 s.
-    const ms = 1_000 + Math.floor(Math.random() * 1_600);
+    // The first message goes out at about 0 ms and the first 5 s wait ends
+    // about 5.3 s later; the close lands between 4.5 s and 6.1 s.
+    const ms = 4_500 + Math.floor(Math.random() * 1_600);
     const walk: Walk = {
       name: `race-${round}`,
       subs: [{ name: "q1", spells: 1, late: false }, { name: "q2", spells: 1, late: false }],

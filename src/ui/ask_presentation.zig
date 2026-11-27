@@ -124,6 +124,7 @@ pub const Runtime = struct {
             .table = pushTable,
             .code_block = pushCodeBlock,
             .thematic_rule = pushThematicRule,
+            .assistant_tail = pushAssistantTail,
         };
     }
 
@@ -133,6 +134,18 @@ pub const Runtime = struct {
         if (self.thinking == active) return;
         self.thinking = active;
         self.render() catch |err| return self.failWith(err);
+    }
+
+    /// The open tail is applied at once: `fx ask` writes committed text without a pacer.
+    fn pushAssistantTail(raw: *anyopaque, alloc: std.mem.Allocator, events: []assistant_presentation.Event) !void {
+        const self: *Runtime = @ptrCast(@alignCast(raw));
+        self.checkPendingError() catch |err| {
+            assistant_presentation.freeEventSlice(alloc, events);
+            return err;
+        };
+        const id = self.shell.stageAssistantTail(alloc, events);
+        self.shell.applyStagedAssistantTail(self.alloc, id);
+        self.render() catch |err| self.rememberFailure(err);
     }
 
     pub fn pushText(self: *Runtime, text: []const u8) !void {
@@ -617,6 +630,57 @@ test "ask presentation carries the light theme into semantic code blocks" {
     defer runtime.deinit();
 
     try std.testing.expect(runtime.shell.retainedTranscriptStyles().code_highlight_theme == .light);
+}
+
+fn askGridRowsContaining(runtime: *Runtime, needle: []const u8) !usize {
+    var count: usize = 0;
+    var row: u16 = 1;
+    while (row <= runtime.shell.layout.rows) : (row += 1) {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(std.testing.allocator);
+        try runtime.shell.shadow_vt.?.rowText(row, &buf);
+        if (std.mem.find(u8, buf.items, needle) != null) count += 1;
+    }
+    return count;
+}
+
+test "ask presentation draws a provisional tail and drops it when committed text arrives" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output = try tmp.dir.createFile(std.testing.io, "ask-tail.log", .{ .read = true });
+    defer output.close(io_mod.getIo());
+
+    var runtime = try Runtime.initConfigured(
+        alloc,
+        .{ .model = "openai/gpt-5" },
+        false,
+        output,
+        zeroFooterLayout(.{
+            .rows = 12,
+            .cols = 48,
+            .content_bottom = 12,
+            .divider_top_row = 12,
+            .input_row = 12,
+            .divider_bottom_row = 12,
+            .hint_row = 12,
+        }),
+        .{ .row = 1, .col = 1 },
+        true,
+    );
+    defer runtime.deinit();
+
+    const events = try alloc.alloc(assistant_presentation.Event, 1);
+    events[0] = .{ .text = try alloc.dupe(u8, "Streaming bold") };
+    const sink = runtime.semanticSink();
+    try sink.assistant_tail.?(sink.ctx, alloc, events);
+    try std.testing.expectEqual(@as(usize, 1), runtime.shell.assistant_tail.items.len);
+    try std.testing.expectEqual(@as(usize, 1), try askGridRowsContaining(&runtime, "Streaming bold"));
+
+    try runtime.pushText("Streaming bold\n");
+    try std.testing.expectEqual(@as(usize, 0), runtime.shell.assistant_tail.items.len);
+    try std.testing.expectEqual(@as(usize, 1), try askGridRowsContaining(&runtime, "Streaming bold"));
+    try runtime.finish();
 }
 
 test "ask presentation retains a streaming write failure until finish" {

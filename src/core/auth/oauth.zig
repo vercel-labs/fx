@@ -307,14 +307,11 @@ pub fn revokeToken(
     endpoint: []const u8,
     client_id: []const u8,
     token: []const u8,
-    token_type_hint: TokenTypeHint,
+    token_type_hint: ?TokenTypeHint,
 ) !void {
-    var form: FormBody = .{};
     var writer: std.Io.Writer.Allocating = .init(alloc);
     defer writer.deinit();
-    try form.append(&writer.writer, "client_id", client_id);
-    try form.append(&writer.writer, "token", token);
-    try form.append(&writer.writer, "token_type_hint", @tagName(token_type_hint));
+    try writeRevocationForm(&writer.writer, client_id, token, token_type_hint);
     const bytes = try fetchJson(
         alloc,
         transport,
@@ -324,6 +321,18 @@ pub fn revokeToken(
         .{},
     );
     secret.zeroAndFree(alloc, bytes);
+}
+
+fn writeRevocationForm(
+    writer: *std.Io.Writer,
+    client_id: []const u8,
+    token: []const u8,
+    token_type_hint: ?TokenTypeHint,
+) !void {
+    var form: FormBody = .{};
+    try form.append(writer, "client_id", client_id);
+    try form.append(writer, "token", token);
+    if (token_type_hint) |hint| try form.append(writer, "token_type_hint", @tagName(hint));
 }
 
 pub fn parseMetadata(alloc: Allocator, bytes: []const u8) !Metadata {
@@ -719,6 +728,26 @@ test "OAuth form codec preserves encoding and first-value query semantics" {
     try std.testing.expectError(
         error.InvalidPercentEncoding,
         queryValueAlloc(alloc, "value=%zz", "value"),
+    );
+}
+
+test "revocation form sends the token type hint when one is given" {
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try writeRevocationForm(&writer.writer, "client-id", "a+b/c=", .refresh_token);
+    try std.testing.expectEqualStrings(
+        "client_id=client-id&token=a%2Bb%2Fc%3D&token_type_hint=refresh_token",
+        writer.written(),
+    );
+}
+
+test "revocation form omits the token type hint when none is given" {
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try writeRevocationForm(&writer.writer, "client-id", "a+b/c=", null);
+    try std.testing.expectEqualStrings(
+        "client_id=client-id&token=a%2Bb%2Fc%3D",
+        writer.written(),
     );
 }
 

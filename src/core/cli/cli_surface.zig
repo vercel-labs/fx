@@ -91,7 +91,6 @@ pub const Command = union(enum) {
     issue: []const [:0]const u8,
     login: []const [:0]const u8,
     logout: []const [:0]const u8,
-    setup: []const [:0]const u8,
     status: []const [:0]const u8,
     permissions: []const [:0]const u8,
     mcp: []const [:0]const u8,
@@ -824,7 +823,6 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .replay)) return .{ .replay = args[1..] };
         },
         's' => {
-            if (command_specs.matchesTopLevel(command_catalog, command, .setup)) return .{ .setup = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .status)) return .{ .status = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .sessions)) return .{ .sessions = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .session)) {
@@ -933,7 +931,7 @@ pub fn parseInteractiveLaunch(
                         if (parseResumeArgs(alloc, resume_line, invocation.top_level_alias)) |parsed_target| {
                             var unused = parsed_target;
                             unused.deinit(alloc);
-                        } else |resume_err| if (removedResumeHint(resume_err) != null) return resume_err;
+                        } else |resume_err| if (removedSpellingHint(resume_err) != null) return resume_err;
                     }
                     return err;
                 };
@@ -972,6 +970,7 @@ pub fn parseInteractiveLaunch(
             .print_flag => return error.PrintFlagUseAsk,
             .unknown_flag => return error.UnknownLaunchFlag,
             .command_typo => return error.UnknownCommandTypo,
+            .removed_setup => return error.RemovedSetupCommand,
             .prompt => {
                 // Read the whole line again so launch flags may also follow
                 // the prompt, as in `fx "fix the bug" --model x`.
@@ -1032,13 +1031,18 @@ const LaunchWord = enum {
     /// A near miss for a command name, such as `stauts`, or a flag name
     /// typed without its dashes, such as `version`.
     command_typo,
+    /// `fx setup`, a removed spelling that names its replacement.
+    removed_setup,
     prompt,
 };
 
 /// Decides what plain `fx` does with a first argument that isn't a command.
+const removed_setup_word = "setup";
+
 fn classifyLaunchWord(command_catalog: CommandCatalog, word: []const u8) LaunchWord {
     // `fx -- "-x"` lets a prompt start with a dash.
     if (std.mem.eql(u8, word, "--")) return .prompt;
+    if (std.mem.eql(u8, word, removed_setup_word)) return .removed_setup;
     if (word.len > 0 and word[0] == '-') {
         if (isVersionFlag(word)) return .command_line;
         if (isPrintFlag(word)) return .print_flag;
@@ -1647,7 +1651,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
             try writeTopLevelUsage(cfg.command_catalog, deps, .@"resume");
             return usage_failure;
         }
-        if (removedResumeHint(err)) |hint| {
+        if (removedSpellingHint(err)) |hint| {
             try writeStderr(deps, hint);
             return usage_failure;
         }
@@ -2049,21 +2053,6 @@ fn runNonInteractiveWithDeps(
                 else => return err,
             };
             return if (activated) .handled_success else .handled_failure;
-        },
-        .setup => |rest| {
-            if (try command_specs.deprecationWarning(alloc, cfg.command_catalog, .setup)) |warning| {
-                defer alloc.free(warning);
-                try writeStderr(deps, warning);
-            }
-            if (rest.len != 0) {
-                try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
-                return usage_failure;
-            }
-            if (cfg.auth_mode == .host_managed) {
-                try writeHostManagedAuthResult(deps);
-                return .handled_success;
-            }
-            return if (try runPasteSetup(alloc, cfg.secret_store, deps, "fx setup")) .handled_success else .handled_failure;
         },
         .status => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
@@ -2726,8 +2715,7 @@ fn writeStderr(deps: RunDeps, text: []const u8) !void {
 }
 
 /// Reads and stores an AI Gateway API key. `command` names the command in
-/// failure messages: `fx login` for `fx login --api-key`, `fx setup` for the
-/// deprecated spelling.
+/// failure messages, such as `fx login`.
 fn runPasteSetup(
     alloc: Allocator,
     secret_store: host.SecretStore,
@@ -5433,14 +5421,15 @@ fn resumeFlagTarget(alloc: Allocator, value: []const u8) !ResumeTarget {
     return .{ .id = try alloc.dupe(u8, id) };
 }
 
-/// The hint for a removed resume spelling, or null for any other error.
-fn removedResumeHint(err: anyerror) ?[]const u8 {
+/// The hint for a removed spelling, such as `fx resume`, or null for any other error.
+fn removedSpellingHint(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.RemovedResumeLast => "fx: --resume-last was removed; use fx --resume last\n",
         error.RemovedResumeIdAlias => "fx: --resume-<id> was removed; use fx --resume <id>\n",
         error.RemovedResumeCommand => "fx: fx resume was removed; use fx --resume [last|<id>] or fx session resume [last|<id>]\n",
         error.RemovedResumeIdFlag => "fx session resume: --id was removed; use fx session resume <id>\n",
         error.RemovedResumeLastFlag => "fx session resume: --resume --last was removed; use fx session resume last\n",
+        error.RemovedSetupCommand => "fx: fx setup was removed; use fx login vercel --api-key\n",
         else => null,
     };
 }
@@ -5565,10 +5554,6 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{ @constCast("issue"), @constCast("flaky") })) {
         .issue => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{@constCast("setup")})) {
-        .setup => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{ @constCast("status"), @constCast("--json") })) {
@@ -6362,8 +6347,30 @@ test "removed resume spellings fail with a hint" {
     };
     for (cases) |case| {
         try std.testing.expectError(case.err, parseResumeArgs(std.testing.allocator, case.args, case.top_level_alias));
-        try std.testing.expect(removedResumeHint(case.err) != null);
+        try std.testing.expect(removedSpellingHint(case.err) != null);
     }
+}
+
+test "removed setup exits 2 with a hint that names its replacement, without a terminal" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    var cfg = testConfig();
+    cfg.secret_store = capture.secretStore();
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("setup"), @constCast("extra") },
+        cfg,
+        capture.deps(),
+    );
+
+    switch (result) {
+        .handled_exit => |code| try std.testing.expectEqual(output_contracts.usage_exit_code, code),
+        else => return error.TestExpectedEqual,
+    }
+    try std.testing.expectEqualStrings("fx: fx setup was removed; use fx login vercel --api-key\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+    try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
 }
 
 test "parse resume args accepts an operand on the top-level resume flag" {
@@ -6747,7 +6754,7 @@ test "runIfRequested version flags reject extra args" {
     }
 }
 
-test "setup is a paste-only stored-key adapter" {
+test "login --api-key is a paste-only stored-key adapter" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
     var cfg = testConfig();
@@ -6755,7 +6762,7 @@ test "setup is a paste-only stored-key adapter" {
 
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
-        &.{@constCast("setup")},
+        &.{ @constCast("login"), @constCast("--api-key") },
         cfg,
         capture.deps(),
     );
@@ -6769,7 +6776,7 @@ test "setup is a paste-only stored-key adapter" {
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), cfg.secret_store.backend_label) != null);
 }
 
-test "setup delegates secure input to an interactive host store" {
+test "login --api-key delegates secure input to an interactive host store" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
     capture.setup_interactive_store = true;
@@ -6778,7 +6785,7 @@ test "setup delegates secure input to an interactive host store" {
 
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
-        &.{@constCast("setup")},
+        &.{ @constCast("login"), @constCast("--api-key") },
         cfg,
         capture.deps(),
     );
@@ -6789,31 +6796,7 @@ test "setup delegates secure input to an interactive host store" {
     try std.testing.expect(!capture.setup_value_matched);
 }
 
-test "setup preserves the disabled secret-store failure" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    capture.setup_store_disabled = true;
-    var cfg = testConfig();
-    cfg.secret_store = capture.secretStore();
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{@constCast("setup")},
-        cfg,
-        capture.deps(),
-    );
-
-    try std.testing.expectEqual(RunResult.handled_failure, result);
-    try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
-    try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
-    try std.testing.expectEqualStrings(
-        "fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n" ++
-            "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
-        capture.stderr.written(),
-    );
-}
-
-test "login --api-key stores a pasted key like setup, without the deprecation warning" {
+test "login --api-key stores a pasted key without a warning" {
     for ([_][]const [:0]const u8{
         &.{"--api-key"},
         &.{ "vercel", "--api-key" },
@@ -6978,15 +6961,15 @@ test "CLI surface uses the supplied command catalog for parsing usage and help" 
             .summary = "Show injected help",
         },
         .{
-            .kind = .setup,
+            .kind = .status,
             .token = "start",
             .usage = "start",
-            .summary = "Run injected setup",
+            .summary = "Run injected start",
         },
     };
     const help_groups = [_]command_specs.TopLevelHelpGroup{
         .{ .entries = &.{
-            .{ .kind = .setup, .usage = "start" },
+            .{ .kind = .status, .usage = "start" },
             .{ .kind = .help, .usage = "guide" },
         } },
     };
@@ -6999,7 +6982,7 @@ test "CLI surface uses the supplied command catalog for parsing usage and help" 
 
     try std.testing.expectEqual(Command.help, parse(command_catalog, &.{@constCast("-?")}));
     switch (parse(command_catalog, &.{@constCast("start")})) {
-        .setup => {},
+        .status => {},
         else => return error.TestExpectedEqual,
     }
 

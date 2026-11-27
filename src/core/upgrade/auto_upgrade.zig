@@ -6,7 +6,7 @@ const update_target = @import("update_target.zig");
 
 const Allocator = std.mem.Allocator;
 
-const check_interval_ms: u64 = 30 * 60 * 1000;
+const default_check_interval_ms: u64 = 30 * 60 * 1000;
 const initial_delay_ms: u64 = 10_000;
 const sleep_increment_ms: u64 = 50;
 /// Upper bound stop() waits for the upgrade thread once cancellation has
@@ -42,6 +42,59 @@ pub const RelaunchRequest = struct {
     }
 };
 
+/// How long fx waits between update checks. `FX_TEST_UPGRADE_CHECK_INTERVAL_MS`,
+/// a positive number of milliseconds, replaces the thirty minutes; only tests
+/// set it (`tests/e2e/tui-resume.test.ts`, "a newer dev release replaces the
+/// update that waits for ctrl+g").
+fn checkIntervalMs() u64 {
+    return parseCheckIntervalMs(io_mod.getenv("FX_TEST_UPGRADE_CHECK_INTERVAL_MS"));
+}
+
+fn parseCheckIntervalMs(text: ?[]const u8) u64 {
+    const value = text orelse return default_check_interval_ms;
+    const ms = std.fmt.parseInt(u32, value, 10) catch return default_check_interval_ms;
+    return if (ms > 0) ms else default_check_interval_ms;
+}
+
+/// The build that an earlier check installed while this fx runs. Later checks
+/// compare a release with it, not with the running build, so the installed
+/// release is never installed again: a dev release replaces it when its commit
+/// differs, and a stable release when its version is higher
+/// (`update_target.Target.shouldInstall`). This tracks what fx installed, not
+/// the file itself, so a binary another process writes there is not noticed.
+const StagedBuild = struct {
+    installed: bool = false,
+    channel: update_target.Channel = .stable,
+    version_buf: [update_target.max_version_bytes]u8 = undefined,
+    version_len: usize = 0,
+    revision_buf: [update_target.max_revision_bytes]u8 = undefined,
+    revision_len: usize = 0,
+
+    /// Copies what `target` names. Its version and revision passed the
+    /// target's own length checks, so they fit.
+    fn record(self: *StagedBuild, target: update_target.Target) void {
+        const version = target.version();
+        const revision = target.revision() orelse "";
+        @memcpy(self.version_buf[0..version.len], version);
+        @memcpy(self.revision_buf[0..revision.len], revision);
+        self.version_len = version.len;
+        self.revision_len = revision.len;
+        self.channel = target.channel();
+        self.installed = true;
+    }
+
+    /// The build a release is compared with: the staged one once a check has
+    /// installed one, otherwise the running build.
+    fn baseline(self: *const StagedBuild, current: update_target.CurrentBuild) update_target.CurrentBuild {
+        if (!self.installed) return current;
+        return .{
+            .channel = self.channel,
+            .version = self.version_buf[0..self.version_len],
+            .revision = self.revision_buf[0..self.revision_len],
+        };
+    }
+};
+
 pub fn shouldEnableForCurrentExecutable() bool {
     var exe_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const n = std.process.executablePath(io_mod.getIo(), &exe_buf) catch return true;
@@ -52,6 +105,20 @@ pub fn isDevelopmentBuildPath(path: []const u8) bool {
     return std.mem.find(u8, path, "/zig-out/bin/") != null or
         std.mem.find(u8, path, "\\zig-out\\bin\\") != null;
 }
+
+/// Where a Ctrl+G restart that waits for running turns stands. Main loop
+/// only (`tests/tla/recovery/RestartWait.tla`).
+pub const RestartWait = enum {
+    none,
+    /// The running turns stop at their next step boundary and hold there;
+    /// a second Ctrl+G cancels.
+    waiting,
+    /// Every turn held or ended, and the held turns were let go; fx exits
+    /// for the relaunch once none runs.
+    releasing,
+};
+
+const restart_wait_label = "restart waits: ctrl+g to cancel";
 
 pub const AutoUpgrade = struct {
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@backingInt(State.idle)),
@@ -74,6 +141,9 @@ pub const AutoUpgrade = struct {
     install_mutex: std.Io.Mutex = .init,
 
     relaunch_request: ?RelaunchRequest = null,
+    /// Main loop only. Ctrl+G accepted the upgrade while turns ran
+    /// (`app_upgrade_runtime` `collectUpgradeFacts`).
+    restart: RestartWait = .none,
 
     pub fn configure_channel(self: *AutoUpgrade, selected: update_target.Channel) void {
         self.selected_channel = selected;
@@ -158,13 +228,30 @@ pub const AutoUpgrade = struct {
         self.relaunch_request = request;
     }
 
+    /// The relaunch the exit runs, consumed once. An exit while the restart
+    /// still waits for turns to stop is not that restart (`/quit`, Ctrl+D,
+    /// a signal): it quits, so the prepared relaunch is dropped.
     pub fn takeRelaunchRequest(self: *AutoUpgrade) ?RelaunchRequest {
         const request = self.relaunch_request;
         self.relaunch_request = null;
+        if (self.restart != .none) {
+            if (request != null) debug_trace.logf("upgrade", "event=relaunch_dropped reason=exit_while_restart_waits", .{});
+            return null;
+        }
         return request;
     }
 
+    /// A second Ctrl+G cancelled the waiting restart: the relaunch it
+    /// prepared is dropped, so a later exit quits
+    /// (`tests/tla/recovery/Resume.tla` CancelledRestartStays).
+    pub fn cancelRestart(self: *AutoUpgrade) void {
+        if (self.relaunch_request != null) debug_trace.logf("upgrade", "event=relaunch_dropped reason=restart_cancelled", .{});
+        self.relaunch_request = null;
+        self.restart = .none;
+    }
+
     pub fn statusLabel(self: *AutoUpgrade, buf: []u8) []const u8 {
+        if (self.restart == .waiting) return restart_wait_label;
         const state = self.getState();
         switch (state) {
             .downloading => {
@@ -227,18 +314,17 @@ pub const AutoUpgrade = struct {
         current: update_target.CurrentBuild,
     ) void {
         defer self.stopped.store(true, .release);
+        const interval_ms = checkIntervalMs();
+        // Checks go on after an update is ready, so a later release replaces
+        // the waiting one and Ctrl+G restarts into the latest.
+        var staged: StagedBuild = .{};
         self.sleepInterruptible(initial_delay_ms);
 
         while (!self.should_stop.load(.acquire)) {
-            if (self.getState() == .ready) return;
-            self.setState(.checking);
-            self.runOnce(alloc, current);
-
-            const post_state = self.getState();
-            if (post_state == .ready) return;
-
-            if (post_state != .failed) self.setState(.waiting);
-            self.sleepInterruptible(check_interval_ms);
+            if (!staged.installed) self.setState(.checking);
+            self.runOnce(alloc, current, &staged);
+            if (!staged.installed and self.getState() != .failed) self.setState(.waiting);
+            self.sleepInterruptible(interval_ms);
         }
     }
 
@@ -246,23 +332,35 @@ pub const AutoUpgrade = struct {
         self: *AutoUpgrade,
         alloc: Allocator,
         current: update_target.CurrentBuild,
+        staged: *StagedBuild,
     ) void {
         const cdn_base = helpers.resolveCdnBase();
         if (helpers.cancelRequested(&self.should_stop)) return;
         var target = helpers.fetchTarget(alloc, self.selected_channel, cdn_base, self.transferControl()) catch return;
         defer target.deinit(alloc);
 
-        if (!target.shouldInstall(current)) return;
+        if (!target.shouldInstall(staged.baseline(current))) return;
 
         var label_buf: [64]u8 = undefined;
         const label = target.writeDisplayLabel(&label_buf) catch return;
-        self.setLatestVersion(label);
-        self.setState(.downloading);
+        // With an update already waiting, the later one downloads behind it:
+        // the footer keeps offering Ctrl+G, and a failed download leaves the
+        // waiting update in place, since only a finished install replaces it.
+        if (!staged.installed) {
+            self.setLatestVersion(label);
+            self.setState(.downloading);
+        }
 
-        self.downloadAndInstall(alloc, target, cdn_base) catch {
+        self.downloadAndInstall(alloc, target, cdn_base) catch |err| {
+            if (staged.installed) {
+                debug_trace.logf("upgrade", "event=later_download_dropped target={s} err={s} kept=waiting_update", .{ label, @errorName(err) });
+                return;
+            }
             self.setState(.failed);
             return;
         };
+        staged.record(target);
+        self.setLatestVersion(label);
         self.setState(.ready);
     }
 
@@ -430,6 +528,60 @@ test "no install starts after a process-exit stop" {
     );
 }
 
+test "the check interval is thirty minutes unless a positive number of milliseconds is given" {
+    try std.testing.expectEqual(default_check_interval_ms, parseCheckIntervalMs(null));
+    try std.testing.expectEqual(@as(u64, 200), parseCheckIntervalMs("200"));
+    try std.testing.expectEqual(default_check_interval_ms, parseCheckIntervalMs("0"));
+    try std.testing.expectEqual(default_check_interval_ms, parseCheckIntervalMs("-5"));
+    try std.testing.expectEqual(default_check_interval_ms, parseCheckIntervalMs("soon"));
+    try std.testing.expectEqual(default_check_interval_ms, parseCheckIntervalMs("99999999999"));
+}
+
+test "a staged dev build is the baseline, so only a different revision replaces it" {
+    const alloc = std.testing.allocator;
+    const current: update_target.CurrentBuild = .{
+        .channel = .stable,
+        .version = "0.0.18",
+        .revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+    var first = try update_target.Target.parseDevManifest(alloc, "{\"version\":\"0.0.18\",\"commit\":\"1111111111111111111111111111111111111111\"}");
+    defer first.deinit(alloc);
+    var newest = try update_target.Target.parseDevManifest(alloc, "{\"version\":\"0.0.18\",\"commit\":\"2222222222222222222222222222222222222222\"}");
+    defer newest.deinit(alloc);
+
+    var staged: StagedBuild = .{};
+    try std.testing.expectEqualStrings(current.revision, staged.baseline(current).revision);
+    try std.testing.expect(first.shouldInstall(staged.baseline(current)));
+
+    staged.record(first);
+    try std.testing.expect(!first.shouldInstall(staged.baseline(current)));
+    try std.testing.expect(newest.shouldInstall(staged.baseline(current)));
+
+    staged.record(newest);
+    try std.testing.expect(!newest.shouldInstall(staged.baseline(current)));
+    try std.testing.expectEqual(update_target.Channel.dev, staged.baseline(current).channel);
+}
+
+test "a staged stable build is the baseline, so only a higher version replaces it" {
+    const alloc = std.testing.allocator;
+    const current: update_target.CurrentBuild = .{ .channel = .stable, .version = "0.0.18", .revision = "" };
+    var staged_target = try update_target.Target.initStable(alloc, "v0.0.19");
+    defer staged_target.deinit(alloc);
+    var same = try update_target.Target.initStable(alloc, "0.0.19");
+    defer same.deinit(alloc);
+    var older = try update_target.Target.initStable(alloc, "0.0.18");
+    defer older.deinit(alloc);
+    var higher = try update_target.Target.initStable(alloc, "0.0.20");
+    defer higher.deinit(alloc);
+
+    var staged: StagedBuild = .{};
+    staged.record(staged_target);
+    try std.testing.expectEqualStrings("0.0.19", staged.baseline(current).version);
+    try std.testing.expect(!same.shouldInstall(staged.baseline(current)));
+    try std.testing.expect(!older.shouldInstall(staged.baseline(current)));
+    try std.testing.expect(higher.shouldInstall(staged.baseline(current)));
+}
+
 test "statusLabel idle returns empty" {
     var au = AutoUpgrade{};
     var buf: [64]u8 = undefined;
@@ -533,6 +685,34 @@ test "relaunch request owns its path and previous revision and is consumed once"
         request.previousRevision().?,
     );
     try std.testing.expect(au.takeRelaunchRequest() == null);
+}
+
+test "an exit while the restart waits for turns drops the relaunch" {
+    var au = AutoUpgrade{};
+    try au.requestRelaunch("/tmp/fx");
+    au.restart = .waiting;
+    try std.testing.expect(au.takeRelaunchRequest() == null);
+    // Dropped, not kept for a later exit.
+    au.restart = .none;
+    try std.testing.expect(au.takeRelaunchRequest() == null);
+}
+
+test "a cancelled restart drops the relaunch it prepared" {
+    var au = AutoUpgrade{};
+    try au.requestRelaunch("/tmp/fx-upgraded");
+    au.restart = .waiting;
+    au.cancelRestart();
+    try std.testing.expectEqual(RestartWait.none, au.restart);
+    try std.testing.expect(au.takeRelaunchRequest() == null);
+}
+
+test "a waiting restart says how to cancel it" {
+    var au = AutoUpgrade{};
+    var buf: [64]u8 = undefined;
+    au.restart = .waiting;
+    try std.testing.expectEqualStrings("restart waits: ctrl+g to cancel", au.statusLabel(&buf));
+    au.restart = .none;
+    try std.testing.expect(!std.mem.eql(u8, "restart waits: ctrl+g to cancel", au.statusLabel(&buf)));
 }
 
 test "statusLabel waiting returns empty" {

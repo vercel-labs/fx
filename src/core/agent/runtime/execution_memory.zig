@@ -540,6 +540,7 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
             .text = copy,
             .assistant_prefix = prefix_copy,
             .after_tool_step_count = tool_step_count,
+            .input_id = message.input_id,
         }) catch |err| {
             alloc.free(copy);
             if (prefix_copy) |prefix| alloc.free(prefix);
@@ -1082,33 +1083,29 @@ pub fn prepareCapturedToolModelOutput(
         candidate.policy() == .required
     else
         false;
-    if (!required_command_replay and
-        (config.session_child_capability != null or config.tool_result_dir != null))
-    {
-        const sanitized_output = try tool_result_limits.prepareSanitizedOutput(
-            arena,
-            raw_output,
-        );
-        if (config.session_child_capability != null) {
+    if (!required_command_replay) {
+        if (config.session_child_capability) |capability| {
             return result_store.prepareManaged(
                 arena,
-                config.session_child_capability,
+                capability,
                 tool_call.id,
                 tool_call.name,
                 raw_output.len,
-                sanitized_output,
+                try tool_result_limits.prepareSanitizedOutput(arena, raw_output),
                 config.max_tool_result_bytes,
             );
         }
-        return result_store.prepare(
-            arena,
-            config.tool_result_dir,
-            tool_call.id,
-            tool_call.name,
-            raw_output.len,
-            sanitized_output,
-            config.max_tool_result_bytes,
-        );
+        if (config.tool_result_dir) |dir| {
+            return result_store.prepare(
+                arena,
+                dir,
+                tool_call.id,
+                tool_call.name,
+                raw_output.len,
+                try tool_result_limits.prepareSanitizedOutput(arena, raw_output),
+                config.max_tool_result_bytes,
+            );
+        }
     }
     const model_output_budget = if (required_command_replay)
         config.max_tool_result_bytes -| command_replay_store.model_handle_notice_reserve_bytes
@@ -3098,4 +3095,25 @@ test "transcript does not mark native web_search as provider resource placeholde
 
     try std.testing.expect(!records[0].provider_native);
     try std.testing.expectEqualStrings("bounded search output", records[0].output);
+}
+
+test "eb03: buildExecutionMemory carries ChatMessage.input_id to PersistedSteering.input_id" {
+    const alloc = std.testing.allocator;
+    const framed = try steeringMessage(alloc, "user steer");
+    defer alloc.free(framed);
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = framed, .input_id = 55 },
+        .{ .role = .user, .content = "Continue.", .recovery_prompt = true },
+    };
+    const execution = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, execution);
+    try std.testing.expectEqual(@as(usize, 2), execution.steering.len);
+    try std.testing.expectEqual(@as(?u64, 55), execution.steering[0].input_id);
+    try std.testing.expectEqual(@as(?u64, null), execution.steering[1].input_id);
+
+    const interrupted = try buildInterruptedExecutionMemory(alloc, &messages, null);
+    defer types.freeExecutionMemory(alloc, interrupted);
+    try std.testing.expectEqual(@as(usize, 2), interrupted.steering.len);
+    try std.testing.expectEqual(@as(?u64, 55), interrupted.steering[0].input_id);
+    try std.testing.expectEqual(@as(?u64, null), interrupted.steering[1].input_id);
 }

@@ -703,16 +703,6 @@ fn configuredEndpoint(alloc: Allocator, env_name: []const u8, default_url: []con
     };
 }
 
-fn requestAccepted(
-    alloc: Allocator,
-    transport: oauth_transport.Provider,
-    method: oauth_transport.Method,
-    url: []const u8,
-    payload: []const u8,
-) ![]u8 {
-    return requestAcceptedWithBounds(alloc, transport, method, url, payload, null, null);
-}
-
 /// `outlives_cancel` for a refresh, which has already retired the old
 /// refresh token by the time it asks (`oauth_transport.Request`).
 fn fetchAccountId(
@@ -751,13 +741,7 @@ pub fn revokeToken(
 ) !void {
     const endpoint_url = try configuredEndpoint(alloc, e2e_revoke_url_env, revoke_url);
     defer alloc.free(endpoint_url);
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-    var form: FormBody = .{};
-    try form.append(&body.writer, "token", token);
-    try form.append(&body.writer, "client_id", client_id);
-    const bytes = try requestAccepted(alloc, transport, .post_form, endpoint_url, body.written());
-    secret.zeroAndFree(alloc, bytes);
+    try oauth.revokeToken(alloc, transport, endpoint_url, client_id, token, null);
 }
 
 fn requestAcceptedWithBounds(

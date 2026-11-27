@@ -72,6 +72,34 @@ pub const ConversationUser = struct {
     text: []const u8,
     images: []const types.ImageAttachment = &.{},
     work_id: ?[]const u8 = null,
+    /// In-memory only: carried to `Session.writePieces` to emit `input_delivered`
+    /// in the same batch; never written into item JSON.
+    input_id: ?u64 = null,
+
+    pub fn jsonStringify(self: ConversationUser, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        try writer.objectField("text");
+        try writer.write(self.text);
+        try writer.objectField("images");
+        try writer.write(self.images);
+        try writer.objectField("work_id");
+        try writer.write(self.work_id);
+        try writer.endObject();
+    }
+};
+
+pub const ConversationSteering = struct {
+    text: []const u8,
+    /// In-memory only: carried to `Session.writePieces` to emit `input_delivered`
+    /// in the same batch; never written into item JSON.
+    input_id: ?u64 = null,
+
+    pub fn jsonStringify(self: ConversationSteering, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        try writer.objectField("text");
+        try writer.write(self.text);
+        try writer.endObject();
+    }
 };
 
 pub const ConversationToolCall = struct {
@@ -214,7 +242,7 @@ pub const ConversationEvent = union(enum) {
     assistant: ConversationAssistant,
     tool_call: ConversationToolCall,
     tool_result: ConversationToolResult,
-    steering: ConversationText,
+    steering: ConversationSteering,
     turn_completed: ConversationTurnCompleted,
     interrupted: ConversationInterruption,
     context_checkpoint: ConversationCheckpoint,
@@ -595,6 +623,7 @@ pub fn appendHistoryTurnConversationEvents(
                 .text = entry.user.text,
                 .images = entry.user.images,
                 .work_id = entry.user.work_id,
+                .input_id = entry.user.input_id,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
             const follows_standalone = entry.execution.tool_steps.len > 0 and
@@ -612,6 +641,7 @@ pub fn appendHistoryTurnConversationEvents(
                 .text = entry.user.text,
                 .images = entry.user.images,
                 .work_id = entry.user.work_id,
+                .input_id = entry.user.input_id,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
             if (entry.tool_call) |call| {
@@ -843,7 +873,7 @@ fn appendSteeringConversationEvents(
         if (assistant.len > 0) try events.append(alloc, .{ .assistant = .{ .text = assistant } });
     }
     if (steering.text.len > 0) {
-        try events.append(alloc, .{ .steering = .{ .text = steering.text } });
+        try events.append(alloc, .{ .steering = .{ .text = steering.text, .input_id = steering.input_id } });
     }
 }
 

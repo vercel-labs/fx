@@ -21,7 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import { jpegHeader, paddedPng, solidPng } from "./fixtures/image-encoding";
-import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERATION_MARKER, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERATION_MARKER, TmuxSession, tmuxAvailable, turnSettled } from "./tmux-helpers";
 import { copyV1Fixture, rootSessionIds, savedText, sessionDir } from "./saved-sessions";
 
 const TIMEOUT = 15_000;
@@ -3705,7 +3705,7 @@ describe("Vision route fake Gateway", () => {
         writeFileSync(firstImagePath, readFileSync(firstMutatedPath));
         await session.sendKeys("1");
         await session.sendKeys("Enter");
-        await session.waitForText("tmux Vision completed", TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("tmux Vision completed") && turnSettled(pane), TIMEOUT);
 
         await session.sendText(`/image ${secondImagePath}`);
         await session.waitForText("attached image: second.png", TIMEOUT);
@@ -3717,7 +3717,10 @@ describe("Vision route fake Gateway", () => {
         expect(secondApproval).toContain("Inspecting images");
         await session.sendKeys("1");
         await session.sendKeys("Enter");
-        await session.waitForText("tmux outage continued", TIMEOUT);
+        await session.waitForPane(
+          (pane) => pane.includes("tmux outage continued") && turnSettled(pane),
+          TIMEOUT,
+        );
 
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).toContain("Inspected images");
@@ -3787,7 +3790,7 @@ describe("Vision route fake Gateway", () => {
         session = await launch(FX_BIN);
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
         await session.sendText("Describe the logo file in this folder.");
-        const live = await session.waitForText("Vision unavailable final answer", TIMEOUT);
+        const live = await session.waitForPane((pane) => pane.includes("Vision unavailable final answer") && turnSettled(pane), TIMEOUT);
         // fx sent the notice to the model on its own; the user never saw it.
         expect(live).not.toContain("None of the requested images were read");
         const turnEnd = gateway.chatRequests.length - 1;
@@ -3815,7 +3818,7 @@ describe("Vision route fake Gateway", () => {
         await session.waitForComposer(TIMEOUT);
 
         await session.sendText("And once more.");
-        await session.waitForText("answered in the resumed terminal", TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("answered in the resumed terminal") && turnSettled(pane), TIMEOUT);
         expect(gateway.chatRequests).toHaveLength(turnEnd + 2);
         expectNextRequestExtends(gateway.chatRequests[turnEnd].body, gateway.chatRequests[turnEnd + 1].body);
         const scrollback = await session.captureFullScrollback();
@@ -3907,7 +3910,7 @@ test.skipIf(!tmuxAvailable())("TUI keeps a failed turn's image through a cold re
     await session.waitForStableComposer(TIMEOUT);
     // Nothing continues on its own (D54): a new prompt asks again.
     await session.sendText("Describe this image again.");
-    await session.waitForText("TUI_RECOVERY_IMAGE_COMPLETE", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("TUI_RECOVERY_IMAGE_COMPLETE") && turnSettled(pane), TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
     expect(nativeFileParts(gateway.chatRequests[2]!.body)[0]!.data.data).toBe(original);
     writeMarkedImage(input, "NEW_IMAGE_AFTER_RECOVERY");
