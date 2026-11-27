@@ -169,7 +169,7 @@ jobs:
         run: python3 benchmarks/shell_command_overhead.py --binary ./zig-out/bin/fx --output ${{ runner.temp }}/shell-command-overhead-with-mcp --calls 100 --timeout 480 --with-mcp
 
       - name: Enforce shell command overhead budget (with MCP)
-        run: jq -e '.completed == true and .rc_loads == 1 and .per_call_ms.median <= 60 and .total_ms <= (.rc_delay_ms + 100*60 + 1000) and .bridge_registrations == (.calls + 1) and .mcp_server_starts == 0' ${{ runner.temp }}/shell-command-overhead-with-mcp/measurements.json
+        run: jq -e '.completed == true and .rc_loads == 1 and .per_call_ms.median <= 60 and .total_ms <= (.rc_delay_ms + 100*60 + 1000) and .bridge_registrations == (.calls + 1) and .mcp_owner_starts == 0' ${{ runner.temp }}/shell-command-overhead-with-mcp/measurements.json
 
       - name: Upload shell command overhead evidence (with MCP)
         if: always()

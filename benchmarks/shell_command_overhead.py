@@ -32,7 +32,7 @@ PATH_EDITS = 40
 FINAL_TEXT = "SHELL_OVERHEAD_COMPLETE"
 TRACE_SCOPES = "mcp-call,mcp-owner,mcp"
 BRIDGE_START_MARKER = "[mcp-call] bridge listening socket="
-MCP_OWNER_START_MARKER = "[mcp-owner] owner started "
+MCP_OWNER_START_MARKER = "[mcp-owner] owner started pid="
 
 
 def startup_file(kind, marker, delay):
@@ -78,17 +78,17 @@ def line_count(path):
 
 def count_bridge_coverage(trace_path):
     if not trace_path.exists():
-        return {"bridge_registrations": 0, "mcp_server_starts": 0}
+        return {"bridge_registrations": 0, "mcp_owner_starts": 0}
     bridge_registrations = 0
-    mcp_server_starts = 0
-    for line in trace_path.read_text().splitlines():
+    mcp_owner_starts = 0
+    for line in trace_path.read_text(encoding="utf-8", errors="replace").splitlines():
         if BRIDGE_START_MARKER in line:
             bridge_registrations += 1
         if MCP_OWNER_START_MARKER in line:
-            mcp_server_starts += 1
+            mcp_owner_starts += 1
     return {
         "bridge_registrations": bridge_registrations,
-        "mcp_server_starts": mcp_server_starts,
+        "mcp_owner_starts": mcp_owner_starts,
     }
 
 
@@ -288,7 +288,7 @@ def main():
     if args.with_mcp:
         report["expected_bridge_registrations"] = expected_calls
         report["bridge_registrations"] = coverage["bridge_registrations"]
-        report["mcp_server_starts"] = coverage["mcp_server_starts"]
+        report["mcp_owner_starts"] = coverage["mcp_owner_starts"]
         if coverage_error is not None:
             report["coverage_error"] = coverage_error
     (root / "measurements.json").write_text(json.dumps(report, indent=2))

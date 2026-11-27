@@ -33,7 +33,7 @@ class ShellCommandOverheadTests(unittest.TestCase):
             server = next(iter(config["mcpServers"].values()))
             self.assertEqual(server["command"], "/bin/true")
 
-    def test_count_bridge_coverage_counts_registrations_and_server_starts(self) -> None:
+    def test_count_bridge_coverage_counts_registrations_and_real_owner_starts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = pathlib.Path(tmp) / "trace.log"
             trace_path.write_text(
@@ -44,30 +44,44 @@ class ShellCommandOverheadTests(unittest.TestCase):
                         "102 [mcp-call] bridge listening socket=/tmp/fx-mcp-2/s",
                         "103 [mcp-call] bridge closed",
                         "104 [mcp-owner] owner started pid=4321",
+                        "105 [mcp-owner] owner started without a pid",
                     ]
                 )
                 + "\n"
             )
             counts = shell_command_overhead.count_bridge_coverage(trace_path)
             self.assertEqual(counts["bridge_registrations"], 2)
-            self.assertEqual(counts["mcp_server_starts"], 1)
+            self.assertEqual(counts["mcp_owner_starts"], 1)
+            self.assertNotIn("mcp_server_starts", counts)
+
+    def test_count_bridge_coverage_handles_invalid_utf8_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = pathlib.Path(tmp) / "trace.log"
+            trace_path.write_bytes(
+                b"100 [mcp-call] bridge listening socket=/tmp/fx-mcp-1/s\n"
+                b"101 [mcp] bad bytes \xff\xfe here\n"
+                b"102 [mcp-owner] owner started pid=99\n"
+            )
+            counts = shell_command_overhead.count_bridge_coverage(trace_path)
+            self.assertEqual(counts["bridge_registrations"], 1)
+            self.assertEqual(counts["mcp_owner_starts"], 1)
 
     def test_count_bridge_coverage_missing_file_returns_zeroes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             counts = shell_command_overhead.count_bridge_coverage(pathlib.Path(tmp) / "missing.log")
             self.assertEqual(counts["bridge_registrations"], 0)
-            self.assertEqual(counts["mcp_server_starts"], 0)
+            self.assertEqual(counts["mcp_owner_starts"], 0)
 
     def test_check_bridge_coverage_requires_every_shell_call(self) -> None:
         ok, err = shell_command_overhead.check_bridge_coverage(
-            {"bridge_registrations": 101, "mcp_server_starts": 0},
+            {"bridge_registrations": 101, "mcp_owner_starts": 0},
             100,
         )
         self.assertTrue(ok)
         self.assertIsNone(err)
 
         ok, err = shell_command_overhead.check_bridge_coverage(
-            {"bridge_registrations": 0, "mcp_server_starts": 0},
+            {"bridge_registrations": 0, "mcp_owner_starts": 0},
             100,
         )
         self.assertFalse(ok)
