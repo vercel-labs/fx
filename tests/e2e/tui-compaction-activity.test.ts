@@ -4,7 +4,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { traceReportNames, waitForNewTraceReport } from "./trace-report";
-import { logLines, onlySessionId, savedText, sessionDir } from "./saved-sessions";
+import { logLines, onlySessionId, savedSession, savedText, savedToolCallIds, sessionDir } from "./saved-sessions";
 import { bearer, rotateFxLogin, startFakeIssuer, writeFxLogin } from "./fx-login-fakes";
 
 // The shared tmux helper imports eval helpers; do not load repository dotenv files.
@@ -306,6 +306,162 @@ async function assertLive(terminal: InstanceType<typeof TmuxSession>) {
     return markers.size === 2 && !rows[0].includes(clock);
   }, 5000);
   expect(later.match(/Compacting/g)).toHaveLength(1);
+}
+
+/// One turn reads a.txt, b.txt and c.txt, and a compaction between the first
+/// read and the second summarizes the first: `auto` before the next request,
+/// `overflow` after the provider refuses it for its size. The session still
+/// saves the first read (D87), so a reopened transcript and Ctrl+O show the
+/// turn as it ran, while the model never gets a.txt back: not on the next
+/// turn, and not after the reopen.
+async function foldedReadAfterReopen(trigger: "auto" | "overflow") {
+  const root = mkdtempSync(join(tmpdir(), `fx-folded-read-${trigger}-`));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace);
+  writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
+  // One-letter words count as a token each, so a.txt's preview pushes the
+  // turn's next request past 10% of the window, which the first stays under.
+  const FOLDED = "FOLDED_READ_5c2e";
+  const letters = "a b c d e f g h i j k l m n o p q r s t";
+  writeFileSync(join(workspace, "a.txt"), `${FOLDED} ${letters}\n${`${letters}\n`.repeat(999)}`);
+  writeFileSync(join(workspace, "b.txt"), "bravo\n");
+  writeFileSync(join(workspace, "c.txt"), "charlie\n");
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+    model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    ...(trigger === "auto" ? { auto_compact_percent: 10 } : {}),
+  }));
+  const PROMPT = "Read the three files.";
+  const DONE = "FOLDED_TURN_DONE_7c1a";
+  const handoff = "Facts:\nF1: FOLDED_HANDOFF_51aa: the user asked to read three files.";
+  let phase: "seed" | "turn" | "next" | "reopen" = "seed";
+  let turnSteps = 0;
+  const bodies: { phase: typeof phase; summary: boolean; body: string }[] = [];
+  const gateway = startDynamicFakeGateway((raw) => {
+    const request = JSON.parse(raw);
+    // A summary request can keep the conversation's tools for the cache, so
+    // its instruction marks it too.
+    const summary = (request.toolChoice?.type === "none" && request.tools?.length === 0) ||
+      raw.includes("Write the compaction notes") || raw.includes("Your notes on the turns above left some out");
+    bodies.push({ phase, summary, body: raw });
+    if (summary) return fakeGatewayFinalText(handoff);
+    if (phase === "seed") {
+      if (!raw.includes('"seed-read"')) return fakeGatewayToolCall("seed-read", "read_file", { path: "seed-notes.txt" });
+      // No usage, which would scale fx's later size estimates.
+      return fakeGatewaySse([
+        { type: "text-delta", id: "answer_1", delta: `${"history alpha beta gamma delta sample line\n".repeat(40)}SEED_DONE` },
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+      ]);
+    }
+    if (phase === "next") return fakeGatewayFinalText("NEXT_OK");
+    if (phase === "reopen") return fakeGatewayFinalText(REOPEN);
+    turnSteps++;
+    const steps: Array<() => Response> = [
+      () => fakeGatewayToolCall("read_a", "read_file", { path: "a.txt", line_count: 1000 }),
+      ...(trigger === "overflow" ? [() => Response.json({ error: {
+        type: "invalid_request_error", code: "context_length_exceeded",
+        message: "This model's maximum context length is 128000 tokens. The request exceeds the context window.",
+      } }, { status: 400 })] : []),
+      () => fakeGatewayToolCall("read_b", "read_file", { path: "b.txt" }),
+      () => fakeGatewayToolCall("read_c", "read_file", { path: "c.txt" }),
+    ];
+    return steps[turnSteps - 1]?.() ?? fakeGatewayFinalText(DONE);
+  }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 67_000 + 8192, max_tokens: 8192 }] });
+  const env: Record<string, string> = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+    TERM: "xterm-256color", AI_GATEWAY_API_KEY: "synthetic-compaction-key",
+    FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1",
+    FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
+    FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  };
+  let terminal: InstanceType<typeof TmuxSession> | undefined;
+  const stderrPaths: string[] = [];
+  async function launch(resume: string | null) {
+    const stderrPath = join(root, `terminal-${stderrPaths.length + 1}.stderr`);
+    stderrPaths.push(stderrPath);
+    const command = `/usr/bin/env -i ${Object.entries(env).map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)}${resume ? ` --resume ${shellQuote(resume)}` : ""}`;
+    terminal = await TmuxSession.create({
+      cmd: command, cwd: workspace, env: { HOME: home, FX_SOUND: "0" }, isolated: true,
+      stderrPath, width: 100, height: 40, startupWaitMs: 0,
+    });
+    await terminal.waitForStableComposer(20_000);
+    return terminal;
+  }
+  async function quit() {
+    await terminal!.sendText("/quit");
+    expect(await terminal!.waitForSessionEnd(10_000)).toBe(true);
+    await terminal!.kill();
+    terminal = undefined;
+  }
+  const finished = (pane: string, marker: string) => pane.includes(marker) && hasEmptyComposer(pane) && turnSettled(pane);
+  const turnRows = (pane: string) => pane.slice(pane.lastIndexOf(`┃ ${PROMPT}`));
+  let passed = false;
+  try {
+    const live = await launch(null);
+    await live.sendText("Seed one turn.");
+    await live.waitForPane((pane) => finished(pane, "SEED_DONE") && /^  (?:[^\n]* · )?\d+s(?: \(↑[^\n]*\))?$/m.test(pane), 20_000);
+    phase = "turn";
+    await live.sendText(PROMPT);
+    const liveRows = turnRows(await live.waitForPane((pane) => finished(pane, DONE) && /Explored \d files/.test(pane), 30_000));
+    expect(bodies.some((entry) => entry.phase === "turn" && entry.summary)).toBe(true);
+    // Live, the compaction's row splits the reads in two. fx saves no such
+    // row, so after reopen the reads are one row.
+    const liveAt = (row: string) => liveRows.indexOf(row);
+    expect(liveAt("● Read a.txt L1-1000")).toBeGreaterThanOrEqual(0);
+    expect(liveAt("✓ Context compacted (")).toBeGreaterThan(liveAt("● Read a.txt L1-1000"));
+    expect(liveAt("● Read b.txt, c.txt")).toBeGreaterThan(liveAt("✓ Context compacted ("));
+    expect(liveRows).toContain("Explored 3 files");
+    phase = "next";
+    await live.sendText("Next live turn.");
+    await live.waitForPane((pane) => finished(pane, "NEXT_OK"), 20_000);
+    await quit();
+
+    const id = onlySessionId(home);
+    const reopened = await launch(id);
+    const reopenedRows = turnRows(await reopened.waitForPane((pane) => pane.includes(DONE) && hasEmptyComposer(pane), 20_000));
+    expect(reopenedRows).toContain("● Read a.txt, b.txt, c.txt");
+    expect(reopenedRows).toContain("Explored 3 files");
+    // Ctrl+O shows a.txt's read too, pages above its end.
+    await reopened.sendKeys("C-o");
+    let page = await reopened.waitForText("esc close · pgup/pgdn scroll", 5000);
+    const pages = [page];
+    while (!page.includes(`┃ ${PROMPT}`) && pages.length < 40) {
+      await reopened.sendKeys("PageUp");
+      const before = page;
+      page = await reopened.waitForPane((pane) => pane !== before, 5000);
+      pages.push(page);
+    }
+    const full = pages.join("\n");
+    expect(full).toContain("● Read a.txt");
+    expect(full).toContain(FOLDED);
+    await reopened.sendKeys("Escape");
+    await reopened.waitForComposer(5000);
+    phase = "reopen";
+    await reopened.sendText("Continue after reopening.");
+    await reopened.waitForPane((pane) => finished(pane, REOPEN), 20_000);
+    await quit();
+    // The log holds the turn once, whole, as `fx session` shows it.
+    logLines(home, id);
+    expect(savedToolCallIds((await savedSession(home, id)).history)).toEqual(["seed-read", "read_a", "read_b", "read_c"]);
+
+    // The summary stands in for a.txt in every request after the compaction.
+    const after = bodies.filter((entry) => entry.phase === "next" || entry.phase === "reopen");
+    expect(after.length).toBeGreaterThanOrEqual(2);
+    for (const entry of after) expect(entry.body.includes(FOLDED)).toBe(false);
+    for (const path of stderrPaths) expect(readFileSync(path, "utf8")).toBe("");
+    passed = true;
+  } finally {
+    if (!passed) {
+      if (terminal) writeFileSync(join(root, "failure.pane.txt"), await terminal.capturePane());
+      console.error(`folded read evidence retained: ${root}; phase=${phase}`);
+    }
+    await terminal?.kill();
+    gateway.stop();
+    if (passed) rmSync(root, { recursive: true, force: true });
+  }
 }
 
 describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
@@ -696,6 +852,12 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         passed = true;
       } finally { await f.cleanup(passed); }
     }, 60_000);
+  }
+
+  for (const trigger of ["auto", "overflow"] as const) {
+    test(`${trigger}: a read the compaction inside its turn summarized still shows after reopen, and the model never gets it back`, async () => {
+      await foldedReadAfterReopen(trigger);
+    }, 120_000);
   }
 
   test("manual failure then success: /trace records compaction decisions and failures without FX_TRACE", async () => {
@@ -1272,13 +1434,9 @@ describe.skipIf(!tmuxAvailable())("tui: tool rows around a notice in the middle 
   test("auto: the calls after an in-turn compaction draw below its line, and share one row after resume", async () => {
     const { liveRows, resumedRows } = await readAroundNotice("auto");
     expect(liveRows).toEqual(compactedRows);
-    // This compaction folds the turn's first step into its summary. Whether
-    // resume draws that step is not what this test checks: the calls share
-    // one row.
-    expect(resumedRows).toHaveLength(3);
-    expect(resumedRows[0]).toBe(`┃ ${NOTICE_PROMPT}`);
-    expect(resumedRows[1]).toMatch(/^● Read (?:a\.txt, )?b\.txt, c\.txt$/);
-    expect(resumedRows[2]).toBe(`  ${NOTICE_DONE}`);
+    // This compaction folds the turn's first step into its summary. The log
+    // still saves that step (D87), so resume draws it in the shared row.
+    expect(resumedRows).toEqual([`┃ ${NOTICE_PROMPT}`, "● Read a.txt, b.txt, c.txt", `  ${NOTICE_DONE}`]);
   }, 120_000);
 
   test("provider error: the calls after the reason fx showed while it waited draw below it, and share one row after resume", async () => {
