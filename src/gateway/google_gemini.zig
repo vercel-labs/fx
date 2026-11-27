@@ -865,6 +865,7 @@ const TestResponseFixture = struct {
         self.reached_stage.store(true, .seq_cst);
         while (!self.stopping.load(.seq_cst)) {
             var sleep_io: std.Io.Threaded = .init_single_threaded;
+            // A failed sleep only polls once more (FXC-1302).
             sleep_io.io().sleep(.fromMilliseconds(5), .real) catch {};
         }
     }
@@ -1430,6 +1431,7 @@ test "Google Gemini cancel stops an open stream fast" {
         fn run(self: *@This()) void {
             while (!self.reached.load(.seq_cst)) {
                 var sleep_io: std.Io.Threaded = .init_single_threaded;
+                // A failed sleep only polls once more (FXC-1302).
                 sleep_io.io().sleep(.fromMilliseconds(2), .real) catch {};
             }
             self.flag.store(true, .seq_cst);

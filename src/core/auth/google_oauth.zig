@@ -2285,6 +2285,7 @@ test "Google concurrent loadAccess calls refresh only once" {
             _ = self.calls.fetchAdd(1, .seq_cst);
             self.entered.store(true, .seq_cst);
             while (!self.release.load(.seq_cst)) {
+                // A failed yield only spins once more (FXC-1302).
                 std.Thread.yield() catch {};
             }
             return .{
@@ -2319,6 +2320,7 @@ test "Google concurrent loadAccess calls refresh only once" {
     var w2 = Worker{ .transport = transport };
 
     const t1 = try std.Thread.spawn(.{}, Worker.run, .{&w1});
+    // A failed yield only spins once more (FXC-1302).
     while (!probe.entered.load(.seq_cst)) std.Thread.yield() catch {};
     const t2 = try std.Thread.spawn(.{}, Worker.run, .{&w2});
     io_mod.sleep(10 * std.time.ns_per_ms);
