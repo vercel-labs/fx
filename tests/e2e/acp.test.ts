@@ -1919,6 +1919,61 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP answers initialize before the Token Pass check answers, and session/new waits for the answer",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-token-pass-late-");
+      const tracePath = join(root.root, "trace.log");
+      const trace = () => existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+      let releaseCredits = () => {};
+      const creditsReleased = new Promise<void>((resolve) => { releaseCredits = resolve; });
+      let creditsRequests = 0;
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_LATE_TOKEN_PASS_OK"), {
+        // A catalog without marks, so only the credits check answers for the team.
+        models: tokenPassCatalog(false),
+        usage: (url) => {
+          if (url.pathname !== "/coding-agent/v1/credits") return null;
+          creditsRequests += 1;
+          return creditsReleased.then(() => Response.json({ balance: "5.00", token_pass: { remaining: "79.92906" } }));
+        },
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_MODEL: undefined,
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "token_pass",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        // fx has no saved answer, and the credits endpoint holds its reply.
+        expect(trace()).toContain("check started saved=none");
+        expect(trace()).not.toContain("check answered");
+        expect(trace()).not.toContain("check wait");
+
+        const created = client.request("session/new", { mcpServers: [] }, 2) as Promise<any>;
+        await waitForCondition("session/new to wait for the Token Pass check", () => trace().includes("check wait started"));
+        releaseCredits();
+        const model = (await created).result.configOptions.find((option: any) => option.id === "model");
+        expect(model.currentValue).toBe("deepseek/deepseek-v4.1-flash");
+        expect(trace()).not.toContain("check wait ended");
+        expect(creditsRequests).toBe(1);
+        const saved = JSON.parse(readFileSync(join(root.home, ".fx", "token-pass.json"), "utf8"));
+        expect(Object.values(saved.teams)).toEqual(["has_pass"]);
+        expect(client.stderr).toBe("");
+      } finally {
+        releaseCredits();
+        await client?.close();
+        client = undefined;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP titles a session with the login another fx refreshed after session/new",
     async () => {
       const root = createIsolatedRoot("fx-acp-title-rotated-login-");

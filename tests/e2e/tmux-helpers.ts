@@ -480,7 +480,7 @@ export type FakeGatewayOptions = {
   // Answers usage GETs (`/v1/report`, `/ai-gateway/usage-report`, ChatGPT's
   // `/backend-api/wham/...`, Grok's `/billing` and `/settings`); see
   // usage-fakes.ts. Null falls through to the routes below.
-  usage?: (url: URL, request: Request) => Response | null;
+  usage?: (url: URL, request: Request) => Response | Promise<Response> | null;
   // Response for the /v4/ai/evaluation-model endpoint (TypeSafe Jev through
   // the gateway). Defaults to a clear Jev decision.
   evaluationResponse?: FakeGatewayResponse;
@@ -547,7 +547,7 @@ function serveFakeGateway(
       }
       if (req.method === "GET" && options.usage) {
         const answer = options.usage(new URL(req.url), req);
-        if (answer) return answer;
+        if (answer) return await answer;
       }
       if (
         req.method === "POST" &&

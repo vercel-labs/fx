@@ -23,8 +23,8 @@ const session_commands = @import("../session/session_commands.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// How long the first prompt of a session waits for a check whose answer fx
-/// has not saved before.
+/// How long after a check starts a new session or its first prompt waits
+/// for an answer fx has not saved before.
 pub const first_prompt_wait_ms: i64 = 2_000;
 
 const Identity = [token_pass.identity_len]u8;
@@ -104,7 +104,8 @@ const answer_poll_ms: u64 = 10;
 
 /// For `fx ask` and ACP: the answer saved for the team, refreshed by a
 /// credits check that runs while the session works. Without a saved answer,
-/// `begin` waits for the check, as the first prompt in the app does.
+/// what depends on it waits for the check with `awaitAnswer`, as the first
+/// prompt in the app does.
 pub const Check = struct {
     lookup: credits_lookup.Lookup = .{},
     named: Named,
@@ -112,18 +113,21 @@ pub const Check = struct {
     has_pass: bool = false,
     /// Whether the credits check answered in this run.
     answered: bool = false,
+    /// Whether fx had an answer saved for the team when the check started.
+    had_saved: bool = false,
+    /// When the credits check started, on the awake clock.
+    started_ms: ?i64 = null,
 
-    /// Starts the check with the saved answer, or waits at most `wait_ms`
-    /// for one when fx has none. Publishes whether the team has Token Pass
-    /// to `token_pass_team`.
+    /// Starts the check with the saved answer, and never waits for it.
+    /// Publishes whether the team has Token Pass to `token_pass_team`.
     pub fn begin(
         self: *Check,
         alloc: Allocator,
         provider: gateway_provider.CreditsProvider,
         input: gateway_provider.CreditsLookupInput,
-        wait_ms: i64,
     ) void {
         const saved: ?token_pass.Answer = if (self.home) |dir| if (self.named.saved_as) |id| token_pass_memory.load(alloc, dir, &id) else null else null;
+        self.had_saved = saved != null;
         self.has_pass = saved == .has_pass;
         token_pass_team.publishAnswer(saved, false);
         if (comptime builtin.single_threaded) return;
@@ -137,13 +141,50 @@ pub const Check = struct {
             debug_trace.logf("token_pass", "check start failed err={s}", .{@errorName(err)});
             return;
         };
+        self.started_ms = io_mod.awakeMilliTimestamp();
         debug_trace.logf("token_pass", "check started saved={s}", .{answerLabel(saved)});
-        if (saved == null) self.waitForAnswer(alloc, wait_ms);
+    }
+
+    /// For what depends on the answer, such as a new session's model: waits
+    /// for the check while fx knows nothing of the team, until
+    /// `first_prompt_wait_ms` after the check started (`holdsRequest`).
+    pub fn awaitAnswer(self: *Check, alloc: Allocator) void {
+        self.poll(alloc);
+        if (!self.holdsRequest(self.lookup.task != null, io_mod.awakeMilliTimestamp())) return;
+        debug_trace.logf("token_pass", "check wait started", .{});
+        while (true) {
+            // The lookup sets no signal to wait on; `holdsRequest` bounds the wait.
+            io_mod.sleep(answer_poll_ms * std.time.ns_per_ms);
+            self.poll(alloc);
+            if (!self.holdsRequest(self.lookup.task != null, io_mod.awakeMilliTimestamp())) break;
+        }
+        if (self.lookup.task != null) debug_trace.logf("token_pass", "check wait ended without an answer wait_ms={d}", .{first_prompt_wait_ms});
+    }
+
+    /// Whether a request that depends on the answer still waits at `now_ms`:
+    /// only while the check runs, fx knows nothing of the team from a saved
+    /// answer, this run's answer, or the catalog's marks, and
+    /// `first_prompt_wait_ms` has not passed since the check started.
+    fn holdsRequest(self: *const Check, running: bool, now_ms: i64) bool {
+        if (!running or self.had_saved or self.answered or self.has_pass) return false;
+        const started = self.started_ms orelse return false;
+        return now_ms - started < first_prompt_wait_ms;
     }
 
     /// Takes the answer if it has arrived, without waiting.
     pub fn poll(self: *Check, alloc: Allocator) void {
-        self.waitForAnswer(alloc, 0);
+        var result = self.lookup.take() orelse return;
+        defer result.deinit();
+        const answer = answerOf(result.snapshot);
+        if (answer) |fresh| {
+            self.has_pass = fresh == .has_pass;
+            self.answered = true;
+            token_pass_team.publishAnswer(fresh, true);
+            if (self.home) |dir| if (self.named.saved_as) |id| saveAnswer(alloc, dir, &id, fresh);
+        }
+        // Logged once the answer is saved, so a reader of the trace finds
+        // the file current.
+        debug_trace.logf("token_pass", "check answered answer={s}", .{answerLabel(answer)});
     }
 
     /// Takes the catalog's Token Pass marks as the team's answer while AI
@@ -161,36 +202,10 @@ pub const Check = struct {
     /// Takes an answer that has arrived, then stops the check. `reason`
     /// names why, for the trace, when the check had not answered.
     pub fn finish(self: *Check, alloc: Allocator, reason: []const u8) void {
-        self.waitForAnswer(alloc, 0);
+        self.poll(alloc);
         _ = self.observeCatalog(alloc);
         if (self.lookup.task != null) debug_trace.logf("token_pass", "check dropped reason={s}", .{reason});
         self.lookup.deinit();
-    }
-
-    fn waitForAnswer(self: *Check, alloc: Allocator, wait_ms: i64) void {
-        const deadline = io_mod.awakeMilliTimestamp() + wait_ms;
-        while (self.lookup.task != null) {
-            if (self.lookup.take()) |taken| {
-                var result = taken;
-                defer result.deinit();
-                const answer = answerOf(result.snapshot);
-                if (answer) |fresh| {
-                    self.has_pass = fresh == .has_pass;
-                    self.answered = true;
-                    token_pass_team.publishAnswer(fresh, true);
-                    if (self.home) |dir| if (self.named.saved_as) |id| saveAnswer(alloc, dir, &id, fresh);
-                }
-                // Logged once the answer is saved, so a reader of the trace
-                // finds the file current.
-                debug_trace.logf("token_pass", "check answered answer={s}", .{answerLabel(answer)});
-                return;
-            }
-            if (io_mod.awakeMilliTimestamp() >= deadline) {
-                if (wait_ms > 0) debug_trace.logf("token_pass", "check wait ended without an answer wait_ms={d}", .{wait_ms});
-                return;
-            }
-            io_mod.sleep(answer_poll_ms * std.time.ns_per_ms);
-        }
     }
 };
 
@@ -581,6 +596,28 @@ test "token pass check: the first prompt waits only for an answer fx has not sav
     try std.testing.expect(!state.holdsFirstPrompt(1_000));
     state = .{};
     try std.testing.expect(!state.holdsFirstPrompt(1_000));
+}
+
+test "token pass check: a request waits only while nothing is known of the team, until the wait from the check's start runs out" {
+    const named: Named = .{ .asked = @splat(0), .saved_as = null };
+    var check: Check = .{ .named = named, .home = null, .started_ms = 1_000 };
+    try std.testing.expect(check.holdsRequest(true, 1_000));
+    try std.testing.expect(check.holdsRequest(true, 1_000 + first_prompt_wait_ms - 1));
+    // The wait counts from the check's start, not from the request.
+    try std.testing.expect(!check.holdsRequest(true, 1_000 + first_prompt_wait_ms));
+    // A check that ended, with or without an answer, holds nothing.
+    try std.testing.expect(!check.holdsRequest(false, 1_000));
+
+    // A saved answer, this run's answer, or the catalog's marks end the wait.
+    check = .{ .named = named, .home = null, .started_ms = 1_000, .had_saved = true };
+    try std.testing.expect(!check.holdsRequest(true, 1_000));
+    check = .{ .named = named, .home = null, .started_ms = 1_000, .answered = true };
+    try std.testing.expect(!check.holdsRequest(true, 1_000));
+    check = .{ .named = named, .home = null, .started_ms = 1_000, .has_pass = true };
+    try std.testing.expect(!check.holdsRequest(true, 1_000));
+    // A check that never started holds nothing.
+    check = .{ .named = named, .home = null };
+    try std.testing.expect(!check.holdsRequest(true, 1_000));
 }
 
 test "token pass check: the transcript says Token Pass is active only once it is known in this run" {

@@ -1815,8 +1815,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
                 alloc,
                 cfg.provider_set.select(.gateway).credits orelse gateway_provider.unavailable_credits_provider,
                 .{ .credential = ctx.api_key, .credential_source = source, .tenant = ctx.gateway_team },
-                token_pass_check.first_prompt_wait_ms,
             );
+            token_pass_run.?.awaitAnswer(alloc);
             const nothing_chose_model = startup.model_source == .compiled_default and
                 options.model_override == null and
                 ctx.requested_resume == null and

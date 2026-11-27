@@ -1688,8 +1688,8 @@ fn dispatchNotification(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mes
 
 fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     reapActivePrompt(state, false);
-    pollTokenPass(state);
     const method = AcpMethod.parse(msg.method);
+    takeTokenPassAnswer(state, method);
 
     if (method == .initialize) {
         return handleInitialize(state, alloc, msg);
@@ -3199,8 +3199,8 @@ test "ordinary ACP ignores private libfx capabilities" {
 
 /// Asks whether the credential's team has Token Pass. A team with Token Pass
 /// starts new sessions on the Token Pass default when nothing chose the
-/// model. The check waits here only when fx has no saved answer, and
-/// `pollTokenPass` takes a later answer.
+/// model. `initialize` never waits for the check; the requests that depend
+/// on its answer do (`tokenPassNeed`).
 fn startTokenPassCheck(state: *ServerState, alloc: Allocator, model_source: config_runtime.ModelSource) void {
     if (state.provider != .gateway) return;
     const source = state.credential_source orelse return;
@@ -3215,17 +3215,35 @@ fn startTokenPassCheck(state: *ServerState, alloc: Allocator, model_source: conf
         alloc,
         state.cfg.provider_set.select(.gateway).credits orelse gateway_provider.unavailable_credits_provider,
         .{ .credential = api_key, .credential_source = source, .tenant = state.gateway_team },
-        token_pass_check.first_prompt_wait_ms,
     );
     if (model_source != .compiled_default or state.process_model_override) return;
     state.token_pass_start = .{ .fast_mode = state.fast_mode, .ultrafast_mode = state.ultrafast_mode };
     applyTokenPassStartModel(state);
 }
 
-fn pollTokenPass(state: *ServerState) void {
+/// What a request does about the Token Pass answer: take it if it has
+/// arrived, or wait for a check that has not answered.
+const TokenPassNeed = enum { take, wait };
+
+/// Clients read a new session's model from the `session/new` reply, so it
+/// waits when nothing chose the model. A prompt waits because its side calls,
+/// such as the title, run on Token Pass models only for a team with Token
+/// Pass (`token_pass_team.modelForSideCall`).
+fn tokenPassNeed(state: *const ServerState, method: AcpMethod) TokenPassNeed {
+    return switch (method) {
+        .session_new => if (state.token_pass_start != null) .wait else .take,
+        .session_prompt => .wait,
+        else => .take,
+    };
+}
+
+fn takeTokenPassAnswer(state: *ServerState, method: AcpMethod) void {
     const check = if (state.token_pass_run) |*value| value else return;
     const before = check.has_pass;
-    if (check.lookup.task != null) check.poll(state.alloc);
+    switch (tokenPassNeed(state, method)) {
+        .take => check.poll(state.alloc),
+        .wait => check.awaitAnswer(state.alloc),
+    }
     _ = check.observeCatalog(state.alloc);
     if (check.has_pass != before) applyTokenPassStartModel(state);
 }
@@ -3247,6 +3265,206 @@ fn applyTokenPassStartModel(state: *ServerState) void {
     }
     state.fast_mode = if (has_pass) false else profile.fast_mode;
     state.ultrafast_mode = if (has_pass) false else profile.ultrafast_mode;
+}
+
+/// The awake clock for the Token Pass tests: it starts at zero, and a sleep
+/// moves it on at once, so a test reads how long fx would have waited.
+const FakeAwakeClock = struct {
+    previous: ?std.Io,
+
+    var vtable: std.Io.VTable = undefined;
+    var base_now: *const fn (?*anyopaque, std.Io.Clock) std.Io.Timestamp = undefined;
+    var awake_ns: std.atomic.Value(i64) = .init(0);
+
+    fn install() FakeAwakeClock {
+        const base = io_mod.getIo();
+        vtable = base.vtable.*;
+        base_now = base.vtable.now;
+        vtable.now = now;
+        vtable.sleep = sleep;
+        awake_ns.store(0, .seq_cst);
+        return .{ .previous = io_mod.replaceIoForTest(.{ .userdata = base.userdata, .vtable = &vtable }) };
+    }
+
+    fn deinit(self: *FakeAwakeClock) void {
+        io_mod.restoreIoForTest(self.previous);
+    }
+
+    fn elapsedMs() i64 {
+        return @divTrunc(awake_ns.load(.seq_cst), std.time.ns_per_ms);
+    }
+
+    fn now(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+        if (clock == .awake) return .fromNanoseconds(awake_ns.load(.seq_cst));
+        return base_now(userdata, clock);
+    }
+
+    fn sleep(_: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+        switch (timeout) {
+            .duration => |duration| _ = awake_ns.fetchAdd(@intCast(duration.raw.nanoseconds), .seq_cst),
+            // The Token Pass waits sleep only for a duration.
+            .none, .deadline => return error.Canceled,
+        }
+    }
+};
+
+/// A credits endpoint that answers only once the test releases it: then it
+/// says the team has Token Pass.
+const HeldCredits = struct {
+    released: std.atomic.Value(bool) = .init(false),
+
+    fn provider(self: *HeldCredits) gateway_provider.CreditsProvider {
+        return .{ .context = self, .fetch_fn = fetch };
+    }
+
+    fn fetch(
+        raw: ?*anyopaque,
+        _: Allocator,
+        input: gateway_provider.CreditsLookupInput,
+    ) @import("../core/output/output_contracts.zig").CreditsSnapshot {
+        const self: *HeldCredits = @ptrCast(@alignCast(raw.?));
+        // A failed yield only spins once more.
+        while (!self.released.load(.seq_cst) and !input.cancel_flag.?.load(.seq_cst)) std.Thread.yield() catch {};
+        return .{ .token_pass = .{} };
+    }
+};
+
+/// A server signed in with an AI Gateway key whose team has no saved Token
+/// Pass answer in `home`, on the built-in default model.
+fn tokenPassTestState(alloc: Allocator, home: []const u8, credits: *HeldCredits, api_key: []u8) !ServerState {
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.init(),
+        .api_key = api_key,
+        .credential_source = .ai_gateway_api_key,
+    };
+    state.cfg.home_override = home;
+    state.cfg.provider_set = @import("../core/gateway/provider_set.zig").gateway_only(.{ .credits = credits.provider() });
+    state.configured_model = try alloc.dupe(u8, "example/built-in-default");
+    errdefer alloc.free(state.configured_model);
+    state.selected_model = try alloc.dupe(u8, state.configured_model);
+    return state;
+}
+
+fn freeTokenPassTestState(state: *ServerState, credits: *HeldCredits) void {
+    credits.released.store(true, .seq_cst);
+    if (state.token_pass_run) |*check| check.finish(state.alloc, "test_finished");
+    state.alloc.free(state.selected_model);
+    state.alloc.free(state.configured_model);
+    @import("../core/gateway/token_pass_team.zig").clear();
+}
+
+test "ACP initialize starts the Token Pass check without waiting for its answer" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var home = std.testing.tmpDir(.{});
+    defer home.cleanup();
+    const home_path = try io_mod.dirRealpathAlloc(alloc, home.dir, ".");
+    defer alloc.free(home_path);
+    var api_key = "vck_example".*;
+    var credits: HeldCredits = .{};
+    var clock = FakeAwakeClock.install();
+    defer clock.deinit();
+    var state = try tokenPassTestState(alloc, home_path, &credits, &api_key);
+    defer freeTokenPassTestState(&state, &credits);
+
+    startTokenPassCheck(&state, alloc, .compiled_default);
+
+    // fx has no saved answer and the credits endpoint has not replied, yet
+    // `initialize` goes on at once and leaves the check running.
+    try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
+    try std.testing.expect(state.token_pass_run.?.lookup.task != null);
+    try std.testing.expectEqualStrings("example/built-in-default", state.selected_model);
+}
+
+test "ACP waits for an unanswered Token Pass check only in a new session nothing chose a model for, and in a prompt" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var home = std.testing.tmpDir(.{});
+    defer home.cleanup();
+    const home_path = try io_mod.dirRealpathAlloc(alloc, home.dir, ".");
+    defer alloc.free(home_path);
+    var api_key = "vck_example".*;
+    var credits: HeldCredits = .{};
+    var clock = FakeAwakeClock.install();
+    defer clock.deinit();
+    var state = try tokenPassTestState(alloc, home_path, &credits, &api_key);
+    defer freeTokenPassTestState(&state, &credits);
+    startTokenPassCheck(&state, alloc, .compiled_default);
+
+    for ([_]AcpMethod{ .initialize, .session_list, .session_load, .session_resume, .session_set_config_option, .session_close }) |method| {
+        takeTokenPassAnswer(&state, method);
+        try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
+    }
+    // A model that the profile or a flag chose does not wait on the answer.
+    const start = state.token_pass_start;
+    state.token_pass_start = null;
+    takeTokenPassAnswer(&state, .session_new);
+    try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
+    state.token_pass_start = start;
+
+    try std.testing.expectEqual(TokenPassNeed.wait, tokenPassNeed(&state, .session_new));
+    try std.testing.expectEqual(TokenPassNeed.wait, tokenPassNeed(&state, .session_prompt));
+    state.token_pass_start = null;
+    try std.testing.expectEqual(TokenPassNeed.wait, tokenPassNeed(&state, .session_prompt));
+}
+
+test "ACP session/new waits for an unanswered Token Pass check until the wait from the check's start runs out" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var home = std.testing.tmpDir(.{});
+    defer home.cleanup();
+    const home_path = try io_mod.dirRealpathAlloc(alloc, home.dir, ".");
+    defer alloc.free(home_path);
+    var api_key = "vck_example".*;
+    var credits: HeldCredits = .{};
+    var clock = FakeAwakeClock.install();
+    defer clock.deinit();
+    var state = try tokenPassTestState(alloc, home_path, &credits, &api_key);
+    defer freeTokenPassTestState(&state, &credits);
+    startTokenPassCheck(&state, alloc, .compiled_default);
+
+    // The client lists its sessions first; on the fake clock this sleep
+    // only moves the time on.
+    io_mod.sleep(500 * std.time.ns_per_ms);
+    takeTokenPassAnswer(&state, .session_new);
+
+    try std.testing.expectEqual(token_pass_check.first_prompt_wait_ms, FakeAwakeClock.elapsedMs());
+    try std.testing.expect(state.token_pass_run.?.lookup.task != null);
+    try std.testing.expectEqualStrings("example/built-in-default", state.selected_model);
+    // The wait does not start again for a later request.
+    takeTokenPassAnswer(&state, .session_prompt);
+    try std.testing.expectEqual(token_pass_check.first_prompt_wait_ms, FakeAwakeClock.elapsedMs());
+}
+
+test "ACP session/new takes a Token Pass answer that arrived after initialize and starts on the Token Pass default" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var home = std.testing.tmpDir(.{});
+    defer home.cleanup();
+    const home_path = try io_mod.dirRealpathAlloc(alloc, home.dir, ".");
+    defer alloc.free(home_path);
+    var api_key = "vck_example".*;
+    var credits: HeldCredits = .{};
+    var clock = FakeAwakeClock.install();
+    defer clock.deinit();
+    var state = try tokenPassTestState(alloc, home_path, &credits, &api_key);
+    defer freeTokenPassTestState(&state, &credits);
+    state.fast_mode = true;
+    startTokenPassCheck(&state, alloc, .compiled_default);
+
+    credits.released.store(true, .seq_cst);
+    const task = state.token_pass_run.?.lookup.task.?;
+    // A failed yield only spins once more.
+    while (!task.done.load(.acquire)) std.Thread.yield() catch {};
+    takeTokenPassAnswer(&state, .session_new);
+
+    try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
+    try std.testing.expectEqualStrings(token_pass.default_model, state.selected_model);
+    // Token Pass credit pays only for standard speed.
+    try std.testing.expect(!state.fast_mode);
+    try std.testing.expectEqual(token_pass.Answer.has_pass, @import("../core/gateway/token_pass_memory.zig").load(alloc, home_path, &state.token_pass_run.?.named.saved_as.?).?);
 }
 
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
@@ -3479,7 +3697,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         _ = try resolveSelectedModelCapabilities(state, startup_catalog);
         // The catalog just loaded; its Token Pass marks can answer for the
         // team when the credits check could not.
-        if (comptime !host_target.is_wasm) pollTokenPass(state);
+        if (comptime !host_target.is_wasm) takeTokenPassAnswer(state, .initialize);
     }
 
     if (state.cfg.effort_override) |raw| {
