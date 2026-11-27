@@ -1722,6 +1722,15 @@ fn memberTakes(member: *const Member, need: RunningCopy.Need) bool {
     };
 }
 
+/// Whether the owner or a member of `session` does not take `need`. The caller holds the audience lock.
+pub fn someMemberLacks(session: *ActiveSessionState, need: RunningCopy.Need) bool {
+    if (!memberTakes(mainLocked(session).?, need)) return true;
+    for (session.members.items) |member| {
+        if (!memberTakes(member, need)) return true;
+    }
+    return false;
+}
+
 /// Frees `session`'s running copy under its audience lock. The save that commits
 /// the turn calls this while it holds `session_write_mutex` (lock order: session
 /// write, then audience), so the copy and the log change together. The turn's end
@@ -9788,6 +9797,33 @@ test "a member whose write fails is dropped, and the list goes out again without
 const with_params_json = "{\"marker\":\"with\"}";
 const without_params_json = "{\"marker\":\"without\"}";
 
+/// The owner and the follower of the model-calls tests, both writing to the caller's wires. The
+/// owner lists `model_calls`. The caller opens the session once the pair is in its final place,
+/// because the session keeps a pointer to the owner.
+const ModelCallsPair = struct {
+    owner: ServerState,
+    follower: ServerState,
+};
+
+fn initModelCallsPair(alloc: Allocator, test_host: *Host, owner_wire: *ClientsWire, follower_wire: *ClientsWire) !ModelCallsPair {
+    return .{
+        .owner = .{
+            .alloc = alloc,
+            .host = test_host,
+            .writer = jsonrpc.Writer.initCallback(owner_wire, ClientsWire.write),
+            .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+            .connection_id = 1,
+            .extensions = .initMany(&.{.model_calls}),
+        },
+        .follower = .{
+            .alloc = alloc,
+            .host = test_host,
+            .writer = jsonrpc.Writer.initCallback(follower_wire, ClientsWire.write),
+            .connection_id = 2,
+        },
+    };
+}
+
 test "a main whose write fails hands its update to the next client with the params that client's need picks, once" {
     const alloc = std.testing.allocator;
     var test_host = testHost(alloc);
@@ -9798,23 +9834,9 @@ test "a main whose write fails hands its update to the next client with the para
     defer follower_wire.deinit();
     var listing_wire = ClientsWire{ .alloc = alloc };
     defer listing_wire.deinit();
-    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
-    var owner = ServerState{
-        .alloc = alloc,
-        .host = &test_host,
-        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
-        .launch = .{ .root = launch_root },
-        .connection_id = 1,
-        .extensions = .initMany(&.{.model_calls}),
-    };
-    defer owner.deinit();
-    var follower = ServerState{
-        .alloc = alloc,
-        .host = &test_host,
-        .writer = jsonrpc.Writer.initCallback(&follower_wire, ClientsWire.write),
-        .connection_id = 2,
-    };
-    defer follower.deinit();
+    var pair = try initModelCallsPair(alloc, &test_host, &owner_wire, &follower_wire);
+    defer pair.owner.deinit();
+    defer pair.follower.deinit();
     var listing = ServerState{
         .alloc = alloc,
         .host = &test_host,
@@ -9823,9 +9845,9 @@ test "a main whose write fails hands its update to the next client with the para
         .extensions = .initMany(&.{.model_calls}),
     };
     defer listing.deinit();
-    const session = try openAnswerSession(alloc, &owner, &follower);
+    const session = try openAnswerSession(alloc, &pair.owner, &pair.follower);
     try joinMemberForTest(session, &listing);
-    releaseOpenerListHold(&owner, session);
+    releaseOpenerListHold(&pair.owner, session);
     owner_wire.fail = true;
     {
         var audience = lockAudience(session);
@@ -9848,25 +9870,11 @@ test "a main whose write fails sends the next client nothing for an update whose
     defer owner_wire.deinit();
     var follower_wire = ClientsWire{ .alloc = alloc };
     defer follower_wire.deinit();
-    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
-    var owner = ServerState{
-        .alloc = alloc,
-        .host = &test_host,
-        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
-        .launch = .{ .root = launch_root },
-        .connection_id = 1,
-        .extensions = .initMany(&.{.model_calls}),
-    };
-    defer owner.deinit();
-    var follower = ServerState{
-        .alloc = alloc,
-        .host = &test_host,
-        .writer = jsonrpc.Writer.initCallback(&follower_wire, ClientsWire.write),
-        .connection_id = 2,
-    };
-    defer follower.deinit();
-    const session = try openAnswerSession(alloc, &owner, &follower);
-    releaseOpenerListHold(&owner, session);
+    var pair = try initModelCallsPair(alloc, &test_host, &owner_wire, &follower_wire);
+    defer pair.owner.deinit();
+    defer pair.follower.deinit();
+    const session = try openAnswerSession(alloc, &pair.owner, &pair.follower);
+    releaseOpenerListHold(&pair.owner, session);
     owner_wire.fail = true;
     {
         var audience = lockAudience(session);

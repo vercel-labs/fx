@@ -454,17 +454,11 @@ const AcpContext = struct {
         try audience.deliver(self.alloc, "session/update", .compaction, with, without);
     }
 
-    /// The params of the done line for the members that do not list `session.compaction`. Its
-    /// message id follows `pushContextNotice`: the operational id when a member lacks the
-    /// capability, else a fresh id that leaves the owner's id state unchanged. Null when the
-    /// line cannot be built, which is logged. The caller holds the audience.
+    /// The params of the done line for the members that do not list `session.compaction`. Null
+    /// when the line cannot be built, which is logged. The caller holds the audience.
     fn doneLineParams(self: *AcpContext, text: []const u8) ?[]u8 {
         var fresh: acp_types.MessageIdBuffer = undefined;
-        var some_member_lacks = !server.mainLocked(self.session).?.client_compaction;
-        for (self.session.members.items) |member| {
-            if (!member.client_compaction) some_member_lacks = true;
-        }
-        const message_id = if (some_member_lacks) self.operationalMessageId() else acp_types.generateMessageId(&fresh);
+        const message_id = self.fallbackMessageId(&fresh, .compaction);
         return self.agentTextParams(message_id, text) catch |err| {
             debug_trace.logf("acp", "dropped a compaction's done line reason={s}", .{@errorName(err)});
             return null;
@@ -495,6 +489,14 @@ const AcpContext = struct {
 
     fn operationalMessageId(self: *AcpContext) []const u8 {
         return self.messageId(.operational);
+    }
+
+    /// The message id for a text that a member without `need` reads as a message. The operational
+    /// id when some member lacks `need`, else a fresh id in `fresh`, which leaves the owner's id
+    /// state unchanged. The caller holds the audience lock.
+    fn fallbackMessageId(self: *AcpContext, fresh: *acp_types.MessageIdBuffer, need: server.RunningCopy.Need) []const u8 {
+        if (server.someMemberLacks(self.session, need)) return self.operationalMessageId();
+        return acp_types.generateMessageId(fresh);
     }
 
     fn messageId(self: *AcpContext, kind: AgentMessageKind) []const u8 {
@@ -4336,14 +4338,8 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     defer ctx.alloc.free(with);
     var audience = server.lockAudience(session);
     defer audience.unlock();
-    // The message fallback takes the operational id, as before, when a member lacks
-    // notices. When none does, a fresh id leaves the owner's id state unchanged.
     var fresh: acp_types.MessageIdBuffer = undefined;
-    var some_member_lacks_notices = !server.mainLocked(ctx.session).?.client_notices;
-    for (session.members.items) |member| {
-        if (!member.client_notices) some_member_lacks_notices = true;
-    }
-    const message_id = if (some_member_lacks_notices) ctx.operationalMessageId() else acp_types.generateMessageId(&fresh);
+    const message_id = ctx.fallbackMessageId(&fresh, .notices);
     const without = ctx.agentTextParams(message_id, text) catch |err| {
         debug_trace.logf("acp", "dropped a context notice's message reason={s}", .{@errorName(err)});
         return;
