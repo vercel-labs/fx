@@ -498,37 +498,9 @@ pub fn buildSessionStatusLine(
     return display_width.prefixByWidthIgnoringAnsi(out[0..end], width);
 }
 
+/// Builds the hint line from the segments that suit `width` columns. It is not
+/// cut to `width`: the caller cuts it, so it can mark the cut.
 pub fn buildHintLine(
-    awaiting_permission: bool,
-    has_api_key: bool,
-    model: []const u8,
-    permission_mode: types.PermissionMode,
-    fast_indicator_active: bool,
-    effort: types.ReasoningEffort,
-    model_supports_effort: bool,
-    statusline: StatuslineItems,
-    width: u16,
-    out: []u8,
-) []const u8 {
-    const line = buildUncutHintLine(
-        awaiting_permission,
-        has_api_key,
-        model,
-        permission_mode,
-        fast_indicator_active,
-        effort,
-        model_supports_effort,
-        statusline,
-        width,
-        out,
-    );
-    if (width == 0) return "";
-    return display_width.prefixByWidthIgnoringAnsi(line, width);
-}
-
-/// Builds the hint line from the segments that suit `width` columns, but does
-/// not cut it to `width`, so a caller that cuts it can mark the cut.
-pub fn buildUncutHintLine(
     awaiting_permission: bool,
     has_api_key: bool,
     model: []const u8,
@@ -1193,10 +1165,6 @@ test "buildHintLine uses one vivid yellow lightning marker for Ultrafast in both
             }
             try std.testing.expectEqual(@as(usize, 1), markers);
             try std.testing.expect(grid.current_style.fg.eql(.{ .indexed = if (light) 241 else 245 }));
-            for (0..32) |width| {
-                const clipped = buildHintLine(false, true, "openai/gpt-6-astra", .auto, false, types.ReasoningEffort.literal("xhigh"), true, .{ .ultrafast_indicator_active = true }, @intCast(width), &buf);
-                try std.testing.expect(display_width.visibleWidthIgnoringAnsi(clipped) <= width);
-            }
         }
     }
 }
@@ -1371,7 +1339,7 @@ test "buildHintLine renders full access with subdued permission styling" {
     try std.testing.expectEqualStrings(expected, line);
 }
 
-test "buildHintLine clips styled auto mode by visible width" {
+test "buildHintLine fits styled auto mode by visible width" {
     initTheme(false, null);
     defer initTheme(false, null);
 
