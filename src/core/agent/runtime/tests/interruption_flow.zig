@@ -509,6 +509,38 @@ test "a tool's notice raised before a later call is cancelled stays in the inter
     });
 }
 
+test "a call that finishes as the user cancels keeps its result, and no model request follows it" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_done", "read_file", "{\"path\":\"a\"}")};
+    // The second completion is the request the cancelled turn must not make.
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "never asked for" } };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    // The call returns its result, not marked cancelled, and the flag is set as it returns.
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "finished result" } }};
+    hooks.cancel_on_execute = &fixture.cancel_flag;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
+    const follow_completions = [_]FakeCompletion{.{ .content = "Carrying on." }};
+    var follow_gateway = FakeGateway.init(alloc, &follow_completions);
+    defer follow_gateway.deinit();
+    var follow_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer follow_hooks.deinit();
+    var follow_fixture = PromptFixture{};
+    var follow_job = follow_fixture.job();
+    follow_job.prompt = @constCast("go on");
+    follow_job.history = hooks.history_turns.items;
+    try runFakePrompt(&follow_gateway, &follow_hooks, follow_fixture.config(), follow_job);
+    try expectBodyContainsInOrder(&follow_gateway, 0, &.{ "finished result", "<turn_aborted>", "go on" });
+}
+
 test "processQueuedPrompt projects no-output interrupted turn as closed before follow-up" {
     const alloc = std.testing.allocator;
     const interrupted_prompt = "create another file in the folder called test.md and add 200 lines in that - anything";

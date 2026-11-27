@@ -5067,6 +5067,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       const sessionOf = (body: string) => /shell-\d+/.exec(body.slice(body.indexOf("TUI-QUIET-READY")))?.[0];
       let childWaiting = false;
       let childAsked = false;
+      let childWait1Start = 0;
+      let childWait1Ms = -1;
       const firstChildRequest = held();
       await withFx(async (body) => {
         if (!isMainRequest(body)) {
@@ -5076,14 +5078,16 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
             return toolCall("child_stop", "shell", { request: { action: "stop", session_id: sessionOf(body) } });
           }
           if (body.includes('"child_wait_1"')) {
+            childWait1Ms = Date.now() - childWait1Start;
             return toolCall("child_wait_2", "shell", {
-              request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 20_000 },
+              request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 5_000 },
             });
           }
           if (body.includes('"child_run"')) {
             childWaiting = true;
+            childWait1Start = Date.now();
             return toolCall("child_wait_1", "shell", {
-              request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 20_000 },
+              request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 5_000 },
             });
           }
           // The child's first request waits until the list has shown its turn's time.
@@ -5125,11 +5129,14 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(workerRow).not.toContain("TUI-QUIET-READY");
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
-        // The child's command crosses the quiet limit while main waits, and
+        // The child's wait ends past the quiet limit while main waits, and
         // fx's note wakes main's wait before the child ends.
         const pane = await session.waitForPane((pane) =>
           pane.includes("TUI_MAIN_SAW_RELAY") || pane.includes("TUI_MAIN_NO_RELAY"), 30_000);
         expect(pane).toContain("TUI_MAIN_SAW_RELAY");
+        await until("the child's first wait to finish", () => childWait1Ms >= 0, 15_000);
+        expect(childWait1Ms).toBeGreaterThanOrEqual(5_000);
+        expect(childWait1Ms).toBeLessThanOrEqual(10_000);
       }, () => {}, false, { FX_TEST_SHELL_QUIET_NOTICE_MS: "3000" });
     },
     TIMEOUT,
