@@ -20,7 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { FX_BIN, HAS_API_KEY, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, HAS_API_KEY, providerVersionTestEnv, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import {
   AUTO_EXA_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
@@ -710,7 +710,8 @@ class AcpClient {
     omitHome?: boolean;
   }): Promise<AcpClient> {
     const args = opts?.args ?? ["acp"];
-    const inheritedEnv: Record<string, string | undefined> = { ...process.env };
+    // The model-backed tests below start fx on the developer's own key.
+    const inheritedEnv: Record<string, string | undefined> = fxChildEnv({}, { keepCredentials: true });
     if (opts?.omitHome) delete inheritedEnv.HOME;
     for (const [key, value] of Object.entries(opts?.env ?? {})) {
       if (value === undefined) {
@@ -2969,7 +2970,7 @@ describe("acp: model-independent", () => {
       ]);
       const proc = nodeSpawn(FX_BIN, ["acp"], {
         cwd: root.workspace,
-        env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+        env: fxChildEnv({ ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" }),
         stdio: ["pipe", "pipe", "pipe"],
       });
       try {
@@ -3094,7 +3095,7 @@ describe("acp: model-independent", () => {
       ]);
       const proc = nodeSpawn(FX_BIN, ["acp"], {
         cwd: root.workspace,
-        env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+        env: fxChildEnv({ ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" }),
         stdio: ["pipe", "pipe", "pipe"],
       });
       try {
@@ -3250,6 +3251,55 @@ describe("acp: model-independent", () => {
         await client.close();
         // The ACP process owned the terminal itself: no host daemon state.
         expect(existsSync(join(root.root, "home", ".fx", "terminal-host-v7"))).toBe(false);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP shell TTY results leave out charset designations",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-charset-");
+      const toolCallId = "acp_shell_tty_charset";
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall(toolCallId, "shell", {
+          request: {
+            action: "run",
+            cwd: root.workspace,
+            // What `tput sgr0` and ncurses line drawing send on xterm terminfo.
+            command: "printf 'TTY_A\\033(B\\033[mC TTY_\\033(0lqqk\\033(B_END\\n'",
+            shell: {
+              kind: "executable",
+              path: TERMINAL_FIXTURE_SHELL,
+              clean_start: true,
+            },
+            tty: true,
+            yield_time_ms: 30_000,
+          },
+        }),
+        finalText("ACP charset shell complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        client.setPermissionOption("allow_once");
+        await startAutoSession(client);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
+        const result = await runPrompt(client, "Run the charset fixture.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(2);
+        const toolResult = acpToolResultText(gateway.requests[1]!.body, toolCallId);
+        expect(toolResult).toContain('"backend":"tty"');
+        expect(toolResult).toContain("TTY_AC TTY_lqqk_END");
+        expect(toolResult).not.toContain("TTY_ABC");
+        expect(client.stderr).toBe("");
       } finally {
         await client?.close();
         gateway.stop();
@@ -8589,7 +8639,7 @@ describe("acp: model-independent", () => {
     });
     const proc = nodeSpawn(FX_BIN, ["acp"], {
       cwd: root.workspace,
-      env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+      env: fxChildEnv({ ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" }),
       stdio: ["pipe", "pipe", "pipe"],
     });
     try {
@@ -11720,7 +11770,7 @@ describe("acp: model-independent", () => {
       ]);
       const proc = nodeSpawn(FX_BIN, ["acp"], {
         cwd: root.workspace,
-        env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+        env: fxChildEnv({ ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" }),
         stdio: ["pipe", "pipe", "pipe"],
       });
       let client: AcpClient | undefined;

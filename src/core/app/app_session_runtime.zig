@@ -3164,7 +3164,7 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             const v2 = agent.session_persistence.v2 orelse return;
-            try v2.appendProgressWithRecord(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }, progress.recovery_record);
+            try v2.appendProgressWithRecord(progress.user, progress.execution, progress.saved_execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }, progress.recovery_record);
         }
 
         /// `AgentRuntimeDeps.record_usage` on v2: each reply's usage
@@ -6217,6 +6217,8 @@ pub fn Runtime(comptime App: type) type {
 
         /// Saves the turn so far as the recovery checkpoint before each model
         /// request, so a reload during the turn can send that request again.
+        /// It saves fx's view, without the steps a compaction inside the turn
+        /// summarized: a reload rebuilds the request from it as it stands.
         /// Does nothing without a JavaScript host session.
         pub fn saveJsHostTurnPiece(app: *App, agent: *AppAgent, progress: agent_runtime.TurnProgress) void {
             if (comptime !runtime_profile.allows(App, .js_host_sessions)) return;
