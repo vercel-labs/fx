@@ -15,16 +15,16 @@ import { join, resolve } from "node:path";
 export const FX_BIN = resolve(import.meta.dirname, "../../zig-out/bin/fx");
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
-export function providerVersionTestEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
-  const result = { ...env };
-  if (env.FX_TEST_OPENAI_CODEX_MODELS_URL && !env.FX_TEST_CODEX_VERSION_URL && !env.FX_TEST_CODEX_CLIENT_VERSION) {
-    result.FX_TEST_CODEX_CLIENT_VERSION = "0.153.0";
-  }
-  if ((env.FX_TEST_XAI_GROK_MODELS_URL || env.FX_TEST_XAI_GROK_RESPONSES_URL) && !env.FX_TEST_GROK_VERSION_URL && !env.FX_TEST_GROK_CLIENT_VERSION) {
-    result.FX_TEST_GROK_CLIENT_VERSION = "1.0.6";
-  }
-  return result;
-}
+/** The Codex and Grok client versions this build of fx sends, read from its source. */
+export const pinnedClientVersions = (() => {
+  const source = readFileSync(join(REPO_ROOT, "src/core/gateway/provider_versions.zig"), "utf8");
+  const pinned = (name: string) => {
+    const match = source.match(new RegExp(`pub const ${name} = "(\\d+\\.\\d+\\.\\d+)";`));
+    if (!match) throw new Error(`no ${name} in src/core/gateway/provider_versions.zig`);
+    return match[1];
+  };
+  return { codex: pinned("codex_client_version"), grok: pinned("grok_client_version") };
+})();
 
 export const EVAL_MODELS = [
   "anthropic/claude-sonnet-4.6",
@@ -618,7 +618,7 @@ export async function runFx(
       }
     }
     const child = nodeSpawn(FX_BIN, args, {
-      env: providerVersionTestEnv(env),
+      env,
       cwd: cwd ?? REPO_ROOT,
       stdio: ["pipe", "pipe", "pipe"],
     });

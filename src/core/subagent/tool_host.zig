@@ -4010,13 +4010,13 @@ fn callToolResult(runtime: *Runtime, arena: Allocator, input: model_contract.Req
 /// while its subagents keep working (`WorkerRuntime.requestYield`).
 fn nudgedWaitResult(restarting: bool) []const u8 {
     return if (restarting)
-        "fx is restarting for an upgrade, so this wait ends here. The subagents keep working, and their reports arrive after the restart."
+        "fx may restart for an upgrade, so this wait ends here. The subagents keep working, and their reports still arrive."
     else
         "A subagent's turn ended without a report. Call status to see where things stand, or wait again.";
 }
 
-test "a wait that the upgrade's restart ends says the reports come after it" {
-    try std.testing.expect(std.mem.find(u8, nudgedWaitResult(true), "reports arrive after the restart") != null);
+test "a wait that the upgrade's restart ends says the reports still arrive" {
+    try std.testing.expect(std.mem.find(u8, nudgedWaitResult(true), "their reports still arrive") != null);
     try std.testing.expectEqualStrings(
         "A subagent's turn ended without a report. Call status to see where things stand, or wait again.",
         nudgedWaitResult(false),
