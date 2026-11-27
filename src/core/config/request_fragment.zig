@@ -34,10 +34,14 @@ pub const Fragment = struct {
     fields: []const Field = &.{},
 
     pub fn has(self: Fragment, key: []const u8) bool {
+        return self.get(key) != null;
+    }
+
+    pub fn get(self: Fragment, key: []const u8) ?[]const u8 {
         for (self.fields) |field| {
-            if (std.mem.eql(u8, field.key, key)) return true;
+            if (std.mem.eql(u8, field.key, key)) return field.value_json;
         }
-        return false;
+        return null;
     }
 };
 

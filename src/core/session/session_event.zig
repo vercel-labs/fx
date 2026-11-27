@@ -364,7 +364,7 @@ fn validateModelCallRecord(record: types.ModelCallRecord) ConversationTransition
     if (!types.validModelCallText(record.provider) or !types.validModelCallText(record.model)) {
         return rejectInvalidConversationEvent("model-call-identity");
     }
-    inline for (.{ record.served_by, record.generation_id, record.finish, record.failure }) |text| {
+    inline for (.{ record.effort, record.served_by, record.generation_id, record.finish, record.failure }) |text| {
         if (text) |value| if (!types.validModelCallText(value)) return rejectInvalidConversationEvent("model-call-text");
     }
 }

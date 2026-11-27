@@ -7821,6 +7821,9 @@ test "v2 conversation pieces stay bounded under fuzzed bytes" {
             "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"cost_usd\":0.01}",
             "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"generation_id\":\"gen_\\u001b[2J\"}",
             "{\"at_ms\":-5,\"provider\":\"\",\"model\":\"m\",\"outcome\":\"exploded\"}",
+            "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"effort\":\"high\"}",
+            "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"effort\":\"\\u001b[2J\"}",
+            "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"effort\":\"\"}",
             // A subagent start (D101).
             "{\"call_id\":\"call-start\"}",
             // A cancelled wait (D102), with names and with names to refuse.
@@ -7854,7 +7857,7 @@ fn fuzzConversationPiece(_: void, smith: *std.testing.Smith) !void {
     }
     if (decodeModelCall(arena_state.allocator(), buffer[0..len])) |record| {
         try std.testing.expect(types.validModelCallText(record.provider) and types.validModelCallText(record.model));
-        inline for (.{ record.served_by, record.generation_id, record.finish, record.failure }) |text| {
+        inline for (.{ record.effort, record.served_by, record.generation_id, record.finish, record.failure }) |text| {
             if (text) |value| try std.testing.expect(types.validModelCallText(value));
         }
     }

@@ -134,6 +134,7 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
         if (request.model_calls) |sink| sink.record(model_call_record.ofError(
             sink.provider,
             request.model,
+            attempt_evidence.sentEffort(delivery.load()),
             callPurpose(request.purpose),
             started_ms,
             io_mod.milliTimestamp(),
@@ -150,6 +151,7 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
     if (request.model_calls) |sink| sink.record(model_call_record.ofResult(
         sink.provider,
         request.model,
+        attempt_evidence.sentEffort(delivery.load()),
         callPurpose(request.purpose),
         started_ms,
         io_mod.milliTimestamp(),
@@ -409,7 +411,16 @@ pub const CompactorCaller = struct {
                 .cooperative_pulse = self.cooperative_transport_pulse,
             },
         ) catch |err| {
-            if (self.model_calls) |sink| sink.record(model_call_record.ofError(sink.provider, self.model, .compaction, started_ms, io_mod.milliTimestamp(), err == error.Cancelled, err));
+            if (self.model_calls) |sink| sink.record(model_call_record.ofError(
+                sink.provider,
+                self.model,
+                attempt_evidence.sentEffort(delivery.load()),
+                .compaction,
+                started_ms,
+                io_mod.milliTimestamp(),
+                err == error.Cancelled,
+                err,
+            ));
             return switch (err) {
                 error.Cancelled => error.Cancelled,
                 error.OutOfMemory => error.OutOfMemory,
@@ -417,7 +428,16 @@ pub const CompactorCaller = struct {
             };
         };
         defer streamed.deinit(alloc);
-        if (self.model_calls) |sink| sink.record(model_call_record.ofResult(sink.provider, self.model, .compaction, started_ms, io_mod.milliTimestamp(), &streamed, call.cancel_flag.load(.seq_cst)));
+        if (self.model_calls) |sink| sink.record(model_call_record.ofResult(
+            sink.provider,
+            self.model,
+            attempt_evidence.sentEffort(delivery.load()),
+            .compaction,
+            started_ms,
+            io_mod.milliTimestamp(),
+            &streamed,
+            call.cancel_flag.load(.seq_cst),
+        ));
         if (call.cancel_flag.load(.seq_cst)) return error.Cancelled;
         const completion = switch (streamed) {
             .failed => |failure| {
@@ -829,7 +849,11 @@ test "a compaction request rejected with 401 is sent once more with the sign-in 
 test "a provider compaction request rejected with 401 is sent once more with the sign-in renewed" {
     const testing = std.testing;
     const support = @import("tests/support.zig");
+    const Transport = enum { normal, refused, reset };
     const Fake = struct {
+        transport: Transport,
+        recorded: [2]agent_stream_provider.RequestEffort = .{ .{}, .{} },
+        record_count: usize = 0,
         sends: usize = 0,
         last_key: [32]u8 = undefined,
         last_key_len: usize = 0,
@@ -841,6 +865,10 @@ test "a provider compaction request rejected with 401 is sent once more with the
             @memcpy(self.last_key[0..key.len], key);
             self.last_key_len = key.len;
             self.sends += 1;
+            request.data().effort_out.?.set(request.provider_options.reasoning.?.label());
+            if (self.transport == .refused) return error.ConnectionRefused;
+            request.delivery.markPossiblySent();
+            if (self.transport == .reset) return error.ConnectionResetByPeer;
             if (std.mem.eql(u8, key, "launch-key")) return .{ .failed = .{
                 .kind = .unauthorized,
                 .http_status = .unauthorized,
@@ -857,6 +885,12 @@ test "a provider compaction request rejected with 401 is sent once more with the
             } };
         }
 
+        fn record(raw: *anyopaque, value: types.ModelCallRecord) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.recorded[self.record_count].set(value.effort);
+            self.record_count += 1;
+        }
+
         fn capabilities(_: *anyopaque, _: []const u8) model_capabilities.Capabilities {
             return .{};
         }
@@ -869,18 +903,20 @@ test "a provider compaction request rejected with 401 is sent once more with the
             return true;
         }
     };
-    const Case = struct { tokens: []const []const u8, sends: usize, block: bool };
+    const Case = struct { tokens: []const []const u8, sends: usize, block: bool, transport: Transport = .normal };
     const cases = [_]Case{
         // Another fx renewed the sign-in: the block comes back on its token.
         .{ .tokens = &.{"stored-key"}, .sends = 2, .block = true },
         // Nothing to renew to: the 401 stands, and fx writes its own summary.
         .{ .tokens = &.{}, .sends = 1, .block = false },
+        .{ .tokens = &.{}, .sends = 1, .block = false, .transport = .refused },
+        .{ .tokens = &.{}, .sends = 1, .block = false, .transport = .reset },
     };
     const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "the agent's instructions" }};
     const history = [_]types.ChatMessage{ .{ .role = .user, .content = "fix the build" }, .{ .role = .assistant, .content = "Fixed." } };
     var cancel = std.atomic.Value(bool).init(false);
     for (cases) |case| {
-        var fake: Fake = .{};
+        var fake: Fake = .{ .transport = case.transport };
         var hooks = support.FakeAgentRuntimeDeps.init(testing.allocator);
         defer hooks.deinit();
         hooks.credential_refresh_tokens = case.tokens;
@@ -900,12 +936,17 @@ test "a provider compaction request rejected with 401 is sent once more with the
             .capabilities_context = &fake,
             .capabilities_fn = Fake.capabilities,
             .renewal_deps = &deps,
-            .conversation = .{ .model = "m", .instructions = &instructions, .messages = &history, .tools = .{ .advertised_names = &.{"shell"} }, .tool_choice = .auto, .provider_options = .{} },
+            .conversation = .{ .model = "m", .instructions = &instructions, .messages = &history, .tools = .{ .advertised_names = &.{"shell"} }, .tool_choice = .auto, .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high") } },
+            .model_calls = .{ .context = &fake, .record_fn = Fake.record, .provider = "gateway" },
         };
         defer summary_model.deinit();
         const caller = summary_model.caller();
         const reply = try caller.vtable.compact_with_provider.?(caller.context, testing.allocator, .{ .older = null, .cancel_flag = &cancel, .trace_ctx = .{} });
         try testing.expectEqual(case.sends, fake.sends);
+        try testing.expectEqual(case.sends, fake.record_count);
+        for (fake.recorded[0..fake.record_count]) |*effort| {
+            if (case.transport == .refused) try testing.expect(effort.slice() == null) else try testing.expectEqualStrings("high", effort.slice().?);
+        }
         switch (reply) {
             .block => |block| {
                 defer {
@@ -920,7 +961,11 @@ test "a provider compaction request rejected with 401 is sent once more with the
             .failed => |failure| {
                 defer testing.allocator.free(failure.detail);
                 try testing.expect(!case.block);
-                try testing.expectEqualStrings("kind=unauthorized", failure.detail);
+                try testing.expectEqualStrings(switch (case.transport) {
+                    .normal => "kind=unauthorized",
+                    .refused => "err=ConnectionRefused",
+                    .reset => "err=ConnectionResetByPeer",
+                }, failure.detail);
             },
         }
     }

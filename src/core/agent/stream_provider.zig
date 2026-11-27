@@ -154,9 +154,36 @@ pub const NetworkFailureEvidence = struct {
     delivery: DeliveryCertainty.State,
 };
 
+/// Exact reasoning effort string serialized into a request body, stored inline
+/// so it outlives per-attempt scratch arenas without heap allocation.
+pub const RequestEffort = struct {
+    pub const max_bytes = types.model_call_text_max_bytes;
+
+    bytes: [max_bytes]u8 = @splat(0),
+    len: usize = 0,
+
+    pub fn set(self: *RequestEffort, value: ?[]const u8) void {
+        self.len = 0;
+        const text = value orelse return;
+        if (!types.validModelCallText(text)) return;
+        @memcpy(self.bytes[0..text.len], text);
+        self.len = text.len;
+    }
+
+    pub fn slice(self: *const RequestEffort) ?[]const u8 {
+        return if (self.len == 0) null else self.bytes[0..self.len];
+    }
+};
+
 pub const AttemptEvidence = struct {
     provider_admitted: bool = false,
     network_failure: ?NetworkFailureEvidence = null,
+    effort: RequestEffort = .{},
+
+    pub fn sentEffort(self: *const AttemptEvidence, delivery: DeliveryCertainty.State) ?[]const u8 {
+        if (!self.provider_admitted or delivery == .definitely_unsent) return null;
+        return self.effort.slice();
+    }
 };
 
 /// Gives a cooperative single-threaded host a chance to publish UI and runtime
@@ -237,6 +264,9 @@ pub const RequestData = struct {
     budget: ?BuildBudget = null,
     verified_images: ?[]const image_attachments.VerifiedSnapshot = null,
     response_format: ?StructuredResponseFormat = null,
+    /// Optional out-slot populated on successful build with the exact effort
+    /// serialized into the request body, or cleared when none was serialized.
+    effort_out: ?*RequestEffort = null,
 
     pub fn validatePrompt(self: RequestData) error{InvalidProviderPrompt}!void {
         try validate_prompt_lanes(self.instructions, self.messages);
@@ -482,6 +512,7 @@ pub const ModelRequest = struct {
             .budget = self.budget,
             .verified_images = self.verified_images,
             .response_format = self.response_format,
+            .effort_out = &self.attempt_evidence.effort,
         };
     }
 };
@@ -1125,4 +1156,18 @@ test "stream provider rejects non-system instructions before serialization" {
         try std.testing.expectEqual(error.InvalidProviderPrompt, err);
     }
     try std.testing.expectEqual(@as(usize, 0), builder.calls);
+}
+
+test "AttemptEvidence.sentEffort requires admission and possible delivery and rejects unsafe or oversized effort" {
+    var evidence: AttemptEvidence = .{};
+    evidence.effort.set("high");
+    try std.testing.expectEqual(@as(?[]const u8, null), evidence.sentEffort(.possibly_sent));
+    evidence.provider_admitted = true;
+    try std.testing.expect(evidence.sentEffort(.definitely_unsent) == null);
+    try std.testing.expectEqualStrings("high", evidence.sentEffort(.possibly_sent).?);
+    const too_long: [RequestEffort.max_bytes + 1]u8 = @splat('a');
+    evidence.effort.set(&too_long);
+    try std.testing.expectEqual(@as(?[]const u8, null), evidence.sentEffort(.possibly_sent));
+    evidence.effort.set("bad\x1b[0m");
+    try std.testing.expectEqual(@as(?[]const u8, null), evidence.sentEffort(.possibly_sent));
 }

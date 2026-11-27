@@ -71,7 +71,7 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
     const metadata = definition.metadata_for(request.model);
     const request_fields: request_fragment.Fragment = if (metadata) |known| known.request orelse .{} else .{};
     const level = effort_fields(metadata, request.provider_options.reasoning);
-    return switch (definition.protocol) {
+    const body = try switch (definition.protocol) {
         .@"openai-chat-completions" => codec.build_request(alloc, request, .{
             .tool_choice_mode = definition.tool_choice_mode,
             .provider = &identity,
@@ -93,6 +93,8 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
             .effort_fields = level,
         }),
     };
+    if (request.effort_out) |out| capture_effort(alloc, definition.protocol, request_fields, level orelse .{}, out);
+    return body;
 }
 
 /// How a connection's protocol reads a successful streamed reply.
@@ -127,6 +129,50 @@ fn effort_fields(metadata: ?definitions.ModelMetadata, effort: ?types.ReasoningE
     const chosen = effort orelse return null;
     const level = known.effort(chosen.label()) orelse return null;
     return level.fields;
+}
+
+fn extract_effort_string(
+    alloc: Allocator,
+    key: []const u8,
+    request_fields: request_fragment.Fragment,
+    level_fields: request_fragment.Fragment,
+    out: *streams.RequestEffort,
+) bool {
+    const value_json = level_fields.get(key) orelse request_fields.get(key) orelse return false;
+    // Effort capture is best-effort metadata; never fail a valid request on OOM.
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return false;
+    defer parsed.deinit();
+    const value = if (std.mem.eql(u8, key, "reasoning_effort"))
+        parsed.value
+    else if (parsed.value == .object)
+        parsed.value.object.get("effort") orelse return false
+    else
+        return false;
+    if (value != .string) return false;
+    out.set(value.string);
+    return true;
+}
+
+fn capture_effort(
+    alloc: Allocator,
+    protocol: definitions.Protocol,
+    request_fields: request_fragment.Fragment,
+    level_fields: request_fragment.Fragment,
+    out: *streams.RequestEffort,
+) void {
+    out.set(null);
+    switch (protocol) {
+        .@"openai-chat-completions" => {
+            var direct: streams.RequestEffort = .{};
+            var nested: streams.RequestEffort = .{};
+            const has_direct = extract_effort_string(alloc, "reasoning_effort", request_fields, level_fields, &direct);
+            const has_nested = extract_effort_string(alloc, "reasoning", request_fields, level_fields, &nested);
+            if (has_direct and has_nested) return;
+            if (has_direct) out.* = direct else if (has_nested) out.* = nested;
+        },
+        .@"openai-responses" => _ = extract_effort_string(alloc, "reasoning", request_fields, level_fields, out),
+        .@"anthropic-messages" => _ = extract_effort_string(alloc, "output_config", request_fields, level_fields, out),
+    }
 }
 
 pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
@@ -169,6 +215,47 @@ test "chat completions adapter binds replay to endpoint authority and wires proj
     defer alloc.free(stripped);
     try std.testing.expect(std.mem.find(u8, stripped, "reasoning_details") == null);
     try std.testing.expect(request.messages[0].provider_replay.?.parts_json.ptr == replay.parts_json.ptr);
+}
+
+test "configured adapter captures serialized effort from merged request and level" {
+    const alloc = std.testing.allocator;
+    const Case = struct { protocol: []const u8, meta: []const u8, label: ?[]const u8, want: ?[]const u8 };
+    var effort_out: streams.RequestEffort = .{};
+    for ([_]Case{
+        .{ .protocol = "openai-chat-completions", .meta = "\"request\":{\"reasoning_effort\":\"medium\"}", .label = null, .want = "medium" },
+        .{ .protocol = "openai-chat-completions", .meta = "\"request\":{\"reasoning\":{\"effort\":\"medium\"}},\"reasoning_efforts\":{\"high\":{\"reasoning_effort\":\"low\"}}", .label = "high", .want = null },
+        .{ .protocol = "openai-chat-completions", .meta = "\"request\":{\"reasoning_effort\":\"low\"},\"reasoning_efforts\":{\"high\":{\"reasoning\":{\"effort\":\"high\"}}}", .label = "high", .want = null },
+        .{ .protocol = "openai-chat-completions", .meta = "\"request\":{\"reasoning\":{\"exclude\":true}},\"reasoning_efforts\":{\"high\":{\"reasoning_effort\":\"low\"}}", .label = "high", .want = "low" },
+        .{ .protocol = "openai-chat-completions", .meta = "\"request\":{\"reasoning\":{\"effort\":\"medium\"}},\"reasoning_efforts\":{\"b\":{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":4096}}}", .label = "b", .want = "medium" },
+        .{ .protocol = "openai-chat-completions", .meta = "\"request\":{\"reasoning\":{\"effort\":\"medium\"}},\"reasoning_efforts\":{\"low\":{\"reasoning\":{}}}", .label = "low", .want = null },
+        .{ .protocol = "openai-chat-completions", .meta = "\"reasoning_efforts\":{\"high\":{\"output_config\":{\"effort\":\"max\"}}}", .label = "high", .want = null },
+        .{ .protocol = "openai-chat-completions", .meta = "\"reasoning_efforts\":{\"long\":{\"reasoning_effort\":\"" ++ @as([streams.RequestEffort.max_bytes + 1]u8, @splat('x')) ++ "\"}}", .label = "long", .want = null },
+        .{ .protocol = "openai-responses", .meta = "\"request\":{\"reasoning\":{\"effort\":\"low\"}},\"reasoning_efforts\":{\"high\":{\"reasoning\":{\"effort\":\"xhigh\"}}}", .label = "high", .want = "xhigh" },
+        .{ .protocol = "openai-responses", .meta = "\"request\":{\"reasoning\":{\"effort\":\"low\"}},\"reasoning_efforts\":{\"off\":{\"reasoning\":{\"exclude\":true}}}", .label = "off", .want = null },
+        .{ .protocol = "anthropic-messages", .meta = "\"reasoning_efforts\":{\"high\":{\"output_config\":{\"effort\":\"max\"}}}", .label = "high", .want = "max" },
+        .{ .protocol = "anthropic-messages", .meta = "\"reasoning_efforts\":{\"b\":{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2048}}}", .label = "b", .want = null },
+    }) |case| {
+        const json = try alloc.print("{s}{s}{s}{s}{s}", .{
+            "{\"p\":{\"protocol\":\"",
+            case.protocol,
+            "\",\"base_url\":\"http://127.0.0.1:1/v1\",\"auth\":{\"type\":\"none\"},\"model_metadata\":{\"m\":{",
+            case.meta,
+            "}}}}",
+        });
+        defer alloc.free(json);
+        var registry = try definitions.Registry.parse_json(alloc, json);
+        defer registry.deinit(alloc);
+        const body = try build_for(registry.get("p").?, alloc, .{
+            .model = "m",
+            .messages = &.{.{ .role = .user, .content = "{\"reasoning_effort\":\"max\"}" }},
+            .tool_choice = .auto,
+            .provider_options = .{ .reasoning = if (case.label) |name| types.ReasoningEffort.parse(name).? else null },
+            .max_output_tokens = 256,
+            .effort_out = &effort_out,
+        });
+        alloc.free(body);
+        if (case.want) |want| try std.testing.expectEqualStrings(want, effort_out.slice().?) else try std.testing.expect(effort_out.slice() == null);
+    }
 }
 
 fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !streams.Result {

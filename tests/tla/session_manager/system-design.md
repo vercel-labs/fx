@@ -1789,8 +1789,9 @@ as it was sent):
   item: when it settled, how long it took, what it was for, how it ended,
   the provider, model and serving provider, the gateway's generation id or
   the provider's response id, the finish or failure kind, a retry wait, and
-  the tokens. Ctrl+O shows each where it happened, live and after a resume.
-  The model never sees one.
+  the tokens. `effort` is the named reasoning effort fx wrote into that
+  request, or null if it sent none. Ctrl+O shows each call where it happened,
+  live and after a resume. The model never sees one.
   - **Place:** a record keeps the tool step boundary of the call
     (`after_tool_step_count`) and how many of the turn's steering messages
     came before it (`after_steering_count`), both taken from the first save
@@ -1808,7 +1809,8 @@ as it was sent):
   - **Reading:** a record is read with its unknown fields ignored, and one
     whose strings aren't short, valid UTF-8 without control characters, or
     whose numbers are out of range, is left out with a trace line, so a
-    record never fails a session. A v1 log never holds one.
+    record never fails a session. A v1 log never holds one. A record with no
+    `effort` key reads as none, as a record saved before effort was kept does.
   - **Older fx:** an fx from before D96 leaves the item out (D17).
   - **Not yet:** calls made inside tools, such as web search and image
     descriptions, and the permission reviewer's calls have no record.
