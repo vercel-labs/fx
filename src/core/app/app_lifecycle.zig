@@ -1699,7 +1699,10 @@ fn emitShutdownCleanupAndResume(shell: *TranscriptRuntime, metrics: *Metrics) vo
 }
 
 pub fn writeLifecycleTerminalBytes(shell: *TranscriptRuntime, metrics: *Metrics, bytes: []const u8) !void {
-    try shell.stdout_file.writeStreamingAll(io_mod.getIo(), bytes);
+    shell.stdout_file.writeStreamingAll(io_mod.getIo(), bytes) catch |err| {
+        if (ui_terminal.terminalGone(shell.stdout_file.handle, err)) return error.TerminalHungUp;
+        return err;
+    };
     if (shell.shadow_vt) |grid| {
         grid.feed(bytes) catch |err| debug_trace.logf(
             "render",
@@ -3058,4 +3061,24 @@ fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !vo
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), text);
+}
+
+test "writeLifecycleTerminalBytes returns TerminalHungUp when the terminal hangs up" {
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |file| file.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+
+    var shell = TranscriptRuntime{ .stdout_file = slave };
+    defer shell.deinit(std.testing.allocator);
+    var metrics = Metrics{};
+
+    try writeLifecycleTerminalBytes(&shell, &metrics, "abc");
+
+    master.?.close(io_mod.getIo());
+    master = null;
+    try std.testing.expectError(error.TerminalHungUp, writeLifecycleTerminalBytes(&shell, &metrics, "abc"));
 }

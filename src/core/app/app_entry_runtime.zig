@@ -237,6 +237,7 @@ fn initFailure(deps: RunDeps, launch: *cli_surface.InteractiveLaunch, alloc: All
     // This thread is the main loop's: the only one besides agents' workers
     // that reads an agent (design section 10).
     agents.markLoopThread();
+    if (isTerminalHangUp(err)) return .returned;
     switch (err) {
         error.NotATerminal => {
             writeStderr(deps, "fx requires an interactive terminal (TTY).\n");
@@ -1983,4 +1984,21 @@ test "app entry returns failure when terminal closure cannot save the session" {
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try std.testing.expectEqualStrings("deinit", test_events[test_event_count - 2]);
     try std.testing.expectEqualStrings("stderr-attempt", test_events[test_event_count - 1]);
+}
+
+test "app entry treats terminal hang-up during startup as quiet exit without stderr" {
+    const alloc = std.testing.allocator;
+    for ([_]anyerror{ error.TerminalHungUp, error.TerminalInputClosed }) |err| {
+        var capture = TestCapture.init(.{ .interactive = .{} });
+        defer capture.deinit();
+        capture.init_error = err;
+        capture.record_stderr_event = true;
+
+        const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+        try std.testing.expectEqual(RunOutcome.returned, outcome);
+        try std.testing.expectEqualStrings("", capture.stderr.written());
+        try std.testing.expectEqual(@as(usize, 0), capture.stderr_calls);
+        try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
+    }
 }
