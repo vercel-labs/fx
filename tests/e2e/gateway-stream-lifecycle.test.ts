@@ -16044,6 +16044,13 @@ function messageCall(id: string, message: string) {
 
 const toolCallsFinish = { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } };
 
+// The text of the first marker a test hold wrote, or "" when the hold never
+// fired. A helper reads it before its fixture folder goes.
+function firstHeldMarker(heldMarker: string) {
+  const path = `${heldMarker}.1`;
+  return existsSync(path) ? readFileSync(path, "utf8") : "";
+}
+
 async function runStopMessage(
   label: string,
   main: (raw: string, state: StopMessageState) => Promise<Response | undefined>,
@@ -16090,16 +16097,17 @@ async function runStopMessage(
       },
       timeoutMs: 60_000,
     });
-    return { result, state };
+    return { result, state, heldMarker: firstHeldMarker(state.heldMarker) };
   } finally {
     writeFileSync(state.release, "");
     held.release("STOPMSG_FIRST_LATE");
     gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
   }
 }
 
 test("a message right after a stop starts the subagent's next turn", async () => {
-  const { result, state } = await runStopMessage("stop-then-message", async (raw, state) => {
+  const { result, state, heldMarker } = await runStopMessage("stop-then-message", async (raw, state) => {
     if (raw.includes("stopmsg-redirect")) {
       state.afterStop.push(raw);
       writeFileSync(state.release, "");
@@ -16117,7 +16125,7 @@ test("a message right after a stop starts the subagent's next turn", async () =>
     return undefined;
   });
   expect(state.afterStop.length).toBe(1);
-  expect(readFileSync(`${state.heldMarker}.1`, "utf8")).toContain("by=parent");
+  expect(heldMarker).toContain("by=parent");
   expect(toolResultText(state.afterStop[0]!, "stopmsg-stop")).toContain("Stopped worker: its turn ended");
   const message = toolResultText(state.afterStop[0]!, "stopmsg-redirect");
   expect(message).not.toContain("child_cancelled");
@@ -16222,6 +16230,7 @@ test("a wait that starts as a subagent's work ends with nothing to report still 
   } finally {
     writeFileSync(settleRelease, "");
     gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
   }
 }, 60_000);
 
@@ -16282,6 +16291,7 @@ test("a test hold set to a relative path is ignored", async () => {
   } finally {
     held.release("RELHOLD_TASK_LATE");
     gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
   }
 }, 60_000);
 
@@ -16340,16 +16350,17 @@ async function runCloseMessage(
       },
       timeoutMs: 60_000,
     });
-    return { result, state };
+    return { result, state, heldMarker: firstHeldMarker(state.heldMarker) };
   } finally {
     writeFileSync(state.release, "");
     held.release("CLOSEMSG_FIRST_LATE");
     gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
   }
 }
 
 test("a message to a subagent whose close is not written yet is refused", async () => {
-  const { result, state } = await runCloseMessage("close-then-message", async (raw, state) => {
+  const { result, state, heldMarker } = await runCloseMessage("close-then-message", async (raw, state) => {
     if (raw.includes("closemsg-message")) {
       state.afterMessage.push(raw);
       writeFileSync(state.release, "");
@@ -16368,7 +16379,7 @@ test("a message to a subagent whose close is not written yet is refused", async 
     return undefined;
   });
   expect(state.afterMessage.length).toBe(1);
-  expect(readFileSync(`${state.heldMarker}.1`, "utf8")).toContain("close_write child=");
+  expect(heldMarker).toContain("close_write child=");
   expect(toolResultText(state.afterMessage[0]!, "closemsg-close")).toContain("Closed worker");
   // The message was refused at once, not held behind the close, and no turn
   // started for the closed subagent.
@@ -16417,16 +16428,17 @@ async function runPublishGap(label: string, action: "stop" | "close") {
       },
       timeoutMs: 60_000,
     });
-    return { result, state };
+    return { result, state, heldMarker: firstHeldMarker(state.heldMarker) };
   } finally {
     writeFileSync(state.release, "");
     gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
   }
 }
 
 test("a stop right after a subagent's turn ended finds it not working", async () => {
-  const { result, state } = await runPublishGap("publish-gap-stop", "stop");
-  expect(readFileSync(`${state.heldMarker}.1`, "utf8")).toContain("publish child=");
+  const { result, state, heldMarker } = await runPublishGap("publish-gap-stop", "stop");
+  expect(heldMarker).toContain("publish child=");
   expect(state.childRequests).toBe(1);
   expect(state.answer).toContain("worker was not working.");
   expect(state.answer).not.toContain("Stopped");
@@ -16434,8 +16446,8 @@ test("a stop right after a subagent's turn ended finds it not working", async ()
 }, 90_000);
 
 test("a close right after a subagent's turn ended closes it as an idle one", async () => {
-  const { result, state } = await runPublishGap("publish-gap-close", "close");
-  expect(readFileSync(`${state.heldMarker}.1`, "utf8")).toContain("publish child=");
+  const { result, state, heldMarker } = await runPublishGap("publish-gap-close", "close");
+  expect(heldMarker).toContain("publish child=");
   expect(state.childRequests).toBe(1);
   expect(state.answer).toContain("Closed worker. A later message to worker starts a new one.");
   expect(state.answer).not.toContain("ending its turn");
@@ -16543,6 +16555,7 @@ async function runStartGap(label: string, options: { releaseWhenWaiting: boolean
   } finally {
     release();
     gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
   }
 }
 
