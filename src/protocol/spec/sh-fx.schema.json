@@ -25,17 +25,25 @@
     "AgentCapabilitiesMeta": {
       "description": "The sh.fx entries that fx lists in `agentCapabilities._meta` of its `initialize` response.",
       "type": "object",
+      "propertyNames": {
+        "if": { "pattern": "^sh\\.fx/" },
+        "then": { "pattern": "^sh\\.fx/[a-z][A-Za-z0-9]*$" }
+      },
       "properties": {},
       "patternProperties": {
-        "^sh\\.fx/[a-z][A-Za-z0-9]*$": { "$ref": "#/$defs/Capability" }
+        "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
       }
     },
     "ClientCapabilitiesMeta": {
       "description": "The sh.fx entries that a client lists in `clientCapabilities._meta` of its `initialize` request.",
       "type": "object",
+      "propertyNames": {
+        "if": { "pattern": "^sh\\.fx/" },
+        "then": { "pattern": "^sh\\.fx/[a-z][A-Za-z0-9]*$" }
+      },
       "properties": {},
       "patternProperties": {
-        "^sh\\.fx/[a-z][A-Za-z0-9]*$": { "$ref": "#/$defs/Capability" }
+        "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
       }
     }
   }
