@@ -121,7 +121,7 @@ pub const List = struct {
 
 pub const Added = struct {
     added: u32 = 0,
-    /// Tools without a plain, non-empty `name`, or whose `inputSchema` isn't an object.
+    /// Tools without a plain, non-empty `name`.
     invalid: u32 = 0,
     /// Tools with a field written twice, `name` included: no copy of it is trusted over the other.
     repeated_field: u32 = 0,
@@ -155,7 +155,7 @@ pub const AddError = wire.DecodeError || std.mem.Allocator.Error;
 /// Why fx leaves one tool out of what a server listed. The set is closed and `words` gives each its fixed words, so
 /// nothing the server wrote reaches a screen; the host shows them beside a server's status.
 pub const Drop = enum {
-    /// No plain, non-empty `name`, or an `inputSchema` that is not an object (`Store.addPage`).
+    /// No plain, non-empty `name` (`Store.addPage`), or an `inputSchema` that is missing or not an object (the host).
     unnamed,
     /// A field of the tool written twice, `name` included (`Store.addPage`).
     repeated_field,
@@ -319,17 +319,19 @@ pub const Store = struct {
                 }
                 continue;
             };
+            // The engine keeps a tool it can index: a plain name. Whether the rest of the definition is usable
+            // is the host's to say (`src/core/mcp_host/dropped_tools.zig`).
             const name = wire.plainString(found[0] orelse "") orelse "";
-            const schema = found[1] orelse "";
-            if (name.len == 0 or schema.len == 0 or schema[0] != '{') {
+            if (name.len == 0) {
                 added.invalid += 1;
                 continue;
             }
+            const schema = found[1] orelse "";
             if (store.gathering.find(name) != null) {
                 added.duplicate += 1;
                 continue;
             }
-            if (store.check_headers) {
+            if (store.check_headers and schema.len > 0 and schema[0] == '{') {
                 var annotations: [http_headers.max_annotations]http_headers.Annotation = undefined;
                 if (http_headers.annotations(schema, &annotations)) |_| {} else |reason| {
                     added.bad_headers += 1;
@@ -546,7 +548,7 @@ test "gathers valid tools, skipping malformed ones and later duplicates" {
     defer store.deinit(testing.allocator);
     const first = try store.addPage(testing.allocator, try parsePage(
         \\{"tools":[{"name":"a","inputSchema":{"type":"object"}},{"name":"","inputSchema":{}},
-        \\{"name":"b"},{"name":"c","inputSchema":null},7,{"name":"\u0064","inputSchema":{}},
+        \\{"inputSchema":{}},{"name":7,"inputSchema":{}},7,{"name":"\u0064","inputSchema":{}},
         \\{"name":"a","inputSchema":{}},{"name":"d","name":"e","inputSchema":{}}],"nextCursor":"p2"}
     ));
     try testing.expectEqual(Added{ .added = 1, .invalid = 4, .unreadable = 1, .repeated_field = 1, .duplicate = 1 }, first);
@@ -568,6 +570,15 @@ test "gathers valid tools, skipping malformed ones and later duplicates" {
     try testing.expectEqual(@as(?[]const u8, null), store.nextCursor());
     try testing.expectEqual(@as(usize, 2), store.current.len());
     try testing.expectError(error.NotAnArray, store.addPage(testing.allocator, .{ .tools = "{}", .next_cursor = null, .ttl_ms = 0 }));
+}
+
+test "a tool whose inputSchema is missing or not an object is kept: the host judges it" {
+    var store: Store = .{};
+    defer store.deinit(testing.allocator);
+    const added = try store.addPage(testing.allocator, try parsePage(
+        \\{"tools":[{"name":"none"},{"name":"null","inputSchema":null},{"name":"list","inputSchema":[]},{"name":"text","inputSchema":"x"},{"name":"empty","inputSchema":{}}]}
+    ));
+    try testing.expectEqual(Added{ .added = 5 }, added);
 }
 
 test "a large list over pages: each tool is found as first listed, and a later one of the same name is skipped" {

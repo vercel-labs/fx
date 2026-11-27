@@ -329,16 +329,23 @@ describe("fx mcp", () => {
     const twice = '{"name":"twice","name":"again","inputSchema":{"type":"object"}}';
     const sameName = '{"name":"good","description":"the second","inputSchema":{"type":"object"}}';
     const tooDeep = JSON.stringify({ name: "deep", inputSchema: deepSchema });
-    // `odd` has a `description` that is no text: the engine keeps it, and the host's reading refuses it. The others the engine
-    // skips itself.
+    // The engine keeps a tool it can index, a plain name. The host's reading refuses the next ones, and a tool it refuses is
+    // in the count of what was left out and in no list: `odd` has a `description` that is no text, `flat` an `inputSchema` of
+    // `{}`, which does not say `"type":"object"`, and `noSchema` and `listSchema` an `inputSchema` that is missing or no object.
     const odd = '{"name":"odd","description":7,"inputSchema":{"type":"object"}}';
+    const flat = '{"name":"flat","inputSchema":{}}';
+    const noSchema = '{"name":"noSchema"}';
+    const listSchema = '{"name":"listSchema","inputSchema":[]}';
     const cases: { tools: string[]; listed: number; text: string | null; json: { count: number; reason: string } | null }[] = [
       { tools: [good], listed: 1, text: null, json: null },
       { tools: [good, twice], listed: 1, text: "1 tool: a field is written twice", json: { count: 1, reason: "a field is written twice" } },
       { tools: [good, sameName], listed: 1, text: "1 tool: a name is used by two tools", json: { count: 1, reason: "a name is used by two tools" } },
       { tools: [good, tooDeep], listed: 1, text: "1 tool: a limit on size or nesting is passed", json: { count: 1, reason: "a limit on size or nesting is passed" } },
-      { tools: [good, odd], listed: 2, text: "1 tool: a definition can't be used", json: { count: 1, reason: "a definition can't be used" } },
-      { tools: [good, twice, sameName, tooDeep, odd], listed: 2, text: "4 tools: more than one reason", json: { count: 4, reason: "more than one reason" } },
+      { tools: [good, odd], listed: 1, text: "1 tool: a definition can't be used", json: { count: 1, reason: "a definition can't be used" } },
+      { tools: [good, flat], listed: 1, text: "1 tool: a definition can't be used", json: { count: 1, reason: "a definition can't be used" } },
+      { tools: [good, noSchema], listed: 1, text: "1 tool: a name or schema is missing", json: { count: 1, reason: "a name or schema is missing" } },
+      { tools: [good, listSchema], listed: 1, text: "1 tool: a name or schema is missing", json: { count: 1, reason: "a name or schema is missing" } },
+      { tools: [good, twice, sameName, tooDeep, odd], listed: 1, text: "4 tools: more than one reason", json: { count: 4, reason: "more than one reason" } },
     ];
     for (const one of cases) {
       const reply = `"result":{"resultType":"complete","tools":[${one.tools.join(",")}]}`;
@@ -351,6 +358,8 @@ describe("fx mcp", () => {
       else expect(text.stdout).toContain(`  left out   ${one.text}\n`);
       const shown = JSON.parse((await mcp(root, "show", "fixture", "--json")).stdout);
       expect(shown).toMatchObject({ status: "ready", tools_error: null, tools_left_out: one.json });
+      // What is counted is what is listed: a tool left out is in no list.
+      expect(shown.tools.map((tool: { name: string }) => tool.name)).toEqual(["good"]);
       expect(JSON.parse((await mcp(root, "list", "--json")).stdout).servers[0]).toHaveProperty("tools_left_out");
     }
   }, 120_000);

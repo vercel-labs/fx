@@ -37,6 +37,8 @@ pub const Error = error{
     ProtocolFailure,
     InvalidListResult,
     InvalidTool,
+    /// The tool has no name, or no `inputSchema` that is an object: `Drop.unnamed`, whose words say so.
+    UnnamedTool,
     DuplicateTool,
     DuplicateCursor,
     InconsistentCacheScope,
@@ -335,10 +337,11 @@ pub fn parseToolJson(alloc: Allocator, json: []const u8, limits: Limits) Error!T
 
 fn parseTool(alloc: Allocator, value: std.json.Value, limits: Limits) Error!Tool {
     if (value != .object) return error.InvalidTool;
-    const name_value = value.object.get("name") orelse return error.InvalidTool;
-    if (name_value != .string or name_value.string.len == 0 or name_value.string.len > limits.max_name_bytes) {
-        return error.InvalidTool;
-    }
+    const name_value = value.object.get("name") orelse return error.UnnamedTool;
+    if (name_value != .string or name_value.string.len == 0) return error.UnnamedTool;
+    const input_schema = value.object.get("inputSchema") orelse return error.UnnamedTool;
+    if (input_schema != .object) return error.UnnamedTool;
+    if (name_value.string.len > limits.max_name_bytes) return error.InvalidTool;
     const description_value = value.object.get("description");
     if (description_value) |description| {
         if (description != .string or description.string.len > limits.max_description_bytes) return error.InvalidTool;
@@ -347,7 +350,6 @@ fn parseTool(alloc: Allocator, value: std.json.Value, limits: Limits) Error!Tool
     if (title_value) |title| {
         if (title != .string or title.string.len > limits.max_title_bytes) return error.InvalidTool;
     }
-    const input_schema = value.object.get("inputSchema") orelse return error.InvalidTool;
     try prepareSchema(input_schema, true);
     if (value.object.get("outputSchema")) |output_schema| {
         try prepareSchema(output_schema, false);

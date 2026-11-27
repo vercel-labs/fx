@@ -1895,13 +1895,14 @@ test "what the catalog leaves out of a server's tools is what the count says was
     defer c.names.deinit();
     c.builtins = .{};
     const built = try c.build(a, "srv", &listed);
-    const counted = try dropped_tools.count(gpa, &list);
+    const counted = try dropped_tools.reading(gpa, &list);
     // Every listed tool is in the catalog or in the count, and no tool is in both.
-    try testing.expectEqual(listed.len, built.len + counted.total());
+    try testing.expectEqual(listed.len, built.len + counted.dropped.total());
     try testing.expectEqual(@as(usize, 2), built.len);
+    try testing.expectEqual(@as(usize, counted.kept), built.len);
     try testing.expectEqualStrings("good", built[0].original_name);
     try testing.expectEqualStrings("fine", built[1].original_name);
-    try testing.expectEqual(@as(u32, 2), counted.total());
+    try testing.expectEqual(@as(u32, 2), counted.dropped.total());
 }
 
 test "a call the server answers with a 401 tells the model it refused the login, in the server's quoted words" {
