@@ -4,6 +4,7 @@ const build_checkpoint = @import("build_checkpoint.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
+const ansi = @import("../../core/agent/presentation/ansi.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
@@ -464,10 +465,11 @@ fn renderThematicRuleForTranscript(alloc: Allocator, cols: u16) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.appendNTimes(alloc, ' ', gutter);
-    try out.appendSlice(alloc, "\x1b[2m");
+    const rule = ansi.mark(shared_theme.current().rule_open, .dim);
+    try out.appendSlice(alloc, rule.open);
     var i: u16 = 0;
     while (i < rule_width) : (i += 1) try out.appendSlice(alloc, "\xe2\x94\x80");
-    try out.appendSlice(alloc, "\x1b[22m");
+    try out.appendSlice(alloc, rule.close);
     return out.toOwnedSlice(alloc);
 }
 
@@ -1317,12 +1319,15 @@ fn appendCodePanelHeader(
     const label = if (label_prefix.len > 0) label_prefix else "?";
     const label_width = display_width.visibleWidth(label);
 
-    try out.appendSlice(alloc, "\x1b[2m─ ");
+    const rule = ansi.mark(shared_theme.current().rule_open, .dim);
+    try out.appendSlice(alloc, rule.open);
+    try out.appendSlice(alloc, "─ ");
     try out.appendSlice(alloc, label);
     try out.append(alloc, ' ');
     var edge: usize = 0;
     while (edge < panel_width - 3 - label_width) : (edge += 1) try out.appendSlice(alloc, "─");
-    try out.appendSlice(alloc, "\x1b[22m\n");
+    try out.appendSlice(alloc, rule.close);
+    try out.append(alloc, '\n');
 }
 
 fn appendCodePanelRule(
@@ -1330,10 +1335,12 @@ fn appendCodePanelRule(
     out: *std.ArrayList(u8),
     panel_width: usize,
 ) !void {
-    try out.appendSlice(alloc, "\x1b[2m");
+    const rule = ansi.mark(shared_theme.current().rule_open, .dim);
+    try out.appendSlice(alloc, rule.open);
     var edge: usize = 0;
     while (edge < panel_width) : (edge += 1) try out.appendSlice(alloc, "─");
-    try out.appendSlice(alloc, "\x1b[22m\n");
+    try out.appendSlice(alloc, rule.close);
+    try out.append(alloc, '\n');
 }
 
 fn appendCodePanelLine(
@@ -1457,6 +1464,8 @@ fn renderUnboxedCode(
 }
 
 fn appendTableBorder(alloc: Allocator, out: *std.ArrayList(u8), left: []const u8, middle: []const u8, right: []const u8, widths: []const usize) !void {
+    const rule = ansi.mark(shared_theme.current().rule_open, .plain);
+    try out.appendSlice(alloc, rule.open);
     try out.appendSlice(alloc, left);
     for (widths, 0..) |width, index| {
         if (index > 0) try out.appendSlice(alloc, middle);
@@ -1464,6 +1473,7 @@ fn appendTableBorder(alloc: Allocator, out: *std.ArrayList(u8), left: []const u8
         while (count < width + 2) : (count += 1) try out.appendSlice(alloc, "─");
     }
     try out.appendSlice(alloc, right);
+    try out.appendSlice(alloc, rule.close);
     try out.append(alloc, '\n');
 }
 
@@ -1484,7 +1494,7 @@ fn renderBoxedGrid(alloc: Allocator, table: assistant_presentation.TablePayload,
             row_height = @max(row_height, lines.items.len);
         }
         for (0..row_height) |line_index| {
-            try out.appendSlice(alloc, "│");
+            try ansi.writeMarked(alloc, out, shared_theme.current().rule_open, "│", .plain);
             for (widths, cell_lines, 0..) |width, lines, col| {
                 try out.append(alloc, ' ');
                 if (line_index < lines.items.len) {
@@ -1502,7 +1512,8 @@ fn renderBoxedGrid(alloc: Allocator, table: assistant_presentation.TablePayload,
                 } else {
                     try out.appendNTimes(alloc, ' ', width);
                 }
-                try out.appendSlice(alloc, " │");
+                try out.append(alloc, ' ');
+                try ansi.writeMarked(alloc, out, shared_theme.current().rule_open, "│", .plain);
             }
             try out.append(alloc, '\n');
         }
@@ -1646,20 +1657,18 @@ fn appendVerticalLine(alloc: Allocator, out: *std.ArrayList(u8), content: []cons
             consumed = unit.byte_len;
         }
         const visible = display_width.visibleWidthIgnoringAnsi(prefix);
-        try out.appendSlice(alloc, "│");
+        try ansi.writeMarked(alloc, out, shared_theme.current().rule_open, "│", .plain);
         try out.appendSlice(alloc, prefix);
         try out.appendNTimes(alloc, ' ', inner_width -| visible);
-        try out.appendSlice(alloc, "│\n");
+        try ansi.writeMarked(alloc, out, shared_theme.current().rule_open, "│", .plain);
+        try out.append(alloc, '\n');
         remaining = remaining[consumed..];
     }
 }
 
 fn renderBoxedVertical(alloc: Allocator, table: assistant_presentation.TablePayload, cols: u16, out: *std.ArrayList(u8)) !void {
     const inner_width: usize = cols - 2;
-    try out.appendSlice(alloc, "┌");
-    var edge: usize = 0;
-    while (edge < inner_width) : (edge += 1) try out.appendSlice(alloc, "─");
-    try out.appendSlice(alloc, "┐\n");
+    try appendBoxEdge(alloc, out, "┌", "┐", inner_width);
     for (table.rows[1..], 0..) |row, row_index| {
         for (table.alignments, 0..) |_, col| {
             var field: std.ArrayList(u8) = .empty;
@@ -1671,17 +1680,21 @@ fn renderBoxedVertical(alloc: Allocator, table: assistant_presentation.TablePayl
             try field.appendSlice(alloc, value);
             try appendVerticalLine(alloc, out, field.items, inner_width);
         }
-        if (row_index + 1 < table.rows.len - 1) {
-            try out.appendSlice(alloc, "├");
-            edge = 0;
-            while (edge < inner_width) : (edge += 1) try out.appendSlice(alloc, "─");
-            try out.appendSlice(alloc, "┤\n");
-        }
+        if (row_index + 1 < table.rows.len - 1) try appendBoxEdge(alloc, out, "├", "┤", inner_width);
     }
-    try out.appendSlice(alloc, "└");
-    edge = 0;
+    try appendBoxEdge(alloc, out, "└", "┘", inner_width);
+}
+
+/// One horizontal edge of a boxed table, in the rule color when set.
+fn appendBoxEdge(alloc: Allocator, out: *std.ArrayList(u8), left: []const u8, right: []const u8, inner_width: usize) !void {
+    const rule = ansi.mark(shared_theme.current().rule_open, .plain);
+    try out.appendSlice(alloc, rule.open);
+    try out.appendSlice(alloc, left);
+    var edge: usize = 0;
     while (edge < inner_width) : (edge += 1) try out.appendSlice(alloc, "─");
-    try out.appendSlice(alloc, "┘\n");
+    try out.appendSlice(alloc, right);
+    try out.appendSlice(alloc, rule.close);
+    try out.append(alloc, '\n');
 }
 
 fn renderUnboxedTable(alloc: Allocator, table: assistant_presentation.TablePayload, cols: u16, out: *std.ArrayList(u8)) !void {
@@ -5534,4 +5547,26 @@ test "a preparation resumed after any prefix equals the full preparation" {
         try std.testing.expectEqual(full.trailing_boundary_blank_rows, resumed.trailing_boundary_blank_rows);
         try std.testing.expectEqualSlices(?usize, &full_floors, &floors);
     }
+}
+
+test "markdown rules and table edges take the theme's rule color" {
+    const alloc = std.testing.allocator;
+    var theme = shared_theme.fx_dark;
+    theme.rule_open = "\x1b[38;5;4m";
+    shared_theme.activate(theme);
+    defer shared_theme.activate(shared_theme.fx_dark);
+
+    const rule = try renderThematicRuleForTranscript(alloc, 20);
+    defer alloc.free(rule);
+    try std.testing.expect(std.mem.find(u8, rule, "\x1b[38;5;4m─") != null);
+    try std.testing.expect(std.mem.find(u8, rule, "\x1b[2m") == null);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try appendTableBorder(alloc, &out, "┌", "┬", "┐", &.{ 3, 4 });
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "\x1b[38;5;4m┌"));
+
+    out.clearRetainingCapacity();
+    try ansi.writeMarked(alloc, &out, shared_theme.current().rule_open, "│", .plain);
+    try std.testing.expectEqualStrings("\x1b[38;5;4m│\x1b[39m", out.items);
 }

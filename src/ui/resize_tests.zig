@@ -6483,9 +6483,9 @@ test "slash main page renders title categories selection and a more row" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridNotContains(&h, "Commands 40");
+    try expectGridNotContains(&h, "Commands 41");
     try expectGridNotContains(&h, "type to filter");
-    try expectGridContains(&h, "↓ 35 more");
+    try expectGridContains(&h, "↓ 36 more");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
     try expectGridContains(&h, "↑↓ navigate     enter use     esc close");
@@ -6494,7 +6494,7 @@ test "slash main page renders title categories selection and a more row" {
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
-    try expectGridContains(&h, "↓ 33 more");
+    try expectGridContains(&h, "↓ 34 more");
 
     input.inputResetState().clearCurrent(alloc);
     try input.edit_state.input.appendSlice(alloc, "/permissions ");

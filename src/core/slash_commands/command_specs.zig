@@ -4,6 +4,7 @@ const display_width = @import("../shared/display_width.zig");
 const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const list_window = @import("../shared/list_window.zig");
 const mod_registry = @import("../mods/registry.zig");
+const shared_theme = @import("../shared/theme.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -74,6 +75,7 @@ pub const SlashKind = enum {
     ultrafast,
     statusline,
     notifications,
+    theme,
     workspace,
     shell,
     version,
@@ -678,6 +680,9 @@ pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
     if (notificationsArgCompletionPrefix(prefix)) |query| {
         return notificationsArgCompletionCount(query);
     }
+    if (themeArgCompletionPrefix(prefix)) |query| {
+        return argCompletionCount(&theme_arg_completions, "/theme ".len, query);
+    }
     if (permissionsArgCompletionPrefix(prefix)) |query| {
         return permissionsArgCompletionCount(query);
     }
@@ -701,6 +706,9 @@ pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize)
     if (notificationsArgCompletionPrefix(prefix)) |query| {
         return nthNotificationsArgCompletion(query, n);
     }
+    if (themeArgCompletionPrefix(prefix)) |query| {
+        return nthArgCompletion(&theme_arg_completions, "/theme ".len, query, n);
+    }
     if (permissionsArgCompletionPrefix(prefix)) |query| {
         return nthPermissionsArgCompletion(query, n);
     }
@@ -719,6 +727,7 @@ pub fn argCompletionAnchor(prefix: []const u8) usize {
     if (argCompletionPrefix(prefix, "/launch") != null) return "/launch ".len;
     if (statuslineArgCompletionPrefix(prefix) != null) return "/statusline ".len;
     if (notificationsArgCompletionPrefix(prefix) != null) return "/sound ".len;
+    if (themeArgCompletionPrefix(prefix) != null) return "/theme ".len;
     if (permissionsArgCompletionPrefix(prefix) != null) return "/permissions ".len;
     if (workspaceArgCompletionPrefix(prefix) != null) return "/workspace ".len;
     if (allowlistArgCompletionAnchor(prefix)) |anchor| return anchor;
@@ -743,6 +752,10 @@ pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: u
     if (notificationsArgCompletionPrefix(prefix)) |query| {
         return nthNotificationsArgLabel(query, n);
     }
+    if (themeArgCompletionPrefix(prefix)) |query| {
+        const full = nthArgCompletion(&theme_arg_completions, "/theme ".len, query, n) orelse return null;
+        return full["/theme ".len..];
+    }
     if (permissionsArgCompletionPrefix(prefix)) |query| {
         return nthPermissionsArgLabel(query, n);
     }
@@ -765,6 +778,7 @@ pub fn nthSlashCompletionDescription(registry: SlashRegistry, prefix: []const u8
     if (allowlistArgCompletionPrefix(prefix) != null) return null;
     if (statuslineArgCompletionPrefix(prefix) != null) return null;
     if (notificationsArgCompletionPrefix(prefix) != null) return null;
+    if (themeArgCompletionPrefix(prefix)) |query| return nthThemeArgDescription(query, n);
     if (permissionsArgCompletionPrefix(prefix) != null) return null;
     if (workspaceArgCompletionPrefix(prefix) != null) return null;
     if (prefix.len == 0 or prefix[0] != '/') return null;
@@ -1039,6 +1053,22 @@ pub fn statuslineArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
 
 pub fn notificationsArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
     return argCompletionPrefix(prefix, "/sound");
+}
+
+pub fn themeArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
+    return argCompletionPrefix(prefix, "/theme");
+}
+
+/// `/theme` offers the named themes fx ships, in their catalog order.
+const theme_arg_completions = blk: {
+    var completions: [shared_theme.named_themes.len][]const u8 = undefined;
+    for (shared_theme.named_themes, 0..) |theme, i| completions[i] = "/theme " ++ theme.name;
+    break :blk completions;
+};
+
+fn nthThemeArgDescription(query: []const u8, n: usize) ?[]const u8 {
+    const full = nthArgCompletion(&theme_arg_completions, "/theme ".len, query, n) orelse return null;
+    return (shared_theme.namedTheme(full["/theme ".len..]) orelse return null).description;
 }
 
 pub fn permissionsArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
@@ -1972,13 +2002,25 @@ test "slash completion categories follow canonical entries" {
     try std.testing.expect(nthSlashCompletionCategory(registry, "/permissions ", 0) == null);
 }
 
+test "/theme completes the named themes fx ships with their descriptions" {
+    const registry = testSlashRegistry();
+    try std.testing.expectEqual(shared_theme.named_themes.len, slashCompletionCount(registry, "/theme "));
+    try std.testing.expectEqualStrings("/theme phosphor", nthSlashCompletion(registry, "/theme ", 0).?);
+    try std.testing.expectEqualStrings("phosphor", nthSlashCompletionLabel(registry, "/theme ", 0).?);
+    try std.testing.expectEqualStrings(shared_theme.named_themes[0].description, nthSlashCompletionDescription(registry, "/theme ", 0).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/theme do"));
+    try std.testing.expectEqualStrings("dotmatrix", nthSlashCompletionLabel(registry, "/theme do", 0).?);
+    try std.testing.expectEqual("/theme ".len, argCompletionAnchor("/theme be"));
+    try std.testing.expect(nthSlashCompletionCategory(registry, "/theme ", 0) == null);
+}
+
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 40), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 41), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
-    try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
+    try std.testing.expectEqual(@as(usize, 4), helpCatalogCount(registry, "appearance"));
     try std.testing.expectEqualStrings("/paste", helpCatalogSpecAt(registry, "clipboard", 0).?.command);
 }
 

@@ -88,6 +88,8 @@ fn preparedDiffPayloadWithFullAllocator(
             .context_fg = ui_render.dim_style,
             .added_marker_fg = ui_render.diff_added_marker_style,
             .removed_marker_fg = ui_render.diff_removed_marker_style,
+            .added_word = ui_render.diff_added_word_style,
+            .removed_word = ui_render.diff_removed_word_style,
             .reset = ui_render.reset_style,
         },
     );

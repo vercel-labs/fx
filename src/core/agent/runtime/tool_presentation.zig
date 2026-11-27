@@ -1791,8 +1791,8 @@ fn renderedSubagentSummary(
 
 fn formatWebSearchCompletion(arena: Allocator, base: []const u8, completion: types.WebSearchCompletion) ![]const u8 {
     return arena.print(
-        "{s} \x1b[38;5;245m| {d} search{s} | {d}ms\x1b[0m",
-        .{ base, completion.searches, if (completion.searches == 1) "" else "es", completion.duration_ms },
+        "{s} {s}| {d} search{s} | {d}ms\x1b[0m",
+        .{ base, shared_theme.current().dim_style, completion.searches, if (completion.searches == 1) "" else "es", completion.duration_ms },
     );
 }
 
@@ -1804,8 +1804,8 @@ fn formatWebFetchCompletion(arena: Allocator, base: []const u8, completion: type
         .unavailable => " | artifact unavailable",
     };
     return arena.print(
-        "{s} \x1b[38;5;245m| {s} | {d} bytes | HTTP {d} | {d}ms | {s}{s}\x1b[0m",
-        .{ base, completion.url(), completion.bytes, completion.status, completion.duration_ms, cache, artifact },
+        "{s} {s}| {s} | {d} bytes | HTTP {d} | {d}ms | {s}{s}\x1b[0m",
+        .{ base, shared_theme.current().dim_style, completion.url(), completion.bytes, completion.status, completion.duration_ms, cache, artifact },
     );
 }
 
@@ -1816,12 +1816,12 @@ pub fn formatToolStatusWithStats(
     deletions: usize,
     markers: runtime_deps.DiffMarkerStyles,
 ) ![]const u8 {
-    const accent = "\x1b[38;5;252m";
-    const dim = "\x1b[38;5;245m";
+    const theme = shared_theme.current();
+    const dim = theme.dim_style;
     const reset = "\x1b[0m";
-    // Fall back to the neutral accent when no marker color is supplied.
-    const add_style = if (markers.added.len != 0) markers.added else accent;
-    const rem_style = if (markers.removed.len != 0) markers.removed else accent;
+    // Without a marker color the counts take the theme's diff line colors.
+    const add_style = if (markers.added.len != 0) markers.added else theme.diff_added_style;
+    const rem_style = if (markers.removed.len != 0) markers.removed else theme.diff_removed_style;
     if (additions > 0 and deletions > 0) {
         return arena.print("{s} {s}+{d}{s} {s}/{s} {s}-{d}{s}", .{ base, add_style, additions, reset, dim, reset, rem_style, deletions, reset });
     } else if (additions > 0) {
@@ -1963,6 +1963,19 @@ test "formatToolStatusWithStats accents the +/- counts and falls back to neutral
     defer alloc.free(neutral);
     try std.testing.expect(std.mem.find(u8, neutral, "\x1b[38;5;252m+3") != null);
     try std.testing.expect(std.mem.find(u8, neutral, "\x1b[38;5;252m-1") != null);
+}
+
+test "tool summaries use the light theme's grays in a light terminal" {
+    const alloc = std.testing.allocator;
+    shared_theme.activate(shared_theme.fx_light);
+    defer shared_theme.activate(shared_theme.fx_dark);
+
+    // fx-dark's 252 and 245 used to show here, too faint on a light background.
+    const neutral = try formatToolStatusWithStats(alloc, "Edited x", 3, 1, .{});
+    defer alloc.free(neutral);
+    try std.testing.expect(std.mem.find(u8, neutral, shared_theme.fx_light.diff_added_style ++ "+3") != null);
+    try std.testing.expect(std.mem.find(u8, neutral, shared_theme.fx_light.dim_style ++ "/") != null);
+    try std.testing.expect(std.mem.find(u8, neutral, "\x1b[38;5;252m") == null);
 }
 
 test "fallback tool display never exposes provider search backend names" {

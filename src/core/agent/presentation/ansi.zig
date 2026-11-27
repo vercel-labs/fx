@@ -30,6 +30,29 @@ pub fn applyTheme(theme: shared_theme.Theme) void {
     task_completed_close = shared_theme.closingFor(theme.task_completed_open);
 }
 
+/// How a markdown structure part looks when the theme leaves its color
+/// (`heading`, `quote`, `list_marker`, `rule`) empty, as the builtins do.
+pub const Unthemed = enum { dim, plain };
+
+pub const Mark = struct { open: []const u8, close: []const u8 };
+
+/// The open and close for a markdown structure color from the active theme,
+/// or the historical look when the theme leaves it empty.
+pub fn mark(open: []const u8, unthemed: Unthemed) Mark {
+    if (open.len != 0) return .{ .open = open, .close = shared_theme.closingFor(open) };
+    return switch (unthemed) {
+        .dim => .{ .open = dim_open, .close = dim_close },
+        .plain => .{ .open = "", .close = "" },
+    };
+}
+
+pub fn writeMarked(alloc: Allocator, out: *std.ArrayList(u8), open: []const u8, bytes: []const u8, unthemed: Unthemed) !void {
+    const m = mark(open, unthemed);
+    try out.appendSlice(alloc, m.open);
+    try out.appendSlice(alloc, bytes);
+    try out.appendSlice(alloc, m.close);
+}
+
 // Keeps table intersections aligned with row separators.
 pub const table_column_sep = " \xe2\x94\x82 ";
 pub const table_horiz = "\xe2\x94\x80";
@@ -51,8 +74,9 @@ pub fn writeDim(alloc: Allocator, out: *std.ArrayList(u8), bytes: []const u8) !v
 }
 
 pub fn writeHorizontalRule(alloc: Allocator, out: *std.ArrayList(u8)) !void {
-    try out.appendSlice(alloc, dim_open);
+    const m = mark(shared_theme.current().rule_open, .dim);
+    try out.appendSlice(alloc, m.open);
     var i: usize = 0;
     while (i < horizontal_rule_width) : (i += 1) try out.appendSlice(alloc, table_horiz);
-    try out.appendSlice(alloc, dim_close);
+    try out.appendSlice(alloc, m.close);
 }

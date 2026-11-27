@@ -1,5 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
+const shared_theme = @import("../shared/theme.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 
@@ -788,8 +789,162 @@ pub const FormatStyles = struct {
     // marker stays in the line color (fully monochrome, the historical look).
     added_marker_fg: []const u8 = "",
     removed_marker_fg: []const u8 = "",
+    // Optional style for the changed words of a paired removed/added line.
+    // Empty leaves the whole line in its line style.
+    added_word: []const u8 = "",
+    removed_word: []const u8 = "",
     reset: []const u8 = "\x1b[0m",
 };
+
+/// The byte range of a changed line that differs from the line it replaces.
+pub const ChangedSpan = struct {
+    start: usize,
+    end: usize,
+};
+
+/// Runs longer than this are not paired, so the pairing walk stays bounded.
+const max_word_pair_run: usize = 16;
+
+/// Rows on each side of a row that `changedSpan` may read. A caller that
+/// passes a window of a longer review must include this many rows around the
+/// rows it renders, or stop at the review's own ends, so each run is seen
+/// whole.
+pub const word_pair_context_rows: usize = 2 * max_word_pair_run + 3;
+
+const ChangeKind = enum { deletion, addition };
+
+fn changeKind(op: anytype) ?ChangeKind {
+    return switch (@TypeOf(op)) {
+        PreviewOp => switch (op) {
+            .deletion => .deletion,
+            .addition => .addition,
+            .context, .elision, .notice => null,
+        },
+        LineOp => switch (op) {
+            .remove => .deletion,
+            .add => .addition,
+            .equal => null,
+        },
+        else => @compileError("unsupported diff line op"),
+    };
+}
+
+/// The changed span of `lines[index]`, the way git's diff-highlight finds
+/// it: when the line sits in a run of N removed lines followed directly by
+/// exactly N added lines, the i-th removed line pairs with the i-th added
+/// one, and the span is the line minus the prefix and suffix it shares with
+/// its pair. Returns null for an unpaired line, when the pair shares no
+/// prefix and no suffix, or when nothing is left between them. Span ends fall
+/// on UTF-8 boundaries and never split a `\xNN` or `\u{...}` escape, so text
+/// that is already terminal-safe encoded keeps each escape whole. `lines` is
+/// a slice of any line type with `op` and `text` fields.
+pub fn changedSpan(lines: anytype, index: usize) ?ChangedSpan {
+    const counterpart = pairedLineIndex(lines, index) orelse return null;
+    return spanAgainst(lines[index].text, lines[counterpart].text);
+}
+
+fn pairedLineIndex(lines: anytype, index: usize) ?usize {
+    const kind = changeKind(lines[index].op) orelse return null;
+    const before = countRunBackward(lines, index, kind);
+    const run_len = before + countRunForward(lines, index, kind);
+    if (run_len > max_word_pair_run) return null;
+    const run_start = index - before;
+    const run_end = run_start + run_len;
+    return switch (kind) {
+        .deletion => if (countRunForward(lines, run_end, .addition) == run_len)
+            run_end + before
+        else
+            null,
+        .addition => if (countRunBackward(lines, run_start, .deletion) == run_len)
+            run_start - run_len + before
+        else
+            null,
+    };
+}
+
+/// Lines of `kind` starting at `start`, counted up to one past the cap.
+fn countRunForward(lines: anytype, start: usize, kind: ChangeKind) usize {
+    var count: usize = 0;
+    while (count <= max_word_pair_run and start + count < lines.len and
+        changeKind(lines[start + count].op) == kind) count += 1;
+    return count;
+}
+
+/// Lines of `kind` directly before `end`, counted up to one past the cap.
+fn countRunBackward(lines: anytype, end: usize, kind: ChangeKind) usize {
+    var count: usize = 0;
+    while (count <= max_word_pair_run and count < end and
+        changeKind(lines[end - 1 - count].op) == kind) count += 1;
+    return count;
+}
+
+fn spanAgainst(text: []const u8, other: []const u8) ?ChangedSpan {
+    const limit = @min(text.len, other.len);
+    var prefix: usize = 0;
+    while (prefix < limit and text[prefix] == other[prefix]) prefix += 1;
+    var suffix: usize = 0;
+    while (suffix < limit - prefix and
+        text[text.len - 1 - suffix] == other[other.len - 1 - suffix]) suffix += 1;
+
+    const start = spanStartBoundary(text, prefix);
+    const end = spanEndBoundary(text, text.len - suffix);
+    if (start == 0 and end == text.len) return null;
+    if (start >= end) return null;
+    return .{ .start = start, .end = end };
+}
+
+/// Moves a span start back so it does not split a UTF-8 sequence or an
+/// encoded escape; the split character then belongs to the span.
+fn spanStartBoundary(text: []const u8, index: usize) usize {
+    var boundary = index;
+    while (boundary > 0 and boundary < text.len and isUtf8Continuation(text[boundary])) boundary -= 1;
+    if (escapeAround(text, boundary)) |escape_start| boundary = escape_start;
+    return boundary;
+}
+
+/// Moves a span end forward so it does not split a UTF-8 sequence or an
+/// encoded escape; the split character then belongs to the span.
+fn spanEndBoundary(text: []const u8, index: usize) usize {
+    var boundary = index;
+    while (boundary < text.len and isUtf8Continuation(text[boundary])) boundary += 1;
+    if (escapeAround(text, boundary)) |escape_start| {
+        boundary = escape_start + escapeLen(text[escape_start..]);
+    }
+    return boundary;
+}
+
+fn isUtf8Continuation(byte: u8) bool {
+    return byte & 0xc0 == 0x80;
+}
+
+/// The longest escape `text_utils.encodeTerminalSafe` writes, `\u{` and
+/// `}` around up to eight hex digits.
+const max_escape_len: usize = 12;
+
+/// The start of an escape that begins before `index` and ends after it.
+fn escapeAround(text: []const u8, index: usize) ?usize {
+    var start = index -| (max_escape_len - 1);
+    while (start < index) : (start += 1) {
+        const len = escapeLen(text[start..]);
+        if (len > 0 and start + len > index) return start;
+    }
+    return null;
+}
+
+/// The length of the `\xNN` or `\u{...}` escape at the start of `text`, or 0.
+fn escapeLen(text: []const u8) usize {
+    if (text.len < 4 or text[0] != '\\') return 0;
+    if (text[1] == 'x') {
+        return if (std.ascii.isHex(text[2]) and std.ascii.isHex(text[3])) 4 else 0;
+    }
+    if (text[1] != 'u' or text[2] != '{') return 0;
+    var index: usize = 3;
+    while (index < text.len and index < max_escape_len) : (index += 1) {
+        if (text[index] == '}') return if (index > 3) index + 1 else 0;
+        if (!std.ascii.isHex(text[index])) return 0;
+    }
+    return 0;
+}
 
 pub fn compute(alloc: Allocator, old_text: []const u8, new_text: []const u8) ![]DiffLine {
     var old_lines: std.ArrayList([]const u8) = .empty;
@@ -1021,7 +1176,7 @@ fn formatFileChangeReviewLines(
     }
     const gutter_width = decimalDigits(max_line_number);
 
-    for (lines) |line| {
+    for (lines, 0..) |line, index| {
         var elision_text: ElisionText = undefined;
         const text = if (line.op == .elision)
             reviewElisionText(&elision_text, line.elision_count)
@@ -1032,6 +1187,7 @@ fn formatFileChangeReviewLines(
             .line_number = line.new_line orelse line.old_line,
             .gutter_width = gutter_width,
             .text = text,
+            .word_span = formatWordSpan(lines, index, styles),
         }, styles);
     }
 
@@ -1228,12 +1384,13 @@ fn formatPreviewLines(
     }
     const gutter_width = decimalDigits(max_line_number);
 
-    for (lines) |line| {
+    for (lines, 0..) |line, index| {
         try appendDiffRenderLine(alloc, &out, .{
             .op = line.op,
             .line_number = line.new_line orelse line.old_line,
             .gutter_width = gutter_width,
             .text = line.text,
+            .word_span = formatWordSpan(lines, index, styles),
         }, styles);
     }
 
@@ -1245,7 +1402,16 @@ const DiffRenderLine = struct {
     line_number: ?u32,
     gutter_width: usize,
     text: []const u8,
+    /// Bytes of `text` drawn in the op's word style, when it has one.
+    word_span: ?ChangedSpan = null,
 };
+
+/// The changed span of `lines[index]`, or null when neither word style is
+/// set, so themes without word styles skip the pairing walk.
+fn formatWordSpan(lines: anytype, index: usize, styles: FormatStyles) ?ChangedSpan {
+    if (styles.added_word.len == 0 and styles.removed_word.len == 0) return null;
+    return changedSpan(lines, index);
+}
 
 fn appendDiffRenderLine(
     alloc: Allocator,
@@ -1255,6 +1421,7 @@ fn appendDiffRenderLine(
 ) !void {
     const line_style = previewLineStyle(line.op, styles);
     const marker_style = previewMarkerStyle(line.op, styles);
+    const word_style = previewWordStyle(line.op, styles);
     const accent = marker_style.len != 0;
 
     try out.appendSlice(alloc, line_style);
@@ -1270,9 +1437,39 @@ fn appendDiffRenderLine(
     // A row's text comes from a file and can hold escape sequences, C1
     // controls, or invalid UTF-8, which the frame's emulator or the user's
     // terminal would act on if written raw.
-    try text_utils.appendTerminalSafeLine(alloc, out, line.text);
+    if (line.word_span != null and word_style.len != 0) {
+        const span = line.word_span.?;
+        const text = line.text;
+        const start = @min(span.start, text.len);
+        const end = @min(@max(span.end, start), text.len);
+        try appendTerminalSafeSegment(alloc, out, text[0..start], false);
+        try out.appendSlice(alloc, word_style);
+        try appendTerminalSafeSegment(alloc, out, text[start..end], end == text.len);
+        try out.appendSlice(alloc, shared_theme.closingFor(word_style));
+        try out.appendSlice(alloc, line_style);
+        try appendTerminalSafeSegment(alloc, out, text[end..], true);
+    } else {
+        try text_utils.appendTerminalSafeLine(alloc, out, line.text);
+    }
     try out.appendSlice(alloc, styles.reset);
     try out.append(alloc, '\n');
+}
+
+/// Appends one piece of a line as `text_utils.appendTerminalSafeLine` writes
+/// it within the whole line. That function drops a trailing carriage return,
+/// which is right only at the end of the line, so a piece that ends before it
+/// keeps the escape the whole line would show.
+fn appendTerminalSafeSegment(
+    alloc: Allocator,
+    out: *std.ArrayList(u8),
+    segment: []const u8,
+    line_end: bool,
+) !void {
+    if (line_end or segment.len == 0 or segment[segment.len - 1] != '\r') {
+        return text_utils.appendTerminalSafeLine(alloc, out, segment);
+    }
+    try text_utils.appendTerminalSafeLine(alloc, out, segment[0 .. segment.len - 1]);
+    try out.print(alloc, "{f}", .{text_utils.terminalSafe("\r")});
 }
 
 fn appendDiffElisionLine(
@@ -1294,6 +1491,14 @@ fn previewLineStyle(op: PreviewOp, styles: FormatStyles) []const u8 {
         .addition => styles.added_fg,
         .deletion => styles.removed_fg,
         .context, .elision, .notice => styles.context_fg,
+    };
+}
+
+fn previewWordStyle(op: PreviewOp, styles: FormatStyles) []const u8 {
+    return switch (op) {
+        .addition => styles.added_word,
+        .deletion => styles.removed_word,
+        .context, .elision, .notice => "",
     };
 }
 
@@ -1413,6 +1618,7 @@ pub fn formatUnified(
             .line_number = line.new_num orelse line.old_num,
             .gutter_width = gutter,
             .text = line.text,
+            .word_span = formatWordSpan(diff, index, styles),
         }, styles);
 
         prev_included = true;
@@ -2163,6 +2369,217 @@ test "formatUnified: marker accent colors only the number and sign" {
     try std.testing.expect(std.mem.find(u8, out, "-\x1b[38;5;252m old") != null);
     // The text is never inside the accent run.
     try std.testing.expect(std.mem.find(u8, out, "[G]2 + new") == null);
+}
+
+fn expectSpan(expected: ?ChangedSpan, actual: ?ChangedSpan) !void {
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "changedSpan pairs the i-th removed line with the i-th added line" {
+    const lines = [_]PreviewLine{
+        .{ .op = .context, .old_line = 1, .new_line = 1, .text = "fn main() {" },
+        .{ .op = .deletion, .old_line = 2, .text = "    let x = 1;" },
+        .{ .op = .deletion, .old_line = 3, .text = "    call(alpha);" },
+        .{ .op = .addition, .new_line = 2, .text = "    let x = 22;" },
+        .{ .op = .addition, .new_line = 3, .text = "    call(beta);" },
+        .{ .op = .context, .old_line = 4, .new_line = 4, .text = "}" },
+    };
+    try expectSpan(null, changedSpan(&lines, 0));
+    try expectSpan(.{ .start = 12, .end = 13 }, changedSpan(&lines, 1));
+    try expectSpan(.{ .start = 9, .end = 13 }, changedSpan(&lines, 2));
+    try expectSpan(.{ .start = 12, .end = 14 }, changedSpan(&lines, 3));
+    try expectSpan(.{ .start = 9, .end = 12 }, changedSpan(&lines, 4));
+    try expectSpan(null, changedSpan(&lines, 5));
+}
+
+test "changedSpan leaves unequal runs and unrelated lines unpaired" {
+    const unequal = [_]PreviewLine{
+        .{ .op = .deletion, .old_line = 1, .text = "value = 1" },
+        .{ .op = .deletion, .old_line = 2, .text = "value = 2" },
+        .{ .op = .addition, .new_line = 1, .text = "value = 3" },
+    };
+    for (0..unequal.len) |index| try expectSpan(null, changedSpan(&unequal, index));
+
+    // An addition run preceded by context, then a deletion run with no
+    // additions after it, pairs nothing.
+    const unordered = [_]PreviewLine{
+        .{ .op = .addition, .new_line = 1, .text = "value = 1" },
+        .{ .op = .deletion, .old_line = 1, .text = "value = 2" },
+        .{ .op = .context, .old_line = 2, .new_line = 2, .text = "value = 3" },
+    };
+    for (0..unordered.len) |index| try expectSpan(null, changedSpan(&unordered, index));
+
+    const unrelated = [_]PreviewLine{
+        .{ .op = .deletion, .old_line = 1, .text = "first" },
+        .{ .op = .addition, .new_line = 1, .text = "other" },
+    };
+    try expectSpan(null, changedSpan(&unrelated, 0));
+    try expectSpan(null, changedSpan(&unrelated, 1));
+}
+
+test "changedSpan returns null for an empty span and keeps the other side" {
+    const lines = [_]PreviewLine{
+        .{ .op = .deletion, .old_line = 1, .text = "abc" },
+        .{ .op = .addition, .new_line = 1, .text = "abcabc" },
+    };
+    try expectSpan(null, changedSpan(&lines, 0));
+    try expectSpan(.{ .start = 3, .end = 6 }, changedSpan(&lines, 1));
+}
+
+test "changedSpan cuts on UTF-8 boundaries" {
+    const lines = [_]PreviewLine{
+        .{ .op = .deletion, .old_line = 1, .text = "caf\u{e9} au lait" },
+        .{ .op = .addition, .new_line = 1, .text = "caf\u{e8} au lait" },
+    };
+    // é and è share their first byte; the span takes the whole character.
+    try expectSpan(.{ .start = 3, .end = 5 }, changedSpan(&lines, 0));
+    try expectSpan(.{ .start = 3, .end = 5 }, changedSpan(&lines, 1));
+}
+
+test "changedSpan keeps raw and encoded escapes whole" {
+    const raw = [_]PreviewLine{
+        .{ .op = .deletion, .old_line = 1, .text = "\x1b[31mred" },
+        .{ .op = .addition, .new_line = 1, .text = "\x1b[32mred" },
+    };
+    try expectSpan(.{ .start = 3, .end = 4 }, changedSpan(&raw, 0));
+
+    // Terminal-safe encoded text: the escape that differs is highlighted
+    // whole, never split between the shared part and the span.
+    const encoded_prefix = [_]PreviewLine{
+        .{ .op = .deletion, .old_line = 1, .text = "a\\x1bz" },
+        .{ .op = .addition, .new_line = 1, .text = "a\\x1cz" },
+    };
+    try expectSpan(.{ .start = 1, .end = 5 }, changedSpan(&encoded_prefix, 0));
+    const encoded_suffix = [_]PreviewLine{
+        .{ .op = .deletion, .old_line = 1, .text = "\\x1bz" },
+        .{ .op = .addition, .new_line = 1, .text = "\\x2bz" },
+    };
+    try expectSpan(.{ .start = 0, .end = 4 }, changedSpan(&encoded_suffix, 1));
+    const encoded_codepoint = [_]PreviewLine{
+        .{ .op = .deletion, .old_line = 1, .text = "x\\u{009b}y" },
+        .{ .op = .addition, .new_line = 1, .text = "x\\u{009c}y" },
+    };
+    try expectSpan(.{ .start = 1, .end = 9 }, changedSpan(&encoded_codepoint, 0));
+}
+
+test "changedSpan does not pair runs longer than the cap" {
+    var lines: [2 * (max_word_pair_run + 1)]PreviewLine = undefined;
+    for (lines[0 .. max_word_pair_run + 1]) |*line| line.* = .{ .op = .deletion, .old_line = 1, .text = "x = 1" };
+    for (lines[max_word_pair_run + 1 ..]) |*line| line.* = .{ .op = .addition, .new_line = 1, .text = "x = 2" };
+    for (0..lines.len) |index| try expectSpan(null, changedSpan(&lines, index));
+    try expectSpan(.{ .start = 4, .end = 5 }, changedSpan(lines[1 .. lines.len - 1], 0));
+}
+
+test "changedSpan reads diff lines" {
+    const alloc = std.testing.allocator;
+    const diff = try compute(alloc, "a\nold one\nc\n", "a\nnew one\nc\n");
+    defer alloc.free(diff);
+    try std.testing.expectEqual(LineOp.remove, diff[1].op);
+    try expectSpan(.{ .start = 0, .end = 3 }, changedSpan(diff, 1));
+    try expectSpan(.{ .start = 0, .end = 3 }, changedSpan(diff, 2));
+}
+
+const word_test_lines = [_]PreviewLine{
+    .{ .op = .context, .old_line = 1, .new_line = 1, .text = "keep" },
+    .{ .op = .deletion, .old_line = 2, .text = "let x = 1;" },
+    .{ .op = .addition, .new_line = 2, .text = "let x = 2;" },
+};
+
+test "formatter output without word styles is unchanged" {
+    const alloc = std.testing.allocator;
+    const out = try formatPreviewLines(alloc, &word_test_lines, .{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "\x1b[38;5;245m  │ 1   keep\x1b[0m\n" ++
+            "\x1b[38;5;252m  │ 2 - let x = 1;\x1b[0m\n" ++
+            "\x1b[38;5;252m  │ 2 + let x = 2;\x1b[0m\n",
+        out,
+    );
+}
+
+test "formatter draws the changed span in the word style" {
+    const alloc = std.testing.allocator;
+    const styles: FormatStyles = .{
+        .added_fg = "<A>",
+        .removed_fg = "<R>",
+        .context_fg = "<C>",
+        .added_word = "\x1b[48;5;22m",
+        .removed_word = "\x1b[48;5;52m",
+        .reset = "<0>",
+    };
+    const out = try formatPreviewLines(alloc, &word_test_lines, styles);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "<C>  │ 1   keep<0>\n" ++
+            "<R>  │ 2 - let x = \x1b[48;5;52m1\x1b[39m\x1b[49m<R>;<0>\n" ++
+            "<A>  │ 2 + let x = \x1b[48;5;22m2\x1b[39m\x1b[49m<A>;<0>\n",
+        out,
+    );
+
+    // Only the removed side has a word style here; the added line is plain.
+    const removed_only = try formatPreviewLines(alloc, &word_test_lines, .{
+        .added_fg = "<A>",
+        .removed_fg = "<R>",
+        .context_fg = "<C>",
+        .removed_word = "<W>",
+        .reset = "<0>",
+    });
+    defer alloc.free(removed_only);
+    try std.testing.expect(std.mem.find(u8, removed_only, "<A>  │ 2 + let x = 2;<0>\n") != null);
+    try std.testing.expect(std.mem.find(u8, removed_only, "let x = <W>1\x1b[39m<R>;<0>") != null);
+}
+
+test "formatter word spans keep file escapes and carriage returns terminal safe" {
+    const alloc = std.testing.allocator;
+    const lines = [_]PreviewLine{
+        .{ .op = .deletion, .old_line = 1, .text = "\x1b[31mred\rx\r" },
+        .{ .op = .addition, .new_line = 1, .text = "\x1b[32mred\ry\r" },
+        .{ .op = .deletion, .old_line = 2, .text = "a\rb" },
+        .{ .op = .addition, .new_line = 2, .text = "a\rcd" },
+        // The added span ends in a carriage return that is not the line's end.
+        .{ .op = .deletion, .old_line = 3, .text = "k1\rZ" },
+        .{ .op = .addition, .new_line = 3, .text = "k2\r\rZ" },
+    };
+    const plain = try formatPreviewLines(alloc, &lines, plain_styles);
+    defer alloc.free(plain);
+    var worded_styles = plain_styles;
+    worded_styles.added_word = "<W>";
+    worded_styles.removed_word = "<W>";
+    const worded = try formatPreviewLines(alloc, &lines, worded_styles);
+    defer alloc.free(worded);
+
+    try std.testing.expect(std.mem.find(u8, worded, "\\x1b[3<W>1mred\\x0dx\x1b[39m\n") != null);
+    try std.testing.expect(std.mem.find(u8, worded, "a\\x0d<W>cd\x1b[39m\n") != null);
+    try std.testing.expect(std.mem.find(u8, worded, "k<W>2\\x0d\x1b[39m\\x0dZ\n") != null);
+    // Removing the word escapes gives back the plain rendering byte for byte,
+    // so a split never changes how the file's own bytes are shown.
+    const stripped = try std.mem.replaceOwned(u8, alloc, worded, "<W>", "");
+    defer alloc.free(stripped);
+    const unstyled = try std.mem.replaceOwned(u8, alloc, stripped, "\x1b[39m", "");
+    defer alloc.free(unstyled);
+    try std.testing.expectEqualStrings(plain, unstyled);
+    try expectTerminalSafeLines(plain);
+}
+
+test "formatUnified and the full review draw word spans" {
+    const alloc = std.testing.allocator;
+    const styles: FormatStyles = .{ .added_word = "<AW>", .removed_word = "<RW>" };
+    const diff = try compute(alloc, "a\nold one\nc\n", "a\nnew one\nc\n");
+    defer alloc.free(diff);
+    const unified = try formatUnified(alloc, diff, styles, null, .edited);
+    defer alloc.free(unified);
+    try std.testing.expect(std.mem.find(u8, unified, "- <RW>old\x1b[39m\x1b[38;5;252m one") != null);
+    try std.testing.expect(std.mem.find(u8, unified, "+ <AW>new\x1b[39m\x1b[38;5;252m one") != null);
+
+    const full = (try formatFileChangeFullDiff(
+        alloc,
+        "a\nold one\nc\n",
+        .{ .after_content = "a\nnew one\nc\n", .lifecycle_id = .{ .turn_id = 1, .call_id = "edit_1" } },
+        styles,
+    )).?;
+    defer full.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, full.content, "- <RW>old\x1b[39m\x1b[38;5;252m one") != null);
+    try std.testing.expect(std.mem.find(u8, full.content, "+ <AW>new\x1b[39m\x1b[38;5;252m one") != null);
 }
 
 test "formatUnified: trailing-newline-only edits render markers" {

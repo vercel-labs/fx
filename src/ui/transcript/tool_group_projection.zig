@@ -15,6 +15,7 @@ const json_depth = @import("../../core/shared/json_depth.zig");
 const command_lex = @import("../../core/shell_command/command_lex.zig");
 const tooling_presentation = @import("../../core/tooling/tool_presentation.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
+const subagent_domain = @import("../../core/subagent/domain.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
@@ -1785,7 +1786,7 @@ const report_rewordings = [_]SubagentRewording{
 
 /// The first rewording in `rewordings` that fits `lead`, or null. A start
 /// may leave no name; an end must leave one.
-fn rewordSubagentLead(scratch: std.mem.Allocator, lead: []const u8, rewordings: []const SubagentRewording) !?[]const u8 {
+fn rewordSubagentLead(lead: []const u8, rewordings: []const SubagentRewording) ?SubagentRowParts {
     for (rewordings) |rewording| {
         const match = rewording.match;
         const name = if (match[match.len - 1] == ' ')
@@ -1794,10 +1795,83 @@ fn rewordSubagentLead(scratch: std.mem.Allocator, lead: []const u8, rewordings: 
             withoutSuffix(lead, match);
         if (name) |agent| {
             const star = findByte(rewording.reads, '*').?;
-            return try std.mem.concat(scratch, u8, &.{ rewording.reads[0..star], agent, rewording.reads[star + 1 ..] });
+            return .{ .before = rewording.reads[0..star], .names = agent, .after = rewording.reads[star + 1 ..] };
         }
     }
     return null;
+}
+
+/// A subagent row's phrase in three parts: what comes before the agent
+/// names, the names, one or several joined with ", ", and what follows them.
+/// The parts together are the phrase; only `names` takes agent colors.
+const SubagentRowParts = struct {
+    before: []const u8,
+    names: []const u8 = "",
+    after: []const u8 = "",
+
+    fn plain(self: SubagentRowParts, scratch: std.mem.Allocator) ![]const u8 {
+        if (self.names.len == 0 and self.after.len == 0) return self.before;
+        return std.mem.concat(scratch, u8, &.{ self.before, self.names, self.after });
+    }
+
+    /// The phrase with each agent name in its theme color, then `restyle`,
+    /// the style around the phrase, so the text after a name keeps its
+    /// color. A theme with no agent colors leaves the phrase as `plain`
+    /// writes it, byte for byte.
+    fn styled(self: SubagentRowParts, scratch: std.mem.Allocator, restyle: []const u8) ![]const u8 {
+        const theme = shared_theme.current();
+        var any = false;
+        var check = std.mem.splitSequence(u8, self.names, ", ");
+        while (check.next()) |name| if (agentNameStyle(theme, name).len > 0) {
+            any = true;
+            break;
+        };
+        if (!any) return self.plain(scratch);
+        var out: std.Io.Writer.Allocating = .init(scratch);
+        writeStyledAgentNames(&out.writer, theme, self, restyle) catch return error.OutOfMemory;
+        return out.toOwnedSlice();
+    }
+};
+
+/// The color of the agent called `name`, or "" for text that is not an
+/// agent's name, such as "subagents", a cut name ("buil..."), or "a
+/// subagent", and for a theme that sets no agent colors.
+fn agentNameStyle(theme: shared_theme.Theme, name: []const u8) []const u8 {
+    if (!subagent_domain.validAgentName(name)) return "";
+    return shared_theme.agentStyle(theme, name);
+}
+
+fn writeStyledAgentNames(writer: *std.Io.Writer, theme: shared_theme.Theme, parts: SubagentRowParts, restyle: []const u8) std.Io.Writer.Error!void {
+    try writer.writeAll(parts.before);
+    var names = std.mem.splitSequence(u8, parts.names, ", ");
+    var first = true;
+    while (names.next()) |name| {
+        if (!first) try writer.writeAll(", ");
+        first = false;
+        const open = agentNameStyle(theme, name);
+        if (open.len == 0) {
+            try writer.writeAll(name);
+            continue;
+        }
+        try writer.writeAll(open);
+        try writer.writeAll(name);
+        try writer.writeAll(shared_theme.closingFor(open));
+        try writer.writeAll(restyle);
+    }
+    try writer.writeAll(parts.after);
+}
+
+/// `lead` split around `agent`, the name the call's arguments give, where
+/// the lead starts or ends with it or is it, as in "reviewer working" or
+/// "Denied reviewer"; otherwise the whole lead names no agent.
+fn namedLeadParts(lead: []const u8, agent: ?[]const u8) SubagentRowParts {
+    const name = agent orelse return .{ .before = lead };
+    if (std.mem.eql(u8, lead, name)) return .{ .before = "", .names = lead };
+    if (lead.len > name.len and std.mem.startsWith(u8, lead, name) and lead[name.len] == ' ')
+        return .{ .before = "", .names = lead[0..name.len], .after = lead[name.len..] };
+    if (lead.len > name.len and std.mem.endsWith(u8, lead, name) and lead[lead.len - name.len - 1] == ' ')
+        return .{ .before = lead[0 .. lead.len - name.len], .names = lead[lead.len - name.len ..] };
+    return .{ .before = lead };
 }
 
 /// A subagent row by its action and the subagent's name, such as
@@ -1806,25 +1880,51 @@ fn rewordSubagentLead(scratch: std.mem.Allocator, lead: []const u8, rewordings: 
 /// adds later still shows, in core's words, without its message. Null for
 /// other rows.
 fn subagentRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *const ToolDetailRecord) !?[]const u8 {
+    const parts = try subagentRowPhraseParts(scratch, phrase, record) orelse return null;
+    return try parts.plain(scratch);
+}
+
+/// subagentRowPhrase's phrase, in parts, so the row can color the agent
+/// names in it. Core's text, which sessions save and `fx ask` and ACP
+/// print, stays plain; only this row adds color.
+fn subagentRowPhraseParts(scratch: std.mem.Allocator, phrase: []const u8, record: *const ToolDetailRecord) !?SubagentRowParts {
     if (!std.mem.eql(u8, record.tool_name, "subagent")) return null;
     const lead = if (std.mem.find(u8, phrase, " · ")) |at| phrase[0..at] else phrase;
     if (lead.len == 0) return null;
     const action = storyArgString(scratch, record, "action");
+    const agent = storyArgString(scratch, record, "agent");
     if (action) |name| if (std.mem.eql(u8, name, "message")) {
         // "reviewer working", "reviewer still running": the subagent works.
-        return try rewordSubagentLead(scratch, lead, &message_rewordings) orelse lead;
+        return rewordSubagentLead(lead, &message_rewordings) orelse namedLeadParts(lead, agent);
     };
-    // A report or a message a subagent sent to main.
-    if (action == null) return try rewordSubagentLead(scratch, lead, &report_rewordings) orelse lead;
+    // A report or a message a subagent sent to main, which carries no
+    // arguments. Its other rows start with the subagent's name, as
+    // "reviewer failed" does.
+    if (action == null) return rewordSubagentLead(lead, &report_rewordings) orelse
+        namedLeadParts(lead, lead[0 .. findByte(lead, ' ') orelse lead.len]);
     // A wait, status, stop, or close leads with its verb, which takes a
     // capital like "Ran" and "Read".
     const verbs = [_][]const u8{ "waited ", "waiting ", "checked ", "checking ", "stopped ", "stopping ", "closed ", "closing ", "couldn't " };
     for (verbs) |verb| if (std.mem.startsWith(u8, lead, verb)) {
         const capital = try scratch.dupe(u8, lead);
         capital[0] = std.ascii.toUpper(capital[0]);
-        return capital;
+        // What follows the verb names the agent, or the agents a wait or
+        // status lists: "for reviewer, tester", "couldn't stop reviewer".
+        var target = capital[verb.len..];
+        for ([_][]const u8{ "wait for ", "check ", "stop ", "close ", "for " }) |word| {
+            if (std.mem.startsWith(u8, target, word)) {
+                target = target[word.len..];
+                break;
+            }
+        }
+        // A call that concerns every subagent says "subagents" when its host
+        // listed none.
+        const unlisted = std.mem.eql(u8, target, "subagents") and
+            !(agent != null and std.mem.eql(u8, agent.?, "subagents"));
+        if (unlisted) return .{ .before = capital };
+        return .{ .before = capital[0 .. capital.len - target.len], .names = target };
     };
-    return lead;
+    return namedLeadParts(lead, agent);
 }
 
 /// A read row by the file's name and the lines it read, such as
@@ -2450,7 +2550,13 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
     const split_failure = splitFailedPhrase(status_phrase, row.detail);
     const raw_phrase = if (split_failure) |split| split.row else status_phrase;
     const full_phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
-    const agent_phrase = if (row.detail) |record| try subagentRowPhrase(scratch, full_phrase, record) else null;
+    // A subagent row names its agents in their colors. A failed row is in
+    // the failure style, which comes back after each name.
+    const agent_restyle = if (storyCallFailed(row.detail)) style.failure_style else style.text_style;
+    const agent_phrase = if (row.detail) |record| if (try subagentRowPhraseParts(scratch, full_phrase, record)) |parts|
+        try parts.styled(scratch, agent_restyle)
+    else
+        null else null;
     const named_phrase = if (try readRowPhrase(scratch, full_phrase, row, merged_read)) |read|
         read
     else if (try editRowPhrase(scratch, full_phrase, row)) |edit|
@@ -8337,6 +8443,208 @@ test "repeated bare subagent waits share one row of their own" {
     var waits = try build(alloc, &lone_entries, &lone_details, 120);
     defer waits.deinit(alloc);
     try std.testing.expectEqualStrings("● Waited for tester", waits.entry_actions.items[0].override.bytes);
+}
+
+/// fx_dark with three agent colors set, for tests that color agent names.
+fn agentColorThemeForTest() shared_theme.Theme {
+    var theme = shared_theme.fx_dark;
+    theme.agent_1_style = "\x1b[38;2;255;0;0m";
+    theme.agent_2_style = "\x1b[1;38;2;0;255;0m";
+    theme.agent_3_style = "\x1b[38;2;0;0;255;48;2;9;9;9m";
+    return theme;
+}
+
+/// `text` without its SGR escapes, in `alloc`.
+fn withoutSgrForTest(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var index: usize = 0;
+    while (index < text.len) {
+        if (std.mem.startsWith(u8, text[index..], "\x1b[")) {
+            if (std.mem.findScalarPos(u8, text, index, 'm')) |end| {
+                index = end + 1;
+                continue;
+            }
+        }
+        try out.append(alloc, text[index]);
+        index += 1;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// The subagent calls of "repeated bare subagent waits share one row of
+/// their own", with a report and a failed message, for agent color tests.
+const AgentColorFixture = struct {
+    entries: [7]TranscriptEntry,
+    details: [7]ToolDetailRecord,
+
+    fn init() AgentColorFixture {
+        const statuses = [_][]const u8{
+            "● sent to reviewer · review the change\n",
+            "● sent to tester · run the tests\n",
+            "● waited for reviewer, tester\n",
+            "● checked reviewer, tester\n",
+            "● waited for subagents\n",
+            "● tester failed · the token expired\n",
+            "● reviewer busy; message not sent · again\n",
+        };
+        const args = [_][]const u8{
+            "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review the change\"}",
+            "{\"action\":\"message\",\"agent\":\"tester\",\"message\":\"run the tests\"}",
+            "{\"action\":\"wait\"}",
+            "{\"action\":\"status\"}",
+            "{\"action\":\"wait\"}",
+            "{}",
+            "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"again\"}",
+        };
+        var fixture: AgentColorFixture = undefined;
+        for (&fixture.entries, &fixture.details, statuses, args, 0..) |*entry, *detail, status, arguments_json, index| {
+            entry.* = .{ .raw_bytes = .{ .id = @intCast(index + 1), .bytes = status, .class = .tool_status } };
+            detail.* = .{
+                .entry_id = @intCast(index + 1),
+                .tool_name = @constCast("subagent"),
+                .activity_kind = .subagent,
+                .arguments_json = @constCast(arguments_json),
+                .outcome = if (index >= 5) .failed else .completed,
+            };
+        }
+        return fixture;
+    }
+};
+
+test "subagent rows name each agent in its theme color and give the row its style back after it" {
+    const alloc = std.testing.allocator;
+    const style: SummaryStyle = .{ .text_style = "\x1b[2m", .reset_style = "\x1b[0m", .failure_style = "\x1b[31m" };
+    const fixture = AgentColorFixture.init();
+    var builtin = try buildStyled(alloc, &fixture.entries, &fixture.details, 120, style, .{});
+    defer builtin.deinit(alloc);
+
+    const theme = agentColorThemeForTest();
+    shared_theme.activate(theme);
+    defer shared_theme.activate(shared_theme.fx_dark);
+    var colored = try buildStyled(alloc, &fixture.entries, &fixture.details, 120, style, .{});
+    defer colored.deinit(alloc);
+    const bytes = colored.entry_actions.items[0].override.bytes;
+    errdefer std.debug.print("group:\n{s}\n", .{bytes});
+
+    const reviewer = shared_theme.agentStyle(theme, "reviewer");
+    const tester = shared_theme.agentStyle(theme, "tester");
+    try std.testing.expect(reviewer.len > 0 and tester.len > 0);
+    const name = struct {
+        fn of(scratch: std.mem.Allocator, open: []const u8, agent: []const u8, restyle: []const u8) ![]const u8 {
+            return std.mem.concat(scratch, u8, &.{ open, agent, shared_theme.closingFor(open), restyle });
+        }
+    }.of;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const expected = [_][]const u8{
+        // Main's message, and its status, which lists several. Reviewer's
+        // row shows its latest message, which failed.
+        try std.mem.concat(arena, u8, &.{ "Messaged ", try name(arena, tester, "tester", style.text_style) }),
+        try std.mem.concat(arena, u8, &.{ "Checked ", try name(arena, reviewer, "reviewer", style.text_style), ", ", try name(arena, tester, "tester", style.text_style) }),
+        // A failed row's words stay in the failure style after the name.
+        try std.mem.concat(arena, u8, &.{ "\x1b[31m", try name(arena, tester, "tester", style.failure_style), " failed" }),
+        try std.mem.concat(arena, u8, &.{ "\x1b[31mCouldn't message ", try name(arena, reviewer, "reviewer", style.failure_style), " (busy)" }),
+    };
+    for (expected) |want| {
+        std.testing.expect(std.mem.find(u8, bytes, want) != null) catch |err| {
+            std.debug.print("missing: {f}\n", .{std.zig.fmtString(want)});
+            return err;
+        };
+    }
+    // "subagents" names no agent, so it stays plain.
+    try std.testing.expect(std.mem.find(u8, bytes, "Waited for subagents") != null);
+
+    // The colors change no text and no width.
+    const plain = try withoutSgrForTest(alloc, bytes);
+    defer alloc.free(plain);
+    const builtin_plain = try withoutSgrForTest(alloc, builtin.entry_actions.items[0].override.bytes);
+    defer alloc.free(builtin_plain);
+    try std.testing.expectEqualStrings(builtin_plain, plain);
+}
+
+test "a narrow subagent row clips a colored name without changing its width or leaving the color on" {
+    const alloc = std.testing.allocator;
+    const style: SummaryStyle = .{ .text_style = "\x1b[2m", .reset_style = "\x1b[0m", .failure_style = "\x1b[31m" };
+    const fixture = AgentColorFixture.init();
+    for ([_]u16{ 12, 18, 24, 40 }) |cols| {
+        var builtin = try buildStyled(alloc, &fixture.entries, &fixture.details, cols, style, .{});
+        defer builtin.deinit(alloc);
+        shared_theme.activate(agentColorThemeForTest());
+        const colored = buildStyled(alloc, &fixture.entries, &fixture.details, cols, style, .{});
+        shared_theme.activate(shared_theme.fx_dark);
+        var projection = try colored;
+        defer projection.deinit(alloc);
+        var builtin_lines = std.mem.splitScalar(u8, builtin.entry_actions.items[0].override.bytes, '\n');
+        var lines = std.mem.splitScalar(u8, projection.entry_actions.items[0].override.bytes, '\n');
+        while (lines.next()) |line| {
+            const builtin_line = builtin_lines.next().?;
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+            try std.testing.expectEqual(display_width.visibleWidthIgnoringAnsi(builtin_line), display_width.visibleWidthIgnoringAnsi(line));
+            // A styled line ends with a reset, so no color stays on.
+            if (std.mem.find(u8, line, "\x1b[") != null) try std.testing.expect(std.mem.endsWith(u8, line, "\x1b[0m"));
+        }
+        try std.testing.expect(builtin_lines.next() == null);
+    }
+}
+
+test "a builtin theme leaves subagent rows byte for byte as they were" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("", shared_theme.agentStyle(shared_theme.current(), "reviewer"));
+    const fixture = AgentColorFixture.init();
+    for (fixture.entries, fixture.details) |entry, record| {
+        const phrase = std.mem.trim(u8, entry.raw_bytes.bytes[4..], "\n");
+        const parts = (try subagentRowPhraseParts(arena, phrase, &record)).?;
+        try std.testing.expectEqualStrings(try parts.plain(arena), try parts.styled(arena, "\x1b[2m"));
+        try std.testing.expectEqualStrings((try subagentRowPhrase(arena, phrase, &record)).?, try parts.styled(arena, "\x1b[2m"));
+    }
+}
+
+test "subagent row parts find the agent names wherever the row puts them" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Case = struct { phrase: []const u8, args: ?[]const u8, names: []const u8 };
+    const message = "{\"action\":\"message\",\"agent\":\"pr-lister\",\"message\":\"List open PRs\"}";
+    const cases = [_]Case{
+        .{ .phrase = "sent to pr-lister · List open PRs", .args = message, .names = "pr-lister" },
+        .{ .phrase = "pr-lister working · List open PRs", .args = message, .names = "pr-lister" },
+        .{ .phrase = "pr-lister still running", .args = message, .names = "pr-lister" },
+        .{ .phrase = "pr-lister feedback not applied", .args = message, .names = "pr-lister" },
+        .{ .phrase = "Denied pr-lister", .args = message, .names = "pr-lister" },
+        .{ .phrase = "waiting for pr-lister, tester", .args = "{\"action\":\"wait\"}", .names = "pr-lister, tester" },
+        .{ .phrase = "waited for subagents", .args = "{\"action\":\"wait\",\"agent\":\"tester\"}", .names = "" },
+        .{ .phrase = "checked subagents", .args = "{\"action\":\"status\"}", .names = "" },
+        .{ .phrase = "closed subagents", .args = "{\"action\":\"close\",\"agent\":\"subagents\"}", .names = "subagents" },
+        .{ .phrase = "couldn't wait for pr-lister", .args = "{\"action\":\"wait\"}", .names = "pr-lister" },
+        .{ .phrase = "couldn't stop pr-lister", .args = "{\"action\":\"stop\",\"agent\":\"pr-lister\"}", .names = "pr-lister" },
+        .{ .phrase = "stopping pr-lister", .args = "{\"action\":\"stop\",\"agent\":\"pr-lister\"}", .names = "pr-lister" },
+        .{ .phrase = "pr-lister completed · done", .args = "{}", .names = "pr-lister" },
+        .{ .phrase = "pr-lister failed · the token expired", .args = "{}", .names = "pr-lister" },
+        .{ .phrase = "from pr-lister · need the repo name", .args = "{}", .names = "pr-lister" },
+        .{ .phrase = "report from a subagent · done", .args = null, .names = "a subagent" },
+    };
+    for (cases) |case| {
+        const record: ToolDetailRecord = .{
+            .entry_id = 1,
+            .tool_name = @constCast("subagent"),
+            .activity_kind = .subagent,
+            .arguments_json = if (case.args) |args| @constCast(args) else null,
+        };
+        const parts = (try subagentRowPhraseParts(arena, case.phrase, &record)).?;
+        std.testing.expectEqualStrings(case.names, parts.names) catch |err| {
+            std.debug.print("phrase: {s}\n", .{case.phrase});
+            return err;
+        };
+    }
+    // A cut roster and a name that is not one stay plain.
+    const theme = agentColorThemeForTest();
+    try std.testing.expectEqualStrings("", agentNameStyle(theme, "buil..."));
+    try std.testing.expectEqualStrings("", agentNameStyle(theme, "a subagent"));
+    try std.testing.expect(agentNameStyle(theme, "builder").len > 0);
 }
 
 test "saved arguments that are not usable leave rows unmerged" {
