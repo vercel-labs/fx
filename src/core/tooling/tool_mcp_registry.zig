@@ -111,7 +111,7 @@ fn resultBytes(ctx: tool_dispatch.DispatchContext) usize {
 /// name is the model's, so the result writes it as visible text.
 pub fn unsupportedOutput(alloc: Allocator, name: []const u8, carried_by: ?[]const u8) Allocator.Error![]u8 {
     if (carried_by != null) return alloc.print("{f} is no longer available. Use toolbox search to find current tools.", .{model_context_encoding.scalar(name)});
-    return alloc.print("Unsupported tool: {f}", .{model_context_encoding.scalar(name)});
+    return tool_dispatch.unsupportedToolOutput(alloc, .{}, name);
 }
 
 fn unsupported(

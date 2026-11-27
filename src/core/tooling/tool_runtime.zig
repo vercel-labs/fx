@@ -803,13 +803,13 @@ fn executeWorkspaceToolCallInner(
         }
     }
     const spec = registeredToolSpec(ctx, call.name) orelse
-        return semanticFailure(try arena.print("Unsupported tool: {f}", .{model_context_encoding.scalar(call.name)}));
+        return semanticFailure(try tool_dispatch.unsupportedToolOutput(arena, ctx.tool_registry, call.name));
     if (ctx.tool_registry.tools.len != 1 or
         !std.mem.eql(u8, spec.name, "shell") or
         spec.executor_kind != .run_command or
         spec.runtime_provider != .run_command)
     {
-        return semanticFailure(try arena.print("Unsupported tool: {f}", .{model_context_encoding.scalar(call.name)}));
+        return semanticFailure(try tool_dispatch.unsupportedToolOutput(arena, ctx.tool_registry, call.name));
     }
 
     var command_backend = RunCommandBackendState{ .runtime = ctx };
@@ -3994,6 +3994,46 @@ test "a workspace call of a tool that is not the one shell tool answers as an un
     }, .ordinary, true);
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try std.testing.expectEqualStrings("Unsupported tool: read_file", result.model_output);
+}
+
+test "a workspace call of unsupported bash hints the visible shell tool unless bash is registered or no shell exists" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var workspace_rt = TestRuntime{ .tool_registry = test_browser_workspace_tools.registry };
+    defer workspace_rt.deinit(std.testing.allocator);
+    const hinted = try executeWorkspaceToolCallInner(workspace_rt.context(), arena, .{
+        .id = "bash-ws",
+        .name = "bash",
+        .arguments_json = "{}",
+    }, .ordinary, true);
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, hinted.status);
+    try std.testing.expectEqualStrings("Unsupported tool: bash. Use shell instead.", hinted.model_output);
+
+    var no_shell_rt = TestRuntime{ .tool_registry = .{ .tools = &.{test_builtin_tools.read_file} } };
+    defer no_shell_rt.deinit(std.testing.allocator);
+    const no_shell = try executeWorkspaceToolCallInner(no_shell_rt.context(), arena, .{
+        .id = "bash-no-shell",
+        .name = "bash",
+        .arguments_json = "{}",
+    }, .ordinary, true);
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, no_shell.status);
+    try std.testing.expectEqualStrings("Unsupported tool: bash", no_shell.model_output);
+
+    var bash_tool = test_builtin_tools.read_file;
+    bash_tool.name = "bash";
+    bash_tool.model_schema.name = "bash";
+    const with_bash_tools = [_]tool_dispatch.Tool{ test_builtin_tools.shell, bash_tool };
+    var with_bash_rt = TestRuntime{ .tool_registry = .{ .tools = &with_bash_tools } };
+    defer with_bash_rt.deinit(std.testing.allocator);
+    const registered_bash = try executeWorkspaceToolCallInner(with_bash_rt.context(), arena, .{
+        .id = "bash-registered",
+        .name = "bash",
+        .arguments_json = "{}",
+    }, .ordinary, true);
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, registered_bash.status);
+    try std.testing.expectEqualStrings("Unsupported tool: bash", registered_bash.model_output);
 }
 
 fn registryOwnedWebFetchCall(

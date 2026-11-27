@@ -581,7 +581,7 @@ pub const Tool = struct {
 pub const Registry = mod_registry.ToolRegistry(Tool);
 
 /// Returns the registered name of the visible shell tool, if one is present.
-pub fn registeredShellToolName(registry: Registry) ?[]const u8 {
+fn registeredShellToolName(registry: Registry) ?[]const u8 {
     for (registry.tools) |tool| {
         if (!tool.model_visible) continue;
         if (tool.executor_kind == .terminal or tool.executor_kind == .run_command) {
@@ -595,15 +595,25 @@ pub fn registeredShellToolName(registry: Registry) ?[]const u8 {
 /// to `bash` when no `bash` tool is registered and a visible shell tool exists
 /// adds a hint naming that shell tool.
 pub fn unsupportedToolOutput(alloc: Allocator, registry: Registry, name: []const u8) Allocator.Error![]u8 {
-    if (std.mem.eql(u8, name, "bash") and registry.lookup("bash") == null) {
-        if (registeredShellToolName(registry)) |shell_name| {
-            return alloc.print(
-                "Unsupported tool: bash. Use {f} instead.",
-                .{model_context_encoding.scalar(shell_name)},
-            );
-        }
+    const shell_name = if (std.mem.eql(u8, name, "bash") and registry.lookup("bash") == null)
+        registeredShellToolName(registry)
+    else
+        null;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    writeUnsupportedTool(&out.writer, name, shell_name) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeUnsupportedTool(writer: *std.Io.Writer, name: []const u8, shell_name: ?[]const u8) std.Io.Writer.Error!void {
+    try writer.writeAll("Unsupported tool: ");
+    if (shell_name) |hint| {
+        try writer.writeAll("bash. Use ");
+        try model_context_encoding.writeScalar(writer, hint);
+        try writer.writeAll(" instead.");
+        return;
     }
-    return alloc.print("Unsupported tool: {f}", .{model_context_encoding.scalar(name)});
+    try model_context_encoding.writeScalar(writer, name);
 }
 
 pub const ProgressLabelKind = enum {
