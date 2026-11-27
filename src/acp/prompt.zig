@@ -32,11 +32,12 @@ const image_attachments = @import("../core/images/image_attachments.zig");
 const image_data = @import("../core/images/image_data.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
+const prompt_test_controls = @import("prompt_test_controls.zig");
 const server = @import("server.zig");
 const mcp_host = @import("../core/mcp_host/host.zig");
 const sessions = @import("sessions.zig");
 const client_instructions = @import("client_instructions.zig");
-const tool_call_identities = @import("tool_call_identities.zig");
+const tool_call_identities = @import("../core/mcp/tool_call_identities.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
 const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const diff_mod = @import("../core/output/diff.zig");
@@ -196,6 +197,28 @@ fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
     };
 }
 
+/// Sent to the client when the content filter blocked a reply and every
+/// resend of it.
+const content_filter_refusal_text = "Blocked by the content filter. Change your request and send it again.";
+
+/// Whether a prompt that failed with `err` ends as refused: the content
+/// filter blocked the reply and every resend of it, so `fx acp` lets the
+/// user change the request, as the terminal does. libfx (`minimal_kernel`)
+/// keeps the failed turn (`tests/e2e/acp.test.ts` "content filter that
+/// blocks every resend ends the prompt as refused and leaves the server usable").
+fn refusesAfterContentFilter(err: anyerror, content_filter_blocked: bool, minimal_kernel: bool) bool {
+    return err == error.ModelError and content_filter_blocked and !minimal_kernel;
+}
+
+test "ACP refuses a prompt the content filter kept blocking only on fx acp" {
+    try std.testing.expect(refusesAfterContentFilter(error.ModelError, true, false));
+    // libfx keeps the failed turn.
+    try std.testing.expect(!refusesAfterContentFilter(error.ModelError, true, true));
+    // A ModelError without the content filter's status is another failure.
+    try std.testing.expect(!refusesAfterContentFilter(error.ModelError, false, false));
+    try std.testing.expect(!refusesAfterContentFilter(error.OutOfMemory, true, false));
+}
+
 /// Where an announced tool-call card stands. A card is open until ACP sends
 /// its final update; a provider-executed search waits for its terminal
 /// lifecycle event instead of a tool result.
@@ -326,6 +349,9 @@ const AcpContext = struct {
     message_id: acp_types.MessageIdBuffer = undefined,
     message_kind: ?AgentMessageKind = null,
     stop_reason: acp_types.StopReason = .end_turn,
+    /// The request ended on fx's content-filter status: the filter blocked
+    /// the reply and every resend of it.
+    content_filter_blocked: bool = false,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
     /// Mode and permission policy captured at prompt dispatch so mid-turn
@@ -455,6 +481,14 @@ const AcpContext = struct {
         defer out.deinit();
         try acp_types.writeModelRecoveryInfoUpdate(&out.writer, null);
         try self.sendUpdate(out.writer.buffered());
+    }
+
+    /// Ends the prompt as refused and tells the user to change the request.
+    fn refuseAfterContentFilter(self: *AcpContext) void {
+        self.stop_reason = .refused;
+        self.sendAgentText(self.operationalMessageId(), content_filter_refusal_text) catch |err| {
+            debug_trace.logf("acp", "content filter refusal text not sent err={s}", .{@errorName(err)});
+        };
     }
 
     fn mcpToolIdentity(self: *AcpContext, arena: Allocator, name: []const u8) ?catalog_state.ToolIdentity {
@@ -886,9 +920,13 @@ fn callHostTool(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const state: *server.ServerState = @ptrCast(@alignCast(raw_state));
     if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+    if (server.outboundClosedOrCancelled(state)) return error.Cancelled;
     const outbound_id = (server.beginOutboundRequest(state, .host_tool) catch
         return .{ .failure = try alloc.dupe(u8, "Host tool request failed") }) orelse
-        return .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
+        return if (server.outboundClosedOrCancelled(state))
+            error.Cancelled
+        else
+            .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
     var awaiting = true;
     errdefer if (awaiting) {
         server.cancelOutboundRequest(state, outbound_id);
@@ -997,6 +1035,7 @@ const AcpElicitationResponderContext = struct {
             .capabilities = capabilities,
             .callback = respondToAcpMcpInput,
             .continuation_terminal = finishAcpUrlElicitations,
+            .declined_notice = tellAcpMcpDeclined,
         };
     }
 };
@@ -1126,10 +1165,37 @@ pub fn handlePrompt(
     captured_permission_mode: PermissionMode,
     usage_total: *types.Usage,
 ) !TerminalOutcome {
+    return handlePromptWithInputId(state, alloc, msg, captured_mode, captured_permission_mode, usage_total, null);
+}
+
+fn withdrawUnusedV2Input(session: *server.ActiveSessionState, maybe_id: ?u64) void {
+    if (comptime !server.has_v2_session_store) return;
+    const id = maybe_id orelse return;
+    const v2 = session.v2 orelse return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    v2.recordInputWithdrawn(id) catch |err| {
+        debug_trace.logf("session", "event=input_withdrawn_write_failed surface=acp id={d} err={s}", .{ id, @errorName(err) });
+    };
+}
+
+pub fn handlePromptWithInputId(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    captured_mode: []const u8,
+    captured_permission_mode: PermissionMode,
+    usage_total: *types.Usage,
+    v2_input_id: ?u64,
+) !TerminalOutcome {
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
     };
+    var unused_v2_input_id = v2_input_id;
+    errdefer withdrawUnusedV2Input(session, unused_v2_input_id);
     if (!try server.selectCredentialForProvider(state, session.provider)) {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
             .message = if (session.provider == .codex)
@@ -1141,17 +1207,23 @@ pub fn handlePrompt(
         } };
     }
     if (!ultrafastPromptAllowed(state, session)) {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
             .message = "Ultrafast mode requires a verified compatible Gateway model",
         } };
     }
 
-    const params = msg.params_raw orelse return .{
-        .rpc_error = .{
-            .code = ErrorCode.invalid_params,
-            .message = "Missing params",
-        },
+    const params = msg.params_raw orelse {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
+        return .{
+            .rpc_error = .{
+                .code = ErrorCode.invalid_params,
+                .message = "Missing params",
+            },
+        };
     };
 
     var prior_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, &.{});
@@ -1170,33 +1242,56 @@ pub fn handlePrompt(
         params,
         next_image_id,
         state.cfg.host_attachments,
-    ) catch |err| return promptInputFailure(err);
+    ) catch |err| {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
+        return promptInputFailure(err);
+    };
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
         if (session.wasm_state == null and session.v2 == null) {
             // libfx kernel session: images stay in memory and ride the kernel
             // checkpoint, so no filesystem snapshot backend is needed.
-            if (!fitsLibfxPrompt(prompt_input.pending_images)) return promptInputFailure(error.PromptImagesTooLarge);
-            prompt_input.captureImagesInline(alloc) catch |err|
+            if (!fitsLibfxPrompt(prompt_input.pending_images)) {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
+                return promptInputFailure(error.PromptImagesTooLarge);
+            }
+            prompt_input.captureImagesInline(alloc) catch |err| {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
                 return promptInputFailure(err);
+            };
             if (session.journal) |*journal| try prompt_input.noteStoredImages(state.alloc, journal);
         } else {
-            if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
+            if (comptime host_target.is_wasm) {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
+                return promptInputFailure(error.UnsupportedPromptImage);
+            }
             var temporary_snapshot_dir: ?[]u8 = null;
             defer if (temporary_snapshot_dir) |path| alloc.free(path);
             // Captured into a temporary folder; the turn keeps the bytes
             // (D44).
             const snapshot_dir = try session_store.imageSnapshotTempDir(alloc, &temporary_snapshot_dir);
             defer alloc.free(snapshot_dir);
-            prompt_input.captureImages(alloc, snapshot_dir) catch |err|
+            prompt_input.captureImages(alloc, snapshot_dir) catch |err| {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
                 return promptInputFailure(err);
-            image_attachments.inlineCapturedSnapshots(alloc, prompt_input.images) catch |err|
+            };
+            image_attachments.inlineCapturedSnapshots(alloc, prompt_input.images) catch |err| {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
                 return promptInputFailure(err);
+            };
         }
     }
     const prompt_text = prompt_input.text;
 
     if (prompt_input.continue_recovery and prompt_text.len != 0) {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
         return .{
             .rpc_error = .{
                 .code = ErrorCode.invalid_params,
@@ -1205,6 +1300,8 @@ pub fn handlePrompt(
         };
     }
     if (!prompt_input.continue_recovery and prompt_text.len == 0) {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
         return .{
             .rpc_error = .{
                 .code = ErrorCode.invalid_params,
@@ -1372,6 +1469,7 @@ pub fn handlePrompt(
     defer sign_in.deinit(alloc);
     var job: worker_runtime.QueuedPrompt = .{
         .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
+        .input_id = unused_v2_input_id,
         .prompt = @constCast(owned_prompt),
         .images = @constCast(current_images),
         .authorized_image_catalog = authorized_image_catalog,
@@ -1421,6 +1519,7 @@ pub fn handlePrompt(
     };
     maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null, ctx.observer);
     defer if (session.title_task != null) completeAcpTitleTask(state, session);
+    unused_v2_input_id = null;
     const first_turn = agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
         .view = state.lifecycle_view,
         .scope = .{
@@ -1451,6 +1550,14 @@ pub fn handlePrompt(
             commitCancelledJournalTurn(alloc, state.alloc, session, &prompt_input) catch |commit_err| {
                 debug_trace.logf("session", "event=libfx_journal_interrupted_commit_failed err={s}", .{@errorName(commit_err)});
             };
+        } else if (refusesAfterContentFilter(err, ctx.content_filter_blocked, state.cfg.minimal_kernel)) {
+            // The turn ends as a failed one does, but the client gets a
+            // refusal it can show instead of an error.
+            ctx.refuseAfterContentFilter();
+            endJournalTurn(alloc, state.alloc, session) catch |end_err| {
+                debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
+            };
+            return .{ .stop_reason = .refused };
         } else {
             // The turn's own failure is the one to report.
             endJournalTurn(alloc, state.alloc, session) catch |end_err| {
@@ -2283,6 +2390,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .push_text = pushText,
         .push_reasoning_delta = pushReasoningDelta,
         .push_route_recovery_status = pushRouteRecoveryStatus,
+        .save_route_recovery_status = saveRouteRecoveryStatus,
         .push_tool_lifecycle = pushToolLifecycle,
         .push_diff_block = pushDiffBlock,
         .push_system_notice = pushSystemNotice,
@@ -2378,7 +2486,13 @@ fn takeSteeringBoundary(
     }
     // An ACP client's steering is the user's own.
     const messages = try arena.alloc(worker_runtime.SteeringMessage, drained.texts.len);
-    for (drained.texts, messages) |text, *message| message.* = .{ .text = text };
+    for (drained.texts, messages, 0..) |text, *message, index| {
+        const v2_input_id: ?u64 = if (comptime server.has_v2_session_store)
+            (if (index < drained.v2_input_ids.len) drained.v2_input_ids[index] else null)
+        else
+            null;
+        message.* = .{ .text = text, .input_id = v2_input_id };
+    }
     return .{ .continue_turn = messages };
 }
 
@@ -2748,7 +2862,13 @@ fn requestAcpPermission(
     try writeValidatedToolArguments(alloc, &validated_arguments.writer, call.arguments_json);
 
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const request_id = server.beginPermissionRequest(ctx.state) orelse return error.PermissionRequestAlreadyPending;
+    prompt_test_controls.pauseBeforePermissionInsert();
+    if (server.outboundClosedOrCancelled(ctx.state)) return error.Cancelled;
+    const request_id = server.beginPermissionRequest(ctx.state) orelse
+        return if (server.outboundClosedOrCancelled(ctx.state))
+            error.Cancelled
+        else
+            error.PermissionRequestAlreadyPending;
     errdefer {
         server.cancelPermissionRequest(ctx.state, request_id);
         _ = server.awaitPermissionDecision(ctx.state, request_id);
@@ -3139,7 +3259,7 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const v2 = session.v2 orelse return;
-    v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }) catch |err| {
+    v2.appendProgressWithRecord(progress.user, progress.execution, progress.saved_execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }, .keep) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
     };
 }
@@ -3153,6 +3273,17 @@ fn recordUsage(raw_ctx: *anyopaque, usage: types.Usage) !void {
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const v2 = session.v2 orelse return;
     try v2.recordUsage(usage);
+}
+
+/// `AgentRuntimeDeps.save_route_recovery_status` on v2: a recovery status
+/// reaches the session log as a `model_recovery` item.
+fn saveRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatus) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = session.v2 orelse return;
+    try v2.saveModelRecovery(status);
 }
 
 /// Where a subagent's captures go: the store's home and the active
@@ -3203,10 +3334,12 @@ test "an ACP session's workspace captures watch its turn cancel, not the flag a 
 fn startWorkspaceCapture(raw_ctx: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*value| value else return;
+    if (step == .settle) return session.turn_capture.settle();
     const context = workspaceCaptureContext(session) orelse return;
     switch (step) {
         .begin => session.turn_capture.begin(context, fresh),
         .capture => session.turn_capture.start(context, &session.session_write_mutex),
+        .settle => unreachable,
     }
 }
 
@@ -3266,8 +3399,13 @@ fn appendJournalToolIntent(raw_ctx: *anyopaque, progress: agent_runtime.TurnProg
 /// Waits until the host holds every journal event sent so far.
 fn flushJournal(state: *server.ServerState, alloc: Allocator, session_id: []const u8) !void {
     if (comptime host_target.is_wasm) return js_host_journal.flush();
+    if (server.outboundClosedOrCancelled(state)) return error.Cancelled;
     const outbound_id = (server.beginOutboundRequest(state, .journal) catch
-        return error.JournalFlushFailed) orelse return error.JournalFlushFailed;
+        return error.JournalFlushFailed) orelse
+        return if (server.outboundClosedOrCancelled(state))
+            error.Cancelled
+        else
+            error.JournalFlushFailed;
     var awaiting = true;
     errdefer if (awaiting) {
         server.cancelOutboundRequest(state, outbound_id);
@@ -3400,6 +3538,10 @@ fn runReportTurns(
             };
             if (err == error.NonInteractivePermissionRequired) {
                 ctx.stop_reason = .refused;
+                return null;
+            }
+            if (refusesAfterContentFilter(err, ctx.content_filter_blocked, state.cfg.minimal_kernel)) {
+                ctx.refuseAfterContentFilter();
                 return null;
             }
             if (err == error.Cancelled and session.cancel_flag.load(.seq_cst)) return null;
@@ -3597,9 +3739,13 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         try journal.appendProgress(ctx.alloc, ctx.state.alloc, session.session_id, checkpoint, session.model);
         // Only the progress right before a request can yield; a compaction
         // or a paused retry finishes where it is.
-        if (checkpoint.outstanding_reservation and checkpoint.cause != .compaction_prepared and
-            journal.yieldsAt(io_mod.milliTimestamp()))
-        {
+        const kind: libfx_journal.QuiesceKind = if (!checkpoint.outstanding_reservation)
+            .other
+        else if (checkpoint.cause == .compaction_prepared)
+            .compaction
+        else
+            .request;
+        if (journal.yieldsAt(io_mod.milliTimestamp(), kind)) {
             try journal.appendMarked(ctx.alloc, session.session_id, .turn_yielded, true);
             yields = true;
         }
@@ -3676,6 +3822,7 @@ fn pushRouteRecoveryStatus(
     status: types.RouteRecoveryStatus,
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (status.kind == .content_filter) ctx.content_filter_blocked = true;
     try ctx.sendModelRecoveryStatus(status);
 }
 
@@ -3803,6 +3950,15 @@ const AcpInputResponse = struct {
         self.* = undefined;
     }
 };
+
+/// A question fx declined, said by the two paths `pushContextNotice` chooses between: an ACP v1 notice for a client that
+/// advertised them, else an operational message. A repeat is not dropped, so each refused call is told.
+fn tellAcpMcpDeclined(raw_ctx: *anyopaque, text: []const u8) void {
+    const responder: *AcpElicitationResponderContext = @ptrCast(@alignCast(raw_ctx));
+    const ctx = responder.acp;
+    if (ctx.state.client_notices) return ctx.sendNotice(text) catch |err| debug_trace.logf("mcp", "MCP declined-question notice not sent err={s}", .{@errorName(err)});
+    pushSystemNotice(@ptrCast(ctx), text) catch |err| debug_trace.logf("mcp", "MCP declined-question notice not sent err={s}", .{@errorName(err)});
+}
 
 fn respondToAcpMcpInput(
     raw_ctx: *anyopaque,
@@ -5183,6 +5339,14 @@ test "stripAnsiAlloc returns the original slice for clean text and strips escape
     defer alloc.free(stripped);
     try std.testing.expectEqualStrings("red and [link](https://example.com)", stripped);
     try std.testing.expect(std.mem.find(u8, stripped, "\x1b") == null);
+}
+
+test "stripAnsiAlloc drops an escape with intermediate bytes whole" {
+    const alloc = std.testing.allocator;
+    // Command output that resets its style as `tput sgr0` does.
+    const stripped = try stripAnsiAlloc(alloc, "Build failed\x1b(B\x1b[m\n");
+    defer alloc.free(stripped);
+    try std.testing.expectEqualStrings("Build failed\n", stripped);
 }
 
 test "stripAnsiAlloc converts OSC-8 hyperlinks with params and BEL terminators" {

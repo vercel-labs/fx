@@ -1,4 +1,5 @@
 const std = @import("std");
+const display_width = @import("../../shared/display_width.zig");
 const shared_theme = @import("../../shared/theme.zig");
 const languages = @import("code_highlight_languages.zig");
 
@@ -450,31 +451,25 @@ fn inPackedList(token: []const u8, target_hash: u32, options: []const u8, keywor
     return false;
 }
 
-fn ansiSequenceEnd(text: []const u8, start: usize) usize {
-    if (start + 2 > text.len or text[start] != 0x1b or text[start + 1] != '[') return start;
-    var index = start + 2;
-    while (index < text.len) : (index += 1) {
-        if (text[index] >= '@' and text[index] <= '~') return index + 1;
-    }
-    return start;
-}
-
 fn stripAnsi(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
     var plain: std.ArrayList(u8) = .empty;
     errdefer plain.deinit(alloc);
     var index: usize = 0;
     while (index < text.len) {
         if (text[index] == 0x1b) {
-            const end = ansiSequenceEnd(text, index);
-            if (end > index) {
-                index = end;
-                continue;
-            }
+            index = display_width.ansiSequenceEnd(text, index);
+            continue;
         }
         try plain.append(alloc, text[index]);
         index += 1;
     }
     return plain.toOwnedSlice(alloc);
+}
+
+test "stripAnsi drops a charset designation with its final byte" {
+    const plain = try stripAnsi(std.testing.allocator, "A\x1b(B\x1b[mC");
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings("AC", plain);
 }
 
 fn count(text: []const u8, needle: []const u8) usize {
