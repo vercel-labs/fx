@@ -136,6 +136,7 @@
     {"name": "verify-tui-mcp-http-many-servers", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-mcp-http-many-servers.test.ts"], "test_file": "tui-mcp-http-many-servers.test.ts"},
     {"name": "verify-tui-render-replay", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-render-replay.test.ts"], "test_file": "tui-render-replay.test.ts"},
     {"name": "verify-tui-resume", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-resume.test.ts"], "test_file": "tui-resume.test.ts"},
+    {"name": "verify-tui-program-resume", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-program-resume.test.ts"], "test_file": "tui-program-resume.test.ts"},
     {"name": "verify-tui-slash-commands", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-commands.test.ts"], "test_file": "tui-slash-commands.test.ts"},
     {"name": "verify-tui-slash-extra", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-extra.test.ts"], "test_file": "tui-slash-extra.test.ts"},
     {"name": "verify-tui-slash-menu", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-menu.test.ts"], "test_file": "tui-slash-menu.test.ts"},

@@ -18,8 +18,11 @@ on:
 permissions:
   contents: read
 
+# A run whose metadata job will skip (the same condition as its `if`) gets a
+# group of its own, so it cannot replace the real run that waits in its
+# channel's group, such as one held for npm approval.
 concurrency:
-  group: publish-libfx-${{ (github.event.workflow_run.name == 'Release' || inputs.channel == 'stable') && 'stable' || 'dev' }}
+  group: ${{ (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository)) && format('publish-libfx-{0}', (github.event.workflow_run.name == 'Release' || inputs.channel == 'stable') && 'stable' || 'dev') || format('publish-libfx-skip-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:

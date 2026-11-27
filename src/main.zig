@@ -3,6 +3,7 @@ const agents = @import("core/agents/agents.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
+const self_exe = @import("core/shared/self_exe.zig");
 const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
@@ -165,6 +166,7 @@ const shell_runtime = @import("ui/shell_runtime.zig");
 const ui_terminal = @import("ui/terminal/terminal.zig");
 const cursor_probe = @import("ui/terminal/cursor_probe.zig");
 const ui_program_status = @import("ui/terminal/program_status.zig");
+const ui_program_resume = @import("ui/terminal/program_resume.zig");
 const transcript_runtime = @import("ui/transcript/runtime.zig");
 const resume_projection = @import("ui/transcript/resume_projection.zig");
 const assistant_pacer = @import("ui/assistant/pacer.zig");
@@ -566,8 +568,36 @@ const App = struct {
         return ui_render.terminalTitleFor(&self.shell.stdout_file);
     }
 
+    pub fn hasProgramResumeToken() bool {
+        return ui_program_resume.keptToken() != null;
+    }
+
+    pub fn putProgramResumeToken(environ: *std.process.Environ.Map) !bool {
+        return ui_program_resume.putToken(environ);
+    }
+
+    pub fn programResumeToken() ?[]const u8 {
+        return ui_program_resume.keptToken();
+    }
+
+    /// The name the terminal runs to resume: the bare name fx was started with,
+    /// else the path of this binary written into `buffer`.
+    pub fn programResumeExecutable(buffer: []u8) ?[]const u8 {
+        if (ui_program_resume.programName()) |name| return name;
+        var fixed = std.heap.FixedBufferAllocator.init(buffer);
+        return self_exe.pathForPeerReexec(fixed.allocator()) catch null;
+    }
+
     pub fn writeProgramStatus(self: *Self, report: []const u8) void {
         self.shell.writeProgramStatus(&self.metrics, report);
+    }
+
+    pub fn writeProgramResume(self: *Self, report: []const u8) void {
+        self.shell.writeProgramResume(&self.metrics, report);
+    }
+
+    pub fn clearProgramResume(self: *Self) void {
+        SessionAppRuntime.clearProgramResume(self);
     }
 
     alloc: Allocator,
@@ -603,6 +633,7 @@ const App = struct {
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
     program_status: ui_program_status.Reporter = .{},
+    program_resume: ui_program_resume.Reporter = .{},
 
     prompt_history: PromptHistoryRuntime = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
@@ -3630,6 +3661,7 @@ const App = struct {
         AgentsAppRuntime.settleLentQuestion(self);
         AgentsAppRuntime.lendPrompt(self);
         HerdrAppRuntime.reconcile(self);
+        SessionAppRuntime.reportProgramResume(self);
     }
 
     /// Gives a subagent's question lent to main's prompt back to it, before
@@ -4043,6 +4075,9 @@ pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char)
 }
 
 fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !void {
+    // Before any mode reads the environment or starts a program, so none inherits the terminal's token.
+    ui_program_resume.takeToken(c_envp);
+    if (c_argc > 0) ui_program_resume.rememberProgramName(c_argv[0]);
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
     // Before any mode runs, since terminal helpers write under fx's folder too.
@@ -5648,6 +5683,7 @@ test {
     _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/subagent_turn_metrics.zig");
+    _ = @import("core/workspace/output_limit_metrics.zig");
     _ = @import("core/workspace/workspace_access.zig");
     _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("core/workspace/workspace_commands.zig");
@@ -8486,6 +8522,39 @@ test "a subagent's run ends only once the turn carrying its work id is saved" {
             App.AgentsAppRuntime.commitChildTurn(a, agent, saved("work-1"));
             try std.testing.expectEqual(agents.ChildRunCompletion.Outcome.completed, done.outcome.?);
             try std.testing.expect(!agent.child_run.?.inFlight());
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, &completion, Check.run);
+}
+
+test "a subagent turn a cut reply failed tells its parent output_limit, and a provider's own error stays first" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    var completion: agents.ChildRunCompletion = .{};
+    var child_run = try testChildRun(alloc, &resolver, false, null);
+    child_run.work_id = try alloc.dupe(u8, "work-1");
+    child_run.completion = &completion;
+    App.AgentsAppRuntime.installChildRun(&app, child, child_run);
+
+    const Check = struct {
+        fn run(_: *agents.ChildRunCompletion, a: *App, agent: *agents.Agent) anyerror!void {
+            // A failure with no reason the parent could use says nothing more.
+            App.AgentsAppRuntime.noteChildTurnFinished(a, agent, .{ .turn_id = 1, .outcome = .failed });
+            try std.testing.expect(agent.child_run.?.failure == null);
+            App.AgentsAppRuntime.noteChildTurnFinished(a, agent, .{ .turn_id = 2, .outcome = .failed, .disposition = .length_limited });
+            try std.testing.expectEqualStrings(
+                "output_limit: the reply was cut off at its output-token limit",
+                agent.child_run.?.failure.?.view(),
+            );
+            agent.child_run.?.failure = types.ModelFailureDiagnostic.init("provider_http_error: HTTP 500");
+            App.AgentsAppRuntime.noteChildTurnFinished(a, agent, .{ .turn_id = 3, .outcome = .failed, .disposition = .length_limited });
+            try std.testing.expectEqualStrings("provider_http_error: HTTP 500", agent.child_run.?.failure.?.view());
         }
     };
     try App.AgentsAppRuntime.visit(&app, child, &completion, Check.run);

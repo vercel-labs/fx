@@ -165,7 +165,11 @@ pub fn collectRegularFileRoot(
         });
     }
 
-    const truncated_reason = try scanFile(arena, absolute_path, pattern, case_insensitive, &matches);
+    const file = try io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), absolute_path, .follow);
+    defer file.close(io_mod.getIo());
+    var buffers: ScanBuffers = .{};
+    defer buffers.deinit(arena);
+    const truncated_reason = try scanFileAt(arena, absolute_path, file, pattern, case_insensitive, &buffers, &matches);
 
     return finishMatches(arena, &matches, truncated_reason, .{
         .count = 1,
@@ -186,7 +190,11 @@ pub fn countRegularFileRoot(
         return finishCount(.{}, .{ .cap = tool_files.default_candidate_cap });
     }
 
-    const file_count = try countFile(arena, absolute_path, pattern, case_insensitive);
+    const file = try io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), absolute_path, .follow);
+    defer file.close(io_mod.getIo());
+    var buffers: ScanBuffers = .{};
+    defer buffers.deinit(arena);
+    const file_count = try countFileAt(arena, absolute_path, file, pattern, case_insensitive, &buffers);
     return finishCount(.{
         .matching_lines = file_count.matching_lines,
         .matching_files = if (file_count.matching_lines > 0) 1 else 0,
@@ -245,43 +253,89 @@ fn finishCount(result: CountResult, stats: CandidateStats) CountResult {
     return out;
 }
 
-const CandidateFile = struct {
-    display_path: []const u8,
-    read_path: []const u8,
-};
-
 fn candidateKind(absolute_path: []const u8) !std.Io.File.Kind {
     const stat = try std.Io.Dir.cwd().statFile(io_mod.getIo(), absolute_path, .{ .follow_symlinks = false });
     return stat.kind;
 }
 
-fn resolveCandidateFile(
+const OpenedCandidate = struct {
+    display_path: []const u8,
+    /// The caller closes the file.
+    file: std.Io.File,
+};
+
+fn openCandidateFile(
     arena: Allocator,
     workspace_root: []const u8,
     provider_root: []const u8,
     candidate: []const u8,
     absolute_match_buf: []u8,
-) !?CandidateFile {
+) Allocator.Error!?OpenedCandidate {
     const absolute_match = joinAbsolutePathScratch(absolute_match_buf, provider_root, candidate) catch |err| {
         debug_trace.logf("core", "grep_files scan skipped root={s} path={s} err={s}", .{ provider_root, candidate, @errorName(err) });
         return null;
     };
-    const entry_kind = candidateKind(absolute_match) catch |err| {
-        debug_trace.logf("core", "grep_files scan skipped path={s} err={s}", .{ absolute_match, @errorName(err) });
+    const file = (try openCandidateAt(arena, workspace_root, absolute_match)) orelse return null;
+    return .{ .display_path = absolute_match, .file = file };
+}
+
+fn openCandidateAt(arena: Allocator, workspace_root: []const u8, absolute_match: []const u8) Allocator.Error!?std.Io.File {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        const entry_kind = candidateKind(absolute_match) catch |err| {
+            logScanSkipped(absolute_match, err);
+            return null;
+        };
+        if (entry_kind != .file and entry_kind != .sym_link) return null;
+        return openResolvedCandidate(arena, workspace_root, absolute_match, entry_kind);
+    }
+    return openNoFollowCandidate(arena, workspace_root, absolute_match);
+}
+
+fn openNoFollowCandidate(arena: Allocator, workspace_root: []const u8, absolute_match: []const u8) Allocator.Error!?std.Io.File {
+    // O_NONBLOCK keeps the open from waiting on a FIFO, and reads of a regular file ignore it.
+    var flags: std.posix.O = .{
+        .ACCMODE = .RDONLY,
+        .NONBLOCK = true,
+        .NOFOLLOW = true,
+    };
+    if (@hasField(std.posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+    if (@hasField(std.posix.O, "LARGEFILE")) flags.LARGEFILE = true;
+    if (@hasField(std.posix.O, "NOCTTY")) flags.NOCTTY = true;
+
+    const fd = std.posix.openat(std.Io.Dir.cwd().handle, absolute_match, flags, 0) catch |err| {
+        if (err == error.SymLinkLoop) return openResolvedCandidate(arena, workspace_root, absolute_match, .sym_link);
+        logScanSkipped(absolute_match, err);
         return null;
     };
-    if (entry_kind != .file and entry_kind != .sym_link) return null;
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    const stat = file.stat(io_mod.getIo()) catch |err| {
+        file.close(io_mod.getIo());
+        logScanSkipped(absolute_match, err);
+        return null;
+    };
+    if (stat.kind != .file) {
+        file.close(io_mod.getIo());
+        return null;
+    }
+    return file;
+}
 
+/// Resolves a listed entry to the path it reads, then opens that path.
+fn openResolvedCandidate(arena: Allocator, workspace_root: []const u8, absolute_match: []const u8, entry_kind: std.Io.File.Kind) Allocator.Error!?std.Io.File {
     const read_path = resolveDirectoryEntryTarget(arena, workspace_root, absolute_match, entry_kind) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        debug_trace.logf("core", "grep_files scan skipped path={s} err={s}", .{ absolute_match, @errorName(err) });
+        logScanSkipped(absolute_match, err);
         return null;
     } orelse return null;
-
-    return .{
-        .display_path = absolute_match,
-        .read_path = read_path,
+    const file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), read_path, .follow) catch |err| {
+        logScanSkipped(absolute_match, err);
+        return null;
     };
+    return file;
+}
+
+fn logScanSkipped(absolute_path: []const u8, err: anyerror) void {
+    debug_trace.logf("core", "grep_files scan skipped path={s} err={s}", .{ absolute_path, @errorName(err) });
 }
 
 /// Files per unit of parallel work. Workers take batches in candidate order.
@@ -332,13 +386,15 @@ const ParallelScan = struct {
 
     fn run(self: *ParallelScan, worker: usize) void {
         const work = self.worker_arenas[worker].allocator();
+        var buffers: ScanBuffers = .{};
+        defer buffers.deinit(work);
         while (!self.stop.load(.acquire)) {
             const batch = self.next_batch.fetchAdd(1, .monotonic);
             const first = batch * batch_files;
             if (first >= self.files.len) return;
             const last = @min(first + batch_files, self.files.len);
             for (first..last) |index| {
-                _ = self.scanOne(work, index) catch {
+                _ = self.scanOne(work, &buffers, index) catch {
                     self.mutex.lockUncancelable(io_mod.getIo());
                     self.out_of_memory_from = @min(self.out_of_memory_from orelse first, first);
                     self.mutex.unlock(io_mod.getIo());
@@ -350,23 +406,24 @@ const ParallelScan = struct {
         }
     }
 
-    fn scanOne(self: *ParallelScan, work: Allocator, index: usize) Allocator.Error!void {
+    fn scanOne(self: *ParallelScan, work: Allocator, buffers: *ScanBuffers, index: usize) Allocator.Error!void {
         var absolute_match_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const candidate_file = try resolveCandidateFile(work, self.workspace_root, self.provider_root, self.files[index], absolute_match_buf[0..]) orelse return;
+        const candidate = try openCandidateFile(work, self.workspace_root, self.provider_root, self.files[index], absolute_match_buf[0..]) orelse return;
+        defer candidate.file.close(io_mod.getIo());
         switch (self.mode) {
             .matches => {
                 var local: std.ArrayList(Match) = .empty;
-                _ = scanFileAt(work, candidate_file.display_path, candidate_file.read_path, self.pattern, self.case_insensitive, &local) catch |err| {
+                _ = scanFileAt(work, candidate.display_path, candidate.file, self.pattern, self.case_insensitive, buffers, &local) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
-                    debug_trace.logf("core", "grep_files scan skipped path={s} err={s}", .{ candidate_file.display_path, @errorName(err) });
+                    logScanSkipped(candidate.display_path, err);
                     return;
                 };
                 self.outcomes[index] = .{ .matches = local.items };
             },
             .count => {
-                const file_count = countFileAt(work, candidate_file.display_path, candidate_file.read_path, self.pattern, self.case_insensitive) catch |err| {
+                const file_count = countFileAt(work, candidate.display_path, candidate.file, self.pattern, self.case_insensitive, buffers) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
-                    debug_trace.logf("core", "grep_files scan skipped path={s} err={s}", .{ candidate_file.display_path, @errorName(err) });
+                    logScanSkipped(candidate.display_path, err);
                     return;
                 };
                 self.outcomes[index] = .{ .matching_lines = file_count.matching_lines };
@@ -528,33 +585,15 @@ fn resolveDirectoryEntryTarget(arena: Allocator, workspace_root: []const u8, abs
     return resolved;
 }
 
-fn scanFile(
-    arena: Allocator,
-    absolute_path: []const u8,
-    pattern: []const u8,
-    case_insensitive: bool,
-    matches: *std.ArrayList(Match),
-) !?TruncatedReason {
-    return scanFileAt(arena, absolute_path, absolute_path, pattern, case_insensitive, matches);
-}
-
-fn countFile(
-    arena: Allocator,
-    absolute_path: []const u8,
-    pattern: []const u8,
-    case_insensitive: bool,
-) !FileCount {
-    return countFileAt(arena, absolute_path, absolute_path, pattern, case_insensitive);
-}
-
 /// `scratch` holds the window for matching across the pieces of a line
 /// longer than `chunk_bytes`, and only when such a line appears.
 fn countFileAt(
     scratch: Allocator,
     display_path: []const u8,
-    read_path: []const u8,
+    file: std.Io.File,
     pattern: []const u8,
     case_insensitive: bool,
+    buffers: *ScanBuffers,
 ) !FileCount {
     var counter: struct {
         matching_lines: usize = 0,
@@ -566,7 +605,7 @@ fn countFileAt(
             return false;
         }
     } = .{};
-    return switch (try scanLines(scratch, display_path, read_path, pattern, case_insensitive, &counter)) {
+    return switch (try scanLines(scratch, display_path, file, pattern, case_insensitive, buffers, &counter)) {
         .done, .stopped => .{ .matching_lines = counter.matching_lines },
         .not_text => .{},
     };
@@ -575,9 +614,10 @@ fn countFileAt(
 fn scanFileAt(
     arena: Allocator,
     display_path: []const u8,
-    read_path: []const u8,
+    file: std.Io.File,
     pattern: []const u8,
     case_insensitive: bool,
+    buffers: *ScanBuffers,
     matches: *std.ArrayList(Match),
 ) !?TruncatedReason {
     var collector: struct {
@@ -592,7 +632,7 @@ fn scanFileAt(
         }
     } = .{ .arena = arena, .matches = matches, .display_path = display_path };
     const first = matches.items.len;
-    return switch (try scanLines(arena, display_path, read_path, pattern, case_insensitive, &collector)) {
+    return switch (try scanLines(arena, display_path, file, pattern, case_insensitive, buffers, &collector)) {
         .done => null,
         .stopped => .collection_cap,
         .not_text => {
@@ -605,7 +645,21 @@ fn scanFileAt(
 
 const ScanEnd = enum { done, stopped, not_text };
 
-/// Streams the regular file at `read_path` with one `chunk_bytes` buffer,
+const FillResult = enum { whole_file, more };
+
+/// Buffers `file_reader` until its buffer is full or the file ends.
+fn fillChunk(file_reader: *std.Io.File.Reader) !FillResult {
+    const reader = &file_reader.interface;
+    while (reader.bufferedLen() < reader.buffer.len) {
+        reader.fillMore() catch |err| switch (err) {
+            error.EndOfStream => return .whole_file,
+            error.ReadFailed => return file_reader.err.?,
+        };
+    }
+    return .more;
+}
+
+/// Streams the open regular file `file` with one `chunk_bytes` buffer,
 /// whatever its size, and calls `sink.line(number, text)` for each line that
 /// contains `pattern`; `sink.line` returns true to stop. Lines are split at
 /// '\n' as `std.mem.splitScalar` splits a whole file, so the text after the
@@ -614,21 +668,20 @@ const ScanEnd = enum { done, stopped, not_text };
 fn scanLines(
     scratch: Allocator,
     display_path: []const u8,
-    read_path: []const u8,
+    file: std.Io.File,
     pattern: []const u8,
     case_insensitive: bool,
+    buffers: *ScanBuffers,
     sink: anytype,
 ) !ScanEnd {
-    // Only regular files are read, and never with a blocking open: opening a
-    // FIFO for reading would wait for a writer that may never come.
-    var file = try io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), read_path, .follow);
-    defer file.close(io_mod.getIo());
-
-    var read_buf: [chunk_bytes]u8 = undefined;
-    var file_reader = file.reader(io_mod.getIo(), &read_buf);
+    // A file that ends inside a long line leaves that state set, so each file starts clean.
+    buffers.long.reset();
+    var file_reader = file.reader(io_mod.getIo(), &buffers.read);
     const reader = &file_reader.interface;
-    var long: LongLine = .{};
-    defer long.deinit(scratch);
+    // A file with no match gives no output, text or not, so skipping its text check is safe.
+    const filled = try fillChunk(&file_reader);
+    if (filled == .whole_file and !lineMatchesPattern(reader.buffered(), pattern, case_insensitive)) return .done;
+    const long = &buffers.long;
 
     var number: usize = 1;
     while (true) {
@@ -721,6 +774,19 @@ const LongLine = struct {
             @memmove(self.window[0..keep], self.window[total - keep .. total]);
             self.carry_len = keep;
         }
+    }
+};
+
+/// One worker's scan buffers, reused for every file it scans. ReleaseSafe fills
+/// each `undefined` buffer with 0xAA when it is created, so one set per file
+/// would cost a fill of 128 KiB per file.
+const ScanBuffers = struct {
+    read: [chunk_bytes]u8 = undefined,
+    long: LongLine = .{},
+
+    /// Frees the window that `long` allocated from `scratch`, the allocator the scans used.
+    fn deinit(self: *ScanBuffers, scratch: Allocator) void {
+        self.long.deinit(scratch);
     }
 };
 
@@ -1163,6 +1229,33 @@ test "grep search keeps a UTF-8 character cut by a chunk edge as text" {
     try std.testing.expectEqual(@as(usize, 2), result.matches[0].line_number);
 }
 
+test "grep search resets the long-line state between files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    // a.txt ends inside its long line, so "nee" is the carried tail. One worker
+    // scans both files in sorted order, so b.txt must not join that tail with its "dle".
+    const long_line = try alloc.alloc(u8, chunk_bytes + 1 + "nee".len);
+    defer alloc.free(long_line);
+    @memset(long_line, 'x');
+    @memcpy(long_line[chunk_bytes + 1 ..], "nee");
+    const first = try writeTempFile(alloc, &tmp, "a.txt", long_line);
+    defer alloc.free(first);
+    const second = try writeTempFile(alloc, &tmp, "b.txt", "dle at start\nneedle here\n");
+    defer alloc.free(second);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, null);
+
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(std.mem.endsWith(u8, result.matches[0].absolute_path, "b.txt"));
+    try std.testing.expectEqual(@as(usize, 2), result.matches[0].line_number);
+    try std.testing.expectEqualStrings("needle here", result.matches[0].line);
+}
+
 test "grep search skips a file whose NUL byte comes after a match" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1192,6 +1285,65 @@ test "grep search skips a file whose NUL byte comes after a match" {
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "grep_files skipped non-text file path=") != null);
     try std.testing.expect(std.mem.find(u8, trace, "reason=contains_nul") != null);
+}
+
+test "grep search skips a file without a match before checking it as text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const match = try writeTempFile(alloc, &tmp, "match.txt", "needle here\n");
+    defer alloc.free(match);
+    const nomatch = try writeTempFile(alloc, &tmp, "nomatch.bin", "plain\x00bytes\n");
+    defer alloc.free(nomatch);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", false, null);
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expect(result.truncated_reason == null);
+
+    const trace = try readTrace(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "nomatch.bin") == null);
+}
+
+test "grep search case-insensitive search matches inside a file that fits the buffer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const title = try writeTempFile(alloc, &tmp, "title.txt", "Needle Here\n");
+    defer alloc.free(title);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, workspace, "needle", true, null);
+    try std.testing.expectEqual(@as(usize, 1), result.matches.len);
+    try std.testing.expectEqualStrings("Needle Here", result.matches[0].line);
+}
+
+test "grep search pattern with a newline matches no line" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    const lines = try writeTempFile(alloc, &tmp, "lines.txt", "a\nb\n");
+    defer alloc.free(lines);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try collectDirectoryMatches(std.testing.allocator, arena_state.allocator(), workspace, workspace, "a\nb", false, null);
+    try std.testing.expectEqual(@as(usize, 0), result.matches.len);
 }
 
 test "grep search include matches a file root by its workspace path" {

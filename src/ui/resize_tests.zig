@@ -1354,7 +1354,8 @@ fn expectActiveInputSurvivesResize(
 
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
-    try expectGridContains(&h, "test-mod");
+    // "test-model" is two columns wider than the row, so its cut ends in "…".
+    try expectGridContains(&h, "test-mo…");
 }
 
 test "active hard-newline footer survives every valid tiny height" {
