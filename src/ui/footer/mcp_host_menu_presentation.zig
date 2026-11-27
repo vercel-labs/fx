@@ -274,8 +274,8 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
     };
     // What needs the user stays bright so it stands out among dim rows.
     try row.appendSlice(alloc, if (needs_you) ui_render.hint_style else ui_render.dim_style);
-    // A refused tool list says so whole where the row has room, and in fewer words where it has not, down to the one
-    // that says it, so the cut never takes it.
+    // A refused tool list says so whole where the row has room, and in fewer words where it has not. From 27 columns
+    // the shortest still fits whole. Under that the row is cut like any other, and may lose the word that says it.
     const shown = try verbs.statusThatFits(arena, r.status, status_width);
     try row_text.appendTerminalSafeSingleLine(alloc, &row, shown, status_width);
     try row.appendSlice(alloc, ui_render.reset_style);
@@ -821,6 +821,27 @@ test "a refused or unavailable tool list fits its row at 30, 33, 60 and 200 colu
             try testing.expect(std.mem.find(u8, line, "\u{2026}") == null);
             try testing.expect(try std.unicode.utf8CountCodepoints(line) <= case.width);
         }
+    }
+}
+
+test "a refused or unavailable tool list is cut inside the row at 20 and 25 columns, where its words do not fit" {
+    var none = testStatus("none", .ready);
+    none.tools_error = "the server answered the list with HTTP 403";
+    var wait = testStatus("wait", .ready);
+    wait.tools_error = "the server answered the list with HTTP 503, which is temporary";
+    wait.tools_unavailable = 503;
+    const rows = [_]menu.Row{ .{ .status = none }, .{ .status = wait } };
+    var p: Projection = .{ .rows = &rows };
+    menu.open(&p.state);
+
+    for ([_]u16{ 20, 25 }) |width| {
+        const text = try render(p, width);
+        defer testing.allocator.free(text);
+        // Both rows are there, and no line of the picker is wider than the terminal.
+        try testing.expect(rowOfServer(text, "none") != null);
+        try testing.expect(rowOfServer(text, "wait") != null);
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| try testing.expect(try std.unicode.utf8CountCodepoints(line) <= width);
     }
 }
 
