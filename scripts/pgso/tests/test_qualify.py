@@ -677,81 +677,63 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual(str(candidate), calls[1][0])
         self.assertTrue(results[0].passed)
 
-    def test_ui_activity_measurement_uses_alternating_hyperfine_rounds(self) -> None:
-        control = self.root / "heavy" / "control"
-        candidate = self.root / "heavy" / "candidate"
-        hyperfine = self.root / "tools" / "hyperfine"
-        for path in (control, candidate, hyperfine):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"executable")
-        pair = BenchmarkPair(
-            selector="ui_activity",
-            control_binary=control,
-            candidate_binary=candidate,
-            bitcode_sha256="b" * 64,
-            merged_raw_profiles=1,
-        )
+    def fake_ui_activity_runner(self, hyperfine, seconds):
+        """A `run_checked` fake whose Hyperfine times run `index` of `label` in
+        an attempt as `seconds(label, retry, index)`."""
         calls: list[tuple[str, ...]] = []
+        runs_so_far: dict[tuple[str, bool], int] = {}
 
-        def fake_run(argv, **kwargs):
+        def fake_run(argv, **_kwargs):
             command = tuple(str(argument) for argument in argv)
             calls.append(command)
             if command[0] != str(hyperfine):
                 return CommandResult(command, 0, "measured\n", "", 1.0)
-            export_path = pathlib.Path(
-                command[command.index("--export-json") + 1]
-            )
-            labels = [
-                command[index + 1]
-                for index, value in enumerate(command)
-                if value == "--command-name"
-            ]
-            export_path.write_text(
-                json.dumps(
+            export_path = pathlib.Path(command[command.index("--export-json") + 1])
+            retry = "retry" in export_path.parts
+            runs = int(command[command.index("--runs") + 1])
+            results = []
+            for index, value in enumerate(command):
+                if value != "--command-name":
+                    continue
+                label = command[index + 1]
+                first = runs_so_far.get((label, retry), 0)
+                runs_so_far[(label, retry)] = first + runs
+                results.append(
                     {
-                        "results": [
-                            {
-                                "command": label,
-                                "times": [1.0 if label == "control" else 0.9],
-                            }
-                            for label in labels
-                        ]
+                        "command": label,
+                        "times": [seconds(label, retry, first + run) for run in range(runs)],
                     }
                 )
-            )
+            export_path.write_text(json.dumps({"results": results}))
             return CommandResult(command, 0, "", "", 1.0)
 
-        with (
-            mock.patch(
-                "scripts.pgso.qualify.build_benchmark_pair",
-                side_effect=AssertionError("must use immutable prebuilt pair"),
-            ),
-            mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run),
-        ):
-            results = measure_heavy_workloads(
-                toolchain=None,
-                repo_root=self.root,
-                output_dir=self.root / "measurements",
-                samples=50,
-                timeout_s=10,
-                workload_names=("ui-activity",),
-                prebuilt_pairs={"ui_activity": pair},
-                hyperfine_binary=hyperfine,
-            )
+        return calls, fake_run
 
-        hyperfine_calls = [
-            command for command in calls if command[0] == str(hyperfine)
-        ]
-        self.assertEqual(50, len(hyperfine_calls))
+    def ui_activity_hyperfine(self) -> pathlib.Path:
+        hyperfine = self.root / "tools" / "hyperfine"
+        hyperfine.parent.mkdir(parents=True, exist_ok=True)
+        hyperfine.write_bytes(b"executable")
+        return hyperfine
+
+    def test_ui_activity_measures_one_thousand_samples_in_balanced_rounds(self) -> None:
+        hyperfine = self.ui_activity_hyperfine()
+        calls, fake_run = self.fake_ui_activity_runner(
+            hyperfine,
+            lambda label, _retry, _index: 1.0 if label == "control" else 0.9,
+        )
+
+        result, _ = self.measure_one_heavy_workload(
+            fake_run, "ui-activity", "ui_activity", hyperfine
+        )
+
+        hyperfine_calls = [command for command in calls if command[0] == str(hyperfine)]
+        self.assertEqual(100, len(hyperfine_calls))
         for round_index, command in enumerate(hyperfine_calls):
             # The benchmark's own output must reach the round log, so a
             # failed round shows why it failed.
             self.assertIn("--output=inherit", command)
-            self.assertEqual("1", command[command.index("--runs") + 1])
-            self.assertEqual(
-                "0",
-                command[command.index("--warmup") + 1],
-            )
+            self.assertEqual("10", command[command.index("--runs") + 1])
+            self.assertEqual("0", command[command.index("--warmup") + 1])
             self.assertEqual(
                 (
                     ("control", "candidate")
@@ -764,9 +746,44 @@ class PgsoQualificationTests(unittest.TestCase):
                     if value == "--command-name"
                 ),
             )
-        self.assertEqual(50, len(results[0].control_samples))
-        self.assertEqual(50, len(results[0].candidate_samples))
-        self.assertTrue(results[0].passed)
+        self.assertEqual(1_000, result.requested_samples)
+        self.assertEqual(1_000, len(result.control_samples))
+        self.assertEqual(1_000, len(result.candidate_samples))
+        self.assertTrue(result.passed)
+
+    def test_a_few_slow_moments_do_not_fail_ui_activity(self) -> None:
+        # Observed on macOS runners: three slow runs of 50 set the candidate's
+        # p95, so a candidate as fast as its control failed both attempts.
+        hyperfine = self.ui_activity_hyperfine()
+        _, fake_run = self.fake_ui_activity_runner(
+            hyperfine,
+            lambda label, _retry, index: 1.5 if label == "candidate" and index < 3 else 1.0,
+        )
+
+        result, _ = self.measure_one_heavy_workload(
+            fake_run, "ui-activity", "ui_activity", hyperfine
+        )
+
+        self.assertTrue(result.passed)
+        self.assertIsNone(result.first_attempt)
+        self.assertAlmostEqual(0.0, result.comparison.p95_change)
+
+    def test_a_slow_tail_still_fails_ui_activity(self) -> None:
+        # One run in ten 50% slower leaves the median alone and must still fail.
+        hyperfine = self.ui_activity_hyperfine()
+        _, fake_run = self.fake_ui_activity_runner(
+            hyperfine,
+            lambda label, _retry, index: 1.5 if label == "candidate" and index % 10 == 0 else 1.0,
+        )
+
+        result, _ = self.measure_one_heavy_workload(
+            fake_run, "ui-activity", "ui_activity", hyperfine
+        )
+
+        self.assertFalse(result.passed)
+        self.assertFalse(result.first_attempt.passed)
+        self.assertAlmostEqual(0.0, result.comparison.p50_change)
+        self.assertAlmostEqual(0.5, result.comparison.p95_change)
 
     def measure_one_heavy_workload(self, fake_run, workload, selector, hyperfine=None):
         self.progress = io.StringIO()
@@ -843,43 +860,26 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual(100, len(calls))
 
     def test_microbenchmark_regression_that_repeats_fails_after_one_retry(self) -> None:
-        hyperfine = self.root / "tools" / "hyperfine"
-        hyperfine.parent.mkdir(parents=True, exist_ok=True)
-        hyperfine.write_bytes(b"executable")
-        exports: list[pathlib.Path] = []
-
-        def fake_run(argv, **_kwargs):
-            command = tuple(str(argument) for argument in argv)
-            if command[0] != str(hyperfine):
-                return CommandResult(command, 0, "measured\n", "", 1.0)
-            export_path = pathlib.Path(command[command.index("--export-json") + 1])
-            exports.append(export_path)
-            labels = [
-                command[index + 1]
-                for index, value in enumerate(command)
-                if value == "--command-name"
-            ]
-            export_path.write_text(
-                json.dumps(
-                    {
-                        "results": [
-                            {"command": label, "times": [1.0 if label == "control" else 1.2]}
-                            for label in labels
-                        ]
-                    }
-                )
-            )
-            return CommandResult(command, 0, "", "", 1.0)
+        hyperfine = self.ui_activity_hyperfine()
+        calls, fake_run = self.fake_ui_activity_runner(
+            hyperfine,
+            lambda label, _retry, _index: 1.0 if label == "control" else 1.2,
+        )
 
         result, _ = self.measure_one_heavy_workload(
             fake_run, "ui-activity", "ui_activity", hyperfine
         )
 
+        exports = [
+            pathlib.Path(command[command.index("--export-json") + 1])
+            for command in calls
+            if command[0] == str(hyperfine)
+        ]
         retry_logs = self.root / "measurements" / "logs" / "ui-activity" / "retry" / "logs"
         self.assertFalse(result.passed)
         self.assertFalse(result.first_attempt.passed)
-        self.assertEqual(100, len(exports))
-        self.assertEqual(50, sum(path.parent == retry_logs for path in exports))
+        self.assertEqual(200, len(exports))
+        self.assertEqual(100, sum(path.parent == retry_logs for path in exports))
 
     def test_ui_activity_measurement_requires_hyperfine(self) -> None:
         control = self.root / "heavy" / "control"

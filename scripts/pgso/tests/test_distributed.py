@@ -722,6 +722,34 @@ class ShardAggregationTests(unittest.TestCase):
                 expected_profile_linkage={"file-index-100k": linkage},
             )
 
+    def test_heavy_aggregate_requires_each_workload_s_own_sample_count(self) -> None:
+        document = self.measurement("ui-activity")
+        document["phase"] = "heavy"
+        measurement = dict(document["measurement"])
+        measurement["argv"] = []
+        document["measurement"] = measurement
+
+        result = aggregate_measurement_shards(
+            (document,),
+            phase="heavy",
+            expected_names=("ui-activity",),
+            expected_identity=self.identity,
+            expected_artifact_sha256="e" * 64,
+        )
+        self.assertEqual("ui-activity", result[0]["name"])
+
+        measurement["requested_samples"] = 50
+        measurement["control_samples"] = [1.0] * 50
+        measurement["candidate_samples"] = [0.9] * 50
+        with self.assertRaisesRegex(PgsoError, "requires exactly 1000 samples: ui-activity"):
+            aggregate_measurement_shards(
+                (document,),
+                phase="heavy",
+                expected_names=("ui-activity",),
+                expected_identity=self.identity,
+                expected_artifact_sha256="e" * 64,
+            )
+
     def test_measurement_aggregate_rejects_truncated_samples(self) -> None:
         document = self.measurement("startup-help")
         measurement = dict(document["measurement"])

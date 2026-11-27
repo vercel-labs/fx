@@ -39,9 +39,10 @@ from scripts.pgso.pipeline import (
 from scripts.pgso.qualify import (
     BENCHMARK_PLANS,
     STARTUP_COMMANDS,
-    STARTUP_MINIMUM_SAMPLES,
+    TAIL_SAMPLES,
     BenchmarkPair,
     build_profile_linked_benchmarks,
+    heavy_workload_samples,
     measure_heavy_workloads,
     measure_startup,
     measurement_payload,
@@ -346,7 +347,9 @@ def aggregate_measurement_shards(
             raise PgsoError(f"duplicate {phase} measurement: {name}")
         if measurement.get("passed") is not True:
             raise PgsoError(f"{phase} measurement failed: {name}")
-        required_samples = STARTUP_MINIMUM_SAMPLES if phase == "startup" else 50
+        required_samples = (
+            TAIL_SAMPLES if phase == "startup" else heavy_workload_samples(name)
+        )
         if measurement.get("requested_samples") != required_samples:
             raise PgsoError(
                 f"{phase} measurement requires exactly {required_samples} samples: {name}"

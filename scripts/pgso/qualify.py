@@ -35,10 +35,12 @@ from scripts.pgso.toolchain import Toolchain
 
 
 MINIMUM_SAMPLES = 50
-STARTUP_MINIMUM_SAMPLES = 1_000
+# A p95 over this many samples rests on its 50 slowest, so a few slow moments
+# of a shared runner cannot decide it.
+TAIL_SAMPLES = 1_000
+MINIMUM_ROUNDS = 10
+MAX_RUNS_PER_ROUND = 10
 STARTUP_WARMUP_RUNS = 10
-STARTUP_MINIMUM_ROUNDS = 10
-STARTUP_MAX_RUNS_PER_ROUND = 10
 MAXIMUM_REGRESSION = 0.10
 REQUIRED_EVIDENCE = (
     "identity",
@@ -72,6 +74,7 @@ class BenchmarkPlan:
     training_argvs: tuple[tuple[str, ...], ...]
     workloads: tuple[Workload, ...]
     microbenchmark: bool = False
+    minimum_samples: int = MINIMUM_SAMPLES
 
 
 @dataclasses.dataclass(frozen=True)
@@ -115,6 +118,9 @@ BENCHMARK_PLANS = (
         training_argvs=((),),
         workloads=(Workload("ui-activity", ()),),
         microbenchmark=True,
+        # A run takes about 50 ms, so 1,000 cost little. With 50, three slow
+        # moments of a macOS runner set its p95.
+        minimum_samples=TAIL_SAMPLES,
     ),
     BenchmarkPlan(
         selector="approval_review",
@@ -146,6 +152,14 @@ BENCHMARK_PLANS = (
         ),
     ),
 )
+
+
+def heavy_workload_samples(name: str) -> int:
+    """Samples of each artifact that the heavy workload `name` measures."""
+    for plan in BENCHMARK_PLANS:
+        if any(workload.name == name for workload in plan.workloads):
+            return plan.minimum_samples
+    raise PgsoError(f"unknown heavy workload: {name}")
 
 
 def select_startup_commands(
@@ -408,6 +422,18 @@ def compare_samples(
         p95_change=p95_change,
         passed=passed,
     )
+
+
+def _round_runs(samples: int) -> tuple[int, ...]:
+    """Runs of each artifact per round, `samples` in all.
+
+    Each round runs one artifact's block and then the other's, in an order
+    that alternates, so a short burst of runner noise lands on both artifacts
+    and no block is longer than MAX_RUNS_PER_ROUND.
+    """
+    rounds = max(MINIMUM_ROUNDS, math.ceil(samples / MAX_RUNS_PER_ROUND))
+    per_round, extra = divmod(samples, rounds)
+    return tuple(per_round + (index < extra) for index in range(rounds))
 
 
 def _read_hyperfine_samples(
@@ -915,16 +941,8 @@ def measure_startup(
     control_binary = _fresh_copy(control_binary, output_dir / "binaries" / "control")
     candidate_binary = _fresh_copy(candidate_binary, output_dir / "binaries" / "candidate")
     results: list[MeasurementResult] = []
-    startup_samples = max(samples, STARTUP_MINIMUM_SAMPLES)
-    startup_rounds = max(
-        STARTUP_MINIMUM_ROUNDS,
-        math.ceil(startup_samples / STARTUP_MAX_RUNS_PER_ROUND),
-    )
-    samples_per_round, extra_samples = divmod(startup_samples, startup_rounds)
-    round_samples = tuple(
-        samples_per_round + (round_index < extra_samples)
-        for round_index in range(startup_rounds)
-    )
+    startup_samples = max(samples, TAIL_SAMPLES)
+    round_samples = _round_runs(startup_samples)
 
     for command_name, command_argv in select_startup_commands(command_names):
         for label, binary in (
@@ -1069,7 +1087,7 @@ def _measure_microbenchmark(
 
     control_samples: list[float] = []
     candidate_samples: list[float] = []
-    for round_index in range(samples):
+    for round_index, runs in enumerate(_round_runs(samples)):
         export_path = logs / f"round-{round_index}-samples.json"
         # The benchmark reports why it failed, such as a timing breach, on
         # its own stdout and stderr. Pass them through so the round log keeps
@@ -1084,7 +1102,7 @@ def _measure_microbenchmark(
             "--warmup",
             "0",
             "--runs",
-            "1",
+            str(runs),
             "--export-json",
             str(export_path),
         ]
@@ -1109,11 +1127,15 @@ def _measure_microbenchmark(
             log_path=logs / f"round-{round_index}.json",
             require_empty_stderr=False,
         )
-        round_results = _read_hyperfine_samples(export_path, expected_samples=1)
-        control_samples.append(round_results["control"][0])
-        candidate_samples.append(round_results["candidate"][0])
+        round_results = _read_hyperfine_samples(export_path, expected_samples=runs)
+        control_samples.extend(round_results["control"])
+        candidate_samples.extend(round_results["candidate"])
 
-    comparison = compare_samples(tuple(control_samples), tuple(candidate_samples))
+    comparison = compare_samples(
+        tuple(control_samples),
+        tuple(candidate_samples),
+        minimum_samples=samples,
+    )
     return MeasurementResult(
         name=name,
         argv=(),
@@ -1189,7 +1211,7 @@ def measure_heavy_workloads(
                         hyperfine_binary,
                         repo_root,
                         attempt_logs,
-                        samples,
+                        max(samples, plan.minimum_samples),
                         timeout_s,
                     )
 
