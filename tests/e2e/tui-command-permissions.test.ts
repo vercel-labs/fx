@@ -20,7 +20,7 @@ import {
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
 import { LineQueue } from "./line-queue";
 import { commandReplays, onlySessionId, savedSessionIds, savedText, storeRoot } from "./saved-sessions";
 import { latestTraceReportPath, readTraceReport, traceReportNames, waitForNewTraceReport } from "./trace-report";
@@ -5596,7 +5596,7 @@ class AcpClient {
   static create(cwd: string, env: Record<string, string | undefined>) {
     return new AcpClient(nodeSpawn(FX_BIN, ["acp"], {
       cwd,
-      env: definedEnv({ ...process.env, ...env, NO_COLOR: "1" }),
+      env: definedEnv(fxChildEnv({ ...env, NO_COLOR: "1" })),
       stdio: ["pipe", "pipe", "pipe"],
     }));
   }
