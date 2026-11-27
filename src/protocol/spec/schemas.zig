@@ -397,9 +397,10 @@ const TableFailure = struct {
     line: []const u8 = "",
 };
 
-/// Splits the rows of a table in sh-fx.md into cells and returns how many rows it has. A line with no
-/// bar is text and is skipped, and so are the header and the separator line. Any other line is a row,
-/// so a row without an outer bar is checked and not skipped.
+/// Splits the rows of a table in sh-fx.md into cells and returns how many rows it has. A line with a bar
+/// is checked as a row, except the header and the separator line. A line with no bar is text and is
+/// skipped, unless it directly follows a table line: GitHub Markdown reads it as a row, so it fails.
+/// An empty line ends the table.
 fn splitTable(
     comptime cells_per_row: usize,
     table: []const u8,
@@ -407,9 +408,19 @@ fn splitTable(
     failure: *TableFailure,
 ) !usize {
     var count: usize = 0;
+    var in_table = false;
     var lines = std.mem.splitScalar(u8, table, '\n');
     while (lines.next()) |line| {
-        if (std.mem.findScalar(u8, line, '|') == null) continue;
+        if (std.mem.trim(u8, line, " ").len == 0) {
+            in_table = false;
+            continue;
+        }
+        if (std.mem.findScalar(u8, line, '|') == null) {
+            if (!in_table) continue;
+            failure.line = line;
+            return error.MalformedTableRow;
+        }
+        in_table = true;
         if (std.mem.startsWith(u8, line, "| Today |") or std.mem.startsWith(u8, line, "| --- |")) continue;
         if (count == rows.len) return error.TableTooLong;
         const cells = tableRowCells(cells_per_row, line) orelse {
@@ -464,11 +475,11 @@ fn expectNamesTableError(expected: anyerror, table: []const u8) !void {
 }
 
 /// Prints why a table check failed. The test that calls the check prints it, because the checks print
-/// nothing themselves. `max_rows` is the row cap of the table.
-fn printTableFailure(name: []const u8, max_rows: usize, err: anyerror, failure: TableFailure) void {
+/// nothing themselves. `max_rows` is the row cap of the table, held by the constant `max_rows_name`.
+fn printTableFailure(name: []const u8, max_rows_name: []const u8, max_rows: usize, err: anyerror, failure: TableFailure) void {
     switch (err) {
         error.MalformedTableRow => std.debug.print("sh-fx.md has a malformed row in its {s}: {s}\n", .{ name, failure.line }),
-        error.TableTooLong => std.debug.print("sh-fx.md {s} has more than {d} rows, which is more than this test holds\n", .{ name, max_rows }),
+        error.TableTooLong => std.debug.print("sh-fx.md {s} has more than {d} rows; raise {s} in schemas.zig to hold more\n", .{ name, max_rows, max_rows_name }),
         error.TableHasNoRows => std.debug.print("sh-fx.md {s} has no rows\n", .{name}),
         error.RemovedKeyNamesNewName, error.NotAnShFxKey, error.RepeatedKeyRow => std.debug.print("sh-fx.md {s} row fails {s}: {s}\n", .{ name, @errorName(err), failure.line }),
         else => {},
@@ -495,7 +506,7 @@ test "the table of names in use today gives each name one valid new name" {
     };
     var failure: TableFailure = .{};
     _ = checkNamesTableAgainstAcp(table, &failure) catch |err| {
-        printTableFailure("names table", max_names_table_rows, err, failure);
+        printTableFailure("names table", "max_names_table_rows", max_names_table_rows, err, failure);
         return err;
     };
 }
@@ -523,6 +534,10 @@ test "a names table rejects a row with an extra cell" {
 
 test "a names table rejects a row with an empty cell" {
     try expectNamesTableError(error.MalformedTableRow, "| `libfx/steer` | client to fx, request |  | Adds text |");
+}
+
+test "a names table rejects a line with no bar right after a row" {
+    try expectNamesTableError(error.MalformedTableRow, "| `libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text |\nAdds text.");
 }
 
 test "a names table with no rows fails" {
@@ -655,7 +670,7 @@ test "the table of keys in use today gives each key one valid new name" {
     };
     var failure: TableFailure = .{};
     _ = checkKeysTable(table, &failure) catch |err| {
-        printTableFailure("keys table", max_keys_table_rows, err, failure);
+        printTableFailure("keys table", "max_keys_table_rows", max_keys_table_rows, err, failure);
         return err;
     };
 }
@@ -681,6 +696,41 @@ test "a keys table rejects a row with an extra cell" {
 
 test "a keys table rejects a row with an empty cell" {
     try expectKeysTableError(error.MalformedTableRow, "| `_meta.fx.steer` | `session/prompt` params |  | `_meta` key | Makes a prompt a steer |");
+}
+
+test "a keys table rejects a key name that is not an sh.fx key" {
+    try expectKeysTableError(error.NotAnShFxKey, "| `_meta.fx.steer` | `session/prompt` params | `sh.fx/journal_seq` | `_meta` key | Makes a prompt a steer |");
+}
+
+test "a keys table rejects a kind that is not one of its three kinds" {
+    try expectKeysTableError(error.MalformedTableRow, "| `_meta.fx.steer` | `session/prompt` params | `sh.fx/steer` | method | Makes a prompt a steer |");
+}
+
+test "a keys table rejects a repeated row" {
+    try expectKeysTableError(error.RepeatedKeyRow,
+        \\| `_meta.fx.steer` | `session/prompt` params | `sh.fx/steer` | `_meta` key | Makes a prompt a steer |
+        \\| `_meta.fx.steer` | `session/prompt` params | `sh.fx/steer2` | `_meta` key | Makes a prompt a steer |
+        \\
+    );
+}
+
+test "a keys table rejects a line with no bar right after a row" {
+    try expectKeysTableError(error.MalformedTableRow,
+        \\| `_meta.fx.steer` | `session/prompt` params | `sh.fx/steer` | `_meta` key | Makes a prompt a steer |
+        \\The steer row above also needs its bars.
+        \\
+    );
+}
+
+test "a keys table ends at its first empty line" {
+    var failure: TableFailure = .{};
+    const rows = try checkKeysTable(
+        \\| `_meta.fx.steer` | `session/prompt` params | `sh.fx/steer` | `_meta` key | Makes a prompt a steer |
+        \\
+        \\Prose after the table is not a row.
+        \\
+    , &failure);
+    try std.testing.expectEqual(@as(usize, 1), rows);
 }
 
 test "a keys table with no rows fails" {

@@ -123,7 +123,7 @@ fx's ACP server puts its extra data under `_meta.fx.<key>` today, and it reads t
 | `_meta.fx.hooksVersion` | the `session/new`, `session/load`, and `session/resume` responses | `sh.fx/hooks` | capability | That fx supports hooks, now listed in `agentCapabilities` |
 | `_meta.fx.hooks` | `session/new`, `session/load`, and `session/resume` params | `sh.fx/hooks` | `_meta` key | The client's hook settings, such as `captureContent` |
 | `_meta.fx.permissionMode` | each value of the `mode` config option | `sh.fx/permissionMode` | `_meta` key | The permission mode that the session mode applies, with fx's original names, such as `yolo` for full access |
-| `_meta.fx.modelResponseRecovery` | `session_info_update` during a running turn | `sh.fx/modelResponseRecovery` | `_meta` key | The live retry status of a model request in a running turn: its state, attempt, cause, and message. Null clears it |
+| `_meta.fx.modelResponseRecovery` | `session_info_update` during a running turn | `sh.fx/modelResponseRecovery` | `_meta` key | The live retry status of a model request in a running turn: its state and attempt, plus its cause, need, and message when the status has them. Null clears it |
 | `_meta.fx.toolCall` | `tool_call` updates | `sh.fx/toolCall` | `_meta` key | Whether the call is fx's own bookkeeping step, and the server and tool name of an MCP call |
 | `_meta.fx.alwaysLoaded` | each MCP server that a client supplies | `sh.fx/alwaysLoaded` | `_meta` key | Whether the server's tools stay advertised on every turn. The default is `true` |
 | `_meta.fx.shared` | each MCP server that a client supplies in `session/new`, `session/load`, and `session/resume` params | `sh.fx/shared` | `_meta` key | Whether fx may share the server with other sessions whose launch config matches. The default is `true` |
@@ -141,7 +141,7 @@ fx's ACP server puts its extra data under `_meta.fx.<key>` today, and it reads t
 | `_meta.fx.systemPrompt` | `session/new` params | - | removed | A copy of `systemPrompt`. Clients send ACP's standard `systemPrompt`, which ACP v1 defines as `{ "mode", "content" }`. fx reads only a bare array of text blocks as its value until it reads that object form |
 | `systemPromptMode` | `session/new` params, a custom field at the root | - | removed | How fx combines the system prompt with its own. ACP v1 puts it in `systemPrompt.mode` |
 | `clientCapabilities.libfx.tools` | the `initialize` request | `sh.fx/hostTools` | capability | The tools that the client runs for fx, as `{ "tools": [...] }` in the capability's value |
-| `clientCapabilities.libfx.instructions` | the `initialize` request | - | removed | Text that the client adds to fx's system prompt. The client sends it as ACP's standard `systemPrompt` with `mode` set to `append`, on each session. fx reads only a bare array of text blocks as its value until it reads that object form |
+| `clientCapabilities.libfx.instructions` | the `initialize` request | - | removed | Text that the client adds to fx's system prompt. fx reads it today as a string of up to 64 KiB and rejects anything else. The client sends it instead as ACP's standard `systemPrompt` with `mode` set to `append`, once fx reads that object form. Until then, fx reads only a bare array of text blocks as the `systemPrompt` value |
 
 The keys and capabilities move with the method names, under the same rules: for some releases fx also accepts the old forms, and it sends a client the old ones unless the client lists the extension's capability.
 
