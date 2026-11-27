@@ -33,7 +33,8 @@
 # LiveSessions models `fx sessions --live`: a scan that tries each session's
 # writer lock without waiting while other fx processes open, hold, crash,
 # and close sessions, and that lists each live session's subagents from its
-# log. live-holds.cfg checks one session exhaustively and must pass;
+# log, with openers whose retry sleeps can last longer than they asked.
+# live-holds.cfg checks one session exhaustively and must pass;
 # live-simulate.cfg runs random behaviors with two sessions, three processes,
 # and two subagents. Each live-witness-*.cfg must be violated, and each
 # live-mutant-*.cfg plants one bug that its property must catch.
@@ -137,6 +138,7 @@ LiveSessions live-mutant-probe-keeps-lock ScanHoldsOneTry
 LiveSessions live-mutant-closed-child AgentsAsLogged
 LiveSessions live-mutant-parent-state AgentsAsLogged
 LiveSessions live-mutant-recent-is-live ProbeSound
+LiveSessions live-mutant-counts-sleeps WaitEndsAtBudget
 LiveSessions live-simulate simulate -simulate num=${SIM_RUNS:-20000} -depth 60 -seed 1
 AcceptedInput accepted-current-survives AcceptedSurvives
 AcceptedInput accepted-design-a -
