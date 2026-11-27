@@ -206,13 +206,14 @@ fx's ACP server puts its extra data under `_meta.fx.<key>` today, and it reads t
 | `_meta.fx.steering` | the `session/prompt` response to a steer | `sh.fx/steeringDelivery` | `_meta` key | How the steer ran: `absorbed` or `next_turn`. Today's `dropped` goes away, because a steer that a turn doesn't take runs in the next turn |
 | `_meta.fx.steering` | a `user_message_chunk` update that shows a steer | `sh.fx/steerInput` | `_meta` key | The steer's request id and input id |
 | `_meta.fx.steer` | `session/prompt` params | `sh.fx/delivery` | `_meta` key | What fx does with a prompt sent during a running turn: `steer` or `queue`. Today's `true` means `steer` |
-| `_meta.fx.hooksVersion` | the `session/new` and `session/load` responses | `sh.fx/hooks` | capability | That fx supports hooks, now listed in `agentCapabilities` |
-| `_meta.fx.hooks` | `session/new` params | `sh.fx/hooks` | `_meta` key | The client's hook settings, such as `captureContent` |
+| `_meta.fx.hooksVersion` | the `session/new`, `session/load`, and `session/resume` responses | `sh.fx/hooks` | capability | That fx supports hooks, now listed in `agentCapabilities` |
+| `_meta.fx.hooks` | `session/new`, `session/load`, and `session/resume` params | `sh.fx/hooks` | `_meta` key | The client's hook settings, such as `captureContent` |
 | `_meta.fx.permissionMode` | each value of the `mode` config option | `sh.fx/permissionMode` | `_meta` key | The permission mode that the session mode applies, with fx's original names, such as `yolo` for full access |
-| `_meta.fx.modelResponseRecovery` | `session_info_update` | `sh.fx/modelResponseRecovery` | `_meta` key | A model request that an earlier fx process was running when it stopped, reported when the session loads |
+| `_meta.fx.modelResponseRecovery` | `session_info_update` during a running turn | `sh.fx/modelResponseRecovery` | `_meta` key | The live retry status of a model request in a running turn: its state, attempt, cause, and message. Null clears it |
 | `_meta.fx.toolCall` | `tool_call` updates | `sh.fx/toolCall` | `_meta` key | Whether the call is fx's own bookkeeping step, and the server and tool name of an MCP call |
 | `_meta.fx.alwaysLoaded` | each MCP server that a client supplies | `sh.fx/alwaysLoaded` | `_meta` key | Whether the server's tools stay advertised on every turn. The default is `true` |
-| `_meta.fx.profileMcpServers` | `session/new` params | `sh.fx/profileMcpServers` | `_meta` key | Whether fx also loads the MCP servers of the user's profile |
+| `_meta.fx.shared` | each MCP server that a client supplies in `session/new`, `session/load`, and `session/resume` params | `sh.fx/shared` | `_meta` key | Whether fx may share the server with other sessions whose launch config matches. The default is `true` |
+| `_meta.fx.profileMcpServers` | `session/new`, `session/load`, and `session/resume` params | `sh.fx/profileMcpServers` | `_meta` key | Whether fx also loads the MCP servers of the user's profile |
 | `_meta.fx.terminal` | `initialize` params | `sh.fx/terminalUi` | `_meta` key | Whether the client is a terminal UI, which picks fx's system prompt. The default is `true` |
 | `_meta.fx.attachment` | an image content block in `session/prompt` | `sh.fx/attachment` | `_meta` key | The id of the binary attachment that holds the image's bytes, in place of `data` |
 | `_meta.fx.stored` | an image content block in `session/prompt` | `sh.fx/storedImage` | `_meta` key | The name under which the host already stored the image |
@@ -223,10 +224,10 @@ fx's ACP server puts its extra data under `_meta.fx.<key>` today, and it reads t
 | `_meta.fx.turnId` | `session/prompt` params | `sh.fx/turnId` | `_meta` key | The host's id for the turn that the prompt starts |
 | `_meta.fx.rerun` | `session/prompt` params | `sh.fx/rerun` | `_meta` key | Tool calls that a crash left running, which the host asks fx to run again |
 | `_meta.fx.yieldAt` | `session/prompt` params | `sh.fx/yieldAt` | `_meta` key | The time, in milliseconds since the epoch, at which a journaled turn yields in place of its next model request |
-| `_meta.fx.systemPrompt` | `session/new` params | - | removed | A copy of `systemPrompt`. Clients send ACP's standard `systemPrompt` field |
+| `_meta.fx.systemPrompt` | `session/new` params | - | removed | A copy of `systemPrompt`. Clients send ACP's standard `systemPrompt`, which ACP v1 defines as `{ "mode", "content" }`. fx reads only a bare array of text blocks as its value until it reads that object form |
 | `systemPromptMode` | `session/new` params, a custom field at the root | - | removed | How fx combines the system prompt with its own. ACP v1 puts it in `systemPrompt.mode` |
 | `clientCapabilities.libfx.tools` | the `initialize` request | `sh.fx/hostTools` | capability | The tools that the client runs for fx, as `{ "tools": [...] }` in the capability's value |
-| `clientCapabilities.libfx.instructions` | the `initialize` request | - | removed | Text that the client adds to fx's system prompt. The client sends it as ACP's standard `systemPrompt` in `append` mode on each session |
+| `clientCapabilities.libfx.instructions` | the `initialize` request | - | removed | Text that the client adds to fx's system prompt. The client sends it as ACP's standard `systemPrompt` with `mode` set to `append`, on each session. fx reads only a bare array of text blocks as its value until it reads that object form |
 
 The keys and capabilities move with the method names, under the same rules: for some releases fx also accepts the old forms, and it sends a client the old ones unless the client lists the extension's capability.
 

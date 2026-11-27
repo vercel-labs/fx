@@ -409,64 +409,100 @@ fn codeCell(cell: []const u8) ?[]const u8 {
 /// The most rows the names table in sh-fx.md may have. The test keeps them in fixed arrays.
 const max_names_table_rows: usize = 64;
 
-/// The parts of a names-table row split on `|`: the empty text before the first bar, the four
-/// cells, and the empty text after the last bar.
-const names_row_parts: usize = 6;
+/// The cells in each row of the names table, not counting the empty text outside its bars.
+const names_table_cells: usize = 4;
 
-/// Returns the trimmed parts of a names-table row, or null when the row has a different number of
-/// parts or lacks the bar at its start or its end.
-fn namesRowCells(line: []const u8) ?[names_row_parts][]const u8 {
-    var cells: [names_row_parts][]const u8 = undefined;
-    var count: usize = 0;
+/// The most rows the keys table in sh-fx.md may have. The test keeps them in fixed arrays.
+const max_keys_table_rows: usize = 64;
+
+/// The cells in each row of the keys table, not counting the empty text outside its bars.
+const keys_table_cells: usize = 5;
+
+/// One row of a table in sh-fx.md: its whole line, for an error message, and its trimmed cells.
+fn TableRow(comptime cells_per_row: usize) type {
+    return struct {
+        line: []const u8,
+        cells: [cells_per_row][]const u8,
+    };
+}
+
+/// Returns the trimmed cells of one table row, or null unless the line has an opening bar, a closing
+/// bar, exactly `cells_per_row` cells between them, and no empty cell.
+fn tableRowCells(comptime cells_per_row: usize, line: []const u8) ?[cells_per_row][]const u8 {
     var parts = std.mem.splitScalar(u8, line, '|');
-    while (count < cells.len) : (count += 1) {
+    const opening = parts.next() orelse return null;
+    if (std.mem.trim(u8, opening, " ").len != 0) return null;
+    var cells: [cells_per_row][]const u8 = undefined;
+    for (&cells) |*cell| {
         const part = parts.next() orelse return null;
-        cells[count] = std.mem.trim(u8, part, " ");
+        cell.* = std.mem.trim(u8, part, " ");
+        if (cell.*.len == 0) return null;
     }
+    const closing = parts.next() orelse return null;
+    if (std.mem.trim(u8, closing, " ").len != 0) return null;
     if (parts.next() != null) return null;
-    if (cells[0].len != 0 or cells[names_row_parts - 1].len != 0) return null;
     return cells;
 }
 
-/// What a names table check got wrong. For `error.MalformedNamesRow`, `line` is the row, so the test
-/// that calls the check can show it. The checks print nothing themselves.
-const NamesTableFailure = struct {
+/// What a table check got wrong. For `error.MalformedTableRow`, `line` is the row, so the test that
+/// calls the check can show it. The checks print nothing themselves.
+const TableFailure = struct {
     line: []const u8 = "",
 };
 
-/// Checks every row of a names table and returns how many rows it has. Any line with a bar is a
-/// row, so a row that lacks an outer bar is checked too and not skipped.
-fn checkNamesTable(
+/// Splits the rows of a table in sh-fx.md into cells and returns how many rows it has. A line with no
+/// bar is text and is skipped, and so are the header and the separator line. Any other line is a row,
+/// so a row without an outer bar is checked and not skipped.
+fn splitTable(
+    comptime cells_per_row: usize,
     table: []const u8,
-    agent_methods: std.json.Value,
-    client_methods: std.json.Value,
-    failure: *NamesTableFailure,
+    rows: []TableRow(cells_per_row),
+    failure: *TableFailure,
 ) !usize {
-    var olds: [max_names_table_rows][]const u8 = undefined;
-    var news: [max_names_table_rows][]const u8 = undefined;
-    var rows: usize = 0;
+    var count: usize = 0;
     var lines = std.mem.splitScalar(u8, table, '\n');
     while (lines.next()) |line| {
         if (std.mem.findScalar(u8, line, '|') == null) continue;
         if (std.mem.startsWith(u8, line, "| Today |") or std.mem.startsWith(u8, line, "| --- |")) continue;
-        if (rows == max_names_table_rows) return error.NamesTableTooLong;
-        const cells = namesRowCells(line);
-        const old = if (cells) |row| codeCell(row[1]) else null;
-        const new = if (cells) |row| codeCell(row[3]) else null;
-        if (old == null or new == null) {
+        if (count == rows.len) return error.TableTooLong;
+        const cells = tableRowCells(cells_per_row, line) orelse {
             failure.line = line;
-            return error.MalformedNamesRow;
-        }
-        try checkNameRow(old.?, new.?, cells.?[2], agent_methods, client_methods, olds[0..rows], news[0..rows]);
-        olds[rows] = old.?;
-        news[rows] = new.?;
-        rows += 1;
+            return error.MalformedTableRow;
+        };
+        rows[count] = .{ .line = line, .cells = cells };
+        count += 1;
     }
-    return rows;
+    if (count == 0) return error.TableHasNoRows;
+    return count;
+}
+
+/// Checks every row of the names table and returns how many rows it has.
+fn checkNamesTable(
+    table: []const u8,
+    agent_methods: std.json.Value,
+    client_methods: std.json.Value,
+    failure: *TableFailure,
+) !usize {
+    var rows: [max_names_table_rows]TableRow(names_table_cells) = undefined;
+    const count = try splitTable(names_table_cells, table, &rows, failure);
+    var olds: [max_names_table_rows][]const u8 = undefined;
+    var news: [max_names_table_rows][]const u8 = undefined;
+    for (rows[0..count], 0..) |row, index| {
+        const old = codeCell(row.cells[0]);
+        const new = codeCell(row.cells[2]);
+        if (old == null or new == null) {
+            failure.line = row.line;
+            return error.MalformedTableRow;
+        }
+        try checkNameRow(old.?, new.?, row.cells[1], agent_methods, client_methods, olds[0..index], news[0..index]);
+        olds[index] = old.?;
+        news[index] = new.?;
+    }
+    return count;
 }
 
 /// Checks a names table against the method lists in ACP's `meta.json` and returns its row count.
-fn checkNamesTableAgainstAcp(table: []const u8, failure: *NamesTableFailure) !usize {
+fn checkNamesTableAgainstAcp(table: []const u8, failure: *TableFailure) !usize {
     const meta = try parseSpecFile(acp_meta);
     defer meta.deinit();
     const agent_methods = field(meta.value, "agentMethods") orelse return error.TestUnexpectedResult;
@@ -476,8 +512,20 @@ fn checkNamesTableAgainstAcp(table: []const u8, failure: *NamesTableFailure) !us
 
 /// Expects `checkNamesTableAgainstAcp` to fail with `expected` on `table`.
 fn expectNamesTableError(expected: anyerror, table: []const u8) !void {
-    var failure: NamesTableFailure = .{};
+    var failure: TableFailure = .{};
     try std.testing.expectError(expected, checkNamesTableAgainstAcp(table, &failure));
+}
+
+/// Prints why a table check failed. The test that calls the check prints it, because the checks print
+/// nothing themselves. `max_rows` is the row cap of the table.
+fn printTableFailure(name: []const u8, max_rows: usize, err: anyerror, failure: TableFailure) void {
+    switch (err) {
+        error.MalformedTableRow => std.debug.print("sh-fx.md has a malformed row in its {s}: {s}\n", .{ name, failure.line }),
+        error.TableTooLong => std.debug.print("sh-fx.md {s} has more than {d} rows, which is more than this test holds\n", .{ name, max_rows }),
+        error.TableHasNoRows => std.debug.print("sh-fx.md {s} has no rows\n", .{name}),
+        error.RemovedKeyNamesNewName, error.NotAnShFxKey, error.RepeatedKeyRow => std.debug.print("sh-fx.md {s} row fails {s}: {s}\n", .{ name, @errorName(err), failure.line }),
+        else => {},
+    }
 }
 
 /// Returns a names table of `count` rows, each with its own names, for the row cap.
@@ -498,29 +546,40 @@ test "the table of names in use today gives each name one valid new name" {
         std.debug.print("sh-fx.md has no \"Names in use today\" section\n", .{});
         return error.TestUnexpectedResult;
     };
-    var failure: NamesTableFailure = .{};
-    const rows = checkNamesTableAgainstAcp(table, &failure) catch |err| {
-        switch (err) {
-            error.MalformedNamesRow => std.debug.print("sh-fx.md has a malformed row in its names table: {s}\n", .{failure.line}),
-            error.NamesTableTooLong => std.debug.print("sh-fx.md names table has more than {d} rows, which is more than this test holds\n", .{max_names_table_rows}),
-            else => {},
-        }
+    var failure: TableFailure = .{};
+    _ = checkNamesTableAgainstAcp(table, &failure) catch |err| {
+        printTableFailure("names table", max_names_table_rows, err, failure);
         return err;
     };
-    try std.testing.expect(rows > 0);
 }
 
 test "a names table row has both outer bars and exactly four cells" {
-    try std.testing.expect(namesRowCells("| `libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text |") != null);
+    try std.testing.expect(tableRowCells(names_table_cells, "| `libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text |") != null);
     for ([_][]const u8{
         "| `libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text | extra",
         "| `libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds | text",
         "`libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text |",
-    }) |line| try std.testing.expect(namesRowCells(line) == null);
+    }) |line| try std.testing.expect(tableRowCells(names_table_cells, line) == null);
 }
 
 test "a names table rejects a row without an opening bar" {
-    try expectNamesTableError(error.MalformedNamesRow, "`libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text |");
+    try expectNamesTableError(error.MalformedTableRow, "`libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text |");
+}
+
+test "a names table rejects a row without a closing bar" {
+    try expectNamesTableError(error.MalformedTableRow, "| `libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text");
+}
+
+test "a names table rejects a row with an extra cell" {
+    try expectNamesTableError(error.MalformedTableRow, "| `libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text | extra |");
+}
+
+test "a names table rejects a row with an empty cell" {
+    try expectNamesTableError(error.MalformedTableRow, "| `libfx/steer` | client to fx, request |  | Adds text |");
+}
+
+test "a names table with no rows fails" {
+    try expectNamesTableError(error.TableHasNoRows, "");
 }
 
 test "a names table rejects a repeated name" {
@@ -536,10 +595,10 @@ test "a names table rejects an unknown direction" {
 }
 
 test "a names table of exactly the row cap passes and one more row fails" {
-    var failure: NamesTableFailure = .{};
+    var failure: TableFailure = .{};
     const rows = try checkNamesTableAgainstAcp(comptime namesTableWithRows(max_names_table_rows), &failure);
     try std.testing.expectEqual(max_names_table_rows, rows);
-    try expectNamesTableError(error.NamesTableTooLong, comptime namesTableWithRows(max_names_table_rows + 1));
+    try expectNamesTableError(error.TableTooLong, comptime namesTableWithRows(max_names_table_rows + 1));
 }
 
 /// Checks one row of the names table: a known direction, an old name that is not already an sh.fx
@@ -582,57 +641,104 @@ fn keyKind(cell: []const u8) ?KeyKind {
     return null;
 }
 
+/// Checks every row of the keys table and returns how many rows it has.
+fn checkKeysTable(table: []const u8, failure: *TableFailure) !usize {
+    var rows: [max_keys_table_rows]TableRow(keys_table_cells) = undefined;
+    const count = try splitTable(keys_table_cells, table, &rows, failure);
+    const Seen = struct { today: []const u8, where: []const u8, new: []const u8, kind: KeyKind };
+    var seen: [max_keys_table_rows]Seen = undefined;
+    for (rows[0..count], 0..) |row, index| {
+        const cells = row.cells;
+        const today = codeCell(cells[0]);
+        const kind = keyKind(cells[3]);
+        if (today == null or kind == null) {
+            failure.line = row.line;
+            return error.MalformedTableRow;
+        }
+        const new: []const u8 = switch (kind.?) {
+            .removed => if (std.mem.eql(u8, cells[2], "-")) "-" else {
+                failure.line = row.line;
+                return error.RemovedKeyNamesNewName;
+            },
+            .meta_key, .capability => name: {
+                const name = codeCell(cells[2]) orelse "";
+                if (!isKeyName(name)) {
+                    failure.line = row.line;
+                    return error.NotAnShFxKey;
+                }
+                break :name name;
+            },
+        };
+        for (seen[0..index]) |earlier| {
+            const same_place = std.mem.eql(u8, earlier.today, today.?) and std.mem.eql(u8, earlier.where, cells[1]);
+            const same_name = kind.? != .removed and earlier.kind == kind.? and std.mem.eql(u8, earlier.new, new);
+            if (same_place or same_name) {
+                failure.line = row.line;
+                return error.RepeatedKeyRow;
+            }
+        }
+        seen[index] = .{ .today = today.?, .where = cells[1], .new = new, .kind = kind.? };
+    }
+    return count;
+}
+
+/// Expects `checkKeysTable` to fail with `expected` on `table`.
+fn expectKeysTableError(expected: anyerror, table: []const u8) !void {
+    var failure: TableFailure = .{};
+    try std.testing.expectError(expected, checkKeysTable(table, &failure));
+}
+
+/// Returns a keys table of `count` rows, each with its own names, for the row cap.
+fn keysTableWithRows(comptime count: usize) []const u8 {
+    @setEvalBranchQuota(100_000);
+    var table: []const u8 = "";
+    for (0..count) |index| {
+        table = table ++ std.fmt.comptimePrint(
+            "| `_meta.fx.op{d}` | `session/new` params | `sh.fx/op{d}` | `_meta` key | Does one thing |\n",
+            .{ index, index },
+        );
+    }
+    return table;
+}
+
 test "the table of keys in use today gives each key one valid new name" {
     const table = section(fx_spec.bytes, "Keys in use today") orelse {
         std.debug.print("sh-fx.md has no \"Keys in use today\" section\n", .{});
         return error.TestUnexpectedResult;
     };
-    const Row = struct { today: []const u8, where: []const u8, new: []const u8, kind: KeyKind };
-    var rows: [64]Row = undefined;
-    var count: usize = 0;
-    var lines = std.mem.splitScalar(u8, table, '\n');
-    while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "|")) continue;
-        if (std.mem.startsWith(u8, line, "| Today |") or std.mem.startsWith(u8, line, "| --- |")) continue;
-        var cells: [7][]const u8 = undefined;
-        var cell_count: usize = 0;
-        var parts = std.mem.splitScalar(u8, line, '|');
-        while (parts.next()) |part| : (cell_count += 1) {
-            if (cell_count == cells.len) break;
-            cells[cell_count] = std.mem.trim(u8, part, " ");
-        }
-        const today = if (cell_count == cells.len) codeCell(cells[1]) else null;
-        const kind = if (cell_count == cells.len) keyKind(cells[4]) else null;
-        if (today == null or kind == null or count == rows.len) {
-            std.debug.print("sh-fx.md has a malformed row in its keys table: {s}\n", .{line});
-            return error.TestUnexpectedResult;
-        }
-        const new: []const u8 = switch (kind.?) {
-            .removed => if (std.mem.eql(u8, cells[3], "-")) "-" else {
-                std.debug.print("{s} is removed but still names \"{s}\"\n", .{ today.?, cells[3] });
-                return error.TestUnexpectedResult;
-            },
-            .meta_key, .capability => name: {
-                const name = codeCell(cells[3]) orelse "";
-                if (!isKeyName(name)) {
-                    std.debug.print("{s} maps to \"{s}\", which is not an sh.fx key\n", .{ today.?, cells[3] });
-                    return error.TestUnexpectedResult;
-                }
-                break :name name;
-            },
-        };
-        for (rows[0..count]) |seen| {
-            const same_place = std.mem.eql(u8, seen.today, today.?) and std.mem.eql(u8, seen.where, cells[2]);
-            const same_name = kind.? != .removed and seen.kind == kind.? and std.mem.eql(u8, seen.new, new);
-            if (same_place or same_name) {
-                std.debug.print("{s} ({s}) repeats a row of the keys table\n", .{ today.?, cells[2] });
-                return error.TestUnexpectedResult;
-            }
-        }
-        rows[count] = .{ .today = today.?, .where = cells[2], .new = new, .kind = kind.? };
-        count += 1;
-    }
-    try std.testing.expect(count > 0);
+    var failure: TableFailure = .{};
+    _ = checkKeysTable(table, &failure) catch |err| {
+        printTableFailure("keys table", max_keys_table_rows, err, failure);
+        return err;
+    };
+}
+
+test "a keys table of exactly the row cap passes and one more row fails" {
+    var failure: TableFailure = .{};
+    const rows = try checkKeysTable(comptime keysTableWithRows(max_keys_table_rows), &failure);
+    try std.testing.expectEqual(max_keys_table_rows, rows);
+    try expectKeysTableError(error.TableTooLong, comptime keysTableWithRows(max_keys_table_rows + 1));
+}
+
+test "a keys table rejects a row without an opening bar" {
+    try expectKeysTableError(error.MalformedTableRow, "`_meta.fx.steer` | `session/prompt` params | `sh.fx/steer` | `_meta` key | Makes a prompt a steer |");
+}
+
+test "a keys table rejects a row without a closing bar" {
+    try expectKeysTableError(error.MalformedTableRow, "| `_meta.fx.steer` | `session/prompt` params | `sh.fx/steer` | `_meta` key | Makes a prompt a steer");
+}
+
+test "a keys table rejects a row with an extra cell" {
+    try expectKeysTableError(error.MalformedTableRow, "| `_meta.fx.steer` | `session/prompt` params | `sh.fx/steer` | `_meta` key | Makes a prompt a steer | extra |");
+}
+
+test "a keys table rejects a row with an empty cell" {
+    try expectKeysTableError(error.MalformedTableRow, "| `_meta.fx.steer` | `session/prompt` params |  | `_meta` key | Makes a prompt a steer |");
+}
+
+test "a keys table with no rows fails" {
+    try expectKeysTableError(error.TableHasNoRows, "");
+    try expectKeysTableError(error.TableHasNoRows, "| Today | Where | New | Kind | What it carries |\n| --- | --- | --- | --- | --- |\n");
 }
 
 test "every sh.fx name in sh-fx.md follows the naming rules" {
