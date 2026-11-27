@@ -35,9 +35,10 @@ pub const token_env = "FX_MCP_CALL_TOKEN";
 pub const max_request_bytes: usize = 1024 * 1024;
 /// The longest reply header line the client reads.
 pub const max_header_bytes: usize = 4 * 1024;
-/// Deepest nesting a request line may have, counted on its raw text before
-/// std.json builds it. The envelope object is level 1, so `arguments` keeps the
-/// depth `json_depth.max_depth` allows when it is counted from its own object.
+/// Deepest nesting a request line may have, counted on its raw text once the
+/// line has parsed, before any field is read or written back. The envelope
+/// object is level 1, so `arguments` keeps the depth `json_depth.max_depth`
+/// allows when it is counted from its own object.
 const max_line_depth: usize = json_depth.max_depth + 1;
 
 pub const token_hex_len = 2 * @sizeOf(mcp_call.Token);
@@ -113,11 +114,11 @@ pub const RequestError = error{ MalformedRequest, OutOfMemory };
 /// Parses one request line. The result borrows from `arena`.
 pub fn parseRequest(arena: Allocator, line: []const u8) RequestError!Request {
     if (line.len > max_request_bytes) return error.MalformedRequest;
-    if (json_depth.exceedsDepth(line, max_line_depth)) return error.MalformedRequest;
     const value = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedRequest,
     };
+    if (json_depth.exceedsDepth(line, max_line_depth)) return error.MalformedRequest;
     if (value != .object) return error.MalformedRequest;
     const object = value.object;
     const version = object.get("v") orelse return error.MalformedRequest;
@@ -696,6 +697,17 @@ test "a request line nested one level past the limit is refused, even outside ar
             try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
         }
     }
+}
+
+test "a request line nested far past the limit is refused, not a crash, once it parses" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // About 1 MB of nesting, the longest line max_request_bytes allows.
+    const line = try nestedCallLine(arena, 500_000);
+    try std.testing.expect(line.len <= max_request_bytes);
+    try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
 }
 
 fn nestedCallLine(arena: Allocator, array_levels: usize) ![]const u8 {
