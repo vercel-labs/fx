@@ -1282,9 +1282,18 @@ fn buildPrintfCommand(
 }
 
 test "shell quoting writes a single quote as close, escaped quote, reopen" {
-    const command = try buildPrintfCommand(std.testing.allocator, "%s", &.{"it's"});
-    defer std.testing.allocator.free(command);
-    try std.testing.expectEqualStrings("printf '%s' 'it'\\''s'", command);
+    const cases = [_]struct { value: []const u8, expected: []const u8 }{
+        .{ .value = "it's", .expected = "printf '%s' 'it'\\''s'" },
+        .{ .value = "", .expected = "printf '%s' ''" },
+        .{ .value = "'''", .expected = "printf '%s' ''\\'''\\'''\\'''" },
+        .{ .value = "'x", .expected = "printf '%s' ''\\''x'" },
+        .{ .value = "x'", .expected = "printf '%s' 'x'\\'''" },
+    };
+    for (cases) |case| {
+        const command = try buildPrintfCommand(std.testing.allocator, "%s", &.{case.value});
+        defer std.testing.allocator.free(command);
+        try std.testing.expectEqualStrings(case.expected, command);
+    }
 }
 
 fn expectNativePrintfEquivalent(command: []const u8, target_os: std.Target.Os.Tag) !void {
