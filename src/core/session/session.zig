@@ -123,7 +123,7 @@ fn isResumeTurn(turn: HistoryTurn) bool {
 
 /// A resume that ran nothing before fx resumed the request again: the later
 /// resume dropped it, so every later request drops it too.
-fn isSupersededResume(history: []const HistoryTurn, index: usize) bool {
+pub fn isSupersededResume(history: []const HistoryTurn, index: usize) bool {
     if (index + 1 >= history.len) return false;
     return switch (history[index]) {
         .interrupted => |entry| ranNothing(entry) and isResumeTurn(history[index]) and isResumeTurn(history[index + 1]),
@@ -2258,6 +2258,27 @@ fn appendActiveContextHistoryChatMessagesWithTrailingProjection(
     }
 }
 
+test "each turn projects the update it saved on its own message, after a provider block too (D103)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const low = core_types.ReasoningEffort.literal("low");
+    const block = "fx-compactor-v1\n{\"provider\":{\"provider\":\"gateway\",\"model\":\"openai/gpt-6.1-sol\",\"parts_json\":\"[]\",\"kept_turns\":2,\"reasoning_anchor\":\"high\"}}";
+    const history = [_]HistoryTurn{
+        .{ .compacted_summary = .{ .summary = @constCast(block), .removed_turn_count = 2, .compaction_count = 1 } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("kept") }, .assistant = @constCast("done"), .execution = .{ .turn_effort = low } } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("new") }, .assistant = @constCast("done"), .execution = .{ .turn_effort = low, .effort_update = low } } },
+    };
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendHistoryChatMessages(arena, &messages, &history);
+    try std.testing.expectEqual(core_types.ChatRole.assistant, messages.items[0].role);
+    try std.testing.expect(messages.items[0].effort_update == null);
+    try std.testing.expectEqualStrings("kept", messages.items[1].content.?);
+    try std.testing.expect(messages.items[1].effort_update == null);
+    try std.testing.expectEqualStrings("new", messages.items[3].content.?);
+    try std.testing.expect(messages.items[3].effort_update.?.eql(low));
+}
+
 test "active context projects checkpoint before retained raw tail" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -2814,14 +2835,14 @@ fn appendHistoryRangeChatMessages(
         switch (turn) {
             .compacted_summary => |entry| kept = try appendCompactedSummaryChatMessage(alloc, messages, entry.summary),
             .assistant => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = resume_note orelse entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
+                try messages.append(alloc, .{ .role = .user, .content = resume_note orelse entry.user.text, .images = entry.user.images, .context_origin = .user_turn, .effort_update = entry.execution.effort_update });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
                 if (entry.assistant.len > 0 or entry.provider_replay != null) {
                     try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant, .provider_replay = entry.provider_replay });
                 }
             },
             .interrupted => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = resume_note orelse entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
+                try messages.append(alloc, .{ .role = .user, .content = resume_note orelse entry.user.text, .images = entry.user.images, .context_origin = .user_turn, .effort_update = entry.execution.effort_update });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
                 if (entry.tool_call) |tool_call| {
                     const assistant_content = try formatInterruptedAssistantToolContent(alloc, entry);

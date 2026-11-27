@@ -2966,6 +2966,64 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP effort change on GPT-6 keeps the session's first effort and sends the change as an update",
+    async () => {
+      // GPT-6 drops its whole prompt cache when the request's own effort
+      // changes (D103).
+      const model = "openai/gpt-6.1-sol";
+      const root = createIsolatedRoot("fx-acp-effort-update-");
+      const gateway = startFakeGateway(
+        [finalText("FIRST_DONE"), finalText("SECOND_DONE")],
+        {
+          models: [{
+            id: model,
+            type: "language",
+            tags: ["tool-use", "reasoning"],
+            context_window: 400_000,
+            reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh"] }],
+          }],
+        },
+      );
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: model },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
+        await client.readLine(); // consume session/update notification
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const sessionId = created.result.sessionId as string;
+
+        const low = await client.request("session/set_config_option", { sessionId, configId: "effort", value: "low" }, 4) as any;
+        expect(low.error).toBeUndefined();
+        const first = await runPrompt(client, "Say FIRST_DONE.", TIMEOUT);
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        const high = await client.request("session/set_config_option", { sessionId, configId: "effort", value: "high" }, 5) as any;
+        expect(high.error).toBeUndefined();
+        const second = await runPrompt(client, "Say SECOND_DONE.", TIMEOUT);
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+
+        const bodies = gateway.requests.map((request) => JSON.parse(request.body) as { prompt: unknown[]; reasoning?: string });
+        expect(bodies).toHaveLength(2);
+        expect(bodies.map((body) => body.reasoning)).toEqual(["low", "low"]);
+        expect(bodies[1]!.prompt.slice(0, bodies[0]!.prompt.length)).toEqual(bodies[0]!.prompt);
+        const updates = bodies[1]!.prompt.filter((message) => JSON.stringify(message).includes("reasoningEffortUpdate"));
+        expect(updates).toEqual([{ role: "system", content: "", providerOptions: { openai: { reasoningEffortUpdate: "high" } } }]);
+        const at = bodies[1]!.prompt.indexOf(updates[0]);
+        expect(JSON.stringify(bodies[1]!.prompt[at + 1])).toContain("Say SECOND_DONE.");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP reload after a crash during a retry shows the finished tool result once and a new prompt goes on",
     async () => {
       const root = createIsolatedRoot("fx-acp-reload-model-recovery-");

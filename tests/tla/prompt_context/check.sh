@@ -30,6 +30,12 @@
 # reads the stable instructions after it, which openai-current-context.cfg
 # shows fx did not before.
 #
+# p6-openai-effort.cfg adds a turn that asks for another reasoning effort on
+# GPT-6: the request keeps the session's first effort and an update block rides
+# right before that turn's message (D103). p6-mutant-effort-follows-current.cfg
+# lets the request's own effort follow the turn, as fx did, which
+# MidSessionKeepsHistory catches.
+#
 # p6-attach.cfg and p6-openai-attach.cfg add a user turn that attaches a file from a
 # folder with its own AGENTS.md, as an ACP client does: its rules ride on that turn's
 # own message. p6-mutant-attach-in-instructions.cfg puts them in the instructions for
@@ -97,4 +103,6 @@ MCPromptCache p6-openai-overlay - -deadlock
 MCPromptCache p6-mutant-overlay-rebuilt MidSessionKeepsHistory -deadlock
 MCPromptCache p6-mutant-overlay-not-saved MidSessionKeepsHistory -deadlock
 MCPromptCache p6-mutant-skill-swapped MidSessionKeepsHistory -deadlock
+MCPromptCache p6-openai-effort - -deadlock
+MCPromptCache p6-mutant-effort-follows-current MidSessionKeepsHistory -deadlock
 EOT

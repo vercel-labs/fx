@@ -79,7 +79,7 @@ function step(request: { body: Body }) {
  * A session of six turns on `model` through the fake gateway, then `body`
  * with it. The gateway's evidence is kept when `body` fails.
  */
-async function withSession(model: string, options: Partial<ProviderGatewayOptions>, body: (session: Session, gateway: Gateway) => Promise<void>) {
+async function withSession(model: string, options: Partial<ProviderGatewayOptions>, body: (session: Session, gateway: Gateway) => Promise<void>, turnArgs: (turn: number) => string[] = () => []) {
   const { root, home, cwd } = fixture(model);
   const started = startProviderGateway({
     models: [{ id: model, type: "language", tags: ["tool-use", "reasoning"], context_window: 400_000, max_tokens: 8192 }],
@@ -99,11 +99,11 @@ async function withSession(model: string, options: Partial<ProviderGatewayOption
   };
   let passed = false;
   try {
-    const first = await ask(env, cwd, root, "t1", [], "TURN 1 Start the work.");
+    const first = await ask(env, cwd, root, "t1", turnArgs(1), "TURN 1 Start the work.");
     expect(first.code).toBe(0);
     const sessionId: string = first.json.session_id;
     for (let turn = 2; turn <= 6; turn += 1) {
-      const next = await ask(env, cwd, root, `t${turn}`, ["--resume", sessionId], `TURN ${turn} Continue.`);
+      const next = await ask(env, cwd, root, `t${turn}`, ["--resume", sessionId, ...turnArgs(turn)], `TURN ${turn} Continue.`);
       expect(next.code).toBe(0);
     }
     const sixth = observed.at(-1)!.body;
@@ -203,6 +203,194 @@ describe("provider compaction", () => {
       });
     }, 240_000);
   });
+
+  // After a provider's block, GPT-6 runs at the request's own effort plus
+  // the updates sent after the block, not at the effort the replaced turns
+  // set (measured live). Each turn saves the update it sent, so the kept
+  // turns keep their bytes, and a new turn decides against that (D103).
+  const effortModels = (contextWindow: () => number) => (() => [{ id: FAMILIES.openai.model, type: "language", tags: ["tool-use", "reasoning"], context_window: contextWindow(), max_tokens: 8192, reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh"] }] }]) as any;
+  const effortUpdates = (body: Body) => body.prompt.flatMap((message, index) => {
+    const value = (message.providerOptions as any)?.openai?.reasoningEffortUpdate;
+    return value === undefined ? [] : [`${value} before ${lastUserText({ prompt: [body.prompt[index + 1]!] }).match(/TURN \d+/)?.[0]}`];
+  });
+  /** The effort the model runs at for the request's last user message: the
+   * request's own, then each update in the prompt. */
+  const runsAt = (body: Body & { reasoning?: string }) => {
+    let effort = body.reasoning ?? "default";
+    const last = body.prompt.map((message) => message.role).lastIndexOf("user");
+    for (const message of body.prompt.slice(0, last)) {
+      const value = (message.providerOptions as any)?.openai?.reasoningEffortUpdate;
+      if (value !== undefined) effort = value;
+    }
+    return effort;
+  };
+
+  test("a GPT-6 block keeps the session's first effort, and the turn after its kept turns sets its own (D103)", async () => {
+    // Turn 1 asks for high and turns 2 to 6 for low. The block replaces
+    // turns 1 to 3 and keeps 4 to 6, which went out with no update.
+    const model = FAMILIES.openai.model;
+    await withSession(model, { models: effortModels(() => 400_000) }, async (session, { observed, counts, edits }) => {
+      const { root, cwd, env, sessionId, sixthTurns, before } = session;
+      const sixth = observed.at(-1)!.body as Body & { reasoning?: string };
+      expect(sixth.reasoning).toBe("high");
+      expect(effortUpdates(sixth)).toEqual(["low before TURN 2"]);
+      const seventh = await ask({ ...env, FX_AUTO_COMPACT_PERCENT: "10" }, cwd, root, "t7", ["--resume", sessionId, "--effort", "low"], "TURN 7 What did the first turns cover?");
+      expect(seventh.code).toBe(0);
+      expect(counts.provider).toBe(1);
+
+      const compaction = observed.slice(before).find((request) => request.kind === "compaction")!.body as Body & { reasoning?: string };
+      expect(compaction.reasoning).toBe("high");
+      expect(effortUpdates(compaction)).toEqual(["low before TURN 2"]);
+      // After the block: the anchor, the kept turns exactly as sent, and the
+      // new turn's own update, so it runs at low.
+      const after = agentRequestFor(observed, before, 7)! as Body & { reasoning?: string };
+      expect(after.reasoning).toBe("high");
+      expect(conversationOf(after).slice(1, 1 + sixthTurns.length).map(withoutCacheMarkers)).toEqual(sixthTurns.map(withoutCacheMarkers));
+      expect(effortUpdates(after)).toEqual(["low before TURN 7"]);
+      expect(runsAt(after)).toBe("low");
+
+      const eighth = await ask(env, cwd, root, "t8", ["--resume", sessionId, "--effort", "low"], "TURN 8 Thanks.");
+      expect(eighth.code).toBe(0);
+      const next = agentRequestFor(observed, before, 8)! as Body & { reasoning?: string };
+      expect(next.reasoning).toBe("high");
+      expect(next.prompt.slice(0, after.prompt.length)).toEqual(after.prompt);
+      expect(effortUpdates(next)).toEqual(["low before TURN 7"]);
+      expect(runsAt(next)).toBe("low");
+      expect(edits).toEqual([]);
+    }, (turn) => ["--effort", turn === 1 ? "high" : "low"]);
+  }, 240_000);
+
+  test("a second GPT-6 block keeps turns with and without their own update unchanged (D103)", async () => {
+    // Block 1 replaces turns 1 and 2 and keeps 3 to 5, which went out with no
+    // update; turn 6 is new after it and sends `low`. A smaller context window
+    // makes turn 7 compact again, keeping turns from both kinds.
+    const model = FAMILIES.openai.model;
+    let contextWindow = 400_000;
+    const { root, home, cwd } = fixture(model);
+    const turnOf = (request: { body: Body }) => Number(lastUserText(request.body).match(/TURN (\d+)/)?.[1] ?? 0);
+    const started = startProviderGateway({
+      models: effortModels(() => contextWindow),
+      defaultModel: model,
+      step: (request) => ({ kind: "final" as const, text: turnOf(request) === 2 ? `Turn 2 done. ${OLDER_TEXT}` : `Turn ${turnOf(request)} done.` }),
+      compaction: () => ({ kind: "block" }),
+    });
+    const { gateway, edits, observed, counts } = started;
+    const env: Record<string, string> = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+      AI_GATEWAY_API_KEY: "synthetic-provider-compaction", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model, FX_TRACE_LOG: join(root, "trace.log"),
+      FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    };
+    let passed = false;
+    try {
+      const first = await ask(env, cwd, root, "t1", ["--effort", "high"], "TURN 1 Start the work.");
+      expect(first.code).toBe(0);
+      const sessionId: string = first.json.session_id;
+      for (let turn = 2; turn <= 7; turn += 1) {
+        if (turn === 7) contextWindow = 60_000;
+        const compact = turn >= 6 ? { FX_AUTO_COMPACT_PERCENT: "10" } : {};
+        const next = await ask({ ...env, ...compact }, cwd, root, `t${turn}`, ["--resume", sessionId, "--effort", "low"], `TURN ${turn} Continue.`);
+        expect(next.code).toBe(0);
+      }
+      expect(counts.provider).toBe(2);
+      // Every turn runs at the effort it asked for, and every request names
+      // the session's first effort.
+      for (const request of observed.filter((request) => request.kind === "agent")) {
+        const body = request.body as Body & { reasoning?: string };
+        expect(body.reasoning).toBe("high");
+        expect(runsAt(body)).toBe(turnOf(request) === 1 ? "high" : "low");
+      }
+      // The second block keeps turns from block 1's kept ones, which have no
+      // update, and turn 6, which has its own, each as it was first sent.
+      const last = observed.filter((request) => request.kind === "agent").at(-1)!.body;
+      const kept = effortUpdates(last);
+      expect(kept).toEqual(["low before TURN 6"]);
+      expect(conversationOf(last).some((message) => message.role === "user" && JSON.stringify(message.content).includes("TURN 5"))).toBe(true);
+      expect(edits).toEqual([]);
+      passed = true;
+    } finally {
+      gateway.stop();
+      if (passed) rmSync(root, { recursive: true, force: true });
+      else {
+        writeFileSync(join(root, "requests.json"), JSON.stringify(observed.map((request) => request.body), null, 1));
+        console.error(`provider compaction evidence retained: ${root} edits=${JSON.stringify(edits)} counts=${JSON.stringify(counts)}`);
+      }
+    }
+  }, 240_000);
+
+  // Turns 1 to 4 ask for high and turns 5 and 6 for low; turn 4's long reply
+  // makes the block replace turns 1 to 4 and keep 5 and 6. Turn 5's update
+  // rides after the block, so the model runs at low there, and turn 7, which
+  // asks for high, must send its own update (D103).
+  async function effortAfterKeptUpdate(compactAt: number) {
+    const model = FAMILIES.openai.model;
+    const { root, home, cwd } = fixture(model);
+    const turnOf = (request: { body: Body }) => Number(lastUserText(request.body).match(/TURN (\d+)/)?.[1] ?? 0);
+    const started = startProviderGateway({
+      models: effortModels(() => 400_000),
+      defaultModel: model,
+      step: (request) => ({ kind: "final" as const, text: turnOf(request) === 4 ? `Turn 4 done. ${OLDER_TEXT}` : `Turn ${turnOf(request)} done.` }),
+      compaction: () => ({ kind: "block" }),
+    });
+    const { gateway, edits, observed, counts } = started;
+    const env: Record<string, string> = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+      AI_GATEWAY_API_KEY: "synthetic-provider-compaction", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model, FX_TRACE_LOG: join(root, "trace.log"),
+      FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    };
+    const effortOf = (turn: number) => (turn <= 4 || turn >= 7 ? "high" : "low");
+    let passed = false;
+    try {
+      const first = await ask(env, cwd, root, "t1", ["--effort", "high"], "TURN 1 Start the work.");
+      expect(first.code).toBe(0);
+      const sessionId: string = first.json.session_id;
+      for (let turn = 2; turn <= 8; turn += 1) {
+        const compact = turn === compactAt ? { FX_AUTO_COMPACT_PERCENT: "10" } : {};
+        const next = await ask({ ...env, ...compact }, cwd, root, `t${turn}`, ["--resume", sessionId, "--effort", effortOf(turn)], `TURN ${turn} Continue.`);
+        expect(next.code).toBe(0);
+        if (turn === compactAt) expect(counts.provider).toBe(1);
+      }
+      expect(counts.provider).toBe(1);
+      const agent = observed.filter((request) => request.kind === "agent");
+      const seventh = agent.filter((request) => turnOf(request) === 7)[0]!.body as Body & { reasoning?: string };
+      const users = conversationOf(seventh).filter((message) => message.role === "user").map((message) => JSON.stringify(message.content));
+      // The block took turns 1 to 4 and kept 5 and 6.
+      expect(users.some((text) => text.includes("TURN 4"))).toBe(false);
+      expect(users.some((text) => text.includes("TURN 5"))).toBe(true);
+      expect(seventh.reasoning).toBe("high");
+      expect(effortUpdates(seventh)).toEqual(["low before TURN 5", "high before TURN 7"]);
+      expect(runsAt(seventh)).toBe("high");
+      // The next turn sends turn 7 as it was sent, and asks for high again,
+      // so it adds nothing.
+      const eighth = agent.filter((request) => turnOf(request) === 8)[0]!.body as Body & { reasoning?: string };
+      expect(eighth.prompt.slice(0, seventh.prompt.length)).toEqual(seventh.prompt);
+      expect(effortUpdates(eighth)).toEqual(["low before TURN 5", "high before TURN 7"]);
+      expect(runsAt(eighth)).toBe("high");
+      for (const request of agent) expect(runsAt(request.body as Body & { reasoning?: string })).toBe(effortOf(turnOf(request)));
+      expect(edits).toEqual([]);
+      passed = true;
+    } finally {
+      gateway.stop();
+      if (passed) rmSync(root, { recursive: true, force: true });
+      else {
+        writeFileSync(join(root, "requests.json"), JSON.stringify(observed.map((request) => request.body), null, 1));
+        console.error(`provider compaction evidence retained: ${root} edits=${JSON.stringify(edits)} counts=${JSON.stringify(counts)}`);
+      }
+    }
+  }
+
+  test("a GPT-6 turn after a resumed block counts the update a kept turn saved (D103)", async () => {
+    // Turn 6 compacts at its first request; turn 7 is a new process.
+    await effortAfterKeptUpdate(6);
+  }, 240_000);
+
+  test("a GPT-6 turn that compacts at its first request counts the update a kept turn saved (D103)", async () => {
+    // Turn 7 compacts at its first request and decides again in the same process.
+    await effortAfterKeptUpdate(7);
+  }, 240_000);
 
   test("a block written after a model switch keeps the other model's steps as their text", async () => {
     const models = Object.values(FAMILIES).map((family) => ({ id: family.model, type: "language", tags: ["tool-use", "reasoning"], context_window: 400_000, max_tokens: 8192 }));

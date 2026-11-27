@@ -20,6 +20,9 @@
 // A named skill's text rides on its turn's message, and later turns send that
 // message as the turn sent it, the text included (D95,
 // src/core/agent/runtime/orchestrator.zig carryExplicitSkill).
+// On GPT-6 a reasoning effort changed between turns keeps the session's first
+// effort on every request and rides as an update message right before that
+// turn's own message (D103, src/gateway/vercel_protocol.zig).
 //
 // Evidence goes to FX_TLA_OUT or a temp folder, under midsession/: every
 // Gateway request, activity.jsonl, observed.json, timeline.md and TLC logs.
@@ -50,7 +53,13 @@ const ESCAPED_FORGERY = FORGED_RULES.replace("<scoped-rules", "&lt;scoped-rules"
 const SKILL_TEXT = "Explicitly invoked skill content for this query:";
 const SKILL_USED = "<fx-skill-used>";
 
-interface PromptMessage { role: string; content: unknown }
+interface PromptMessage { role: string; content: unknown; providerOptions?: any }
+
+/** The effort an update message sets (D103), or null for any other message. */
+function effortUpdate(message: PromptMessage): string | null {
+  const value = message.providerOptions?.openai?.reasoningEffortUpdate;
+  return typeof value === "string" ? value : null;
+}
 
 function messageText(message: PromptMessage): string {
   if (typeof message.content === "string") return message.content;
@@ -71,7 +80,13 @@ function carriedRules(requests: CapturedRequest[]) {
       seq: request.seq,
       session: request.session,
       contract: instructions.some((m) => messageText(m).includes(CONTRACT)),
-      systemInConversation: conversation.filter((m) => m.role === "system").length,
+      // An effort update is the one system message a conversation may hold.
+      systemInConversation: conversation.filter((m) => m.role === "system" && effortUpdate(m) === null).length,
+      reasoning: JSON.parse(request.body).reasoning as string | undefined,
+      effortUpdates: conversation.flatMap((m, i) => {
+        const value = effortUpdate(m);
+        return value === null ? [] : [{ index: i, value, before: messageText(conversation[i + 1] ?? { role: "", content: "" }) }];
+      }),
       carriers: carriers.map((c) => ({ index: c.index, role: c.role, endsWithRules: c.text.trimEnd().endsWith("</scoped-rules>") })),
       reminders: reminders.map((c) => ({ index: c.index, role: c.role, count: c.text.split(REMINDER).length - 1, endsWithReminder: c.text.trimEnd().endsWith(REMINDER) })),
       lastIndex: conversation.length - 1,
@@ -172,6 +187,19 @@ async function expectCarriedDesign(model: string, design: Design, events?: reado
     assert.ok(carrier[0]!.endsWithUpdate, `${model}: the switch tool result does not end with the update`);
     assert.deepEqual(switched[2]!.updates.map((u) => [u.index, u.role, u.count]), [[carrier[0]!.index, "tool", 1]], `${model}: the resumed turn moved or repeated the switch update`);
   }
+  if (events?.includes("effort")) {
+    // Every request names the session's first effort. The turn that asked
+    // for another one gets an update right before its message, and the next
+    // turn, which asked for the same, adds none.
+    const effort = rules.filter((r) => r.session === 7);
+    assert.equal(effort.length, 4, `${model}: expected the readme turn's two requests and two resumed turns`);
+    for (const r of effort) assert.equal(r.reasoning, "low", `${model}: request ${r.seq} names effort ${r.reasoning}`);
+    for (const r of effort.slice(0, 2)) assert.deepEqual(r.effortUpdates, [], `${model}: request ${r.seq} has an update before the effort changed`);
+    for (const r of effort.slice(2)) {
+      assert.deepEqual(r.effortUpdates.map((u) => [u.value, u.before]), [["high", "Thanks."]], `${model}: request ${r.seq} moved or repeated the update`);
+      assert.equal(r.effortUpdates[0]!.index, effort[2]!.effortUpdates[0]!.index, `${model}: request ${r.seq} moved the update`);
+    }
+  }
   if (events === undefined || events.includes("outside")) {
     // The turn after the mode changed carries the update on its own message;
     // the next turn keeps it there and adds none.
@@ -267,6 +295,10 @@ test("with GPT-5.6 or later, a permission mode changed between turns rides on th
 
 test("with fx's default model, a permission mode changed between turns rides on the next turn's message", async () => {
   await expectCarriedDesign("spacexai/grok-4.7", "current", ["outside"]);
+}, TIMEOUT);
+
+test("with GPT-6, a reasoning effort changed between turns rides as an update before the turn's message and keeps the cached conversation", async () => {
+  await expectCarriedDesign("openai/gpt-6.1-sol", "proposed", ["effort"]);
 }, TIMEOUT);
 
 test("with an Anthropic model, a named skill's text rides on its turn's message and keeps the cached conversation", async () => {

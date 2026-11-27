@@ -115,6 +115,14 @@
 (* Mutation "overlay_rebuilt" is fx before that: the turn context and      *)
 (* runtime block follow the current values on every request. Mutation      *)
 (* "overlay_not_saved" freezes them but recaptures them when fx restarts.  *)
+(* Event "effort" is a user turn that asks for another reasoning effort,   *)
+(* for a model that takes the change as a message (GPT-6 and later, D103). *)
+(* The request's own effort is part of the provider's cache key, so it is  *)
+(* modeled as part of the first block. With Notes the request keeps the    *)
+(* session's first effort and an update block, "eff", comes right before   *)
+(* that turn's message (src/gateway/vercel_protocol.zig). Mutation         *)
+(* "effort_follows_current" is fx before that: the request's own effort    *)
+(* follows the turn's.                                                     *)
 (*                                                                         *)
 (* Abstraction: a block is a [k, v] record; equal v means equal bytes.     *)
 (* Tokens, cache lifetime, eviction and the provider's 20-block lookback   *)
@@ -133,7 +141,7 @@ CONSTANTS
   Limit,        \* blocks per request that may carry a cache marker
   PathScoped,   \* toolbox menu and project rules embed the worktree path
   Family,       \* "anthropic" | "openai": the provider's cache rules
-  Events,       \* mid-session events: a subset of {"switch", "deliver", "skill", "remind", "resume", "outside", "attach"}
+  Events,       \* mid-session events: a subset of {"switch", "deliver", "skill", "remind", "resume", "outside", "attach", "effort"}
   Notes,        \* mid-session changes join the conversation, not the instructions
   Carrier       \* "message" | "note": where such a change goes
 
@@ -142,11 +150,11 @@ ASSUME Family \in {"anthropic", "openai"}
 ASSUME Mutation \in {"none", "mark_every_system", "fence_after_context", "no_auto",
                      "note_not_saved", "contract_late", "remind_old_result",
                      "stale_in_instructions", "overlay_rebuilt", "overlay_not_saved",
-                     "skill_swapped", "attach_in_instructions"}
+                     "skill_swapped", "attach_in_instructions", "effort_follows_current"}
 ASSUME Carrier \in {"message", "note"}
 ASSUME MaxSessions \in Nat /\ MaxSteps \in Nat /\ Limit \in Nat
 ASSUME PathScoped \in BOOLEAN
-ASSUME Events \subseteq {"switch", "deliver", "skill", "remind", "resume", "outside", "attach"} /\ Notes \in BOOLEAN
+ASSUME Events \subseteq {"switch", "deliver", "skill", "remind", "resume", "outside", "attach", "effort"} /\ Notes \in BOOLEAN
 ASSUME "attach" \in Events => Notes
 
 Block(k, v) == [k |-> k, v |-> v]
@@ -163,6 +171,7 @@ Block(k, v) == [k |-> k, v |-> v]
 (*   scoped   rules from a subfolder AGENTS.md, delivered at tool time     *)
 (*   skill    a named skill's text for its turn                            *)
 (*   note     a mid-session change after the conversation (Carrier note)   *)
+(*   eff      an effort update right before its turn's message             *)
 (* A message that carries a change has kind "userc" or "asstc" (Carrier    *)
 (* message); the change is part of its bytes.                              *)
 Scoped(w) == IF PathScoped THEN w ELSE RepoOf[w]
@@ -255,7 +264,7 @@ NoSession == [on |-> FALSE, w |-> "none", s |-> 0, n |-> 0, br |-> "b1", br0 |->
               skill |-> FALSE, skillText |-> 0,
               carrierAt |-> 0, remindable |-> FALSE, reminded |-> FALSE,
               resumed |-> FALSE, stale |-> FALSE, out |-> FALSE, out0 |-> FALSE,
-              attached |-> FALSE, attach |-> FALSE]
+              attached |-> FALSE, attach |-> FALSE, effort |-> "e1", effortChanged |-> FALSE]
 
 (* Whether the request's turn context and runtime block show the outside  *)
 (* change, and which branch they show.                                    *)
@@ -284,10 +293,20 @@ LeadBlocks(a) ==
          \o (IF a.skill THEN << Block("skill", "k") >> ELSE << >>)
          \o Overlay(a.w, LeadBranch(a))
 
+(* The effort the request itself names. With Notes it is the session's      *)
+(* first, "e1"; before that it follows the turn.                           *)
+RequestEffort(a) == IF Notes /\ Mutation # "effort_follows_current" THEN "e1" ELSE a.effort
+
+(* The first block with the request's own effort, which is part of the     *)
+(* provider's cache key.                                                    *)
+WithEffort(a, lead) ==
+  IF RequestEffort(a) = "e1" THEN lead
+  ELSE [lead EXCEPT ![1] = Block("tools", "p@" \o RequestEffort(a))]
+
 (* The instructions of session a's next request. With Notes they stay as   *)
 (* the session started; otherwise they carry today's mid-session           *)
 (* insertions.                                                             *)
-Lead(a) == WithRt(a, LeadBlocks(a))
+Lead(a) == WithEffort(a, WithRt(a, LeadBlocks(a)))
 
 (* The end of prev without the notes after its last message: what the next *)
 (* request must read. A trailing note is cheap, and OpenAI caches it only  *)
@@ -346,12 +365,14 @@ Uncarried(b) ==
 Continue(kind) ==
   LET a == active
       n == a.n + 1
-      isTurn == kind \in {"turn", "skill", "resume", "outside", "attach"}
+      isTurn == kind \in {"turn", "skill", "resume", "outside", "attach", "effort"}
       staleInLead == kind = "resume" /\ (~Notes \/ Mutation = "stale_in_instructions")
       \* The change shows up ahead of the history instead of on a message.
       inLead == staleInLead \/ (kind \in {"switch", "outside"} /\ (~Notes \/ Mutation = "overlay_rebuilt"))
                 \/ (kind = "attach" /\ Mutation = "attach_in_instructions")
-      event == kind \in {"switch", "deliver", "skill", "resume", "outside", "attach"} \/ (kind = "remind" /\ Notes)
+      event == kind \in {"switch", "deliver", "skill", "resume", "outside", "attach", "effort"} \/ (kind = "remind" /\ Notes)
+      \* The turn's message follows an update; the request keeps its effort.
+      effortUpdate == kind = "effort" /\ Notes /\ Mutation # "effort_follows_current"
       carried == Notes /\ Carrier = "message"
       recapture == kind = "resume" /\ Mutation = "overlay_not_saved"
       misplaced == kind = "remind" /\ carried /\ Mutation = "remind_old_result"
@@ -368,11 +389,13 @@ Continue(kind) ==
       reminded == IF misplaced
                   THEN [kept EXCEPT ![a.carrierAt] = Block(@.k, @.v \o "+remind")]
                   ELSE kept
-      msgKind == CASE isTurn /\ carried /\ event /\ ~inLead -> "userc"
+      msgKind == CASE kind = "effort" -> "user"
+                   [] isTurn /\ carried /\ event /\ ~inLead -> "userc"
                    [] isTurn -> "user"
                    [] carried /\ event /\ ~misplaced /\ ~inLead -> "asstc"
                    [] OTHER -> "asst"
-      withMsg == Append(reminded, Block(msgKind, ToString(a.s) \o "." \o ToString(n)))
+      updated == IF effortUpdate THEN Append(reminded, Block("eff", "e2")) ELSE reminded
+      withMsg == Append(updated, Block(msgKind, ToString(a.s) \o "." \o ToString(n)))
       hist == CASE ~Notes \/ carried -> withMsg
                 [] kind = "switch" /\ ~inLead -> Append(withMsg, Block("note", "branch"))
                 [] kind = "deliver" -> Append(withMsg, Block("note", "scoped"))
@@ -398,6 +421,8 @@ Continue(kind) ==
                         !.resumed = a.resumed \/ kind = "resume",
                         !.stale = a.stale \/ staleInLead,
                         !.out = a.out \/ kind = "outside",
+                        !.effort = IF kind = "effort" THEN "e2" ELSE a.effort,
+                        !.effortChanged = a.effortChanged \/ kind = "effort",
                         !.attached = a.attached \/ kind = "attach",
                         !.attach = (IF isTurn THEN kind = "attach" /\ Mutation = "attach_in_instructions"
                                     ELSE a.attach),
@@ -407,7 +432,7 @@ Continue(kind) ==
       keep == LastKept(a.last)
   IN /\ a.on
      /\ a.n < MaxSteps
-     /\ kind \in {"switch", "deliver", "skill", "remind", "resume", "outside", "attach"} => kind \in Events
+     /\ kind \in {"switch", "deliver", "skill", "remind", "resume", "outside", "attach", "effort"} => kind \in Events
      /\ kind = "switch" => ~a.switched
      /\ kind = "deliver" => ~a.delivered
      /\ kind = "skill" => ~a.skilled
@@ -415,6 +440,7 @@ Continue(kind) ==
      /\ kind = "resume" => ~a.resumed
      /\ kind = "outside" => ~a.out
      /\ kind = "attach" => ~a.attached
+     /\ kind = "effort" => ~a.effortChanged
      /\ active' = [next EXCEPT !.last = req]
      /\ Send(a.w, a.s, req, FALSE, a.last, event, keep)
      /\ branchOf' = [branchOf EXCEPT ![a.w] = br]
@@ -435,7 +461,7 @@ ExternalSwitch(w) ==
 
 Next ==
   \/ \E w \in Worktrees : Start(w)
-  \/ \E kind \in {"step", "turn", "switch", "deliver", "skill", "remind", "resume", "outside", "attach"} : Continue(kind)
+  \/ \E kind \in {"step", "turn", "switch", "deliver", "skill", "remind", "resume", "outside", "attach", "effort"} : Continue(kind)
   \/ End
   \/ \E w \in Worktrees : ExternalSwitch(w)
 

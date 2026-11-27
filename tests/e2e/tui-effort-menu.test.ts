@@ -69,6 +69,7 @@ afterEach(async () => {
 /// the catalog has been served, so `/effort` sees the levels.
 async function launch(options: {
   model?: string;
+  catalog?: typeof catalog;
   width?: number;
   height?: number;
   respond?: (body: string) => Response;
@@ -83,7 +84,7 @@ async function launch(options: {
   const gateway = startDynamicFakeGateway(options.respond ?? (() => fakeGatewayFinalText("ANSWER")), {
     models: () => {
       catalogServed += 1;
-      return catalog;
+      return options.catalog ?? catalog;
     },
   });
   const tape = join(root, "session.fxtape");
@@ -339,6 +340,40 @@ test.skipIf(!tmuxAvailable())("/effort <level> applies the level directly, and t
   // The model's default sends no effort at all.
   expect(turn("second question")).not.toHaveProperty("reasoning");
   expect(menuViews(current, "direct")).toEqual([]);
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())("/effort on GPT-6 keeps the session's first effort and sends the change as an update before the next message", async () => {
+  // GPT-6 drops its whole prompt cache when the request's own effort changes
+  // (D103).
+  const gpt6 = "openai/gpt-6.1-sol";
+  const current = await launch({ model: gpt6, catalog: [{ ...catalog[0]!, id: gpt6 }, catalog[1]!] });
+  const { session, gateway } = current;
+  await session.sendText("/effort low");
+  await session.waitForText(`Reasoning effort set to low for ${gpt6}`, 5_000);
+  await session.sendText("first question");
+  await session.waitForPane((pane) => pane.includes("ANSWER") && turnSettled(pane), 10_000);
+  await session.waitForComposer(10_000);
+
+  await session.sendText("/effort high");
+  await session.waitForText(`Reasoning effort set to high for ${gpt6}`, 5_000);
+  await session.sendText("second question");
+  await session.waitForPane(() => gateway.requests.some((request) => request.body.includes("second question")), 10_000);
+  await session.waitForComposer(10_000);
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+
+  const turn = (prompt: string) => gateway.requests
+    .filter((request) => request.body.includes(prompt))
+    .map((request) => JSON.parse(request.body) as { prompt: unknown[]; reasoning?: string })[0]!;
+  const first = turn("first question"), second = turn("second question");
+  expect(first.reasoning).toBe("low");
+  expect(second.reasoning).toBe("low");
+  expect(second.prompt.slice(0, first.prompt.length)).toEqual(first.prompt);
+  const update = { role: "system", content: "", providerOptions: { openai: { reasoningEffortUpdate: "high" } } };
+  const at = second.prompt.findIndex((message) => JSON.stringify(message).includes("reasoningEffortUpdate"));
+  expect(second.prompt[at]).toEqual(update);
+  expect(JSON.stringify(second.prompt[at + 1])).toContain("second question");
+  expect(second.prompt.filter((message) => JSON.stringify(message).includes("reasoningEffortUpdate"))).toHaveLength(1);
 }, TIMEOUT);
 
 test.skipIf(!tmuxAvailable())("a level the model does not offer, or a malformed one, changes nothing and names the levels", async () => {

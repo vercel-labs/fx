@@ -142,7 +142,9 @@ export function abstractRequest(body: string, family: Family): Abstraction {
     return { blocks: [], manual: [], sources: [], errors: ["body is not JSON"] };
   }
   const prompt: any[] = Array.isArray(parsed.prompt) ? parsed.prompt : [];
-  const blocks: Block[] = [{ k: "tools", v: short(JSON.stringify(parsed.tools ?? [])) }];
+  // The request's own effort is part of the provider's cache key, so it
+  // joins the first block (PromptCache.tla "effort").
+  const blocks: Block[] = [{ k: "tools", v: short(JSON.stringify(parsed.tools ?? []) + "\u0000" + String(parsed.reasoning ?? "")) }];
   const sources: number[][] = [[]];
   const marked: boolean[] = [false];
   if (Array.isArray(parsed.tools) && parsed.tools.some((tool: any) => tool?.providerOptions)) {
@@ -215,6 +217,14 @@ export function abstractRequest(body: string, family: Family): Abstraction {
   for (; i < prompt.length; i += 1) {
     const role = prompt[i].role;
     if (role === "system") {
+      // An effort update rides right before its turn's message (D103).
+      const update = prompt[i]?.providerOptions?.openai?.reasoningEffortUpdate;
+      if (typeof update === "string") {
+        blocks.push({ k: "eff", v: short(update) });
+        sources.push([i]);
+        marked.push(hasMarker(prompt[i], family));
+        continue;
+      }
       const kind = noteKind(text(prompt[i]));
       if (kind === null) {
         errors.push(`system message ${i} after the conversation started`);
@@ -303,7 +313,7 @@ export function derive(observed: ObservedRequest[]): Derived[] {
     const prev = sameSession.at(-1) ?? null;
     const ctx = (r: ObservedRequest) => r.req.find((b) => b.k === "ctx")?.v;
     // The messages that carry a change (Carrier "message").
-    const carried = (r: ObservedRequest) => r.req.filter((b) => b.k === "asstc" || b.k === "userc").length;
+    const carried = (r: ObservedRequest) => r.req.filter((b) => b.k === "asstc" || b.k === "userc" || b.k === "eff").length;
     const sameWorktree = earlier.filter((e) => e.w === o.w);
     return {
       first: prev === null,
@@ -324,7 +334,10 @@ export function coverage(observed: ObservedRequest[]): Record<Property, number> 
   // The runtime block changed since the previous request of the session, as
   // when fx put a notice in the instructions mid-session.
   const rt = (r: ObservedRequest) => r.req.find((b) => b.k === "rt")?.v;
-  const rtChanged = (x: Derived, n: number) => x.prev !== null && rt(x.prev) !== rt(observed[n]!);
+  // The first block holds the request's own effort, which a model that takes
+  // effort changes as messages keeps for the session (D103).
+  const tools = (r: ObservedRequest) => r.req[0]?.v;
+  const rtChanged = (x: Derived, n: number) => x.prev !== null && (rt(x.prev) !== rt(observed[n]!) || tools(x.prev) !== tools(observed[n]!));
   return {
     Budget: observed.length,
     SessionReuse: d.filter((x) => !x.first && !x.changed).length,
@@ -341,7 +354,7 @@ export function coverage(observed: ObservedRequest[]): Record<Property, number> 
   };
 }
 
-const MID_KINDS = new Set(["scoped", "skill", "note", "skilltext", "skillnote", "asstc", "userc"]);
+const MID_KINDS = new Set(["scoped", "skill", "note", "skilltext", "skillnote", "asstc", "userc", "eff"]);
 const USER_KINDS = new Set(["user", "userc"]);
 const MESSAGE_KINDS = new Set(["user", "userc", "asst", "asstc"]);
 

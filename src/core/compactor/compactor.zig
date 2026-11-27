@@ -151,6 +151,9 @@ pub const Request = struct {
     /// message text each. A provider block keeps it, so the turns after the
     /// block go on after the same instructions.
     runtime_context: []const []const u8 = &.{},
+    /// The effort the conversation's requests named, for a model that takes
+    /// effort changes as messages. A provider block keeps it (D103).
+    reasoning_anchor: ?[]const u8 = null,
 };
 
 /// Owns everything it points to except the turns it shares with
@@ -340,6 +343,7 @@ fn compactWithProvider(
         .parts_json = block.parts_json,
         .kept_turns = chosen.retained_history.len,
         .runtime_context = request.runtime_context,
+        .reasoning_anchor = request.reasoning_anchor,
     };
     trace.info(trace_ctx, .provider_completed, "model={s} path=provider_block text_bytes={d} parts_bytes={d} turns={d} tools={d}", .{ caller.model, block.text.len, block.parts_json.len, exact.compacted.turn_count, exact.compacted.tool_count });
     return .{

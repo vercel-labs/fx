@@ -46,6 +46,11 @@ pub const TurnFinalizationGuard = struct {
     /// Every save of the turn carries it, so a streamed turn keeps one prefix
     /// (D94). Borrowed from the turn's arena.
     captured_runtime_context: ?[][]u8 = null,
+    /// The effort this turn asked for, for a model that takes effort changes
+    /// as messages, and the update it sends before its message. Every save of
+    /// the turn carries them, from the first (D103).
+    turn_effort: ?types.ReasoningEffort = null,
+    effort_update: ?types.ReasoningEffort = null,
     lease_allocator: Allocator = std.heap.c_allocator,
     agent_terminal_leases: std.ArrayList([]u8) = .empty,
     /// The turn's settled model calls, in the order they settled, for
@@ -71,7 +76,8 @@ pub const TurnFinalizationGuard = struct {
 
     /// The execution memory fx's history and the recovery checkpoint keep of
     /// this turn: the part after any in-turn compaction cut, with the runtime
-    /// context the turn captured and the model calls it made. `execution`
+    /// context the turn captured, the effort it asked for and the model calls
+    /// it made. `execution`
     /// holds the whole turn; a call settled since the last save is placed
     /// after the steps it holds. Borrows `execution`, the captured texts and
     /// the call records.
@@ -98,6 +104,8 @@ pub const TurnFinalizationGuard = struct {
         var with_records = execution;
         with_records.model_calls = self.model_calls.items;
         with_records.runtime_context = self.captured_runtime_context;
+        with_records.turn_effort = self.turn_effort;
+        with_records.effort_update = self.effort_update;
         return with_records;
     }
 

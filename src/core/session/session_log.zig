@@ -43,7 +43,7 @@ pub const ConversationProgress = struct {
             const standalone = switch (event) {
                 .assistant, .context_checkpoint, .interrupted => true,
                 // A note counts no step, as steering does (D93, D94).
-                .steering, .context_note, .runtime_context, .model_call => assistant.has_replay,
+                .steering, .context_note, .runtime_context, .turn_effort, .model_call => assistant.has_replay,
                 else => false,
             };
             if (standalone) {
@@ -162,7 +162,7 @@ const ReplayState = struct {
             .interrupted => self.clearPendingToolCalls(),
             .user, .assistant, .steering, .turn_completed => {},
             // Only a v2 session saves a context note or runtime context (D93, D94).
-            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .turn_effort, .model_call => return error.InvalidConversationFrame,
         }
         self.last_seq = seq;
         self.turn_open = turn_open;
@@ -177,7 +177,7 @@ fn nextConversationTurnOpen(open: bool, event: session_event.ConversationEvent) 
         .context_checkpoint => open,
         // v1 logs never hold a context note or runtime context; only a v2
         // session saves them (D93, D94). Every v1 reader below refuses both.
-        .context_note, .runtime_context, .model_call => error.InvalidConversationFrame,
+        .context_note, .runtime_context, .turn_effort, .model_call => error.InvalidConversationFrame,
     };
 }
 
@@ -898,7 +898,7 @@ fn replayConversationHistory(
             .tool_call => |value| try turn.appendToolCall(value),
             .tool_result => |value| try turn.appendToolResult(value),
             .steering => |value| try turn.appendSteering(value.text),
-            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .turn_effort, .model_call => return error.InvalidConversationFrame,
             .turn_completed => |value| {
                 const completed = try turn.finishAssistant(value);
                 checkpoint_turn_open = false;
@@ -990,7 +990,7 @@ const ConversationHistoryReader = struct {
                     try self.builder.appendSteering(value.text);
                     break :blk null;
                 },
-                .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+                .context_note, .runtime_context, .turn_effort, .model_call => return error.InvalidConversationFrame,
                 .turn_completed => |value| try self.builder.finishAssistant(value),
                 .interrupted => |value| try self.builder.finishInterrupted(value),
                 .context_checkpoint => blk: {
@@ -1095,7 +1095,7 @@ fn load_conversation_archive_from_source(
                 try builder.appendSteering(value.text);
                 break :blk null;
             },
-            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .turn_effort, .model_call => return error.InvalidConversationFrame,
             .turn_completed => |value| try builder.finishAssistant(value),
             .interrupted => |value| try builder.finishInterrupted(value),
             .context_checkpoint => |value| blk: {
@@ -1170,7 +1170,7 @@ const ConversationReplayScan = struct {
                     .coverage = checkpoint.covers_through_seq,
                 };
             },
-            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .turn_effort, .model_call => return error.InvalidConversationFrame,
             else => {},
         }
     }
@@ -1235,6 +1235,8 @@ pub const ConversationTurnBuilder = struct {
     steering: std.ArrayList(types.PersistedSteering) = .empty,
     context_notes: std.ArrayList(types.PersistedContextNote) = .empty,
     runtime_context: ?[][]u8 = null,
+    turn_effort: ?types.ReasoningEffort = null,
+    effort_update: ?types.ReasoningEffort = null,
     model_calls: std.ArrayList(types.ModelCallRecord) = .empty,
     bridge_calls: std.ArrayList(types.BridgeCallRecord) = .empty,
     /// The call a `cancelled_command` item names: the turn's command that
@@ -1354,7 +1356,8 @@ pub const ConversationTurnBuilder = struct {
             self.steps.items.len == 0 and
             self.steering.items.len == 0 and
             self.context_notes.items.len == 0 and
-            self.runtime_context == null;
+            self.runtime_context == null and
+            self.turn_effort == null;
     }
 
     pub fn begin(
@@ -1534,6 +1537,19 @@ pub const ConversationTurnBuilder = struct {
         self.pending_assistant = null;
     }
 
+    /// The effort a turn asked for comes right after its user message, once,
+    /// ahead of its runtime context (D103).
+    pub fn setTurnEffort(self: *ConversationTurnBuilder, effort: types.ReasoningEffort, update: ?types.ReasoningEffort) !void {
+        if (self.user == null or self.turn_effort != null or self.runtime_context != null or self.steps.items.len != 0 or
+            self.calls.items.len != 0 or self.results.items.len != 0 or self.pending_assistant != null or
+            self.pending_replay != null or self.steering.items.len != 0 or self.context_notes.items.len != 0)
+        {
+            return error.InvalidConversationFrame;
+        }
+        self.turn_effort = effort;
+        self.effort_update = update;
+    }
+
     /// The runtime context a turn captured comes right after its user message,
     /// once (D94).
     pub fn setRuntimeContext(self: *ConversationTurnBuilder, messages: []const []const u8) !void {
@@ -1702,12 +1718,18 @@ pub const ConversationTurnBuilder = struct {
         const bridge_calls = try self.bridge_calls.toOwnedSlice(self.alloc);
         const runtime_context = self.runtime_context;
         self.runtime_context = null;
+        const turn_effort = self.turn_effort;
+        self.turn_effort = null;
+        const effort_update = self.effort_update;
+        self.effort_update = null;
         return .{
             .tool_steps = steps,
             .files = files,
             .steering = steering,
             .context_notes = context_notes,
             .runtime_context = runtime_context,
+            .turn_effort = turn_effort,
+            .effort_update = effort_update,
             .turn_summary = turn_summary,
             .model_calls = model_calls,
             .bridge_calls = bridge_calls,

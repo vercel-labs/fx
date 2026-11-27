@@ -371,6 +371,16 @@ fn buildGatewayRequestBodyValidated(
         const message = messages[i];
         if (budget) |active| try active.check();
         if (i > 0) try out.writer.writeByte(',');
+        // Each turn decided its update once, from saved data, so every
+        // request prints it the same way; a value the model does not list is
+        // left out, as the turn-start decision leaves it out
+        // (`model_capabilities.listsEffort`).
+        if (options.effort_updates) |updates| if (message.effort_update) |*update| {
+            if (model_capabilities.listsEffort(updates.listed.slice(), update.*)) {
+                try writeEffortUpdate(&out.writer, update);
+                try out.writer.writeByte(',');
+            }
+        };
         if (message.role == .tool) {
             const results = tool_result_prefix(messages[i..]);
             try write_tool_result_group(alloc, &out.writer, results, budget, &ids);
@@ -421,6 +431,15 @@ fn buildGatewayRequestBodyValidated(
     try out.writer.writeByte('}');
     if (budget) |active| try active.check();
     return try out.toOwnedSlice();
+}
+
+/// An effort change as the AI SDK takes it without touching the cached
+/// prefix: an empty system message with no cache marker, right before the
+/// turn's own message. Two are never adjacent: each precedes a user message.
+fn writeEffortUpdate(writer: *std.Io.Writer, effort: *const types.ReasoningEffort) !void {
+    try writer.writeAll("{\"role\":\"system\",\"content\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEffortUpdate\":");
+    try std.json.Stringify.value(effort.label(), .{}, writer);
+    try writer.writeAll("}}}");
 }
 
 /// Returns a new request body with the provider-visible user agent added.
@@ -1804,6 +1823,90 @@ test "buildGatewayRequestBodyWithOptions sends max effort unchanged" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("max", parsed.value.object.get("reasoning").?.string);
+}
+
+/// `body` with an effort update for `label` right before the user message
+/// whose text is `user_text`. Caller owns the result.
+fn withEffortUpdateBefore(alloc: std.mem.Allocator, body: []const u8, user_text: []const u8, label: []const u8) ![]u8 {
+    const user = try alloc.print("{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"", .{user_text});
+    defer alloc.free(user);
+    const at = std.mem.find(u8, body, user) orelse return error.TestUnexpectedResult;
+    const update = try alloc.print("{{\"role\":\"system\",\"content\":\"\",\"providerOptions\":{{\"openai\":{{\"reasoningEffortUpdate\":\"{s}\"}}}}}},", .{label});
+    defer alloc.free(update);
+    return std.mem.concat(alloc, u8, &.{ body[0..at], update, body[at..] });
+}
+
+test "a request prints each turn's saved update right before its message, and nothing else moves" {
+    const alloc = std.testing.allocator;
+    const effort = types.ReasoningEffort.literal;
+    const listed = [_]types.ReasoningEffort{ effort("low"), effort("medium"), effort("high"), effort("xhigh") };
+    // Turns 2 and 4 saved an update; turns 1 and 3 saved none.
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "instructions", .cache_breakpoint = true },
+        .{ .role = .user, .content = "q1" },
+        .{ .role = .assistant, .content = "a1" },
+        .{ .role = .user, .content = "q2", .effort_update = effort("low") },
+        .{ .role = .assistant, .content = "a2" },
+        .{ .role = .user, .content = "q3" },
+        .{ .role = .assistant, .content = "a3" },
+        .{ .role = .user, .content = "q4", .effort_update = effort("medium") },
+    };
+    const without_updates: model_capabilities.ResolvedProviderOptions = .{ .reasoning = effort("high"), .prompt_caching = true, .cache_markers = .openai };
+    var with_updates = without_updates;
+    with_updates.effort_updates = .{ .listed = .fromSlice(&listed) };
+
+    const plain = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, without_updates, .auto);
+    defer alloc.free(plain);
+    const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, with_updates, .auto);
+    defer alloc.free(body);
+
+    // Byte for byte the request without updates, with each saved update
+    // right before its turn's message; fx's cache marker stays where it was.
+    const turn_two = try withEffortUpdateBefore(alloc, plain, "q2", "low");
+    defer alloc.free(turn_two);
+    const expected = try withEffortUpdateBefore(alloc, turn_two, "q4", "medium");
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, body);
+    try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":\"high\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "promptCacheBreakpoint"));
+}
+
+test "a request without effort updates prints none, whatever its turns saved" {
+    const alloc = std.testing.allocator;
+    const effort = types.ReasoningEffort.literal;
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "q1" },
+        .{ .role = .assistant, .content = "a1" },
+        .{ .role = .user, .content = "q2", .effort_update = effort("low") },
+    };
+    // A Claude model or GPT-5.5: the request's own effort is the current one.
+    const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{ .reasoning = effort("low") }, .auto);
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "reasoningEffortUpdate") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"system\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":\"low\"") != null);
+}
+
+test "a saved update the current model does not list is left out" {
+    const alloc = std.testing.allocator;
+    const effort = types.ReasoningEffort.literal;
+    // Another GPT-6 model with no medium: the provider would reject it.
+    const listed = [_]types.ReasoningEffort{ effort("low"), effort("high") };
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "q1", .effort_update = effort("medium") },
+        .{ .role = .assistant, .content = "a1" },
+        .{ .role = .user, .content = "q2", .effort_update = effort("low") },
+    };
+    const without_updates: model_capabilities.ResolvedProviderOptions = .{ .reasoning = effort("high") };
+    var with_updates = without_updates;
+    with_updates.effort_updates = .{ .listed = .fromSlice(&listed) };
+    const plain = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, without_updates, .auto);
+    defer alloc.free(plain);
+    const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, with_updates, .auto);
+    defer alloc.free(body);
+    const expected = try withEffortUpdateBefore(alloc, plain, "q2", "low");
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, body);
 }
 
 test "required gateway request serializes required tool choice and max output" {

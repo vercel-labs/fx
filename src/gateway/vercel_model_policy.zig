@@ -59,6 +59,17 @@ pub fn providerCompaction(model: []const u8) ?ProviderCompaction {
 const first_claude_compaction: ModelVersion = .{ .major = 4, .minor = 6 };
 const first_gpt_compaction: ModelVersion = .{ .major = 6, .minor = 0 };
 
+/// Whether `model` takes a change of reasoning effort as a message in the
+/// conversation: GPT-6 and later. A change of the request's own `reasoning`
+/// drops its whole prompt cache and its earlier reasoning, so a session keeps
+/// its first effort there and sends each later change as an update (D103).
+pub fn effortUpdates(model: []const u8) bool {
+    const version = gptVersion(model) orelse return false;
+    return version.atLeast(first_gpt_effort_updates);
+}
+
+const first_gpt_effort_updates: ModelVersion = .{ .major = 6, .minor = 0 };
+
 const ModelVersion = struct {
     major: u32,
     minor: u32,
@@ -105,6 +116,15 @@ test "Claude 4.6 and later and GPT-6 and later compact through their provider" {
     }
     for ([_][]const u8{ "anthropic/claude-haiku-4.5", "anthropic/claude-opus-4.5", "anthropic/claude-sonnet-4.5", "anthropic/claude-sonnet", "anthropic/claude-", "openai/gpt-5.6-sol", "openai/gpt-5", "openai/gpt-oss-120b", "openai/gpt-", "zai/glm-5.3", "google/gemini-4-argon", "fixture/compaction" }) |model| {
         try std.testing.expectEqual(@as(?ProviderCompaction, null), providerCompaction(model));
+    }
+}
+
+test "only GPT-6 and later take effort changes as messages" {
+    for ([_][]const u8{ "openai/gpt-6", "openai/gpt-6-sol", "openai/gpt-6.1-sol", "openai/gpt-6.1-terra-fast", "openai/gpt-7" }) |model| {
+        try std.testing.expect(effortUpdates(model));
+    }
+    for ([_][]const u8{ "openai/gpt-5.5", "openai/gpt-5.6-sol", "openai/gpt-5", "openai/gpt-oss-120b", "openai/gpt-", "anthropic/claude-fable-5.2", "anthropic/claude-opus-4.8", "xai/gpt-6" }) |model| {
+        try std.testing.expect(!effortUpdates(model));
     }
 }
 

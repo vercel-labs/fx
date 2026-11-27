@@ -309,7 +309,7 @@ manager:
   `user`, `assistant`, `tool_call`, `tool_result`, `steering`,
   `context_note` (D93), `runtime_context` (D94), `model_call` (D96),
   `mcp_bridge_call` (D99), `cancelled_command` (D100), `subagent_started`
-  (D101), `cancelled_wait` (D102), `turn_end` (files
+  (D101), `cancelled_wait` (D102), `turn_effort` (D103), `turn_end` (files
   and turn summary), `interruption` (reason detail, partial text, command
   refs, origin), `recovery`, `model_recovery` (a model request's recovery
   status, for reading the log), `workspace_capture` (D98) and `continues`.
@@ -2226,6 +2226,64 @@ as it was sent):
   fx's strict reader rejects with the whole session; or the names of the
   turn's last completed wait, which miss a subagent that started or ended
   after it.
+
+Settled for reasoning effort on GPT-6 (2026-11-27, so a changed effort does
+not drop the cached prompt):
+- **D103 Decision:** for a model that takes an effort change as a message
+  (GPT-6 and later, `src/gateway/vercel_model_policy.zig` effortUpdates),
+  every request names the session's first effort as its own `reasoning`, and
+  a later change goes as an update message right before that turn's user
+  message: an empty system message with
+  `providerOptions.openai.reasoningEffortUpdate`, `medium` for a turn on
+  the default.
+  - **Saved:** each turn saves the effort it asked for, `auto` included,
+    and the update it decided to send, in every save from the prompt's
+    first. A v2 session writes a `turn_effort` item,
+    `{"effort":"low","update":"low"}` (no `update` for none), right after
+    the user item and before any `runtime_context` item. In the execution JSON it needs schema version
+    13, written only for such a turn, and libfx versions the journal,
+    checkpoint, and snapshot that hold it as D93 does.
+  - **Anchor:** the first effort a retained turn saved. A provider's
+    compaction block saves the effort its request named
+    (`reasoning_anchor`) and stands in for the turns it replaced; fx's own
+    summary, or a block without one, starts again. With none, the current
+    turn's effort is the anchor.
+  - **Decision:** a turn decides once, when it starts, and every request
+    sends each saved update as it is, so a kept turn keeps its bytes after
+    any block (`tests/tla/compaction/ProviderCompaction.tla`
+    NoDroppedReasoning, provider-compaction-mutation-kept-redecide.cfg).
+    The model runs at the request's own effort and the updates sent after
+    the newest block or summary: measured live on 2026-11-27, a block does
+    not keep the effort the turns it replaced had set. So the turn sends
+    an update when the effort it asks for differs from the last saved
+    update after the newest checkpoint, or from the anchor when there is
+    none (RunsAsAsked, provider-compaction-mutation-ignores-block.cfg).
+    The decision and the writer check the same listed efforts: an update
+    the model does not list is never sent and never counts. A resume that a
+    later one replaced is never sent, so it never counts either.
+  - **Compaction inside a turn:** fx compacts at a turn's first request,
+    after the turn decided. A turn with none of its own steps after the
+    new block or summary decides again against the new history. One whose
+    steps the block kept keeps its bytes, and the rest of that turn can
+    run at the anchor's effort (the model's `stale` case).
+  - **Recovery:** a recovered turn keeps the effort and update its first
+    attempt saved.
+  - **Not covered:** the one resend at a lower effort after a reply cut
+    while it reasoned names its own effort with no updates, as before; the
+    next step names the anchor again. fx's own summary request keeps its
+    least effort. Other models name the turn's effort, as before.
+  - **Older fx:** an fx from before D103 leaves the item out (D17) and
+    names each turn's effort, as it did.
+
+  **Why:** a changed `reasoning` made GPT-6 read none of the prompt from
+  its cache and drop its earlier reasoning; the update kept the cache and
+  lowered the reasoning as a real lower effort does
+  (`tests/tla/prompt_context/PromptCache.tla` "effort",
+  p6-mutant-effort-follows-current.cfg).
+  **Alternative:** the current effort on every request, which rewrites the
+  cache key; the update in the messages lane, which every other provider
+  would get; or a field on the `user` piece, which an older fx's strict
+  reader rejects with the whole session.
 
 ## Design Risks And Failure Behavior
 

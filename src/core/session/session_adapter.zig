@@ -6579,6 +6579,9 @@ fn mergeContinued(alloc: Allocator, earlier: types.HistoryTurn, later: types.His
         .steering = steering,
         .context_notes = context_notes,
         .runtime_context = runtime_context,
+        // The effort and update of the turn that started the chain, as its first request sent them.
+        .turn_effort = head.execution.turn_effort orelse tail.turn_effort,
+        .effort_update = if (head.execution.turn_effort != null) head.execution.effort_update else tail.effort_update,
         .turn_summary = turn_summary,
         .model_calls = model_calls,
         .bridge_calls = bridge_calls,
@@ -6806,6 +6809,7 @@ noinline fn replay(
                         .steering => |value| try builder.appendSteering(value.text),
                         .context_note => |value| try builder.appendContextNote(value.text, value.sources),
                         .runtime_context => |value| try builder.setRuntimeContext(value.messages),
+                        .turn_effort => |value| try builder.setTurnEffort(value.effort, value.update),
                         .turn_completed => |value| {
                             const finished = try presentStoredResults(src, alloc, try builder.finishAssistant(value));
                             // Numbered as its chain's first turn when it continues one (RULES R1.8).
@@ -7704,9 +7708,10 @@ fn itemType(kind: PieceKind) ?[]const u8 {
         .turn_completed => "turn_end",
         .interrupted => "interruption",
         .context_checkpoint => null,
-        // An older fx leaves out an item type it does not know (D17, D93, D94).
+        // An older fx leaves out an item type it does not know (D17, D93, D94, D103).
         .context_note => "context_note",
         .runtime_context => "runtime_context",
+        .turn_effort => "turn_effort",
         .model_call => "model_call",
     };
 }
@@ -12354,6 +12359,63 @@ test "a turn's runtime context comes back on resume, saved once right after its 
     for (captured, execution.runtime_context.?) |want, got| try testing.expectEqualStrings(want, got);
     // A later turn that used the saved copy saves none.
     try testing.expect(restored.history[1].assistant.execution.runtime_context == null);
+}
+
+test "a turn's effort and update come back on resume, saved once right after its user message (D103)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    var captured = [_][]u8{@constCast("Runtime context: permission mode is ask.")};
+    const low = types.ReasoningEffort.literal("low");
+    const user: types.UserTurn = .{ .text = @constCast("two steps") };
+    // The prompt is saved before the runtime context is captured, so the
+    // effort comes first and every later save keeps the same prefix.
+    try s.appendProgress(user, .{ .turn_effort = low, .effort_update = low }, .{});
+    try s.appendProgress(user, .{ .tool_steps = fixture.steps[0..1], .runtime_context = &captured, .turn_effort = low, .effort_update = low }, .{});
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = fixture.steps[0..2], .runtime_context = &captured, .turn_effort = low, .effort_update = low },
+    } }, types.ConversationLanguage.default());
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("on auto") },
+        .assistant = @constCast("ok"),
+        .execution = .{ .turn_effort = .auto },
+    } }, types.ConversationLanguage.default());
+    try s.commitTurn(assistantTurn("plain", "turn"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.find(u8, bytes, superseded_type) == null);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\"type\":\"turn_effort\""));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\"update\":\"low\""));
+    try testing.expect(std.mem.find(u8, bytes, "two steps").? < std.mem.find(u8, bytes, "\"type\":\"turn_effort\"").?);
+    try testing.expect(std.mem.find(u8, bytes, "\"type\":\"turn_effort\"").? < std.mem.find(u8, bytes, "permission mode is ask").?);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), restored.history.len);
+    const execution = restored.history[0].assistant.execution;
+    try testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    try testing.expect(execution.turn_effort.?.eql(low));
+    try testing.expect(execution.effort_update.?.eql(low));
+    try testing.expect(execution.runtime_context != null);
+    try testing.expect(restored.history[1].assistant.execution.turn_effort.? == .auto);
+    try testing.expect(restored.history[1].assistant.execution.effort_update == null);
+    // A turn on a model without effort updates saves none.
+    try testing.expect(restored.history[2].assistant.execution.turn_effort == null);
 }
 
 test "a turn's model call records come back on resume at their steps, each saved once" {

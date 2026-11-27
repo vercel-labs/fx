@@ -757,6 +757,14 @@ pub const Provider = struct {
     provider_compaction_fn: ?*const fn (model: []const u8) ?model_capabilities.ProviderCompaction = null,
     /// A reply's provider replay parts hold one compaction block.
     holds_compaction_block_fn: ?*const fn (alloc: Allocator, parts_json: []const u8) bool = null,
+    /// `model` takes a change of reasoning effort as a message in the
+    /// conversation through this provider (D103).
+    effort_updates_fn: ?*const fn (model: []const u8) bool = null,
+
+    pub fn effortUpdates(self: Provider, model: []const u8) bool {
+        const takes = self.effort_updates_fn orelse return false;
+        return takes(model);
+    }
 
     pub fn providerCompaction(self: Provider, model: []const u8) ?model_capabilities.ProviderCompaction {
         const find = self.provider_compaction_fn orelse return null;

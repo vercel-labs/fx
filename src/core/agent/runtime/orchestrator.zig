@@ -58,6 +58,7 @@ const credential_renewal = @import("credential_renewal.zig");
 const runtime_lifecycle = @import("lifecycle.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
 const runtime_context_state = @import("runtime_context.zig");
+const effort_anchor_state = @import("effort_anchor.zig");
 const compactor = @import("../../compactor/compactor.zig");
 const runtime_text_completion = @import("text_completion.zig");
 const compaction_activity = @import("../../output/compaction_activity.zig");
@@ -5273,6 +5274,15 @@ fn discardCompletionProse(
     completed.completion.provider_state_json = if (selected) |value| value.parts_json else null;
 }
 
+/// Whether `messages`, the part of the running turn a compaction kept, hold
+/// a step the model already answered.
+fn hasAssistantStep(messages: []const ChatMessage) bool {
+    for (messages) |message| {
+        if (message.role == .assistant) return true;
+    }
+    return false;
+}
+
 fn projectEmptyHistoryReplay(
     arena: Allocator,
     provider: agent_stream_provider.Provider,
@@ -7244,6 +7254,24 @@ fn processQueuedPromptInner(
             job.images = images;
         }
     }
+    // Every save of the turn carries the effort it asked for and the update
+    // it decided to send, the prompt's first one included, for a model that
+    // takes effort changes as messages (D103). The turn decides once, here,
+    // with the same listed efforts the request writer checks. A recovered
+    // turn keeps what its first attempt saved.
+    if (deps.agent_stream_provider.effortUpdates(job.model)) {
+        const saved = if (job.recovery_checkpoint) |checkpoint| checkpoint.execution else null;
+        if (saved != null and saved.?.turn_effort != null) {
+            finalization.turn_effort = saved.?.turn_effort;
+            finalization.effort_update = saved.?.effort_update;
+        } else {
+            // Against the history this turn's requests send: a resume
+            // leaves out the one it replaces.
+            const decision = try effort_anchor_state.decide(arena, resumed_history, request_capabilities.reasoning_efforts.slice(), config.effort);
+            finalization.turn_effort = config.effort;
+            finalization.effort_update = decision.update;
+        }
+    }
     // The repository as the turn found it, before any tool (D98). The
     // prompt reaches the session first, so a process killed during the
     // capture keeps it; the capture then runs beside the first request, and
@@ -7271,6 +7299,7 @@ fn processQueuedPromptInner(
         else
             job.prompt,
         .images = job.images,
+        .effort_update = finalization.effort_update,
     };
 
     var stop_state = CommonStopState{};
@@ -8543,7 +8572,7 @@ fn processQueuedPromptLoop(
     for (config.initial_dynamic_tools) |tool| {
         selected_dynamic_tools.appendAssumeCapacity(tool);
     }
-    const current_user_effective = current_user_message;
+    var current_user_effective = current_user_message;
     const initial_pending_image_ids = try arena.alloc(usize, job.images.len);
     for (job.images, 0..) |attachment, index| initial_pending_image_ids[index] = attachment.id;
     if (initial_pending_image_ids.len > 0) {
@@ -8628,6 +8657,12 @@ fn processQueuedPromptLoop(
     );
     finalization.captured_runtime_context = runtime_context.captured;
     debug_trace.logf("context", "runtime context saved_copy={} known_update={}", .{ runtime_context.frozen != null, runtime_context.known_update != null });
+    // Every request names the session's first effort, and a later change
+    // rides as an update before its turn's message (D103).
+    var effort_anchor: ?types.ReasoningEffort = if (finalization.turn_effort) |asked|
+        (try effort_anchor_state.sessionAnchor(arena, job.history)) orelse asked
+    else
+        null;
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         // The notes the last step's gate queued follow that step's results and
@@ -9156,6 +9191,12 @@ fn processQueuedPromptLoop(
                     try deps.push_text(deps.ctx, .{ .operational = "\n" });
                 }
             }
+            // A resend after a reply cut while it reasoned names its lower
+            // effort itself, so that effort applies; the next step names the
+            // anchor again.
+            if (effort_anchor) |anchor| if (resend_effort == null) {
+                provider_opts = model_capabilities.withEffortUpdates(request_capabilities, provider_opts, anchor);
+            };
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
                 .none
             else if (configured_first_tool_choice_pending and vision_mode != .required)
@@ -9349,6 +9390,7 @@ fn processQueuedPromptLoop(
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
                             .runtime_context = try runtimeContextTexts(arena, runtime_context.messages()),
+                            .reasoning_anchor = if (effort_anchor) |*anchor| anchor.label() else null,
                         },
                     });
                     // The turn's duration leaves out the compaction, as its
@@ -9409,6 +9451,17 @@ fn processQueuedPromptLoop(
                         trace_count_after_compaction = true;
                         active_compaction_history_tail = compacted_messages.items[1..];
                         compaction_history = next_history;
+                        // The block does not keep the effort the turns it
+                        // replaced had set, so a turn with none of its own
+                        // steps after it decides again against the new
+                        // history (D103). One whose steps the block kept
+                        // keeps the bytes it sent them with.
+                        if (finalization.turn_effort) |asked| if (!hasAssistantStep(within_turn_suffix.items[compacted_suffix_len..])) {
+                            const decision = try effort_anchor_state.decide(arena, next_history, request_capabilities.reasoning_efforts.slice(), asked);
+                            effort_anchor = decision.anchor;
+                            finalization.effort_update = decision.update;
+                            current_user_effective.effort_update = decision.update;
+                        };
                         finalization.compacted_execution = .{
                             .tool_steps = finalization.compacted_execution.tool_steps + active_cut.tool_steps,
                             .steering = finalization.compacted_execution.steering + active_cut.steering,

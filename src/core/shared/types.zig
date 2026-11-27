@@ -1733,6 +1733,16 @@ pub const ExecutionMemory = struct {
     /// that captured it saves it; later turns send the newest saved copy
     /// unchanged (D94).
     runtime_context: ?[][]u8 = null,
+    /// The reasoning effort this turn asked for, saved only for a model that
+    /// takes effort changes as messages (`vercel_model_policy.effortUpdates`).
+    /// Every save of the turn carries it. Every request names the session's
+    /// first saved effort as its own (D103).
+    turn_effort: ?ReasoningEffort = null,
+    /// The update this turn sent right before its message, decided once from
+    /// saved data, or null for none. Every later request sends it the same
+    /// way, so the turn's bytes never change (D103). Set only with
+    /// `turn_effort`.
+    effort_update: ?ReasoningEffort = null,
     turn_summary: ?TurnSummary = null,
     /// The turn's settled model calls, in order, for Ctrl+O. Display data:
     /// never part of what the model is sent.
@@ -2082,6 +2092,10 @@ pub const ChatMessage = struct {
     /// provider's compaction block stands for, which only the model that
     /// wrote it can read (`tests/tla/compaction/ProviderCompaction.tla` Wire).
     replay_fallback: ?[]const u8 = null,
+    /// On a turn's first user message, for a model that takes effort changes
+    /// as messages: the update the turn sent, which the Gateway request
+    /// writer prints right before this message (D103).
+    effort_update: ?ReasoningEffort = null,
     /// The user's own answer to a question fx asked, which the security
     /// review and compaction take as the user's words. Set from the call
     /// that ran and its result (`isUserAnswer`), where the result is made and
@@ -3566,6 +3580,8 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
         .steering = steering,
         .context_notes = context_notes,
         .runtime_context = runtime_context,
+        .turn_effort = memory.turn_effort,
+        .effort_update = memory.effort_update,
         .turn_summary = memory.turn_summary,
         .model_calls = model_calls,
         .bridge_calls = bridge_calls,

@@ -33,18 +33,20 @@ Kinds == <<"tools", "base", "menu", "project", "ctx", "rt">>
 
 Has(req, kind) == \E j \in 1..Len(req) : req[j].k = kind
 
-\* The messages of a request that carry a change (Carrier "message").
-Carried(req) == Cardinality({j \in 1..Len(req) : req[j].k \in {"asstc", "userc"}})
+\* The messages of a request that carry a change (Carrier "message"), and
+\* its effort updates.
+Carried(req) == Cardinality({j \in 1..Len(req) : req[j].k \in {"asstc", "userc", "eff"}})
 
 \* Blocks fx before P6 adds ahead of the history mid-session, and the blocks a
 \* note carrier adds inside it. With Carrier = "message" a change is part of
 \* the message that caused it, so no block of its own may appear.
 Inserted == {"scoped", "skill"}
 Noted == {"note", "skilltext", "skillnote"}
+\* An effort update is its own block in either carrier (D103).
 ConversationKinds ==
   CASE ~Notes -> {"user", "asst"}
-    [] Carrier = "message" -> PC!MessageKinds
-    [] OTHER -> {"user", "asst"} \cup Noted
+    [] Carrier = "message" -> PC!MessageKinds \cup {"eff"}
+    [] OTHER -> {"user", "asst", "eff"} \cup Noted
 
 Layout(req) ==
   /\ Has(req, "rt")

@@ -31,6 +31,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySse,
+  startDynamicFakeGateway,
   startFakeGateway,
   tokenPassCatalog,
 } from "./tmux-helpers";
@@ -5886,6 +5887,86 @@ describe("cli: ask success", () => {
     },
     60_000,
   );
+
+  // GPT-6 loses the whole prompt cache when the request's own `reasoning`
+  // changes, so a session keeps its first effort there and sends each later
+  // change as an update message before that turn's user message (D103).
+  for (const family of [
+    { model: "openai/gpt-6.1-sol", updates: true },
+    { model: "anthropic/claude-fable-5.2", updates: false },
+  ]) {
+    test(
+      `fx ask --resume --effort on ${family.model} ${family.updates ? "keeps the first effort and extends the prompt" : "sends each turn's own effort"}`,
+      async () => {
+        const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-effort-updates-"));
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("turn done"), {
+          models: [{
+            id: family.model,
+            type: "language",
+            tags: ["reasoning", "tool-use"],
+            context_window: 400_000,
+            max_tokens: 64_000,
+            reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh"] }],
+          }],
+        });
+        try {
+          mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+          mkdirSync(workspace);
+          writeFileSync(join(home, ".fx", "settings.json"), `${JSON.stringify({ model: family.model, auto_upgrade: false })}\n`);
+          const env = {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "fake-effort-updates-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_AUTO_UPGRADE: "0",
+          };
+          const ask = async (args: string[]) => {
+            const result = await runFx(["ask", "--json", "--auto", ...args], { cwd: realpathSync(workspace), env, timeoutMs: 60_000 });
+            expect(result.code).toBe(0);
+            return JSON.parse(result.stdout);
+          };
+          const first = await ask(["--effort", "low", "TURN 1 start."]);
+          const sessionId: string = first.session_id;
+          await ask(["--resume", sessionId, "--effort", "high", "TURN 2 more."]);
+          await ask(["--resume", sessionId, "--effort", "high", "TURN 3 again."]);
+
+          const bodies = gateway.requests.map((request) => JSON.parse(request.body) as { prompt: unknown[]; reasoning?: string });
+          expect(bodies).toHaveLength(3);
+          const updates = bodies.map((body) => body.prompt.filter((message) => JSON.stringify(message).includes("reasoningEffortUpdate")));
+          if (!family.updates) {
+            expect(bodies.map((body) => body.reasoning)).toEqual(["low", "high", "high"]);
+            expect(updates.flat()).toEqual([]);
+            return;
+          }
+          // Each request starts with the one before it, whole, and every
+          // request-level field stays the same, so the provider reads it all
+          // from its cache.
+          for (let index = 1; index < bodies.length; index += 1) {
+            const earlier = bodies[index - 1]!, later = bodies[index]!;
+            expect(later.prompt.slice(0, earlier.prompt.length)).toEqual(earlier.prompt);
+            expect({ ...later, prompt: null }).toEqual({ ...earlier, prompt: null });
+          }
+          expect(bodies.map((body) => body.reasoning)).toEqual(["low", "low", "low"]);
+          const update = { role: "system", content: "", providerOptions: { openai: { reasoningEffortUpdate: "high" } } };
+          expect(updates).toEqual([[], [update], [update]]);
+          // The update sits right before turn 2's message; turn 3 asked for
+          // the same effort, so it has none.
+          const third = bodies[2]!.prompt;
+          const at = third.findIndex((message) => JSON.stringify(message).includes("reasoningEffortUpdate"));
+          expect(JSON.stringify(third[at + 1])).toContain("TURN 2 more.");
+          expect(JSON.stringify(third[at - 1])).toContain("turn done");
+        } finally {
+          gateway.stop();
+          rmSync(root, { recursive: true, force: true });
+        }
+      },
+      120_000,
+    );
+  }
 
   test(
     "fx ask requests compressed model catalog and decodes gzip responses",

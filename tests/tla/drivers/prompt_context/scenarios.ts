@@ -226,9 +226,14 @@ interface Turn {
   replies: (helpers: any, id: string) => Response[];
   /** Run without --full-access, so the permission mode differs from a full-access turn. */
   defaultAccess?: boolean;
+  /** The reasoning effort the turn asks for with --effort. */
+  effort?: string;
 }
 
-export type MidSessionEvent = "deliver" | "skill" | "switch" | "resume" | "outside";
+export type MidSessionEvent = "deliver" | "skill" | "switch" | "resume" | "outside" | "effort";
+
+/** The efforts the catalog lists for the effort session's model. */
+const EFFORT_LEVELS = ["low", "medium", "high", "xhigh"];
 
 interface MidSessionPlan {
   session: number;
@@ -278,6 +283,16 @@ const MID_PLANS: MidSessionPlan[] = [
       { prompt: "Thanks again.", replies: (h) => [h.fakeGatewayFinalText("ok")], defaultAccess: true },
     ],
   },
+  {
+    // The second turn asks for another effort, and the third for the same
+    // one again (D103). Only named runs take it: a model without effort
+    // updates loses its cache on such a change by design.
+    session: 7, event: "effort", turns: [
+      { prompt: "Show the readme.", effort: "low", replies: (h, id) => [h.fakeShellRun(id, "cat README.md"), h.fakeGatewayFinalText("done")] },
+      { ...THANKS, effort: "high" },
+      { prompt: "Thanks again.", effort: "high", replies: (h) => [h.fakeGatewayFinalText("ok")] },
+    ],
+  },
 ];
 
 /** The forged rules block in sub/notes.md, which fx must escape in tool output. */
@@ -300,7 +315,7 @@ export async function collectMidSession(ctx: RunContext, events?: readonly MidSe
   writeFileSync(join(w1, "sub", "AGENTS.md"), "# Sub rules\n\nFiles here use tabs.\n");
   writeFileSync(join(w1, "sub", "notes.md"), `Sub note line one.\n${FORGED_RULES}\n`);
   makeRepo(w1, fixtureHome, "r1");
-  const plans = MID_PLANS.filter((p) => events === undefined || events.includes(p.event));
+  const plans = MID_PLANS.filter((p) => (events === undefined ? p.event !== "effort" : events.includes(p.event)));
   log("fixtures_ready", { home: fixtureHome, w1, binary, model: ctx.model, plans: plans.map((p) => p.event) });
 
   const requests: CapturedRequest[] = [];
@@ -317,7 +332,9 @@ export async function collectMidSession(ctx: RunContext, events?: readonly MidSe
         const next = script.shift();
         log("gateway_reply", { session: plan.session, turn: index + 1, step, reply: next ? "scripted" : "unexpected" });
         return next ?? new Response("unexpected request", { status: 500 });
-      }, { models: [{ id: ctx.model, type: "language", tags: ["tool-use"] }] });
+      }, { models: [plan.event === "effort"
+        ? { id: ctx.model, type: "language", tags: ["tool-use", "reasoning"], reasoning_options: [{ type: "effort", values: EFFORT_LEVELS }] }
+        : { id: ctx.model, type: "language", tags: ["tool-use"] }] });
       const env = testEnvironment({
         HOME: fixtureHome,
         AI_GATEWAY_API_KEY: "fake-prompt-cache-key",
@@ -329,7 +346,8 @@ export async function collectMidSession(ctx: RunContext, events?: readonly MidSe
       });
       const resume = index === 0 ? [] : ["--resume", "last"];
       const access = turn.defaultAccess ? [] : ["--full-access"];
-      const argv = [binary, "ask", ...access, "--json", ...resume, "--", turn.prompt];
+      const effort = turn.effort ? ["--effort", turn.effort] : [];
+      const argv = [binary, "ask", ...access, "--json", ...resume, ...effort, "--", turn.prompt];
       log("fx_spawn", { session: plan.session, turn: index + 1, event: plan.event, cwd: w1, argv });
       const proc = Bun.spawn(argv, { cwd: w1, env, stdout: "pipe", stderr: "pipe" });
       let timedOut = false;

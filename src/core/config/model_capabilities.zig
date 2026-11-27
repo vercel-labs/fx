@@ -39,6 +39,16 @@ pub const ResolvedProviderOptions = struct {
     /// Sends `provider_order` as the gateway's hard `only` restriction
     /// instead of its `order` preference.
     provider_strict: bool = false,
+    /// Set only for a model that takes effort changes as messages: then
+    /// `reasoning` holds the session's first effort, and the request writer
+    /// prints each turn's saved update before its message (D103).
+    effort_updates: ?EffortUpdates = null,
+};
+
+pub const EffortUpdates = struct {
+    /// The efforts the model lists. A saved update to any other is left out,
+    /// as the provider rejects it.
+    listed: ReasoningEffortOptions,
 };
 
 pub const ReasoningEffortOptions = struct {
@@ -347,6 +357,77 @@ pub fn resolveProviderOptionsForCapabilities(
     }
     resolved.fast = fast_mode and capabilities.supports_fast_mode;
     return resolved;
+}
+
+test "effort updates send the session's first effort through the same check as the current one" {
+    const effort = types.ReasoningEffort.literal;
+    const listed = [_]types.ReasoningEffort{ effort("low"), effort("high") };
+    const caps = Capabilities{ .reasoning_efforts = .fromSlice(&listed) };
+    const current = resolveProviderOptionsForCapabilities(caps, effort("low"), false);
+    try std.testing.expect(current.reasoning.?.eql(effort("low")));
+
+    const anchored = withEffortUpdates(caps, current, effort("high"));
+    try std.testing.expect(anchored.reasoning.?.eql(effort("high")));
+    try std.testing.expectEqual(@as(usize, 2), anchored.effort_updates.?.listed.len);
+    // Auto, or a value the model does not list, sends no request effort.
+    try std.testing.expect(withEffortUpdates(caps, current, .auto).reasoning == null);
+    try std.testing.expect(withEffortUpdates(caps, current, effort("max")).reasoning == null);
+}
+
+/// The effort an update names for a turn on `auto`, and the one the model
+/// runs at for a request that names none: OpenAI's default. Only OpenAI
+/// models take effort changes as messages.
+const default_update_effort = types.ReasoningEffort.literal("medium");
+
+/// Whether the model lists `effort`. The turn-start decision and the request
+/// writer both ask this, so an update the writer leaves out never counts as
+/// sent.
+pub fn listsEffort(listed: []const types.ReasoningEffort, effort: types.ReasoningEffort) bool {
+    for (listed) |option| {
+        if (option.eql(effort)) return true;
+    }
+    return false;
+}
+
+/// The effort the model runs at for a request whose own effort is `named`:
+/// the provider's default when it is `auto` or one the model does not list,
+/// which the request leaves out.
+pub fn requestEffort(listed: []const types.ReasoningEffort, named: types.ReasoningEffort) types.ReasoningEffort {
+    if (!named.isDefault() and listsEffort(listed, named)) return named;
+    return default_update_effort;
+}
+
+/// The update a turn that asks for `asked` sends when the model runs at
+/// `runs_at`: none when it already runs there, or when the model does not
+/// list the effort, since the provider rejects that.
+pub fn effortUpdate(listed: []const types.ReasoningEffort, runs_at: types.ReasoningEffort, asked: types.ReasoningEffort) ?types.ReasoningEffort {
+    const sent = if (asked.isDefault()) default_update_effort else asked;
+    if (sent.eql(runs_at) or !listsEffort(listed, sent)) return null;
+    return sent;
+}
+
+test "a turn's update is the effort it asks for, unless the model runs there or does not list it" {
+    const effort = types.ReasoningEffort.literal;
+    const listed = [_]types.ReasoningEffort{ effort("low"), effort("medium"), effort("high") };
+    try std.testing.expect(effortUpdate(&listed, effort("high"), effort("low")).?.eql(effort("low")));
+    try std.testing.expect(effortUpdate(&listed, effort("low"), effort("low")) == null);
+    try std.testing.expect(effortUpdate(&listed, effort("high"), .auto).?.eql(effort("medium")));
+    try std.testing.expect(effortUpdate(&listed, effort("medium"), .auto) == null);
+    try std.testing.expect(effortUpdate(&listed, effort("high"), effort("max")) == null);
+    // A request that names auto, or an effort the model does not list, runs at the default.
+    try std.testing.expect(requestEffort(&listed, .auto).eql(effort("medium")));
+    try std.testing.expect(requestEffort(&listed, effort("max")).eql(effort("medium")));
+    try std.testing.expect(requestEffort(&listed, effort("high")).eql(effort("high")));
+}
+
+/// `options` for a model that takes effort changes as messages: the request
+/// names the session's first effort, `anchor`, through the same check as the
+/// current one, and later changes go as updates.
+pub fn withEffortUpdates(capabilities: Capabilities, options: ResolvedProviderOptions, anchor: types.ReasoningEffort) ResolvedProviderOptions {
+    var anchored = options;
+    anchored.reasoning = resolveProviderOptionsForCapabilities(capabilities, anchor, false).reasoning;
+    anchored.effort_updates = .{ .listed = capabilities.reasoning_efforts };
+    return anchored;
 }
 
 /// Ultrafast is an explicit, catalog-verified OpenAI Gateway opt-in. Unlike Fast,

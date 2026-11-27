@@ -181,6 +181,25 @@ pub const ProviderBlock = struct {
     /// system message text each. Later requests send it unchanged, so
     /// nothing before those turns changes (D94).
     runtime_context: []const []const u8 = &.{},
+    /// The effort the compaction request named, for a model that takes
+    /// effort changes as messages. Later requests name it too, so the block's
+    /// reasoning stays valid (D103). An older block has none.
+    reasoning_anchor: ?[]const u8 = null,
+
+    /// Leaves out an absent anchor, so a block without one keeps the bytes an
+    /// fx from before anchors wrote.
+    pub fn jsonStringify(self: ProviderBlock, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (.{ "provider", "model", "text", "parts_json", "kept_turns", "runtime_context" }) |name| {
+            try writer.objectField(name);
+            try writer.write(@field(self, name));
+        }
+        if (self.reasoning_anchor) |anchor| {
+            try writer.objectField("reasoning_anchor");
+            try writer.write(anchor);
+        }
+        try writer.endObject();
+    }
 };
 
 /// The provider block a checkpoint holds, or null for fx's own summary.
@@ -671,6 +690,32 @@ test "payload checkpoints round trip and render each turn in order, then the ent
     try testing.expect(std.mem.startsWith(u8, text, "<compacted_conversation>\n"));
     try testing.expect(std.mem.find(u8, text, marker) == null);
     try testing.expect(std.mem.find(u8, text, "\"turn_count\"") == null);
+}
+
+test "a provider block keeps the request effort it was written at, and an older block reads without one (D103)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const runtime_context = [_][]const u8{"ctx"};
+    const block: ProviderBlock = .{ .provider = "gateway", .model = "openai/gpt-6.1-sol", .parts_json = "[]", .kept_turns = 2, .runtime_context = &runtime_context };
+    // The bytes an fx from before the anchor wrote for this block, and still
+    // writes for a block without one.
+    const older = "{\"provider\":\"gateway\",\"model\":\"openai/gpt-6.1-sol\",\"text\":\"\",\"parts_json\":\"[]\",\"kept_turns\":2,\"runtime_context\":[\"ctx\"]}";
+    var plain: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(block, .{}, &plain.writer);
+    try testing.expectEqualStrings(older, plain.written());
+
+    var anchored_block = block;
+    anchored_block.reasoning_anchor = "high";
+    var anchored: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(anchored_block, .{}, &anchored.writer);
+    try testing.expectEqualStrings(older[0 .. older.len - 1] ++ ",\"reasoning_anchor\":\"high\"}", anchored.written());
+
+    const saved = try encode(arena, .{ .provider = anchored_block });
+    try testing.expectEqualStrings("high", (try providerBlock(arena, saved)).?.reasoning_anchor.?);
+    const older_saved = try encode(arena, .{ .provider = block });
+    try testing.expect((try providerBlock(arena, older_saved)).?.reasoning_anchor == null);
+    try testing.expectEqualStrings("ctx", (try providerBlock(arena, older_saved)).?.runtime_context[0]);
 }
 
 test "the turn in progress shows its summary, added messages and tools" {
