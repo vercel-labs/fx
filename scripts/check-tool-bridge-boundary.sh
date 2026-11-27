@@ -75,7 +75,7 @@ if [[ -n "$reaching_in" ]]; then
   exit 1
 fi
 
-allowed='^(std|builtin|fuzz_corpus|[a-z_]+\.zig|\.\./shared/(types|io|debug_trace|text_utils)\.zig|\.\./execution/command_runner\.zig)$'
+allowed='^(std|builtin|fuzz_corpus|[a-z_]+\.zig|\.\./shared/(types|io|debug_trace|text_utils|json_depth)\.zig|\.\./execution/command_runner\.zig)$'
 reaching_out=""
 while IFS= read -r line; do
   target="${line#*@import(\"}"
@@ -85,6 +85,6 @@ while IFS= read -r line; do
   fi
 done < <(git grep --untracked -n -o -E '@import\("[^"]+"\)' -- "$folder" || true)
 if [[ -n "$reaching_out" ]]; then
-  printf 'The tool bridge module may import only std, builtin, fuzz_corpus, its own files, shared basics (types, io, debug_trace, text_utils), and command_runner.zig:\n%s' "$reaching_out" >&2
+  printf 'The tool bridge module may import only std, builtin, fuzz_corpus, its own files, shared basics (types, io, debug_trace, text_utils, json_depth), and command_runner.zig:\n%s' "$reaching_out" >&2
   exit 1
 fi

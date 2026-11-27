@@ -3864,7 +3864,8 @@ describe("slice 6 break-it", () => {
     expect(result.stderr).not.toContain("panic:");
     const out = (JSON.parse(toolResultText(gateway.requests[1]!.body, "fifo_bash")) as { value: string }).value;
     expect(out).toContain("rc=6");
-    expect(out).toContain("SkillResourceNotRegularFile");
+    expect(out).toContain("out=fx tool skill open: resource pipe in skill demo is not a regular file (a folder, a link, a pipe, or a device); name a regular file inside the skill folder.");
+    expect(out).not.toContain("SkillResourceNotRegularFile");
   }, 15_000);
 });
 

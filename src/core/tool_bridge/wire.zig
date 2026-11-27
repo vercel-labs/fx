@@ -21,6 +21,7 @@
 const std = @import("std");
 const capability_mod = @import("capability.zig");
 const edit_blocks = @import("edit_blocks.zig");
+const json_depth = @import("../shared/json_depth.zig");
 const mcp_call = @import("core.zig");
 
 const Allocator = std.mem.Allocator;
@@ -34,11 +35,10 @@ pub const token_env = "FX_MCP_CALL_TOKEN";
 pub const max_request_bytes: usize = 1024 * 1024;
 /// The longest reply header line the client reads.
 pub const max_header_bytes: usize = 4 * 1024;
-/// Deepest `arguments` value `parseRequest` accepts (matches `json_depth.max_depth`
-/// in `src/core/shared/json_depth.zig`, which the tool-bridge boundary does not
-/// import, and stays under `std.json.Stringify`'s 256-level fixed stack, which
-/// panics at level 257 in Debug and ReleaseSafe builds).
-const max_arguments_depth: usize = 64;
+/// Deepest nesting a request line may have, counted on its raw text before
+/// std.json builds it. The envelope object is level 1, so `arguments` keeps the
+/// depth `json_depth.max_depth` allows when it is counted from its own object.
+const max_line_depth: usize = json_depth.max_depth + 1;
 
 pub const token_hex_len = 2 * @sizeOf(mcp_call.Token);
 
@@ -113,6 +113,7 @@ pub const RequestError = error{ MalformedRequest, OutOfMemory };
 /// Parses one request line. The result borrows from `arena`.
 pub fn parseRequest(arena: Allocator, line: []const u8) RequestError!Request {
     if (line.len > max_request_bytes) return error.MalformedRequest;
+    if (json_depth.exceedsDepth(line, max_line_depth)) return error.MalformedRequest;
     const value = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedRequest,
@@ -130,7 +131,6 @@ pub fn parseRequest(arena: Allocator, line: []const u8) RequestError!Request {
         .call => blk: {
             const arguments = object.get("arguments") orelse return error.MalformedRequest;
             if (arguments != .object) return error.MalformedRequest;
-            if (!withinDepth(arguments, max_arguments_depth)) return error.MalformedRequest;
             var out: std.Io.Writer.Allocating = .init(arena);
             std.json.Stringify.value(arguments, .{}, &out.writer) catch return error.OutOfMemory;
             break :blk .{ .call = .{ .tool = try nonEmptyString(object, "tool"), .arguments_json = out.written() } };
@@ -188,48 +188,6 @@ fn optionalNonEmptyString(object: std.json.ObjectMap, key: []const u8) RequestEr
 fn optionalReport(object: std.json.ObjectMap) RequestError!?capability_mod.AgentReport {
     const raw = (try optionalNonEmptyString(object, "report")) orelse return null;
     return capability_mod.AgentReport.parse(raw) orelse error.MalformedRequest;
-}
-
-const DepthFrame = union(enum) {
-    array: struct { items: []const std.json.Value, next: usize },
-    object: std.json.ObjectMap.Iterator,
-};
-
-fn withinDepth(value: std.json.Value, max: usize) bool {
-    std.debug.assert(max <= max_arguments_depth);
-    var stack: [max_arguments_depth]DepthFrame = undefined;
-    var len: usize = 0;
-    var pending: ?std.json.Value = value;
-    while (true) {
-        if (pending) |entered| {
-            pending = null;
-            switch (entered) {
-                .array => |array| {
-                    if (len == max) return false;
-                    stack[len] = .{ .array = .{ .items = array.items, .next = 0 } };
-                    len += 1;
-                },
-                .object => |object| {
-                    if (len == max) return false;
-                    stack[len] = .{ .object = object.iterator() };
-                    len += 1;
-                },
-                else => {},
-            }
-        }
-        if (len == 0) return true;
-        switch (stack[len - 1]) {
-            .array => |*frame| {
-                if (frame.next < frame.items.len) {
-                    pending = frame.items[frame.next];
-                    frame.next += 1;
-                } else len -= 1;
-            },
-            .object => |*iterator| {
-                if (iterator.next()) |entry| pending = entry.value_ptr.* else len -= 1;
-            },
-        }
-    }
 }
 
 /// The blocks of an edit line: one to `edit_blocks.max_blocks`, each with a
@@ -683,7 +641,7 @@ test "a call request whose arguments nest deeper than the limit is refused, not 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    for ([_]usize{ 300, max_arguments_depth }) |array_levels| {
+    for ([_]usize{ 300, json_depth.max_depth }) |array_levels| {
         const line = try nestedCallLine(arena, array_levels);
         try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
     }
@@ -706,8 +664,8 @@ test "a call request whose arguments nest at the limit parses and round-trips" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // `arguments` itself is level 1, plus `max_arguments_depth - 1` array levels.
-    const line = try nestedCallLine(arena, max_arguments_depth - 1);
+    // `arguments` itself is level 1, plus `json_depth.max_depth - 1` array levels.
+    const line = try nestedCallLine(arena, json_depth.max_depth - 1);
     const parsed = try parseRequest(arena, line);
     const token = parsed.token orelse return error.TestExpectedToken;
     var out: std.Io.Writer.Allocating = .init(arena);
@@ -715,6 +673,29 @@ test "a call request whose arguments nest at the limit parses and round-trips" {
     const rewritten = out.written();
     const reparsed = try parseRequest(arena, rewritten[0 .. rewritten.len - 1]);
     try expectSameOperation(parsed.operation, reparsed.operation);
+}
+
+test "a request line nested one level past the limit is refused, even outside arguments" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The envelope object is level 1 of the line, so the line takes
+    // `json_depth.max_depth` array levels after it, and one more is refused.
+    for ([_]usize{ json_depth.max_depth, json_depth.max_depth + 1 }) |array_levels| {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        const hex = tokenHex(@splat(0xab));
+        try out.writer.print("{{\"v\":1,\"token\":\"{s}\",\"op\":\"list\",\"server\":\"s\",\"extra\":", .{&hex});
+        try out.writer.splatByteAll('[', array_levels);
+        try out.writer.splatByteAll(']', array_levels);
+        try out.writer.writeAll("}");
+        const line = out.written();
+        if (array_levels == json_depth.max_depth) {
+            _ = try parseRequest(arena, line);
+        } else {
+            try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
+        }
+    }
 }
 
 fn nestedCallLine(arena: Allocator, array_levels: usize) ![]const u8 {

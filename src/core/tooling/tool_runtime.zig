@@ -65,6 +65,21 @@ const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_bridge = @import("../tool_bridge/tool_bridge.zig");
 const mcp_call_capability = tool_bridge.capability;
+const subagent_reports = @import("../subagent/reports.zig");
+
+// capability.AgentReport mirrors reports.Rule, since the bridge module may not
+// import subagent code. This is the one file that imports both, so it checks them.
+comptime {
+    const mirror = @typeInfo(mcp_call_capability.AgentReport).@"enum".field_names;
+    const source = @typeInfo(subagent_reports.Rule).@"enum".field_names;
+    for (0..@max(mirror.len, source.len)) |index| {
+        const mirror_name = if (index < mirror.len) mirror[index] else "(no field)";
+        const source_name = if (index < source.len) source[index] else "(no field)";
+        if (!std.mem.eql(u8, mirror_name, source_name)) {
+            @compileError("capability.AgentReport must mirror reports.Rule field for field: AgentReport has " ++ mirror_name ++ " where reports.Rule has " ++ source_name);
+        }
+    }
+}
 const model_tool_schema = @import("model_tool_schema.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const capability_retrieval = @import("capability_retrieval.zig");
@@ -1734,9 +1749,10 @@ fn runBridgeSkillOpen(
     }
 }
 
-/// The model-facing text for a skill read that failed after the skill was
-/// chosen. Each named error says what is wrong and what to do next. The last
-/// arm names an unexpected error, so no failure is shown as a bare error name.
+/// The text for a skill read that failed after the skill was chosen. Each named
+/// error says what is wrong and what to do next. The last arm names an
+/// unexpected error, so no failure is shown as a bare error name. The text has
+/// no command name: `fx tool` writes `fx tool skill open:` before it.
 /// The longest encoded skill name or resource that a failure text shows. A
 /// longer one is cut on a token boundary and ends with "...".
 const skill_open_field_bytes: usize = 200;
@@ -1753,15 +1769,16 @@ fn skillOpenFailureText(arena: Allocator, raw_name: []const u8, raw_resource: ?[
     const shown = resource orelse "SKILL.md";
     return switch (err) {
         error.FileNotFound => if (resource) |path|
-            arena.print("fx tool skill open: resource {s} was not found in skill {s}; check the path, which is relative to the skill folder.", .{ path, name })
+            arena.print("resource {s} was not found in skill {s}; check the path, which is relative to the skill folder.", .{ path, name })
         else
-            arena.print("fx tool skill open: no skill named {s}; run skill list to see the names.", .{name}),
-        error.InvalidSkillResourcePath => arena.print("fx tool skill open: resource {s} is not a valid path in skill {s}; use a relative path inside the skill folder with no .. parts.", .{ shown, name }),
-        error.IsDir => arena.print("fx tool skill open: resource {s} is a folder, not a file, in skill {s}; name a file inside it.", .{ shown, name }),
-        error.AccessDenied => arena.print("fx tool skill open: resource {s} in skill {s} cannot be read: permission denied; check the file's permissions.", .{ shown, name }),
-        error.SkillFileLimitExceeded => arena.print("fx tool skill open: resource {s} in skill {s} is larger than the skill_file_bytes limit; raise skill_file_bytes to read it.", .{ shown, name }),
-        error.SkillResourceChanged, error.ChangedSkillWasLoaded => arena.print("fx tool skill open: resource {s} in skill {s} changed while fx read it; open it again.", .{ shown, name }),
-        else => arena.print("fx tool skill open: could not read {s} in skill {s} ({s}); open it again, and report it if this repeats.", .{ shown, name, @errorName(err) }),
+            arena.print("no skill named {s}; run skill list to see the names.", .{name}),
+        error.InvalidSkillResourcePath => arena.print("resource {s} is not a valid path in skill {s}; use a relative path inside the skill folder with no .. parts.", .{ shown, name }),
+        error.IsDir => arena.print("resource {s} is a folder, not a file, in skill {s}; name a file inside it.", .{ shown, name }),
+        error.SkillResourceNotRegularFile => arena.print("resource {s} in skill {s} is not a regular file (a folder, a link, a pipe, or a device); name a regular file inside the skill folder.", .{ shown, name }),
+        error.AccessDenied => arena.print("resource {s} in skill {s} cannot be read: permission denied; check the file's permissions.", .{ shown, name }),
+        error.SkillFileLimitExceeded => arena.print("resource {s} in skill {s} is larger than the skill_file_bytes limit; raise skill_file_bytes to read it.", .{ shown, name }),
+        error.SkillResourceChanged, error.ChangedSkillWasLoaded => arena.print("resource {s} in skill {s} changed while fx read it; open it again.", .{ shown, name }),
+        else => arena.print("could not read {s} in skill {s} ({s}); open it again, and report it if this repeats.", .{ shown, name, @errorName(err) }),
     };
 }
 
@@ -3627,7 +3644,7 @@ test "bridged skill open names a missing skill and the command that lists names"
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const text = try skillOpenFailureText(arena_state.allocator(), "alpha", null, error.FileNotFound);
-    try std.testing.expectEqualStrings("fx tool skill open: no skill named alpha; run skill list to see the names.", text);
+    try std.testing.expectEqualStrings("no skill named alpha; run skill list to see the names.", text);
 }
 
 test "bridged skill open names a bad resource path, a missing resource, and a folder, with the next step" {
@@ -3650,9 +3667,9 @@ test "bridged skill open names a bad resource path, a missing resource, and a fo
     defer rt.deinit(alloc);
     var state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
     const cases = [_]struct { resource: []const u8, expected: []const u8 }{
-        .{ .resource = "../outside.txt", .expected = "fx tool skill open: resource ../outside.txt is not a valid path in skill alpha; use a relative path inside the skill folder with no .. parts." },
-        .{ .resource = "missing.md", .expected = "fx tool skill open: resource missing.md was not found in skill alpha; check the path, which is relative to the skill folder." },
-        .{ .resource = "nested", .expected = "fx tool skill open: resource nested is a folder, not a file, in skill alpha; name a file inside it." },
+        .{ .resource = "../outside.txt", .expected = "resource ../outside.txt is not a valid path in skill alpha; use a relative path inside the skill folder with no .. parts." },
+        .{ .resource = "missing.md", .expected = "resource missing.md was not found in skill alpha; check the path, which is relative to the skill folder." },
+        .{ .resource = "nested", .expected = "resource nested in skill alpha is not a regular file (a folder, a link, a pipe, or a device); name a regular file inside the skill folder." },
     };
     for (cases) |case| {
         const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-47", .{ .skill_open = .{ .name = "alpha", .resource = case.resource } })) {
@@ -3673,22 +3690,22 @@ test "bridged skill open read failures name the file, what is wrong, and the nex
         .{
             .err = error.AccessDenied,
             .resource = null,
-            .expected = "fx tool skill open: resource SKILL.md in skill alpha cannot be read: permission denied; check the file's permissions.",
+            .expected = "resource SKILL.md in skill alpha cannot be read: permission denied; check the file's permissions.",
         },
         .{
             .err = error.SkillFileLimitExceeded,
             .resource = "big.txt",
-            .expected = "fx tool skill open: resource big.txt in skill alpha is larger than the skill_file_bytes limit; raise skill_file_bytes to read it.",
+            .expected = "resource big.txt in skill alpha is larger than the skill_file_bytes limit; raise skill_file_bytes to read it.",
         },
         .{
             .err = error.SkillResourceChanged,
             .resource = "big.txt",
-            .expected = "fx tool skill open: resource big.txt in skill alpha changed while fx read it; open it again.",
+            .expected = "resource big.txt in skill alpha changed while fx read it; open it again.",
         },
         .{
             .err = error.NoSpaceLeft,
             .resource = null,
-            .expected = "fx tool skill open: could not read SKILL.md in skill alpha (NoSpaceLeft); open it again, and report it if this repeats.",
+            .expected = "could not read SKILL.md in skill alpha (NoSpaceLeft); open it again, and report it if this repeats.",
         },
     };
     for (cases) |case| {
@@ -3707,7 +3724,7 @@ test "bridged skill open shows a program's name and resource terminal-safe and c
     const hostile: []const u8 = &hostile_buf;
 
     const missing = try skillOpenFailureText(arena, hostile, null, error.FileNotFound);
-    const missing_prefix = "fx tool skill open: no skill named ";
+    const missing_prefix = "no skill named ";
     const missing_suffix = "; run skill list to see the names.";
     try std.testing.expect(std.mem.startsWith(u8, missing, missing_prefix));
     try std.testing.expect(std.mem.endsWith(u8, missing, missing_suffix));
@@ -3717,13 +3734,23 @@ test "bridged skill open shows a program's name and resource terminal-safe and c
     try std.testing.expect(std.mem.findScalar(u8, shown_name, 0x1b) == null);
 
     const resource_text = try skillOpenFailureText(arena, "alpha", hostile, error.FileNotFound);
-    const resource_prefix = "fx tool skill open: resource ";
+    const resource_prefix = "resource ";
     const resource_end = " was not found in skill alpha";
     try std.testing.expect(std.mem.startsWith(u8, resource_text, resource_prefix));
     const end = std.mem.find(u8, resource_text, resource_end) orelse return error.TestUnexpectedResult;
     const shown_resource = resource_text[resource_prefix.len..end];
     try std.testing.expect(shown_resource.len <= 200);
     try std.testing.expect(std.mem.findScalar(u8, shown_resource, 0x1b) == null);
+}
+
+test "bridged skill open names a resource that is not a regular file, with the next step" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const text = try skillOpenFailureText(arena_state.allocator(), "demo", "pipe", error.SkillResourceNotRegularFile);
+    try std.testing.expectEqualStrings(
+        "resource pipe in skill demo is not a regular file (a folder, a link, a pipe, or a device); name a regular file inside the skill folder.",
+        text,
+    );
 }
 
 const RunCommandBackendState = struct {
