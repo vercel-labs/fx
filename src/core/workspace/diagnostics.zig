@@ -11,7 +11,9 @@ const render_metrics = @import("render_metrics.zig");
 const auto_review_metrics = @import("auto_review_metrics.zig");
 const compactor = @import("../compactor/compactor.zig");
 const model_catalog_metrics = @import("model_catalog_metrics.zig");
+const output_limit_metrics = @import("output_limit_metrics.zig");
 const io_mod = @import("../shared/io.zig");
+const os_errors = @import("../shared/os_errors.zig");
 
 pub const NetworkCall = network_metrics.NetworkCall;
 pub const NetworkCallKind = network_metrics.NetworkCallKind;
@@ -46,6 +48,21 @@ pub const AutoReviewAttempt = auto_review_metrics.Attempt;
 pub const AutoReviewAttemptResult = auto_review_metrics.AttemptResult;
 pub const auto_review_recent_capacity = auto_review_metrics.recent_capacity;
 pub const auto_review_held_capacity = auto_review_metrics.held_capacity;
+pub const OutputLimitStop = output_limit_metrics.Stop;
+pub const OutputLimitRecord = output_limit_metrics.Record;
+pub const OutputLimitAction = output_limit_metrics.Action;
+pub const output_limit_stop_capacity = output_limit_metrics.ring_capacity;
+
+/// Records a reply cut off at its output limit, and what fx did next, so
+/// `/trace` lists it as a problem without FX_TRACE.
+pub fn recordOutputLimitStop(stop: OutputLimitRecord) void {
+    output_limit_metrics.record(stop);
+}
+
+/// Copies the newest kept output-limit stops, oldest first.
+pub fn snapshotOutputLimitStops(out: []OutputLimitStop) usize {
+    return output_limit_metrics.snapshot(out);
+}
 
 pub fn snapshotCompactionEvents(out: []CompactionEvent) usize {
     return compactor.snapshotTrace(out);
@@ -90,6 +107,22 @@ pub fn snapshotFailedNetworkCalls(out: []NetworkCall) usize {
 
 pub fn networkLifetimeStats() NetworkLifetimeStats {
     return network_metrics.lifetimeStats();
+}
+
+pub const OsError = os_errors.Note;
+pub const os_error_capacity = os_errors.capacity;
+/// False where no OS error is ever kept, such as the wasm builds.
+pub const os_errors_kept = os_errors.supported;
+
+/// Copies the kept OS errors behind network `error.Unexpected` results,
+/// oldest first.
+pub fn snapshotOsErrors(out: []OsError) usize {
+    return os_errors.snapshot(io_mod.getIo(), out);
+}
+
+/// OS errors noted this session, including any no longer kept.
+pub fn osErrorCount() u64 {
+    return os_errors.count(io_mod.getIo());
 }
 
 pub fn snapshotNetworkTurnRollups(out: []NetworkTurnRollup) usize {
@@ -191,6 +224,8 @@ pub fn resetSession() void {
     compactor.resetTrace();
     model_catalog_metrics.reset();
     auto_review_metrics.reset();
+    os_errors.reset(io_mod.getIo());
+    output_limit_metrics.reset();
 }
 
 pub fn resetForTest() void {

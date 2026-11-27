@@ -56,6 +56,7 @@ test {
     _ = @import("core/shared/text_utils.zig");
     _ = @import("core/shared/types.zig");
     _ = @import("core/workspace/network_metrics.zig");
+    _ = @import("core/workspace/repo_root.zig");
     _ = @import("core/shell_command/command_classification.zig");
     _ = @import("core/shell_command/command_effect.zig");
     _ = @import("core/shell_command/command_lex.zig");

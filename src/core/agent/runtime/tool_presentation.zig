@@ -588,6 +588,31 @@ pub const ProvisionalToolStatuses = struct {
         turn_id: u64,
         recovered_calls: []const ToolCall,
     ) !void {
+        try self.finishUnmatchedStarts(hooks, alloc, arena, turn_id, recovered_calls, "Connection interrupted before {s} ran");
+    }
+
+    /// Settles the row of each streamed start that none of `calls` finished:
+    /// the reply was cut off at its output limit, so the call never runs.
+    pub fn finishCutStarts(
+        self: *ProvisionalToolStatuses,
+        hooks: *const AgentRuntimeDeps,
+        alloc: Allocator,
+        arena: Allocator,
+        turn_id: u64,
+        complete_calls: []const ToolCall,
+    ) !void {
+        try self.finishUnmatchedStarts(hooks, alloc, arena, turn_id, complete_calls, "Cut off at the output limit before {s} ran");
+    }
+
+    fn finishUnmatchedStarts(
+        self: *ProvisionalToolStatuses,
+        hooks: *const AgentRuntimeDeps,
+        alloc: Allocator,
+        arena: Allocator,
+        turn_id: u64,
+        recovered_calls: []const ToolCall,
+        comptime summary_format: []const u8,
+    ) !void {
         var index = self.tracked.items.len;
         while (index > 0) {
             index -= 1;
@@ -615,10 +640,7 @@ pub const ProvisionalToolStatuses = struct {
                 detail,
                 diff.max_encoded_label_bytes,
             );
-            const summary = try arena.print(
-                "Connection interrupted before {s} ran",
-                .{encoded.bytes},
-            );
+            const summary = try arena.print(summary_format, .{encoded.bytes});
             try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
                 .id = .{ .turn_id = turn_id, .call_id = status.id },
                 .outcome = .{ .kind = .failed, .summary = summary },
@@ -2171,7 +2193,7 @@ const ProvisionalStatusTestCapture = struct {
         };
     }
 
-    fn noopAppendRuntimeContext(_: *anyopaque, _: Allocator, _: *std.ArrayList(types.ChatMessage)) !void {}
+    fn noopAppendRuntimeContext(_: *anyopaque, _: Allocator, _: []const u8, _: *std.ArrayList(types.ChatMessage)) !void {}
     fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: types.PermissionMode, _: []const types.PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8, _: ?[]const u8) !command_admission.PermissionOutcome {
         return .{ .decision = .once, .execution_authority = .ordinary };
     }

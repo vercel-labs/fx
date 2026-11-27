@@ -711,6 +711,32 @@ test "full projection keeps noncontiguous retained command records at source ent
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source, "  result"));
 }
 
+test "full transcript shows a notice link as its label and URL" {
+    const alloc = std.testing.allocator;
+    const entries = [_]transcript_blocks.TranscriptEntry{.{ .semantic_notice = .{
+        .id = 1,
+        .topic = "",
+        .tone = .warning,
+        .body = "Needs a pass.\n├ \x1b]8;;https://a.example/pass\x1b\\Subscribe to Token Pass\x1b]8;;\x1b\\",
+        .visibility = .compact_and_full,
+    } }};
+    var projection = try buildProjection(
+        alloc,
+        &entries,
+        &.{},
+        &.{},
+        .{ .system_notice_label_style = "", .system_notice_text_style = "", .reset_style = "", .dim_style = "", .red_style = "" },
+        80,
+        null,
+    );
+    defer projection.deinit(alloc);
+    const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 20, 0);
+    defer alloc.free(source);
+    try std.testing.expect(std.mem.find(u8, source, "├ Subscribe to Token Pass (https://a.example/pass)") != null);
+    try std.testing.expect(std.mem.find(u8, source, "\\x1b]8") == null);
+    try std.testing.expect(std.mem.find(u8, source, "\x1b") == null);
+}
+
 test "full projection matches file details to full diffs by marker and lifecycle" {
     const alloc = std.testing.allocator;
     const compact_first = try @import("../core/output/diff.zig").wrapWithMarkers(
@@ -5973,13 +5999,17 @@ const ProjectionComposeContext = struct {
         out: *std.Io.Writer.Allocating,
         notice: transcript_blocks.TranscriptEntry.SemanticNoticeEntry,
     ) !bool {
+        const body = try transcript_blocks.noticeLinksAsText(self.alloc, notice.body);
+        defer self.alloc.free(body);
+        const detail = try transcript_blocks.noticeLinksAsText(self.alloc, notice.detail);
+        defer self.alloc.free(detail);
         var safe: std.Io.Writer.Allocating = .init(self.alloc);
         defer safe.deinit();
         var encoder = TerminalSafeIndentedWriter{ .prefix = "" };
-        try encoder.append(&safe.writer, notice.body);
-        if (notice.detail.len > 0) {
+        try encoder.append(&safe.writer, body);
+        if (detail.len > 0) {
             try encoder.append(&safe.writer, "\n");
-            try encoder.append(&safe.writer, notice.detail);
+            try encoder.append(&safe.writer, detail);
         }
         try encoder.finish(&safe.writer);
         var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, safe.written(), "\n"), '\n');

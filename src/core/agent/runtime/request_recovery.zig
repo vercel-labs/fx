@@ -28,7 +28,8 @@
 //! instances, and each can have a request in flight.
 //!
 //! Without a retry budget (`retry_budget_ms == null`), the module retries every
-//! transient failure for as long as it lasts and only Esc ends a request whose
+//! transient failure for as long as it lasts, except for unreadable replies and
+//! OS errors that Zig has no name for: only Esc ends a request whose other
 //! failures keep coming. `fx ask` sets `retry_budget_ms` (5 minutes from the
 //! request's first failure), after which transient failures end the request on
 //! its error.
@@ -80,6 +81,12 @@ pub fn failureKind(cause: types.ModelRecoveryCause) ?Failure.Kind {
 /// that sends one every time is broken, not having a bad moment.
 const max_unreadable_replies = 3;
 
+/// The OS errors that Zig has no name for one request takes before its turn
+/// ends. Their cause is not known, so one that comes back every time is taken
+/// as a defect, not a bad moment on the network. Other network failures in
+/// between do not count.
+const max_unnamed_os_errors = 3;
+
 /// Whether the store now holds a login the waiting request can send, other
 /// than the one the provider refused, as another fx process that signs in
 /// saves.
@@ -110,6 +117,9 @@ pub const RequestRecovery = struct {
     /// Replies this request could not read. Touched only by the request's
     /// own thread.
     unreadable_replies: u8 = 0,
+    /// Sends that failed with an OS error Zig has no name for. Touched only
+    /// by the request's own thread.
+    unnamed_os_errors: u8 = 0,
     /// Links the request into `registry` while it is registered. Guarded by
     /// `registry_mutex`, not `mutex`.
     registry_node: std.DoublyLinkedList.Node = .{},
@@ -546,6 +556,14 @@ pub const RequestRecovery = struct {
     pub fn unreadableReplyEndsRequest(self: *RequestRecovery) bool {
         self.unreadable_replies +|= 1;
         return self.unreadable_replies >= max_unreadable_replies;
+    }
+
+    /// Counts a send that failed with an OS error Zig has no name for, and
+    /// says whether it is the last one: at `max_unnamed_os_errors` the turn
+    /// ends with the error instead of another resend.
+    pub fn unnamedOsErrorEndsRequest(self: *RequestRecovery) bool {
+        self.unnamed_os_errors +|= 1;
+        return self.unnamed_os_errors >= max_unnamed_os_errors;
     }
 
     pub fn attempt(self: *RequestRecovery) u16 {

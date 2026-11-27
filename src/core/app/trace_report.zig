@@ -60,7 +60,8 @@
 //!   taken during a turn, so it may be partial; `interrupted_turn`
 //!   {`in_flight_tool`, `completed_tools`, a count}; `session_title`
 //!   {`status`, `reason`, `detail`}; `network_call`, for the newest 3 failed
-//!   calls, with `call` holding the `network_call` fields; `tool_call`, for
+//!   calls, with `call` holding the `network_call` fields; `os_error`, for
+//!   the newest 3, with the `os_error` fields; `tool_call`, for
 //!   the newest 5 calls that did not succeed, with `call` {`at`, `name`,
 //!   `outcome`, `duration_ms`, `source`, `cause`, `call_id`}, from the kept
 //!   failures that later successful calls do not remove; `compaction` {`event`,
@@ -153,6 +154,14 @@
 //!   push out (0 when none failed); `session.errors` counts every failed
 //!   call. Then a `failed_network_call` per kept failure, oldest first, with
 //!   the `network_call` fields; the `network_call` problems come from these.
+//!   The `network` record also has `os_errors`, the network calls this
+//!   session that failed with an OS error code that Zig has no name for and
+//!   reports as `Unexpected`. Then an `os_error` per kept one, at most 16,
+//!   oldest first: `at`, `call` (`lookup`, `connect`, `read`, `write`,
+//!   `receive`, or `send`), and the code as `errno` and `errno_name`, such as
+//!   `EINVAL`, when the call left one; a `lookup` has none. A request that
+//!   failed with the error `Unexpected` in one of those calls has an
+//!   `os_error` near the time it ended.
 //! - `model_catalog`: `cache` {`state`, `entries`, `last_attempt_age_ms`, and
 //!   after a failure `failure`, `retryable`, `http_status`,
 //!   `anonymous_fallback`}; `selected_model` {`model`, `image_input`,
@@ -348,9 +357,11 @@ const tool_args_max_bytes: usize = 1200;
 const result_preview_max_bytes: usize = 180;
 const pending_items_shown: usize = 3;
 const network_problems_shown: usize = 3;
+const os_error_problems_shown: usize = 3;
 const tool_problems_shown: usize = 5;
 const compaction_problems_shown: usize = 3;
 const model_catalog_problems_shown: usize = 3;
+const output_limit_problems_shown: usize = 5;
 const trace_tail_bytes: usize = 6 * 1024;
 const trace_max_lines: usize = 80;
 
@@ -894,10 +905,12 @@ noinline fn writeProblems(r: *Records, app: anytype) !void {
     try writeInterruptedTurnProblem(p, agents.screenAgentOf(app).session.agent.history.items);
     try writeSessionTitleProblem(p, app);
     try writeNetworkProblems(p);
+    try writeOsErrorProblems(p);
     try writeToolProblems(p);
     try writeCompactionProblems(p);
     try writeMcpHostProblems(p, app);
     try writeModelCatalogProblems(p);
+    try writeOutputLimitProblems(p);
 
     try r.begin("problems");
     try r.number("count", p.count);
@@ -963,6 +976,27 @@ fn writeNetworkProblems(p: *Records) !void {
         try p.endObject();
         try p.end();
     }
+}
+
+/// The newest OS errors behind network calls that failed as `Unexpected`.
+fn writeOsErrorProblems(p: *Records) !void {
+    if (comptime !diagnostics.os_errors_kept) return;
+    var notes: [diagnostics.os_error_capacity]diagnostics.OsError = undefined;
+    const count = diagnostics.snapshotOsErrors(&notes);
+    var index = count;
+    while (index > count -| os_error_problems_shown) {
+        index -= 1;
+        try beginProblem(p, "os_error");
+        try writeOsErrorFields(p, notes[index]);
+        try p.end();
+    }
+}
+
+fn writeOsErrorFields(r: *Records, note: diagnostics.OsError) !void {
+    try r.time("at", note.at_ms);
+    try r.text("call", @tagName(note.call));
+    if (note.errno != 0) try r.number("errno", note.errno);
+    if (note.errnoName()) |name| try r.text("errno_name", try r.arena.print("E{s}", .{name}));
 }
 
 /// The newest failed calls come from the kept failures, not the window, so
@@ -1038,6 +1072,33 @@ fn writeModelCatalogProblems(p: *Records) !void {
         try beginProblem(p, "model_catalog");
         try p.text("event", event.name());
         try p.optionalText("detail", event.detail());
+        try p.end();
+    }
+}
+
+/// The newest replies cut off at their output limit while they called tools.
+/// The provider answered each with a success, so the network problems never
+/// list them.
+fn writeOutputLimitProblems(p: *Records) !void {
+    var stops: [diagnostics.output_limit_stop_capacity]diagnostics.OutputLimitStop = undefined;
+    const count = diagnostics.snapshotOutputLimitStops(&stops);
+    var index = count;
+    while (index > count -| output_limit_problems_shown) {
+        index -= 1;
+        const stop = &stops[index];
+        try beginProblem(p, "output_limit");
+        try p.text("action", @tagName(stop.action));
+        try p.text("model", stop.model());
+        if (stop.subagent_id != 0) try p.number("subagent_id", stop.subagent_id);
+        try p.number("turn_id", stop.turn_id);
+        try p.number("step_id", stop.step_id);
+        if (stop.outputLimit()) |limit| try p.number("max_output_tokens", limit);
+        if (stop.outputTokens()) |tokens| try p.number("output_tokens", tokens);
+        if (stop.raisedTo()) |limit| try p.number("raised_to", limit);
+        try p.number("complete_tool_calls", stop.complete_calls);
+        try p.number("cut_tool_calls", stop.cut_calls);
+        if (stop.cutTool()) |tool| try p.text("cut_tool", traceToolDisplayName(tool));
+        try p.number("in_a_row", stop.in_a_row);
         try p.end();
     }
 }
@@ -1651,6 +1712,7 @@ noinline fn writeNetwork(r: *Records) !void {
     try r.number("turns_retained", rollup_count);
     try r.number("turns_evicted", lifetime.evicted_turns);
     try r.number("kept_failures", kept_count);
+    try r.number("os_errors", diagnostics.osErrorCount());
     try r.end();
 
     for (rollups[0..rollup_count]) |*rollup| {
@@ -1671,6 +1733,13 @@ noinline fn writeNetwork(r: *Records) !void {
     for (kept[0..kept_count]) |*call| {
         try r.begin("failed_network_call");
         try writeNetworkCallFields(r, call);
+        try r.end();
+    }
+    if (comptime !diagnostics.os_errors_kept) return;
+    var notes: [diagnostics.os_error_capacity]diagnostics.OsError = undefined;
+    for (notes[0..diagnostics.snapshotOsErrors(&notes)]) |note| {
+        try r.begin("os_error");
+        try writeOsErrorFields(r, note);
         try r.end();
     }
 }
@@ -2732,6 +2801,7 @@ fn entryText(arena: std.mem.Allocator, entry: anytype) ![]const u8 {
                 .body = e.body,
                 .visibility = e.visibility,
                 .detail = e.detail,
+                .detail_visibility = e.detail_visibility,
             },
             .{},
             std.math.maxInt(u16),
@@ -5450,6 +5520,44 @@ test "trace network calls keep web search counts, stop reasons, and schema diagn
     try std.testing.expectEqualStrings("gateway", try testString(problem_call, "kind"));
 }
 
+test "trace network names the OS error behind a call that failed as Unexpected" {
+    const os_errors = @import("../shared/os_errors.zig");
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var failed: diagnostics.NetworkCall = .{ .started_at_ms = 1_000, .duration_ms = 20, .turn_id = 2, .step_id = 73 };
+    failed.setModel("provider/model-a");
+    failed.setError("Unexpected");
+    diagnostics.recordNetworkCall(failed);
+    os_errors.note(io_mod.getIo(), .read, @backingInt(std.posix.E.INVAL));
+    os_errors.note(io_mod.getIo(), .lookup, 0);
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeNetwork(&w.records);
+    try writeOsErrorProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    try std.testing.expectEqual(@as(i64, 2), try testInt(try trace.one("network"), "os_errors"));
+    try std.testing.expectEqual(@as(usize, 2), trace.count("os_error"));
+    const read = try trace.nth("os_error", 0);
+    try std.testing.expectEqualStrings("read", try testString(read, "call"));
+    try std.testing.expectEqual(@as(i64, @backingInt(std.posix.E.INVAL)), try testInt(read, "errno"));
+    try std.testing.expectEqualStrings("EINVAL", try testString(read, "errno_name"));
+    const lookup = try trace.nth("os_error", 1);
+    try std.testing.expectEqualStrings("lookup", try testString(lookup, "call"));
+    try expectAbsent(lookup, "errno");
+    try expectAbsent(lookup, "errno_name");
+
+    // Newest first, like the other problems.
+    try std.testing.expectEqual(@as(usize, 2), trace.count("problem"));
+    const newest = try trace.nth("problem", 0);
+    try std.testing.expectEqualStrings("os_error", try testString(newest, "kind"));
+    try std.testing.expectEqualStrings("lookup", try testString(newest, "call"));
+    try std.testing.expectEqualStrings("EINVAL", try testString(try trace.nth("problem", 1), "errno_name"));
+}
+
 test "trace network keeps a failed call after later calls fill the window" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
@@ -5551,6 +5659,66 @@ test "trace problems list the newest kept failures the windows no longer hold" {
         var buf: [32]u8 = undefined;
         try std.testing.expectEqualStrings(try std.mem.print(&buf, "model=m{d}", .{failures - index}), try testString(problem, "detail"));
     }
+}
+
+test "trace problems list replies cut off at their output limit and what fx did next" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    // A cut reply's network call succeeded, so it is no network problem.
+    diagnostics.recordNetworkCall(.{ .started_at_ms = 1_000, .status = 200 });
+    diagnostics.recordOutputLimitStop(.{
+        .model = "google/gemini-4-neon",
+        .subagent_id = 110,
+        .turn_id = 429,
+        .step_id = 11490,
+        .output_limit = 32_768,
+        .raised_to = 65_536,
+        .output_tokens = 32_768,
+        .complete_calls = 6,
+        .cut_calls = 1,
+        .in_a_row = 1,
+        .cut_tool = "edit_file",
+        .action = .ran_complete_calls,
+    });
+    diagnostics.recordOutputLimitStop(.{
+        .model = "google/gemini-4-neon",
+        .turn_id = 430,
+        .step_id = 11600,
+        .output_limit = null,
+        .raised_to = null,
+        .output_tokens = null,
+        .complete_calls = 0,
+        .cut_calls = 1,
+        .in_a_row = 3,
+        .cut_tool = null,
+        .action = .ended_turn,
+    });
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeNetworkProblems(&w.records);
+    try writeOutputLimitProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+    try std.testing.expectEqual(@as(usize, 2), trace.count("problem"));
+    // The newest first.
+    const ended = try trace.nth("problem", 0);
+    try std.testing.expectEqualStrings("output_limit", try testString(ended, "kind"));
+    try std.testing.expectEqualStrings("ended_turn", try testString(ended, "action"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(ended, "in_a_row"));
+    try std.testing.expect(ended.get("max_output_tokens") == null);
+    try std.testing.expect(ended.get("subagent_id") == null);
+    try std.testing.expect(ended.get("cut_tool") == null);
+    const ran = try trace.nth("problem", 1);
+    try std.testing.expectEqualStrings("ran_complete_calls", try testString(ran, "action"));
+    try std.testing.expectEqualStrings("google/gemini-4-neon", try testString(ran, "model"));
+    try std.testing.expectEqual(@as(i64, 110), try testInt(ran, "subagent_id"));
+    try std.testing.expectEqual(@as(i64, 32_768), try testInt(ran, "max_output_tokens"));
+    try std.testing.expectEqual(@as(i64, 32_768), try testInt(ran, "output_tokens"));
+    try std.testing.expectEqual(@as(i64, 65_536), try testInt(ran, "raised_to"));
+    try std.testing.expectEqual(@as(i64, 6), try testInt(ran, "complete_tool_calls"));
+    try std.testing.expectEqual(@as(i64, 1), try testInt(ran, "cut_tool_calls"));
+    try std.testing.expectEqualStrings("edit_file", try testString(ran, "cut_tool"));
 }
 
 test "trace failures count the session's failures past what is kept" {

@@ -3512,7 +3512,7 @@ tmuxTest(
     const refused = await session.captureFullScrollback();
     expect(refused).toContain("not allowed for this team");
     expect(refused).toContain("Vercel team example-internal-team");
-    expect(refused).toContain("press Esc twice, run /login, choose another team, and send it again");
+    expect(refused).toContain("Wrong team? Press Esc twice, run /login, choose another team, and send it again");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -4400,7 +4400,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     expect(Date.now() - cancelStarted).toBeLessThan(500);
     expect(cancelledPane).toContain("▪ Cancelled");
-    expect(cancelledPane).not.toContain("system: cancelled");
+    expect(cancelledPane).not.toContain("⊘ Cancelled");
     expect(cancelledPane).not.toContain("Cancelling");
     expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -7144,7 +7144,7 @@ tmuxTest(
         FX_TEST_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
       });
       await session.waitForComposer(TIMEOUT);
-      const failureVisible = session.waitForText("request failed: reply too large to read", TIMEOUT);
+      const failureVisible = session.waitForText("Request failed: reply too large to read", TIMEOUT);
       await session.sendText("Recover from a bounded Grok response.");
       await failureVisible;
       await session.sendText("Accept another prompt after recovery.");
@@ -7153,7 +7153,7 @@ tmuxTest(
       await session.waitForText("GROK_AFTER_LIMIT_OK", TIMEOUT);
 
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toContain("request failed: reply too large to read");
+      expect(scrollback).toContain("Request failed: reply too large to read");
       expect(scrollback).not.toContain("XaiGrokSseEventTooLarge");
       expect(grok.bodies).toHaveLength(3);
       expect(gateway.requests).toHaveLength(0);
@@ -7608,7 +7608,8 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
       const result = await runFx(["ask", "--json", "--auto", "Report the supplied answer without using tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(result.signal).toBeNull();
       expect(result.code, result.stdout + result.stderr).toBe(rejected ? 1 : 0);
-      expect(direct ? direct.bodies.length : gateway.requests.length).toBe(rejected || limited ? 1 : 2);
+      // A cut answer goes on in a second request, as a failed one is retried.
+      expect(direct ? direct.bodies.length : gateway.requests.length).toBe(rejected ? 1 : 2);
       const output = JSON.parse(result.stdout);
       expect(output.tool_calls).toEqual([]);
       if (rejected) {
@@ -7633,15 +7634,21 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
           expect(input.filter((item: { type?: string }) => item.type === "function_call")).toEqual([]);
         }
       } else {
-        expect(output.output).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
-        if (limited) expect(result.stderr).toContain("response hit provider length limit");
+        // The reply that finishes a cut answer joins it, so the answer is whole.
+        const answer = limited ? "LIMITED_ANSWERRECOVERED_OK" : "RECOVERED_OK";
+        expect(output.final_output).toBe(answer);
+        if (limited) {
+          expect(result.stderr).toContain("Asking the model to continue from where it stopped.");
+          expect(direct!.bodies[1]).toContain("LIMITED_ANSWER");
+          expect(direct!.bodies[1]).toContain("Continue exactly where it stopped, without repeating it.");
+        }
         // A retry shows the recovery module's wording, never the provider's detail.
         else expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
         const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
         const history = JSON.parse(detail.stdout).history;
         expect(history).toHaveLength(1);
-        expect(history[0].assistant).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
+        expect(history[0].assistant).toBe(answer);
         expect(history[0].execution.tool_steps).toEqual([]);
         if (mode === "partial") expect(direct!.bodies[1]).not.toContain("DISCARDED_PREVIEW");
       }
