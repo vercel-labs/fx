@@ -757,6 +757,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .shell, .command = "/shell", .help_entry = "/shell reload", .completion_description = "reload shell startup files for commands", .presentation_category = .workspace, .has_args = true, .requires_args = true, .accepts_payload = true },
+    .{ .kind = .trust, .command = "/trust", .help_entry = "/trust", .completion_description = "Trust this folder: start the servers in its .mcp.json, now and when more are added", .presentation_category = .extensions },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the fx version", .presentation_category = .general },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },
 };
@@ -870,6 +871,7 @@ test "built-in slash commands register exact active order" {
         "/sound",
         "/workspace",
         "/shell",
+        "/trust",
         "/version",
         "/quit",
     };
@@ -886,6 +888,9 @@ test "built-in slash registry resolves primary commands and aliases" {
 
     const usage = slash_registry.lookup("/usage") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(SlashKind.usage, usage.kind);
+
+    const trust = slash_registry.lookup("/trust") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(SlashKind.trust, trust.kind);
 
     const quit = slash_registry.matchExact("/exit\t") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(SlashKind.quit, quit.command.kind);

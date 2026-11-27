@@ -1225,6 +1225,16 @@ pub fn attemptProjectMcpMutation(
     action: project_config.ProjectMcpAction,
 ) CommitAttempt {
     const home = io_mod.homeDir() orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    return attemptProjectMcpMutationInHome(alloc, home, workspace_root, action);
+}
+
+/// Like attemptProjectMcpMutation, for callers and tests with an explicit home.
+pub fn attemptProjectMcpMutationInHome(
+    alloc: Allocator,
+    home: []const u8,
+    workspace_root: []const u8,
+    action: project_config.ProjectMcpAction,
+) CommitAttempt {
     var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
         return .{ .failure = .{ .err = err } };
     };
@@ -5099,4 +5109,42 @@ test "experimental.workspace_capture is read from the profile only and stays off
     try std.testing.expectEqual(@as(?bool, null), project.experimental_workspace_capture);
     // A value of another type is refused, as for every other switch.
     try std.testing.expectError(error.InvalidExperimentalWorkspaceCaptureType, parseSettingsJson(alloc, "{\"experimental\":{\"workspace_capture\":\"yes\"}}"));
+}
+
+test "attemptProjectMcpMutationInHome approve_all saves enableAllProjectMcpServers for the workspace root" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var rejected = attemptProjectMcpMutationInHome(alloc, home, workspace, .{ .reject = "blocked" });
+    defer rejected.deinit(alloc);
+    try std.testing.expect(rejected == .outcome);
+
+    var approved = attemptProjectMcpMutationInHome(alloc, home, workspace, .approve_all);
+    defer approved.deinit(alloc);
+    try std.testing.expect(approved == .outcome);
+
+    var loaded = try loadProjectMcpChoicesFromHome(alloc, home, workspace);
+    defer loaded.deinit(alloc);
+    try std.testing.expect(loaded.choices.enable_all);
+    try std.testing.expectEqual(@as(usize, 1), loaded.choices.rejected.len);
+    try std.testing.expectEqualStrings("blocked", loaded.choices.rejected[0]);
+
+    const settings_path = try profile_paths.settingsPath(alloc, home);
+    defer alloc.free(settings_path);
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), settings_path, .{});
+    defer file.close(io_mod.getIo());
+    const raw = try io_mod.readFileToEnd(alloc, &file, 64 * 1024);
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const workspaces = parsed.value.object.get("workspaces").?.object;
+    const entry = workspaces.get(workspace).?.object;
+    try std.testing.expectEqual(true, entry.get(project_config.enable_all_key).?.bool);
 }

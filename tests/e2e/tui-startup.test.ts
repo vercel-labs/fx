@@ -73,7 +73,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 40", 5_000);
+      const pane = await session.waitForText("Commands 41", 5_000);
       expect(pane).toContain("[All]");
       expect(pane).toContain("tab category");
       expect(pane).toContain("enter open");
@@ -1676,6 +1676,148 @@ describe.skipIf(!tmuxAvailable())("tui: a new folder opens straight to the compo
         await session.waitForComposer(15_000);
         const grid = await session.capturePaneGrid();
         expect(grid.join("\n")).not.toContain("Folder access");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  const TRUST_LINE =
+    "This repo contains .mcp.json – it's ignored until you trust this folder. Run /trust.";
+
+  function writeTrustRepo(repo: string, pidPath: string, wireLogPath: string): void {
+    mkdirSync(repo);
+    execFileSync("git", ["init"], { cwd: repo, stdio: "pipe" });
+    writeFileSync(
+      join(repo, ".mcp.json"),
+      `${JSON.stringify({
+        mcpServers: {
+          project: {
+            command: process.execPath,
+            args: [MODERN_FIXTURE],
+            env: {
+              FX_MCP_PID_PATH: pidPath,
+              FX_MCP_WIRE_LOG: wireLogPath,
+              FX_MCP_MODE: "normal",
+            },
+          },
+        },
+      })}\n`,
+    );
+  }
+
+  function startTrustSession(repo: string, home: string, stderrPath: string): Promise<TmuxSession> {
+    return TmuxSession.create({
+      cwd: repo,
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
+      },
+      stderrPath,
+      width: 120,
+      height: 30,
+    });
+  }
+
+  function projectServerStarted(pidPath: string, wireLogPath: string): boolean {
+    return existsSync(pidPath) &&
+      existsSync(wireLogPath) &&
+      readFileSync(wireLogPath, "utf8").includes("\"tools/list\"");
+  }
+
+  function trustSaved(settingsPath: string, repoKey: string): boolean {
+    if (!existsSync(settingsPath)) return false;
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    return settings.workspaces?.[repoKey]?.enableAllProjectMcpServers === true;
+  }
+
+  test(
+    "a repo's .mcp.json waits for /trust, which starts it and is remembered",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-trust-remember-")));
+      const home = realpathSync(createIsolatedTestHome());
+      const repo = join(root, "repo");
+      const stderrPath = join(root, "stderr.log");
+      const restartStderrPath = join(root, "restart-stderr.log");
+      const pidPath = join(repo, "project-mcp.pid");
+      const wireLogPath = join(repo, "project-mcp-wire.jsonl");
+      const settingsPath = join(home, ".fx", "settings.json");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      writeTrustRepo(repo, pidPath, wireLogPath);
+      const repoKey = realpathSync(repo);
+      writeFileSync(stderrPath, "");
+      writeFileSync(restartStderrPath, "");
+
+      try {
+        session = await startTrustSession(repo, home, stderrPath);
+        await session.waitForComposer(15_000);
+        const pane = await session.waitForText(TRUST_LINE, 15_000);
+        expect(hasEmptyComposer(pane)).toBe(true);
+        const grid = await session.capturePaneGrid();
+        expect(grid.filter((line) => line.includes(TRUST_LINE))).toHaveLength(1);
+        expect(existsSync(pidPath)).toBe(false);
+
+        await session.sendText("/trust");
+        await session.waitForPane(
+          () => trustSaved(settingsPath, repoKey) && projectServerStarted(pidPath, wireLogPath),
+          15_000,
+        );
+        const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+        expect(settings.workspaces[repoKey].enableAllProjectMcpServers).toBe(true);
+        await session.kill();
+        session = null;
+        rmSync(pidPath, { force: true });
+        rmSync(wireLogPath, { force: true });
+
+        session = await startTrustSession(repo, home, restartStderrPath);
+        await session.waitForComposer(15_000);
+        await session.waitForPane(() => projectServerStarted(pidPath, wireLogPath), 15_000);
+        const restartGrid = await session.capturePaneGrid();
+        expect(restartGrid.join("\n")).not.toContain("This repo contains .mcp.json");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(readFileSync(restartStderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "Ctrl+C exits at startup",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-trust-ctrl-c-")));
+      const home = realpathSync(createIsolatedTestHome());
+      const repo = join(root, "repo");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      writeTrustRepo(repo, join(repo, "project-mcp.pid"), join(repo, "project-mcp-wire.jsonl"));
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await startTrustSession(repo, home, stderrPath);
+        await session.waitForComposer(15_000);
+        await session.sendKeys("C-c");
+        await session.waitForText("press ctrl+c again to exit", 5_000);
+        await session.sendKeys("C-c");
+        expect(await session.waitForSessionEnd(10_000)).toBe(true);
+        expect(session.recordedExitStatus()).toBe(0);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         if (session) {

@@ -314,6 +314,7 @@ pub fn Handlers(comptime App: type) type {
                 .show_usage = commandShowUsage,
                 .undo_last = commandUndoLast,
                 .handle_mcp = commandHandleMcp,
+                .trust = commandTrustFolder,
                 .handle_skills = commandHandleSkills,
                 .copy_last = commandCopyLast,
                 .submit_feedback = commandSubmitFeedback,
@@ -354,6 +355,11 @@ pub fn Handlers(comptime App: type) type {
             if (comptime !@hasDecl(App, "takeMcpHostNotices")) return;
             // A reload that fails leaves its warning among the notices.
             app.applyMcpHostReload(agent);
+            if (comptime runtime_profile.allows(App, .mcp) and @hasDecl(App, "takeStartupTrustNotice")) {
+                if (app.takeStartupTrustNotice()) |notice| {
+                    try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = notice }, true);
+                }
+            }
             const notices = app.takeMcpHostNotices();
             defer {
                 for (notices) |n| std.heap.c_allocator.free(n.text);
@@ -980,6 +986,20 @@ pub fn Handlers(comptime App: type) type {
             closeOtherMenusForMcp(app, agents.screenAgentOf(app));
             app.openMcpHostMenu();
             app.shell.render_requests.request(.footer);
+        }
+
+        fn commandTrustFolder(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !runtime_profile.allows(App, .mcp)) {
+                try app.writeDomainNotice(.{
+                    .topic = "mcp",
+                    .tone = .warning,
+                    .body = "MCP servers are unavailable in this host; the embedding app provides MCP tools.",
+                }, true);
+                return;
+            }
+            if (comptime !@hasField(App, "mcp")) return;
+            try app_mcp_runtime.trustFolder(app);
         }
 
         noinline fn commandHandleSkills(ctx: *anyopaque, rest: []const u8) !void {
@@ -2889,4 +2909,92 @@ test "/version command writes dev build label and omits unresolved revision" {
     try expectVersionCommandBody(.dev, "f1862c5061f5", "0.0.17-f1862c5 (dev)");
     try expectVersionCommandBody(.dev, "unknown", "0.0.17 (dev)");
     try expectVersionCommandBody(.dev, "", "0.0.17 (dev)");
+}
+
+test "/trust writes unavailable warning notice when MCP capability is disabled" {
+    const WasmTrustApp = struct {
+        pub const host_profile = runtime_profile.wasm;
+
+        alloc: std.mem.Allocator,
+        notice_topic: ?[]const u8 = null,
+        notice_tone: ?types.NoticeTone = null,
+        notice_body: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.notice_body.deinit(self.alloc);
+        }
+
+        fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
+            self.notice_topic = notice.topic;
+            self.notice_tone = notice.tone;
+            try self.notice_body.appendSlice(self.alloc, notice.body);
+        }
+    };
+
+    var app = WasmTrustApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Handlers(WasmTrustApp).commandTrustFolder(@ptrCast(&app));
+
+    try std.testing.expectEqualStrings("mcp", app.notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.warning, app.notice_tone.?);
+    try std.testing.expectEqualStrings(
+        "MCP servers are unavailable in this host; the embedding app provides MCP tools.",
+        app.notice_body.items,
+    );
+}
+
+test "collectMcpHostFacts emits startup trust notice once with empty topic when MCP is allowed" {
+    const FakeApp = struct {
+        alloc: std.mem.Allocator,
+        main_agent: struct {} = .{},
+        pending_trust: ?[]const u8 = app_mcp_runtime.startup_trust_notice,
+        notices_written: usize = 0,
+        last_topic: ?[]const u8 = null,
+        last_tone: ?types.NoticeTone = null,
+        last_body: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.last_body.deinit(self.alloc);
+        }
+
+        pub fn takeMcpHostNotices(_: *@This()) []app_mcp_runtime.State.HostNotice {
+            return &.{};
+        }
+
+        pub fn applyMcpHostReload(_: *@This(), _: anytype) void {}
+
+        pub fn takeStartupTrustNotice(self: *@This()) ?[]const u8 {
+            const out = self.pending_trust;
+            self.pending_trust = null;
+            return out;
+        }
+
+        pub fn refreshMcpCompletion(_: *@This()) void {}
+        pub fn refreshMcpHostMenu(_: *@This()) void {}
+        pub fn refreshMcpHostStatus(_: *@This()) void {}
+
+        pub fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
+            self.notices_written += 1;
+            self.last_topic = notice.topic;
+            self.last_tone = notice.tone;
+            self.last_body.clearRetainingCapacity();
+            try self.last_body.appendSlice(self.alloc, notice.body);
+        }
+    };
+
+    var app = FakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Handlers(FakeApp).collectMcpHostFacts(&app, &app.main_agent);
+    try std.testing.expectEqual(@as(usize, 1), app.notices_written);
+    try std.testing.expectEqualStrings("", app.last_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+    try std.testing.expectEqualStrings(
+        "This repo contains .mcp.json – it's ignored until you trust this folder. Run /trust.",
+        app.last_body.items,
+    );
+
+    try Handlers(FakeApp).collectMcpHostFacts(&app, &app.main_agent);
+    try std.testing.expectEqual(@as(usize, 1), app.notices_written);
 }

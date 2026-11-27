@@ -30,6 +30,7 @@ pub const ParsedCommand = union(enum) {
     usage,
     undo,
     mcp: []const u8,
+    trust,
     skills: []const u8,
     copy,
     feedback,
@@ -74,6 +75,7 @@ pub const CommandHandlers = struct {
     show_usage: *const fn (ctx: *anyopaque) anyerror!void,
     undo_last: *const fn (ctx: *anyopaque) anyerror!void,
     handle_mcp: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    trust: *const fn (ctx: *anyopaque) anyerror!void,
     handle_skills: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     copy_last: *const fn (ctx: *anyopaque) anyerror!void,
     submit_feedback: *const fn (ctx: *anyopaque) anyerror!void,
@@ -124,6 +126,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .usage => .usage,
         .undo => .undo,
         .mcp => .{ .mcp = payload },
+        .trust => .trust,
         .skills => .{ .skills = payload },
         .copy => .copy,
         .feedback => .feedback,
@@ -190,6 +193,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .usage => try handlers.show_usage(handlers.ctx),
         .undo => try handlers.undo_last(handlers.ctx),
         .mcp => |rest| try handlers.handle_mcp(handlers.ctx, rest),
+        .trust => try handlers.trust(handlers.ctx),
         .skills => |rest| try handlers.handle_skills(handlers.ctx, rest),
         .copy => try handlers.copy_last(handlers.ctx),
         .feedback => try handlers.submit_feedback(handlers.ctx),
@@ -532,6 +536,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .show_usage = unexpectedNoPayload,
         .undo_last = unexpectedNoPayload,
         .handle_mcp = unexpectedPayload,
+        .trust = unexpectedNoPayload,
         .handle_skills = unexpectedPayload,
         .copy_last = unexpectedNoPayload,
         .submit_feedback = unexpectedNoPayload,
@@ -669,4 +674,21 @@ test "route propagates callback errors" {
     handlers.show_status = failStatus;
 
     try std.testing.expectError(error.TestRouteFailure, route(testSlashRegistry(), &handlers, "/status"));
+}
+
+test "parse recognizes /trust without arguments and routes to trust handler" {
+    try std.testing.expectEqual(ParsedCommand.trust, parse(testSlashRegistry(), "/trust"));
+    try std.testing.expectEqual(ParsedCommand.trust, parse(testSlashRegistry(), "/trust "));
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/trust extra"));
+
+    var ctx: TestContext = .{};
+    var handlers = testHandlers(&ctx);
+    handlers.trust = struct {
+        fn record(raw: *anyopaque) anyerror!void {
+            testContext(raw).called = "trust";
+        }
+    }.record;
+
+    try route(testSlashRegistry(), &handlers, "/trust");
+    try std.testing.expectEqualStrings("trust", ctx.called);
 }

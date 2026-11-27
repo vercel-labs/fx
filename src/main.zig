@@ -2060,6 +2060,10 @@ const App = struct {
         return self.mcp.takeHostNotices();
     }
 
+    pub fn takeStartupTrustNotice(self: *App) ?[]const u8 {
+        return self.mcp.takeStartupTrustNotice();
+    }
+
     pub fn refreshMcpCompletion(self: *App) void {
         self.mcp.refreshCompletion();
     }
