@@ -108,7 +108,7 @@ fx's ACP server names its additions today with a `libfx/` prefix, which doesn't 
 | `libfx/tool_call` | fx to client, request | `_sh.fx/tools/call` | Asks the client to run a tool that the client listed at `initialize` |
 | `session/remove` | client to fx, request | `session/delete` | Deletes a session. The new name is ACP's standard method |
 
-For some releases after fx moves to the new names, fx also accepts the `libfx/*` names, and it sends a client the old names unless the client lists the extension's capability. `session/remove` moves to `session/delete` with no such period.
+For some releases after fx moves to the new names, fx also accepts the `libfx/*` names. Once an extension's section defines its capability, a client that lists the capability gets the new names, and other clients get the old names for that period. Until then, fx sends the old names. `session/remove` moves to `session/delete` with no such period.
 
 ## Keys in use today
 
