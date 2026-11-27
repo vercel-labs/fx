@@ -581,8 +581,9 @@ fn pushSteeringRows(
     var oldest_row_limit: u16 = 0;
     while (visible_start > 0 and remaining_rows > 0) {
         const candidate = visible_start - 1;
-        const candidate_rows = render_input.steering_message_layout(
+        const candidate_rows = render_input.steering_message_layout_with_author(
             ctx.steering_messages[candidate],
+            render_input.steeringMessageAuthor(ctx.steering_message_authors, candidate),
             width,
             ctx.steering_waits_for_boundary,
             render_input.max_steering_message_rows,
@@ -600,9 +601,10 @@ fn pushSteeringRows(
             oldest_row_limit
         else
             render_input.max_steering_message_rows;
-        var rows = try input_presentation.composeSteeringMessageRows(
+        var rows = try input_presentation.composeSteeringMessageRowsWithAuthor(
             alloc,
             message,
+            render_input.steeringMessageAuthor(ctx.steering_message_authors, index),
             width,
             row_limit,
             ctx.steering_waits_for_boundary,

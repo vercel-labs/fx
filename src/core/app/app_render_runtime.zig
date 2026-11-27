@@ -139,14 +139,18 @@ const RenderReconciliation = union(enum) {
 
 const SteeringProjection = struct {
     messages: [][]u8 = &.{},
+    message_authors: []types.MessageAuthor = &.{},
     pending_feedback: [][]u8 = &.{},
+    pending_feedback_authors: []types.MessageAuthor = &.{},
     waits_for_boundary: bool = false,
 
     fn deinit(self: *SteeringProjection, alloc: std.mem.Allocator) void {
         for (self.messages) |message| alloc.free(message);
         if (self.messages.len > 0) alloc.free(self.messages);
+        if (self.message_authors.len > 0) alloc.free(self.message_authors);
         for (self.pending_feedback) |message| alloc.free(message);
         if (self.pending_feedback.len > 0) alloc.free(self.pending_feedback);
+        if (self.pending_feedback_authors.len > 0) alloc.free(self.pending_feedback_authors);
         self.* = .{};
     }
 };
@@ -311,11 +315,18 @@ fn buildPendingSteeringCardProjection(
             steering.pending_feedback[index]
         else
             steering.messages[index - steering.pending_feedback.len];
+        const author: types.MessageAuthor = if (index < steering.pending_feedback.len)
+            if (index < steering.pending_feedback_authors.len) steering.pending_feedback_authors[index] else .user
+        else blk: {
+            const msg_index = index - steering.pending_feedback.len;
+            break :blk if (msg_index < steering.message_authors.len) steering.message_authors[msg_index] else .user;
+        };
         const gap: u16 = @intFromBool(card_bytes.items.len > 0);
         const remaining_rows = row_limit - row_count -| gap;
         if (remaining_rows == 0) break;
-        const card = try user_message_card.buildUserPromptCardTailForTerminalPresentationInterruptible(
+        const card = try user_message_card.buildTurnCardTailForTerminalPresentationInterruptible(
             alloc,
+            author,
             message,
             &.{},
             shell.layout.cols,
@@ -399,8 +410,12 @@ fn buildSteeringProjection(comptime App: type, app: *App) !SteeringProjection {
         projection.waits_for_boundary = snapshot.waits_for_boundary;
         projection.messages = snapshot.messages;
         snapshot.messages = &.{};
+        projection.message_authors = snapshot.message_authors;
+        snapshot.message_authors = &.{};
         projection.pending_feedback = snapshot.pending_feedback;
         snapshot.pending_feedback = &.{};
+        projection.pending_feedback_authors = snapshot.pending_feedback_authors;
+        snapshot.pending_feedback_authors = &.{};
     }
     return projection;
 }
@@ -764,6 +779,7 @@ pub fn Runtime(comptime App: type) type {
                 // The agent on screen's own mode.
                 .permission_mode = app_permission_runtime.Runtime(App).currentMode(app),
                 .steering_messages = steering.messages,
+                .steering_message_authors = steering.message_authors,
                 .steering_waits_for_boundary = steering.waits_for_boundary,
                 .fast_indicator_active = fast_indicator_active,
                 .effort = visible_effort,
@@ -2703,6 +2719,40 @@ test "pending steering cards preserve feedback order and tool waiting placement"
         shell.layout.cols = cols;
         try std.testing.expect((try buildPendingSteeringCardProjection(alloc, &shell, steering, null)) == null);
     }
+}
+
+test "pending steering card renders from main without rail for parent feedback and rail for user" {
+    const alloc = std.testing.allocator;
+    var shell = transcript_runtime.TranscriptRuntime{
+        .layout = .{
+            .rows = 12,
+            .cols = 60,
+            .content_bottom = 8,
+            .divider_top_row = 9,
+            .input_row = 10,
+            .divider_bottom_row = 11,
+            .hint_row = 12,
+        },
+        .cursor_row = 3,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+    var feedback = [_][]u8{@constCast("from parent feedback")};
+    var feedback_authors = [_]types.MessageAuthor{.parent};
+    var queued = [_][]u8{@constCast("typed by user")};
+    var queued_authors = [_]types.MessageAuthor{.user};
+    const steering = SteeringProjection{
+        .messages = &queued,
+        .message_authors = &queued_authors,
+        .pending_feedback = &feedback,
+        .pending_feedback_authors = &feedback_authors,
+    };
+    var card = (try buildPendingSteeringCardProjection(alloc, &shell, steering, null)).?;
+    defer card.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, card.bytes, "from main") != null);
+    try std.testing.expect(std.mem.find(u8, card.bytes, "  from parent feedback") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, card.bytes, "┃"));
+    try std.testing.expect(std.mem.find(u8, card.bytes, "typed by user") != null);
 }
 
 test "pending prompt at an occupied band bottom preserves the summary through adoption" {

@@ -2443,8 +2443,9 @@ pub fn writeUserPromptCard(
         );
     }
 
-    const card = try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentation(
+    const card = try user_message_card.buildTurnCardWithSkillTokensForTerminalPresentation(
         alloc,
+        user.author,
         user.text,
         user.images,
         shadow.layout.cols,

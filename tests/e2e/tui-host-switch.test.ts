@@ -2933,7 +2933,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // main's shows it in the tool call that sent it.
         await session.sendKeys("Down");
         await waitForSelectedRow(session, "reviewer");
-        const preview = await session.waitForPane((pane) => pane.includes("\u2503 EDGE_TASK") && pane.includes(LIST_HINT), 10_000);
+        const preview = await session.waitForPane((pane) => pane.includes("from main") && pane.includes("EDGE_TASK") && pane.includes(LIST_HINT), 10_000);
         expect(preview).toContain("EDGE_CHILD_ANSWER");
         expect(preview).not.toContain("EDGE_MAIN_FINAL");
         await session.sendKeys("Up");
@@ -2941,13 +2941,13 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForPane((pane) => pane.includes("EDGE_MAIN_FINAL") && pane.includes(LIST_HINT), 10_000);
         await session.sendKeys("Down");
         await waitForSelectedRow(session, "reviewer");
-        await session.waitForPane((pane) => pane.includes("\u2503 EDGE_TASK") && pane.includes(LIST_HINT), 10_000);
+        await session.waitForPane((pane) => pane.includes("from main") && pane.includes("EDGE_TASK") && pane.includes(LIST_HINT), 10_000);
 
         // Esc goes back to main, the agent the list opened on.
         await session.sendKeys("Escape");
         const back = await session.waitForPane((pane) => pane.includes("EDGE_MAIN_FINAL") && !pane.includes(LIST_HINT), 10_000);
         expect(back).toContain("main \u2193");
-        expect(back).not.toContain("\u2503 EDGE_TASK");
+        expect(back).not.toContain("EDGE_TASK");
 
         // Up on main's row, the first, closes the list: nothing is above it.
         await session.sendKeys("Down");
@@ -2961,11 +2961,13 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForText(LIST_HINT, 10_000);
         await session.sendKeys("Down");
         await waitForSelectedRow(session, "reviewer");
-        await session.waitForPane((pane) => pane.includes("\u2503 EDGE_TASK") && pane.includes(LIST_HINT), 10_000);
+        await session.waitForPane((pane) => pane.includes("from main") && pane.includes("EDGE_TASK") && pane.includes(LIST_HINT), 10_000);
         await session.sendKeys("Enter");
         const kept = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("reviewer \u00b7 done \u2193"), 10_000);
         expect(kept).toContain("EDGE_CHILD_ANSWER");
-        expect(kept).toContain("\u2503 EDGE_TASK");
+        expect(kept).toContain("from main");
+        expect(kept).toContain("EDGE_TASK");
+        expect(kept).not.toContain("\u2503 EDGE_TASK");
         expect(kept).not.toContain("EDGE_MAIN_FINAL");
       });
     },
@@ -2990,7 +2992,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("Down");
         await waitForSelectedRow(session, "reviewer");
         // The subagent shows at once, with its own composer, not main's draft.
-        const moved = await session.waitForPane((pane) => pane.includes("\u2503 EDGE_TASK") && pane.includes(LIST_HINT), 10_000);
+        const moved = await session.waitForPane((pane) => pane.includes("from main") && pane.includes("EDGE_TASK") && pane.includes(LIST_HINT), 10_000);
         expect(moved).not.toContain("EDGE_MAIN_FINAL");
         expect(moved).not.toContain("EDGE_KEEP_ME");
         await session.sendKeys("Enter");
@@ -3023,7 +3025,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // the highlight moves to reviewer, which shows at once as a move
         // would show it.
         await session.sendLiteral("VIEW");
-        const found = await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "VIEW") && pane.includes("\u2503 EDGE_TASK"), 10_000);
+        const found = await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "VIEW") && pane.includes("from main") && pane.includes("EDGE_TASK"), 10_000);
         expect(found).toMatch(subagentRow("reviewer"));
         expect(found).toContain("esc clear");
         expect(found).not.toContain("delete close");
@@ -3034,7 +3036,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendLiteral("q");
         const none = await session.waitForPane((pane) => pane.includes("Agents 0") && composerContains(pane, "VIEWq"), 10_000);
         expect(none).not.toMatch(subagentRow("reviewer"));
-        expect(none).toContain("\u2503 EDGE_TASK");
+        expect(none).toContain("from main");
+        expect(none).toContain("EDGE_TASK");
 
         // With no row, Up has nothing to move to and leaves the list open, so
         // the Backspace after it still edits the search. Backspace edits the
@@ -3563,7 +3566,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           const moved = await waitForSelectedRow(session, "tester");
           expect(moved).toContain("enter switch     delete close     esc back");
           // Each move shows the agent it lands on: tester is on screen now.
-          const onTester = await session.waitForPane((pane) => pane.includes("\u2503 ORDER_TEST_TASK") && pane.includes(LIST_HINT), 10_000);
+          const onTester = await session.waitForPane((pane) => pane.includes("from main") && pane.includes("ORDER_TEST_TASK") && pane.includes(LIST_HINT), 10_000);
           expect(onTester).not.toContain("ORDER_MAIN_IDLE");
 
           gates.reviewer.release();
@@ -3576,7 +3579,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           // highlight moves with it; tester stays on screen.
           expectRowOrder(reordered, mainRow(), subagentRow("tester"), subagentRow("reviewer"));
           await waitForSelectedRow(session, "tester");
-          expect(await session.capturePane()).toContain("\u2503 ORDER_TEST_TASK");
+          const testerPane = await session.capturePane();
+          expect(testerPane).toContain("from main");
+          expect(testerPane).toContain("ORDER_TEST_TASK");
           gates.tester.release();
           // Reports are disabled, so tester has the newest reply of the two.
           // Its row can read done a moment before the main loop applies its
@@ -3625,7 +3630,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           // and moving back shows main's again.
           await resumed.sendKeys("Down");
           await waitForSelectedRow(resumed, "tester");
-          const savedTester = await resumed.waitForPane((pane) => pane.includes("\u2503 ORDER_TEST_TASK") && pane.includes(LIST_HINT), 15_000);
+          const savedTester = await resumed.waitForPane((pane) => pane.includes("from main") && pane.includes("ORDER_TEST_TASK") && pane.includes(LIST_HINT), 15_000);
           expect(savedTester).not.toContain("ORDER_MAIN_NEWEST");
           await resumed.sendKeys("Up");
           await waitForSelectedRow(resumed, "main");
@@ -3701,7 +3706,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await resumed.waitForText("SWITCH_MAIN_TWO", 60_000);
         await until("the follow-up's shell call to be served", () => slowCallServed, 90_000);
         await showAgent(resumed, "reviewer");
-        await resumed.waitForPane((pane) => pane.includes("\u2503 FOLLOW-L01") && !pane.includes(LIST_HINT), 20_000);
+        await resumed.waitForPane((pane) => pane.includes("from main") && pane.includes("FOLLOW-L01") && !pane.includes(LIST_HINT), 20_000);
         // The follow-up's answer comes only after its shell call returns. The call
         // waits for a gate file that this test creates after this check, so the
         // pane shows the switch made while the call still ran. The call's command
@@ -4167,7 +4172,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await waitForSelectedRow(session, "tester");
         await session.sendKeys("Down");
         await waitForSelectedRow(session, "reviewer");
-        await session.waitForPane((pane) => pane.includes("\u2503 MIDDLE_REVIEW") && pane.includes("enter switch     delete close     esc back"), 10_000);
+        await session.waitForPane((pane) => pane.includes("from main") && pane.includes("MIDDLE_REVIEW") && pane.includes("enter switch     delete close     esc back"), 10_000);
         await session.sendKeys("BSpace");
         await session.waitForText("press delete again to close this subagent", 10_000);
         // Any other key keeps it, and its warning goes at once.
@@ -4181,7 +4186,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // takes its place on screen and in the highlight, not main.
         await session.waitForPane((pane) => !subagentRow("reviewer").test(pane) && pane.includes("esc back"), 15_000);
         await waitForSelectedRow(session, "tester");
-        const above = await session.waitForPane((pane) => pane.includes("\u2503 MIDDLE_TEST") && pane.includes("delete close"), 10_000);
+        const above = await session.waitForPane((pane) => pane.includes("from main") && pane.includes("MIDDLE_TEST") && pane.includes("delete close"), 10_000);
         expect(above).toMatch(subagentRow("tester"));
         // Closing tester then shows main, the row above it.
         await session.sendKeys("BSpace");
@@ -4256,13 +4261,14 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.sendKeys("BSpace");
           await session.waitForPane((pane) => !subagentRow("lead").test(pane) && !/[\u251c\u2514] helper /.test(pane) && pane.includes(LIST_HINT), 15_000);
           await waitForSelectedRow(session, "first");
-          await session.waitForPane((pane) => pane.includes("\u2503 BRANCH_FIRST_TASK") && pane.includes(LIST_HINT), 10_000);
+          await session.waitForPane((pane) => pane.includes("from main") && pane.includes("BRANCH_FIRST_TASK") && pane.includes(LIST_HINT), 10_000);
           expect(agentRows(await session.capturePaneEscapes()).map((row) => row.name)).toEqual(["main", "first"]);
 
           // The list opened on lead, which is gone, so Esc keeps first.
           await session.sendKeys("Escape");
           const kept = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("first \u2193"), 10_000);
-          expect(kept).toContain("\u2503 BRANCH_FIRST_TASK");
+          expect(kept).toContain("from main");
+          expect(kept).toContain("BRANCH_FIRST_TASK");
         });
       } finally {
         gates.first.release();
@@ -4308,20 +4314,21 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         const task = (name: string) => (name === "tester" ? "EDGE_TEST_TASK" : "EDGE_REVIEW_TASK");
         for (let step = 0; step < rows.length - 1; step += 1) await session.sendKeys("Down");
         await waitForSelectedRow(session, target);
-        await session.waitForPane((pane) => pane.includes(`\u2503 ${task(target)}`) && pane.includes(LIST_HINT), 10_000);
+        await session.waitForPane((pane) => pane.includes("from main") && pane.includes(task(target)) && pane.includes(LIST_HINT), 10_000);
         closeNow.release();
         // The shown subagent's row goes, and the row above it takes its place
         // on screen and in the highlight, not main; the list stays.
         await session.waitForPane((pane) => !subagentRow(target).test(pane) && pane.includes(LIST_HINT), 30_000);
         await waitForSelectedRow(session, above);
-        await session.waitForPane((pane) => pane.includes(`\u2503 ${task(above)}`) && pane.includes(LIST_HINT), 10_000);
+        await session.waitForPane((pane) => pane.includes("from main") && pane.includes(task(above)) && pane.includes(LIST_HINT), 10_000);
 
         // A paste closes the list, keeps that subagent on screen, and lands in
         // its composer.
         await session.pasteText("EDGE_PASTED");
         const pasted = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("\u2503 EDGE_PASTED"), 10_000);
         expect(pasted).toContain(`${above} \u00b7 done \u00b7 ctrl+x`);
-        expect(pasted).toContain(`\u2503 ${task(above)}`);
+        expect(pasted).toContain("from main");
+        expect(pasted).toContain(task(above));
         expect(pasted).not.toContain("main \u00b7 ctrl+x");
         await showAgent(session, "main");
         await session.waitForText("EDGE_CLOSE_DONE", 30_000);
@@ -5253,6 +5260,144 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     "a second report more than the limit after the first hold starts its turn while a subagent's approval stays open",
     async () => {
       await reportWhilePromptStaysOpen("approval", 6000, true);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "subagent view labels main's first prompt, busy steer, and idle message with from main while keeping ┃ only for user prompts and unchanged model requests",
+    async () => {
+      const childHold = held();
+      let childBusyAsked = false;
+      let childIdleAsked = false;
+      let childUserAsked = false;
+      const captured = {
+        first: "",
+        busySteer: "",
+        idle: "",
+        user: "",
+      };
+      let mainStep = 0;
+
+      const requests = await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          const users = userTexts(body);
+          const latest = users.at(-1) ?? "";
+          if (users.some((u) => u.includes("B368_USER_PROMPT"))) {
+            childUserAsked = true;
+            captured.user = body;
+            return text("child_user", "B368_CHILD_USER_DONE");
+          }
+          if (users.some((u) => u.includes("B368_IDLE_MSG"))) {
+            childIdleAsked = true;
+            captured.idle = body;
+            return text("child_idle", "B368_CHILD_IDLE_DONE");
+          }
+          if (users.some((u) => u.includes("B368_BUSY_STEER"))) {
+            captured.busySteer = body;
+            return text("child_steered", "B368_CHILD_BUSY_DONE");
+          }
+          if (latest.includes("B368_FIRST_TASK") && !body.includes('"child_shell"')) {
+            captured.first = body;
+            return toolCall("child_shell", "shell", { command: "echo B368_TOOL_RAN" });
+          }
+          childBusyAsked = true;
+          await childHold.promise;
+          return text("child_after_tool", "B368_CHILD_AFTER_TOOL");
+        }
+        mainStep += 1;
+        if (mainStep === 1) {
+          return toolCall("main_first", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "B368_FIRST_TASK", report: "never" },
+          });
+        }
+        if (mainStep === 2) {
+          return text("main_first_done", "B368_MAIN_FIRST_DONE");
+        }
+        if (mainStep === 3) {
+          return toolCall("main_steer", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "B368_BUSY_STEER", report: "never" },
+          });
+        }
+        if (mainStep === 4) {
+          return text("main_steer_done", "B368_MAIN_STEER_DONE");
+        }
+        if (mainStep === 5) {
+          return toolCall("main_idle", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "B368_IDLE_MSG", report: "never" },
+          });
+        }
+        return text("main_idle_done", "B368_MAIN_IDLE_DONE");
+      }, async (session, { home, launch }) => {
+        await session.sendText("SWITCH_USER B368_MAIN_ONE");
+        await session.waitForPane((pane) => pane.includes("B368_MAIN_FIRST_DONE") && turnSettled(pane), 30_000);
+        await until("child to hold after tool", () => childBusyAsked);
+
+        // Send a busy steer while the subagent is running.
+        await session.sendText("SWITCH_USER B368_MAIN_TWO");
+        await session.waitForPane((pane) => pane.includes("B368_MAIN_STEER_DONE") && turnSettled(pane), 30_000);
+        childHold.release();
+
+        // Wait for the child to become idle (done), then send an idle message.
+        await showAgent(session, "reviewer");
+        await session.waitForPane((pane) => pane.includes("B368_CHILD_BUSY_DONE") && pane.includes("reviewer · done"), 30_000);
+        await showAgent(session, "main");
+        await session.sendText("SWITCH_USER B368_MAIN_THREE");
+        await session.waitForPane((pane) => pane.includes("B368_MAIN_IDLE_DONE") && turnSettled(pane), 30_000);
+        await until("child idle message request", () => childIdleAsked);
+
+        // Switch to reviewer, wait for idle, and type one user prompt there.
+        await showAgent(session, "reviewer");
+        await session.waitForPane((pane) => pane.includes("B368_CHILD_IDLE_DONE") && pane.includes("reviewer · done"), 30_000);
+        await session.sendText("B368_USER_PROMPT");
+        await until("child user prompt request", () => childUserAsked);
+        await session.waitForPane((pane) => pane.includes("B368_CHILD_USER_DONE") && pane.includes("reviewer · done"), 30_000);
+
+        const assertSubagentPane = (pane: string) => {
+          const fromMainCount = pane.split("from main").length - 1;
+          expect(fromMainCount).toBe(3);
+          expect(pane).toContain("  B368_FIRST_TASK");
+          expect(pane).toContain("  B368_BUSY_STEER");
+          expect(pane).toContain("  B368_IDLE_MSG");
+          expect(pane).not.toContain("┃ B368_FIRST_TASK");
+          expect(pane).not.toContain("┃ B368_BUSY_STEER");
+          expect(pane).not.toContain("┃ B368_IDLE_MSG");
+          expect(pane).toContain("┃ B368_USER_PROMPT");
+        };
+
+        assertSubagentPane(await session.captureFullScrollback());
+
+        // Check captured model requests match main's text expectations.
+        expect(userTexts(captured.first).at(-1)).toBe("B368_FIRST_TASK");
+        expect(userTexts(captured.busySteer).at(-1)).toContain("<parent_agent_steering>");
+        expect(userTexts(captured.busySteer).at(-1)).toContain("B368_BUSY_STEER");
+        expect(userTexts(captured.idle).at(-1)).toBe("B368_IDLE_MSG");
+        expect(userTexts(captured.user).at(-1)).toBe("B368_USER_PROMPT");
+
+        // Quit, resume the session, and verify the reopened subagent view and child log.jsonl.
+        await showAgent(session, "main");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+
+        const parents = sessionsHolding(home, "B368_MAIN_IDLE_DONE");
+        expect(parents).toHaveLength(1);
+        const resumed = await launch(`--resume ${parents[0]}`);
+        await resumed.waitForText("B368_MAIN_IDLE_DONE", 30_000);
+        await showAgent(resumed, "reviewer");
+        await resumed.waitForText("B368_CHILD_USER_DONE", 30_000);
+        assertSubagentPane(await resumed.captureFullScrollback());
+
+        // Child log.jsonl saved author items for main's first prompt and idle message.
+        const sessions = join(home, ".fx", "sessions", "v2");
+        const childLog = readdirSync(sessions)
+          .map((id) => join(sessions, id, "log.jsonl"))
+          .filter((p) => existsSync(p))
+          .map((p) => readFileSync(p, "utf8"))
+          .find((text) => text.includes("B368_FIRST_TASK") && text.includes("B368_USER_PROMPT")) ?? "";
+        expect(childLog).toContain('"type":"author"');
+        expect(childLog).toContain('"by":"parent"');
+      });
+      expect(requests.length).toBeGreaterThan(0);
     },
     TIMEOUT,
   );

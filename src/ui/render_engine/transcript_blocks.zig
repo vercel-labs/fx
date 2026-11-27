@@ -2123,8 +2123,9 @@ fn renderEntryToBlockForPresentationInterruptible(
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, rendered);
         },
         .user_turn => |e| blk: {
-            const card = try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentationInterruptible(
+            const card = try user_message_card.buildTurnCardWithSkillTokensForTerminalPresentationInterruptible(
                 alloc,
+                e.turn.author,
                 e.turn.text,
                 e.turn.images,
                 cols,
@@ -5672,6 +5673,32 @@ test "renderEntriesToBytes rebuilds user card at paint-time cols" {
     try std.testing.expect(std.mem.find(u8, wide, "┃") != null);
     try std.testing.expect(std.mem.find(u8, wide, "this is") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "this is") != null);
+}
+
+test "renderEntriesToBytes renders parent-authored turn with dim from main and plain body" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+
+    try entries.append(alloc, .{ .user_turn = .{
+        .id = 1,
+        .turn = .{
+            .text = try alloc.dupe(u8, "check the edge case in the parser"),
+            .images = try alloc.alloc(types.ImageAttachment, 0),
+            .author = .parent,
+        },
+        .skill_tokens = try alloc.alloc(input_visual_layout.SkillTokenSpan, 0),
+    } });
+    try appendUserTestEntry(&entries, alloc, 2, "user follow-up");
+
+    const rendered = try renderEntriesToBytes(alloc, entries.items, 80, .{});
+    defer alloc.free(rendered);
+
+    try std.testing.expect(std.mem.find(u8, rendered, "from main") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "  check the edge case in the parser") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "┃ check the edge case") == null);
+    try std.testing.expect(std.mem.find(u8, rendered, "\x1b[1mcheck the edge case") == null);
+    try std.testing.expect(std.mem.find(u8, rendered, "┃\x1b[0m \x1b[1muser follow-up") != null);
 }
 
 test "renderEntriesToBytes preserves selected skill token spans through user card reflow" {

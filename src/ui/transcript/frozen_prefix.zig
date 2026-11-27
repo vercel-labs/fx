@@ -221,6 +221,7 @@ fn hashEntry(start: u64, entry: TranscriptEntry) u64 {
             std.hash.autoHash(&hasher, value.id);
             std.hash.autoHash(&hasher, value.created_at_ms);
             std.hash.autoHash(&hasher, value.inline_hidden);
+            std.hash.autoHash(&hasher, value.turn.author);
             std.hash.autoHashStrat(&hasher, value.turn.text, .Deep);
             std.hash.autoHashStrat(&hasher, value.turn.work_id, .Deep);
             std.hash.autoHashStrat(&hasher, value.skill_tokens, .Deep);

@@ -390,14 +390,18 @@ pub const CommandOutputChunk = struct {
 
 pub const SteeringPresentationSnapshot = struct {
     messages: [][]u8 = &.{},
+    message_authors: []MessageAuthor = &.{},
     pending_feedback: [][]u8 = &.{},
+    pending_feedback_authors: []MessageAuthor = &.{},
     waits_for_boundary: bool = false,
 
     pub fn deinit(self: *SteeringPresentationSnapshot, alloc: std.mem.Allocator) void {
         for (self.messages) |message| alloc.free(message);
         if (self.messages.len > 0) alloc.free(self.messages);
+        if (self.message_authors.len > 0) alloc.free(self.message_authors);
         for (self.pending_feedback) |message| alloc.free(message);
         if (self.pending_feedback.len > 0) alloc.free(self.pending_feedback);
+        if (self.pending_feedback_authors.len > 0) alloc.free(self.pending_feedback_authors);
         self.* = .{};
     }
 };
@@ -559,6 +563,7 @@ pub const WorkerEvent = union(enum) {
     /// transcript already shows, so no user card is written.
     begin_continued_prompt: u64,
     append_user_feedback: []u8,
+    append_parent_feedback: []u8,
     /// A subagent's report or message a boundary took into the running
     /// turn. The screen shows it as the subagent's card, never as the user's.
     append_agent_message: []u8,
@@ -2059,10 +2064,11 @@ pub const WorkerRuntime = struct {
             copied += 1;
             // Every steer the turn takes gets its card, a parent's too, so the screen shows what the model read.
             const text = try alloc.dupe(u8, prompt.prompt);
-            events[event_count] = if (prompt.author == .child)
-                .{ .append_agent_message = text }
-            else
-                .{ .append_user_feedback = text };
+            events[event_count] = switch (prompt.author) {
+                .child => .{ .append_agent_message = text },
+                .parent => .{ .append_parent_feedback = text },
+                .user => .{ .append_user_feedback = text },
+            };
             event_count += 1;
         }
         try self.worker_events.ensureUnusedCapacity(alloc, event_count);
@@ -3136,35 +3142,49 @@ pub const WorkerRuntime = struct {
         snapshot.pending_feedback = pending: {
             var count: usize = 0;
             for (self.worker_events.items) |event| {
-                if (event == .append_user_feedback) count += 1;
+                if (event == .append_user_feedback or event == .append_parent_feedback) count += 1;
             }
             if (count == 0) break :pending &.{};
             const feedback = try alloc.alloc([]u8, count);
             errdefer alloc.free(feedback);
+            const authors = try alloc.alloc(MessageAuthor, count);
+            errdefer alloc.free(authors);
             var written: usize = 0;
             errdefer for (feedback[0..written]) |message| alloc.free(message);
             for (self.worker_events.items) |event| {
-                if (event == .append_user_feedback) {
-                    feedback[written] = try alloc.dupe(u8, event.append_user_feedback);
-                    written += 1;
+                switch (event) {
+                    .append_user_feedback => |text| {
+                        feedback[written] = try alloc.dupe(u8, text);
+                        authors[written] = .user;
+                        written += 1;
+                    },
+                    .append_parent_feedback => |text| {
+                        feedback[written] = try alloc.dupe(u8, text);
+                        authors[written] = .parent;
+                        written += 1;
+                    },
+                    else => {},
                 }
             }
+            snapshot.pending_feedback_authors = authors;
             break :pending feedback;
         };
         if (steering_count == 0) return snapshot;
 
         const messages = try alloc.alloc([]u8, steering_count);
+        errdefer alloc.free(messages);
+        const authors = try alloc.alloc(MessageAuthor, steering_count);
+        errdefer alloc.free(authors);
         var copied: usize = 0;
-        errdefer {
-            for (messages[0..copied]) |message| alloc.free(message);
-            alloc.free(messages);
-        }
+        errdefer for (messages[0..copied]) |message| alloc.free(message);
         for (self.queued_prompts.items) |prompt| {
             if (!previewsAsSteering(prompt)) continue;
             messages[copied] = try alloc.dupe(u8, prompt.prompt);
+            authors[copied] = prompt.author;
             copied += 1;
         }
         snapshot.messages = messages;
+        snapshot.message_authors = authors;
         return snapshot;
     }
 
@@ -5468,6 +5488,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .begin_resumed_prompt => |turn_id| .{ .begin_resumed_prompt = turn_id },
         .begin_continued_prompt => |turn_id| .{ .begin_continued_prompt = turn_id },
         .append_user_feedback => |text| .{ .append_user_feedback = try alloc.dupe(u8, text) },
+        .append_parent_feedback => |text| .{ .append_parent_feedback = try alloc.dupe(u8, text) },
         .append_agent_message => |text| .{ .append_agent_message = try alloc.dupe(u8, text) },
         .assistant_presentation => |presentation| .{
             .assistant_presentation = try presentation.clone(alloc),
@@ -5563,7 +5584,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             freeSkillDisplaySpans(alloc, begin.skill_display_spans);
         },
         .begin_presented_prompt, .begin_resumed_prompt, .begin_continued_prompt => {},
-        .append_user_feedback, .append_agent_message => |text| alloc.free(text),
+        .append_user_feedback, .append_parent_feedback, .append_agent_message => |text| alloc.free(text),
         .assistant_presentation => |presentation| {
             var owned = presentation;
             owned.deinit(alloc);
@@ -5908,7 +5929,7 @@ test "a parent's steer that a boundary takes shows as feedback with its raw text
     try std.testing.expectEqualStrings("parent steer", boundary.continue_turn[0].text);
     try std.testing.expectEqual(SteeringDelivery.applied, receipt.state.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 1), runtime.worker_events.items.len);
-    try std.testing.expectEqualStrings("parent steer", runtime.worker_events.items[0].append_user_feedback);
+    try std.testing.expectEqualStrings("parent steer", runtime.worker_events.items[0].append_parent_feedback);
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
 }
 

@@ -5181,7 +5181,7 @@ pub fn Runtime(comptime App: type) type {
             // The parent's words are the end of `text`, past its label, so the
             // turn keeps the same `[]u8` slice of the saved text.
             if (runtime_execution_memory.parentSteeringText(text)) |own| {
-                return .{ .text = text[text.len - own.len ..], .author = .user };
+                return .{ .text = text[text.len - own.len ..], .author = .parent };
             }
             return .{ .text = text, .author = .user };
         }
@@ -14562,4 +14562,23 @@ test "eb03: failed restore notice still withdraws accepted inputs" {
     var remaining = try app.agent().session_persistence.v2.?.pendingAcceptedInputs(alloc);
     defer remaining.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), remaining.ids.len);
+}
+
+test "savedSteeringTurn restores .parent for parent-framed steer and .user for plain steer" {
+    const alloc = std.testing.allocator;
+    const framed = try runtime_execution_memory.parentSteeringMessage(alloc, "check the edge case");
+    defer alloc.free(framed);
+    const saved = try runtime_execution_memory.buildExecutionMemory(alloc, &.{
+        .{ .role = .user, .content = framed },
+    });
+    defer types.freeExecutionMemory(alloc, saved);
+    try std.testing.expectEqual(@as(usize, 1), saved.steering.len);
+    const parent_turn = Runtime(TestApp).savedSteeringTurn(saved.steering[0].text);
+    try std.testing.expectEqual(types.MessageAuthor.parent, parent_turn.author);
+    try std.testing.expectEqualStrings("check the edge case", parent_turn.text);
+
+    var plain = "user steer".*;
+    const user_turn = Runtime(TestApp).savedSteeringTurn(&plain);
+    try std.testing.expectEqual(types.MessageAuthor.user, user_turn.author);
+    try std.testing.expectEqualStrings("user steer", user_turn.text);
 }

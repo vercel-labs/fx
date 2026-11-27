@@ -453,6 +453,7 @@ pub fn Runtime(comptime App: type) type {
                 .begin_resumed_prompt,
                 .begin_continued_prompt,
                 .append_user_feedback,
+                .append_parent_feedback,
                 .append_agent_message,
                 .notification,
                 .question_requested,
@@ -1329,14 +1330,19 @@ pub fn Runtime(comptime App: type) type {
                         else
                             session_notices.resumed_request_notice);
                     },
-                    .append_user_feedback, .append_agent_message => |text| {
+                    .append_user_feedback, .append_parent_feedback, .append_agent_message => |text| {
                         if (!try requireAssistantTextDrain(handlers)) {
                             try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
-                        // A subagent's message draws as its card.
-                        const author: types.MessageAuthor = if (event == .append_agent_message) .child else .user;
+                        // A subagent's message draws as its card, and a parent's draws as `from main`.
+                        const author: types.MessageAuthor = switch (event) {
+                            .append_agent_message => .child,
+                            .append_parent_feedback => .parent,
+                            .append_user_feedback => .user,
+                            else => unreachable,
+                        };
                         try handlers.write_user_prompt(handlers.ctx, .{ .text = text, .author = author });
                         if (agent.stream.active and agent.stream.phase != .thinking) {
                             agent.stream.phase = .thinking;
@@ -2684,6 +2690,7 @@ const PacedTranscriptBridge = struct {
     metrics: types.Metrics = .{},
     drain_count: usize = 0,
     user_prompt_count: usize = 0,
+    last_user_author: ?types.MessageAuthor = null,
     pacer_pending_when_user_prompt_written: bool = false,
     assistant_present_when_user_prompt_written: bool = false,
     notice_count: usize = 0,
@@ -2746,9 +2753,10 @@ const PacedTranscriptBridge = struct {
         try self.pacer.enqueue(self.app.alloc, text);
     }
 
-    fn writeUserPrompt(raw: *anyopaque, _: types.UserTurn) !void {
+    fn writeUserPrompt(raw: *anyopaque, turn: types.UserTurn) !void {
         const self: *PacedTranscriptBridge = @ptrCast(@alignCast(raw));
         self.user_prompt_count += 1;
+        self.last_user_author = turn.author;
         self.record('U');
         self.pacer_pending_when_user_prompt_written = self.pacer.hasPending();
         self.assistant_present_when_user_prompt_written =
@@ -4462,6 +4470,36 @@ test "core.app_worker_runtime feedback boundary drains paced text before writing
         "cancelled response tail",
         app.shell.lifecycle.notebook.entries.items[0].assistant_turn.segments.text.items,
     );
+}
+
+test "core.app_worker_runtime parent steer keeps .parent author through takeSteeringBoundaryInto and tick" {
+    const gpa = std.heap.c_allocator;
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(gpa);
+
+    try std.testing.expect(worker.beginDirectProcessing(41));
+    var steer = try FlushApp.queuedRequest(gpa, "parent steer");
+    steer.author = .parent;
+    try std.testing.expect(try worker.admitActiveSteering(gpa, steer));
+
+    var output = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer output.deinit();
+    const boundary = try worker.takeSteeringBoundaryInto(gpa, output.allocator(), 41, .model);
+    try std.testing.expectEqual(@as(usize, 1), boundary.continue_turn.len);
+
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    var bridge = PacedTranscriptBridge.init(&app);
+    defer bridge.deinit();
+    var events = worker.takeEvents();
+    defer events.deinit(gpa);
+    for (events.items) |event| {
+        try app.agent().worker.pushEvent(gpa, event);
+    }
+
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
+    try std.testing.expectEqual(@as(usize, 1), bridge.user_prompt_count);
+    try std.testing.expectEqual(types.MessageAuthor.parent, bridge.last_user_author.?);
 }
 
 test "core.app_worker_runtime blocked prompt drain retains the prompt before reset or write" {

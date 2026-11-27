@@ -1,7 +1,9 @@
 // Renders submitted user turns and owns their row collection and wrapping.
 const std = @import("std");
+const assistant_wrap = @import("../render_engine/assistant_wrap.zig");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const profiles = @import("../../core/profiles/profiles.zig");
 const types = @import("../../core/shared/types.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
 const visual_layout = @import("../input/visual_layout.zig");
@@ -23,6 +25,7 @@ const osc8_close = osc8_prefix ++ osc8_terminator;
 var accent_style: []const u8 = shared_theme.fx_dark.user_card_accent_style;
 
 var marker_style: []const u8 = shared_theme.fx_dark.user_card_marker_style;
+var statusline_style: []const u8 = shared_theme.fx_dark.statusline_style;
 
 pub fn setStyle(light: bool, terminal_bg: ?Rgb) void {
     applyTheme(shared_theme.builtin(light), terminal_bg);
@@ -31,6 +34,7 @@ pub fn setStyle(light: bool, terminal_bg: ?Rgb) void {
 pub fn applyTheme(theme: shared_theme.Theme, _: ?Rgb) void {
     marker_style = theme.user_card_marker_style;
     accent_style = theme.user_card_accent_style;
+    statusline_style = theme.statusline_style;
 }
 
 pub fn promptMarkerStyle() []const u8 {
@@ -110,8 +114,20 @@ pub fn buildUserPromptCardWithSkillTokensForTerminalPresentation(
     cols: u16,
     skill_tokens: []const visual_layout.SkillTokenSpan,
 ) ![]u8 {
-    return buildUserPromptCardWithSkillTokensForTerminalPresentationInterruptible(
+    return buildTurnCardWithSkillTokensForTerminalPresentation(alloc, .user, text, images, cols, skill_tokens);
+}
+
+pub fn buildTurnCardWithSkillTokensForTerminalPresentation(
+    alloc: std.mem.Allocator,
+    author: types.MessageAuthor,
+    text: []const u8,
+    images: []const types.ImageAttachment,
+    cols: u16,
+    skill_tokens: []const visual_layout.SkillTokenSpan,
+) ![]u8 {
+    return buildTurnCardWithSkillTokensForTerminalPresentationInterruptible(
         alloc,
+        author,
         text,
         images,
         cols,
@@ -131,8 +147,29 @@ pub fn buildUserPromptCardWithSkillTokensForTerminalPresentationInterruptible(
     skill_tokens: []const visual_layout.SkillTokenSpan,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) ![]u8 {
-    return buildUserPromptCardWithSkillTokensAndLinksInterruptible(
+    return buildTurnCardWithSkillTokensForTerminalPresentationInterruptible(
         alloc,
+        .user,
+        text,
+        images,
+        cols,
+        skill_tokens,
+        checkpoint,
+    );
+}
+
+pub fn buildTurnCardWithSkillTokensForTerminalPresentationInterruptible(
+    alloc: std.mem.Allocator,
+    author: types.MessageAuthor,
+    text: []const u8,
+    images: []const types.ImageAttachment,
+    cols: u16,
+    skill_tokens: []const visual_layout.SkillTokenSpan,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) ![]u8 {
+    return buildAuthorCardWithSkillTokensAndLinksInterruptible(
+        alloc,
+        author,
         text,
         images,
         cols,
@@ -152,10 +189,33 @@ pub fn buildUserPromptCardTailForTerminalPresentationInterruptible(
     max_rows: usize,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) ![]u8 {
+    return buildTurnCardTailForTerminalPresentationInterruptible(
+        alloc,
+        .user,
+        text,
+        images,
+        cols,
+        skill_tokens,
+        max_rows,
+        checkpoint,
+    );
+}
+
+pub fn buildTurnCardTailForTerminalPresentationInterruptible(
+    alloc: std.mem.Allocator,
+    author: types.MessageAuthor,
+    text: []const u8,
+    images: []const types.ImageAttachment,
+    cols: u16,
+    skill_tokens: []const visual_layout.SkillTokenSpan,
+    max_rows: usize,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) ![]u8 {
     // The pending-frame path retains only the newest rows that fit its current
     // transcript band; canonical formatting remains shared with ordinary turns.
-    return buildUserPromptCardWithSkillTokensAndLinksInterruptible(
+    return buildAuthorCardWithSkillTokensAndLinksInterruptible(
         alloc,
+        author,
         text,
         images,
         cols,
@@ -174,8 +234,9 @@ fn buildUserPromptCardWithSkillTokensAndLinks(
     skill_tokens: []const visual_layout.SkillTokenSpan,
     linked_images: bool,
 ) ![]u8 {
-    return buildUserPromptCardWithSkillTokensAndLinksInterruptible(
+    return buildAuthorCardWithSkillTokensAndLinksInterruptible(
         alloc,
+        .user,
         text,
         images,
         cols,
@@ -189,8 +250,9 @@ fn buildUserPromptCardWithSkillTokensAndLinks(
     };
 }
 
-fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
+fn buildAuthorCardWithSkillTokensAndLinksInterruptible(
     alloc: std.mem.Allocator,
+    author: types.MessageAuthor,
     text: []const u8,
     images: []const types.ImageAttachment,
     cols: u16,
@@ -199,12 +261,14 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
     max_rows: ?usize,
 ) ![]u8 {
-    const window: usize = if (cols > 2) @as(usize, cols) - 2 else 0;
+    const parent_card = author == .parent;
+    const gutter: usize = if (parent_card) assistant_wrap.gutterWidth(cols) else 2;
+    const window: usize = if (parent_card) @as(usize, cols) -| gutter else if (cols > 2) @as(usize, cols) - 2 else 0;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    if (window == 0) {
+    if (window == 0 or (parent_card and cols == 0)) {
         try build_checkpoint.consume(checkpoint, text.len +| images.len);
         return out.toOwnedSlice();
     }
@@ -218,7 +282,7 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
     const safe = try terminalSafePrompt(alloc, text, skill_tokens);
     defer safe.deinit(alloc);
     const token_text = if (safe.tokens.len > 0)
-        try renderSkillTokensForCard(alloc, safe.text, safe.tokens)
+        try renderSkillTokensForCard(alloc, safe.text, safe.tokens, !parent_card)
     else
         safe.text;
     defer if (safe.tokens.len > 0) alloc.free(token_text);
@@ -256,18 +320,36 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
     var row_buf: std.Io.Writer.Allocating = .init(alloc);
     defer row_buf.deinit();
 
-    try collectLogicalLinesWithFirstPrefix(
+    if (parent_card) {
+        const header_text = "from " ++ profiles.main_name;
+        const header_clipped = display_width.prefixByWidthIgnoringAnsi(header_text, cols);
+        try row_buf.writer.writeAll(statusline_style);
+        try row_buf.writer.writeAll(header_clipped);
+        try row_buf.writer.writeAll(reset_style);
+        try appendVisibleRow(alloc, &rows, row_buf.written(), max_rows);
+    }
+
+    try collectLogicalLinesWithAuthor(
         alloc,
         &rows,
         &row_buf,
         display_text,
         window,
+        parent_card,
+        gutter,
         checkpoint,
         max_rows,
     );
 
-    for (rows.items) |content| {
-        try emitRow(&out.writer, content);
+    if (parent_card) {
+        for (rows.items) |content| {
+            try out.writer.writeAll(content);
+            try out.writer.writeByte('\n');
+        }
+    } else {
+        for (rows.items) |content| {
+            try emitRow(&out.writer, content);
+        }
     }
 
     return out.toOwnedSlice();
@@ -323,6 +405,7 @@ fn renderSkillTokensForCard(
     alloc: std.mem.Allocator,
     text: []const u8,
     skill_tokens: []const visual_layout.SkillTokenSpan,
+    bold: bool,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -335,7 +418,7 @@ fn renderSkillTokensForCard(
         try out.writer.writeAll(text[pos..token.raw_start]);
         try out.writer.writeAll(accent_style);
         try out.writer.writeAll(token.name);
-        try out.writer.writeAll(restore_prompt_text_style);
+        try out.writer.writeAll(if (bold) restore_prompt_text_style else reset_style);
         pos = token.raw_end;
     }
     try out.writer.writeAll(text[pos..]);
@@ -397,13 +480,15 @@ fn hyperlinkStateAfter(fragment: []const u8, initial: ?[]const u8) ?[]const u8 {
     return active;
 }
 
-// Wraps `text` onto rows and repeats the rail so adjacent rows stay connected.
-fn collectLogicalLinesWithFirstPrefix(
+// Wraps `text` onto rows and repeats the rail for user prompts or plain body indent for parent messages.
+fn collectLogicalLinesWithAuthor(
     alloc: std.mem.Allocator,
     rows: *std.ArrayList([]const u8),
     row_buf: *std.Io.Writer.Allocating,
     text: []const u8,
     window: usize,
+    parent_card: bool,
+    gutter: usize,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
     max_rows: ?usize,
 ) !void {
@@ -414,7 +499,7 @@ fn collectLogicalLinesWithFirstPrefix(
         var remaining = line;
         if (remaining.len == 0) {
             row_buf.clearRetainingCapacity();
-            try writeRowPrefix(&row_buf.writer);
+            if (!parent_card) try writeRowPrefix(&row_buf.writer);
             try appendVisibleRow(alloc, rows, row_buf.written(), max_rows);
             continue;
         }
@@ -423,7 +508,11 @@ fn collectLogicalLinesWithFirstPrefix(
             try build_checkpoint.consume(checkpoint, @max(c.keep_bytes, c.skip_bytes));
             const fragment = remaining[0..c.keep_bytes];
             row_buf.clearRetainingCapacity();
-            try writeRowPrefix(&row_buf.writer);
+            if (parent_card) {
+                try row_buf.writer.splatByteAll(' ', gutter);
+            } else {
+                try writeRowPrefix(&row_buf.writer);
+            }
             if (active_hyperlink) |opener| try row_buf.writer.writeAll(opener);
             try row_buf.writer.writeAll(fragment);
             active_hyperlink = hyperlinkStateAfter(fragment, active_hyperlink);
@@ -926,4 +1015,35 @@ test "pending terminal card keeps only the visible tail rows" {
     try std.testing.expect(std.mem.find(u8, card, "row2") == null);
     try std.testing.expect(std.mem.find(u8, card, "row3") != null);
     try std.testing.expect(std.mem.find(u8, card, "row4") != null);
+}
+
+test "buildTurnCardWithSkillTokensForTerminalPresentation renders dim from main and indented plain text for parent" {
+    setStyle(false, null);
+    const alloc = std.testing.allocator;
+
+    const parent_card = try buildTurnCardWithSkillTokensForTerminalPresentation(
+        alloc,
+        .parent,
+        "review the parser carefully across wrapped rows",
+        &.{},
+        30,
+        &.{},
+    );
+    defer alloc.free(parent_card);
+    try std.testing.expect(std.mem.startsWith(u8, parent_card, shared_theme.fx_dark.statusline_style ++ "from main\x1b[0m\n"));
+    try std.testing.expect(std.mem.find(u8, parent_card, "┃") == null);
+    try std.testing.expect(std.mem.find(u8, parent_card, "\x1b[1m") == null);
+    try std.testing.expect(std.mem.find(u8, parent_card, "\n  review the parser") != null);
+
+    const user_card = try buildTurnCardWithSkillTokensForTerminalPresentation(
+        alloc,
+        .user,
+        "typed by user",
+        &.{},
+        80,
+        &.{},
+    );
+    defer alloc.free(user_card);
+    try std.testing.expect(std.mem.find(u8, user_card, "┃\x1b[0m \x1b[1mtyped by user") != null);
+    try std.testing.expect(std.mem.find(u8, user_card, "from main") == null);
 }

@@ -60,15 +60,31 @@ pub fn composeSteeringMessageRows(
     row_limit: u16,
     waits_for_boundary: bool,
 ) !ComposedInputRows {
+    return composeSteeringMessageRowsWithAuthor(alloc, message, .user, width, row_limit, waits_for_boundary);
+}
+
+pub fn composeSteeringMessageRowsWithAuthor(
+    alloc: Allocator,
+    message: []const u8,
+    author: types.MessageAuthor,
+    width: u16,
+    row_limit: u16,
+    waits_for_boundary: bool,
+) !ComposedInputRows {
     var composed: ComposedInputRows = .{};
     errdefer composed.deinit(alloc);
-    const layout = render_input.steering_message_layout(message, width, waits_for_boundary, row_limit);
+    const layout = render_input.steering_message_layout_with_author(message, author, width, waits_for_boundary, row_limit);
     for (0..layout.row_count) |index| {
         var row: std.ArrayList(u8) = .empty;
         errdefer row.deinit(alloc);
         try row.appendSlice(alloc, if (waits_for_boundary) ui_render.dim_style else ui_render.hint_style);
         if (waits_for_boundary) try row_text.appendClipped(alloc, &row, "┋ ", width);
-        try appendMessageLayoutRow(alloc, &row, layout, index);
+        if (author == .parent and index == 0) {
+            try row_text.appendClipped(alloc, &row, render_input.parent_steering_prefix, layout.content_width);
+            try appendMessageLayoutRowWithWidth(alloc, &row, layout, index, layout.content_width -| render_input.parent_steering_prefix_width);
+        } else {
+            try appendMessageLayoutRow(alloc, &row, layout, index);
+        }
         try row.appendSlice(alloc, ui_render.reset_style);
         try composed.rows.append(alloc, row);
     }
@@ -83,6 +99,16 @@ pub fn appendMessageLayoutRow(
     layout: render_input.SteeringMessageLayout,
     index: usize,
 ) !void {
+    return appendMessageLayoutRowWithWidth(alloc, row, layout, index, layout.content_width);
+}
+
+fn appendMessageLayoutRowWithWidth(
+    alloc: Allocator,
+    row: *std.ArrayList(u8),
+    layout: render_input.SteeringMessageLayout,
+    index: usize,
+    row_width: u16,
+) !void {
     const normalized = try alloc.dupe(u8, layout.rows[index]);
     defer alloc.free(normalized);
     for (normalized) |*byte| {
@@ -90,8 +116,8 @@ pub fn appendMessageLayoutRow(
     }
     var safe = try text_utils.encodeTerminalSafe(alloc, normalized, std.math.maxInt(usize));
     defer safe.deinit(alloc);
-    const ellipsis = layout.truncated and index + 1 == layout.row_count and layout.content_width > 0;
-    try row_text.appendClipped(alloc, row, safe.bytes, layout.content_width - @as(u16, @intFromBool(ellipsis)));
+    const ellipsis = layout.truncated and index + 1 == layout.row_count and row_width > 0;
+    try row_text.appendClipped(alloc, row, safe.bytes, row_width - @as(u16, @intFromBool(ellipsis)));
     if (ellipsis) try row.appendSlice(alloc, "…");
 }
 
@@ -107,6 +133,14 @@ test "steering rows use the dotted rail without an escape hint" {
     try std.testing.expect(std.mem.find(u8, second.rows.items[0].items, "┋ Second steer") != null);
     try std.testing.expect(std.mem.find(u8, first.rows.items[0].items, "Esc to steer now") == null);
     try std.testing.expect(std.mem.find(u8, second.rows.items[0].items, "Esc to steer now") == null);
+}
+
+test "parent waiting steering row prefixes from main in the footer banner" {
+    var rows = try composeSteeringMessageRowsWithAuthor(std.testing.allocator, "check edge cases", .parent, 80, 2, true);
+    defer rows.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+    try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "┋ from main · check edge cases") != null);
 }
 
 test "steering preview preserves the first two lines and hides the rest" {

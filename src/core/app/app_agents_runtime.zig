@@ -3263,7 +3263,7 @@ pub fn Runtime(comptime App: type) type {
             // turn carries main's work id, so it is saved with it.
             agent.prompt_work_id = start.child.agent.child_run.?.work_id;
             defer agent.prompt_work_id = null;
-            if (!try app.enqueuePrompt(agent, post.message)) return error.PromptNotAdmitted;
+            if (!try app.enqueuePromptFromParent(agent, post.message)) return error.PromptNotAdmitted;
         }
 
         /// The agent for child session `id`, its worker started on first use.

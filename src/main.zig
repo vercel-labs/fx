@@ -1464,10 +1464,24 @@ const App = struct {
     }
 
     pub fn enqueuePrompt(self: *App, agent: *agents.Agent, prompt: []const u8) !bool {
-        return self.enqueuePromptWithSkillBindings(agent, prompt, &.{});
+        return self.enqueuePromptWithSkillBindingsAndAuthor(agent, prompt, &.{}, .user);
+    }
+
+    pub fn enqueuePromptFromParent(self: *App, agent: *agents.Agent, prompt: []const u8) !bool {
+        return self.enqueuePromptWithSkillBindingsAndAuthor(agent, prompt, &.{}, .parent);
     }
 
     pub fn enqueuePromptWithSkillBindings(self: *App, agent: *agents.Agent, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
+        return self.enqueuePromptWithSkillBindingsAndAuthor(agent, prompt, skill_tokens, .user);
+    }
+
+    fn enqueuePromptWithSkillBindingsAndAuthor(
+        self: *App,
+        agent: *agents.Agent,
+        prompt: []const u8,
+        skill_tokens: []const registered_entities.SkillTokenSpan,
+        author: types.MessageAuthor,
+    ) !bool {
         try AgentAppRuntime.refreshProjectContext(self, agent);
         self.noteModelCatalogActivity();
         agent.session.setConversationLanguageFromUserMessage(prompt);
@@ -1482,10 +1496,11 @@ const App = struct {
                 debug_trace.preview(prompt, 120),
             },
         );
-        if (!try self.snapshotAndAdmitInteractivePromptWithSkillBindings(
+        if (!try self.snapshotAndAdmitInteractivePromptWithSkillBindingsAndAuthor(
             agent,
             prompt,
             skill_tokens,
+            author,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1779,7 +1794,22 @@ const App = struct {
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
     ) !bool {
-        const queued = try self.snapshotPrompt(
+        return self.snapshotAndAdmitInteractivePromptWithSkillBindingsAndAuthor(
+            agent,
+            prompt,
+            skill_tokens,
+            .user,
+        );
+    }
+
+    fn snapshotAndAdmitInteractivePromptWithSkillBindingsAndAuthor(
+        self: *App,
+        agent: *agents.Agent,
+        prompt: []const u8,
+        skill_tokens: []const registered_entities.SkillTokenSpan,
+        author: types.MessageAuthor,
+    ) !bool {
+        var queued = try self.snapshotPrompt(
             agent,
             prompt,
             skill_tokens,
@@ -1788,6 +1818,7 @@ const App = struct {
             0,
             false,
         );
+        queued.author = author;
         errdefer releaseUnadmittedPrompt(agent, queued);
         try agent.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
         return true;
@@ -1958,6 +1989,7 @@ const App = struct {
         return .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
             .work_id = work_id_copy,
+            .author = if (recovery_checkpoint) |checkpoint| checkpoint.user.author else .user,
             .prompt = prompt_copy,
             .images = images_copy,
             .authorized_image_catalog = authorized_image_catalog,
@@ -9011,6 +9043,80 @@ test "a report reaches the agent that owns its host as its subagent's message" {
     // A subagent's turn keeps its run's root request.
     try std.testing.expectEqualStrings("ROOT_REQUEST", queued.root_user_intent_context);
     try std.testing.expect(queued.delivery == .continuation);
+}
+
+test "subagent first prompt from main queues .parent and saves an author item in child log" {
+    const alloc = std.testing.allocator;
+    const session_adapter = @import("core/session/session_adapter.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home_path);
+    var store = try session_adapter.Store.open(alloc, home_path);
+    defer store.deinit(alloc);
+
+    var fixture: EndsFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const child = try addTestChildAgent(app, "child-1");
+    child.session_attached = true;
+    child.view_built = true;
+    defer App.AgentsAppRuntime.shutdownChildren(app);
+    defer {
+        child.agent.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
+        var left = child.agent.worker.takeEvents();
+        for (left.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+        left.deinit(std.heap.c_allocator);
+    }
+
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    const credential = credentials.Credential{
+        .token = try alloc.dupe(u8, "CHILD_TOKEN"),
+        .source = .stored_key,
+    };
+    var child_run = try testChildRun(alloc, &resolver, false, credential);
+    child_run.work_id = try alloc.dupe(u8, "work-1");
+    var turn = subagent_execution.TurnContext.initHosted(alloc, 8);
+    defer turn.deinit();
+    turn.child_id = "child-1";
+    turn.child_name = "reviewer";
+    turn.child_purpose = "check it";
+    var post = app_agents_runtime.Post{
+        .turn = &turn,
+        .run = child_run,
+        .message = "FIRST_FROM_MAIN",
+    };
+    {
+        app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+        defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+        try app.child_handoffs.posts.append(std.heap.c_allocator, &post);
+    }
+    App.AgentsAppRuntime.takePosts(app);
+    try std.testing.expectEqual(app_agents_runtime.Post.State.taken, post.state.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queuedPromptCount());
+    const queued = child.agent.worker.queued_prompts.items[0];
+    try std.testing.expectEqual(types.MessageAuthor.parent, queued.author);
+
+    var model = "m".*;
+    const child_session = try session_adapter.Session.create(alloc, &store, "/w", .ask, .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+    defer child_session.close();
+    try child_session.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast(queued.prompt), .work_id = queued.work_id, .author = queued.author },
+        .assistant = @constCast("child answer"),
+    } }, types.ConversationLanguage.default());
+    const sid = try alloc.dupe(u8, child_session.id());
+    defer alloc.free(sid);
+    const log_path = try std.Io.Dir.path.join(alloc, &.{ home_path, ".fx", "sessions", "v2", sid, "log.jsonl" });
+    defer alloc.free(log_path);
+    const log_bytes = try std.Io.Dir.cwd().readFileAlloc(io_mod.getIo(), log_path, alloc, .limited(1 << 20));
+    defer alloc.free(log_bytes);
+    try std.testing.expect(std.mem.find(u8, log_bytes, "\"type\":\"author\"") != null);
+    try std.testing.expect(std.mem.find(u8, log_bytes, "\"by\":\"parent\"") != null);
 }
 
 test "a subagent's message to an agent that stops for fx's restart is refused before it is sent" {
