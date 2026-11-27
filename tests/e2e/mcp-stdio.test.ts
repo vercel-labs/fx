@@ -25,7 +25,7 @@ import {
   turnSettled,
 } from "./tmux-helpers";
 import { traceReportNames, waitForNewTraceReport } from "./trace-report";
-import { RAW_ANSWER, RAW_KEYS, RAW_STATE, expectRawRetry, rawForm, rawLinesAt, rawRequests } from "./mcp-raw-rounds";
+import { RAW_ANSWER, RAW_KEYS, RAW_STATE, arrayOf, escapedString, expectRawRetry, longNumber, longString, nested, objectOf, rawForm, rawLinesAt, rawRequests } from "./mcp-raw-rounds";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
@@ -3966,6 +3966,78 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     45_000,
   );
 
+  // A round is refused whole when a part of a request that fx does not read goes past one of its bounds, or is not
+  // JSON that std reads. Where the value sits decides its depth: the round is level 0, a request 1, its params or one
+  // more member of it 2, and a member's value 3 or 2. A value, empty or not, may sit at level 32 and no deeper; a
+  // string or a number may spell 65536 bytes, a collection may hold 256 members, and a name may be 256 bytes. An
+  // object may not repeat a name, however the name is written, and that answer wins over a bound. The words are the
+  // ones the user hears, and nothing goes back to the server.
+  const LARGER = "MCP server 'fixture' asked for input, and fx declined it: the form is larger than fx can show.";
+  const INVALID =
+    "MCP server 'fixture' asked for input, and fx declined it: fx can't show the form: it is invalid, has a field type fx doesn't support, or asks for a secret.";
+  // Half a surrogate pair never reaches the form check: the reader of the reply refuses the whole reply first.
+  const BAD_REPLY = "MCP protocol error -32600: invalid reply (it isn't valid JSON-RPC)";
+  const limitCases: Array<{ name: string; in: "params" | "request"; value: string; answer: "shown" | typeof LARGER | typeof INVALID | typeof BAD_REPLY }> = [
+    { name: "a value at level 32 in the params", in: "params", value: nested(29), answer: "shown" },
+    { name: "a value at level 33 in the params", in: "params", value: nested(30), answer: LARGER },
+    { name: "a value at level 32 in the request", in: "request", value: nested(30), answer: "shown" },
+    { name: "a value at level 33 in the request", in: "request", value: nested(31), answer: LARGER },
+    { name: "a string of 65536 bytes", in: "params", value: longString(65536), answer: "shown" },
+    { name: "a string of 65537 bytes", in: "params", value: longString(65537), answer: LARGER },
+    { name: "an escaped string of 65536 bytes", in: "params", value: escapedString(65536 - 2000, "\\n", 2000), answer: "shown" },
+    { name: "an escaped string of 65537 bytes", in: "params", value: escapedString(65536 - 2000, "\\n", 2001), answer: LARGER },
+    { name: "a number of 65536 digits", in: "params", value: longNumber(65536), answer: "shown" },
+    { name: "a number of 65537 digits", in: "params", value: longNumber(65537), answer: LARGER },
+    { name: "an array of 256 items", in: "params", value: arrayOf(256), answer: "shown" },
+    { name: "an array of 257 items", in: "params", value: arrayOf(257), answer: LARGER },
+    { name: "an array of 257 items in the request", in: "request", value: arrayOf(257), answer: LARGER },
+    { name: "an object of 256 members", in: "params", value: objectOf(256), answer: "shown" },
+    { name: "an object of 257 members", in: "params", value: objectOf(257), answer: LARGER },
+    { name: "an object of 257 members in the request", in: "request", value: objectOf(257), answer: LARGER },
+    { name: "a name of 256 bytes", in: "params", value: `{"${"k".repeat(256)}":0}`, answer: "shown" },
+    { name: "a name of 257 bytes", in: "params", value: `{"${"k".repeat(257)}":0}`, answer: LARGER },
+    { name: "a name of 257 bytes written as escapes", in: "params", value: `{"${"\\u006b".repeat(257)}":0}`, answer: LARGER },
+    { name: "an object of 300 members with 3 names", in: "params", value: objectOf(300, 3), answer: INVALID },
+    { name: "a repeated name in an object of the params", in: "params", value: '{"a":0,"a":1}', answer: INVALID },
+    { name: "a repeated name in the request", in: "request", value: '1,"x":2', answer: INVALID },
+    { name: "a repeated name, once written as escapes", in: "request", value: '1,"\\u0078":2', answer: INVALID },
+    { name: "a repeated name under a value past the depth bound", in: "params", value: `{"a":${nested(40)},"a":1}`, answer: INVALID },
+    { name: "a string that is half a surrogate pair", in: "params", value: '"\\ud800"', answer: BAD_REPLY },
+    { name: "a string that is half a surrogate pair under a value past the depth bound", in: "params", value: `[${nested(40)},"\\ud800"]`, answer: BAD_REPLY },
+    { name: "the same name in two objects", in: "params", value: '{"a":{"a":0},"b":{"a":0}}', answer: "shown" },
+  ];
+  for (const limit of limitCases) {
+    for (const surface of limit.answer !== "shown" ? (["TUI", "Ask"] as const) : (["TUI"] as const)) {
+      test.skipIf(!tmuxAvailable())(
+        `${surface} ${limit.answer !== "shown" ? "declines a round with" : "shows a round with"} ${limit.name}`,
+        async () => {
+          const { root, session, activeGateway } = await startRawRound(
+            `${surface.toLowerCase()}-raw-limit`,
+            surface,
+            { mrtrRaw: [{ requests: rawRequests([RAW_KEYS[0]], { in: limit.in, value: limit.value }), state: RAW_STATE }] },
+            `${surface} raw limit complete.`,
+          );
+          if (limit.answer === "shown") {
+            await answerRawForms(session, surface, ["accept"]);
+            await session.waitForText(`${surface} raw limit complete.`, 20_000);
+            const lines = rawLinesOf(root);
+            expect(lines).toHaveLength(2);
+            expectRawRetry(lines[1], [RAW_KEYS[0]], [RAW_ANSWER.accept("f1")], RAW_STATE);
+            return;
+          }
+          await session.waitForText(`${surface} raw limit complete.`, 30_000);
+          const screen = await session.captureFullScrollback();
+          // The longer answer wraps on the screen, so the words are compared with the line breaks taken out.
+          expect(screen.replace(/\s+/g, " ").split(limit.answer).length - 1, screen).toBe(1);
+          expect(rawLinesOf(root)).toHaveLength(1);
+          expect(activeGateway.requests.map((entry) => entry.body).join("\n")).not.toContain("continued after raw rounds");
+          if (limit.answer !== BAD_REPLY) expect(readFileSync(root.traceLogPath, "utf8")).toContain("MCP question not answered server=fixture");
+        },
+        60_000,
+      );
+    }
+  }
+
   test.skipIf(!tmuxAvailable())(
     "a URL request and a form request in one round both go back under their own keys",
     async () => {
@@ -5707,6 +5779,61 @@ describe("fx mcp call", () => {
   };
   const callTo = (outFile: string, text = "hello") =>
     `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"${text}"}' > ${outFile} 2> err.txt; echo "exit=$?"; cat err.txt; echo "out=$(wc -c < ${outFile} | tr -d ' ')"`;
+
+  // ---- a shell command's `fx mcp call` on a tool whose first answer is an input_required round ----
+  // The round reaches the session's input responder, as any call's does. Without a terminal there is none, so the
+  // host ends the call; with one, the user answers and the call finishes. fx mcp call itself never reports that the
+  // tool asked for input.
+  const askingRound = { requests: rawRequests([RAW_KEYS[0]]), state: RAW_STATE };
+
+  test("a tool that asks for input ends the call when fx has no terminal to ask on", async () => {
+    const root = bridgeRoot("bridge-asks-no-terminal", {}, { mode: "mrtr_raw", mrtrRaw: [askingRound] });
+    const seen = await runBridgeCommand(root, callTo("out.txt"));
+    expect(seen).toContain("exit=1");
+    expect(seen).toContain("fx mcp call: MCP server 'fixture' ended the call: the server asked for input fx can't give.");
+    expect(seen).toContain("out=0");
+    expect(seen).not.toContain("cannot give");
+    expect(rawLinesAt(join(root.root, "mcp-raw-lines.txt"))).toHaveLength(1);
+  }, 90_000);
+
+  for (const surface of ["TUI", "Ask"] as const) {
+    for (const choice of ["accepts", "cancels"] as const) {
+      test.skipIf(!tmuxAvailable())(`${surface}: a tool that asks for input is answered, the user ${choice} and the call finishes`, async () => {
+        const root = bridgeRoot(`bridge-asks-${surface.toLowerCase()}-${choice}`, {}, { mode: "mrtr_raw", expectedElicitation: "both", mrtrRaw: [askingRound] });
+        let seen = "";
+        const activeGateway = startFakeGateway([
+          fakeGatewayToolCall("run_call", "shell", { action: "run", command: callTo("out.txt") }),
+          (body: string) => {
+            seen = toolResultText(body, "run_call");
+            return fakeGatewayFinalText("BRIDGE_ASKS_DONE");
+          },
+        ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+        gateway = activeGateway;
+        const env = { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" };
+        if (surface === "TUI") {
+          tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 140, height: 40, env });
+          await tui.waitForComposer(15_000);
+          await tui.sendText("Run the command.");
+        } else {
+          tui = await TmuxSession.create({
+            isolated: true, cwd: root.workspace, width: 140, height: 40, env, remainOnExit: true,
+            cmd: `${JSON.stringify(FX_BIN)} ask --full-access --no-save ${JSON.stringify("Run the command.")}`,
+          });
+        }
+        const press = (text: string) => (surface === "TUI" ? tui!.sendKeys(text) : tui!.sendText(text));
+        await tui.waitForText("requests f1", 20_000);
+        await press("1");
+        await tui.waitForText("- f1: true", 20_000);
+        await press(choice === "accepts" ? "1" : "4");
+        await tui.waitForText("BRIDGE_ASKS_DONE", 30_000);
+        expect(seen).toContain("exit=0");
+        expect(seen).toContain("fx mcp call: wrote 27 bytes of text in 1 lines");
+        expect(seen).toContain("out=27");
+        expect(seen).not.toContain("cannot give");
+        expect(rawLinesAt(join(root.root, "mcp-raw-lines.txt"))).toHaveLength(2);
+      }, 90_000);
+    }
+  }
 
   test("a tool that returns an error exits 6 with the tool's message and no data", async () => {
     const root = bridgeRoot("bridge-tool-error", {}, { mode: "tool_failure" });

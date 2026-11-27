@@ -93,8 +93,9 @@ pub fn readRequests(
     return readRawRequests(alloc, raw, wire, limits);
 }
 
-/// Reads the form of each request in `raw`, and nothing else of the round. The
-/// size limit is on the round as the text form writes it: `{key:request,...}`.
+/// Reads the form of each request in `raw`. The round gets the answer the text form gets: the size limit is on the
+/// round as that form writes it, `{key:request,...}`, and every request is checked against `validateJsonBounds`'s
+/// bounds by `scanRequestBounds`, which reads its text once and builds no tree, before any request's form is read.
 fn readRawRequests(
     alloc: Allocator,
     raw: []const RawRequest,
@@ -104,6 +105,12 @@ fn readRawRequests(
     var bytes: usize = 2 + raw.len - 1;
     for (raw) |request| bytes += request.key.len + 1 + request.raw.len;
     if (bytes > limits.max_json_bytes) return error.MetadataLimitExceeded;
+    var exceeded = false;
+    for (raw) |request| {
+        if (try keyLength(alloc, request.key) > limits.max_name_bytes) exceeded = true;
+        if (try scanRequestBounds(alloc, request.raw, limits)) exceeded = true;
+    }
+    if (exceeded) return error.MetadataLimitExceeded;
     if (raw.len > limits.max_requests) return error.InvalidInputRequired;
 
     const requests = try alloc.alloc(InputRequest, raw.len);
@@ -113,7 +120,7 @@ fn readRawRequests(
         alloc.free(requests);
     }
     for (raw) |request| {
-        try checkKeyToken(alloc, request.key, limits);
+        if (try keyLength(alloc, request.key) == 0) return error.InvalidInputRequired;
         const key = try alloc.dupe(u8, request.key);
         errdefer alloc.free(key);
         const payload: RequestPayload = switch (request.kind) {
@@ -127,17 +134,119 @@ fn readRawRequests(
     return requests;
 }
 
-/// A key that reads as a name of one to `max_name_bytes` bytes. The token is
-/// only decoded to be checked; nothing keeps the decoded name.
-fn checkKeyToken(alloc: Allocator, token: []const u8, limits: Limits) Error!void {
+/// The bytes of the name a key token spells once decoded. The token is only decoded to be measured.
+fn keyLength(alloc: Allocator, token: []const u8) Error!usize {
     var scratch: std.heap.ArenaAllocator = .init(alloc);
     defer scratch.deinit();
     const name = json_decode.parseFromSliceLeaky([]const u8, scratch.allocator(), token, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidInputRequired,
     };
-    if (name.len > limits.max_name_bytes) return error.MetadataLimitExceeded;
-    if (name.len == 0) return error.InvalidInputRequired;
+    return name.len;
+}
+
+const BoundsFrame = struct {
+    object: bool,
+    members: usize = 0,
+    expect_key: bool = true,
+    names: std.StringHashMapUnmanaged(void) = .empty,
+};
+
+/// Whether the JSON text of one request goes past a bound of `validateJsonBounds`, read as the tree
+/// `parseRequestJsonForWire` builds from it: a value deeper than `max_depth` (the request is level 1), a string or
+/// a number of more than `max_string_bytes`, a name of more than `max_name_bytes`, or an array or object of more
+/// than `max_collection_items`. Text that is no JSON, or an object that repeats a name, is `InvalidInputRequired`,
+/// as it is when the tree is built, and it is found whatever else the text holds. One pass over the text, with
+/// memory in proportion to it: no tree.
+fn scanRequestBounds(alloc: Allocator, text: []const u8, limits: Limits) Error!bool {
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var scanner: std.json.Scanner = .initCompleteInput(a, text);
+    var frames: std.ArrayList(BoundsFrame) = .empty;
+    var name: std.ArrayList(u8) = .empty;
+    var exceeded = false;
+    var scalar_bytes: usize = 0;
+    while (true) {
+        const token = scanner.next() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidInputRequired,
+        };
+        const naming = frames.items.len > 0 and frames.items[frames.items.len - 1].object and
+            frames.items[frames.items.len - 1].expect_key;
+        switch (token) {
+            .end_of_document => return exceeded,
+            .object_begin, .array_begin => {
+                if (startValue(frames.items, limits)) exceeded = true;
+                try frames.append(a, .{ .object = token == .object_begin });
+            },
+            .object_end, .array_end => {
+                const frame = frames.pop().?;
+                if (frame.members > limits.max_collection_items) exceeded = true;
+                endValue(frames.items);
+            },
+            .partial_string => |piece| {
+                scalar_bytes +|= piece.len;
+                if (naming) try name.appendSlice(a, piece);
+            },
+            .partial_string_escaped_1 => |piece| {
+                scalar_bytes +|= piece.len;
+                if (naming) try name.appendSlice(a, &piece);
+            },
+            .partial_string_escaped_2 => |piece| {
+                scalar_bytes +|= piece.len;
+                if (naming) try name.appendSlice(a, &piece);
+            },
+            .partial_string_escaped_3 => |piece| {
+                scalar_bytes +|= piece.len;
+                if (naming) try name.appendSlice(a, &piece);
+            },
+            .partial_string_escaped_4 => |piece| {
+                scalar_bytes +|= piece.len;
+                if (naming) try name.appendSlice(a, &piece);
+            },
+            .string => |piece| {
+                scalar_bytes +|= piece.len;
+                if (naming) {
+                    try name.appendSlice(a, piece);
+                    const frame = &frames.items[frames.items.len - 1];
+                    if (name.items.len > limits.max_name_bytes) exceeded = true;
+                    const added = try frame.names.getOrPut(a, try a.dupe(u8, name.items));
+                    if (added.found_existing) return error.InvalidInputRequired;
+                    frame.members += 1;
+                    frame.expect_key = false;
+                    name.clearRetainingCapacity();
+                } else {
+                    if (startValue(frames.items, limits) or scalar_bytes > limits.max_string_bytes) exceeded = true;
+                    endValue(frames.items);
+                }
+                scalar_bytes = 0;
+            },
+            .partial_number => |piece| scalar_bytes +|= piece.len,
+            .number => |piece| {
+                scalar_bytes +|= piece.len;
+                if (startValue(frames.items, limits) or scalar_bytes > limits.max_string_bytes) exceeded = true;
+                endValue(frames.items);
+                scalar_bytes = 0;
+            },
+            .true, .false, .null => {
+                if (startValue(frames.items, limits)) exceeded = true;
+                endValue(frames.items);
+            },
+            .allocated_number, .allocated_string => return error.InvalidInputRequired,
+        }
+    }
+}
+
+/// A value starts inside `frames`: whether it is deeper than `max_depth`, and one more item of an array.
+fn startValue(frames: []BoundsFrame, limits: Limits) bool {
+    if (frames.len > 0 and !frames[frames.len - 1].object) frames[frames.len - 1].members += 1;
+    return frames.len + 1 > limits.max_depth;
+}
+
+/// A value inside `frames` is over: an object then waits for its next name.
+fn endValue(frames: []BoundsFrame) void {
+    if (frames.len > 0 and frames[frames.len - 1].object) frames[frames.len - 1].expect_key = true;
 }
 
 pub fn parseRequestJsonForWire(
@@ -338,6 +447,144 @@ test "a round the engine read is refused when a key or a form is not one fx can 
     try std.testing.expectError(error.InvalidInputRequired, readRequests(alloc, &.{no_params}, "", .modern_mcp, .{}));
     const not_object: RawRequest = .{ .key = "\"k\"", .kind = .elicitation, .raw = "{\"method\":\"elicitation/create\",\"params\":[]}", .params = "[]" };
     try std.testing.expectError(error.InvalidInputRequired, readRequests(alloc, &.{not_object}, "", .modern_mcp, .{}));
+}
+
+fn repeatIn(a: Allocator, piece: []const u8, count: usize) ![]u8 {
+    const out = try a.alloc(u8, piece.len * count);
+    for (0..count) |index| @memcpy(out[index * piece.len ..][0..piece.len], piece);
+    return out;
+}
+
+fn nestedIn(a: Allocator, depth: usize) ![]u8 {
+    const open = try repeatIn(a, "[", depth);
+    const close = try repeatIn(a, "]", depth);
+    return a.print("{s}0{s}", .{ open, close });
+}
+
+/// The answer a request gets from the text form and from the engine's slices, by the name of its error.
+fn answerNames(alloc: Allocator, params_tail: []const u8, request_tail: []const u8) ![2][]const u8 {
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const params = try a.print("{{\"message\":\"m\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{{\"n\":{{\"type\":\"boolean\"}}}}}}{s}}}", .{params_tail});
+    const request = try a.print("{{\"method\":\"elicitation/create\",\"params\":{s}{s}}}", .{ params, request_tail });
+    const text = try a.print("{{\"k\":{s}}}", .{request});
+    var names: [2][]const u8 = undefined;
+    if (parseRequestJsonForWire(alloc, text, .modern_mcp, .{})) |requests| {
+        freeRequests(alloc, requests);
+        names[0] = "ok";
+    } else |err| names[0] = @errorName(err);
+    const raw = [_]RawRequest{.{ .key = "\"k\"", .kind = .elicitation, .raw = request, .params = params }};
+    if (readRequests(alloc, &raw, "", .modern_mcp, .{})) |requests| {
+        freeRequests(alloc, requests);
+        names[1] = "ok";
+    } else |err| names[1] = @errorName(err);
+    return names;
+}
+
+fn expectAnswer(expected: []const u8, params_tail: []const u8, request_tail: []const u8) !void {
+    const names = try answerNames(std.testing.allocator, params_tail, request_tail);
+    try std.testing.expectEqualStrings(expected, names[0]);
+    try std.testing.expectEqualStrings(expected, names[1]);
+}
+
+test "a round of the engine's slices gets the answer the text form gets at the depth bound" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The round is level 0, the request 1, its params or one more member of it 2, and a member's value 3 or 2. A value
+    // may sit at level 32, and nothing deeper.
+    for ([_]struct { depth: usize, in_params: bool, expected: []const u8 }{
+        .{ .depth = 29, .in_params = true, .expected = "ok" },
+        .{ .depth = 30, .in_params = true, .expected = "MetadataLimitExceeded" },
+        .{ .depth = 30, .in_params = false, .expected = "ok" },
+        .{ .depth = 31, .in_params = false, .expected = "MetadataLimitExceeded" },
+    }) |case| {
+        const member = try a.print(",\"x\":{s}", .{try nestedIn(a, case.depth)});
+        try expectAnswer(case.expected, if (case.in_params) member else "", if (case.in_params) "" else member);
+    }
+}
+
+test "a round of the engine's slices gets the answer the text form gets at the string and number bound" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bound = 64 * 1024;
+    // A string counts the bytes it spells once decoded. A string of 64 KiB written as escapes alone is larger than the
+    // round may be, so each case writes plain text first and escapes after it.
+    for ([_]struct { plain: usize, piece: []const u8, count: usize, expected: []const u8 }{
+        .{ .plain = bound, .piece = "", .count = 0, .expected = "ok" },
+        .{ .plain = bound - 1, .piece = "s", .count = 2, .expected = "MetadataLimitExceeded" },
+        .{ .plain = bound - 2000, .piece = "\\u00e9", .count = 1000, .expected = "ok" },
+        .{ .plain = bound - 2000, .piece = "\\u00e9", .count = 1001, .expected = "MetadataLimitExceeded" },
+        .{ .plain = bound - 2000, .piece = "\\n", .count = 2000, .expected = "ok" },
+        .{ .plain = bound - 2000, .piece = "\\n", .count = 2001, .expected = "MetadataLimitExceeded" },
+    }) |case| {
+        const plain = try repeatIn(a, "s", case.plain);
+        const member = try a.print(",\"x\":\"{s}{s}\"", .{ plain, try repeatIn(a, case.piece, case.count) });
+        try expectAnswer(case.expected, member, "");
+    }
+    for ([_]struct { digits: usize, expected: []const u8 }{
+        .{ .digits = bound, .expected = "ok" },
+        .{ .digits = bound + 1, .expected = "MetadataLimitExceeded" },
+    }) |case| {
+        const member = try a.print(",\"x\":{s}", .{try repeatIn(a, "1", case.digits)});
+        try expectAnswer(case.expected, member, "");
+    }
+}
+
+test "a round of the engine's slices gets the answer the text form gets at the collection and name bound" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]struct { items: usize, expected: []const u8 }{
+        .{ .items = 256, .expected = "ok" },
+        .{ .items = 257, .expected = "MetadataLimitExceeded" },
+    }) |case| {
+        const zeros = try repeatIn(a, "0,", case.items);
+        const array = try a.print(",\"x\":[{s}]", .{zeros[0 .. zeros.len - 1]});
+        try expectAnswer(case.expected, array, "");
+        try expectAnswer(case.expected, "", array);
+        var members: std.ArrayList(u8) = .empty;
+        for (0..case.items) |index| try members.print(a, "{s}\"k{d}\":0", .{ if (index == 0) "" else ",", index });
+        const object = try a.print(",\"x\":{{{s}}}", .{members.items});
+        try expectAnswer(case.expected, object, "");
+        try expectAnswer(case.expected, "", object);
+    }
+    // A name of 256 bytes in an object fx does not read is kept, and one of 257 is not, written plain or with escapes.
+    for ([_]struct { piece: []const u8, count: usize, expected: []const u8 }{
+        .{ .piece = "k", .count = 256, .expected = "ok" },
+        .{ .piece = "k", .count = 257, .expected = "MetadataLimitExceeded" },
+        .{ .piece = "\\u006b", .count = 256, .expected = "ok" },
+        .{ .piece = "\\u006b", .count = 257, .expected = "MetadataLimitExceeded" },
+    }) |case| {
+        const member = try a.print(",\"x\":{{\"{s}\":0}}", .{try repeatIn(a, case.piece, case.count)});
+        try expectAnswer(case.expected, member, "");
+    }
+}
+
+test "a round of the engine's slices gets the answer the text form gets for a repeated name and for text that is no JSON" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A repeated name is refused wherever it sits, written the same way or not, and it wins over a bound that is passed.
+    const deep = try a.print(",\"y\":{s}", .{try nestedIn(a, 40)});
+    for ([_]struct { params_tail: []const u8, request_tail: []const u8 }{
+        .{ .params_tail = ",\"x\":{\"a\":0,\"a\":1}", .request_tail = "" },
+        .{ .params_tail = "", .request_tail = ",\"x\":1,\"x\":2" },
+        .{ .params_tail = "", .request_tail = ",\"x\":1,\"\\u0078\":2" },
+        .{ .params_tail = "", .request_tail = ",\"x\":{\"a\\u0062\":0,\"ab\":1}" },
+        .{ .params_tail = ",\"x\":[{\"a\":0,\"a\":1}]", .request_tail = "" },
+    }) |case| {
+        try expectAnswer("InvalidInputRequired", case.params_tail, case.request_tail);
+        const both = try a.print("{s}{s}", .{ case.request_tail, deep });
+        try expectAnswer("InvalidInputRequired", case.params_tail, both);
+    }
+    // The same name in two objects, or at two levels, is no repeat.
+    try expectAnswer("ok", ",\"x\":{\"a\":0},\"y\":{\"a\":0,\"b\":{\"a\":0}}", ",\"z\":{\"a\":0}");
+    // A string that spells half a surrogate pair is no JSON text, and is refused before a bound is read.
+    try expectAnswer("InvalidInputRequired", ",\"x\":\"\\ud800\"", "");
+    try expectAnswer("InvalidInputRequired", ",\"x\":\"\\ud800\"", deep);
 }
 
 test "a round larger than the text form allows is refused whatever its requests are" {

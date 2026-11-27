@@ -636,7 +636,6 @@ test "a -32042 answer reaches the model as a protocol error, as the host hands i
     });
     defer result.deinit(alloc);
     try std.testing.expectEqual(tool_mcp_runtime.CallStatus.protocol_failure, result.status);
-    try std.testing.expect(result.input_required == null);
     try std.testing.expect(std.mem.find(u8, result.model_output, "MCP protocol error -32042") != null);
 }
 

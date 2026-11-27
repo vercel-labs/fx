@@ -10,12 +10,27 @@ import { existsSync, readFileSync } from "node:fs";
 export const RAW_KEYS = ['"\\u0061b"', '"caf\\u00e9 \\ud83d\\ude00 é 😀"', '"q\\"u\\\\o\\/te"'];
 export const RAW_STATE = '"{\\"b\\": 1,  \\"a\\":[2 , 3]}\\t \\u0061 é \\ud83d\\ude00 \\n  "';
 
-/** An `elicitation/create` request with one boolean field, `field`, as the server writes it. */
-export const rawForm = (field: string) =>
-  `{"method":"elicitation/create","params":{"message":"Question ${field}","requestedSchema":{"type":"object","properties":{"${field}":{"type":"boolean"}},"required":["${field}"],"additionalProperties":false}}}`;
+/**
+ * An `elicitation/create` request with one boolean field, `field`, as the server writes it. `extra` is one more member,
+ * `"x":<extra>`, that fx does not read: in the params, or in the request object itself.
+ */
+export const rawForm = (field: string, extra?: { in: "params" | "request"; value: string }) =>
+  `{"method":"elicitation/create","params":{"message":"Question ${field}","requestedSchema":{"type":"object","properties":{"${field}":{"type":"boolean"}},"required":["${field}"],"additionalProperties":false}${extra?.in === "params" ? `,"x":${extra.value}` : ""}}${extra?.in === "request" ? `,"x":${extra.value}` : ""}}`;
 
 /** An `inputRequests` object whose nth key, as written, asks the form `f<n>`. */
-export const rawRequests = (keys: string[]) => `{${keys.map((key, index) => `${key}:${rawForm(`f${index + 1}`)}`).join(",")}}`;
+export const rawRequests = (keys: string[], extra?: { in: "params" | "request"; value: string }) =>
+  `{${keys.map((key, index) => `${key}:${rawForm(`f${index + 1}`, extra)}`).join(",")}}`;
+
+/** JSON values at the edge of what fx reads from a round: `depth` arrays inside one another, a string, an array, an object. */
+export const nested = (depth: number) => `${"[".repeat(depth)}0${"]".repeat(depth)}`;
+export const longString = (bytes: number) => `"${"s".repeat(bytes)}"`;
+export const longNumber = (digits: number) => "1".repeat(digits);
+/** A string of `plain` plain bytes, then `escapes` copies of `escape`, which the server wrote as an escape. */
+export const escapedString = (plain: number, escape: string, escapes: number) => `"${"s".repeat(plain)}${escape.repeat(escapes)}"`;
+export const arrayOf = (items: number) => `[${Array.from({ length: items }, () => "0").join(",")}]`;
+/** An object of `members` members written with `distinct` different names, the others repeating them. */
+export const objectOf = (members: number, distinct = members) =>
+  `{${Array.from({ length: members }, (_, index) => `"k${index % distinct}":0`).join(",")}}`;
 
 /** What the retry writes for each answer: the fx wording of an answer, as the server receives it. */
 export const RAW_ANSWER = {

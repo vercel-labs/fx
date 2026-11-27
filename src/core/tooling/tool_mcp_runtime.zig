@@ -223,13 +223,11 @@ pub const CallStatus = enum {
     success,
     tool_failure,
     protocol_failure,
-    input_required,
 
     pub fn observed(self: CallStatus) observation.McpStatus {
         return switch (self) {
             .success => .success,
             .tool_failure, .protocol_failure => .failure,
-            .input_required => .input_required,
         };
     }
 };
@@ -238,19 +236,16 @@ test "MCP hook statuses normalize tool and protocol failures" {
     try std.testing.expectEqual(observation.McpStatus.success, CallStatus.success.observed());
     try std.testing.expectEqual(observation.McpStatus.failure, CallStatus.tool_failure.observed());
     try std.testing.expectEqual(observation.McpStatus.failure, CallStatus.protocol_failure.observed());
-    try std.testing.expectEqual(observation.McpStatus.input_required, CallStatus.input_required.observed());
 }
 
 pub const CallResult = struct {
     model_output: []const u8,
     images: []types.ToolImage = &.{},
     status: CallStatus = .success,
-    input_required: ?InputRequired = null,
 
     pub fn deinit(self: *CallResult, alloc: Allocator) void {
         alloc.free(self.model_output);
         types.freeToolImages(alloc, self.images);
-        self.deinitInputRequired(alloc);
         self.* = undefined;
     }
 
@@ -263,16 +258,8 @@ pub const CallResult = struct {
     pub fn takeModelOutput(self: *CallResult, alloc: Allocator) []const u8 {
         const model_output = self.model_output;
         types.freeToolImages(alloc, self.images);
-        self.deinitInputRequired(alloc);
         self.* = undefined;
         return model_output;
-    }
-
-    fn deinitInputRequired(self: *CallResult, alloc: Allocator) void {
-        if (self.input_required) |required| {
-            alloc.free(required.input_requests_json);
-            if (required.request_state_json) |state| alloc.free(state);
-        }
     }
 };
 

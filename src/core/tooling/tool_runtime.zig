@@ -922,7 +922,6 @@ fn executeRegisteredTool(
         .authorized_image_catalog = authorized_image_catalog,
     };
     var mcp_progress_bridge = McpProgressBridge{ .ctx = ctx };
-    var mcp_call_status: ?tool_mcp_runtime.CallStatus = null;
     var mcp_execution_error: ?anyerror = null;
     var dispatch_metadata: DispatchMetadata = .{};
     var subagent_provider = SubagentProviderState{
@@ -950,7 +949,6 @@ fn executeRegisteredTool(
         .input_responder = ctx.mcp_input_responder,
         .access = ctx.mcp_access,
     };
-    dispatch_ctx.mcp_call_status_sink = &mcp_call_status;
     if (ctx.mcp_ctx != null and ctx.mcp_call_tool != null) {
         dispatch_ctx.mcp_call_capability = mcp_call_bridge.capability();
     }
@@ -1005,10 +1003,6 @@ fn executeRegisteredTool(
     else
         toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (mcp_call_status == .input_required) {
-        execution.finish_turn = true;
-        execution.status_detail = "McpInputRequired";
-    }
     execution.context_notices = context_notice_sink.notices.items;
     execution.result_commit = result_commit_token;
     if (dispatch_ctx.cancel_flag) |cancel_flag| {
@@ -1354,7 +1348,6 @@ fn callBridgeTool(
         .success => .{ .status = .ok, .bytes = try bridgeResultData(arena, result.model_output) },
         .tool_failure => .{ .status = .tool_error, .bytes = try bridgeResultData(arena, result.model_output) },
         .protocol_failure => .{ .status = .failed, .bytes = result.model_output },
-        .input_required => .{ .status = .failed, .bytes = "This tool asked for input that fx mcp call cannot give. Call the tool directly instead." },
     };
 }
 
