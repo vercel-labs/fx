@@ -11,6 +11,7 @@ const acp_types = @import("types.zig");
 const client_info = @import("client_info.zig");
 const sessions = @import("sessions.zig");
 const leader_mod = @import("leader.zig");
+const takeover_mod = @import("takeover.zig");
 const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
@@ -2921,6 +2922,9 @@ fn startLeader(state: *ServerState) void {
         .pid = @intCast(std.c.getpid()),
         .sessions = .{ .context = store, .copy_ids = copyLeadingIds },
     };
+    // Set before the leader accepts, so a session that a client opens at once
+    // has its takeover hook. The manager reads the hook without a lock.
+    store.manager.setLockWon(takeover_mod.takeOverDeadLeader, takeover_mod.max_record_bytes);
     const leader = leader_mod.Leader.start(host.alloc, io, io_mod.getenv("TMPDIR"), .{
         .context = host,
         .run = runSocketConnection,

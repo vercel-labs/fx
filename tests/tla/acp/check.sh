@@ -26,7 +26,9 @@
 # names. The other configs must pass. AcpConfigTurn: session/set_config_option
 # while a turn runs: answered at once, and the running turn keeps its own
 # settings.
-# AcpDisconnect: a client that disconnects: a client that lists
+# AcpTakeover: a session after its holder dies: the next holder repairs the turn,
+# removes the dead holder's folder (built with the takeover; `today` is the code before it), and
+# restores nothing. AcpDisconnect: a client that disconnects: a client that lists
 # sh.fx/keepTurnOnDisconnect keeps its turns, any other's running turn stops,
 # and fx never waits for the gone client.
 # AcpLeader: the lock of a session names its holder and the holder's leader
@@ -103,6 +105,8 @@
 #   bun ../drivers/acp/disconnect/driver.ts   # a client that disconnects
 #   bun ../drivers/acp/leader/check-spec.ts
 #   bun ../drivers/acp/leader/driver.ts   # the real fx acp against AcpLeader
+#   bun ../drivers/acp/takeover/check-spec.ts   # AcpTakeover: the design, today, planted bugs, witnesses
+#   bun ../drivers/acp/takeover/driver.ts   # the real fx acp through the takeover plans, against AcpTakeoverTrace
 #   bun ../drivers/acp/join/check-spec.ts
 #   bun ../drivers/acp/join/driver.ts   # the real fx acp with followers, against AcpJoinTrace
 #   bun ../drivers/acp/session_state/check-spec.ts
@@ -205,6 +209,24 @@ MCAcpDisconnect AcpDisconnectToday-keep KeptTurnsComplete
 MCAcpDisconnect AcpDisconnectToday-wait NeverWaitsForGoneClient
 MCAcpLeader MCAcpLeader -
 MCAcpLeader AcpLeaderToday temporal
+AcpTakeover AcpTakeover -
+AcpTakeover AcpTakeover-today temporal
+AcpTakeover AcpTakeover-today-rest -
+AcpTakeover AcpTakeover-remove-live NoLiveFolderRemoved
+AcpTakeover AcpTakeover-remove-no-lock FolderRemovedByHolder
+AcpTakeover AcpTakeover-remove-on-timeout NoRemovalAfterTimeout
+AcpTakeover AcpTakeover-two-holders AtMostOneHolder
+AcpTakeover AcpTakeover-restore-grant GrantOwnedByHolder
+AcpTakeover AcpTakeover-restore-queue QueueOwnedByHolder
+AcpTakeover AcpTakeover-restore-question QuestionOwnedByHolder
+AcpTakeover AcpTakeover-continue-turn CallsAreAsked
+AcpTakeover AcpTakeover-line-by-other LineWrittenByHolder
+AcpTakeover AcpTakeover-remove-plain NoPlainEntryRemoved
+AcpTakeover AcpTakeover-probe-first NoProbeOfFailedFolder
+AcpTakeover AcpTakeover-witness-busy NoBusyLoad
+AcpTakeover AcpTakeover-witness-repair NoRepairedTurn
+AcpTakeover AcpTakeover-witness-cleanup NoDeadFolderRemoved
+AcpTakeover AcpTakeover-witness-reconnect NoFollowerConnected
 MCAcpJoin MCAcpJoin -
 MCAcpJoin AcpJoinToday temporal
 MCAcpSessionReaders MCAcpSessionReaders -

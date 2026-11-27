@@ -225,6 +225,7 @@ pub const Storage = struct {
     /// Returns the number of bytes read.
     pub fn readAt(s: Storage, file: File, buffer: []u8, offset: u64) Error!usize {
         try s.alive();
+        if (hooks) if (s.fault) |f| if (f.takeReadFailure()) return f.fail_error;
         var done: usize = 0;
         while (done < buffer.len) {
             const n = file.handle.readPositional(s.io, &.{buffer[done..]}, offset + done) catch |err|

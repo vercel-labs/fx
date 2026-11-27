@@ -17,7 +17,7 @@ const testing = std.testing;
 /// A Unix socket path must fit `sun_path`, which holds 104 bytes on macOS with
 /// the NUL. Std copies a longer path without checking, so `Leader.start` checks
 /// it too.
-const max_socket_path_bytes = 103;
+pub const max_socket_path_bytes = 103;
 /// Connections served at once. A connection past this is closed at once, so
 /// one client cannot hold every thread.
 const max_connections = 16;
@@ -28,10 +28,10 @@ const max_write_wait_ms = 1000;
 /// How often the accept loop and each connection check the stop flag. Stop
 /// therefore waits at most this long.
 const poll_ms = 100;
-const folder_prefix = "fx-leader-";
-const random_len = 8;
-const hex_len = random_len * 2;
-const socket_name = "s";
+pub const folder_prefix = "fx-leader-";
+pub const random_len = 8;
+pub const hex_len = random_len * 2;
+pub const socket_name = "s";
 /// Used when TMPDIR is missing, or when its socket path would be too long.
 const fallback_base = "/tmp";
 
@@ -62,7 +62,7 @@ pub fn writeRecord(w: *std.Io.Writer, socket_path: []const u8, pid: i64) !void {
     try w.print(",\"pid\":{d}}}\n", .{pid});
 }
 
-fn recordBytes(alloc: Allocator, socket_path: []const u8, pid: i64) ![]u8 {
+pub fn recordBytes(alloc: Allocator, socket_path: []const u8, pid: i64) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try writeRecord(&out.writer, socket_path, pid);
@@ -417,7 +417,7 @@ const FakeRunner = struct {
     }
 };
 
-fn pathGone(io: std.Io, path: []const u8) bool {
+pub fn pathGone(io: std.Io, path: []const u8) bool {
     std.Io.Dir.cwd().access(io, path, .{}) catch |err| return err == error.FileNotFound;
     return false;
 }

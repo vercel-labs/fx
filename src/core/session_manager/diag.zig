@@ -32,6 +32,9 @@ pub const Kind = enum {
     /// lock was released or when the session became live; the record stays
     /// until the next holder replaces it.
     leader_record_not_cleared,
+    /// The lock's line could not be read before the lock hook ran. The hook is
+    /// not called, so the previous holder's folder stays.
+    leader_lock_not_read,
 };
 
 pub const Event = struct {

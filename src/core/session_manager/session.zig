@@ -30,6 +30,12 @@ const Log = log_mod.Log;
 /// log bytes when the folded state (settings, children) is large.
 pub const default_snapshot_every_bytes: u64 = 64 << 10;
 
+/// Runs right after this process wins a session's lock, with the bytes the
+/// previous holder left in it (empty when none). It runs before this process
+/// writes its own record. The hook gets at most one byte more than the limit its
+/// owner registered, so a longer lock reaches it past that limit and it can refuse it.
+pub const LockWon = *const fn (io: std.Io, old_line: []const u8) void;
+
 pub const Options = struct {
     /// How long `openResume` retries a held flock before Busy.
     lock_wait_ms: u64 = 2000,
@@ -44,6 +50,11 @@ pub const Options = struct {
     /// the holder. The owner keeps them alive while the env lives. Null clears
     /// any record a holder that died left behind.
     leader_record: ?[]const u8 = null,
+    /// Runs once for each lock this process wins, see `LockWon`. Null when the
+    /// process keeps no leader.
+    lock_won: ?LockWon = null,
+    /// The limit the hook was registered with, in bytes of a lock's line.
+    lock_won_limit_bytes: usize = 0,
 };
 
 /// What every Session of one manager shares. Owned by L4; outlives them.
@@ -1369,6 +1380,7 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
     };
     errdefer s.closeFile(lock);
     if (!env.isPlanted(.skip_flock)) try acquireLock(env, lock, options.lock_wait_ms orelse env.options.lock_wait_ms);
+    notifyLockWon(env, lock, options.id);
 
     var opened = Log.open(gpa, s, dir, "log.jsonl", .read_write, .{}) catch |err| return switch (err) {
         error.NotFound => error.Corrupt,
@@ -1415,6 +1427,23 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
         if (!std.mem.eql(u8, parent, own)) return error.ChildSession;
     }
     return .{ .dir = dir, .lock = lock, .log = opened.log, .loaded = loaded };
+}
+
+/// Hands the bytes that a previous holder left in the lock to the hook, when
+/// this process has one. A lock that cannot be read is reported and the hook is
+/// not called, so the previous holder's folder stays where it is.
+fn notifyLockWon(env: *const Env, lock: storage.File, id: []const u8) void {
+    const won = env.options.lock_won orelse return;
+    const buffer = env.gpa.alloc(u8, env.options.lock_won_limit_bytes + 1) catch {
+        diag.report(env.diagnostics, .{ .kind = .leader_lock_not_read, .session_id = id });
+        return;
+    };
+    defer env.gpa.free(buffer);
+    const read = env.s.readAt(lock, buffer, 0) catch {
+        diag.report(env.diagnostics, .{ .kind = .leader_lock_not_read, .session_id = id });
+        return;
+    };
+    won(env.s.io, buffer[0..read]);
 }
 
 fn acquireLock(env: *const Env, lock: storage.File, wait_ms: u64) OpenError!void {

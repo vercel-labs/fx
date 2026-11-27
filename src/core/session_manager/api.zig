@@ -225,6 +225,14 @@ pub const Manager = struct {
         m.env.options.leader_record = owned;
     }
 
+    /// Sets the hook that each lock this manager wins calls, with the bytes the
+    /// previous holder left (see `session_mod.LockWon`). Call it before any
+    /// session opens.
+    pub fn setLockWon(m: *Manager, hook: session_mod.LockWon, limit_bytes: usize) void {
+        m.env.options.lock_won = hook;
+        m.env.options.lock_won_limit_bytes = limit_bytes;
+    }
+
     /// The ids of the sessions this manager leads, copied under the lock. The
     /// caller frees each id and the slice.
     pub fn leadingIds(m: *Manager, alloc: std.mem.Allocator) error{OutOfMemory}![][]u8 {
@@ -1232,6 +1240,67 @@ const api_tests = struct {
         led.release();
         try testing.expectEqual(@as(usize, 0), f.recorder.count(.leader_record_not_cleared));
         try testing.expectEqual(@as(usize, 0), f.recorder.count(.leader_record_not_written));
+    }
+
+    const lock_line_limit_test: usize = 1024;
+    var lock_hook_calls: usize = 0;
+    var lock_hook_len: usize = 0;
+
+    fn countLockWon(io_unused: std.Io, old_line: []const u8) void {
+        _ = io_unused;
+        lock_hook_calls += 1;
+        lock_hook_len = old_line.len;
+    }
+
+    test "a lock line of 1025 bytes reaches the lock hook one byte past the limit, so the takeover refuses it" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        const line = try gpa.alloc(u8, lock_line_limit_test + 1);
+        defer gpa.free(line);
+        @memset(line, ' ');
+        @memcpy(line[0..dead_holder_record.len], dead_holder_record);
+        try writeLock(m, id, line);
+
+        lock_hook_calls = 0;
+        lock_hook_len = 0;
+        m.setLockWon(countLockWon, lock_line_limit_test);
+        const resumed = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .ask });
+        resumed.release();
+        try testing.expectEqual(@as(usize, 1), lock_hook_calls);
+        try testing.expectEqual(lock_line_limit_test + 1, lock_hook_len);
+    }
+
+    test "a lock the next holder cannot read is traced as leader_lock_not_read, and the lock hook is not called" {
+        if (!storage.hooks) return error.SkipZigTest;
+        var fault: storage.Fault = .init(gpa, io, 1);
+        defer fault.deinit();
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        m.setFault(&fault);
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        try writeLock(m, id, dead_holder_record);
+        lock_hook_calls = 0;
+        m.setLockWon(countLockWon, lock_line_limit_test);
+        fault.fail_next_read = true;
+        const resumed = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .ask });
+        resumed.release();
+        try testing.expectEqual(@as(usize, 1), f.recorder.count(.leader_lock_not_read));
+        try testing.expectEqual(@as(usize, 0), lock_hook_calls);
     }
 
     test "a second manager with another leader record cannot open a led session, and the first record stays" {
