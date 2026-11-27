@@ -438,6 +438,43 @@ describe("fx mcp", () => {
     }, 90_000);
   }
 
+  // A stdio server whose first process dies and whose second is ready and refuses its list. The engine keeps the crash
+  // after the server is back, but the server is not down: the model is told the refusal, as `show` says it.
+  test("tells the model the refusal of a server that crashed once and is ready again, not its old crash", async () => {
+    const root = createRoot();
+    const marker = join(root.workspace, "started");
+    const script = `if [ ! -e "${marker}" ]; then : > "${marker}"; echo "first start crashes" >&2; exit 3; fi; : > "${marker}.ready"; exec "$@"`;
+    writeFileSync(root.profilePath, JSON.stringify({
+      mcpServers: {
+        web: {
+          command: "sh",
+          args: ["-c", script, "sh", process.execPath, MODERN_FIXTURE],
+          env: { FX_MCP_LIST_REPLY: '"result":{"resultType":"complete","tools":[],"tools":[]}' },
+        },
+      },
+    }));
+    const wait = `for i in $(seq 1 100); do [ -e "${marker}.ready" ] && break; sleep 0.2; done; sleep 2`;
+    const activeGateway = startFakeGateway([
+      fakeGatewayToolCall("search_down", "toolbox", { search: "web tools", server: "web" }),
+      fakeGatewayToolCall("wait_back", "shell", { action: "run", command: wait }),
+      fakeGatewayToolCall("search_web", "toolbox", { search: "web tools", server: "web" }),
+      fakeGatewayToolCall("search_any", "toolbox", { search: "weather forecast" }),
+      fakeGatewayFinalText("REFUSAL_TOLD"),
+    ], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    gateway = activeGateway;
+    const asked = await runFx(["ask", "--json", "--full-access", "--no-save", "Find the web tools."], {
+      cwd: root.workspace,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: activeGateway.baseUrl, FX_GATEWAY_CHAT_URL: activeGateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+      timeoutMs: 90_000,
+    });
+    expect(asked.code).toBe(0);
+    expect(existsSync(`${marker}.ready`)).toBe(true);
+    const told = activeGateway.requests[4]?.body ?? "";
+    // The first search met the crash and says it. The two after the server is back say the refusal and not the crash.
+    expect(told.split("MCP server 'web' is unavailable: its process exited").length - 1).toBeLessThanOrEqual(1);
+    expect(told.split("MCP server 'web' is unavailable: a field is written twice").length - 1).toBeGreaterThanOrEqual(2);
+  }, 120_000);
+
   // The `/mcp` list gives each row the words of its status that fit: under 33 columns the whole words of a refused list
   // do not, so a row says its kind in fewer, and a cut never takes the word that says it.
   test.skipIf(!tmuxAvailable())("the /mcp list says a refused and an unavailable tool list in rows that fit at 30, 33, 60 and 200 columns", async () => {
