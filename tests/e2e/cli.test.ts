@@ -31,7 +31,9 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySse,
+  startDynamicFakeGateway,
   startFakeGateway,
+  TITLE_GENERATION_MARKER,
   tokenPassCatalog,
 } from "./tmux-helpers";
 import { onlySessionId, savedSession, savedText, sessionDir } from "./saved-sessions";
@@ -446,6 +448,7 @@ The prompt may be passed as arguments or piped on stdin when no prompt args are 
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
 Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
 JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Subagent usage and dollar spend are excluded.
+JSON billed_usage has the same shape as usage and sums every billed model call of the run: main turns, title generation, auto-mode permission reviews, and compaction.
 JSON subagents appears only when a subagent did work in this request. It lists each one in the order it first ran, with its name, id, and usage in the same shape, counted for this request alone. fx session <session_id>/<name> reads one and prints the same id.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
@@ -5800,7 +5803,7 @@ describe("cli: ask success", () => {
         expect(jsonResult.code).toBe(1);
         expect(jsonResult.stderr).toBe("");
         expect(jsonResult.stdout).toBe(
-          '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
+          '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"billed_usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
         );
       } finally {
         cleanupIsolatedTestHome(home);
@@ -6154,6 +6157,232 @@ describe("cli: ask success", () => {
       }
     },
     60_000,
+  );
+
+  test(
+    "fx ask billed_usage sums main turns plus title, reviewer, and compaction while usage stays main-only",
+    async () => {
+      const sseText = (text: string, inputTokens: number, outputTokens: number) =>
+        fakeGatewaySse([
+          { type: "text-delta", id: "answer_1", delta: text },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: {
+              inputTokens: { total: inputTokens },
+              outputTokens: { total: outputTokens },
+            },
+          },
+        ]);
+      const sseToolCall = (
+        id: string,
+        name: string,
+        input: object,
+        inputTokens: number,
+        outputTokens: number,
+      ) =>
+        fakeGatewaySse([
+          { type: "tool-call", toolCallId: id, toolName: name, input },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+            usage: {
+              inputTokens: { total: inputTokens },
+              outputTokens: { total: outputTokens },
+            },
+          },
+        ]);
+      const isCompactionRequest = (body: string) => {
+        const parsed = JSON.parse(body);
+        const promptText = JSON.stringify(parsed.prompt ?? "");
+        return (
+          (Array.isArray(parsed.tools) &&
+            parsed.tools.length === 0 &&
+            parsed.toolChoice?.type === "none") ||
+          promptText.includes("Write the compaction notes for the ")
+        );
+      };
+      const baseEnv = (home: string, gateway: ReturnType<typeof startDynamicFakeGateway>) => ({
+        HOME: realpathSync(home),
+        AI_GATEWAY_API_KEY: "fake-ask-billed-usage-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_AUTO_UPGRADE: "0",
+      });
+
+      // 1. Plain `say hi`: title (200/20) + main (100/10)
+      {
+        const root = mkdtempSync(join(tmpdir(), "fx-e2e-billed-plain-"));
+        const posts: string[] = [];
+        const gateway = startDynamicFakeGateway(
+          (body) => {
+            expect(body.includes(TITLE_GENERATION_MARKER)).toBe(false);
+            posts.push("main");
+            return sseText("hi\n", 100, 10);
+          },
+          {
+            models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 4096 }],
+            titleResponses: [
+              () => {
+                posts.push("title");
+                return sseText("Greeting", 200, 20);
+              },
+            ],
+          },
+        );
+        try {
+          const home = join(root, "home");
+          const workspace = join(root, "workspace");
+          mkdirSync(home);
+          mkdirSync(workspace);
+          const res = await runFx(["ask", "--json", "say hi"], {
+            cwd: realpathSync(workspace),
+            env: baseEnv(home, gateway),
+            timeoutMs: 60_000,
+          });
+          expect(res.code).toBe(0);
+          expect(res.stderr).toBe("");
+          const json = JSON.parse(res.stdout.trim());
+          expect(posts.sort()).toEqual(["main", "title"]);
+          expect(json.usage).toEqual({ input_tokens: 100, output_tokens: 10 });
+          expect(json.billed_usage).toEqual({ input_tokens: 300, output_tokens: 30 });
+        } finally {
+          gateway.stop();
+          rmSync(root, { recursive: true, force: true });
+        }
+      }
+
+      // 2. `--auto` with one reviewed shell call: title (200/20) + main (100/10) + reviewer (300/30) + main (100/10)
+      {
+        const root = mkdtempSync(join(tmpdir(), "fx-e2e-billed-review-"));
+        const posts: string[] = [];
+        let mainCount = 0;
+        const gateway = startDynamicFakeGateway(
+          () => {
+            posts.push("main");
+            mainCount += 1;
+            if (mainCount === 1) {
+              return sseToolCall(
+                "call_shell_1",
+                "shell",
+                { request: { action: "run", command: "python3 -c \"print('ok')\"", yield_time_ms: 10000 } },
+                100,
+                10,
+              );
+            }
+            return sseText("done\n", 100, 10);
+          },
+          {
+            models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 4096 }],
+            titleResponses: [
+              () => {
+                posts.push("title");
+                return sseText("Run Python", 200, 20);
+              },
+            ],
+            classifierResponses: [
+              () => {
+                posts.push("reviewer");
+                return sseToolCall(
+                  "permission_decision_1",
+                  "permission_decision",
+                  { risk: "low", decision: "clear", rationale: "safe test command" },
+                  300,
+                  30,
+                );
+              },
+            ],
+          },
+        );
+        try {
+          const home = join(root, "home");
+          const workspace = join(root, "workspace");
+          mkdirSync(home);
+          mkdirSync(workspace);
+          const res = await runFx(["ask", "--json", "--auto", "run python"], {
+            cwd: realpathSync(workspace),
+            env: baseEnv(home, gateway),
+            timeoutMs: 60_000,
+          });
+          expect(res.code).toBe(0);
+          const json = JSON.parse(res.stdout.trim());
+          expect(posts.sort()).toEqual(["main", "main", "reviewer", "title"]);
+          expect(json.usage).toEqual({ input_tokens: 200, output_tokens: 20 });
+          expect(json.billed_usage).toEqual({ input_tokens: 700, output_tokens: 70 });
+        } finally {
+          gateway.stop();
+          rmSync(root, { recursive: true, force: true });
+        }
+      }
+
+      // 3. Resume with auto-compaction: compaction (400/40) + main (100/10)
+      {
+        const root = mkdtempSync(join(tmpdir(), "fx-e2e-billed-compact-"));
+        const posts: string[] = [];
+        let mainCount = 0;
+        const gateway = startDynamicFakeGateway(
+          (body) => {
+            if (isCompactionRequest(body)) {
+              posts.push("compaction");
+              return sseText("Turn 1\nIn between: read big.txt\nT1: read big.txt", 400, 40);
+            }
+            posts.push("main");
+            mainCount += 1;
+            if (mainCount === 1) {
+              return sseToolCall("call_read_1", "read_file", { path: "big.txt" }, 100, 10);
+            }
+            return sseText("done\n", 100, 10);
+          },
+          {
+            models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 20000, max_tokens: 4096 }],
+            titleResponses: [
+              () => sseText("Read Big File", 200, 20),
+            ],
+          },
+        );
+        try {
+          const home = join(root, "home");
+          const workspace = join(root, "workspace");
+          mkdirSync(home);
+          mkdirSync(workspace);
+          writeFileSync(
+            join(workspace, "big.txt"),
+            "line of historical fixture data for compaction\n".repeat(12_000),
+          );
+          const turn1 = await runFx(["ask", "--json", "--auto", "read big.txt"], {
+            cwd: realpathSync(workspace),
+            env: baseEnv(home, gateway),
+            timeoutMs: 60_000,
+          });
+          expect(turn1.code).toBe(0);
+          const sessionId = JSON.parse(turn1.stdout.trim()).session_id;
+          posts.length = 0;
+
+          const turn2 = await runFx(
+            ["ask", "--json", "--auto", "--resume", sessionId, "continue"],
+            {
+              cwd: realpathSync(workspace),
+              env: { ...baseEnv(home, gateway), FX_AUTO_COMPACT_PERCENT: "10" },
+              timeoutMs: 60_000,
+            },
+          );
+          expect(turn2.code).toBe(0);
+          const json2 = JSON.parse(turn2.stdout.trim());
+          expect(posts.sort()).toEqual(["compaction", "main"]);
+          expect(json2.usage).toEqual({ input_tokens: 100, output_tokens: 10 });
+          expect(json2.billed_usage).toEqual({ input_tokens: 500, output_tokens: 50 });
+        } finally {
+          gateway.stop();
+          rmSync(root, { recursive: true, force: true });
+        }
+      }
+    },
+    120_000,
   );
 
   test(

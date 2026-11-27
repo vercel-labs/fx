@@ -128,6 +128,7 @@ pub const Request = struct {
     /// after a 401 sends once more only with a stored token that replaced the
     /// rejected one. It never refreshes the sign-in itself.
     shared_sign_in: ?auth_runtime.SharedSignIn = null,
+    usage_out: ?*types.Usage = null,
 };
 
 /// Why a title generation attempt did not install a generated title. Static
@@ -300,6 +301,9 @@ fn send(alloc: Allocator, request: Request, token: []const u8, deadline: std.Io.
 }
 
 fn finish(alloc: Allocator, request: Request, sent: Sent) !Outcome {
+    if (sent == .result and sent.result == .completed) {
+        if (request.usage_out) |usage| usage.* = sent.result.completed.completion.usage;
+    }
     if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };
     const result = switch (sent) {
         .unavailable => |failure| return .{ .unavailable = failure },
@@ -352,6 +356,7 @@ pub const Task = struct {
     reads_shared_sign_in: bool = false,
     stream_provider: stream_provider.Provider,
     title: ?[]u8 = null,
+    usage: types.Usage = .{},
     failure: ?anyerror = null,
     started_at_ms: i64 = 0,
     finished_at_ms: i64 = 0,
@@ -495,6 +500,7 @@ pub const Task = struct {
                 auth_runtime.SharedSignIn.forSource(self.credential_source, self.account_id, self.gateway_team)
             else
                 null,
+            .usage_out = &self.usage,
         }) catch |err| {
             self.failure = err;
             self.status = .unavailable;
@@ -962,4 +968,30 @@ test "joinOrCancel keeps a title that answers within the grace" {
     const title = task.takeTitle().?;
     defer std.heap.c_allocator.free(title);
     try std.testing.expectEqualStrings("Fix the renderer", title);
+}
+
+test "title generation forwards completion usage even when content is empty" {
+    const EmptyWithUsage = struct {
+        fn stream(_: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
+            try request.admission.admit();
+            return .{ .completed = .{ .completion = .{
+                .content = null,
+                .finish_reason = .stop,
+                .usage = .{ .input_tokens = 21, .output_tokens = 3 },
+            }, .ownership = .borrowed } };
+        }
+    };
+    var cancelled = std.atomic.Value(bool).init(false);
+    var usage: types.Usage = .{};
+    const outcome = try run(std.testing.allocator, .{
+        .stream_provider = .{ .stream_fn = EmptyWithUsage.stream },
+        .model = "test/title",
+        .api_key = "key",
+        .prompt_excerpt = "fix the renderer",
+        .cancel_flag = &cancelled,
+        .usage_out = &usage,
+    });
+    try std.testing.expectEqual(FailureReason.empty_content, outcome.unavailable.reason);
+    try std.testing.expectEqual(@as(?u64, 21), usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 3), usage.output_tokens);
 }

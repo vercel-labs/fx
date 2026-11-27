@@ -325,6 +325,7 @@ pub const AgentRuntimeDeps = struct {
     /// as it arrives, so a saved session keeps the usage of every reply even
     /// when the turn never ends. A failure is traced and never fails the turn.
     record_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) anyerror!void = null,
+    record_side_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) void = null,
     /// Keeps the conversation's Claude prompt cache warm between requests.
     /// Owned by the conversation's `SessionRuntime`; null where no one waits
     /// on the conversation, as in `fx ask` and subagents.
@@ -427,6 +428,11 @@ pub const AgentRuntimeDeps = struct {
     pub fn pushContextNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
         if (self.push_context_notice) |push| return push(self.ctx, text);
         return self.push_system_notice(self.ctx, text);
+    }
+
+    pub fn sideUsageSink(self: *const AgentRuntimeDeps) ?types.UsageSink {
+        const record = self.record_side_usage orelse return null;
+        return .{ .context = self.ctx, .record_fn = record };
     }
 
     pub fn executeToolCall(self: *const AgentRuntimeDeps, request: ToolExecutionRequest) !ToolExecutionResult {

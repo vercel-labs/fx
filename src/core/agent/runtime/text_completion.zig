@@ -275,6 +275,7 @@ pub const CompactorCaller = struct {
     conversation: ?agent_stream_provider.RequestData = null,
     /// Takes each request's record once it settles, for Ctrl+O.
     model_calls: ?model_call_record.Sink = null,
+    side_usage: ?types.UsageSink = null,
     /// Renews the credential once after the provider rejects it with 401, as
     /// an agent turn does (`credential_renewal.renewRejected`). Null when the
     /// caller cannot renew it. Must outlive the compaction.
@@ -426,6 +427,7 @@ pub const CompactorCaller = struct {
             },
             .completed => |completed| completed.completion,
         };
+        if (self.side_usage) |sink| sink.record(completion.usage);
         if (capture.failed) return error.OutOfMemory;
         if (capture.saw_tool_call or completion.tool_calls.len > 0) return .{ .reply = try providerFailed(alloc, .tool_call, "", .{}) };
         // Anthropic ends a compaction with its own stop reason, which reads
@@ -538,6 +540,7 @@ pub const CompactorCaller = struct {
             usage = .{};
             outcome = try self.completeCall(alloc, call, conversation, options, &usage);
         }
+        if (self.side_usage) |sink| sink.record(usage);
         compactor.traceLog(false, "compaction model call model={s} after_conversation={} input_tokens={any} cache_read_tokens={any} cache_write_tokens={any} output_tokens={any}", .{
             call.model,               call.after_conversation, usage.input_tokens, usage.cache_read_tokens,
             usage.cache_write_tokens, usage.output_tokens,
@@ -924,4 +927,87 @@ test "a provider compaction request rejected with 401 is sent once more with the
             },
         }
     }
+}
+
+test "CompactorCaller forwards summary and provider compaction usage to side_usage" {
+    const testing = std.testing;
+    const Sink = struct {
+        total: types.Usage = .{},
+
+        fn record(raw: *anyopaque, usage: types.Usage) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.total.add(usage);
+        }
+    };
+    const Fake = struct {
+        fn stream(_: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !runtime_gateway_step.StreamResult {
+            try request.admission.admit();
+            return .{ .completed = .{
+                .completion = .{
+                    .content = try alloc.dupe(u8, "notes"),
+                    .provider_state_json = try alloc.dupe(u8, "block"),
+                    .finish_reason = .stop,
+                    .usage = .{ .input_tokens = 120, .output_tokens = 15, .cache_read_tokens = 80 },
+                },
+                .ownership = .owned,
+            } };
+        }
+        fn capabilities(_: *anyopaque, _: []const u8) model_capabilities.Capabilities {
+            return .{};
+        }
+        fn providerCompaction(_: []const u8) ?model_capabilities.ProviderCompaction {
+            return .openai;
+        }
+        fn holdsBlock(_: Allocator, _: []const u8) bool {
+            return true;
+        }
+    };
+    var fake: Fake = .{};
+    var sink: Sink = .{};
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "sys" }};
+    const history = [_]types.ChatMessage{.{ .role = .user, .content = "hi" }};
+    var summary_model: CompactorCaller = .{
+        .stream_provider = .{
+            .context = &fake,
+            .stream_fn = Fake.stream,
+            .provider_compaction_fn = Fake.providerCompaction,
+            .holds_compaction_block_fn = Fake.holdsBlock,
+        },
+        .provider = .gateway,
+        .model = "m",
+        .api_key = "k",
+        .retry_count = 0,
+        .capabilities_context = &fake,
+        .capabilities_fn = Fake.capabilities,
+        .side_usage = .{ .context = &sink, .record_fn = Sink.record },
+        .conversation = .{ .model = "m", .instructions = &instructions, .messages = &history, .tools = .{}, .tool_choice = .auto, .provider_options = .{} },
+    };
+    const caller = summary_model.caller();
+    var cancel = std.atomic.Value(bool).init(false);
+
+    const text_reply = try caller.vtable.send(caller.context, testing.allocator, .{
+        .model = "m",
+        .reasoning = null,
+        .system = "s",
+        .user = "u",
+        .max_bytes = 1024,
+        .cancel_flag = &cancel,
+        .trace_ctx = .{},
+    });
+    defer testing.allocator.free(text_reply.text);
+
+    const block_reply = try caller.vtable.compact_with_provider.?(caller.context, testing.allocator, .{
+        .older = null,
+        .cancel_flag = &cancel,
+        .trace_ctx = .{},
+    });
+    defer {
+        testing.allocator.free(block_reply.block.provider);
+        testing.allocator.free(block_reply.block.text);
+        testing.allocator.free(block_reply.block.parts_json);
+    }
+
+    try testing.expectEqual(@as(?u64, 240), sink.total.input_tokens);
+    try testing.expectEqual(@as(?u64, 30), sink.total.output_tokens);
+    try testing.expectEqual(@as(?u64, 160), sink.total.cache_read_tokens);
 }
