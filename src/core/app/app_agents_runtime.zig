@@ -3443,7 +3443,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasDecl(App, "writeDomainNotice")) return;
             const body = try app.alloc.print("a message from {s} came while fx waits to restart, so fx restarts without it", .{sender});
             defer app.alloc.free(body);
-            try app.writeDomainNotice(.{ .topic = "upgrade", .tone = .neutral, .body = body }, true);
+            try app.writeDomainNotice(.{ .topic = "update", .tone = .neutral, .body = body }, true);
         }
 
         /// Takes every waiting hand-off. Runs on the main loop each pass,

@@ -645,7 +645,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (app.upgrader.restart != .none and !submitsQuit(app)) {
                     debug_trace.logf("input", "submit held reason=upgrade_restart_waits input_bytes={d}", .{app.input_runtime.edit_state.input.items.len});
                     try app.writeDomainNotice(.{
-                        .topic = "upgrade",
+                        .topic = "update",
                         .tone = .neutral,
                         .body = restartHeldSubmitNotice(app.upgrader.restart == .waiting),
                     }, true);

@@ -342,7 +342,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn writeUpgradeNotice(app: *App, tone: types.NoticeTone, body: []const u8) !void {
             try app.writeDomainNotice(.{
-                .topic = "upgrade",
+                .topic = "update",
                 .tone = tone,
                 .body = body,
             }, true);
