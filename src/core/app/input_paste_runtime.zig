@@ -1,7 +1,5 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
-const host_target = @import("../hosts/target.zig");
-const runtime_profile = @import("../hosts/runtime_profile.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -18,26 +16,11 @@ const paste_framing = @import("../input/paste_framing.zig");
 const text_scalar = @import("../input/text_scalar.zig");
 const render_request = @import("../../ui/render_request.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
-const app_agents_runtime = @import("app_agents_runtime.zig");
-const app_session_runtime = @import("app_session_runtime.zig");
-const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
-
-pub const PasteDropReason = enum {
-    trust_screen,
-    agents_menu,
-    api_key_entry,
-    sign_in_screen,
-};
 
 pub const PasteCaptureTarget = struct {
     owner: paste_framing.Owner,
     buffer_limit: usize,
-};
-
-pub const PasteTarget = union(enum) {
-    capture: PasteCaptureTarget,
-    drop: PasteDropReason,
 };
 
 fn normalizeApprovalAmendmentPasteInPlace(bytes: []u8) []u8 {
@@ -121,64 +104,36 @@ test "pasted image slash removes only a prefix before a captured path" {
 pub fn PasteEditRuntime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
-        pub const Target = PasteTarget;
-
-        fn trustScreenActive(app: *const App) bool {
-            if (comptime host_target.is_wasm or !@hasField(App, "trust")) return false;
-            if (comptime !@hasDecl(@TypeOf(app.trust), "asking")) return false;
-            return app.trust.asking();
-        }
-
-        fn agentsMenuActive(app: *App) bool {
-            if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
-            return app_agents_runtime.Runtime(App).menuActive(app);
-        }
-
-        fn authApiKeyEntryActive(app: *const App) bool {
-            if (comptime !@hasField(App, "auth") or
-                !@hasDecl(@TypeOf(app.auth), "apiKeyEntryActive")) return false;
-            return app.auth.apiKeyEntryActive();
-        }
-
-        fn authSignInEntryActive(app: *const App) bool {
-            if (comptime !@hasField(App, "auth") or
-                !@hasDecl(@TypeOf(app.auth), "signInEntryActive")) return false;
-            return app.auth.signInEntryActive();
-        }
-
         fn authCodeEntryActive(app: *const App) bool {
             if (comptime !@hasField(App, "auth") or
                 !@hasDecl(@TypeOf(app.auth), "signInCodeEntryActive")) return false;
             return app.auth.signInCodeEntryActive();
         }
 
-        fn targetForOwner(
+        fn captureTargetForOwner(
             app: *App,
             agent: *AppAgent,
             owner: paste_framing.Owner,
             max_input_len: usize,
-        ) PasteTarget {
+        ) PasteCaptureTarget {
             const buffer_limit = switch (owner) {
                 .composer => app.input_runtime.replacementState(&agent.pending_images).availableBytesForSelectionOrInsertion(max_input_len),
                 .auth_code => login_flow.max_manual_code_bytes,
                 .none, .decision_prompt, .question_freeform, .approval_amendment => max_input_len,
             };
-            return .{ .capture = .{
+            return .{
                 .owner = owner,
                 .buffer_limit = buffer_limit,
-            } };
+            };
         }
 
-        pub fn composerTarget(app: *App, agent: *AppAgent, max_input_len: usize) PasteTarget {
-            return targetForOwner(app, agent, .composer, max_input_len);
+        pub fn composerTarget(app: *App, agent: *AppAgent, max_input_len: usize) PasteCaptureTarget {
+            return captureTargetForOwner(app, agent, .composer, max_input_len);
         }
 
-        pub fn resolvePasteTarget(app: *App, agent: *AppAgent, max_input_len: usize) PasteTarget {
-            if (trustScreenActive(app)) return .{ .drop = .trust_screen };
-            if (agentsMenuActive(app)) return .{ .drop = .agents_menu };
-            if (authApiKeyEntryActive(app)) return .{ .drop = .api_key_entry };
-            if (authSignInEntryActive(app) and !authCodeEntryActive(app)) return .{ .drop = .sign_in_screen };
-
+        /// The capture target for a paste that starts now: whichever prompt or
+        /// the auth code entry owns input, otherwise the composer.
+        pub fn pasteCaptureTarget(app: *App, agent: *AppAgent, max_input_len: usize) PasteCaptureTarget {
             const owner: paste_framing.Owner = if (agent.question_prompt.isActive())
                 if (agent.question_prompt.isFreeformSelected()) .question_freeform else .decision_prompt
             else if (agent.approval_prompt.isAmending())
@@ -189,7 +144,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 .auth_code
             else
                 .composer;
-            return targetForOwner(app, agent, owner, max_input_len);
+            return captureTargetForOwner(app, agent, owner, max_input_len);
         }
 
         fn openPasteCapture(app: *App, capture: PasteCaptureTarget) void {
@@ -223,9 +178,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     .{},
                 );
             }
-            if (comptime @hasField(App, "terminal_input_runtime")) {
-                app.terminal_input_runtime.resetEscapeDecoder();
-            }
+            app.terminal_input_runtime.resetEscapeDecoder();
             if (gesture_reset.clearedAny()) {
                 app.shell.render_requests.request(.footer);
             }
@@ -238,20 +191,13 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         pub fn beginPaste(app: *App, agent: *AppAgent, max_input_len: usize) void {
-            const capture = switch (resolvePasteTarget(app, agent, max_input_len)) {
-                .capture => |capture| capture,
-                .drop => |reason| {
-                    debug_trace.logf("input", "paste begin dropped reason={s}", .{@tagName(reason)});
-                    return;
-                },
-            };
-            openPasteCapture(app, capture);
+            openPasteCapture(app, pasteCaptureTarget(app, agent, max_input_len));
         }
 
         pub fn pasteDecodedText(
             app: *App,
             agent: *AppAgent,
-            target: PasteTarget,
+            capture: PasteCaptureTarget,
             text: []const u8,
             max_input_len: usize,
         ) !void {
@@ -259,13 +205,6 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 debug_trace.logf("input", "decoded paste empty", .{});
                 return;
             }
-            const capture = switch (target) {
-                .capture => |capture| capture,
-                .drop => |reason| {
-                    debug_trace.logf("input", "decoded paste dropped bytes={d} reason={s}", .{ text.len, @tagName(reason) });
-                    return;
-                },
-            };
 
             openPasteCapture(app, capture);
             app.input_runtime.paste.ingestDecodedSlice(app.alloc, text) catch |err| {
@@ -286,13 +225,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 app.input_runtime.paste.overflow_bytes == 0 and
                 app.input_runtime.paste.buffer.items.len == 0)
             {
-                app.input_runtime.paste.resetWithTrace(.invalid_utf8);
-                app.shell.render_requests.request(.footer);
-                try app.writeDomainNotice(.{
-                    .topic = "input",
-                    .tone = .@"error",
-                    .body = "Pasted text contains unsupported bytes and was not added to the draft.",
-                }, true);
+                try rejectUnsupportedPaste(app, .footer);
                 return;
             }
 
@@ -302,10 +235,6 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 .{ @tagName(capture.owner), app.input_runtime.paste.byteCount() },
             );
             try finishPaste(app, agent, max_input_len);
-            if (!app.input_runtime.paste.active()) {
-                syncCatalogMenus(app, agent);
-                settleModelPickerDraft(app);
-            }
         }
 
         pub fn handleActivePasteByte(app: *App, byte: u8) !void {
@@ -342,6 +271,17 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 }, true);
             }
             return true;
+        }
+
+        /// Drops the paste whose bytes fx cannot keep, and says so.
+        fn rejectUnsupportedPaste(app: *App, render_reason: render_request.Reason) !void {
+            app.input_runtime.paste.resetWithTrace(.invalid_utf8);
+            app.shell.render_requests.request(render_reason);
+            try app.writeDomainNotice(.{
+                .topic = "input",
+                .tone = .@"error",
+                .body = "Pasted text contains unsupported bytes and was not added to the draft.",
+            }, true);
         }
 
         /// Resets the paste after `owner` failed to take it and returns `err`.
@@ -402,13 +342,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     .question_freeform, .approval_amendment => .modal,
                     else => .footer,
                 };
-                app.input_runtime.paste.resetWithTrace(.invalid_utf8);
-                app.shell.render_requests.request(render_reason);
-                try app.writeDomainNotice(.{
-                    .topic = "input",
-                    .tone = .@"error",
-                    .body = "Pasted text contains unsupported bytes and was not added to the draft.",
-                }, true);
+                try rejectUnsupportedPaste(app, render_reason);
                 return;
             }
 
@@ -853,107 +787,6 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 if (!(std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-' or byte == '.' or byte == ':')) break;
             }
             return end;
-        }
-
-        fn modelMenuActive(app: *App) bool {
-            if (comptime !@hasField(App, "model_cache")) return false;
-            return app.model_cache.menu.active;
-        }
-
-        fn restoreModelPickerDraft(app: *App) void {
-            if (comptime !@hasField(@TypeOf(app.input_runtime), "model_picker_draft")) return;
-            if (app.input_runtime.model_picker_draft) |*draft| {
-                app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                draft.restore(app.alloc, app.input_runtime.composerStashView());
-                app.input_runtime.model_picker_draft = null;
-                app.shell.render_requests.request(.footer);
-            }
-        }
-
-        fn settleModelPickerDraft(app: *App) void {
-            if (comptime !@hasField(@TypeOf(app.input_runtime), "model_picker_draft")) return;
-            if (app.input_runtime.model_picker_draft == null) return;
-            if (modelMenuActive(app) or input_completion_runtime.CompletionRuntime(App).hasModelQuery(app)) return;
-            const leftover_bytes = app.input_runtime.edit_state.input.items.len;
-            if (leftover_bytes > 0) {
-                debug_trace.logf(
-                    "input",
-                    "model picker flow ended; discarding borrowed composer bytes={d} to restore the draft",
-                    .{leftover_bytes},
-                );
-            }
-            restoreModelPickerDraft(app);
-        }
-
-        fn syncCatalogMenus(app: *App, agent: *AppAgent) void {
-            syncAgentsMenu(app);
-            syncSettingsMenu(app);
-            syncHelpMenu(app);
-            syncSkillsMenu(app);
-            syncModelMenu(app);
-            syncSessionMenu(app, agent);
-            syncMcpHostMenu(app);
-        }
-
-        fn syncAgentsMenu(app: *App) void {
-            if (comptime !@hasDecl(App, "openAgentsMenu")) return;
-            app_agents_runtime.Runtime(App).searchChanged(app);
-        }
-
-        fn syncSettingsMenu(app: *App) void {
-            if (!app.input_runtime.settings_menu.active) return;
-            app.input_runtime.settings_menu.resetForQuery();
-        }
-
-        fn syncHelpMenu(app: *App) void {
-            if (!app.input_runtime.help_menu.active) return;
-            app.input_runtime.help_menu.resetForQuery();
-        }
-
-        fn syncSkillsMenu(app: *App) void {
-            if (comptime !@hasField(App, "skills")) return;
-            if (!app.skills.menu.active) return;
-            if (!app.skills.menu.origin.isMention()) {
-                app.skills.setMenuQuery(app.alloc, app.input_runtime.edit_state.input.items);
-                return;
-            }
-            const target = app.skills.menu.target orelse return;
-            const items = app.input_runtime.edit_state.input.items;
-            if (target.start >= items.len or items[target.start] != '$') {
-                app.skills.closeMenu();
-                return;
-            }
-            const end = skillTokenEnd(items, target.start + 1);
-            app.skills.menu.target = .{ .start = target.start, .end = end };
-            app.skills.setMenuQuery(app.alloc, items[target.start + 1 .. end]);
-        }
-
-        fn syncModelMenu(app: *App) void {
-            if (comptime !@hasField(App, "model_cache")) return;
-            if (!app.model_cache.menu.active) return;
-            app.model_cache.setMenuQuery(app.input_runtime.edit_state.input.items);
-        }
-
-        fn syncSessionMenu(app: *App, agent: *AppAgent) void {
-            if (comptime !agents.hasAgentField(App, "session_persistence")) return;
-            const picker = &agent.session_persistence.session_picker;
-            if (!picker.active) return;
-            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
-                picker.setQuery(app.input_runtime.edit_state.input.items);
-                return;
-            }
-            app_session_runtime.Runtime(App).searchSessionPicker(app, agent) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "session picker search dropped the listed sessions err={s}",
-                    .{@errorName(err)},
-                );
-            };
-        }
-
-        fn syncMcpHostMenu(app: *App) void {
-            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return;
-            app.mcp.hostMenuFilterChanged(app.input_runtime.edit_state.input.items);
         }
     };
 }
