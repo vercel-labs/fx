@@ -299,6 +299,36 @@ pub const Storage = struct {
         file.handle.unlock(s.io);
     }
 
+    /// Records the writer's PID in the lock file the caller holds. Best
+    /// effort: a failed write leaves the file as it was, and `readLockPid`
+    /// then reports no PID. It skips `mutate`, so fault schedules see only
+    /// the session's own writes.
+    pub fn writeLockPid(s: Storage, file: File, pid: i64) void {
+        if (pid <= 0) return;
+        var buf: [lock_pid_max_bytes]u8 = undefined;
+        const text = std.mem.print(&buf, "{d}\n", .{pid}) catch return;
+        file.handle.writePositionalAll(s.io, text, 0) catch return;
+        file.handle.setLength(s.io, text.len) catch return;
+    }
+
+    /// Empties the PID record on a clean close, so a free lock file reads as
+    /// empty. Best effort, like `writeLockPid`.
+    pub fn clearLockPid(s: Storage, file: File) void {
+        file.handle.setLength(s.io, 0) catch return;
+    }
+
+    /// The PID the lock file's writer recorded, or null when none is readable.
+    pub fn readLockPid(s: Storage, file: File) ?i64 {
+        var buf: [lock_pid_max_bytes]u8 = undefined;
+        var done: usize = 0;
+        while (done < buf.len) {
+            const n = file.handle.readPositional(s.io, &.{buf[done..]}, done) catch return null;
+            if (n == 0) break;
+            done += n;
+        }
+        return parseLockPid(buf[0..done]);
+    }
+
     /// Renames within the root. A file rename replaces an existing file; a
     /// folder rename never replaces a non-empty folder (AlreadyExists).
     pub fn rename(s: Storage, old_dir: Dir, old_name: []const u8, new_dir: Dir, new_name: []const u8) Error!void {
@@ -369,6 +399,21 @@ pub const Storage = struct {
         if (hooks) if (s.fault) |f| if (f.dead) return error.Io;
     }
 };
+
+/// Bytes read from a lock file to find its writer's PID. A signed 64-bit
+/// number has at most 19 digits, so this leaves room for the newline.
+const lock_pid_max_bytes: usize = 32;
+
+/// The PID a lock file's writer recorded: digits only, with surrounding
+/// whitespace allowed, naming a positive process. Anything else is null.
+pub fn parseLockPid(bytes: []const u8) ?i64 {
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    for (trimmed) |byte| if (!std.ascii.isDigit(byte)) return null;
+    const pid = std.fmt.parseInt(i64, trimmed, 10) catch return null;
+    if (pid <= 0) return null;
+    return pid;
+}
 
 pub const Listing = struct {
     io: Io,
@@ -596,4 +641,66 @@ test "listing names every entry" {
     };
     try testing.expectEqual(@as(usize, 1), files);
     try testing.expectEqual(@as(usize, 1), dirs);
+}
+
+test "parseLockPid reads a positive PID and refuses every other shape" {
+    try testing.expectEqual(@as(?i64, 12345), parseLockPid("12345\n"));
+    try testing.expectEqual(@as(?i64, 42), parseLockPid("42"));
+    try testing.expectEqual(@as(?i64, 7), parseLockPid(" \t7\r\n"));
+    try testing.expectEqual(@as(?i64, null), parseLockPid(""));
+    try testing.expectEqual(@as(?i64, null), parseLockPid(" \r\n"));
+    try testing.expectEqual(@as(?i64, null), parseLockPid("0\n"));
+    try testing.expectEqual(@as(?i64, null), parseLockPid("-1\n"));
+    try testing.expectEqual(@as(?i64, null), parseLockPid("+12\n"));
+    try testing.expectEqual(@as(?i64, null), parseLockPid("12abc\n"));
+    try testing.expectEqual(@as(?i64, null), parseLockPid("1_2\n"));
+    try testing.expectEqual(@as(?i64, null), parseLockPid("99999999999999999999999\n"));
+}
+
+test "a lock file records its writer's PID, a shorter one replaces it, and a clear empties it" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const s: Storage = .{ .io = testing.io };
+    const root = testRoot(&tmp);
+    const lock = try s.createFile(root, "lock");
+    defer s.closeFile(lock);
+    try testing.expect(try s.tryLock(lock));
+    try testing.expectEqual(@as(?i64, null), s.readLockPid(lock));
+
+    s.writeLockPid(lock, 1234567);
+    try testing.expectEqual(@as(?i64, 1234567), s.readLockPid(lock));
+    s.writeLockPid(lock, 42);
+    try testing.expectEqual(@as(u64, 3), try s.length(lock));
+    try testing.expectEqual(@as(?i64, 42), s.readLockPid(lock));
+
+    s.writeLockPid(lock, 0);
+    try testing.expectEqual(@as(?i64, 42), s.readLockPid(lock));
+    s.clearLockPid(lock);
+    try testing.expectEqual(@as(u64, 0), try s.length(lock));
+    try testing.expectEqual(@as(?i64, null), s.readLockPid(lock));
+    s.unlock(lock);
+}
+
+test "a lock file with bytes that are not a PID reads as no PID" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const s: Storage = .{ .io = testing.io };
+    const root = testRoot(&tmp);
+    const lock = try s.createFile(root, "lock");
+    defer s.closeFile(lock);
+    try s.writeAt(lock, "not-a-pid\n", 0);
+    try s.sync(lock);
+    try testing.expectEqual(@as(?i64, null), s.readLockPid(lock));
+}
+
+test "lock pid parsing never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzLockPid, .{ .corpus = &(.{""} ++ @import("build_options").fuzz_corpus_session_lock_pid.*) });
+}
+
+fn fuzzLockPid(_: void, smith: *testing.Smith) anyerror!void {
+    var buffer: [64]u8 = undefined;
+    const len = smith.slice(&buffer);
+    if (parseLockPid(buffer[0..len])) |pid| {
+        try testing.expect(pid > 0);
+    }
 }

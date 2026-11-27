@@ -32,6 +32,7 @@ const shell_runtime = @import("shell_runtime.zig");
 const shimmer_runtime = @import("transcript/shimmer_runtime.zig");
 const transcript_painter = @import("transcript/painter.zig");
 const transcript_runtime = @import("transcript/runtime.zig");
+const resume_projection = @import("transcript/resume_projection.zig");
 const full_transcript_screen = @import("full_transcript_screen.zig");
 const vt_emulator = @import("../core/terminal/engine.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
@@ -2499,6 +2500,815 @@ test "streamed paragraphs keep words together through shrink and grow" {
     _ = try findRowContaining(&h, "alpha beta gamma delta epsilon");
 }
 
+fn applyProvisionalTail(h: *Harness, processor: *const assistant_presentation.MarkdownProcessor) !void {
+    var events: std.ArrayList(assistant_presentation.Event) = .empty;
+    defer events.deinit(h.alloc);
+    _ = try processor.renderProvisional(h.alloc, &events);
+    const id = h.shell.stageAssistantTail(h.alloc, try events.toOwnedSlice(h.alloc));
+    h.shell.applyStagedAssistantTail(h.alloc, id);
+}
+
+fn countRowsContaining(h: *Harness, needle: []const u8) !usize {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(h.alloc);
+    var count: usize = 0;
+    var row: u16 = 1;
+    while (row <= h.vt.rows) : (row += 1) {
+        buf.clearRetainingCapacity();
+        try h.vt.rowText(row, &buf);
+        if (std.mem.find(u8, buf.items, needle) != null) count += 1;
+    }
+    return count;
+}
+
+test "a provisional tail draws its open bold run formatted before the line ends" {
+    var h = try Harness.init(std.testing.allocator, 40, 24, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(h.alloc);
+    try processor.push(h.alloc, "Streaming **bold", &committed);
+    try std.testing.expectEqual(@as(usize, 0), committed.items.len);
+
+    try applyProvisionalTail(&h, &processor);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const row = try findRowContaining(&h, "Streaming bold");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(h.alloc);
+    try h.vt.rowText(row, &buf);
+    try std.testing.expect(std.mem.find(u8, buf.items, "**") == null);
+    const bold_index = std.mem.find(u8, buf.items, "bold") orelse return error.TestMissingBoldWord;
+    const bold_cell = h.vt.cellAt(row, @intCast(bold_index + 1)) orelse return error.TestMissingCell;
+    try std.testing.expect(bold_cell.codepoint == 'b' and bold_cell.style.flags.bold);
+    const plain_index = std.mem.find(u8, buf.items, "Streaming") orelse return error.TestMissingPlainWord;
+    const plain_cell = h.vt.cellAt(row, @intCast(plain_index + 1)) orelse return error.TestMissingCell;
+    try std.testing.expect(plain_cell.codepoint == 'S' and !plain_cell.style.flags.bold);
+}
+
+test "a cancelled tail freezes into the same bold row it showed" {
+    var h = try Harness.init(std.testing.allocator, 40, 24, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(h.alloc);
+    try processor.push(h.alloc, "Streaming **bold", &committed);
+
+    try applyProvisionalTail(&h, &processor);
+    try h.renderTranscriptFrame();
+    try h.flush();
+    const shown_row = try findRowContaining(&h, "Streaming bold");
+    var shown: std.ArrayList(u8) = .empty;
+    defer shown.deinit(h.alloc);
+    try h.vt.rowText(shown_row, &shown);
+
+    try h.shell.freezeAssistantTail(h.alloc, "cancel");
+    try std.testing.expectEqual(@as(usize, 0), h.shell.assistant_tail.items.len);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const frozen_row = try findRowContaining(&h, "Streaming bold");
+    try std.testing.expectEqual(shown_row, frozen_row);
+    var frozen: std.ArrayList(u8) = .empty;
+    defer frozen.deinit(h.alloc);
+    try h.vt.rowText(frozen_row, &frozen);
+    try std.testing.expectEqualStrings(shown.items, frozen.items);
+    const bold_index = std.mem.find(u8, frozen.items, "bold") orelse return error.TestMissingBoldWord;
+    const bold_cell = h.vt.cellAt(frozen_row, @intCast(bold_index + 1)) orelse return error.TestMissingCell;
+    try std.testing.expect(bold_cell.codepoint == 'b' and bold_cell.style.flags.bold);
+}
+
+test "an open line with control bytes draws the row its committed line draws" {
+    const line = "Streaming \x1b[31mred\x1b[0m \x1b]0;title\x07 done";
+    var open = try Harness.init(std.testing.allocator, 80, 24, 4);
+    defer open.deinit();
+    try open.shell.initViewport(&open.metrics, 1);
+    var open_processor = assistant_presentation.MarkdownProcessor{};
+    defer open_processor.deinit(open.alloc);
+    var open_committed: std.ArrayList(u8) = .empty;
+    defer open_committed.deinit(open.alloc);
+    try open_processor.push(open.alloc, line, &open_committed);
+    try applyProvisionalTail(&open, &open_processor);
+    try open.renderTranscriptFrame();
+    try open.flush();
+    const open_row = try findRowContaining(&open, "Streaming");
+    var open_text: std.ArrayList(u8) = .empty;
+    defer open_text.deinit(open.alloc);
+    try open.vt.rowText(open_row, &open_text);
+
+    var done = try Harness.init(std.testing.allocator, 80, 24, 4);
+    defer done.deinit();
+    try done.shell.initViewport(&done.metrics, 1);
+    var done_processor = assistant_presentation.MarkdownProcessor{};
+    defer done_processor.deinit(done.alloc);
+    var done_committed: std.ArrayList(u8) = .empty;
+    defer done_committed.deinit(done.alloc);
+    try done_processor.push(done.alloc, line ++ "\n", &done_committed);
+    _ = try done.shell.streamAssistantChunk(done.alloc, &done.metrics, done_committed.items);
+    try done.renderTranscriptFrame();
+    try done.flush();
+    const done_row = try findRowContaining(&done, "Streaming");
+    var done_text: std.ArrayList(u8) = .empty;
+    defer done_text.deinit(done.alloc);
+    try done.vt.rowText(done_row, &done_text);
+
+    try std.testing.expectEqualStrings(std.mem.trimEnd(u8, done_text.items, " "), std.mem.trimEnd(u8, open_text.items, " "));
+    try std.testing.expect(std.mem.find(u8, open_text.items, "\x1b") == null);
+    const red_index = std.mem.find(u8, open_text.items, "red") orelse return error.TestMissingRedWord;
+    const red_cell = open.vt.cellAt(open_row, @intCast(red_index)) orelse return error.TestMissingCell;
+    try std.testing.expect(!red_cell.style.flags.bold);
+}
+
+test "an open line of block markers draws no rule row" {
+    var h = try Harness.init(std.testing.allocator, 40, 24, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(h.alloc);
+    try processor.push(h.alloc, "w1\n", &committed);
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, committed.items);
+    committed.clearRetainingCapacity();
+    try h.renderTranscriptFrame();
+    try h.flush();
+    const rules_before = try countRowsContaining(&h, "─");
+
+    try processor.push(h.alloc, "** **", &committed);
+    try applyProvisionalTail(&h, &processor);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    try std.testing.expectEqual(rules_before, try countRowsContaining(&h, "─"));
+    try std.testing.expectEqual(@as(usize, 0), try countRowsContaining(&h, "** **"));
+    _ = try findRowContaining(&h, "w1");
+}
+
+test "a long open tail never enters native history and its line commits once" {
+    const alloc = std.testing.allocator;
+    const early = "EARLY_01\nEARLY_02\nEARLY_03\nEARLY_04\nEARLY_05\nEARLY_06\nEARLY_07\nEARLY_08\n" ++
+        "EARLY_09\nEARLY_10\nEARLY_11\nEARLY_12\nEARLY_13\nEARLY_14\nEARLY_15\nEARLY_16\nEARLY_17\nEARLY_18\n" ++
+        "EARLY_19\nEARLY_20\n";
+    const words = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike " ++
+        "november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu ";
+    const line = words ++ words ++ "TAIL_END";
+    const early_rows: u32 = 20;
+
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    _ = try h.shell.appendRawTranscriptEntry(alloc, early);
+    try h.renderTranscriptFrame();
+    try h.flush();
+    const history_before = h.shell.transcriptCommitDiagnostic().history_visual_offset;
+    try std.testing.expect(history_before > 0);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(alloc);
+    try processor.push(alloc, line, &committed);
+    try applyProvisionalTail(&h, &processor);
+    try h.renderTranscriptFrame();
+    try h.flush();
+    _ = try findRowContaining(&h, "TAIL_END");
+    try std.testing.expectEqual(early_rows, h.shell.transcriptCommitDiagnostic().history_visual_offset);
+
+    try processor.push(alloc, "\n", &committed);
+    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, committed.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    var reference = try Harness.init(alloc, 40, 12, 4);
+    defer reference.deinit();
+    try reference.shell.initViewport(&reference.metrics, 1);
+    _ = try reference.shell.appendRawTranscriptEntry(alloc, early);
+    try reference.renderTranscriptFrame();
+    try reference.flush();
+    var reference_processor = assistant_presentation.MarkdownProcessor{};
+    defer reference_processor.deinit(alloc);
+    var reference_committed: std.ArrayList(u8) = .empty;
+    defer reference_committed.deinit(alloc);
+    try reference_processor.push(alloc, line ++ "\n", &reference_committed);
+    _ = try reference.shell.streamAssistantChunk(alloc, &reference.metrics, reference_committed.items);
+    try reference.renderTranscriptFrame();
+    try reference.flush();
+
+    try std.testing.expectEqual(
+        reference.shell.transcriptCommitDiagnostic().history_visual_offset,
+        h.shell.transcriptCommitDiagnostic().history_visual_offset,
+    );
+    var row: u16 = 1;
+    while (row <= h.vt.rows) : (row += 1) {
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(alloc);
+        var want: std.ArrayList(u8) = .empty;
+        defer want.deinit(alloc);
+        try h.vt.rowText(row, &got);
+        try reference.vt.rowText(row, &want);
+        try std.testing.expectEqualStrings(want.items, got.items);
+    }
+}
+
+test "a provisional tail continues the committed text of its turn without a second block" {
+    var h = try Harness.init(std.testing.allocator, 40, 24, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(h.alloc);
+    try processor.push(h.alloc, "Committed line\nsecond line\n", &committed);
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, committed.items);
+    committed.clearRetainingCapacity();
+    try processor.push(h.alloc, "third words", &committed);
+
+    try applyProvisionalTail(&h, &processor);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    try std.testing.expectEqual(@as(usize, 1), try countRowsContaining(&h, "Committed line"));
+    try std.testing.expectEqual(@as(usize, 1), try countRowsContaining(&h, "second line"));
+    try std.testing.expectEqual(@as(usize, 1), try countRowsContaining(&h, "third words"));
+    const second_row = try findRowContaining(&h, "second line");
+    try expectRowTrimmedEquals(&h, second_row + 1, "  third words");
+}
+
+test "a provisional tail keeps the blank rows its committed text ends with" {
+    const cases = [_]struct { gap: []const u8, blank_rows: u16 }{
+        .{ .gap = "\n", .blank_rows = 0 },
+        .{ .gap = "\n\n", .blank_rows = 1 },
+        .{ .gap = "\n\n\n", .blank_rows = 2 },
+    };
+    for (cases) |case| {
+        var h = try Harness.init(std.testing.allocator, 40, 24, 4);
+        defer h.deinit();
+        try h.shell.initViewport(&h.metrics, 1);
+
+        var processor = assistant_presentation.MarkdownProcessor{};
+        defer processor.deinit(h.alloc);
+        var committed: std.ArrayList(u8) = .empty;
+        defer committed.deinit(h.alloc);
+        try processor.push(h.alloc, "First paragraph", &committed);
+        try processor.push(h.alloc, case.gap, &committed);
+        try processor.push(h.alloc, "Second", &committed);
+        _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, committed.items);
+        committed.clearRetainingCapacity();
+
+        try applyProvisionalTail(&h, &processor);
+        try h.renderTranscriptFrame();
+        try h.flush();
+        const first_row = try findRowContaining(&h, "First paragraph");
+        const open_row = try findRowContaining(&h, "Second");
+        try std.testing.expectEqual(first_row + 1 + case.blank_rows, open_row);
+
+        try processor.push(h.alloc, " paragraph\n", &committed);
+        _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, committed.items);
+        try h.renderTranscriptFrame();
+        try h.flush();
+        try std.testing.expectEqual(open_row, try findRowContaining(&h, "Second paragraph"));
+    }
+}
+
+test "a provisional tail after a user prompt keeps the footer gap of its committed text" {
+    var h = try Harness.init(std.testing.allocator, 96, 10, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(h.alloc);
+    var approval: approval_prompt.ApprovalPrompt = .{};
+    defer approval.deinit(h.alloc);
+
+    try h.shell.initViewport(&h.metrics, 1);
+    const prompt = try h.alloc.dupe(u8, "Explain it");
+    _ = try h.shell.appendUserTurnOwned(h.alloc, .{ .text = prompt, .images = &.{} });
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(h.alloc);
+    try processor.push(h.alloc, "Tail answer", &committed);
+    try applyProvisionalTail(&h, &processor);
+
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    const tail_row = try findRowContaining(&h, "Tail answer");
+    const footer_row = try findFirstDividerRowAfter(&h, tail_row);
+    try expectExactlyOneBlankRowBetween(&h, tail_row, footer_row);
+}
+
+const DocumentStream = struct {
+    h: *Harness,
+    processor: assistant_presentation.MarkdownProcessor = .{},
+    formatted: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *DocumentStream) void {
+        self.processor.deinit(self.h.alloc);
+        self.formatted.deinit(self.h.alloc);
+    }
+
+    fn push(self: *DocumentStream, chunk: []const u8) !void {
+        var table = assistant_presentation.TableCompletion{ .ctx = self, .deliver = deliverTable };
+        var code = assistant_presentation.CodeBlockCompletion{ .ctx = self, .deliver = deliverCode };
+        const completions = assistant_presentation.MarkdownCompletions{ .table = &table, .code = &code };
+        try self.processor.pushWithCompletions(self.h.alloc, chunk, &self.formatted, completions);
+        try self.show();
+    }
+
+    fn finish(self: *DocumentStream) !void {
+        var table = assistant_presentation.TableCompletion{ .ctx = self, .deliver = deliverTable };
+        var code = assistant_presentation.CodeBlockCompletion{ .ctx = self, .deliver = deliverCode };
+        const completions = assistant_presentation.MarkdownCompletions{ .table = &table, .code = &code };
+        try self.processor.flushWithCompletions(self.h.alloc, &self.formatted, completions);
+        try self.show();
+    }
+
+    fn show(self: *DocumentStream) !void {
+        try self.commitText(&self.formatted);
+        try applyProvisionalTail(self.h, &self.processor);
+        try self.h.renderTranscriptFrame();
+        try self.h.flush();
+    }
+
+    fn commitText(self: *DocumentStream, out: *std.ArrayList(u8)) !void {
+        if (out.items.len == 0) return;
+        _ = try self.h.shell.streamAssistantChunk(self.h.alloc, &self.h.metrics, out.items);
+        out.clearRetainingCapacity();
+    }
+
+    fn deliverTable(ctx: *anyopaque, table: assistant_presentation.TablePayload, out: *std.ArrayList(u8)) !void {
+        const self: *DocumentStream = @ptrCast(@alignCast(ctx));
+        try self.commitText(out);
+        _ = try self.h.shell.appendAssistantTableOwned(self.h.alloc, table);
+    }
+
+    fn deliverCode(ctx: *anyopaque, block: assistant_presentation.CodeBlockPayload, out: *std.ArrayList(u8)) !void {
+        const self: *DocumentStream = @ptrCast(@alignCast(ctx));
+        try self.commitText(out);
+        _ = try self.h.shell.appendAssistantCodeBlockOwned(self.h.alloc, block);
+    }
+};
+
+fn historyOffset(h: *Harness) u32 {
+    return h.shell.transcriptCommitDiagnostic().history_visual_offset;
+}
+
+fn appendScreenText(h: *Harness, out: *std.ArrayList(u8)) !void {
+    var row: u16 = 1;
+    while (row <= h.vt.rows) : (row += 1) {
+        try h.vt.rowTextTrimmed(row, out);
+        try out.append(h.alloc, '\n');
+    }
+}
+
+fn appendRows(h: *Harness, first: u16, count: u16, out: *std.ArrayList(u8)) !void {
+    var row = first;
+    while (row < first + count) : (row += 1) {
+        try h.vt.rowTextTrimmed(row, out);
+        try out.append(h.alloc, '\n');
+    }
+}
+
+fn appendStyledRows(h: *Harness, first: u16, count: u16, out: *std.ArrayList(u8)) !void {
+    var row = first;
+    while (row < first + count) : (row += 1) {
+        var line: std.Io.Writer.Allocating = .init(h.alloc);
+        defer line.deinit();
+        try h.vt.rowStyledTextTrimmed(row, &line.writer);
+        try out.appendSlice(h.alloc, line.written());
+        try out.append(h.alloc, '\n');
+    }
+}
+
+fn nonBlankRunLength(h: *Harness, first: u16) !u16 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(h.alloc);
+    var count: u16 = 0;
+    var row = first;
+    while (row <= h.vt.rows) : (row += 1) {
+        buf.clearRetainingCapacity();
+        try h.vt.rowTextTrimmed(row, &buf);
+        if (buf.items.len == 0) break;
+        count += 1;
+    }
+    return count;
+}
+
+test "an open table draws its rows as the committed table does" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 80, 30, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var open = DocumentStream{ .h = &h };
+    defer open.deinit();
+    try open.push("| name | value |\n| --- | --- |\n| a | 1 |\n| b | 2 |\n| c | 3");
+
+    const first = try findRowContaining(&h, "name");
+    const count = try nonBlankRunLength(&h, first);
+    try std.testing.expect(count >= 4);
+    var open_text: std.ArrayList(u8) = .empty;
+    defer open_text.deinit(alloc);
+    try appendRows(&h, first, count, &open_text);
+    try std.testing.expect(std.mem.find(u8, open_text.items, "| --- |") == null);
+    try std.testing.expect(std.mem.find(u8, open_text.items, "| a |") == null);
+    var open_styled: std.ArrayList(u8) = .empty;
+    defer open_styled.deinit(alloc);
+    try appendStyledRows(&h, first, count, &open_styled);
+
+    try open.push("\n\nDone.\n");
+    try std.testing.expectEqual(first, try findRowContaining(&h, "name"));
+    var committed_text: std.ArrayList(u8) = .empty;
+    defer committed_text.deinit(alloc);
+    try appendRows(&h, first, count, &committed_text);
+    try std.testing.expectEqualStrings(committed_text.items, open_text.items);
+    var committed_styled: std.ArrayList(u8) = .empty;
+    defer committed_styled.deinit(alloc);
+    try appendStyledRows(&h, first, count, &committed_styled);
+    try std.testing.expectEqualStrings(committed_styled.items, open_styled.items);
+}
+
+test "a table header with no delimiter yet draws as a header, never as raw pipes" {
+    var h = try Harness.init(std.testing.allocator, 80, 30, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var open = DocumentStream{ .h = &h };
+    defer open.deinit();
+    try open.push("| name | value |");
+
+    const row = try findRowContaining(&h, "name");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(h.alloc);
+    try h.vt.rowTextTrimmed(row, &buf);
+    try std.testing.expect(std.mem.find(u8, buf.items, "|") == null);
+    try std.testing.expect(std.mem.find(u8, buf.items, "value") != null);
+}
+
+test "an open code fence draws its lines as the committed block does" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 80, 30, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var open = DocumentStream{ .h = &h };
+    defer open.deinit();
+    try open.push("```zig\nconst a = 1;\nconst b = 2;\nconst c = 3");
+
+    const open_top = (try findRowContaining(&h, "const a")) - 1;
+    const open_bottom = try findRowContaining(&h, "const c");
+    var open_text: std.ArrayList(u8) = .empty;
+    defer open_text.deinit(alloc);
+    try appendRows(&h, open_top, open_bottom - open_top + 1, &open_text);
+    try std.testing.expect(std.mem.find(u8, open_text.items, "const c = 3") != null);
+    try std.testing.expect(std.mem.find(u8, open_text.items, "```") == null);
+    var open_styled: std.ArrayList(u8) = .empty;
+    defer open_styled.deinit(alloc);
+    try appendStyledRows(&h, open_top, open_bottom - open_top + 1, &open_styled);
+    try std.testing.expect(std.mem.find(u8, open_styled.items, "\x1b[") != null);
+
+    try open.push("\n```\n\nDone.\n");
+    const committed_top = (try findRowContaining(&h, "const a")) - 1;
+    try std.testing.expectEqual(open_top, committed_top);
+    const committed_bottom = try findRowContaining(&h, "const c");
+    var committed_text: std.ArrayList(u8) = .empty;
+    defer committed_text.deinit(alloc);
+    try appendRows(&h, committed_top, committed_bottom - committed_top + 1, &committed_text);
+    try std.testing.expectEqualStrings(committed_text.items, open_text.items);
+    var committed_styled: std.ArrayList(u8) = .empty;
+    defer committed_styled.deinit(alloc);
+    try appendStyledRows(&h, committed_top, committed_bottom - committed_top + 1, &committed_styled);
+    try std.testing.expectEqualStrings(committed_styled.items, open_styled.items);
+}
+
+const tall_table_header = "| n | v |\n| --- | --- |\n";
+const tall_table_rows = blk: {
+    @setEvalBranchQuota(2000000);
+    var rows: [60][]const u8 = undefined;
+    for (&rows, 0..) |*row, index| {
+        row.* = std.fmt.comptimePrint("| row {d} | {d} |\n", .{ index + 1, index + 1 });
+    }
+    break :blk rows;
+};
+const tall_table_text = blk: {
+    @setEvalBranchQuota(2000000);
+    var text: []const u8 = "";
+    for (tall_table_rows) |row| text = text ++ row;
+    break :blk text;
+};
+
+test "a tall open table shows its newest rows and enters no history until it commits" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 80, 24, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var open = DocumentStream{ .h = &h };
+    defer open.deinit();
+    try open.push("Intro\n");
+    try open.push(tall_table_header);
+    for (tall_table_rows) |row| try open.push(row);
+
+    try std.testing.expect(historyOffset(&h) <= 1);
+    const newest = try findRowContaining(&h, "row 60");
+    try std.testing.expect(newest + 2 >= h.shell.layout.content_bottom);
+    try std.testing.expect(newest <= h.shell.layout.content_bottom);
+
+    try open.push("\n\nDone.\n");
+
+    var reference = try Harness.init(alloc, 80, 24, 4);
+    defer reference.deinit();
+    try reference.shell.initViewport(&reference.metrics, 1);
+    var whole = DocumentStream{ .h = &reference };
+    defer whole.deinit();
+    try whole.push("Intro\n" ++ tall_table_header ++ tall_table_text ++ "\n\nDone.\n");
+    try whole.finish();
+
+    try std.testing.expectEqual(historyOffset(&reference), historyOffset(&h));
+    var live_text: std.ArrayList(u8) = .empty;
+    defer live_text.deinit(alloc);
+    var reference_text: std.ArrayList(u8) = .empty;
+    defer reference_text.deinit(alloc);
+    try appendScreenText(&h, &live_text);
+    try appendScreenText(&reference, &reference_text);
+    try std.testing.expectEqualStrings(reference_text.items, live_text.items);
+}
+
+const s4_chunks = blk: {
+    @setEvalBranchQuota(2000000);
+    var chunks: [105][]const u8 = undefined;
+    var n: usize = 0;
+    chunks[n] = "| name | value |\n";
+    n += 1;
+    chunks[n] = "| --- | --- |\n";
+    n += 1;
+    for (1..51) |i| {
+        chunks[n] = std.fmt.comptimePrint("| row {d} | {d} |\n", .{ i, i });
+        n += 1;
+    }
+    chunks[n] = "```zig\n";
+    n += 1;
+    for (1..51) |i| {
+        chunks[n] = std.fmt.comptimePrint("const v_{d} = {d};\n", .{ i, i });
+        n += 1;
+    }
+    chunks[n] = "```\n";
+    n += 1;
+    chunks[n] = "Done.\n";
+    n += 1;
+    break :blk chunks;
+};
+const s4_text = blk: {
+    @setEvalBranchQuota(2000000);
+    var text: []const u8 = "";
+    for (s4_chunks) |chunk| text = text ++ chunk;
+    break :blk text;
+};
+
+test "a streamed table and code block match their one-push commit with no extra blank rows" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 120, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var live = DocumentStream{ .h = &h };
+    defer live.deinit();
+    for (s4_chunks) |chunk| try live.push(chunk);
+    try live.finish();
+
+    var reference = try Harness.init(alloc, 120, 40, 4);
+    defer reference.deinit();
+    try reference.shell.initViewport(&reference.metrics, 1);
+    var whole = DocumentStream{ .h = &reference };
+    defer whole.deinit();
+    try whole.push(s4_text);
+    try whole.finish();
+
+    try std.testing.expect(historyOffset(&reference) > 0);
+    try std.testing.expect(historyOffset(&h) > 0);
+    try std.testing.expectEqual(historyOffset(&reference), historyOffset(&h));
+    var live_text: std.ArrayList(u8) = .empty;
+    defer live_text.deinit(alloc);
+    var reference_text: std.ArrayList(u8) = .empty;
+    defer reference_text.deinit(alloc);
+    try appendScreenText(&h, &live_text);
+    try appendScreenText(&reference, &reference_text);
+    try std.testing.expectEqualStrings(reference_text.items, live_text.items);
+}
+
+fn countPresentTableRows(
+    alloc: Allocator,
+    h: *Harness,
+    probe: *PhysicalHistoryProbe,
+    row_count: usize,
+) !usize {
+    const screen = try captureTrimmedGrid(h, alloc);
+    defer alloc.free(screen);
+    var present: usize = 0;
+    for (1..row_count + 1) |i| {
+        var marker_buf: [16]u8 = undefined;
+        const marker = try std.mem.print(&marker_buf, "row {d:0>2}", .{i});
+        if (std.mem.find(u8, probe.history.items, marker) != null or
+            std.mem.find(u8, screen, marker) != null)
+        {
+            present += 1;
+        }
+    }
+    return present;
+}
+
+test "a 49-row open table never loses visible rows when it commits" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 120, 40, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(h.vt.cols, h.vt.rows);
+    defer probe.deinit();
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    try h.shell.initViewport(&h.metrics, 1);
+
+    const renderFrame = struct {
+        fn call(
+            harness: *Harness,
+            p: *PhysicalHistoryProbe,
+            inp: *const InputRuntime,
+            app: *const approval_prompt.ApprovalPrompt,
+            generating: bool,
+        ) !void {
+            var ctx = defaultFooterContext(inp);
+            ctx.transcript_depth = harness.shell.transcriptPresentationDepth();
+            if (generating) ctx.activity = .{ .turn_thinking = .{ .label = "Generating" } };
+            harness.frame_redraw = true;
+            try renderTestFooterWithContext(harness, app, &harness.frame_redraw, ctx);
+            try capturePhysicalFrame(harness, p);
+        }
+    }.call;
+
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try capturePhysicalFrame(&h, &probe);
+
+    for (1..42) |i| {
+        var buf: [32]u8 = undefined;
+        _ = try h.shell.appendRawTranscriptEntry(alloc, try std.mem.print(&buf, "intro {d:0>2}\n", .{i}));
+        if (i % 4 == 0 or i == 41) try renderFrame(&h, &probe, &input, &approval, false);
+    }
+    try renderFrame(&h, &probe, &input, &approval, false);
+    try std.testing.expect(historyOffset(&h) > 0);
+    try std.testing.expect(probe.history.items.len > 0);
+
+    var stream = DocumentStream{ .h = &h };
+    defer stream.deinit();
+    var table_cb = assistant_presentation.TableCompletion{ .ctx = &stream, .deliver = DocumentStream.deliverTable };
+    var code_cb = assistant_presentation.CodeBlockCompletion{ .ctx = &stream, .deliver = DocumentStream.deliverCode };
+    const completions = assistant_presentation.MarkdownCompletions{ .table = &table_cb, .code = &code_cb };
+
+    try stream.processor.pushWithCompletions(alloc, "| name | value |\n| --- | --- |\n", &stream.formatted, completions);
+    try stream.commitText(&stream.formatted);
+    try applyProvisionalTail(&h, &stream.processor);
+    try renderFrame(&h, &probe, &input, &approval, true);
+
+    var max_seen: usize = 0;
+    var saw_table = false;
+    for (1..49) |i| {
+        var row_buf: [32]u8 = undefined;
+        const chunk = try std.mem.print(&row_buf, "| row {d:0>2} | {d} |\n", .{ i, i });
+        try stream.processor.pushWithCompletions(alloc, chunk, &stream.formatted, completions);
+        try stream.commitText(&stream.formatted);
+        try applyProvisionalTail(&h, &stream.processor);
+        try renderFrame(&h, &probe, &input, &approval, true);
+        const present = try countPresentTableRows(alloc, &h, &probe, 49);
+        if (present > 0) saw_table = true;
+        try std.testing.expect(!saw_table or present >= max_seen);
+        max_seen = @max(max_seen, present);
+    }
+    try std.testing.expect(saw_table);
+
+    try stream.processor.pushWithCompletions(alloc, "| row 49 | 49 |\n\nDone.\n", &stream.formatted, completions);
+    try stream.commitText(&stream.formatted);
+    try applyProvisionalTail(&h, &stream.processor);
+    try renderFrame(&h, &probe, &input, &approval, true);
+    const at_commit = try countPresentTableRows(alloc, &h, &probe, 49);
+    try std.testing.expect(at_commit >= max_seen);
+    max_seen = @max(max_seen, at_commit);
+
+    try stream.processor.flushWithCompletions(alloc, &stream.formatted, completions);
+    try stream.commitText(&stream.formatted);
+    try applyProvisionalTail(&h, &stream.processor);
+    try renderFrame(&h, &probe, &input, &approval, false);
+    const after_finish = try countPresentTableRows(alloc, &h, &probe, 49);
+    try std.testing.expect(after_finish >= max_seen);
+    try std.testing.expectEqual(@as(usize, 49), after_finish);
+}
+
+test "a 49-row open table committing mid-growth into a code block never loses visible rows" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 120, 40, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(h.vt.cols, h.vt.rows);
+    defer probe.deinit();
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    try h.shell.initViewport(&h.metrics, 1);
+
+    const renderFrame = struct {
+        fn call(
+            harness: *Harness,
+            p: *PhysicalHistoryProbe,
+            inp: *const InputRuntime,
+            app: *const approval_prompt.ApprovalPrompt,
+            generating: bool,
+        ) !void {
+            var ctx = defaultFooterContext(inp);
+            ctx.transcript_depth = harness.shell.transcriptPresentationDepth();
+            if (generating) ctx.activity = .{ .turn_thinking = .{ .label = "Generating" } };
+            harness.frame_redraw = true;
+            try renderTestFooterWithContext(harness, app, &harness.frame_redraw, ctx);
+            try capturePhysicalFrame(harness, p);
+        }
+    }.call;
+
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try capturePhysicalFrame(&h, &probe);
+
+    for (1..42) |i| {
+        var buf: [32]u8 = undefined;
+        _ = try h.shell.appendRawTranscriptEntry(alloc, try std.mem.print(&buf, "intro {d:0>2}\n", .{i}));
+        if (i % 4 == 0 or i == 41) try renderFrame(&h, &probe, &input, &approval, false);
+    }
+    try renderFrame(&h, &probe, &input, &approval, false);
+
+    var stream = DocumentStream{ .h = &h };
+    defer stream.deinit();
+    var table_cb = assistant_presentation.TableCompletion{ .ctx = &stream, .deliver = DocumentStream.deliverTable };
+    var code_cb = assistant_presentation.CodeBlockCompletion{ .ctx = &stream, .deliver = DocumentStream.deliverCode };
+    const completions = assistant_presentation.MarkdownCompletions{ .table = &table_cb, .code = &code_cb };
+
+    try stream.processor.pushWithCompletions(alloc, "| name | value |\n| --- | --- |\n", &stream.formatted, completions);
+    try stream.commitText(&stream.formatted);
+    try applyProvisionalTail(&h, &stream.processor);
+    try renderFrame(&h, &probe, &input, &approval, true);
+
+    var max_seen: usize = 0;
+    var saw_table = false;
+    for (1..21) |i| {
+        var row_buf: [32]u8 = undefined;
+        const chunk = try std.mem.print(&row_buf, "| row {d:0>2} | {d} |\n", .{ i, i });
+        try stream.processor.pushWithCompletions(alloc, chunk, &stream.formatted, completions);
+        try stream.commitText(&stream.formatted);
+        try applyProvisionalTail(&h, &stream.processor);
+        try renderFrame(&h, &probe, &input, &approval, true);
+        const present = try countPresentTableRows(alloc, &h, &probe, 49);
+        if (present > 0) saw_table = true;
+        try std.testing.expect(!saw_table or present >= max_seen);
+        max_seen = @max(max_seen, present);
+    }
+    try std.testing.expect(saw_table);
+
+    var rest: std.ArrayList(u8) = .empty;
+    defer rest.deinit(alloc);
+    for (21..50) |i| {
+        var row_buf: [32]u8 = undefined;
+        try rest.appendSlice(alloc, try std.mem.print(&row_buf, "| row {d:0>2} | {d} |\n", .{ i, i }));
+    }
+    try rest.appendSlice(alloc, "```zig\nconst v_1 = 1;\nconst v_2 = 2;\nconst v_3 = 3;\nconst v_4 = 4;\nconst v_5 = 5;\n");
+    try stream.processor.pushWithCompletions(alloc, rest.items, &stream.formatted, completions);
+    try stream.commitText(&stream.formatted);
+    try applyProvisionalTail(&h, &stream.processor);
+    try renderFrame(&h, &probe, &input, &approval, true);
+    const at_commit = try countPresentTableRows(alloc, &h, &probe, 49);
+    try std.testing.expect(at_commit >= max_seen);
+    max_seen = @max(max_seen, at_commit);
+
+    try stream.processor.pushWithCompletions(alloc, "```\n\nDone.\n", &stream.formatted, completions);
+    try stream.commitText(&stream.formatted);
+    try applyProvisionalTail(&h, &stream.processor);
+    try renderFrame(&h, &probe, &input, &approval, false);
+    try stream.processor.flushWithCompletions(alloc, &stream.formatted, completions);
+    try stream.commitText(&stream.formatted);
+    try applyProvisionalTail(&h, &stream.processor);
+    try renderFrame(&h, &probe, &input, &approval, false);
+    const after_finish = try countPresentTableRows(alloc, &h, &probe, 49);
+    try std.testing.expect(after_finish >= max_seen);
+    try std.testing.expectEqual(@as(usize, 49), after_finish);
+}
+
 test "entry-bound shimmer resolves to the painted status row without moving footer" {
     var h = try Harness.init(std.testing.allocator, 80, 22, 4);
     defer h.deinit();
@@ -4289,6 +5099,8 @@ test "hidden auto approval lifecycle reposition adds no compact scroll rows" {
         .arguments_json = "{\"command\":\"seq 1 1\"}",
         .place_after_current_transcript = true,
     } });
+    // Core names the call right after it starts; until then it has no row.
+    _ = try h.shell.applyToolLifecycle(h.alloc, .{ .progress = .{ .id = id, .text = "● Running seq 1 1" } });
     const status_entry_id = h.shell.toolActivityRecord(id).?.entry_id;
     var canonical_source = try h.shell.prepareTranscriptSource(h.alloc, null);
     defer canonical_source.deinit(h.alloc);
@@ -4296,7 +5108,7 @@ test "hidden auto approval lifecycle reposition adds no compact scroll rows" {
     try std.testing.expect(std.mem.find(
         u8,
         canonical_source.bytes,
-        "run_command",
+        "Running",
     ) != null);
 
     var projection = try h.shell.buildFullTranscriptProjection(h.alloc, null);
@@ -4313,7 +5125,7 @@ test "hidden auto approval lifecycle reposition adds no compact scroll rows" {
     defer h.alloc.free(full_source);
     const notice_index = std.mem.find(u8, full_source, "Auto agent approved") orelse
         return error.TestExpectedEqual;
-    const status_index = std.mem.find(u8, full_source, "run_command") orelse
+    const status_index = std.mem.find(u8, full_source, "Running") orelse
         return error.TestExpectedEqual;
     try std.testing.expect(notice_index < status_index);
 
@@ -4328,7 +5140,7 @@ test "hidden auto approval lifecycle reposition adds no compact scroll rows" {
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
     try expectGridNotContains(&h, "Auto agent approved");
-    try expectGridNotContains(&h, "run_command");
+    try expectGridNotContains(&h, "Running seq 1 1");
 }
 
 test "completed replay tool entries fit a constrained terminal" {
@@ -6778,6 +7590,8 @@ test "compact command completion keeps restored history footer stable" {
         .activity_kind = .command,
         .arguments_json = "{\"command\":\"sleep 5\"}",
     } });
+    // Core names the call right after it starts; until then it has no row.
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .progress = .{ .id = id, .text = "● Running sleep 5" } });
     try std.testing.expect(try approval.syncRequest(alloc, .{
         .label = "shell.run sleep 5",
         .command = "sleep 5",
@@ -6793,7 +7607,7 @@ test "compact command completion keeps restored history footer stable" {
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
 
-    const running_row = try findRowContaining(&h, "run_command");
+    const running_row = try findRowContaining(&h, "Running sleep 5");
     const running_thinking_row = try findRowContaining(&h, "Thinking");
     const running_footer_row = try findFirstDividerRowAfter(&h, running_thinking_row);
     try std.testing.expect(h.shell.transcriptCommitDiagnostic().visual_offset > 0);
@@ -9282,8 +10096,10 @@ test "full transcript shows terminal session launch commands in full across widt
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    // The main view still trails a row that does not fit.
-    try expectGridContains(&h, "Observed python3");
+    // The main view still trails a row that does not fit. The check came
+    // back while the command runs on, so its row still waits for it.
+    try expectGridContains(&h, "Waiting for python3");
+    try expectGridNotContains(&h, "Observed");
     try expectGridNotContains(&h, "LAUNCH_COMMAND_TAIL");
 
     // Ctrl+O shows the whole launch command at every width.
@@ -9304,8 +10120,191 @@ test "full transcript shows terminal session launch commands in full across widt
     // Leaving Ctrl+O restores the trailing main view.
     try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .inline_mode));
     try h.driveResize(100, 30, 4, true);
-    try expectGridContains(&h, "Observed python3");
+    try expectGridContains(&h, "Waiting for python3");
     try expectGridNotContains(&h, "LAUNCH_COMMAND_TAIL");
+}
+
+fn renderToolRows(h: *Harness, input: *InputRuntime, approval: *approval_prompt.ApprovalPrompt) !void {
+    h.frame_redraw = true;
+    try renderTestFooter(h, input, approval, &h.frame_redraw);
+    try h.flush();
+}
+
+test "a started call that core has not named yet shows no tool name on the grid" {
+    const alloc = std.testing.allocator;
+    const edit_args = "{\"path\":\"src/tool_host.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+    const first = types.ToolLifecycleId{ .turn_id = 1, .call_id = "edit-1" };
+    const second = types.ToolLifecycleId{ .turn_id = 1, .call_id = "edit-2" };
+    const check = types.ToolLifecycleId{ .turn_id = 1, .call_id = "check-1" };
+    for ([_]u16{ 40, 100 }) |cols| {
+        var h = try Harness.init(alloc, cols, 30, 4);
+        defer h.deinit();
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        var approval = approval_prompt.ApprovalPrompt{};
+        defer approval.deinit(alloc);
+        try h.shell.initViewport(&h.metrics, 1);
+
+        for ([_]types.ToolLifecycleId{ first, second }) |id| {
+            _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+                .id = id,
+                .reconciles_provisional_call_id = null,
+                .tool_name = "edit_file",
+                .activity_kind = .edit,
+                .arguments_json = edit_args,
+            } });
+        }
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .progress = .{ .id = first, .text = "● Editing src/tool_host.zig" } });
+        // A check of a session has started too. Core has named neither it
+        // nor the second edit, so each still reads as its tool's name.
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = check,
+            .reconciles_provisional_call_id = null,
+            .tool_name = "shell",
+            .activity_kind = .command,
+            .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}",
+        } });
+        try renderToolRows(&h, &input, &approval);
+        try expectGridContains(&h, "● Editing tool_host.zig");
+        try expectGridNotContains(&h, "edit_file");
+        try expectGridNotContains(&h, "● shell");
+        try expectGridNotContains(&h, "└ shell");
+
+        // Core names both calls.
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .progress = .{ .id = second, .text = "● Editing src/tool_host.zig" } });
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .progress = .{ .id = check, .text = "● Waiting for sleep 30" } });
+        try renderToolRows(&h, &input, &approval);
+        try expectGridContains(&h, "├ Editing tool_host.zig · 2 edits");
+        try expectGridContains(&h, "└ Waiting for sleep 30");
+        try expectGridNotContains(&h, "edit_file");
+    }
+}
+
+test "a check row keeps one verb on the grid while Ctrl+O keeps each check's own line" {
+    const alloc = std.testing.allocator;
+    const command = "sleep 30; printf done";
+    const run_args = "{\"action\":\"run\",\"command\":\"sleep 30; printf done\"}";
+    const check_args = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}";
+    for ([_]u16{ 40, 100 }) |cols| {
+        var h = try Harness.init(alloc, cols, 30, 4);
+        defer h.deinit();
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        var approval = approval_prompt.ApprovalPrompt{};
+        defer approval.deinit(alloc);
+        try h.shell.initViewport(&h.metrics, 1);
+
+        const calls = [_]struct { id: types.ToolLifecycleId, args: []const u8, label: []const u8, summary: []const u8, ended: bool = false }{
+            .{ .id = .{ .turn_id = 1, .call_id = "run" }, .args = run_args, .label = "Ran", .summary = "● Still running " ++ command },
+            .{ .id = .{ .turn_id = 1, .call_id = "check-1" }, .args = check_args, .label = "Observed", .summary = "● Observed " ++ command },
+            .{ .id = .{ .turn_id = 2, .call_id = "check-2" }, .args = check_args, .label = "Observed", .summary = "● Observed " ++ command, .ended = true },
+        };
+        for (calls, 0..) |call, index| {
+            // The second turn's check follows the first turn's summary.
+            if (index == 2) {
+                try renderToolRows(&h, &input, &approval);
+                // The check came back while the command runs on.
+                try expectGridContains(&h, "● Waiting for sleep, printf · 2 calls");
+                try expectGridNotContains(&h, "Observed");
+                _ = try h.shell.appendTurnSummaryEntry(h.alloc, .{ .turn_duration_ms = 1200 });
+                try renderToolRows(&h, &input, &approval);
+                try expectGridContains(&h, "● Waited for sleep, printf · 2 calls");
+            }
+            _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+                .id = call.id,
+                .reconciles_provisional_call_id = null,
+                .tool_name = "shell",
+                .activity_kind = .command,
+                .arguments_json = call.args,
+            } });
+            try h.shell.setToolCommandMetadata(alloc, call.id, command, call.label);
+            _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+                .id = call.id,
+                .outcome = .{ .kind = .completed, .summary = call.summary },
+                .check_found_command_ended = call.ended,
+            } });
+        }
+        // The next turn's check found the command ended.
+        try renderToolRows(&h, &input, &approval);
+        try expectGridContains(&h, "● Waited for sleep, printf · 2 calls");
+        try expectGridContains(&h, "● Ran sleep, printf ✓");
+        try expectGridNotContains(&h, "Observed");
+
+        // Ctrl+O keeps each call's own line.
+        try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .full));
+        try renderToolRows(&h, &input, &approval);
+        try expectGridContains(&h, "● Still running " ++ command);
+        try expectGridContains(&h, "● Observed " ++ command);
+        try expectGridNotContains(&h, "Waiting for");
+        try expectGridNotContains(&h, "Waited for");
+        try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .inline_mode));
+        try h.driveResize(cols, 30, 4, true);
+        try expectGridContains(&h, "● Waited for sleep, printf · 2 calls");
+        try expectGridContains(&h, "● Ran sleep, printf ✓");
+    }
+}
+
+test "a check of a command found ended keeps its row on Ran on the grid while it runs" {
+    const alloc = std.testing.allocator;
+    const command = "sleep 30; printf done";
+    const check_args = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}";
+    const run_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "run" };
+    const ended_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "check-ended" };
+    const recheck_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "check-again" };
+    for ([_]u16{ 40, 100 }) |cols| {
+        var h = try Harness.init(alloc, cols, 30, 4);
+        defer h.deinit();
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        var approval = approval_prompt.ApprovalPrompt{};
+        defer approval.deinit(alloc);
+        try h.shell.initViewport(&h.metrics, 1);
+
+        const calls = [_]struct { id: types.ToolLifecycleId, args: []const u8, label: []const u8, summary: []const u8, ended: bool = false }{
+            .{ .id = run_id, .args = "{\"action\":\"run\",\"command\":\"sleep 30; printf done\"}", .label = "Ran", .summary = "● Still running " ++ command },
+            .{ .id = ended_id, .args = check_args, .label = "Observed", .summary = "● Observed " ++ command, .ended = true },
+        };
+        for (calls) |call| {
+            _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+                .id = call.id,
+                .reconciles_provisional_call_id = null,
+                .tool_name = "shell",
+                .activity_kind = .command,
+                .arguments_json = call.args,
+            } });
+            try h.shell.setToolCommandMetadata(alloc, call.id, command, call.label);
+            _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+                .id = call.id,
+                .outcome = .{ .kind = .completed, .summary = call.summary },
+                .check_found_command_ended = call.ended,
+            } });
+        }
+        try renderToolRows(&h, &input, &approval);
+        try expectGridContains(&h, "● Ran sleep, printf · 2 calls ✓");
+
+        // The model checks the ended command again; the check runs a while.
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = recheck_id,
+            .reconciles_provisional_call_id = null,
+            .tool_name = "shell",
+            .activity_kind = .command,
+            .arguments_json = check_args,
+        } });
+        try h.shell.setToolCommandMetadata(alloc, recheck_id, command, "Observed");
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .progress = .{ .id = recheck_id, .text = "● Waiting for " ++ command } });
+        try renderToolRows(&h, &input, &approval);
+        try expectGridContains(&h, "● Ran sleep, printf · 3 calls ✓");
+        try expectGridNotContains(&h, "Waiting for");
+
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+            .id = recheck_id,
+            .outcome = .{ .kind = .completed, .summary = "● Observed " ++ command },
+            .check_found_command_ended = true,
+        } });
+        try renderToolRows(&h, &input, &approval);
+        try expectGridContains(&h, "● Ran sleep, printf · 3 calls ✓");
+        try expectGridNotContains(&h, "Waiting for");
+    }
 }
 
 test "transcript painting keeps the shadow terminal in step with the screen" {
@@ -9545,4 +10544,318 @@ test "attaching a transcript slot and resetting the terminal shows only that tra
     try expectGridContains(&h, "main second");
     try expectGridNotContains(&h, "child");
     try std.testing.expect(std.mem.find(u8, hidden.notebook.transcript.items, "child second") != null);
+}
+
+fn expectAllToolItemsVisible(
+    alloc: Allocator,
+    h: *Harness,
+    probe: *PhysicalHistoryProbe,
+    item_count: usize,
+) !void {
+    const screen = try captureTrimmedGrid(h, alloc);
+    defer alloc.free(screen);
+    for (1..item_count + 1) |i| {
+        var marker_buf: [24]u8 = undefined;
+        const marker = try std.mem.print(&marker_buf, "item-{d:0>2}.txt", .{i});
+        if (std.mem.find(u8, probe.history.items, marker) == null and
+            std.mem.find(u8, screen, marker) == null)
+        {
+            std.debug.print(
+                "missing {s}: history_offset={d} visual_offset={d}\n",
+                .{
+                    marker,
+                    h.shell.transcriptCommitDiagnostic().history_visual_offset,
+                    h.shell.transcriptCommitDiagnostic().visual_offset,
+                },
+            );
+            return error.MissingTranscriptRow;
+        }
+    }
+}
+
+fn setupPickerClosePastToolFloor(
+    alloc: Allocator,
+    h: *Harness,
+    probe: *PhysicalHistoryProbe,
+    input: *InputRuntime,
+    approval: *approval_prompt.ApprovalPrompt,
+    item_count: usize,
+) !void {
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(
+        alloc,
+        &h.metrics,
+        "intro 01\nintro 02\nintro 03\nintro 04\n",
+        true,
+    );
+    h.frame_redraw = true;
+    try renderTestFooter(h, input, approval, &h.frame_redraw);
+    try capturePhysicalFrame(h, probe);
+
+    try input.edit_state.input.appendSlice(alloc, "/");
+    input.edit_state.cursor = input.edit_state.input.items.len;
+    h.frame_redraw = true;
+    try renderTestFooter(h, input, approval, &h.frame_redraw);
+    try capturePhysicalFrame(h, probe);
+
+    _ = input.deletionState(null).delete(alloc, .character_left, .clear);
+    const group = types.ToolPresentationGroupId{ .turn_id = 99, .anchor_step_id = 1 };
+    for (1..item_count + 1) |i| {
+        var call_buf: [24]u8 = undefined;
+        var tool_buf: [24]u8 = undefined;
+        var summary_buf: [32]u8 = undefined;
+        const call_id = try std.mem.print(&call_buf, "read-hold-{d:0>2}", .{i});
+        const tool_name = try std.mem.print(&tool_buf, "tool_{d:0>2}", .{i});
+        const summary = try std.mem.print(&summary_buf, "Checked item-{d:0>2}.txt", .{i});
+        const id = types.ToolLifecycleId{ .turn_id = 99, .call_id = call_id };
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = id,
+            .presentation_group_id = if (i == 1) null else group,
+            .reconciles_provisional_call_id = null,
+            .tool_name = tool_name,
+            .activity_kind = .mcp,
+        } });
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+            .id = id,
+            .outcome = .{ .kind = .completed, .summary = summary },
+        } });
+    }
+    h.frame_redraw = true;
+    try renderTestFooter(h, input, approval, &h.frame_redraw);
+    try capturePhysicalFrame(h, probe);
+    try expectAllToolItemsVisible(alloc, h, probe, item_count);
+}
+
+test "a picker close past a tool finality floor keeps all rows visible during committed growth" {
+    const alloc = std.testing.allocator;
+    const item_count: usize = 30;
+    var h = try Harness.init(alloc, 100, 32, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(h.vt.cols, h.vt.rows);
+    defer probe.deinit();
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try setupPickerClosePastToolFloor(alloc, &h, &probe, &input, &approval, item_count);
+
+    _ = try h.shell.streamAssistantChunk(
+        alloc,
+        &h.metrics,
+        "COMMITTED_REPLY_01\nCOMMITTED_REPLY_02\nCOMMITTED_REPLY_03\n",
+    );
+    h.shell.notebook.transcript_release = h.shell.notebook.transcript_release.with_assistant_tail_writable(false);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try capturePhysicalFrame(&h, &probe);
+    try expectAllToolItemsVisible(alloc, &h, &probe, item_count);
+}
+
+test "a picker close past a tool finality floor keeps all rows visible during provisional tail growth" {
+    const alloc = std.testing.allocator;
+    const item_count: usize = 30;
+    var h = try Harness.init(alloc, 100, 32, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(h.vt.cols, h.vt.rows);
+    defer probe.deinit();
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try setupPickerClosePastToolFloor(alloc, &h, &probe, &input, &approval, item_count);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(alloc);
+    try processor.push(alloc, "PROVISIONAL_TAIL_LINE", &committed);
+    try applyProvisionalTail(&h, &processor);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try capturePhysicalFrame(&h, &probe);
+    try expectAllToolItemsVisible(alloc, &h, &probe, item_count);
+}
+
+fn expectGridExcludes(h: *Harness, needle: []const u8) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(h.alloc);
+    var r: u16 = 1;
+    while (r <= h.vt.rows) : (r += 1) {
+        buf.clearRetainingCapacity();
+        try h.vt.rowText(r, &buf);
+        try std.testing.expect(std.mem.find(u8, buf.items, needle) == null);
+    }
+}
+
+fn expectGridJoinedContains(h: *Harness, needle: []const u8) !void {
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(h.alloc);
+    var row_buf: std.ArrayList(u8) = .empty;
+    defer row_buf.deinit(h.alloc);
+    var r: u16 = 1;
+    while (r <= h.vt.rows) : (r += 1) {
+        row_buf.clearRetainingCapacity();
+        try h.vt.rowTextTrimmed(r, &row_buf);
+        if (row_buf.items.len > 0) {
+            if (joined.items.len > 0) try joined.append(h.alloc, ' ');
+            try joined.appendSlice(h.alloc, row_buf.items);
+        }
+    }
+    if (std.mem.find(u8, joined.items, needle) != null) return;
+    std.debug.print("joined grid did not contain '{s}':\n{s}\n", .{ needle, joined.items });
+    return error.TestExpectedGridText;
+}
+
+test "tall recovering resumed transcript holds pending restore until handoff, then renders notice and composer" {
+    const alloc = std.testing.allocator;
+    const app_session_runtime = @import("../core/app/app_session_runtime.zig");
+    const restore_test_controls = @import("../core/app/restore_test_controls.zig");
+    const session_adapter = @import("../core/session/session_adapter.zig");
+    const session_persistence = @import("../core/app/session_persistence.zig");
+
+    const VtRestoreApp = struct {
+        alloc: Allocator,
+        main_agent: struct {
+            session_persistence: session_persistence.Persistence = .{},
+            pending_images: std.ArrayList(types.ImageAttachment) = .empty,
+            next_image_id: usize = 1,
+        } = .{},
+        input_runtime: InputRuntime = .{},
+        shell: TranscriptRuntime,
+        metrics: Metrics = .{},
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
+
+        pub fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, flush_notice: bool) !void {
+            try self.shell.writeNotice(self.alloc, &self.metrics, notice, flush_notice);
+        }
+    };
+
+    for ([_]u16{ 40, 80, 120 }) |cols| {
+        var h = try Harness.init(alloc, cols, 24, 4);
+        defer h.deinit();
+        try h.shell.initViewport(&h.metrics, 1);
+
+        try h.tmp.dir.createDir(io_mod.getIo(), "home", .default_dir);
+        try h.tmp.dir.createDir(io_mod.getIo(), "ws", .default_dir);
+        const home = try io_mod.dirRealpathAlloc(alloc, h.tmp.dir, "home");
+        defer alloc.free(home);
+        const ws = try io_mod.dirRealpathAlloc(alloc, h.tmp.dir, "ws");
+        defer alloc.free(ws);
+
+        var store = try session_adapter.Store.open(alloc, home);
+        defer store.deinit(alloc);
+        const sid = blk: {
+            var model = "test-model".*;
+            const writer = try session_adapter.Session.create(alloc, &store, ws, .app, .{
+                .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+                .language = types.ConversationLanguage.default(),
+                .permission_state = .{},
+            });
+            defer writer.close();
+            try writer.commitTurn(.{ .assistant = .{
+                .user = .{ .text = @constCast("turn one") },
+                .assistant = @constCast("done"),
+            } }, types.ConversationLanguage.default());
+            _ = try writer.recordInputAccepted("P2");
+            _ = try writer.recordInputAccepted("P3");
+            break :blk try alloc.dupe(u8, writer.id());
+        };
+        defer alloc.free(sid);
+
+        var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &h.shell, 0, 1);
+        errdefer projection.deinit();
+        for (0..80) |i| {
+            var buf: [64]u8 = undefined;
+            const line = try std.mem.print(&buf, "resumed history line {d}\n", .{i});
+            _ = try projection.appendRawClassified(line, .unknown_raw);
+        }
+        try projection.finalize();
+        projection.install(&h.shell);
+        try std.testing.expect(h.shell.notebook.pending_resume_source != null);
+
+        const reopened = try session_adapter.Session.resumeSession(alloc, &store, .{ .id = sid }, ws, .app);
+        var vt_app = VtRestoreApp{
+            .alloc = alloc,
+            .shell = h.shell,
+        };
+        h.shell = .{ .layout = h.shell.layout };
+        defer {
+            vt_app.input_runtime.deinit(alloc);
+            for (vt_app.agent().pending_images.items) |img| types.freeImageAttachment(alloc, img);
+            vt_app.agent().pending_images.deinit(alloc);
+            vt_app.agent().session_persistence.pending_input_restore.deinit();
+            if (vt_app.agent().session_persistence.v2) |v2| v2.close();
+            h.shell = vt_app.shell;
+        }
+        vt_app.agent().session_persistence.v2 = reopened;
+        try vt_app.agent().session_persistence.pending_input_restore.queue(
+            reopened.id(),
+            reopened.pendingInputsReader(),
+        );
+
+        var approval = approval_prompt.ApprovalPrompt{};
+        defer approval.deinit(alloc);
+
+        // Paint frame 1 so the transcript enters `.recovering` and `.first_frame` clears.
+        std.mem.swap(TranscriptRuntime, &h.shell, &vt_app.shell);
+        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, defaultFooterContext(&vt_app.input_runtime));
+        std.mem.swap(TranscriptRuntime, &h.shell, &vt_app.shell);
+        try h.flush();
+        try std.testing.expectEqual(
+            transcript_runtime.TranscriptCommitDiagnosticState.recovering,
+            vt_app.shell.transcriptCommitDiagnostic().state,
+        );
+
+        // Start and await the background scan while still recovering.
+        try vt_app.agent().session_persistence.pending_input_restore.startQueued();
+        restore_test_controls.awaitRunning(&vt_app.agent().session_persistence.pending_input_restore);
+
+        var settled = false;
+        var frame: usize = 0;
+        while (frame < 400) : (frame += 1) {
+            try app_session_runtime.Runtime(VtRestoreApp).pollPendingInputRestore(&vt_app, vt_app.agent());
+            std.mem.swap(TranscriptRuntime, &h.shell, &vt_app.shell);
+            const render_result = renderTestFooterWithContext(&h, &approval, &h.frame_redraw, defaultFooterContext(&vt_app.input_runtime));
+            std.mem.swap(TranscriptRuntime, &h.shell, &vt_app.shell);
+            try render_result;
+            try h.flush();
+
+            const handoff_pending = vt_app.shell.pendingResumeFlow().len > 0 or
+                vt_app.shell.transcriptCommitDiagnostic().state == .recovering;
+            if (handoff_pending) {
+                try std.testing.expectEqualStrings("", vt_app.input_runtime.edit_state.input.items);
+                try expectGridExcludes(&h, "were not delivered.");
+            } else if (!vt_app.agent().session_persistence.pending_input_restore.isActive() and
+                vt_app.shell.transcriptCommitDiagnostic().state == .stable)
+            {
+                settled = true;
+                break;
+            }
+        }
+        try std.testing.expect(settled);
+
+        try std.testing.expectEqualStrings("P2\n\nP3", vt_app.input_runtime.edit_state.input.items);
+        try expectGridJoinedContains(&h, "were not delivered.");
+        try expectGridContains(&h, "P2");
+        try expectGridContains(&h, "P3");
+
+        std.mem.swap(TranscriptRuntime, &h.shell, &vt_app.shell);
+        const resize_result = h.driveResize(cols, 28, 4, true);
+        if (resize_result) |_| {
+            try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, defaultFooterContext(&vt_app.input_runtime));
+        } else |err| {
+            std.mem.swap(TranscriptRuntime, &h.shell, &vt_app.shell);
+            return err;
+        }
+        std.mem.swap(TranscriptRuntime, &h.shell, &vt_app.shell);
+        try h.flush();
+        try expectGridJoinedContains(&h, "were not delivered.");
+        try expectGridContains(&h, "P2");
+        try expectGridContains(&h, "P3");
+    }
 }

@@ -10,7 +10,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
+import { LineQueue } from "./line-queue";
 import {
   fakeGatewayFinalText,
   fakeGatewaySse,
@@ -21,7 +22,9 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
+import { holdChildAnswer } from "./saved-sessions";
 
 const TIMEOUT = 20_000;
 const ULTRA_MODEL = "openai/gpt-6-astra";
@@ -185,8 +188,7 @@ async function waitForGatewayModelCatalog(gateway: Gateway): Promise<void> {
 
 class AcpClient {
   private buffer = "";
-  private lines: string[] = [];
-  private waiters: Array<(line: string) => void> = [];
+  private queue = new LineQueue();
   private closed = false;
   private stderr = "";
   private readonly exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
@@ -207,9 +209,7 @@ class AcpClient {
       this.buffer = lines.pop() ?? "";
       for (const line of lines) {
         if (!line.trim()) continue;
-        const waiter = this.waiters.shift();
-        if (waiter) waiter(line);
-        else this.lines.push(line);
+        this.queue.push(line);
       }
     });
   }
@@ -220,7 +220,7 @@ class AcpClient {
     args: string[] = [],
   ) {
     const processEnv = Object.fromEntries(
-      Object.entries({ ...process.env, NO_COLOR: "1", ...env }).filter(
+      Object.entries(fxChildEnv({ NO_COLOR: "1", ...env })).filter(
         (entry): entry is [string, string] => entry[1] !== undefined,
       ),
     );
@@ -262,27 +262,9 @@ class AcpClient {
   }
 
   async readLine(timeoutMs = TIMEOUT): Promise<any> {
-    const line = await new Promise<string>((resolve, reject) => {
-      const buffered = this.lines.shift();
-      if (buffered) {
-        resolve(buffered);
-        return;
-      }
-      if (this.closed) {
-        reject(new Error(`ACP exited before a response: ${this.stderr}`));
-        return;
-      }
-      const waiter = (value: string) => {
-        clearTimeout(timer);
-        resolve(value);
-      };
-      const timer = setTimeout(() => {
-        const index = this.waiters.indexOf(waiter);
-        if (index !== -1) this.waiters.splice(index, 1);
-        reject(new Error(`ACP read timeout: ${this.stderr}`));
-      }, timeoutMs);
-      this.waiters.push(waiter);
-    });
+    // Once the process has closed no line is still to come: the queued ones are read, and then the read ends at once.
+    const line = await this.queue.next(this.closed ? 0 : timeoutMs, () =>
+      new Error(this.closed ? `ACP exited before a response: ${this.stderr}` : `ACP read timeout: ${this.stderr}`));
     return JSON.parse(line);
   }
 
@@ -877,8 +859,13 @@ describe("ultrafast fake Gateway", () => {
     "an allowed subagent child inherits ultrafast routing",
     async () => {
       const root = createIsolatedRoot();
-      const gateway = startDynamicFakeGateway((body) => {
-        if (!body.includes('"name":"subagent"')) return finishWithServiceTier("child completed", "ultrafast");
+      const hold = holdChildAnswer(root.home);
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes('"name":"subagent"')) {
+          const refused = await hold.wait();
+          if (refused) return refused;
+          return finishWithServiceTier("child completed", "ultrafast");
+        }
         if (latestUserIsReport(body)) return finishWithServiceTier("parent read the report", "ultrafast");
         if (body.includes("subagent_1")) return finishWithServiceTier("parent observed the child", "ultrafast");
         return fakeGatewayToolCall(
@@ -890,8 +877,11 @@ describe("ultrafast fake Gateway", () => {
       try {
         const result = await runFx(
           ["ask", "--full-access", "--json", "--ultrafast", "Delegate one task."],
-          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+          // Below the test's limit, so a failed hold ends fx here and the kept
+          // error is thrown, instead of Bun ending the test with fx still running.
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway), timeoutMs: TIMEOUT - 5_000 },
         );
+        hold.check();
         expect(result.code, result.stderr).toBe(0);
         const output = JSON.parse(result.stdout).output;
         expect(output).toContain("parent observed the child");
@@ -915,10 +905,13 @@ describe("ultrafast fake Gateway", () => {
     async () => {
       const root = createIsolatedRoot({ ultrafast_mode: true, models: { gateway: ULTRA_MODEL } });
       const childBodies: string[] = [];
+      const hold = holdChildAnswer(root.home);
       let parentRequests = 0;
       let round = 1;
-      const gateway = startDynamicFakeGateway((body) => {
+      const gateway = startDynamicFakeGateway(async (body) => {
         if (!body.includes('"name":"subagent"')) {
+          const refused = await hold.wait();
+          if (refused) return refused;
           childBodies.push(body);
           return finishWithServiceTier(
             `ULTRA_CHILD_${childBodies.length}`,
@@ -947,6 +940,7 @@ describe("ultrafast fake Gateway", () => {
         let sessionId: string | undefined;
         for (const current of [1, 2, 3]) {
           round = current;
+          hold.mark();
           const result = await runFx(
             [
               "ask", "--full-access", "--json",
@@ -954,8 +948,10 @@ describe("ultrafast fake Gateway", () => {
               ...(round === 3 ? ["--no-ultrafast"] : []),
               `Ask the named reviewer for round ${round}.`,
             ],
-            { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+            // Below the test's limit, as above.
+            { cwd: root.workspace, env, timeoutMs: TIMEOUT - 5_000 },
           );
+          hold.check();
           expect(result.code, result.stderr).toBe(0);
           const payload = JSON.parse(result.stdout);
           expect(payload.output).toContain(`ULTRA_PARENT_${round}`);
@@ -1117,7 +1113,7 @@ describe("ultrafast fake Gateway", () => {
           await session.sendKeys("Escape");
           await session.waitForPane((pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"), TIMEOUT);
           await session.sendText("Return the Settings disabled marker.");
-          await session.waitForText("Settings disabled Ultra", TIMEOUT);
+          await session.waitForPane((pane) => pane.includes("Settings disabled Ultra") && turnSettled(pane), TIMEOUT);
           const settled = await session.waitForStableComposer(TIMEOUT);
           expect(settled).not.toContain("⚡︎");
           expect(await session.captureFullScrollback()).toContain("Settings disabled Ultra");
@@ -1182,7 +1178,7 @@ describe("ultrafast fake Gateway", () => {
             .toMatchObject({ ultrafast_mode: true, models: { gateway: ULTRA_MODEL }, effort: "xhigh" });
           expect(gateway.requests).toEqual([]);
           await session.sendText("Return the model picker marker.");
-          await session.waitForText("marker selection response", TIMEOUT);
+          await session.waitForPane((pane) => pane.includes("marker selection response") && turnSettled(pane), TIMEOUT);
           expect(gateway.requests).toHaveLength(1);
           expectUltrafastRequest(gateway.requests[0]!.body);
           await session.sendText("/ultrafast off");
@@ -1314,7 +1310,7 @@ describe("ultrafast fake Gateway", () => {
           await session.waitForComposer(TIMEOUT);
           await waitForGatewayModelCatalog(gateway);
           await session.sendText("Return the downgrade sentinel.");
-          await session.waitForText("downgraded answer", TIMEOUT);
+          await session.waitForPane((pane) => pane.includes("downgraded answer") && turnSettled(pane), TIMEOUT);
           const scrollback = normalizeTerminalWhitespace(
             await session.captureFullScrollback(),
           );

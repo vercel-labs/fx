@@ -509,6 +509,38 @@ test "a tool's notice raised before a later call is cancelled stays in the inter
     });
 }
 
+test "a call that finishes as the user cancels keeps its result, and no model request follows it" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_done", "read_file", "{\"path\":\"a\"}")};
+    // The second completion is the request the cancelled turn must not make.
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "never asked for" } };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    // The call returns its result, not marked cancelled, and the flag is set as it returns.
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "finished result" } }};
+    hooks.cancel_on_execute = &fixture.cancel_flag;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
+    const follow_completions = [_]FakeCompletion{.{ .content = "Carrying on." }};
+    var follow_gateway = FakeGateway.init(alloc, &follow_completions);
+    defer follow_gateway.deinit();
+    var follow_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer follow_hooks.deinit();
+    var follow_fixture = PromptFixture{};
+    var follow_job = follow_fixture.job();
+    follow_job.prompt = @constCast("go on");
+    follow_job.history = hooks.history_turns.items;
+    try runFakePrompt(&follow_gateway, &follow_hooks, follow_fixture.config(), follow_job);
+    try expectBodyContainsInOrder(&follow_gateway, 0, &.{ "finished result", "<turn_aborted>", "go on" });
+}
+
 test "processQueuedPrompt projects no-output interrupted turn as closed before follow-up" {
     const alloc = std.testing.allocator;
     const interrupted_prompt = "create another file in the folder called test.md and add 200 lines in that - anything";
@@ -631,6 +663,47 @@ test "processQueuedPrompt persists interrupted turn with aborted tool output for
     try expectBodyNotContains(&follow_gateway, 0, removed_resume_guidance);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, follow_gateway.request_bodies.items[0], "<turn_aborted>"));
     try expectGatewayPromptRoleContentKinds(&follow_gateway, 0);
+}
+
+test "processQueuedPrompt keeps the names a cancelled wait's row showed in interrupted history (D102)" {
+    const alloc = std.testing.allocator;
+    const Case = struct { call: ToolCall, target: ?[]const u8, wait: bool };
+    const cases = [_]Case{
+        .{ .call = toolCall("call_wait", "subagent", "{\"action\":\"wait\"}"), .target = "lander", .wait = true },
+        .{ .call = toolCall("call_named", "subagent", "{\"action\":\"wait\",\"agent\":\"lander\"}"), .target = "lander, scout", .wait = true },
+        .{ .call = toolCall("call_unnamed", "subagent", "{\"action\":\"wait\"}"), .target = null, .wait = true },
+        // A message or a read the user cancelled is no wait.
+        .{ .call = toolCall("call_message", "subagent", "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"go\"}"), .target = "lander", .wait = false },
+        .{ .call = toolCall("call_read", "read_file", "{\"path\":\"notes.md\"}"), .target = null, .wait = false },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.call.id});
+        const calls = [_]ToolCall{case.call};
+        const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        hooks.exec_plans = &.{.{ .err = error.Cancelled }};
+        hooks.cancel_on_execute = &fixture.cancel_flag;
+        hooks.tool_display_target = case.target;
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+        const interrupted = hooks.history_turns.items[0].interrupted;
+        try std.testing.expectEqualStrings(case.call.id, interrupted.tool_call.?.id);
+        try std.testing.expect(interrupted.cancelled_command == null);
+        if (!case.wait) {
+            try std.testing.expect(interrupted.cancelled_wait == null);
+            continue;
+        }
+        const wait = interrupted.cancelled_wait orelse return error.TestExpectedCancelledWait;
+        if (case.target) |target| {
+            try std.testing.expectEqualStrings(target, wait.waited_for.?);
+        } else try std.testing.expect(wait.waited_for == null);
+    }
 }
 
 test "processQueuedPrompt retains cancelled command replay in interrupted history" {

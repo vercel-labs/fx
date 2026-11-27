@@ -30,7 +30,7 @@ const Result = struct {
     turn_seconds: ?i64,
     phase: []const u8,
     compaction_seconds: ?i64,
-    /// Operation.written_percent of the operation on screen, 0 without one.
+    /// Operation.progress.notes of the operation on screen, 0 without one.
     written: u8 = 0,
     @"error": ?[]const u8 = null,
 };
@@ -93,10 +93,10 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         };
         lab.activity.running(lab.id orelse return, stage);
     } else if (is(op.op, "write")) {
-        lab.activity.written(lab.id orelse return, op.percent);
+        lab.activity.written(lab.id orelse return, op.percent, lab.now);
     } else if (is(op.op, "stale_write")) {
         // Before a second compaction there is no older one to arrive late.
-        lab.activity.written(lab.previous orelse return, op.percent);
+        lab.activity.written(lab.previous orelse return, op.percent, lab.now);
     } else if (is(op.op, "stop")) {
         lab.activity.stopping(lab.id orelse return);
     } else if (is(op.op, "settle")) {
@@ -121,7 +121,7 @@ fn report(lab: *const Lab, result: *Result) void {
     result.waiting_since_ms = lab.marks.waiting_since_ms;
     result.turn_seconds = turn_clock.seconds(lab.marks, lab.now);
     result.phase = phaseName(lab);
-    result.written = if (lab.activity.snapshot.operation) |op| op.written_percent else 0;
+    result.written = if (lab.activity.snapshot.operation) |op| op.progress.notes else 0;
     result.compaction_seconds = if (lab.activity.snapshot.operation) |op|
         if (op.active()) turn_clock.seconds(turn_clock.compactionMarks(op), lab.now) else null
     else

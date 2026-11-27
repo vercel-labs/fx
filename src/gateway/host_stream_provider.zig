@@ -202,6 +202,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         stream_provider.EventSink.onReasoningChunk,
         request.cancel_flag,
         request.content_capture_limit,
+        .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages },
     ) catch |err| switch (err) {
         error.ReadFailed => return readFailure(&reader, request.cancel_flag),
         else => return err,
@@ -433,8 +434,9 @@ test "host provider signals logical consumption only after valid uncancelled com
         .{ .body = text ++ "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"length\"}}\n\n" },
         .{ .body = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\"}}\n\n" },
         .{ .body = text ++ "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"code\":\"gateway_stream_timeout\"}\n\n" },
+        // A call with an empty id gets an fx id, so the reply is valid.
         .{ .body = "data: {\"type\":\"tool-call\",\"toolCallId\":\"\",\"toolName\":\"test_tool\",\"input\":{}}\n\n" ++
-            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\"}}\n\n" },
+            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\"}}\n\n", .expected_consumed = true },
         .{ .body = text ++ stop, .cancel_on_content = true },
         .{ .body = "upstream failure", .status = 500 },
         .{ .body = text ++ stop, .status = 0, .expected_error = error.HostStreamFailed },

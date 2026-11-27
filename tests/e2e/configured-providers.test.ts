@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import { completion, neverAnswers, stallsAfterFirstChunk, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
 import * as messagesFake from "./fixtures/anthropic-messages";
 import * as responsesFake from "./fixtures/responses";
-import { committedRootTurns, logLines, rootSessionIds, waitForRootTurnCommitted } from "./saved-sessions";
+import { holdChildAnswer, logLines, rootSessionIds } from "./saved-sessions";
 import { reviewedActionEvidence } from "./tmux-helpers";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
@@ -376,20 +376,23 @@ describe("configured providers", () => {
     const childModel = mode === "inherited" ? "local-model" : mode === "override" ? "child-model" : "unknown-model";
     const f = fixture(async body => {
       if (isChildRequest(body)) {
-        // A report that arrives while the parent's first turn runs joins that
-        // turn, so the child answers only once that turn is saved.
-        await waitForRootTurnCommitted(f.home);
+        const refused = await hold.wait();
+        if (refused) return refused;
         return completion(body.model, "child reply");
       }
       if (isReportTurn(body)) return completion(body.model, "report handled");
       if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "parent reply");
       return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "helper", message: "child-marker", ...(mode === "inherited" ? {} : { model: childModel }) } });
     });
+    // The child answers only once the parent has saved the turn that sent its
+    // message, so its report starts the next turn instead of joining that one.
+    const hold = holdChildAnswer(f.home);
     f.settings.providers.local.model_metadata["local-model"].max_output_tokens = 512;
     (f.settings.providers.local.model_metadata as any)["child-model"] = { context_window: 32768, max_output_tokens: 1024, supports_tool_use: true };
     f.save();
     try {
       const result = await runFx(["ask", "--json", "Delegate a task"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      hold.check();
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
       // The parent's turn ends with the receipt; the child's report starts its next one.
       const output = JSON.parse(result.stdout).output;
@@ -406,19 +409,20 @@ describe("configured providers", () => {
 
   test("persistent child capabilities stay bound when the parent changes providers", async () => {
     let callId = 0;
-    // Turns saved before the current run. A report that arrives while the
-    // parent's first turn of a run is still going joins that turn, so the
-    // child answers only once that turn is saved.
-    let committedBefore = 0;
     const f = fixture(async body => {
       if (isChildRequest(body)) {
-        await waitForRootTurnCommitted(f.home, committedBefore);
+        const refused = await hold.wait();
+        if (refused) return refused;
         return completion(body.model, "child reply");
       }
       if (isReportTurn(body)) return completion(body.model, "report handled");
       if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
       return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: "read the child fixture" } }, `child-call-${++callId}`);
     });
+    // Each run's child answers only once the parent has saved the turn that
+    // sent its message, so its report starts the next turn instead of joining
+    // that one.
+    const hold = holdChildAnswer(f.home);
     f.settings.models.local = "shared-model";
     f.settings.models.remote = "shared-model";
     (f.settings.providers.local as any).model_metadata = { "shared-model": { context_window: 32768, max_output_tokens: 512, supports_tool_use: true } };
@@ -426,12 +430,15 @@ describe("configured providers", () => {
     f.save();
     try {
       const first = await runFx(["ask", "--json", "Create the named child"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "remote" }, timeoutMs: 30000 });
+      hold.check();
       if (first.code !== 0) throw new Error(first.stdout + first.stderr);
       const id = JSON.parse(first.stdout).session_id;
       // Parent call, the child and the parent after its receipt, then the report turn.
       expect(f.requests.map(request => request.body.max_tokens)).toEqual([1024, 1024, 1024, 1024]);
-      committedBefore = committedRootTurns(f.home);
+      // The resumed run's child waits for a turn past the ones the first run saved.
+      hold.mark();
       const resumed = await runFx(["ask", "--json", "--resume", id, "Continue the named child"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "local" }, timeoutMs: 30000 });
+      hold.check();
       if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
       const resumedRequests = f.requests.slice(4);
       const resumedResult = resumedRequests.find(request => request.body.messages.at(-1)?.role === "tool")!.body.messages.at(-1).content;
@@ -616,7 +623,7 @@ describe("configured providers", () => {
 
   test.each(["headers", "stream"])("cancellation stops stalled custom %s without replaying the POST", async phase => {
     const f = fixture(() => phase === "headers" ? new Promise<Response>(() => {}) : new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n')); } }), { headers: { "content-type": "text/event-stream" } }));
-    const env: Record<string, string | undefined> = { ...process.env };
+    const env: Record<string, string | undefined> = fxChildEnv();
     for (const [key, value] of Object.entries(f.env)) {
       if (value === undefined) delete env[key]; else env[key] = value;
     }
@@ -870,6 +877,7 @@ describe("custom connection options", () => {
       expect(f.requests).toHaveLength(2);
       expect(f.requests.every(request => request.body.reasoning_effort === undefined)).toBe(true);
       expect(occurrences(undeclared.stderr, "high is not available for local-model")).toBe(1);
+      expect(undeclared.stderr).toContain("Effort high is not available for local-model, so it is not sent. To offer it, add it to the model's reasoning_efforts in settings.json.");
 
       metadata(f).reasoning_efforts = { low: { reasoning_effort: "low" } };
       f.save();
@@ -1313,7 +1321,7 @@ describe("custom connection limits", () => {
       const first = await runFx(["ask", "--json", "start the long task"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
       if (first.code !== 0) throw new Error(first.stdout + first.stderr);
       const session = JSON.parse(first.stdout).session_id;
-      const env = Object.fromEntries(Object.entries({ ...process.env, ...f.env }).filter(([, value]) => value !== undefined)) as Record<string, string>;
+      const env = Object.fromEntries(Object.entries(fxChildEnv(f.env)).filter(([, value]) => value !== undefined)) as Record<string, string>;
       const child = Bun.spawn([FX_BIN, "ask", "--json", "--resume", session, "second step"], { cwd: f.workspace, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
       const deadline = Date.now() + 15_000;
       while (f.requests.length < 2 && Date.now() < deadline) await Bun.sleep(20);
