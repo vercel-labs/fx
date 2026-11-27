@@ -535,7 +535,9 @@ Relaunch ==
     /\ UNCHANGED <<sameFail, deaths, cleanExit, net, gateway, needUser,
                    faults, cancelled>>
     /\ UNCHANGED filterVars
-    /\ UNCHANGED budgetVars
+    \* A resume starts a new process whose monotonic clock does not carry
+    \* across processes (`recovery.zig` resumeFrom).
+    /\ budgetUsed' = 0 /\ UNCHANGED budgeted
     /\ UNCHANGED yielded
 
 \* fx stops the request for its own restart (Ctrl+G for an upgrade), at
@@ -556,7 +558,7 @@ Yield ==
                    seenDeaths, deaths, net, gateway, needUser, faults,
                    cancelled, askedSignIn, polling>>
     /\ UNCHANGED filterVars
-    /\ UNCHANGED budgetVars
+    /\ budgetUsed' = 0 /\ UNCHANGED budgeted
 
 \* The new fx continues the stopped turn: start(record, continues). The
 \* record's questions and death count apply as for a relaunch; otherwise
@@ -591,7 +593,7 @@ Continue ==
     /\ UNCHANGED <<sameFail, deaths, cleanExit, net, gateway, needUser,
                    faults, cancelled>>
     /\ UNCHANGED filterVars
-    /\ UNCHANGED budgetVars
+    /\ budgetUsed' = 0 /\ UNCHANGED budgeted
 
 -----------------------------------------------------------------------------
 (* The user, and fx's own end of a request nobody can answer.              *)

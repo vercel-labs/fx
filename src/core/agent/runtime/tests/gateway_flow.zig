@@ -11823,3 +11823,25 @@ test "400 and 422 still end after one request" {
         try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     }
 }
+
+test "processQueuedPrompt lets cancel win when cancel arrives between stream_error check and exhausted budget" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .stream_error = error.ReadFailed },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    hooks.cancel_on_settled_checkpoint = &fixture.cancel_flag;
+    var config = fixture.config();
+    config.recovery_retry_budget_ms = 100;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_history_count);
+}

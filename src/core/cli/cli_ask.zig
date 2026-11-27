@@ -1974,7 +1974,13 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, job, false)) |early| return early;
     // The ask ends once its whole tree is quiet: mail that waits when a turn
     // ends runs as the ask's next turn, as one wakes an idle main.
+    // When fx ask's own turn ended because its retry budget ran out, stop
+    // waiting and let `ctx.deinit()` cancel and join any running subagents.
     while (ctx.subagent_host) |tree| {
+        if (askTurnStoppedByRetryBudget(&ctx)) {
+            tree.closeTree();
+            break;
+        }
         switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag())) {
             .quiet, .stopped => break,
             .mail => {},
@@ -2007,6 +2013,11 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     if (ctx.presenter) |value| try value.finish();
 
     return takePromptRunResult(&ctx, alloc);
+}
+
+fn askTurnStoppedByRetryBudget(ctx: *const AskContext) bool {
+    const recovery = ctx.last_recovery_status orelse return false;
+    return ctx.failed and recovery.kind == .failed;
 }
 
 /// Starts background title generation for a fresh saved session. The task runs

@@ -9382,7 +9382,8 @@ fn processQueuedPromptLoop(
                         delay_completed = try request_recovery.waitForSend() != null;
                     }
                 }
-                if (cancel_requested or (!request_recovery.budgetExhausted() and !delay_completed)) {
+                const cancelled_now = cancel_requested or config.cancel_flag.load(.seq_cst);
+                if (cancelled_now or (!request_recovery.budgetExhausted() and !delay_completed)) {
                     runtime_telemetry.traceCancelObserved(step_ctx, false);
                     try request_recovery.cancel();
                     try stream_ctx.provisional_statuses.finishTrackedCancelled(
