@@ -122,13 +122,13 @@ For example, this prompt steers the running turn:
 
 These rules apply to both deliveries:
 
-- A prompt that arrives while no turn runs starts a turn right away, whatever its delivery.
+- A prompt that arrives while no turn runs starts a turn right away, whatever its delivery. A prompt that starts a turn may hold any content block that `session/prompt` accepts.
 - A prompt without `sh.fx/delivery` that arrives while a turn runs fails with `-32600`, "Prompt already in progress".
 - fx keeps one order for each session across all of its clients.
 
 #### Steers
 
-- A steer holds only text content blocks. fx joins their text, which must be 1 byte to 64 KiB long. A steer with any other block fails with `-32602`, and the client can send the same prompt with `"queue"`.
+- A steer that joins a running turn holds only text content blocks. fx joins their text, which must be 1 byte to 64 KiB long. A steer that joins a running turn with any other block fails with `-32602`, and the client can send the same prompt with `"queue"`.
 - A session holds at most 64 steers and 1 MiB of steer text that no turn has taken yet. A steer past either limit fails with `-32600`, "Steering queue is full".
 - If the model is writing a reply when a steer arrives, fx stops the reply. The turn takes the steer at its next safe point, before its next model request.
 - A steer that arrives between two model requests waits for the turn's next one: after the running tool, or, when the model's reply has ended, the turn goes on with the steer instead of ending.
@@ -142,6 +142,8 @@ The response to a steer arrives when the turn that took it ends. It carries that
 | --- | --- |
 | `"absorbed"` | The turn that was running took the steer |
 | `"next_turn"` | The turn that was running had stopped taking input, or the client stopped it, so the steer ran in the next turn |
+
+A prompt that starts its own turn, because no turn was running, gets the normal answer of that turn with no delivery result: its `_meta` holds no `sh.fx/steeringDelivery`.
 
 #### Queued prompts
 
@@ -157,7 +159,7 @@ The response to a steer arrives when the turn that took it ends. It carries that
 
 ACP v2's rule for [prompts during active work](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle) differs on one point: there, `session/cancel` also answers the prompts that haven't run with `-32800`. ACP v1 has no such rule. fx revisits this point when it moves to ACP v2.
 
-`tests/tla/acp/AcpPromptDelivery.tla` models these rules, and TLC checks them in every order of steers, queued prompts, stops, withdrawals, and closing. Its `Today` configs show where fx's ACP path breaks them now, and `tests/tla/drivers/acp/prompt_delivery/driver.ts` runs `fx acp` along the model.
+`tests/tla/acp/AcpPromptDelivery.tla` models these rules, and TLC checks every order of up to five prompts, with one tool call, one stop, and one close, within the bounds of its configs. Its `Today` configs show where fx's ACP path breaks them now, and `tests/tla/drivers/acp/prompt_delivery/driver.ts` runs `fx acp` along the model. The model does not check the caps of 64 steers, 1 MiB of steer text, and 64 queued prompts; the 64 KiB limit on steer text; the `sh.fx/steerInput` update; capability gating; or the host methods.
 
 #### Host steering
 

@@ -900,3 +900,75 @@ test "the steering tables give the values of the schema's delivery types" {
         }
     }
 }
+
+test "checkRefs accepts a $ref to a type that exists and counts it" {
+    const fx = try parseSpecFile(fx_schema);
+    defer fx.deinit();
+    const acp = try parseSpecFile(acp_schema);
+    defer acp.deinit();
+    const fx_defs = field(fx.value, "$defs") orelse return error.TestUnexpectedResult;
+    const acp_defs = field(acp.value, "$defs") orelse return error.TestUnexpectedResult;
+    const doc = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"$ref\": \"#/$defs/Capability\"}", .{});
+    defer doc.deinit();
+    var refs: usize = 0;
+    try checkRefs(doc.value, fx_defs, acp_defs, &refs);
+    try std.testing.expectEqual(@as(usize, 1), refs);
+}
+
+test "checkRefs fails on a $ref to a type that does not exist" {
+    const fx = try parseSpecFile(fx_schema);
+    defer fx.deinit();
+    const acp = try parseSpecFile(acp_schema);
+    defer acp.deinit();
+    const fx_defs = field(fx.value, "$defs") orelse return error.TestUnexpectedResult;
+    const acp_defs = field(acp.value, "$defs") orelse return error.TestUnexpectedResult;
+    for ([_][]const u8{
+        "{\"$ref\": \"#/$defs/NoSuchType\"}",
+        "{\"$ref\": \"acp/v1/schema.json#/$defs/NoSuchType\"}",
+        "{\"properties\": {\"x\": {\"$ref\": \"#/$defs/NoSuchType\"}}}",
+    }) |bytes| {
+        const doc = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+        defer doc.deinit();
+        var refs: usize = 0;
+        try std.testing.expectError(error.TestUnexpectedResult, checkRefs(doc.value, fx_defs, acp_defs, &refs));
+        try std.testing.expectEqual(@as(usize, 0), refs);
+    }
+}
+
+test "tableValues reads the quoted first-column values of its table" {
+    const doc =
+        \\
+        \\| `sh.fx/delivery` | Meaning |
+        \\| --- | --- |
+        \\| `"steer"` | Adds the prompt's text |
+        \\| `"queue"` | Holds the prompt |
+        \\
+        \\Next paragraph.
+        \\
+    ;
+    var buffer: [4][]const u8 = undefined;
+    const values = try tableValues(doc, "| `sh.fx/delivery` |", &buffer);
+    try std.testing.expectEqual(@as(usize, 2), values.len);
+    try std.testing.expectEqualStrings("steer", values[0]);
+    try std.testing.expectEqualStrings("queue", values[1]);
+}
+
+test "tableValues fails when the document has no table with the header" {
+    var buffer: [4][]const u8 = undefined;
+    try std.testing.expectError(
+        error.TestUnexpectedResult,
+        tableValues("\n| `sh.fx/other` | Meaning |\n| --- | --- |\n| `\"steer\"` | Adds |\n", "| `sh.fx/delivery` |", &buffer),
+    );
+}
+
+test "tableValues fails on a row whose value is not quoted" {
+    const doc = "\n| `sh.fx/delivery` | Meaning |\n| --- | --- |\n| `steer` | Adds |\n";
+    var buffer: [4][]const u8 = undefined;
+    try std.testing.expectError(error.TestUnexpectedResult, tableValues(doc, "| `sh.fx/delivery` |", &buffer));
+}
+
+test "tableValues fails when the table has more rows than its buffer" {
+    const doc = "\n| `sh.fx/delivery` | Meaning |\n| --- | --- |\n| `\"steer\"` | Adds |\n| `\"queue\"` | Holds |\n";
+    var buffer: [1][]const u8 = undefined;
+    try std.testing.expectError(error.TestUnexpectedResult, tableValues(doc, "| `sh.fx/delivery` |", &buffer));
+}

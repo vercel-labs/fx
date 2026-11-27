@@ -46,6 +46,7 @@ MCAcpPromptDelivery AcpPromptDeliveryToday-interrupt NoSteerWaitsOnReply
 MCAcpPromptDelivery AcpPromptDeliveryToday-lost NothingLost
 MCAcpPromptDelivery AcpPromptDeliveryToday-dropped DeliveryValues
 MCAcpPromptDelivery AcpPromptDeliveryToday-late LateRunTogether
+MCAcpPromptDelivery AcpPromptDeliveryToday-withdraw PendingRefused
 EOF
 
 if [ "$ci" = true ]; then
