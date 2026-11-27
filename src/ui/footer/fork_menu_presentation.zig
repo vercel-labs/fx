@@ -280,35 +280,49 @@ fn questionText(buf: *[64]u8, count: usize) []const u8 {
     return buf[0 .. prefix.len + num.len + suffix.len];
 }
 
-fn composeListHeaderRow(alloc: Allocator, point_count: usize, width: u16) !std.ArrayList(u8) {
+fn composeHeaderRow(alloc: Allocator, point_count: ?usize, width: u16) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
-    var num_buf: [24]u8 = undefined;
-    const num = formatDecimal(&num_buf, point_count);
     var title_buf: [32]u8 = undefined;
-    const prefix = "Fork ";
-    @memcpy(title_buf[0..prefix.len], prefix);
-    @memcpy(title_buf[prefix.len..][0..num.len], num);
-    const title = title_buf[0 .. prefix.len + num.len];
+    const title: []const u8 = if (point_count) |count| blk: {
+        var num_buf: [24]u8 = undefined;
+        const num = formatDecimal(&num_buf, count);
+        const prefix = "Fork ";
+        @memcpy(title_buf[0..prefix.len], prefix);
+        @memcpy(title_buf[prefix.len..][0..num.len], num);
+        break :blk title_buf[0 .. prefix.len + num.len];
+    } else "Fork";
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     try row_text.appendClipped(alloc, &row, title, width);
     try row.appendSlice(alloc, ui_render.reset_style);
-    const title_width = display_width.visibleWidth(title);
-    const subtitle_width = display_width.visibleWidth(header_subtitle);
-    if (title_width + 2 + subtitle_width <= width) {
-        try row.appendSlice(alloc, "  ");
-        try row.appendSlice(alloc, ui_render.dim_style);
-        try row.appendSlice(alloc, header_subtitle);
-        try row.appendSlice(alloc, ui_render.reset_style);
+    if (point_count != null) {
+        const title_width = display_width.visibleWidth(title);
+        if (title_width + 2 + header_subtitle.len <= width) {
+            try row.appendSlice(alloc, "  ");
+            try row.appendSlice(alloc, ui_render.dim_style);
+            try row.appendSlice(alloc, header_subtitle);
+            try row.appendSlice(alloc, ui_render.reset_style);
+        }
     }
     return row;
 }
 
-fn composeQuestionHeaderRow(alloc: Allocator, width: u16) !std.ArrayList(u8) {
+fn composeStyledLayoutRow(
+    alloc: Allocator,
+    indent: u16,
+    style: []const u8,
+    columns: ?Columns,
+    index: usize,
+    first_line: bool,
+    layout: MessageLayout,
+    line_index: usize,
+) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.selected_completion_style);
-    try row_text.appendClipped(alloc, &row, "Fork", width);
+    try row.appendNTimes(alloc, ' ', indent);
+    try row.appendSlice(alloc, style);
+    if (columns) |cols| try appendNumberGutter(alloc, &row, cols, index, first_line);
+    try input_presentation.appendMessageLayoutRow(alloc, &row, layout, line_index);
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
@@ -325,7 +339,7 @@ fn composeQuestionRow(
 ) !std.ArrayList(u8) {
     const layout = QuestionLayout.build(projection, count, width, row_budget);
     if (row_index >= layout.row_count) return .empty;
-    if (layout.show_header and row_index == 0) return composeQuestionHeaderRow(alloc, width);
+    if (layout.show_header and row_index == 0) return composeHeaderRow(alloc, null, width);
 
     if (layout.prompt_rows > 0 and row_index >= layout.prompt_start and row_index < layout.prompt_start + layout.prompt_rows) {
         var scratch: [compact_prompt_scratch_bytes]u8 = undefined;
@@ -337,13 +351,7 @@ fn composeQuestionRow(
         );
         const prompt_line = row_index - layout.prompt_start;
         if (prompt_line >= prompt_wrapped.row_count) return .empty;
-        var row: std.ArrayList(u8) = .empty;
-        errdefer row.deinit(alloc);
-        try row.appendNTimes(alloc, ' ', layout.columns.indent);
-        try row.appendSlice(alloc, ui_render.dim_style);
-        try input_presentation.appendMessageLayoutRow(alloc, &row, prompt_wrapped, prompt_line);
-        try row.appendSlice(alloc, ui_render.reset_style);
-        return row;
+        return composeStyledLayoutRow(alloc, layout.columns.indent, ui_render.dim_style, null, 0, false, prompt_wrapped, prompt_line);
     }
 
     if (row_index >= layout.question_start and row_index < layout.question_start + layout.question_rows) {
@@ -353,13 +361,7 @@ fn composeQuestionRow(
         trimTruncatedTail(&q_wrapped);
         const q_line = row_index - layout.question_start;
         if (q_line >= q_wrapped.row_count) return .empty;
-        var row: std.ArrayList(u8) = .empty;
-        errdefer row.deinit(alloc);
-        try row.appendNTimes(alloc, ' ', layout.columns.indent);
-        try row.appendSlice(alloc, ui_render.selected_completion_style);
-        try input_presentation.appendMessageLayoutRow(alloc, &row, q_wrapped, q_line);
-        try row.appendSlice(alloc, ui_render.reset_style);
-        return row;
+        return composeStyledLayoutRow(alloc, layout.columns.indent, ui_render.selected_completion_style, null, 0, false, q_wrapped, q_line);
     }
 
     return .empty;
@@ -407,7 +409,7 @@ pub fn composeForkMenuRow(
     }
     const list = ListLayout.build(projection, width, row_budget);
     if (row_index >= list.row_count) return .empty;
-    if (list.show_header and row_index == 0) return composeListHeaderRow(alloc, projection.points.len, width);
+    if (list.show_header and row_index == 0) return composeHeaderRow(alloc, projection.points.len, width);
     if (row_index < list.first_item_row) return .empty;
 
     const line = listWindowStart(projection, list) + (row_index - list.first_item_row);
@@ -416,15 +418,8 @@ pub fn composeForkMenuRow(
     for (projection.points, 0..) |point, index| {
         const layout = promptLayout(point.prompt, &scratch, list.columns.text_width, max_prompt_lines);
         if (line < first + layout.row_count) {
-            var row: std.ArrayList(u8) = .empty;
-            errdefer row.deinit(alloc);
-            const selected = index == projection.selected;
-            try row.appendNTimes(alloc, ' ', list.columns.indent);
-            try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
-            try appendNumberGutter(alloc, &row, list.columns, index, line == first);
-            try input_presentation.appendMessageLayoutRow(alloc, &row, layout, line - first);
-            try row.appendSlice(alloc, ui_render.reset_style);
-            return row;
+            const style = if (index == projection.selected) ui_render.selected_completion_style else ui_render.dim_style;
+            return composeStyledLayoutRow(alloc, list.columns.indent, style, list.columns, index, line == first, layout, line - first);
         }
         first += layout.row_count;
     }

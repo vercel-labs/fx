@@ -275,7 +275,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn routeComposerShortcutAction(app: *App, agent: *AppAgent, action: input_action.ShortcutAction, max_input_len: usize) !void {
             if (forkMenuAsking(agent) and action != .redraw) {
-                debug_trace.logf("input", "fork question ignored shortcut={s} reason=not_an_answer", .{@tagName(action)});
+                debug_trace.logf("input", "fork question ignored shortcut reason=not_an_answer", .{});
                 return;
             }
             switch (action) {
@@ -2164,11 +2164,13 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn forkMenuActive(agent: *AppAgent) bool {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
             return agent.session_persistence.fork_menu.active();
         }
 
         fn forkMenuAsking(agent: *AppAgent) bool {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
             return agent.session_persistence.fork_menu.asking();
         }

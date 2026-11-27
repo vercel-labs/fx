@@ -14,6 +14,7 @@ const paste_blocks = @import("../input/pasted_blocks.zig");
 const paste_framing = @import("../input/paste_framing.zig");
 const text_scalar = @import("../input/text_scalar.zig");
 const render_request = @import("../../ui/render_request.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 
@@ -105,6 +106,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         fn forkMenuAsking(agent: *const AppAgent) bool {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
             return agent.session_persistence.fork_menu.asking();
         }
