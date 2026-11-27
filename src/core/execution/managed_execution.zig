@@ -898,10 +898,16 @@ pub const Runtime = struct {
         }
         self.evictOldestTombstoneLocked();
         const slot = self.emptySlotLocked() orelse {
+            if (input.capacity_reserved and self.pending_admissions != 0) {
+                self.pending_admissions -= 1;
+            }
             self.mutex.unlock(zio);
             return error.ExecutionCapacityExceeded;
         };
         const entry = Entry.initTty(self, input) catch |err| {
+            if (input.capacity_reserved and self.pending_admissions != 0) {
+                self.pending_admissions -= 1;
+            }
             self.mutex.unlock(zio);
             return err;
         };
@@ -3480,4 +3486,79 @@ test "terminal output keeps its head and tail through restore, refresh, and deli
     try std.testing.expectEqualStrings("gh", next.snapshot.output_delta);
     try std.testing.expect(!next.snapshot.output_truncated);
     try runtime.commitDelivery(next.snapshot.execution_id, next.reservation_id);
+}
+
+test "failed reserved TTY admission releases pending_admissions and leaves runtime idle" {
+    const alloc = std.testing.allocator;
+    {
+        var runtime = Runtime.init(alloc);
+        defer runtime.deinit();
+
+        try runtime.reserveTtyCapacity();
+        try std.testing.expectEqual(@as(usize, 1), runtime.pending_admissions);
+        try std.testing.expect(runtime.hasRunningExecution());
+
+        try std.testing.expectError(
+            error.InvalidTtyCursor,
+            runtime.registerTty(alloc, .{
+                .execution_id = "tty-reserved-init-fail",
+                .command = "interactive",
+                .state = .running,
+                .max_output_bytes = 64,
+                .published_running = true,
+                .capacity_reserved = true,
+                .next_cursor = .{ .segment = 0, .offset = 0 },
+            }),
+        );
+        try std.testing.expectEqual(@as(usize, 0), runtime.pending_admissions);
+        try std.testing.expect(!runtime.hasRunningExecution());
+    }
+
+    {
+        var runtime = Runtime.init(alloc);
+        defer runtime.deinit();
+        var ids: [max_entries][32]u8 = undefined;
+        var pinned_entries: [max_entries]*Entry = undefined;
+        var pinned_len: usize = 0;
+        defer for (pinned_entries[0..pinned_len]) |entry| runtime.releaseEntry(entry);
+
+        for (0..max_entries) |index| {
+            const id = try std.mem.print(&ids[index], "tty-slot-full-{d}", .{index});
+            var prepared = try runtime.registerTty(alloc, .{
+                .execution_id = id,
+                .command = "true",
+                .state = .{ .completed = .{ .exit_code = 0 } },
+                .max_output_bytes = 64,
+                .published_running = true,
+            });
+            defer prepared.deinit(alloc);
+            try runtime.commitDelivery(prepared.snapshot.execution_id, prepared.reservation_id);
+
+            var retained = (try runtime.retainedTerminalSnapshot(alloc, id)).?;
+            defer retained.deinit(alloc);
+            pinned_entries[pinned_len] = runtime.acquireEntryForReservation(
+                retained.reservation_id,
+            ) orelse return error.TestExpectedEqual;
+            pinned_len += 1;
+        }
+        try std.testing.expect(!runtime.hasRunningExecution());
+
+        try runtime.reserveTtyCapacity();
+        try std.testing.expectEqual(@as(usize, 1), runtime.pending_admissions);
+        try std.testing.expect(runtime.hasRunningExecution());
+
+        try std.testing.expectError(
+            error.ExecutionCapacityExceeded,
+            runtime.registerTty(alloc, .{
+                .execution_id = "tty-reserved-no-slot",
+                .command = "interactive",
+                .state = .running,
+                .max_output_bytes = 64,
+                .published_running = true,
+                .capacity_reserved = true,
+            }),
+        );
+        try std.testing.expectEqual(@as(usize, 0), runtime.pending_admissions);
+        try std.testing.expect(!runtime.hasRunningExecution());
+    }
 }

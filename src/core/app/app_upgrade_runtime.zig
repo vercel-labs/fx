@@ -492,6 +492,14 @@ pub fn Runtime(comptime App: type) type {
             if (!isIdleForAutoRestart(app, agent, now_ms, quiet_ms)) return false;
             const outcome = applyReadyUpgradeWithDeps(app, agent, deps) catch |err| {
                 debug_trace.logf("upgrade", "event=idle_auto_restart_failed err={s}", .{@errorName(err)});
+                var msg_buf: [192]u8 = undefined;
+                const msg = std.mem.print(
+                    &msg_buf,
+                    "automatic restart failed ({s}); press ctrl+g or restart fx manually",
+                    .{@errorName(err)},
+                ) catch "automatic restart failed; press ctrl+g or restart fx manually";
+                // Best-effort notice on an already-failing restart path; auto_restart_failed suppresses retries.
+                writeUpgradeNotice(app, .@"error", msg) catch {};
                 if (comptime @hasField(App, "upgrader") and
                     @hasField(@FieldType(App, "upgrader"), "auto_restart_failed"))
                 {
@@ -675,6 +683,10 @@ const TestApp = struct {
     session_id: ?[]const u8 = "session-123",
     test_now_ms: ?i64 = null,
     notices: std.ArrayList(u8) = .empty,
+    notice_count: usize = 0,
+    last_notice_tone: ?types.NoticeTone = null,
+    notice_fail_once: bool = false,
+    notice_fail_always: bool = false,
     prepare_count: usize = 0,
     request_handoff_count: usize = 0,
     relaunch_path: [std.Io.Dir.max_path_bytes]u8 = undefined,
@@ -761,6 +773,13 @@ const TestApp = struct {
     }
 
     fn writeDomainNotice(self: *TestApp, notice: types.SemanticNotice, _: bool) !void {
+        if (self.notice_fail_always) return error.WriteNoticeFailed;
+        if (self.notice_fail_once) {
+            self.notice_fail_once = false;
+            return error.WriteNoticeFailed;
+        }
+        self.notice_count += 1;
+        self.last_notice_tone = notice.tone;
         try self.notices.appendSlice(self.alloc, notice.body);
     }
 
@@ -1696,4 +1715,57 @@ test "app_upgrade_runtime idle auto-restart does not repeat failed relaunch noti
 
     Runtime(TestApp).collectUpgradeFacts(&app);
     try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+}
+
+test "app_upgrade_runtime idle auto-restart reports catch-arm failure once and suppresses retries" {
+    var app = TestApp{
+        .alloc = std.testing.allocator,
+        .session_id = null,
+        .notice_fail_once = true,
+    };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.upgrader.ready_since_ms = 10_000;
+    app.test_now_ms = 12_000;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expect(app.upgrader.auto_restart_failed);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expectEqual(@as(?types.NoticeTone, .@"error"), app.last_notice_tone);
+    try std.testing.expect(std.mem.find(u8, app.notices.items, "WriteNoticeFailed") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items, "ctrl+g") != null);
+
+    // Next tick must not repeat the notice or retry.
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+
+    // If writing the catch-arm notice itself also fails, it is swallowed without retrying.
+    var failing = TestApp{
+        .alloc = std.testing.allocator,
+        .session_id = null,
+        .notice_fail_always = true,
+    };
+    defer failing.deinit();
+    failing.upgrader.state = .ready;
+    failing.upgrader.ready_since_ms = 10_000;
+    failing.test_now_ms = 12_000;
+
+    Runtime(TestApp).collectUpgradeFacts(&failing);
+    try std.testing.expect(failing.upgrader.auto_restart_failed);
+    try std.testing.expectEqual(@as(usize, 0), failing.notice_count);
+}
+
+test "app_upgrade_runtime auto-restart holds while an instance turn runs" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.turn_running = false;
+        }
+    }.clear);
 }

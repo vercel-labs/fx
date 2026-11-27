@@ -3704,6 +3704,7 @@ const RoutingSubagents = struct {
 const RoutingUpgradeStatus = struct {
     state: auto_upgrade.State = .ready,
     stop_count: usize = 0,
+    last_user_input_ms: ?i64 = null,
 
     pub fn getState(self: *const RoutingUpgradeStatus) auto_upgrade.State {
         return self.state;
@@ -16433,4 +16434,39 @@ test "app input bridge loads the most recent durable history in chronological or
     try std.testing.expectEqual(@as(usize, 100), app.input_runtime.composer_history.count());
     try std.testing.expectEqualStrings("prompt-1", app.input_runtime.composer_history.entryText(0).?);
     try std.testing.expectEqualStrings("prompt-100", app.input_runtime.composer_history.entryText(99).?);
+}
+
+test "app_input_runtime mouse and paste ingress update the idle upgrade quiet timestamp" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const limits: paste_framing.InputLimits = .{};
+
+    app.upgrader.last_user_input_ms = 1_000;
+    _ = try Runtime(RoutingFakeApp).handleTerminalInputIngressWithLimits(
+        &app,
+        .{ .event = .{ .action = .{ .action = .ignore } } },
+        limits,
+        100,
+    );
+    try std.testing.expectEqual(@as(?i64, 1_000), app.upgrader.last_user_input_ms);
+
+    _ = try Runtime(RoutingFakeApp).handleTerminalInputIngressWithLimits(
+        &app,
+        .{ .event = .{ .action = .{ .action = .{ .mouse_wheel = .down } } } },
+        limits,
+        100,
+    );
+    const after_mouse = app.upgrader.last_user_input_ms.?;
+    try std.testing.expect(after_mouse > 1_000);
+
+    app.upgrader.last_user_input_ms = 2_000;
+    app.input_runtime.paste.begin(.composer, limits.composer_bytes);
+    _ = try Runtime(RoutingFakeApp).handleTerminalInputIngressWithLimits(
+        &app,
+        .{ .event = .{ .paste_byte = 'a' } },
+        limits,
+        100,
+    );
+    try std.testing.expect(app.upgrader.last_user_input_ms.? > 2_000);
 }
