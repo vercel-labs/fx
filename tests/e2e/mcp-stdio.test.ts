@@ -3705,12 +3705,14 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
           await tui.waitForText(`requests choice${ordinal}`, 20_000);
           if (ordinal === 1) {
             const choices = await tui.captureFullScrollback();
-            expect(choices).toContain("[1] Skip");
-            expect(choices).toContain("[2] Use default");
-            expect(choices).toContain("[3] Duplicate");
-            expect(choices).toContain("[4] Duplicate");
-            expect(choices).toContain("[5] Collision\\x1b[2J");
-            expect(choices).toContain("[6] Collision\\x1b[2J");
+            const marker = surface === "TUI" ? ")" : ".";
+            expect(choices).toContain(`1${marker} Skip`);
+            expect(choices).toContain(`2${marker} Use default`);
+            expect(choices).toContain(`3${marker} Duplicate (value-3)`);
+            expect(choices).toContain(`4${marker} Duplicate (Duplicate)`);
+            expect(choices).toContain(`5${marker} Collision\\x1b[2J (escape-raw)`);
+            expect(choices).toContain(`6${marker} Collision\\x1b[2J (escape-literal)`);
+            expect(choices).not.toMatch(/\[\d\] /);
           }
           await choose(ordinal);
         }
@@ -3718,12 +3720,12 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         await tui.waitForText('- literalSkip: "Skip"', 20_000);
         const review = await tui.captureFullScrollback();
         expect(review).toContain('- literalDefault: "Use default"');
-        expect(review).toContain('- choice1: "Skip"');
-        expect(review).toContain('- choice2: "Use default"');
-        expect(review).toContain('- choice3: "value-3"');
-        expect(review).toContain('- choice4: "Duplicate"');
-        expect(review).toContain('- choice5: "escape-raw"');
-        expect(review).toContain('- choice6: "escape-literal"');
+        expect(review).toContain("- choice1: Skip");
+        expect(review).toContain("- choice2: Use default");
+        expect(review).toContain("- choice3: Duplicate (value-3)");
+        expect(review).toContain("- choice4: Duplicate (Duplicate)");
+        expect(review).toContain("- choice5: Collision\\x1b[2J (escape-raw)");
+        expect(review).toContain("- choice6: Collision\\x1b[2J (escape-literal)");
         await choose(1);
         await tui.waitForText(`${surface} collision form complete.`, 20_000);
 
@@ -3997,8 +3999,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         await Bun.sleep(6_000);
         await tui.sendText("1");
         const expectedValue = legacyVersion === "2025-06-18"
-          ? '- choice: "legacy-alpha-choice"'
-          : '- choice: "legacyvalid"';
+          ? "- choice: Alpha"
+          : "- choice: Legacy valid";
         await tui.waitForText(expectedValue, 20_000);
         await tui.sendText("1");
         await tui.waitForText(`Legacy ${legacyVersion} elicitation complete.`, 20_000);
@@ -4359,7 +4361,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       expect(review).toContain("- age: 42");
       expect(review).toContain("- ratio: 0.5");
       expect(review).toContain("- enabled: true");
-      expect(review).toContain('- color: "blue"');
+      expect(review).toContain("- color: Blue");
       expect(review).toContain('- tags: ["a"]');
       await tui.sendText("2");
 
@@ -4379,7 +4381,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await tui.sendText("2");
       await tui.waitForText("MCP server fixture requests enabled", 20_000);
       await tui.sendText("2");
-      await tui.waitForText('current value for color is "blue"', 20_000);
+      await tui.waitForText("current value for color is Blue", 20_000);
       await tui.sendText("2");
       await tui.waitForText("MCP server fixture requests color", 20_000);
       await tui.sendText("1");
@@ -4395,7 +4397,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       expect(review).toContain("- age: 43");
       expect(review).toContain("- ratio: 0.75");
       expect(review).toContain("- enabled: false");
-      expect(review).toContain('- color: "red"');
+      expect(review).toContain("- color: Red");
       expect(review).toContain('- tags: ["b"]');
       await tui.sendText("1");
       await tui.waitForText("Interactive Ask full form complete.", 20_000);

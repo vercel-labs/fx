@@ -114,6 +114,33 @@ function terminalCommand(args: string[]): string {
   return `/bin/sh -c ${shellQuote(script)}`;
 }
 
+const MCP_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
+const MCP_TOOL = "mcp_fixture_echo";
+const MCP_MODEL = "openai/gpt-5";
+
+/** A profile whose MCP fixture asks one form, with `field` as its only question. */
+function writeMcpFormProfile(root: { root: string; home: string }, field: Record<string, unknown>): void {
+  mkdirSync(join(root.home, ".fx"), { recursive: true });
+  writeFileSync(
+    join(root.home, ".fx", "mcp.json"),
+    JSON.stringify({
+      mcp: {
+        fixture: {
+          type: "local",
+          command: [process.execPath, MCP_FIXTURE],
+          enabled: true,
+          environment: {
+            FX_MCP_WIRE_LOG: join(root.root, "mcp-wire.jsonl"),
+            FX_MCP_PID_PATH: join(root.root, "mcp.pid"),
+            FX_MCP_MODE: "mrtr_input_required",
+            FX_MCP_COMPACT_FIELD: JSON.stringify(field),
+          },
+        },
+      },
+    }),
+  );
+}
+
 function fakeGatewayStreamingText(lines: string[], delayMs: number) {
   const encoder = new TextEncoder();
   return new Response(
@@ -1517,6 +1544,202 @@ describe("fx ask presentation", () => {
       TIMEOUT,
     );
   }
+
+  test.skipIf(!tmuxAvailable())(
+    "a titled MCP choice lists each option with one number and reviews its title",
+    async () => {
+      const root = createRoot();
+      writeMcpFormProfile(root, {
+        type: "string",
+        title: "Team",
+        oneOf: [
+          { const: "design", title: "Design" },
+          { const: "documentation", title: "Documentation" },
+          { const: "operations", title: "Operations" },
+          { const: "acme-playground", title: "Acme Playground" },
+        ],
+      });
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: MCP_TOOL }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: MCP_TOOL, arguments: { text: "hello" } }),
+        fakeGatewayFinalText("Team saved.\n"),
+      ], { models: [{ id: MCP_MODEL, type: "language", tags: ["tool-use"] }] });
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--auto", "--no-save", "Choose the team."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), FX_MODEL: MCP_MODEL, NO_COLOR: undefined },
+        width: 100,
+        height: 40,
+        minimumHistoryLines: 200,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      await session.waitForText("Choose a number or enter a value:", 60_000);
+      const menu = await session.captureFullScrollback();
+      expect(menu).toMatch(/^ {2}1\. Design$/m);
+      expect(menu).toMatch(/^ {2}4\. Acme Playground$/m);
+      expect(menu).not.toContain("[4]");
+
+      await session.sendText("4");
+      await session.waitForText("Current values:", TIMEOUT);
+      const review = await session.captureFullScrollback();
+      expect(review).toMatch(/^- Team: Acme Playground$/m);
+      expect(review).not.toContain("acme-playground");
+
+      await session.sendText("1");
+      await session.waitForText("Team saved.", TIMEOUT);
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      expect(readFileSync(join(root.root, "mcp-wire.jsonl"), "utf8")).toContain(
+        '"answer":"acme-playground"',
+      );
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a typed label that matches two titled choices asks again, and a number names its choice",
+    async () => {
+      const root = createRoot();
+      writeMcpFormProfile(root, {
+        type: "string",
+        title: "Team",
+        oneOf: [
+          { const: "a", title: "Decline" },
+          { const: "c", title: "Decline" },
+          { const: "d", title: "Decline (c)" },
+        ],
+      });
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: MCP_TOOL }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: MCP_TOOL, arguments: { text: "hello" } }),
+        fakeGatewayFinalText("Team saved.\n"),
+      ], { models: [{ id: MCP_MODEL, type: "language", tags: ["tool-use"] }] });
+      gateways.push(gateway);
+      const tracePath = join(root.root, "fx-trace.log");
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--auto", "--no-save", "Choose the team."]),
+        cwd: root.workspace,
+        env: {
+          ...gatewayEnv(root.home, gateway),
+          FX_MODEL: MCP_MODEL,
+          NO_COLOR: undefined,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "mcp",
+        },
+        width: 100,
+        height: 40,
+        minimumHistoryLines: 200,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      await session.waitForText("Choose a number or enter a value:", 60_000);
+      await session.sendText("Decline (c)");
+      await session.waitForText("That matches more than one choice. Type its number.", 15_000);
+      await session.sendText("3");
+      await session.waitForText("Current values:", TIMEOUT);
+      const review = await session.captureFullScrollback();
+      expect(review).toMatch(/^- Team: Decline \(c\)$/m);
+
+      await session.sendText("1");
+      await session.waitForText("Team saved.", TIMEOUT);
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      expect(readFileSync(join(root.root, "mcp-wire.jsonl"), "utf8")).toContain('"answer":"d"');
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("dropped an ambiguous typed choice answer");
+      expect(trace).not.toContain("Decline (c)");
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a typed title shaped like an option index names its own choice",
+    async () => {
+      const root = createRoot();
+      writeMcpFormProfile(root, {
+        type: "string",
+        title: "Team",
+        oneOf: [
+          { const: "a", title: '{"option":1}' },
+          { const: "b", title: "Beta" },
+        ],
+      });
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: MCP_TOOL }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: MCP_TOOL, arguments: { text: "hello" } }),
+        fakeGatewayFinalText("Team saved.\n"),
+      ], { models: [{ id: MCP_MODEL, type: "language", tags: ["tool-use"] }] });
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--auto", "--no-save", "Choose the team."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), FX_MODEL: MCP_MODEL, NO_COLOR: undefined },
+        width: 100,
+        height: 40,
+        minimumHistoryLines: 200,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      await session.waitForText("Choose a number or enter a value:", 60_000);
+      await session.sendText('{"option":1}');
+      await session.waitForText("Current values:", TIMEOUT);
+      const review = await session.captureFullScrollback();
+      expect(review).toContain('- Team: {"option":1}');
+      expect(review).not.toContain("- Team: Beta");
+
+      await session.sendText("1");
+      await session.waitForText("Team saved.", TIMEOUT);
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      expect(readFileSync(join(root.root, "mcp-wire.jsonl"), "utf8")).toContain('"answer":"a"');
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "fx ask in a terminal answers ask_user_question as unavailable and opens no choice prompt",
+    async () => {
+      const root = createRoot();
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("question", "ask_user_question", {
+          questions: [{
+            question: "Pick one",
+            options: [{ label: "Alpha", description: "First" }, { label: "Beta", description: "Second" }],
+          }],
+        }),
+        fakeGatewayFinalText("Question unavailable handled.\n"),
+      ]);
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--auto", "--no-save", "Ask me a question."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 100,
+        height: 40,
+        minimumHistoryLines: 200,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      await session.waitForText("Question unavailable handled.", TIMEOUT);
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const screen = await session.captureFullScrollback();
+      expect(screen).not.toContain("Choose a number or enter a value:");
+      expect(screen).not.toContain("Pick one");
+      expect(gateway.requests[1]?.body).toContain("only available in the interactive shell");
+    },
+    TIMEOUT,
+  );
 });
 
 // Both login shells read these files, so the tests hold for zsh and bash.

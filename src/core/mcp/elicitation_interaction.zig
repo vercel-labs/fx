@@ -7,6 +7,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -203,9 +204,13 @@ const FieldValue = struct {
     name: []const u8,
     answered: bool = false,
     json: ?[]u8,
+    /// The menu label of the chosen option of a single-select field. The review shows
+    /// it; the server still receives `json`.
+    choice_label: ?[]u8 = null,
 
     fn deinit(self: *FieldValue, alloc: Allocator) void {
         if (self.json) |value| alloc.free(value);
+        if (self.choice_label) |label| alloc.free(label);
         self.* = undefined;
     }
 };
@@ -214,6 +219,14 @@ const FieldAnswer = union(enum) {
     cancelled,
     declined,
     value: ?[]u8,
+    /// A single-select answer with the index of its option, so the review shows that
+    /// option's label even when another option has the same value.
+    choice: ChosenChoice,
+};
+
+const ChosenChoice = struct {
+    json: []u8,
+    index: usize,
 };
 
 const FillAction = enum {
@@ -298,6 +311,7 @@ fn answerForm(
                 },
                 else => return err,
             };
+            var chosen_index: ?usize = null;
             const value = switch (answer) {
                 .declined => return alloc.dupe(u8, "{\"action\":\"decline\"}"),
                 .cancelled => {
@@ -305,9 +319,21 @@ fn answerForm(
                     break;
                 },
                 .value => |value| value,
+                .choice => |chosen| blk: {
+                    chosen_index = chosen.index;
+                    break :blk chosen.json;
+                },
             };
             if (current.json) |previous| alloc.free(previous);
             current.json = value;
+            if (current.choice_label) |previous| alloc.free(previous);
+            current.choice_label = null;
+            current.choice_label = if (chosen_index) |index|
+                try choiceLabelAlloc(alloc, field.choices, &.{}, index)
+            else if (value) |json|
+                try choiceLabelFor(alloc, field, json)
+            else
+                null;
             current.answered = true;
         }
         if (cancelled) return alloc.dupe(u8, "{\"action\":\"cancel\"}");
@@ -406,6 +432,7 @@ fn answerField(
             alloc,
             speaker,
             field,
+            current.choice_label,
             current.json,
             deadline_ms,
             cancel_flag,
@@ -496,7 +523,7 @@ fn answerField(
     switch (field.kind) {
         .boolean => {},
         .single_select => for (field.choices, 0..) |choice, choice_index| {
-            const label = try choiceLabelAlloc(alloc, choice_index, choice.title);
+            const label = try choiceLabelAlloc(alloc, field.choices, &.{}, choice_index);
             var owns_label = true;
             errdefer if (owns_label) alloc.free(label);
             const description = if (choice.description) |raw| blk: {
@@ -512,13 +539,16 @@ fn answerField(
         .string, .number, .integer => {},
         .multi_select => unreachable,
     }
+    if (field.kind == .single_select) {
+        return singleSelectAnswer(alloc, field, question, option_list.items, deadline_ms, cancel_flag, questioner);
+    }
     const boolean_options = [_]types.QuestionOption{
         .{ .label = "True" },
         .{ .label = "False" },
     };
     const question_options: []const types.QuestionOption = switch (field.kind) {
         .boolean => &boolean_options,
-        .single_select => option_list.items,
+        .single_select => unreachable,
         .string, .number, .integer => &.{},
         .multi_select => unreachable,
     };
@@ -541,7 +571,7 @@ fn answerField(
             try alloc.dupe(u8, "false")
         else
             return error.InvalidAnswer,
-        .single_select => try choiceJson(alloc, option_list.items, field.choices, answer),
+        .single_select => unreachable,
         .multi_select => unreachable,
     };
     errdefer alloc.free(result);
@@ -581,9 +611,13 @@ fn answerCompactField(
     var choices: std.ArrayList(types.QuestionOption) = .empty;
     var actions: std.ArrayList(CompactAction) = .empty;
     std.debug.assert(field.kind == .single_select);
+    var controls: std.ArrayList([]const u8) = .empty;
+    try controls.appendSlice(temp, &.{ "Decline", "Cancel" });
+    if (field.default_json != null) try controls.append(temp, "Use default");
+    if (!field.required) try controls.append(temp, "Skip");
     for (field.choices, 0..) |choice, index| {
         try choices.append(temp, .{
-            .label = try choiceLabelAlloc(temp, index, choice.title),
+            .label = try choiceLabelAlloc(temp, field.choices, controls.items, index),
             .description = if (choice.description) |desc| try terminalSafeAlloc(temp, desc) else null,
         });
         try actions.append(temp, .{ .value = try stringifyString(temp, choice.value) });
@@ -637,6 +671,7 @@ fn askToKeepCurrentValue(
     alloc: Allocator,
     speaker: Speaker,
     field: elicitation.Field,
+    current_label: ?[]const u8,
     current_json: ?[]const u8,
     deadline_ms: i64,
     cancel_flag: ?*const std.atomic.Value(bool),
@@ -644,7 +679,10 @@ fn askToKeepCurrentValue(
 ) Error!KeepCurrentDecision {
     const display_name = try terminalSafeAlloc(alloc, field.displayName());
     defer alloc.free(display_name);
-    const display_value = if (current_json) |json|
+    // A choice label is already terminal-safe, so it is shown as it is.
+    const display_value = if (current_label) |label|
+        try alloc.dupe(u8, label)
+    else if (current_json) |json|
         try terminalSafeAlloc(alloc, json)
     else
         try alloc.dupe(u8, "(skipped)");
@@ -892,7 +930,9 @@ fn buildReviewQuestion(
         const display_label = try terminalSafeAlloc(alloc, label);
         defer alloc.free(display_label);
         try out.writer.print("- {s}: ", .{display_label});
-        if (value.json) |json| {
+        if (value.choice_label) |chosen| {
+            try out.writer.writeAll(chosen);
+        } else if (value.json) |json| {
             const display_json = try terminalSafeAlloc(alloc, json);
             defer alloc.free(display_json);
             try out.writer.writeAll(display_json);
@@ -910,6 +950,22 @@ fn stringifyString(alloc: Allocator, value: []const u8) Error![]u8 {
     defer out.deinit();
     try std.json.Stringify.value(value, .{}, &out.writer);
     return out.toOwnedSlice();
+}
+
+/// The menu label of the option whose value is `json`, for a single-select field. The
+/// review shows that label, so a repeated title keeps its value. A value that matches
+/// no option, such as typed text, has no label.
+fn choiceLabelFor(alloc: Allocator, field: elicitation.Field, json: []const u8) Error!?[]u8 {
+    if (field.kind != .single_select) return null;
+    const parsed = json_decode.parseFromSlice([]const u8, alloc, json, .{}) catch |err|
+        return if (err == error.OutOfMemory) error.OutOfMemory else null;
+    defer parsed.deinit();
+    for (field.choices, 0..) |choice, index| {
+        if (std.mem.eql(u8, parsed.value, choice.value)) {
+            return try choiceLabelAlloc(alloc, field.choices, &.{}, index);
+        }
+    }
+    return null;
 }
 
 fn validateNumberAnswer(
@@ -932,36 +988,156 @@ fn validateNumberAnswer(
     return alloc.dupe(u8, trimmed);
 }
 
-fn choiceJson(
+/// The most answers one single-select question takes while each typed label matches
+/// more than one choice. After that the answer is invalid.
+const ambiguous_choice_attempts = 3;
+const ambiguous_choice_notice = "That matches more than one choice. Type its number.";
+
+/// Asks a single-select field and returns the chosen value as JSON, with the index of
+/// the chosen option.
+fn singleSelectAnswer(
+    alloc: Allocator,
+    field: elicitation.Field,
+    question: []const u8,
+    options: []const types.QuestionOption,
+    deadline_ms: i64,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    questioner: Questioner,
+) Error!FieldAnswer {
+    const index = (try askChoiceIndex(alloc, question, options, deadline_ms, cancel_flag, questioner)) orelse
+        return .cancelled;
+    const value = try stringifyString(alloc, field.choices[index].value);
+    errdefer alloc.free(value);
+    elicitation.validateFieldJson(alloc, field, value, .{}) catch |err| switch (err) {
+        error.InvalidResponse => return error.InvalidAnswer,
+        else => return err,
+    };
+    return .{ .choice = .{ .json = value, .index = index } };
+}
+
+/// Asks one single-select question and returns the index of the chosen option, or null
+/// when the user cancels. A surface answers with JSON only: `{"option":N}` names option N,
+/// and `{"value":S}` carries typed text S, which names the option whose label equals S.
+/// Text that equals several labels asks again with a notice.
+fn askChoiceIndex(
+    alloc: Allocator,
+    question: []const u8,
+    options: []const types.QuestionOption,
+    deadline_ms: i64,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    questioner: Questioner,
+) Error!?usize {
+    var notice = false;
+    for (0..ambiguous_choice_attempts) |attempt| {
+        const asked = if (notice)
+            try alloc.print("{s}\n{s}", .{ question, ambiguous_choice_notice })
+        else
+            try alloc.dupe(u8, question);
+        defer alloc.free(asked);
+        const answer = switch (try ask_single(alloc, asked, options, .choice, deadline_ms, cancel_flag, questioner)) {
+            .cancelled => return null,
+            .invalid => return error.InvalidAnswer,
+            .answer => |answer| answer,
+        };
+        defer alloc.free(answer);
+        switch (try choiceAnswerIndex(alloc, options, answer)) {
+            .none => return error.InvalidAnswer,
+            .one => |index| return index,
+            .many => {
+                debug_trace.logf(
+                    "mcp",
+                    "mcp elicitation dropped an ambiguous typed choice answer: it matched more than one choice attempt={d} of {d}",
+                    .{ attempt + 1, ambiguous_choice_attempts },
+                );
+                notice = true;
+            },
+        }
+    }
+    debug_trace.logf(
+        "mcp",
+        "mcp elicitation dropped the typed choice answer: every answer matched more than one choice",
+        .{},
+    );
+    return error.InvalidAnswer;
+}
+
+const ChoiceAnswer = union(enum) {
+    none,
+    one: usize,
+    many,
+};
+
+/// The answer to a single-select question: `{"option":N}` or `{"value":S}`, and nothing else.
+const ChoiceWire = struct {
+    option: ?usize = null,
+    value: ?[]const u8 = null,
+};
+
+fn choiceAnswerIndex(
     alloc: Allocator,
     options: []const types.QuestionOption,
-    choices: []const elicitation.Choice,
     answer: []const u8,
-) Error![]u8 {
-    const value = selectedChoiceValue(options, choices, answer) orelse return error.InvalidAnswer;
-    return stringifyString(alloc, value);
-}
-
-fn selectedChoiceValue(
-    options: []const types.QuestionOption,
-    choices: []const elicitation.Choice,
-    answer: []const u8,
-) ?[]const u8 {
-    if (options.len != choices.len) return null;
-    for (options, choices) |option, choice| {
-        if (std.mem.eql(u8, answer, option.label)) return choice.value;
+) Error!ChoiceAnswer {
+    const parsed = json_decode.parseFromSlice(ChoiceWire, alloc, answer, .{}) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return error.InvalidAnswer;
+    };
+    defer parsed.deinit();
+    if (parsed.value.option) |index| {
+        if (parsed.value.value != null) return error.InvalidAnswer;
+        return if (index < options.len) .{ .one = index } else .none;
     }
-    return null;
+    const text = parsed.value.value orelse return error.InvalidAnswer;
+    return labelMatch(options, text);
 }
 
+fn labelMatch(options: []const types.QuestionOption, answer: []const u8) ChoiceAnswer {
+    var found: ?usize = null;
+    for (options, 0..) |option, index| {
+        if (!std.mem.eql(u8, answer, option.label)) continue;
+        if (found != null) return .many;
+        found = index;
+    }
+    const index = found orelse return .none;
+    return .{ .one = index };
+}
+
+/// The text a single-select choice shows and answers with: its title, with no
+/// number. The surface that prints the menu adds the number. A title that another
+/// choice, or a control in the same menu (`reserved`), also shows gets the choice's
+/// value in parentheses, so each answer names one option.
 fn choiceLabelAlloc(
     alloc: Allocator,
+    choices: []const elicitation.Choice,
+    reserved: []const []const u8,
     choice_index: usize,
-    raw_title: []const u8,
 ) Error![]u8 {
-    const title = try terminalSafeAlloc(alloc, raw_title);
+    const title = try terminalSafeAlloc(alloc, choices[choice_index].title);
     defer alloc.free(title);
-    return alloc.print("[{d}] {s}", .{ choice_index + 1, title });
+    if (!try titleRepeats(alloc, choices, reserved, choice_index, title)) return alloc.dupe(u8, title);
+    const value = try terminalSafeAlloc(alloc, choices[choice_index].value);
+    defer alloc.free(value);
+    return alloc.print("{s} ({s})", .{ title, value });
+}
+
+/// Whether a control or another choice shows `title` once terminal-safe escaping is applied.
+fn titleRepeats(
+    alloc: Allocator,
+    choices: []const elicitation.Choice,
+    reserved: []const []const u8,
+    choice_index: usize,
+    title: []const u8,
+) Error!bool {
+    for (reserved) |control| {
+        if (std.mem.eql(u8, control, title)) return true;
+    }
+    for (choices, 0..) |other, other_index| {
+        if (other_index == choice_index) continue;
+        const other_title = try terminalSafeAlloc(alloc, other.title);
+        defer alloc.free(other_title);
+        if (std.mem.eql(u8, other_title, title)) return true;
+    }
+    return false;
 }
 
 fn answerUrl(
@@ -1219,23 +1395,23 @@ test "interaction review shows every validated current value before submission" 
     const alloc = std.testing.allocator;
     var fixture = Fixture{
         .answers = &.{
-            "A1",           "Edit",
-            "Ada",          "0.5",
-            "42",           "True",
-            "[1] Red",      "Include",
-            "Exclude",      "Edit",
-            "Edit value",   "Bea",
-            "Keep current", "Keep current",
-            "Keep current", "Keep current",
-            "Edit value",   "Exclude",
-            "Include",      "Submit",
+            "A1",                  "Edit",
+            "Ada",                 "0.5",
+            "42",                  "True",
+            "{\"value\":\"Red\"}", "Include",
+            "Exclude",             "Edit",
+            "Edit value",          "Bea",
+            "Keep current",        "Keep current",
+            "Keep current",        "Keep current",
+            "Edit value",          "Exclude",
+            "Include",             "Submit",
         },
         .expected_review_values = &.{
             "- name: \"Bea\"",
             "- ratio: 0.5",
             "- age: 42",
             "- active: true",
-            "- color: \"red\"",
+            "- color: Red",
             "- tags: [\"b\"]",
         },
     };
@@ -1256,6 +1432,138 @@ test "interaction review shows every validated current value before submission" 
         response,
     );
     try std.testing.expect(fixture.review_contained_values);
+}
+
+test "interaction review shows the enumNames title of an enum choice" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{
+        .answers = &.{ "{\"value\":\"Small\"}", "Submit" },
+        .expected_review_values = &.{"- Size: Small"},
+    };
+    const required = @import("../tooling/tool_mcp_runtime.zig").InputRequired{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Size","requestedSchema":{"type":"object","properties":{"size":{"type":"string","title":"Size","enum":["s","m"],"enumNames":["Small","Medium"]}},"required":["size"]}}}}
+        ,
+    };
+    const response = try respond(alloc, Fixture.origin(), required, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings(
+        "{\"form\":{\"action\":\"accept\",\"content\":{\"size\":\"s\"}}}",
+        response,
+    );
+    try std.testing.expect(fixture.review_contained_values);
+}
+
+test "titled choices have no number and answer by title, and a repeated title keeps its value" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{
+        .answers = &.{ "{\"value\":\"Decline (c)\"}", "Submit" },
+        .require_terminal_safe = true,
+        .expected_display_fragments = &.{ "Decline (a)", "Cancel", "Decline (c)" },
+    };
+    const required = @import("../tooling/tool_mcp_runtime.zig").InputRequired{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Reply","requestedSchema":{"type":"object","properties":{"choice":{"type":"string","title":"Reply","oneOf":[{"const":"a","title":"Decline"},{"const":"b","title":"Cancel"},{"const":"c","title":"Decline"}]}},"required":["choice"]}}}}
+        ,
+    };
+    const response = try respond(alloc, Fixture.origin(), required, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings(
+        "{\"form\":{\"action\":\"accept\",\"content\":{\"choice\":\"c\"}}}",
+        response,
+    );
+    try std.testing.expect(fixture.saw_all_expected_display_fragments);
+}
+
+test "a typed label that matches two choices asks again, and a chosen index names its own choice" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{
+        .answers = &.{ "{\"value\":\"Decline (c)\"}", "{\"option\":2}", "Submit" },
+        .require_terminal_safe = true,
+        .expected_display_fragments = &.{"That matches more than one choice. Type its number."},
+    };
+    const required = @import("../tooling/tool_mcp_runtime.zig").InputRequired{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Reply","requestedSchema":{"type":"object","properties":{"choice":{"type":"string","title":"Reply","oneOf":[{"const":"a","title":"Decline"},{"const":"c","title":"Decline"},{"const":"d","title":"Decline (c)"}]}},"required":["choice"]}}}}
+        ,
+    };
+    const response = try respond(alloc, Fixture.origin(), required, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings(
+        "{\"form\":{\"action\":\"accept\",\"content\":{\"choice\":\"d\"}}}",
+        response,
+    );
+    try std.testing.expect(fixture.saw_all_expected_display_fragments);
+}
+
+test "a typed title that looks like an option index names its own choice" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{
+        .answers = &.{ "{\"value\":\"{\\\"option\\\":1}\"}", "Submit" },
+    };
+    const required = @import("../tooling/tool_mcp_runtime.zig").InputRequired{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Reply","requestedSchema":{"type":"object","properties":{"choice":{"type":"string","title":"Reply","oneOf":[{"const":"a","title":"{\"option\":1}"},{"const":"b","title":"Beta"}]}},"required":["choice"]}}}}
+        ,
+    };
+    const response = try respond(alloc, Fixture.origin(), required, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings(
+        "{\"form\":{\"action\":\"accept\",\"content\":{\"choice\":\"a\"}}}",
+        response,
+    );
+}
+
+test "a titled choice list refuses a repeated value, so no two options share one" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{ .answers = &.{} };
+    try std.testing.expectError(error.InvalidInputRequired, respond(alloc, Fixture.origin(), .{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Reply","requestedSchema":{"type":"object","properties":{"choice":{"type":"string","title":"Reply","oneOf":[{"const":"a","title":"One"},{"const":"a","title":"Two"}]}},"required":["choice"]}}}}
+        ,
+    }, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+    }));
+}
+
+test "compact menu label for a choice titled like a control keeps its value" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{
+        .answers = &.{"{\"option\":0}"},
+        .require_terminal_safe = true,
+        .expected_display_fragments = &.{"Cancel (a)"},
+    };
+    const response = try respond(alloc, Fixture.origin(), .{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Choose","requestedSchema":{"type":"object","properties":{"name":{"type":"string","oneOf":[{"const":"a","title":"Cancel"},{"const":"b","title":"Keep"}]}},"required":["name"]}}}}
+        ,
+    }, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+        .compact_forms = true,
+    });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings("{\"form\":{\"action\":\"accept\",\"content\":{\"name\":\"a\"}}}", response);
+    try std.testing.expect(fixture.saw_all_expected_display_fragments);
 }
 
 test "URL interaction requires consent and does not open on decline" {
@@ -1373,36 +1681,38 @@ test "single-select local identities preserve every colliding wire value" {
         "escape-raw",
         "escape-literal",
     };
-    var labels: [raw_titles.len][]u8 = undefined;
-    var label_count: usize = 0;
-    defer for (labels[0..label_count]) |label| alloc.free(label);
-    var options: [raw_titles.len]types.QuestionOption = undefined;
     var choices: [raw_titles.len]elicitation.Choice = undefined;
     for (raw_titles, 0..) |title, index| {
-        labels[index] = try choiceLabelAlloc(alloc, index, title);
-        label_count += 1;
-        options[index] = .{ .label = labels[index] };
         choices[index] = .{
             .value = @constCast(wire_values[index]),
             .title = @constCast(title),
         };
     }
+    var labels: [raw_titles.len][]u8 = undefined;
+    var label_count: usize = 0;
+    defer for (labels[0..label_count]) |label| alloc.free(label);
+    var options: [raw_titles.len]types.QuestionOption = undefined;
+    for (0..raw_titles.len) |index| {
+        labels[index] = try choiceLabelAlloc(alloc, &choices, &.{}, index);
+        label_count += 1;
+        options[index] = .{ .label = labels[index] };
+    }
 
     for (options, 0..) |option, index| {
-        try std.testing.expectEqualStrings(
-            wire_values[index],
-            selectedChoiceValue(&options, &choices, option.label).?,
-        );
+        const found = labelMatch(&options, option.label);
+        try std.testing.expect(std.meta.activeTag(found) == .one);
+        try std.testing.expectEqual(index, found.one);
+        try std.testing.expectEqualStrings(wire_values[index], choices[found.one].value);
         for (options[index + 1 ..]) |other| {
             try std.testing.expect(!std.mem.eql(u8, option.label, other.label));
         }
     }
-    try std.testing.expect(std.mem.endsWith(u8, labels[4], "Collision\\x1b[2J"));
-    try std.testing.expect(std.mem.endsWith(u8, labels[5], "Collision\\x1b[2J"));
-    try std.testing.expect(selectedChoiceValue(&options, &choices, "Skip") == null);
-    try std.testing.expect(selectedChoiceValue(&options, &choices, "Use default") == null);
-    try std.testing.expect(selectedChoiceValue(&options, &choices, "Duplicate") == null);
-    try std.testing.expect(selectedChoiceValue(&options, &choices, "escape-raw") == null);
+    try std.testing.expectEqualStrings("Collision\\x1b[2J (escape-raw)", labels[4]);
+    try std.testing.expectEqualStrings("Collision\\x1b[2J (escape-literal)", labels[5]);
+    try std.testing.expectEqual(@as(usize, 0), labelMatch(&options, "Skip").one);
+    try std.testing.expectEqual(@as(usize, 1), labelMatch(&options, "Use default").one);
+    try std.testing.expect(std.meta.activeTag(labelMatch(&options, "Duplicate")) == .none);
+    try std.testing.expect(std.meta.activeTag(labelMatch(&options, "escape-raw")) == .none);
 }
 
 test "URL browser failure supports manual continuation and bounded retry" {
@@ -1629,7 +1939,7 @@ test "elicitation presentation terminal-safes every untrusted display value" {
     var fixture = Fixture{
         .answers = &.{
             "value\x1b]52;c;answer\x07\nnext",
-            "[1] Choice\\x1b]52;c;option\\x07",
+            "{\"value\":\"Choice\\\\x1b]52;c;option\\\\x07\"}",
             "Submit",
         },
         .require_terminal_safe = true,
@@ -1857,7 +2167,7 @@ test "compact form keeps review for short text numbers and booleans" {
 
 test "compact form keeps review for four choices" {
     const alloc = std.testing.allocator;
-    var fixture = Fixture{ .answers = &.{ "[1] a", "Submit" } };
+    var fixture = Fixture{ .answers = &.{ "{\"value\":\"a\"}", "Submit" } };
     const response = try respond(alloc, Fixture.origin(), .{
         .input_requests_json =
         \\{"form":{"method":"elicitation/create","params":{"message":"Choose","requestedSchema":{"type":"object","properties":{"name":{"type":"string","enum":["a","b","c","d"]}},"required":["name"]}}}}
