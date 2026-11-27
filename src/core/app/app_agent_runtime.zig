@@ -757,6 +757,24 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
+        pub fn resolveCommandPlacement(
+            app: *App,
+            agent: *AppAgent,
+            arena: Allocator,
+            call: ToolCall,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) !?types.CommandPlacement {
+            const ctx = toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
+            return tool_admission.runCommandPlacement(ctx.admissionInput(), arena, call);
+        }
+
         pub fn releaseAgentTerminalLease(
             app: *App,
             agent: *AppAgent,
@@ -1824,13 +1842,17 @@ fn formatToolAction(
     };
     if (try tool_presentation.formatRunCommandActivity(arena, ctx.tool_registry, ctx.workspace_root, call)) |activity| {
         defer arena.free(activity.detail);
-        const label = if (activity.compatibility_tool) |compatibility_tool|
+        const base_label = if (activity.compatibility_tool) |compatibility_tool|
             specLabel(compatibility_tool, state, denied_label)
         else switch (state) {
             .active => "Running",
             .completed => "Ran",
             .denied => denied_label.?,
         };
+        const label = if (activity.compatibility_tool == null)
+            try tool_presentation.formatCommandPlacementLabel(arena, base_label, call.command_placement)
+        else
+            base_label;
         return formatCommandActionValue(
             arena,
             label,
@@ -3982,4 +4004,39 @@ test "app agent runtime highlights shell command rows over the tool text base" {
     try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252m|\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252mwc\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;250m-c\x1b[39m") != null);
+}
+
+test "app agent runtime formats shell run labels for remote, isolated, local, and unplaced calls" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    const base_call: ToolCall = .{
+        .id = "1",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"uname -a\"}",
+    };
+
+    var remote_call = base_call;
+    remote_call.command_placement = .remote;
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolAction(app.agent(), arena, remote_call), "● Running on remote\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionCompleted(app.agent(), arena, remote_call), "● Ran on remote\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionDenied(app.agent(), arena, remote_call, "Exited 1"), "● Exited 1 on remote\x1b[0m "));
+
+    var isolated_call = base_call;
+    isolated_call.command_placement = .isolated;
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolAction(app.agent(), arena, isolated_call), "● Running on isolated\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionCompleted(app.agent(), arena, isolated_call), "● Ran on isolated\x1b[0m "));
+
+    var local_call = base_call;
+    local_call.command_placement = .local;
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolAction(app.agent(), arena, local_call), "● Running\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionCompleted(app.agent(), arena, local_call), "● Ran\x1b[0m "));
+
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolAction(app.agent(), arena, base_call), "● Running\x1b[0m "));
+    try std.testing.expect(std.mem.startsWith(u8, try app.describeToolActionCompleted(app.agent(), arena, base_call), "● Ran\x1b[0m "));
 }

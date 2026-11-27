@@ -5560,6 +5560,7 @@ pub fn dupeToolLifecycleEvent(
                 .arguments_json = arguments_json,
                 .place_after_current_transcript = started.place_after_current_transcript,
                 .mcp_tool = try dupeMcpToolName(alloc, started.mcp_tool),
+                .command_placement = started.command_placement,
             } };
         },
         .progress => |progress| blk: {
@@ -5664,11 +5665,12 @@ test "a copied terminal event keeps the notice of its shell result, and a failed
         .id = .{ .turn_id = 1, .call_id = "shell-1" },
         .outcome = .{ .kind = .completed, .summary = "Ran uname -s" },
         .result = "{\"output_delta\":\"Darwin\\n\"}",
-        .result_memory = .{ .notice = "fx: ran on local because of your rule for uname -s*" },
+        .result_memory = .{ .notice = "fx: ran on local because of your rule for uname -s*", .command_placement = .remote },
     } };
     const copy = try dupeToolLifecycleEvent(alloc, event);
     defer freeToolLifecycleEvent(alloc, copy);
     try std.testing.expectEqualStrings("fx: ran on local because of your rule for uname -s*", copy.terminal.result_memory.?.notice.?);
+    try std.testing.expectEqual(@as(?types.CommandPlacement, .remote), copy.terminal.result_memory.?.command_placement);
     try std.testing.checkAllAllocationFailures(@import("../shared/testing_allocator.zig").no_resize, struct {
         fn run(a: std.mem.Allocator, value: types.ToolLifecycleEvent) !void {
             freeToolLifecycleEvent(a, try dupeToolLifecycleEvent(a, value));
@@ -5756,6 +5758,7 @@ fn dupeToolResultMemory(
         .terminal_action_presentation = memory.terminal_action_presentation,
         .quiet_crossing = quiet_crossing,
         .subagent_started = memory.subagent_started,
+        .command_placement = memory.command_placement,
     };
 }
 

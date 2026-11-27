@@ -512,6 +512,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .request_tool_permission = requestToolPermission,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermission,
         .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
+        .resolve_command_placement = resolveCommandPlacement,
         .describe_tool_action = describeToolAction,
         .describe_tool_action_completed = describeToolAction,
         .describe_tool_action_denied = describeToolActionDenied,
@@ -951,6 +952,7 @@ fn describeToolAction(raw: *anyopaque, arena: Allocator, call: types.ToolCall, f
         .call = call,
         .workspace_root = context.config.tool_context.workspace_root,
         .display_target = file_path,
+        .command_placement = call.command_placement,
     });
 }
 
@@ -964,6 +966,11 @@ fn resolveToolActionDisplayTarget(raw: *anyopaque, arena: Allocator, call: types
         context.config.tool_context.managed_executions,
         call,
     );
+}
+
+fn resolveCommandPlacement(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !?types.CommandPlacement {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_admission.runCommandPlacement(context.toolContext().admissionInput(), arena, call);
 }
 
 fn describeToolActionDenied(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, label: []const u8, dynamic_names: []const []const u8) ![]const u8 {

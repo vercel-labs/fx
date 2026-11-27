@@ -2317,6 +2317,20 @@ const unsafe_git_hold_output =
     "names turned off, and plain git could start them. Inspect files with read_file, glob_files or grep_files, " ++
     "or ask the user to run git themselves.";
 
+/// Where a shell run is placed before execution, or null when the call is not
+/// a shell run or cannot be placed now.
+pub fn runCommandPlacement(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+) Allocator.Error!?types.CommandPlacement {
+    const context = runCommandContext(input, arena, call) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    return context.placement;
+}
+
 pub fn runCommandContext(
     input: Input,
     arena: Allocator,
@@ -7680,4 +7694,36 @@ test "a run keeps its approved placement when its cwd resolves to another path" 
         return error.TestExpectedPlacement;
     try std.testing.expectEqual(command_environment.Placement.local, kept.placement);
     try std.testing.expectEqualStrings("/private/tmp", kept.resolved_cwd);
+}
+
+test "runCommandPlacement returns the policy placement for shell runs and null for other calls" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, true);
+    const config = try arena.print(
+        "{{\"provider\":[\"{s}/fake-cli\"],\"rules\":[{{\"command\":\"uname*\",\"runner\":\"remote\"}},{{\"command\":\"convert*\",\"runner\":\"isolated\"}}]}}",
+        .{fx_home},
+    );
+    const policy = try loadSandboxTestPolicy(std.testing.allocator, tmp.dir, fx_home, config);
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = "/Users/example/repo";
+    input.sandbox_policy = policy;
+
+    const remote_call = try shellRunCall(arena, "uname -a", false);
+    const isolated_call = try shellRunCall(arena, "convert a.png b.jpg", false);
+    const local_call = try shellRunCall(arena, "echo ok", false);
+    const interact_call = ToolCall{ .id = "interact", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"s1\"}" };
+
+    try std.testing.expectEqual(@as(?types.CommandPlacement, .remote), try runCommandPlacement(input, arena, remote_call));
+    try std.testing.expectEqual(@as(?types.CommandPlacement, .isolated), try runCommandPlacement(input, arena, isolated_call));
+    try std.testing.expectEqual(@as(?types.CommandPlacement, .local), try runCommandPlacement(input, arena, local_call));
+    try std.testing.expectEqual(@as(?types.CommandPlacement, null), try runCommandPlacement(input, arena, interact_call));
+    input.sandbox_policy = null;
+    try std.testing.expectEqual(@as(?types.CommandPlacement, .local), try runCommandPlacement(input, arena, remote_call));
 }

@@ -2415,6 +2415,10 @@ const App = struct {
         return AgentAppRuntime.resolveToolActionDisplayTarget(self, agent, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
+    pub fn resolveCommandPlacement(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall) !?types.CommandPlacement {
+        return AgentAppRuntime.resolveCommandPlacement(self, agent, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    }
+
     pub fn describeToolActionWithAdvertised(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
         return self.describeToolAction(agent, arena, call, display_target, advertised_dynamic_tool_names);
     }

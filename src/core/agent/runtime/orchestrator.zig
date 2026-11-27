@@ -12448,6 +12448,9 @@ fn processQueuedPromptLoop(
                 resolved.authority.grants
             else
                 local_grants.items;
+            if (deps.resolve_command_placement) |resolve| {
+                tool_call.command_placement = try resolve(deps.ctx, arena, tool_call);
+            }
             var status_started = false;
             const defer_auto_command_lifecycle = try runtime_tool_admission.deferCapturedCommandLifecycleForAutoPermissionNotice(
                 deps.tool_registry,
@@ -12471,7 +12474,7 @@ fn processQueuedPromptLoop(
                 file_call_arena_state.allocator()
             else
                 arena;
-            const execution_call = if (is_file_mutation)
+            var execution_call = if (is_file_mutation)
                 try types.dupeToolCall(call_allocator, tool_call)
             else
                 tool_call;
@@ -12697,6 +12700,7 @@ fn processQueuedPromptLoop(
             }
             if (permission_result.tool_failure) |failure_output| {
                 if (!status_started) {
+                    execution_call.command_placement = null;
                     status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                         deps,
                         call_allocator,
@@ -12886,6 +12890,9 @@ fn processQueuedPromptLoop(
             );
             if (file_display_path) |display_path| {
                 tool_display_target = display_path;
+            }
+            if (runtime_tool_presentation.commandPlacementFromAuthority(execution_authority)) |approved_placement| {
+                execution_call.command_placement = approved_placement;
             }
 
             if (!status_started) {

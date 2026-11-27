@@ -99,6 +99,11 @@ pub const ToolDetailRecord = struct {
     /// A `subagent` message that made a new subagent, as its host said
     /// live and its session saved (D101).
     subagent_started: bool = false,
+    /// Where an admitted shell command ran, from admission's placement
+    /// (`ToolLifecycleEvent.authoritative_started.command_placement` and
+    /// `ToolResultMemory.command_placement`). Null for any other call or a
+    /// row restored from a saved session (R3.5).
+    command_placement: ?types.CommandPlacement = null,
     /// The MCP server a call's tool is on and the tool's own name, as core
     /// knew them when the call started or the session recorded them
     /// (`types.McpToolName`); null for any other call, or one core could not

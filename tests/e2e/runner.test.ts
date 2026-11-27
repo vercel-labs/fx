@@ -3483,3 +3483,90 @@ describe("the notice of a shell run reaches the person in the TUI and in plain f
     );
   }, TIMEOUT * 2);
 });
+
+describe("shell rows and group headers name non-local runners (D8)", () => {
+  test.skipIf(!HAS_TMUX)(
+    "the TUI shows Running on remote while a remote command runs, Ran on remote after it ends, and plain Ran for a local command",
+    async () => {
+      await withSandboxFixture(
+        [
+          fakeGatewayToolCall("call-1", "shell", { command: "sleep 2; echo done" }),
+          fakeGatewayFinalText("Remote done.\n"),
+          fakeGatewayToolCall("call-2", "shell", { command: "echo local-ok" }),
+          fakeGatewayFinalText("Local done.\n"),
+        ],
+        async (fixture) => {
+          const session = await TmuxSession.create({
+            cmd: FX_BIN,
+            cwd: fixture.workspace,
+            width: 200,
+            env: { ...gatewayEnv(fixture.home, fixture.gateway), ...fixture.setup.env, FX_PERMISSION_MODE: "full-access" },
+          });
+          sessions.push(session);
+          await session.waitForComposer(TIMEOUT);
+          await session.sendText("Run remote.");
+          await session.waitForText("Running on remote", TIMEOUT);
+          await session.waitForText("Ran on remote", TIMEOUT);
+          await session.waitForText("Remote done.", TIMEOUT);
+          await session.waitForComposer(TIMEOUT);
+
+          await session.sendText("Run local.");
+          await session.waitForText("Local done.", TIMEOUT);
+          const scrollback = await session.captureFullScrollback();
+          expect(scrollback).toContain("Ran on remote");
+          expect(scrollback).toContain("Ran echo local-ok");
+          expect(scrollback).not.toContain("on remote echo local-ok");
+        },
+        () => ({ rules: [{ command: "sleep 2*", runner: "remote" }] }),
+      );
+    },
+    TIMEOUT * 2,
+  );
+
+  test.skipIf(!HAS_TMUX)(
+    "a mixed group shows (1 on remote) in its header",
+    async () => {
+      await withSandboxFixture(
+        [
+          fakeGatewayToolCall("call-1", "shell", { command: "uname -a" }),
+          fakeGatewayToolCall("call-2", "shell", { command: "echo local-ok" }),
+          fakeGatewayFinalText("Mixed done.\n"),
+        ],
+        async (fixture) => {
+          const session = await TmuxSession.create({
+            cmd: FX_BIN,
+            cwd: fixture.workspace,
+            width: 200,
+            env: { ...gatewayEnv(fixture.home, fixture.gateway), ...fixture.setup.env, FX_PERMISSION_MODE: "full-access" },
+          });
+          sessions.push(session);
+          await session.waitForComposer(TIMEOUT);
+          await session.sendText("Run mixed.");
+          await session.waitForText("Mixed done.", TIMEOUT);
+          const lines = (await session.captureFullScrollback()).split("\n");
+          const header = lines.find((line) => line.includes("● Ran ") && line.includes("(1 on remote)"));
+          expect(header).toBeDefined();
+          expect(header).toContain("✓");
+        },
+        () => ({ rules: [{ command: "uname*", runner: "remote" }] }),
+      );
+    },
+    TIMEOUT * 2,
+  );
+
+  test("plain fx ask progress lines say Running on remote for a remote run", async () => {
+    await withSandboxFixture(
+      shellCall({ command: "uname -a", runner: "remote" }),
+      async (fixture) => {
+        const result = await runFx(["ask", "--permission-mode", "full-access", "Run it."], {
+          cwd: fixture.workspace,
+          timeoutMs: TIMEOUT,
+          env: { ...gatewayEnv(fixture.home, fixture.gateway), ...fixture.setup.env },
+        });
+        expect(result.code).toBe(0);
+        expect(result.stderr).toContain("Running on remote uname -a");
+      },
+    );
+  }, TIMEOUT * 2);
+});
+

@@ -2031,6 +2031,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .check_found_command_ended = source.check_found_command_ended,
         .resolved_path = resolved_path,
         .subagent_started = source.subagent_started,
+        .command_placement = source.command_placement,
         .mcp_server = mcp_server,
         .mcp_tool = mcp_tool,
     };
@@ -2061,9 +2062,11 @@ test "a snapshot copy of a shell check keeps whether it found its command ended"
             .arguments_json = @constCast("{\"action\":\"interact\",\"session_id\":\"shell-1\"}"),
             .outcome = .completed,
             .check_found_command_ended = ended,
+            .command_placement = if (ended) .remote else null,
         });
         defer copy.deinit(alloc);
         try std.testing.expectEqual(ended, copy.check_found_command_ended);
+        try std.testing.expectEqual(if (ended) @as(?types.CommandPlacement, .remote) else null, copy.command_placement);
     }
 }
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const host_target = @import("../hosts/target.zig");
+const types = @import("../shared/types.zig");
 
 pub const Profile = enum {
     clean,
@@ -36,11 +37,7 @@ pub const Environment = union(enum) {
 /// Where an admitted command runs: this machine, the kept remote
 /// sandbox, or a fresh isolated sandbox. A grant binds it, so a grant for one
 /// placement never approves another.
-pub const Placement = enum {
-    local,
-    remote,
-    isolated,
-};
+pub const Placement = types.CommandPlacement;
 
 const permission_identity_prefix = "@fx-terminal-env:";
 const tty_permission_identity_prefix = "@fx-shell-mode:tty:";

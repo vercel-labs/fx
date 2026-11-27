@@ -364,6 +364,10 @@ pub fn Bindings(comptime App: type) type {
                     agentResolveToolActionDisplayTarget
                 else
                     null,
+                .resolve_command_placement = if (comptime @hasDecl(App, "resolveCommandPlacement"))
+                    agentResolveCommandPlacement
+                else
+                    null,
                 .describe_tool_action = agentDescribeToolAction,
                 .describe_tool_action_completed = agentDescribeToolActionCompleted,
                 .describe_tool_action_denied = agentDescribeToolActionDenied,
@@ -1118,6 +1122,12 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
             return app.resolveToolActionDisplayTarget(agent, arena, call);
+        }
+
+        fn agentResolveCommandPlacement(ctx: *anyopaque, arena: Allocator, call: ToolCall) !?types.CommandPlacement {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            return app.resolveCommandPlacement(agent, arena, call);
         }
 
         fn agentDescribeToolAction(ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {

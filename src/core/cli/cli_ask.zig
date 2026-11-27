@@ -2248,6 +2248,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
         .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
+        .resolve_command_placement = resolveCommandPlacement,
         .describe_tool_action = describeToolAction,
         .describe_tool_action_completed = describeToolActionCompleted,
         .describe_tool_action_denied = describeToolActionDenied,
@@ -2749,6 +2750,7 @@ fn describeToolAction(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, dis
         .workspace_root = ctx.workspace_root,
         .display_target = display_target,
         .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
+        .command_placement = call.command_placement,
     });
 }
 
@@ -2764,6 +2766,11 @@ fn resolveToolActionDisplayTarget(raw_ctx: *anyopaque, arena: Allocator, call: T
     );
 }
 
+fn resolveCommandPlacement(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?types.CommandPlacement {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_admission.runCommandPlacement(ctx.toolContext().admissionInput(), arena, call);
+}
+
 fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (try tool_presentation.formatSubagentPlainAction(arena, call, .completed)) |line| return line;
@@ -2773,6 +2780,7 @@ fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: Tool
         .workspace_root = ctx.workspace_root,
         .display_target = display_target,
         .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
+        .command_placement = call.command_placement,
     });
 }
 
@@ -2785,6 +2793,7 @@ fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCal
         .workspace_root = ctx.workspace_root,
         .display_target = display_target,
         .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
+        .command_placement = call.command_placement,
     });
     return arena.print("{s}: {s}", .{ label, action });
 }

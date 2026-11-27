@@ -1114,6 +1114,106 @@ test "a command row keeps the notice of a call that a later call joined" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "├ fx: ran on local because of your rule for uname -s*"));
 }
 
+test "shell group headers format all-remote and mixed-runner groups" {
+    const alloc = std.testing.allocator;
+    // All-remote group: header says "Ran on remote ...".
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran on remote uname -a\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran on remote sleep 1\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran on remote echo ok\n", .class = .tool_status } },
+        };
+        var details = [_]ToolDetailRecord{
+            storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"uname -a\"}", 0, "{\"output_delta\":\"Linux\\n\",\"exit_code\":0}"),
+            storyCommandDetail(2, "{\"action\":\"run\",\"command\":\"sleep 1\"}", 0, "{\"output_delta\":\"\",\"exit_code\":0}"),
+            storyCommandDetail(3, "{\"action\":\"run\",\"command\":\"echo ok\"}", 0, "{\"output_delta\":\"ok\\n\",\"exit_code\":0}"),
+        };
+        for (&details) |*d| d.command_placement = .remote;
+        details[0].command_display = @constCast("uname -a");
+        details[1].command_display = @constCast("sleep 1");
+        details[2].command_display = @constCast("echo ok");
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Ran on remote uname, sleep, echo · 3 calls ✓", firstLineForTest(text));
+    }
+    // All-isolated group: header says "Ran on isolated ...".
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran on isolated uname -a\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran on isolated echo ok\n", .class = .tool_status } },
+        };
+        var details = [_]ToolDetailRecord{
+            storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"uname -a\"}", 0, "{\"output_delta\":\"Linux\\n\",\"exit_code\":0}"),
+            storyCommandDetail(2, "{\"action\":\"run\",\"command\":\"echo ok\"}", 0, "{\"output_delta\":\"ok\\n\",\"exit_code\":0}"),
+        };
+        for (&details) |*d| d.command_placement = .isolated;
+        details[0].command_display = @constCast("uname -a");
+        details[1].command_display = @constCast("echo ok");
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Ran on isolated uname, echo · 2 calls ✓", firstLineForTest(text));
+    }
+    // Mixed group of commands only: keeps plain "Ran" and adds "(2 on remote)" before ✓.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran uname -a\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran on remote sleep 1\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran on remote echo ok\n", .class = .tool_status } },
+        };
+        var details = [_]ToolDetailRecord{
+            storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"uname -a\"}", 0, "{\"output_delta\":\"Linux\\n\",\"exit_code\":0}"),
+            storyCommandDetail(2, "{\"action\":\"run\",\"command\":\"sleep 1\"}", 0, "{\"output_delta\":\"\",\"exit_code\":0}"),
+            storyCommandDetail(3, "{\"action\":\"run\",\"command\":\"echo ok\"}", 0, "{\"output_delta\":\"ok\\n\",\"exit_code\":0}"),
+        };
+        details[0].command_display = @constCast("uname -a");
+        details[0].command_placement = .local;
+        details[1].command_display = @constCast("sleep 1");
+        details[1].command_placement = .remote;
+        details[2].command_display = @constCast("echo ok");
+        details[2].command_placement = .remote;
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Ran uname, sleep, echo · 3 calls (2 on remote) ✓", firstLineForTest(text));
+    }
+    // Multi-row mixed group (read + local shell + remote shell): header adds "(1 on remote)" before ✓.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Read notes.md\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran uname -a\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran on remote echo ok\n", .class = .tool_status } },
+        };
+        var details = [_]ToolDetailRecord{
+            storyReadDetailForTest(1, "notes.md"),
+            storyCommandDetail(2, "{\"action\":\"run\",\"command\":\"uname -a\"}", 0, "{\"output_delta\":\"Linux\\n\",\"exit_code\":0}"),
+            storyCommandDetail(3, "{\"action\":\"run\",\"command\":\"echo ok\"}", 0, "{\"output_delta\":\"ok\\n\",\"exit_code\":0}"),
+        };
+        details[1].command_display = @constCast("uname -a");
+        details[1].command_placement = .local;
+        details[2].command_display = @constCast("echo ok");
+        details[2].command_placement = .remote;
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Ran commands, read a file (1 on remote) ✓", firstLineForTest(text));
+    }
+    // Restored row with no runner data (command_placement == null): shows no marker.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran uname -a\n", .class = .tool_status } },
+        };
+        var details = [_]ToolDetailRecord{
+            storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"uname -a\"}", 0, "{\"output_delta\":\"Linux\\n\",\"exit_code\":0}"),
+        };
+        details[0].origin = .recorded;
+        details[0].command_display = @constCast("uname -a");
+        details[0].command_placement = null;
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Ran uname -a ✓", firstLineForTest(text));
+        try std.testing.expect(std.mem.find(u8, text, "on remote") == null);
+        try std.testing.expect(std.mem.find(u8, text, "on isolated") == null);
+    }
+}
+
 test "a failed command's reason leaves out escapes with intermediate bytes and OSC links" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1361,6 +1461,9 @@ const StoryTally = struct {
     web_searches: usize = 0,
     web_reads: usize = 0,
     commands: usize = 0,
+    commands_local: usize = 0,
+    commands_remote: usize = 0,
+    commands_isolated: usize = 0,
     /// Sessions that later calls sent input to or stopped. Those calls are
     /// not new commands, so they count here instead.
     followed_sessions: std.ArrayList([]const u8) = .empty,
@@ -1482,6 +1585,11 @@ const StoryTally = struct {
                 const follow_up = isSessionFollowUp(scratch, record);
                 if (!follow_up) {
                     self.commands += 1;
+                    switch (record.command_placement orelse .local) {
+                        .local => self.commands_local += 1,
+                        .remote => self.commands_remote += 1,
+                        .isolated => self.commands_isolated += 1,
+                    }
                 } else if (storyArgString(scratch, record, "session_id")) |id| {
                     try addDistinct(&self.followed_sessions, scratch, id);
                 } else {
@@ -1548,6 +1656,35 @@ const StoryTally = struct {
 
     fn changedFiles(self: StoryTally) usize {
         return if (self.changed_paths.items.len > 0) self.changed_paths.items.len else self.change_calls;
+    }
+
+    fn uniformNonLocalPlacement(self: StoryTally) ?types.CommandPlacement {
+        if (self.commands == 0) return null;
+        if (self.commands_remote == self.commands) return .remote;
+        if (self.commands_isolated == self.commands) return .isolated;
+        return null;
+    }
+
+    fn isMixedRunner(self: StoryTally) bool {
+        return self.uniformNonLocalPlacement() == null and
+            (self.commands_remote > 0 or self.commands_isolated > 0);
+    }
+
+    fn mixedRunnerNote(self: StoryTally, scratch: std.mem.Allocator) ![]const u8 {
+        if (!self.isMixedRunner()) return "";
+        var out: std.Io.Writer.Allocating = .init(scratch);
+        try out.writer.writeAll(" (");
+        var wrote_any = false;
+        if (self.commands_remote > 0) {
+            try writeCount(&out.writer, "", self.commands_remote, " on remote");
+            wrote_any = true;
+        }
+        if (self.commands_isolated > 0) {
+            if (wrote_any) try out.writer.writeAll(", ");
+            try writeCount(&out.writer, "", self.commands_isolated, " on isolated");
+        }
+        try out.writer.writeByte(')');
+        return out.written();
     }
 };
 
@@ -1772,6 +1909,15 @@ fn checkRowPhrase(scratch: std.mem.Allocator, row: *const StoryRow, phrase: []co
     const own_label = check_returned_label ++ " ";
     if (!std.mem.startsWith(u8, phrase, own_label)) return null;
     const label = if (record.check_found_command_ended) "Ran" else if (row.turn_ended) check_waited_label else check_running_label;
+    if (record.check_found_command_ended and row.identity.kind != .commands) {
+        if (row.background) |bg| {
+            if (bg.command_placement) |placement| {
+                if (placement.runnerPhrase()) |suffix| {
+                    return try std.mem.concat(scratch, u8, &.{ label, " ", suffix, " ", phrase[own_label.len..] });
+                }
+            }
+        }
+    }
     return try std.mem.concat(scratch, u8, &.{ label, " ", phrase[own_label.len..] });
 }
 
@@ -2037,9 +2183,21 @@ fn workPhrase(tally: StoryTally, kind: WorkKind) []const u8 {
             break :blk if (one) "edited a file" else "edited files";
         },
         .subagents => subagentWorkPhrase(tally, one),
-        .commands => if (tally.commands_running == tally.commands)
-            (if (one) "running a command" else "running commands")
-        else if (one) "ran a command" else "ran commands",
+        .commands => blk: {
+            const running = tally.commands_running == tally.commands;
+            if (tally.uniformNonLocalPlacement()) |placement| switch (placement) {
+                .remote => break :blk if (running)
+                    (if (one) "running a command on remote" else "running commands on remote")
+                else if (one) "ran a command on remote" else "ran commands on remote",
+                .isolated => break :blk if (running)
+                    (if (one) "running a command on isolated" else "running commands on isolated")
+                else if (one) "ran a command on isolated" else "ran commands on isolated",
+                .local => {},
+            };
+            break :blk if (running)
+                (if (one) "running a command" else "running commands")
+            else if (one) "ran a command" else "ran commands";
+        },
         .sessions => if (one) "checked a shell session" else "checked shell sessions",
         .mcp => if (one) "used an MCP tool" else "used MCP tools",
         .web_pages => if (one) "read a web page" else "read web pages",
@@ -2132,8 +2290,12 @@ fn formatStoryHeader(scratch: std.mem.Allocator, tally: StoryTally, summary: Sum
         return null;
     }
 
+    const runner_note = try tally.mixedRunnerNote(scratch);
     var mark: std.Io.Writer.Allocating = .init(scratch);
-    if (mark_shown) try writeResultMark(&mark.writer, tally, style);
+    if (mark_shown) {
+        if (runner_note.len > 0) try mark.writer.writeAll(runner_note);
+        try writeResultMark(&mark.writer, tally, style);
+    }
     // A failed call that is not a command was most often the model's own
     // mistake, which it works past, so the header does not count it; its
     // row still says it failed. A collapsed group shows no rows, so its
@@ -2401,8 +2563,50 @@ fn commandRowLabel(scratch: std.mem.Allocator, entry: TranscriptEntry, detail: ?
     return if (label[label.len - 1] == ' ') label else null;
 }
 
+/// Strips `"on remote "` or `"on isolated "` from the end of a command row label.
+fn baseCommandLabel(label: []const u8) []const u8 {
+    for ([_][]const u8{ "on remote ", "on isolated " }) |suffix| {
+        if (label.len > suffix.len and std.mem.endsWith(u8, label, suffix) and label[label.len - suffix.len - 1] == ' ') {
+            return label[0 .. label.len - suffix.len];
+        }
+    }
+    return label;
+}
+
+/// Non-local placement shared by every shell run in `combined`, or null when
+/// any run was local/unplaced or the runs used different runners.
+fn uniformCombinedPlacement(scratch: std.mem.Allocator, combined: []const *const ToolDetailRecord) ?types.CommandPlacement {
+    var seen: ?types.CommandPlacement = null;
+    for (combined) |record| {
+        if (isSessionFollowUp(scratch, record)) continue;
+        const placement = record.command_placement orelse .local;
+        if (placement == .local) return null;
+        if (seen) |first| {
+            if (first != placement) return null;
+        } else {
+            seen = placement;
+        }
+    }
+    return seen;
+}
+
+/// Label for a `.commands` row: preserves `"on remote "` / `"on isolated "`
+/// when every shell run in the row used that runner, and falls back to the base
+/// verb (`"Ran "`, `"Running "`, `"Still running "`) when mixed or local.
+fn combinedCommandRowLabel(scratch: std.mem.Allocator, label: []const u8, combined: []const *const ToolDetailRecord) ![]const u8 {
+    const base = baseCommandLabel(label);
+    if (ranFamily(base)) {
+        if (uniformCombinedPlacement(scratch, combined)) |placement| {
+            if (placement.runnerPhrase()) |suffix| {
+                return std.mem.concat(scratch, u8, &.{ base, suffix, " " });
+            }
+        }
+    }
+    return base;
+}
+
 /// Whether a command call joins the row before it as one more step: both
-/// share a label, neither failed, and the row is not a repeat of one command,
+/// share a base label, neither failed, and the row is not a repeat of one command,
 /// so a failure, its reason line, and "×3" stay on rows of their own.
 fn joinsCommandRow(scratch: std.mem.Allocator, last: *const StoryRow, entry: TranscriptEntry, detail: ?*const ToolDetailRecord) !bool {
     if (detail == null or storyCallFailed(detail)) return false;
@@ -2413,14 +2617,16 @@ fn joinsCommandRow(scratch: std.mem.Allocator, last: *const StoryRow, entry: Tra
     }
     const label = try commandRowLabel(scratch, entry, detail) orelse return false;
     const last_label = try commandRowLabel(scratch, last.entry, last.detail) orelse return false;
+    const base_label = baseCommandLabel(label);
+    const base_last = baseCommandLabel(last_label);
     // Commands that ran or still run share a row, so a call still running
     // does not show on a row of its own first and then fold into this one
     // when it ends. One that ran does not join a row whose latest command
     // returned while it ran on: the row's label and mark come from its latest
     // call, so the row would say that command ran.
-    if (std.mem.eql(u8, label, last_label)) return true;
-    if (!ranFamily(label) or !ranFamily(last_label)) return false;
-    return !(std.mem.eql(u8, label, "Ran ") and std.mem.eql(u8, last_label, still_running_label ++ " "));
+    if (std.mem.eql(u8, base_label, base_last)) return true;
+    if (!ranFamily(base_label) or !ranFamily(base_last)) return false;
+    return !(std.mem.eql(u8, base_label, "Ran ") and std.mem.eql(u8, base_last, still_running_label ++ " "));
 }
 
 /// Whether `label` is what a command's row says while it runs, after its
@@ -5192,7 +5398,8 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
     if (rowListsNames(row)) return nameListRowText(scratch, row, cols);
     if (row.identity.kind == .commands) {
         const own_label = try commandRowLabel(scratch, row.entry, row.detail) orelse "Ran ";
-        const label = try checkRowPhrase(scratch, row, own_label) orelse own_label;
+        const check_label = try checkRowPhrase(scratch, row, own_label) orelse own_label;
+        const label = try combinedCommandRowLabel(scratch, check_label, row.combined.items);
         var steps = try combinedCommandSteps(scratch, row.combined.items);
         var display = try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, steps, style.text_style) });
         // The row names each step once, so only its count says how many
@@ -6078,8 +6285,25 @@ fn writeGroupBlock(
         // A failure the phrase does not name, such as a status line `fx ask`
         // never rewrites, still shows on the header.
         const unnamed_failure = storyCallFailed(row.detail) and !phraseNamesFailure(text.display);
-        const mark = if (succeeded_command) " ✓" else if (unnamed_failure) try std.mem.concat(scratch, u8, &.{ " ", try inFailureStyle(scratch, "✗", style) }) else "";
-        break :blk try applySummaryStyle(scratch, try clipStoryRow(scratch, "● ", row, &text, mark, cols, style), style);
+        const runner_note = try tally.mixedRunnerNote(scratch);
+        var single_text_value = text;
+        if (tally.isMixedRunner() and row.identity.kind == .command) {
+            if (try commandRowLabel(scratch, row.entry, row.detail)) |row_label| {
+                const base = baseCommandLabel(row_label);
+                if (base.len < row_label.len) {
+                    const strip_len = row_label.len - base.len;
+                    const suffix_slice = row_label[base.len..];
+                    if (std.mem.find(u8, single_text_value.body, suffix_slice)) |at| {
+                        const stripped_body = try std.mem.concat(scratch, u8, &.{ single_text_value.body[0..at], single_text_value.body[at + strip_len ..] });
+                        single_text_value.body = stripped_body;
+                        single_text_value.display = if (single_text_value.suffix.len == 0) stripped_body else try std.mem.concat(scratch, u8, &.{ stripped_body, single_text_value.suffix });
+                    }
+                }
+            }
+        }
+        const base_mark = if (succeeded_command) " ✓" else if (unnamed_failure) try std.mem.concat(scratch, u8, &.{ " ", try inFailureStyle(scratch, "✗", style) }) else "";
+        const mark = if (runner_note.len > 0) try std.mem.concat(scratch, u8, &.{ runner_note, base_mark }) else base_mark;
+        break :blk try applySummaryStyle(scratch, try clipStoryRow(scratch, "● ", row, &single_text_value, mark, cols, style), style);
     } else if (try formatStoryHeader(scratch, tally, summary, style, collapse_tool_calls)) |story|
         try applySummaryStyle(scratch, try clipStoryHeader(scratch, story, cols), style)
     else
@@ -7522,13 +7746,20 @@ fn highlightCommandPhrase(
     // split at the true boundary. Otherwise trust the stored command text:
     // prose-prefixed rows ("Reading project instructions before continuing:
     // <cmd>") end with it. Then known multi-word labels, then first space.
-    const label_end = if (record.command_action_label) |action|
-        if (std.mem.startsWith(u8, phrase, action) and phrase.len > action.len and phrase[action.len] == ' ')
-            action.len
-        else
-            null
-    else
-        null;
+    const label_end = if (record.command_action_label) |action| blk: {
+        if (std.mem.startsWith(u8, phrase, action) and phrase.len > action.len and phrase[action.len] == ' ') {
+            if (record.command_placement) |placement| {
+                if (placement.runnerPhrase()) |suffix| {
+                    const after_action = phrase[action.len + 1 ..];
+                    if (std.mem.startsWith(u8, after_action, suffix) and after_action.len > suffix.len and after_action[suffix.len] == ' ') {
+                        break :blk action.len + 1 + suffix.len;
+                    }
+                }
+            }
+            break :blk action.len;
+        }
+        break :blk null;
+    } else null;
     const display_end = if (record.command_display) |display| blk: {
         if (display.len == 0 or phrase.len <= display.len + 1) break :blk null;
         if (!std.mem.endsWith(u8, phrase, display)) break :blk null;
