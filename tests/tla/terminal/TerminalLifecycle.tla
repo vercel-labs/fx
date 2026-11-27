@@ -26,6 +26,16 @@
 (* caller), or a second caller of the same process would index it too and  *)
 (* the start's caller would index it again.                                *)
 (*                                                                          *)
+(* The launcher leads the terminal's session. The host keeps an ended         *)
+(* launcher's process entry (`launcher`) after the launcher exits, so its pid *)
+(* stays reserved and still names the session, until the session cannot hold *)
+(* a process any more, or the exit close has ended what is left in it. The    *)
+(* exit close ends the session's processes only while the entry is held: a    *)
+(* pid that no entry holds names no session to anyone, and a number that has  *)
+(* been reused could name another one. macOS ends a PTY's output when the     *)
+(* session leader exits, even while a late child holds the PTY, so the host   *)
+(* cannot count on the drain to wait for it.                                  *)
+(*                                                                          *)
 (* What holds a terminal's PTY keeps its backend from draining. The shell *)
 (* does until the hangup. A process the shell starts between the record    *)
 (* and the hangup, in its own process group and out of the shell's job     *)
@@ -45,7 +55,10 @@
 (* start returns, before its caller has indexed the terminal.               *)
 (* "record_once" is the exit close that kills only the tree it recorded:   *)
 (* a late child survives it. "launcher_wait" is the launcher that waits for *)
-(* the release byte even when its shell is gone.                            *)
+(* the release byte even when its shell is gone. "early_reap" is the host   *)
+(* that collects the launcher as soon as it has ended, whatever its         *)
+(* session still holds: the exit close finds no entry to end the late       *)
+(* child by.                                                                *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -54,7 +67,7 @@ CONSTANTS Procs, Ttys, MaxInst, Mutation
 ASSUME MaxInst \in Nat \ {0}
 ASSUME Mutation \in {"none", "daemon_survives", "exit_skips_close",
                      "profile_wide_recover", "reattach", "list_in_flight",
-                     "end_at_return", "record_once", "launcher_wait"}
+                     "end_at_return", "record_once", "launcher_wait", "early_reap"}
 
 VARIABLES
     run,          \* fx process slot state
@@ -72,9 +85,10 @@ VARIABLES
     wrongEnd,     \* reconciliation ended a terminal whose owner is running
     phase,        \* the exit close: "none", "recorded", "hungup", or "killed"
     lateKid,      \* a process started after the record holds the PTY
-    stuck         \* the launcher waits for a release that cannot come, and holds the PTY
+    stuck,        \* the launcher waits for a release that cannot come, and holds the PTY
+    launcher      \* the host's entry for the terminal's launcher: "none", "held", or "collected"
 
-exitVars == <<phase, lateKid, stuck>>
+exitVars == <<phase, lateKid, stuck, launcher>>
 
 vars == <<run, inst, crashedInst, owner, alive, rec, shown, starting, pending,
           returned, early, badInteract, wrongEnd, exitVars>>
@@ -98,6 +112,7 @@ TypeOK ==
     /\ phase \in [Ttys -> {"none", "recorded", "hungup", "killed"}]
     /\ lateKid \in [Ttys -> BOOLEAN]
     /\ stuck \in [Ttys -> BOOLEAN]
+    /\ launcher \in [Ttys -> {"none", "held", "collected"}]
 
 Init ==
     /\ run = [x \in Procs |-> "off"]
@@ -116,6 +131,7 @@ Init ==
     /\ phase = [t \in Ttys |-> "none"]
     /\ lateKid = [t \in Ttys |-> FALSE]
     /\ stuck = [t \in Ttys |-> FALSE]
+    /\ launcher = [t \in Ttys |-> "none"]
 
 OwnedBy(t, x) == owner[t].p = x /\ owner[t].i = inst[x]
 
@@ -144,8 +160,9 @@ OpenBegin(x, t) ==
     /\ rec' = [rec EXCEPT ![t] = "live"]
     /\ starting' = [starting EXCEPT ![t] = TRUE]
     /\ pending' = [pending EXCEPT ![t] = TRUE]
+    /\ launcher' = [launcher EXCEPT ![t] = "held"]
     /\ UNCHANGED <<run, inst, crashedInst, shown, returned, early, badInteract,
-                   wrongEnd, exitVars>>
+                   wrongEnd, phase, lateKid, stuck>>
 
 \* Second step: the registry's start returns its result to the caller.
 ReturnStart(x, t) ==
@@ -230,30 +247,44 @@ ExitRecord(x, t) ==
     /\ phase' = [phase EXCEPT ![t] = "recorded"]
     /\ UNCHANGED <<run, inst, crashedInst, owner, alive, rec, shown, starting,
                    pending, returned, early, badInteract, wrongEnd, lateKid,
-                   stuck>>
+                   stuck, launcher>>
+
+\* Between the record and the hangup, the shell may start a process in its own
+\* process group and out of its job table (`sleep 30 & disown`), which the
+\* hangup misses. Only a live shell starts one, so no process joins the
+\* session once the shell has ended.
+ForkLate(x, t) ==
+    /\ run[x] = "exiting"
+    /\ OwnedBy(t, x)
+    /\ phase[t] = "recorded"
+    /\ alive[t]
+    /\ ~lateKid[t]
+    /\ lateKid' = [lateKid EXCEPT ![t] = TRUE]
+    /\ UNCHANGED <<run, inst, crashedInst, owner, alive, rec, shown, starting,
+                   pending, returned, early, badInteract, wrongEnd, phase,
+                   stuck, launcher>>
 
 \* Second step: hang up the shell's process group and the recorded tree. The
-\* shell ends, and the launcher with it. Between the record and now, the shell
-\* may have started a process in its own process group and out of its job
-\* table (`sleep 30 & disown`), which the hangup misses. The shell may also
-\* have ended before the host released its command, which leaves the
-\* launcher in its wait for the release.
+\* shell ends, and the launcher with it. The shell may also have ended before
+\* the host released its command, which leaves the launcher in its wait for
+\* the release.
 ExitHangup(x, t) ==
     /\ run[x] = "exiting"
     /\ OwnedBy(t, x)
     /\ phase[t] = "recorded"
     /\ phase' = [phase EXCEPT ![t] = "hungup"]
     /\ alive' = [alive EXCEPT ![t] = FALSE]
-    /\ \E late \in BOOLEAN : lateKid' = [lateKid EXCEPT ![t] = late]
     /\ \/ /\ Mutation = "launcher_wait"
           /\ stuck' = [stuck EXCEPT ![t] = TRUE]
        \/ stuck' = stuck
     /\ UNCHANGED <<run, inst, crashedInst, owner, rec, shown, starting, pending,
-                   returned, early, badInteract, wrongEnd>>
+                   returned, early, badInteract, wrongEnd, lateKid, launcher>>
 
 \* Third step, after the grace: kill what the hangup left, record the terminal
 \* as lost, and end every process of the launcher's session, which a late
-\* child is in. A program that moved to its own session is not in it.
+\* child is in. A program that moved to its own session is not in it. The
+\* session's processes are ended only while the host still holds the
+\* launcher's entry, which is what proves whose session the pid names.
 ExitKill(x, t) ==
     /\ run[x] = "exiting"
     /\ OwnedBy(t, x)
@@ -261,10 +292,28 @@ ExitKill(x, t) ==
     /\ phase' = [phase EXCEPT ![t] = "killed"]
     /\ rec' = [rec EXCEPT ![t] = "ended"]
     /\ shown' = [shown EXCEPT ![t] = IF shown[t] = "hidden" THEN "hidden" ELSE "ended"]
-    /\ lateKid' = IF Mutation = "record_once"
+    /\ lateKid' = IF Mutation = "record_once" \/ launcher[t] # "held"
                   THEN lateKid ELSE [lateKid EXCEPT ![t] = FALSE]
     /\ UNCHANGED <<run, inst, crashedInst, owner, alive, starting, pending,
-                   returned, early, badInteract, wrongEnd, stuck>>
+                   returned, early, badInteract, wrongEnd, stuck, launcher>>
+
+\* The host collects an ended launcher, once, and so gives up its entry. The
+\* design does it when the session can hold no process any more (nothing
+\* joins an empty session), or after the exit close has ended what was left
+\* in it. A terminal's close and the freeing of its session are the same
+\* step here. The planted `early_reap` does it as soon as the launcher ended.
+ReapLauncher(x, t) ==
+    /\ OwnerRunning(t)
+    /\ OwnedBy(t, x)
+    /\ launcher[t] = "held"
+    /\ ~alive[t] /\ ~stuck[t]
+    /\ \/ ~lateKid[t]
+       \/ phase[t] = "killed"
+       \/ Mutation = "early_reap"
+    /\ launcher' = [launcher EXCEPT ![t] = "collected"]
+    /\ UNCHANGED <<run, inst, crashedInst, owner, alive, rec, shown, starting,
+                   pending, returned, early, badInteract, wrongEnd, phase,
+                   lateKid, stuck>>
 
 \* The process ends, and its in-memory set of starts and its callers go with it.
 FinishExit(x) ==
@@ -278,8 +327,12 @@ FinishExit(x) ==
     /\ starting' = [t \in Ttys |-> IF OwnedBy(t, x) THEN FALSE ELSE starting[t]]
     /\ pending' = [t \in Ttys |-> IF OwnedBy(t, x) THEN FALSE ELSE pending[t]]
     /\ returned' = [t \in Ttys |-> IF OwnedBy(t, x) THEN FALSE ELSE returned[t]]
+    \* The process's entries go with it: the system collects what it left.
+    /\ launcher' = [t \in Ttys |->
+                     IF OwnedBy(t, x) /\ launcher[t] = "held"
+                     THEN "collected" ELSE launcher[t]]
     /\ UNCHANGED <<inst, crashedInst, owner, alive, rec, shown, early, badInteract,
-                   wrongEnd, exitVars>>
+                   wrongEnd, phase, lateKid, stuck>>
 
 Crash(x) ==
     /\ run[x] \in {"on", "exiting"}
@@ -289,6 +342,9 @@ Crash(x) ==
     /\ pending' = [t \in Ttys |-> IF OwnedBy(t, x) THEN FALSE ELSE pending[t]]
     /\ returned' = [t \in Ttys |-> IF OwnedBy(t, x) THEN FALSE ELSE returned[t]]
     /\ phase' = [t \in Ttys |-> IF OwnedBy(t, x) THEN "none" ELSE phase[t]]
+    /\ launcher' = [t \in Ttys |->
+                     IF OwnedBy(t, x) /\ launcher[t] = "held"
+                     THEN "collected" ELSE launcher[t]]
     /\ UNCHANGED <<inst, owner, alive, rec, shown, early, badInteract, wrongEnd,
                    lateKid, stuck>>
 
@@ -302,7 +358,8 @@ Hangup(t) ==
     /\ alive' = [alive EXCEPT ![t] = FALSE]
     /\ stuck' = [stuck EXCEPT ![t] = FALSE]
     /\ UNCHANGED <<run, inst, crashedInst, owner, rec, shown, starting, pending,
-                   returned, early, badInteract, wrongEnd, phase, lateKid>>
+                   returned, early, badInteract, wrongEnd, phase, lateKid,
+                   launcher>>
 
 \* Resume (or first terminal use) in process x reconciles stale records.
 Reconcile(x, t) ==
@@ -328,7 +385,9 @@ Next ==
     \/ \E x \in Procs, t \in Ttys :
           OpenBegin(x, t) \/ ReturnStart(x, t) \/ Index(x, t) \/ Sync(x, t)
               \/ Interact(x, t) \/ Reconcile(x, t)
-              \/ ExitRecord(x, t) \/ ExitHangup(x, t) \/ ExitKill(x, t)
+              \/ ExitRecord(x, t) \/ ForkLate(x, t) \/ ExitHangup(x, t)
+              \/ ExitKill(x, t)
+              \/ ReapLauncher(x, t)
     \/ \E t \in Ttys : EndNatural(t) \/ Hangup(t)
     \/ Done
 
@@ -337,6 +396,7 @@ Fairness ==
     /\ \A x \in Procs, t \in Ttys : WF_vars(ExitRecord(x, t))
     /\ \A x \in Procs, t \in Ttys : WF_vars(ExitHangup(x, t))
     /\ \A x \in Procs, t \in Ttys : WF_vars(ExitKill(x, t))
+    /\ \A x \in Procs, t \in Ttys : WF_vars(ReapLauncher(x, t))
     /\ \A x \in Procs, t \in Ttys : WF_vars(ReturnStart(x, t))
     /\ \A x \in Procs, t \in Ttys : WF_vars(Index(x, t))
     /\ \A t \in Ttys : WF_vars(Hangup(t))
@@ -361,6 +421,13 @@ NoHolderAfterCleanExit ==
         (~OwnerRunning(t) /\ (lateKid[t] \/ stuck[t]))
             => <<owner[t].p, owner[t].i>> \in crashedInst
 
+\* While its owner runs, a terminal's session that still holds a process keeps
+\* the launcher's entry held: the entry is what lets the exit close tell whose
+\* processes they are.
+LauncherHeldWhileSessionHasMembers ==
+    \A t \in Ttys :
+        (OwnerRunning(t) /\ (lateKid[t] \/ stuck[t])) => launcher[t] = "held"
+
 \* A terminal listed as live belongs to a running owner (or a crashed one).
 ShownLiveIsOwned ==
     \A t \in Ttys :
@@ -384,6 +451,12 @@ NoIndexBeforeStartReturns == \A t \in Ttys : ~early[t]
 ExitCompletes == \A x \in Procs : (run[x] = "exiting") ~> (run[x] = "off")
 
 OrphansEnd == \A t \in Ttys : (alive[t] /\ ~OwnerRunning(t)) ~> ~alive[t]
+
+\* An ended launcher is collected, so the entries do not pile up: by the host,
+\* or with its process.
+LauncherCollected ==
+    \A t \in Ttys :
+        (launcher[t] = "held" /\ ~alive[t] /\ ~stuck[t]) ~> launcher[t] # "held"
 
 \* A start in flight does not stay hidden: its caller indexes it, or its
 \* process ends.

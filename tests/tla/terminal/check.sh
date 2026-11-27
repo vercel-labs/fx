@@ -40,4 +40,5 @@ TerminalLifecycle TerminalLifecycle-list_in_flight NoIndexBeforeStartReturns -de
 TerminalLifecycle TerminalLifecycle-end_at_return NoIndexBeforeStartReturns -deadlock
 TerminalLifecycle TerminalLifecycle-record_once NoHolderAfterCleanExit -deadlock
 TerminalLifecycle TerminalLifecycle-launcher_wait NoHolderAfterCleanExit -deadlock
+TerminalLifecycle TerminalLifecycle-early_reap NoHolderAfterCleanExit -deadlock
 EOF

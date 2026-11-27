@@ -3,12 +3,13 @@ stateDiagram-v2
 
     TerminalRunning --> ExitStarted: You quit fx
     ExitStarted --> TreeNoted: fx writes down the terminal's processes
-    TreeNoted --> ShellHungUp: fx hangs up the shell, which ends
-    ShellHungUp --> ShellHungUp: The shell had started a child in its own group
-    ShellHungUp --> SessionEmpty: fx ends the terminal and every process of its session
+    TreeNoted --> TreeNoted: The shell starts a child in its own group
+    TreeNoted --> ShellHungUp: fx hangs up the shell, which ends, and keeps the launcher's process entry
+    ShellHungUp --> SessionEmpty: fx ends every process of the launcher's session, then collects the entry
     SessionEmpty --> FxGone: fx exits after a bounded wait
 
     ShellHungUp --> ChildHoldsPty: Planted record_once, only the noted processes die
+    ShellHungUp --> ChildHoldsPty: Planted early_reap, fx collected the launcher's entry too soon, so nothing names the session
     ChildHoldsPty --> FxGoneHeld: fx exits after the wait
     ShellHungUp --> LauncherWaits: Planted launcher_wait, the launcher waits for a release that cannot come
     LauncherWaits --> FxGoneHeld: fx exits after the wait
@@ -25,8 +26,10 @@ stateDiagram-v2
     note right of FxGoneHeld
         Breaks NoHolderAfterCleanExit: after a normal exit something still
         holds the PTY, which keeps its backend from draining.
-        Shortest path, 7 steps for either planted defect:
-        Start, OpenBegin, BeginExit, ExitRecord, ExitHangup, ExitKill, FinishExit.
+        Shortest paths: launcher_wait takes 7 steps, Start, OpenBegin,
+        BeginExit, ExitRecord, ExitHangup, ExitKill, FinishExit. record_once
+        adds ForkLate after ExitRecord, and early_reap adds ReapLauncher after
+        ExitHangup.
     end note
 
     note right of SessionEmpty

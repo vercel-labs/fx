@@ -1537,7 +1537,12 @@ const Session = struct {
     shell_ready_seen: bool = false,
     start_failure: ?contracts.StructuredErrorCode = null,
     master_fd: ?std.posix.fd_t = null,
+    /// The host's handle on the launcher, until `reapLauncher` collects it. An
+    /// ended launcher is kept uncollected on purpose, see `awaitLauncherEnd`.
     launcher: ?std.process.Child = null,
+    /// Set under `mutex` once the control thread has seen the launcher end.
+    /// Only then may `reapLauncher` collect it.
+    launcher_ended: bool = false,
     control_file: ?std.Io.File = null,
     liveness_file: ?std.Io.File = null,
     output_thread: ?std.Thread = null,
@@ -1566,7 +1571,9 @@ const Session = struct {
     exit_tree: ?process_tree.Tracker = null,
     /// The launcher, as it was when it started. It leads the terminal's
     /// session, and the exit path ends what is left in that session only
-    /// while this identity still matches the process at its pid.
+    /// while this identity still matches the process at its pid. The host
+    /// keeps an ended launcher uncollected until its session is empty, so the
+    /// pid stays the launcher's (`awaitLauncherEnd`).
     launcher_target: ?SignalTarget = null,
     engine: terminal_engine.Grid,
     screen_available: bool = true,
@@ -1874,6 +1881,7 @@ const Session = struct {
         self.mutex.lockUncancelable(zio);
         self.launcher_target = .{ .pid = pid, .token = token };
         self.mutex.unlock(zio);
+        self.launcherEvent(.started, pid);
     }
 
     fn deinit(self: *Session) void {
@@ -1890,9 +1898,11 @@ const Session = struct {
             if (self.master_fd) |fd| closeFd(fd);
             if (self.control_file) |file| file.close(io_mod.getIo());
             if (self.liveness_file) |file| file.close(io_mod.getIo());
-            if (self.launcher) |*child| {
-                if (child.id != null) child.kill(io_mod.getIo());
-            }
+        }
+        self.reapLauncher();
+        // A launcher that is still here never ran a command and has not ended.
+        if (self.launcher) |*child| {
+            if (child.id != null) child.kill(io_mod.getIo());
         }
         self.markNotLive();
         self.deinitUnlaunched();
@@ -2009,6 +2019,7 @@ const Session = struct {
     /// the liveness pipe also makes the launcher kill the process group if
     /// the signal missed it.
     fn killForExit(self: *Session) void {
+        if (builtin.is_test) if (test_before_exit_kill) |hook| hook(self.id);
         if (self.isLive()) {
             _ = self.killTerminal();
             self.markLost();
@@ -2019,6 +2030,7 @@ const Session = struct {
             self.exit_tree = null;
         }
         self.endLauncherSession();
+        self.reapLauncher();
     }
 
     fn launcherTarget(self: *Session) ?SignalTarget {
@@ -2038,9 +2050,9 @@ const Session = struct {
     /// (`tests/tla/terminal/TerminalLifecycle.tla` NoHolderAfterCleanExit; the
     /// test `closing owned terminals for exit ends a child the shell started
     /// after the process tree was recorded` in `src/core/terminal/client.zig`).
-    /// A launcher that has exited but is not collected yet still counts: the
-    /// host collects it only after the PTY drains, and that is the launcher
-    /// this runs for when a process that outlived the shell holds the PTY.
+    /// A launcher that has exited but is not collected yet still counts, and
+    /// the host keeps it that way while its session has a process, so this
+    /// finds it however early the PTY's output ended (`awaitLauncherEnd`).
     fn endLauncherSession(self: *Session) void {
         const target = self.launcherTarget() orelse return;
         const launcher_is_ours = switch (self.signalTargetMatch(target)) {
@@ -2064,6 +2076,121 @@ const Session = struct {
                 .{ summary.delivered, self.id, summary.incomplete },
             );
         }
+    }
+
+    /// Waits for the launcher to end and records how it ended, but leaves it
+    /// uncollected. The launcher leads the terminal's session, and collecting
+    /// it frees its pid, which then names no session: the exit path could not
+    /// tell any more which processes left in that session are the terminal's.
+    /// macOS makes that the usual case, because it ends the PTY's output as
+    /// soon as the session leader exits, even while a late child holds the
+    /// PTY, so nothing keeps the host from collecting the launcher at once.
+    /// The entry is collected by `reapLauncher`, when the session cannot hold a
+    /// process any more or the terminal is closed or freed or the exit path has
+    /// ended what is left in it (`tests/tla/terminal/TerminalLifecycle.tla`
+    /// `LauncherHeldWhileSessionHasMembers`).
+    fn awaitLauncherEnd(self: *Session) void {
+        const pid = (self.launcher orelse return).id orelse return;
+        const end = process_tree.waitUntilExitedUncollected(pid) catch |err| {
+            debug_trace.logf(
+                "terminal",
+                "terminal launcher end not read id={s} err={s}; collecting it",
+                .{ self.id, @errorName(err) },
+            );
+            self.collectLauncherUnread();
+            return;
+        };
+        self.recordLauncherEnd(switch (end) {
+            .exited => |code| code == 0,
+            .signaled => false,
+        });
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        self.launcher_ended = true;
+        self.mutex.unlock(zio);
+        self.reapLauncherIfSessionEmpty();
+    }
+
+    /// The fallback when the end could not be read: collects the launcher the
+    /// usual way, which gives up its entry.
+    fn collectLauncherUnread(self: *Session) void {
+        var child = self.takeLauncher(false) orelse return;
+        const term = child.wait(io_mod.getIo()) catch {
+            self.markLost();
+            return;
+        };
+        self.recordLauncherEnd(switch (term) {
+            .exited => |code| code == 0,
+            .signal, .stopped, .unknown => false,
+        });
+    }
+
+    /// A launcher that ended badly, with nothing reported yet, loses the terminal.
+    fn recordLauncherEnd(self: *Session, clean: bool) void {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        const reported = self.term != null or self.lifecycle == .lost;
+        self.mutex.unlock(zio);
+        if (!reported and !clean) self.markLost();
+    }
+
+    /// Collects an ended launcher as soon as its session holds no live
+    /// process: nothing can join an empty session, so nothing is left for the
+    /// entry to prove.
+    fn reapLauncherIfSessionEmpty(self: *Session) void {
+        const target = self.launcherTarget() orelse {
+            // Without its identity the exit path ends nothing in the session.
+            self.reapLauncher();
+            return;
+        };
+        const empty = process_tree.sessionIsEmpty(self.alloc, target.pid) catch |err| {
+            debug_trace.logf(
+                "terminal",
+                "terminal launcher kept, its session was not read id={s} err={s}",
+                .{ self.id, @errorName(err) },
+            );
+            self.launcherEvent(.kept, target.pid);
+            return;
+        };
+        if (!empty) {
+            debug_trace.logf(
+                "terminal",
+                "terminal launcher kept until its session ends id={s}",
+                .{self.id},
+            );
+            self.launcherEvent(.kept, target.pid);
+            return;
+        }
+        self.reapLauncher();
+    }
+
+    /// The only place that collects an ended launcher: it does nothing before
+    /// the launcher has ended, and it collects at most once.
+    fn reapLauncher(self: *Session) void {
+        var child = self.takeLauncher(true) orelse return;
+        const pid = child.id orelse return;
+        _ = child.wait(io_mod.getIo()) catch |err| {
+            debug_trace.logf(
+                "terminal",
+                "terminal launcher not collected id={s} err={s}",
+                .{ self.id, @errorName(err) },
+            );
+        };
+        self.launcherEvent(.collected, pid);
+    }
+
+    fn launcherEvent(self: *Session, event: LauncherEvent, pid: std.posix.pid_t) void {
+        if (builtin.is_test) if (test_launcher_event) |hook| hook(event, self.id, pid);
+    }
+
+    fn takeLauncher(self: *Session, comptime only_if_ended: bool) ?std.process.Child {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        if (only_if_ended and !self.launcher_ended) return null;
+        const child = self.launcher orelse return null;
+        self.launcher = null;
+        return child;
     }
 
     fn markLive(self: *Session) void {
@@ -3597,6 +3724,7 @@ fn closeAction(
     session.lifecycle = .closed;
     session.mutex.unlock(zio);
     session.finalizeBackend();
+    session.reapLauncher();
     try session.durable.finish_close(io_mod.milliTimestamp());
     if (force_signal_attempted and forceCloseSignalIncomplete(force_tree_complete)) {
         return contracts.OwnedResult.init(
@@ -3822,28 +3950,15 @@ fn controlMain(session: *Session) void {
             .startup_failed,
             .invalid_term,
             => {
-                session.output_done.waitUncancelable(io_mod.getIo());
+                if (!(builtin.is_test and test_end_before_drain)) {
+                    session.output_done.waitUncancelable(io_mod.getIo());
+                }
             },
             .prepared, .shell_ready, .command_started => {},
         }
         session.handleControl(frame);
     }
-    if (session.launcher) |*child| {
-        const term = child.wait(io_mod.getIo()) catch blk: {
-            session.markLost();
-            break :blk null;
-        };
-        const zio = io_mod.getIo();
-        session.mutex.lockUncancelable(zio);
-        const reported = session.term != null or session.lifecycle == .lost;
-        session.mutex.unlock(zio);
-        if (!reported and term != null) {
-            switch (term.?) {
-                .exited => |code| if (code != 0) session.markLost(),
-                .signal, .stopped, .unknown => session.markLost(),
-            }
-        }
-    }
+    session.awaitLauncherEnd();
 
     session.output_done.waitUncancelable(io_mod.getIo());
     if (session.output_thread) |thread| {
@@ -3862,7 +3977,6 @@ fn controlMain(session: *Session) void {
     session.master_fd = null;
     session.control_file = null;
     session.liveness_file = null;
-    session.launcher = null;
     session.mutex.unlock(zio);
     if (master_fd) |fd| closeFd(fd);
     if (control_file) |file| file.close(zio);
@@ -3968,6 +4082,36 @@ pub var test_after_exit_record: if (builtin.is_test) ?*const fn (
     session_id: []const u8,
     launcher_pid: ?std.posix.pid_t,
 ) void else void = if (builtin.is_test) null else {};
+
+/// Test builds only: a test sets it to run code at the start of the exit
+/// close's last step for a terminal, which gets the terminal's id.
+pub var test_before_exit_kill: if (builtin.is_test) ?*const fn (session_id: []const u8) void else void =
+    if (builtin.is_test) null else {};
+
+/// What happens to a terminal's launcher on the host's side.
+pub const LauncherEvent = enum {
+    /// It started and its identity is recorded.
+    started,
+    /// It ended, and the host keeps it uncollected because its session may
+    /// still hold a process.
+    kept,
+    /// The host collected it.
+    collected,
+};
+
+/// Test builds only: a test sets it to see each `LauncherEvent`, with the
+/// terminal's id and the launcher's pid.
+pub var test_launcher_event: if (builtin.is_test) ?*const fn (
+    event: LauncherEvent,
+    session_id: []const u8,
+    launcher_pid: std.posix.pid_t,
+) void else void = if (builtin.is_test) null else {};
+
+/// Test builds only: when set, the control thread handles a terminal's end
+/// without waiting for its PTY to drain. macOS ends a PTY's output once the
+/// session leader exits, even while a late child still holds the PTY, and
+/// Linux does not, so a test sets this to get the macOS order on either OS.
+pub var test_end_before_drain: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
 
 /// Test builds only: when set, the host never writes the release byte that
 /// lets the launcher run the terminal's command, so the launcher keeps waiting

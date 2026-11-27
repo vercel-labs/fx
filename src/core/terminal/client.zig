@@ -1936,6 +1936,63 @@ const TestProcess = struct {
     }
 };
 
+/// What the host does with a terminal's launcher, as `native_session.zig`
+/// reports it. A test arms it before it starts the one terminal it watches.
+const LauncherWatch = struct {
+    var pid: std.atomic.Value(std.posix.pid_t) = .init(0);
+    var kept: std.atomic.Value(usize) = .init(0);
+    var collected: std.atomic.Value(usize) = .init(0);
+    var kept_seen: std.Io.Event = .unset;
+    var collected_seen: std.Io.Event = .unset;
+    var decided: std.Io.Event = .unset;
+
+    fn arm() void {
+        pid.store(0, .release);
+        kept.store(0, .release);
+        collected.store(0, .release);
+        kept_seen = .unset;
+        collected_seen = .unset;
+        decided = .unset;
+        native_session.test_launcher_event = &observe;
+    }
+
+    fn disarm() void {
+        native_session.test_launcher_event = null;
+    }
+
+    fn observe(
+        event: native_session.LauncherEvent,
+        _: []const u8,
+        launcher_pid: std.posix.pid_t,
+    ) void {
+        const zio = io_mod.getIo();
+        switch (event) {
+            .started => pid.store(launcher_pid, .release),
+            .kept => {
+                _ = kept.fetchAdd(1, .acq_rel);
+                kept_seen.set(zio);
+                decided.set(zio);
+            },
+            .collected => {
+                _ = collected.fetchAdd(1, .acq_rel);
+                collected_seen.set(zio);
+                decided.set(zio);
+            },
+        }
+    }
+
+    /// Blocks until `event` is set, for at most `timeout_ms`.
+    fn waitFor(event: *std.Io.Event, timeout_ms: i64) !void {
+        event.waitTimeout(io_mod.getIo(), .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(timeout_ms),
+        } }) catch |err| switch (err) {
+            error.Timeout => return error.TestLauncherEventTimedOut,
+            error.Canceled => return err,
+        };
+    }
+};
+
 /// What a late-fork test holds while the exit close runs: the pipe that lets
 /// the terminal's command go on once the close has recorded its process tree,
 /// the pipes that command answers on once it has started its late child, and
@@ -1948,6 +2005,10 @@ const ExitGate = struct {
     var session_id_len: usize = 0;
     var failed = false;
     var launcher: ?TestProcess = null;
+    /// Holds the close's last step until the host has decided what to do with
+    /// the ended launcher, so that step cannot run first and hide whether the
+    /// launcher was kept for it.
+    var wait_for_launcher_decision = false;
 
     fn arm(
         go_signal: ?*GoSignal,
@@ -1962,11 +2023,14 @@ const ExitGate = struct {
         @memcpy(session_id[0..session_id_len], id[0..session_id_len]);
         failed = false;
         launcher = null;
+        wait_for_launcher_decision = false;
         native_session.test_after_exit_record = &afterRecord;
+        native_session.test_before_exit_kill = &beforeKill;
     }
 
     fn disarm() void {
         native_session.test_after_exit_record = null;
+        native_session.test_before_exit_kill = null;
         go = null;
         forked = null;
         alive = null;
@@ -1987,6 +2051,14 @@ const ExitGate = struct {
         };
         const alive_signal = alive orelse return;
         alive_signal.waitStarted(15_000) catch {
+            failed = true;
+        };
+    }
+
+    fn beforeKill(id: []const u8) void {
+        if (!wait_for_launcher_decision) return;
+        if (!std.mem.eql(u8, id, session_id[0..session_id_len])) return;
+        LauncherWatch.waitFor(&LauncherWatch.decided, 15_000) catch {
             failed = true;
         };
     }
@@ -2019,10 +2091,29 @@ fn readPid(fixture: *LiveTerminalFixture, name: []const u8) !std.posix.pid_t {
 }
 
 test "closing owned terminals for exit ends a child the shell started after the process tree was recorded" {
+    try expectExitEndsLateChild(.drains_first);
+}
+
+test "closing owned terminals for exit ends a late child when the terminal's output ended first" {
+    try expectExitEndsLateChild(.ends_first);
+}
+
+/// Where the terminal's output ends relative to the late child. macOS ends it
+/// when the shell exits, while the late child still holds the PTY, and Linux
+/// only when the PTY has no holder left. `ends_first` has Linux do what macOS
+/// does.
+const OutputEnds = enum { drains_first, ends_first };
+
+fn expectExitEndsLateChild(output: OutputEnds) !void {
     var fixture: LiveTerminalFixture = undefined;
     try fixture.init();
     defer fixture.deinit();
     const alloc = std.testing.allocator;
+
+    native_session.test_end_before_drain = output == .ends_first;
+    defer native_session.test_end_before_drain = false;
+    LauncherWatch.arm();
+    defer LauncherWatch.disarm();
 
     var go: GoSignal = undefined;
     try go.init(fixture.home);
@@ -2038,6 +2129,7 @@ test "closing owned terminals for exit ends a child the shell started after the 
     defer alloc.free(session_id);
     ExitGate.arm(&go, &forked, &alive, session_id);
     defer ExitGate.disarm();
+    ExitGate.wait_for_launcher_decision = output == .ends_first;
 
     fixture.runtime.closeOwnedTerminals();
     // The hook ran after the shell's tree was recorded and waited for the child.
@@ -2047,6 +2139,78 @@ test "closing owned terminals for exit ends a child the shell started after the 
     defer late.end();
     try std.testing.expect(fixture.runtime.backend_drained);
     try alive.waitGone(2_000);
+    // The host collected the launcher once, after the close ended its session.
+    try std.testing.expectEqual(@as(usize, 1), LauncherWatch.collected.load(.acquire));
+    try std.testing.expect(!process_tree.exitedChildIsUncollected(LauncherWatch.pid.load(.acquire)));
+}
+
+test "a launcher is collected as soon as its terminal ends with nothing left in its session" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    LauncherWatch.arm();
+    defer LauncherWatch.disarm();
+    var go: GoSignal = undefined;
+    try go.init(fixture.home);
+    defer go.deinit();
+    const session_id = try fixture.start("read -r _ < ./" ++ GoSignal.name ++ "; exit 3");
+    defer alloc.free(session_id);
+
+    try go.send();
+    try std.testing.expectEqual(
+        contracts.ReturnOutcome{ .exited = 3 },
+        try fixture.waitForExit(session_id),
+    );
+    try LauncherWatch.waitFor(&LauncherWatch.collected_seen, 15_000);
+    try std.testing.expect(!process_tree.exitedChildIsUncollected(LauncherWatch.pid.load(.acquire)));
+    try std.testing.expectEqual(@as(usize, 0), LauncherWatch.kept.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), LauncherWatch.collected.load(.acquire));
+}
+
+test "closing a terminal collects the launcher that was kept for its session" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    // The terminal's output ends before its last process does, as on macOS.
+    native_session.test_end_before_drain = true;
+    defer native_session.test_end_before_drain = false;
+    LauncherWatch.arm();
+    defer LauncherWatch.disarm();
+    var go: GoSignal = undefined;
+    try go.init(fixture.home);
+    defer go.deinit();
+    var launched: LaunchSignal = undefined;
+    try launched.init(fixture.home);
+    defer launched.deinit();
+    // A process the shell started stays in its session after the shell ends.
+    const session_id = try fixture.start("sleep 30 & echo $! > ./late.pid; disown; printf x > ./" ++
+        LaunchSignal.name ++ "; read -r _ < ./" ++ GoSignal.name ++ "; exit 0");
+    defer alloc.free(session_id);
+    try launched.wait(15_000);
+    const late = TestProcess.init(try readPid(&fixture, "late.pid"));
+    defer late.end();
+
+    try go.send();
+    try LauncherWatch.waitFor(&LauncherWatch.kept_seen, 15_000);
+    const launcher_pid = LauncherWatch.pid.load(.acquire);
+    try std.testing.expect(process_tree.exitedChildIsUncollected(launcher_pid));
+    try std.testing.expectEqual(@as(usize, 0), LauncherWatch.collected.load(.acquire));
+
+    // The last process of the session ends, and closing the terminal collects the launcher.
+    late.end();
+    var closed = try fixture.run(.{ .close = .{
+        .session_id = session_id,
+        .policy = .force,
+        .authority = fixture.claim(),
+    } });
+    defer closed.deinit(alloc);
+    try std.testing.expect(closed.view() == .success);
+    try std.testing.expectEqual(@as(usize, 1), LauncherWatch.collected.load(.acquire));
+    try std.testing.expect(!process_tree.exitedChildIsUncollected(launcher_pid));
 }
 
 test "closing owned terminals for exit ends a launcher that still waits to release its command" {
