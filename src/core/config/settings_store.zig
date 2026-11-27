@@ -13,12 +13,14 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const tool_placement = @import("tool_placement.zig");
+const shortcut_rules = @import("../shortcuts/shortcuts.zig");
+const durable_model = @import("../shared/durable_model.zig");
 const settings_keys = @import("settings_keys.zig");
 const theme_mod = @import("../shared/theme.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
-pub const max_model_bytes: usize = 1024;
+pub const max_model_bytes: usize = durable_model.max_bytes;
 const lock_deadline_ms: u64 = 2000;
 const backup_keep_count: usize = 5;
 const corrupt_keep_count: usize = 3;
@@ -95,6 +97,10 @@ pub const ProjectMcpMutation = struct {
     action: project_config.ProjectMcpAction,
 };
 
+const WorkspaceTrustMutation = struct {
+    workspace_root: []const u8,
+};
+
 pub const UserSettingsPatch = struct {
     model_preference: ?ModelPreferencePatch = null,
     provider: ?model_provider.ProviderId = null,
@@ -128,6 +134,8 @@ pub const UserSettingsPatch = struct {
     cache_warming: ?bool = null,
     /// One `tool_placement.<tool>` entry.
     tool_placement: ?ToolPlacementPatch = null,
+    /// One `shortcuts.<key>` entry: added, or removed when `action_json` is null.
+    shortcut: ?ShortcutPatch = null,
     /// Removes a plain setting, such as `fast_mode` or `status_line.context`,
     /// so it falls back to its default. Distinct from the fields above, where
     /// null means "leave unchanged".
@@ -162,6 +170,7 @@ pub const UserSettingsPatch = struct {
             self.context == null and
             self.cache_warming == null and
             self.tool_placement == null and
+            self.shortcut == null and
             self.remove == null;
     }
 };
@@ -171,6 +180,26 @@ pub const ToolPlacementPatch = struct {
     tool: []const u8,
     /// `toolbox` or `direct`.
     placement: []const u8,
+};
+
+/// Decides whether a whole `shortcuts` object is valid after a change. The
+/// shortcut grammar lives above this module, so the caller passes it in.
+pub const ShortcutCheck = *const fn (object: std.json.Value) bool;
+
+pub const ShortcutPatch = struct {
+    /// The chord to write, spelled canonically when the store writes it. When
+    /// it is null, `key` is used as the raw entry name, such as a malformed
+    /// entry that `unset` removes.
+    chord: ?shortcut_rules.Chord = null,
+    key: []const u8 = "",
+    /// A model preset as JSON text to add, or null. Null with `command` null
+    /// removes the key.
+    action_json: ?[]const u8,
+    /// One fx command line to add, written as a JSON string such as "/fast". The
+    /// store builds the string itself, so the caller's text needs no encoding.
+    command: ?[]const u8 = null,
+    /// Run on the whole object after the change; a false result refuses it.
+    check: ShortcutCheck,
 };
 
 pub const ModelPreferencePatch = struct {
@@ -308,6 +337,7 @@ const SettingsMutation = union(enum) {
     workspace_directory: WorkspaceDirectoryMutation,
     permission: PermissionMutation,
     project_mcp: ProjectMcpMutation,
+    workspace_trust: WorkspaceTrustMutation,
 
     fn operation(self: SettingsMutation) []const u8 {
         return switch (self) {
@@ -315,6 +345,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => "workspace_directory_patch",
             .permission => "permission_patch",
             .project_mcp => "project_mcp_patch",
+            .workspace_trust => "workspace_trust_patch",
         };
     }
 
@@ -327,6 +358,7 @@ const SettingsMutation = union(enum) {
                 .local => .local,
             },
             .project_mcp => .local,
+            .workspace_trust => .local,
         };
     }
 
@@ -339,6 +371,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => "commit_first",
             .permission => "commit_first",
             .project_mcp => "commit_first",
+            .workspace_trust => "commit_first",
         };
     }
 
@@ -348,6 +381,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => false,
             .permission => false,
             .project_mcp => false,
+            .workspace_trust => false,
         };
     }
 };
@@ -522,6 +556,14 @@ pub const Store = struct {
         mutation: ProjectMcpMutation,
     ) !CommitOutcome {
         return self.applyMutation(alloc, .{ .project_mcp = mutation });
+    }
+
+    pub fn applyWorkspaceTrustMutation(
+        self: *Store,
+        alloc: Allocator,
+        mutation: WorkspaceTrustMutation,
+    ) !CommitOutcome {
+        return self.applyMutation(alloc, .{ .workspace_trust = mutation });
     }
 
     fn applyMutation(
@@ -964,18 +1006,11 @@ fn validateMutation(mutation: SettingsMutation) !void {
                 .approve_all, .reset => {},
             }
         },
+        .workspace_trust => |trust| try validateWorkspaceRoot(trust.workspace_root),
     }
 }
 
-pub fn validateModel(model: []const u8) !void {
-    if (model.len == 0 or model.len > max_model_bytes or !std.unicode.utf8ValidateSlice(model)) {
-        return error.InvalidDurableField;
-    }
-    if (!std.mem.eql(u8, model, std.mem.trim(u8, model, " \t\r\n"))) return error.InvalidDurableField;
-    for (model) |byte| {
-        if (std.ascii.isControl(byte)) return error.InvalidDurableField;
-    }
-}
+pub const validateModel = durable_model.validate;
 
 /// Bounds on the gateway provider routing list (`provider_order`). Slugs are
 /// the gateway's provider identifiers (for example `anthropic`, `bedrock`,
@@ -1011,6 +1046,10 @@ fn validateUserPatch(patch: UserSettingsPatch) !void {
             return error.InvalidSettingsFormat;
         }
     }
+    if (patch.shortcut) |shortcut| {
+        var buffer: [max_shortcut_key_bytes]u8 = undefined;
+        if (shortcutKeyText(shortcut, &buffer) == null) return error.InvalidSettingsFormat;
+    }
     if (patch.remove) |path| {
         if (!removablePath(path)) return error.InvalidSettingsFormat;
     }
@@ -1044,6 +1083,101 @@ fn removeChild(object: *std.json.ObjectMap, parent_key: []const u8, child: []con
     if (parent.* != .object) return false;
     if (!parent.object.orderedRemove(child)) return false;
     if (parent.object.count() == 0) _ = object.orderedRemove(parent_key);
+    return true;
+}
+
+/// Longest key under `shortcuts`, in bytes. The shortcut map owns the limit;
+/// this store reads it from there.
+pub const max_shortcut_key_bytes = shortcut_rules.max_key_bytes;
+
+/// A key that names one `shortcuts` entry: printable ASCII without spaces. A
+/// dot is allowed, since a chord may be `ctrl+.`: the key is stored as one JSON
+/// object key, never as a path, so it can't reach a sibling entry. The caller
+/// spells the key canonically before it gets here.
+fn validShortcutKey(key: []const u8) bool {
+    if (key.len == 0 or key.len > max_shortcut_key_bytes) return false;
+    for (key) |byte| {
+        if (!std.ascii.isPrint(byte) or byte == ' ') return false;
+    }
+    return true;
+}
+
+/// The entry name a patch writes: its chord spelled canonically into `buffer`,
+/// or its raw key when no chord is set. Null for a raw key that isn't valid.
+fn shortcutKeyText(patch: ShortcutPatch, buffer: *[max_shortcut_key_bytes]u8) ?[]const u8 {
+    if (patch.chord) |chord| return chord.format(buffer);
+    return if (validShortcutKey(patch.key)) patch.key else null;
+}
+
+/// Whether one existing key is the entry a patch names: the same chord in any
+/// spelling, or the exact raw name for a patch that carries no chord.
+fn keyNamesPatch(key: []const u8, patch: ShortcutPatch) bool {
+    if (patch.chord) |chord| {
+        const parsed = shortcut_rules.Chord.parseChecked(key) catch |err| switch (err) {
+            error.Malformed => return false,
+            error.Reserved => return reservedNameIs(key, chord),
+        };
+        return parsed.eql(chord);
+    }
+    return std.mem.eql(u8, key, patch.key);
+}
+
+/// Whether a reserved key's text spells `chord`'s canonical name in any case.
+/// The chord module parses case-insensitively, so this is exact: a key that
+/// spells the name of a non-reserved chord can't be reserved.
+fn reservedNameIs(key: []const u8, chord: shortcut_rules.Chord) bool {
+    var buffer: [max_shortcut_key_bytes]u8 = undefined;
+    const name = chord.format(&buffer) orelse return false;
+    return std.ascii.eqlIgnoreCase(key, name);
+}
+
+/// The JSON value a set writes: a command line as a string, or a preset parsed
+/// from its JSON text, so a malformed preset never reaches the file.
+fn actionValue(arena: Allocator, patch: ShortcutPatch) !std.json.Value {
+    if (patch.command) |command| return .{ .string = try arena.dupe(u8, command) };
+    return std.json.parseFromSliceLeaky(std.json.Value, arena, patch.action_json.?, .{}) catch error.InvalidSettingsFormat;
+}
+
+/// Adds or removes one `shortcuts` entry in the fresh file, under the lock.
+/// A set refuses a key that already names the chord, in any spelling; a removal
+/// removes every key that names it and changes nothing when there is none.
+/// Either way the whole object must pass the caller's check, so a write never
+/// leaves an invalid map behind.
+fn applyShortcutPatch(arena: Allocator, root: *std.json.ObjectMap, patch: ShortcutPatch) !bool {
+    var buffer: [max_shortcut_key_bytes]u8 = undefined;
+    const key = shortcutKeyText(patch, &buffer) orelse return error.InvalidSettingsFormat;
+    if (root.get("shortcuts")) |value| {
+        if (value != .object) return error.ShortcutsMalformed;
+    }
+    if (patch.action_json != null or patch.command != null) {
+        if (!root.contains("shortcuts")) try root.put(arena, "shortcuts", .{ .object = .empty });
+        const shortcut_entries = root.getPtr("shortcuts").?;
+        for (shortcut_entries.object.keys()) |existing| {
+            if (keyNamesPatch(existing, patch)) return error.ShortcutOccupied;
+        }
+        try shortcut_entries.object.put(arena, try arena.dupe(u8, key), try actionValue(arena, patch));
+    } else {
+        const shortcut_entries = root.getPtr("shortcuts") orelse return false;
+        var removed = false;
+        var found = true;
+        while (found) {
+            found = false;
+            for (shortcut_entries.object.keys()) |existing| {
+                if (!keyNamesPatch(existing, patch)) continue;
+                _ = shortcut_entries.object.orderedRemove(existing);
+                removed = true;
+                found = true;
+                break;
+            }
+        }
+        if (!removed) return false;
+        // An empty map is the same as no map, so the last unset drops the key.
+        if (shortcut_entries.object.count() == 0) {
+            _ = root.orderedRemove("shortcuts");
+            return true;
+        }
+    }
+    if (!patch.check(root.get("shortcuts").?)) return error.ShortcutInvalid;
     return true;
 }
 
@@ -1232,6 +1366,7 @@ fn applyMutationToRoot(
         ),
         .permission => |permission| applyPermissionMutationToRoot(arena, root, permission),
         .project_mcp => |project_mcp| applyProjectMcpMutationToRoot(arena, root, project_mcp),
+        .workspace_trust => |trust| applyWorkspaceTrustMutationToRoot(arena, root, trust),
     };
     application.changed = application.changed or retired_settings_removed;
     return application;
@@ -1318,6 +1453,7 @@ fn applyUserPatchToRoot(
         };
         application.changed = try putString(arena, &placements.object, entry.tool, entry.placement) or application.changed;
     }
+    if (patch.shortcut) |shortcut| application.changed = try applyShortcutPatch(arena, &root.object, shortcut) or application.changed;
     if (patch.remove) |path| application.changed = removePath(&root.object, path) or application.changed;
     try cleanupLegacyWorkspacePreferences(arena, root, patch, &application);
     return application;
@@ -1800,6 +1936,16 @@ fn applyProjectMcpMutationToRoot(
     };
 }
 
+fn applyWorkspaceTrustMutationToRoot(
+    arena: Allocator,
+    root: *std.json.Value,
+    mutation: WorkspaceTrustMutation,
+) !PatchApplication {
+    const workspace = try workspaceObject(arena, root, mutation.workspace_root);
+    const changed = try putBool(arena, workspace, settings_keys.workspace_trusted_key, true);
+    return .{ .changed = changed };
+}
+
 fn workspaceObject(
     arena: Allocator,
     root: *std.json.Value,
@@ -2119,6 +2265,7 @@ fn validateCandidate(
             .local => permission.workspace_root.?,
         },
         .project_mcp => |project_mcp| project_mcp.workspace_root,
+        .workspace_trust => |trust| trust.workspace_root,
     };
     const workspace_may_be_absent = switch (mutation) {
         .workspace_directory => |workspace| workspace.patch != .add,
@@ -3975,6 +4122,43 @@ test "workspace directory mutations compose against the latest settings state" {
     try std.testing.expect(std.mem.find(u8, empty_cleared, "\"/other\":{\"sandbox\":\"none\"}") != null);
 }
 
+test "a workspace trust grant marks only that folder and keeps the rest" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try writeStoreFixture(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"model\":\"user/model\",\"workspaces\":{\"/a\":{\"additional_directories\":[\"/x\"]}}}\n",
+    );
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var granted = try store.applyWorkspaceTrustMutation(alloc, .{ .workspace_root = "/b" });
+    defer granted.deinit(alloc);
+    try std.testing.expect(granted == .committed);
+    const composed = try store.readPrimaryForTest(alloc);
+    defer alloc.free(composed);
+    try std.testing.expect(std.mem.find(u8, composed, "\"/b\":{\"trusted\":true}") != null);
+    try std.testing.expect(std.mem.find(u8, composed, "\"/a\":{\"additional_directories\":[\"/x\"]}") != null);
+    try std.testing.expect(std.mem.find(u8, composed, "\"model\":\"user/model\"") != null);
+
+    var again = try store.applyWorkspaceTrustMutation(alloc, .{ .workspace_root = "/b" });
+    defer again.deinit(alloc);
+    try std.testing.expect(again == .unchanged);
+
+    var both = try store.applyWorkspaceTrustMutation(alloc, .{ .workspace_root = "/a" });
+    defer both.deinit(alloc);
+    try std.testing.expect(both == .committed);
+    const after = try store.readPrimaryForTest(alloc);
+    defer alloc.free(after);
+    try std.testing.expect(std.mem.find(u8, after, "\"/a\":{\"additional_directories\":[\"/x\"],\"trusted\":true}") != null);
+}
+
 test "workspace directory clear removes the final empty workspace" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4575,4 +4759,287 @@ test "workspace directory add compacts saved aliases before applying effective c
     defer alloc.free(retained_identity);
     try std.testing.expectEqualStrings(shared, retained_identity);
     try std.testing.expectEqualStrings(added, directories[1].string);
+}
+
+fn acceptShortcuts(object: std.json.Value) bool {
+    _ = object;
+    return true;
+}
+
+fn refuseShortcuts(object: std.json.Value) bool {
+    _ = object;
+    return false;
+}
+
+fn shortcutFixtureHome(alloc: Allocator, tmp: *std.testing.TmpDir, text: []const u8) ![]u8 {
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", text);
+    return io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+}
+
+test "a shortcut set adds one key and keeps every other profile key" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try shortcutFixtureHome(alloc, &tmp, "{\"theme\":\"dark\",\"models\":{\"gateway\":\"openai/gpt-5\"},\"shortcuts\":{\"alt+m\":\"/model\"}}\n");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var outcome = try store.applyUserPatch(alloc, .{ .shortcut = .{
+        .key = "ctrl+2",
+        .action_json = "\"/model\"",
+        .check = acceptShortcuts,
+    } });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"theme\":\"dark\"") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "openai/gpt-5") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "alt+m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"ctrl+2\":\"/model\"") != null);
+}
+
+test "a shortcut set never replaces an occupied key, and the file stays byte-identical" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const text = "{\"shortcuts\":{\"ctrl+2\":\"/model\"}}\n";
+    const home = try shortcutFixtureHome(alloc, &tmp, text);
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    try std.testing.expectError(error.ShortcutOccupied, store.applyUserPatch(alloc, .{ .shortcut = .{
+        .key = "ctrl+2",
+        .action_json = "\"/model\"",
+        .check = acceptShortcuts,
+    } }));
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings(text, bytes);
+}
+
+test "a set refuses a shortcuts value that is not an object, and writes nothing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const text = "{\"shortcuts\":[1,2]}\n";
+    const home = try shortcutFixtureHome(alloc, &tmp, text);
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    try std.testing.expectError(error.ShortcutsMalformed, store.applyUserPatch(alloc, .{ .shortcut = .{
+        .key = "ctrl+2",
+        .action_json = "\"/model\"",
+        .check = acceptShortcuts,
+    } }));
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings(text, bytes);
+}
+
+test "a write whose whole shortcuts object fails the check is never saved" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const text = "{\"shortcuts\":{\"alt+m\":\"/model\"}}\n";
+    const home = try shortcutFixtureHome(alloc, &tmp, text);
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    try std.testing.expectError(error.ShortcutInvalid, store.applyUserPatch(alloc, .{ .shortcut = .{
+        .key = "ctrl+2",
+        .action_json = "\"/model\"",
+        .check = refuseShortcuts,
+    } }));
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings(text, bytes);
+}
+
+test "an unset removes only its key, and an absent key changes nothing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try shortcutFixtureHome(alloc, &tmp, "{\"theme\":\"light\",\"shortcuts\":{\"alt+m\":\"/model\",\"ctrl+2\":\"/model\"}}\n");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var removed = try store.applyUserPatch(alloc, .{ .shortcut = .{ .key = "ctrl+2", .action_json = null, .check = acceptShortcuts } });
+    defer removed.deinit(alloc);
+    try std.testing.expect(removed == .committed);
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "ctrl+2") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "alt+m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"theme\":\"light\"") != null);
+
+    var again = try store.applyUserPatch(alloc, .{ .shortcut = .{ .key = "ctrl+2", .action_json = null, .check = acceptShortcuts } });
+    defer again.deinit(alloc);
+    try std.testing.expect(again == .unchanged);
+}
+
+test "an unset removes a malformed entry when the rest of the object is valid" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try shortcutFixtureHome(alloc, &tmp, "{\"shortcuts\":{\"ctrl+0\":{\"action\":\"x\"}}}\n");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var outcome = try store.applyUserPatch(alloc, .{ .shortcut = .{ .key = "ctrl+0", .action_json = null, .check = acceptShortcuts } });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "ctrl+0") == null);
+}
+
+test "a shortcut key with a space, an empty name, or too many bytes is refused before anything is read" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try shortcutFixtureHome(alloc, &tmp, "{}\n");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    try std.testing.expectError(error.InvalidSettingsFormat, store.applyUserPatch(alloc, .{ .shortcut = .{ .key = "ctrl 2", .action_json = null, .check = acceptShortcuts } }));
+    const too_long: [max_shortcut_key_bytes + 1]u8 = @splat('x');
+    try std.testing.expectError(error.InvalidSettingsFormat, store.applyUserPatch(alloc, .{ .shortcut = .{ .key = too_long[0..], .action_json = null, .check = acceptShortcuts } }));
+    try std.testing.expectError(error.InvalidSettingsFormat, store.applyUserPatch(alloc, .{ .shortcut = .{ .key = "", .action_json = null, .check = acceptShortcuts } }));
+}
+
+test "a set refuses a chord the file already binds under another spelling" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const text = "{\"shortcuts\":{\"Alt+Ctrl+K\":\"/fast\"}}\n";
+    const home = try shortcutFixtureHome(alloc, &tmp, text);
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    const chord = shortcut_rules.Chord.parse("ctrl+alt+k").?;
+    try std.testing.expectError(error.ShortcutOccupied, store.applyUserPatch(alloc, .{ .shortcut = .{
+        .chord = chord,
+        .action_json = "\"/model\"",
+        .check = acceptShortcuts,
+    } }));
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings(text, bytes);
+}
+
+test "an unset removes the chord under whatever spelling the file holds it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try shortcutFixtureHome(alloc, &tmp, "{\"theme\":\"dark\",\"shortcuts\":{\"Alt+Ctrl+K\":\"/fast\",\"alt+m\":\"/model\"}}\n");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    const chord = shortcut_rules.Chord.parse("ctrl+alt+k").?;
+    var outcome = try store.applyUserPatch(alloc, .{ .shortcut = .{ .chord = chord, .action_json = null, .check = acceptShortcuts } });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "Alt+Ctrl+K") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "alt+m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"theme\":\"dark\"") != null);
+}
+
+test "the last unset removes the shortcuts key, so no empty object is left" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try shortcutFixtureHome(alloc, &tmp, "{\"theme\":\"light\",\"shortcuts\":{\"ctrl+2\":\"/model\"}}\n");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var removed = try store.applyUserPatch(alloc, .{ .shortcut = .{ .chord = shortcut_rules.Chord.parse("ctrl+2").?, .action_json = null, .check = acceptShortcuts } });
+    defer removed.deinit(alloc);
+    try std.testing.expect(removed == .committed);
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "shortcuts") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"theme\":\"light\"") != null);
+}
+
+test "a command line is saved as a JSON string, with its quotes and backslashes escaped" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try shortcutFixtureHome(alloc, &tmp, "{}\n");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var added = try store.applyUserPatch(alloc, .{ .shortcut = .{
+        .chord = shortcut_rules.Chord.parse("ctrl+f").?,
+        .action_json = null,
+        .command = "/a-1 \"q\" \\ z",
+        .check = acceptShortcuts,
+    } });
+    defer added.deinit(alloc);
+    try std.testing.expect(added == .committed);
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"ctrl+f\":\"/a-1 \\\"q\\\" \\\\ z\"") != null);
+}
+
+test "an unset removes a reserved entry under another spelling" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try shortcutFixtureHome(alloc, &tmp, "{\"theme\":\"light\",\"shortcuts\":{\"Ctrl+C\":\"/fast\",\"alt+m\":\"/model\"}}\n");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    // The first reserved table entry is Ctrl+C; the file holds it in another case.
+    var outcome = try store.applyUserPatch(alloc, .{ .shortcut = .{ .chord = shortcut_rules.reserved[0].chord, .action_json = null, .check = acceptShortcuts } });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "Ctrl+C") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "alt+m") != null);
+}
+
+test "a set and an unset name one chord whatever its spelling" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try shortcutFixtureHome(alloc, &tmp, "{}\n");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var added = try store.applyUserPatch(alloc, .{ .shortcut = .{
+        .chord = shortcut_rules.Chord.parse("Alt+Ctrl+K").?,
+        .action_json = "\"/effort low\"",
+        .check = acceptShortcuts,
+    } });
+    defer added.deinit(alloc);
+    try std.testing.expect(added == .committed);
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"ctrl+alt+k\":\"/effort low\"") != null);
+
+    try std.testing.expectError(error.ShortcutOccupied, store.applyUserPatch(alloc, .{ .shortcut = .{
+        .chord = shortcut_rules.Chord.parse("ctrl+alt+k").?,
+        .action_json = "\"/model\"",
+        .check = acceptShortcuts,
+    } }));
 }

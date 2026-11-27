@@ -51,6 +51,7 @@ const ISOLATED_KEYS = [
   "FX_TEST_GATEWAY_CHAT_URL",
   "FX_TEST_GATEWAY_MODELS_URL",
   "FX_TEST_GATEWAY_CREDITS_URL",
+  "FX_PROVIDER",
   // A developer's terminal recording and the bridge of the fx session that
   // started their tmux server must not reach a test's fx.
   "FX_DEBUG_RECORD",
@@ -59,6 +60,8 @@ const ISOLATED_KEYS = [
   "FX_RECORD_INPUT",
   "FX_MCP_CALL_SOCKET",
   "FX_MCP_CALL_TOKEN",
+  // A terminal's program resume token must not reach a test's fx.
+  "OSC7577_TOKEN",
   // A test hold left there would stop every test's fx at it.
   "FX_TEST_REPORT_DELIVERY_HELD",
   "FX_TEST_REPORT_DELIVERY_RELEASE",

@@ -82,17 +82,20 @@ function scriptedHarness({ steps = 3 } = {}) {
         }
         return null;
       };
-      const run = (turnId, input, yieldAt) => scriptedTurn(async (push, signal) => {
-        try {
-          return await steps_(turnId, input, yieldAt, push, signal);
-        } catch (error) {
-          // A cancel ends the turn; a handoff, or an engine that stopped,
-          // stores nothing more.
-          if (signal.aborted && !handedOff && error?.code !== "FX_HARNESS_STOPPED") await append({ turnId, end: true }, [{ end: true }]).catch(() => {});
-          throw error;
-        }
-      }, () => { handedOff = true; });
-      const steps_ = async (turnId, input, yieldAt, push, signal) => {
+      const run = (turnId, input, yieldAt) => {
+        const asked = { yield: false };
+        return scriptedTurn(async (push, signal) => {
+          try {
+            return await steps_(turnId, input, yieldAt, push, signal, asked);
+          } catch (error) {
+            // A cancel ends the turn; a handoff, or an engine that stopped,
+            // stores nothing more.
+            if (signal.aborted && !handedOff && error?.code !== "FX_HARNESS_STOPPED") await append({ turnId, end: true }, [{ end: true }]).catch(() => {});
+            throw error;
+          }
+        }, () => { handedOff = true; }, () => { asked.yield = true; });
+      };
+      const steps_ = async (turnId, input, yieldAt, push, signal, asked) => {
         if (input === brittle || input === shattered) {
           // The engine dies at its next model request, which a cancel that
           // arrives first avoids, as fx's kernel does.
@@ -102,7 +105,7 @@ function scriptedHarness({ steps = 3 } = {}) {
         }
         let first = true;
         for (let step = turnOf(turnId).length; step < steps; step += 1) {
-          if (!first && yieldAt !== undefined && Date.now() >= yieldAt) {
+          if (!first && (asked.yield || (yieldAt !== undefined && Date.now() >= yieldAt))) {
             await append({ turnId, yield: true }, [{ yield: true }]);
             return { stopReason: "yielded" };
           }
@@ -173,7 +176,7 @@ function scriptedHarness({ steps = 3 } = {}) {
 
 // A turn: its events as an async iterable, its `result`, and `cancel()`; a
 // handoff stops it and stores nothing more.
-function scriptedTurn(body, onHandoff) {
+function scriptedTurn(body, onHandoff, onYield = () => {}) {
   const queue = [];
   let wake = null;
   let finished = false;
@@ -190,6 +193,7 @@ function scriptedTurn(body, onHandoff) {
   return {
     result,
     steer: async () => {},
+    yield: async () => { onYield(); },
     cancel(options = {}) {
       if (options.reason === "handoff") onHandoff();
       cancelled = true;
@@ -216,6 +220,7 @@ function chain(before, next) {
   return {
     result,
     steer: async (...args) => (await ready).steer(...args),
+    yield: () => ready.then((value) => value.yield?.(), () => {}),
     // A turn whose start was refused has nothing to cancel.
     cancel: (options) => { ready.then((value) => value.cancel(options), () => {}); },
     async *[Symbol.asyncIterator]() { yield* await ready; },
@@ -308,6 +313,41 @@ test("a turn longer than the time limit continues in the next delivery, each ste
   await agent.close();
 });
 
+test("a duration must be one a timer can wait", async () => {
+  // setTimeout and setInterval run a longer delay at once: each step would be
+  // cut off as it starts, and a worker would poll or renew without pause.
+  const longest = 2 ** 31 - 1;
+  assert.throws(() => memory({ maxDurationMs: longest + 1 }), { name: "TypeError", message: `memory() maxDurationMs must be at most ${longest}` });
+  for (const key of ["maxDurationMs", "pollMs", "leaseMs"]) {
+    assert.throws(() => world(() => ({}), { [key]: longest + 1 }), { name: "TypeError", message: `world() ${key} must be at most ${longest}` }, key);
+    assert.doesNotThrow(() => world(() => ({}), { [key]: longest }), key);
+  }
+  const deadlines = [];
+  const agent = createAgent({ durability: await durabilityFor({ maxDurationMs: longest }), onEvent: (event) => { if (event.type === "session.deadline") deadlines.push(event); } });
+  const { text, result } = await textOf(agent.session().prompt("zenith", { messageId: "turn-zenith" }));
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(text, "zenith-0 zenith-1 zenith-2");
+  assert.deepEqual(deadlines, [], "the longest time limit cuts no step off");
+  await agent.close();
+});
+
+if (durabilityKind === "world" || durabilityKind === "queue") {
+  test("a World deadline further off than a timer can wait cuts no step off", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-"));
+    dirs.push(dir);
+    const durability = await durabilityAt(dir);
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+    durability.world().getRuntimeDeadline = async () => new Date(Date.now() + thirtyDaysMs);
+    const deadlines = [];
+    const agent = createAgent({ durability, onEvent: (event) => { if (event.type === "session.deadline") deadlines.push(event); } });
+    const { text, result } = await textOf(agent.session().prompt("nadir", { messageId: "turn-nadir" }));
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "nadir-0 nadir-1 nadir-2");
+    assert.deepEqual(deadlines, [], "a deadline 30 days off cuts no step off");
+    await agent.close();
+  });
+}
+
 test("a step cut off at the deadline continues in the next delivery", async () => {
   const agent = createAgent({ durability: await durabilityFor() });
   const session = agent.session();
@@ -324,6 +364,161 @@ test("a step cut off at the deadline continues in the next delivery", async () =
   assert.equal(result.stopReason, "end_turn");
   assert.equal(text, "gamma-0 gamma-1 gamma-2");
   assert.deepEqual(ran.slice(before), ["turn-g:0", "turn-g:1", "turn-g:2"], "the cut-off step ran once, in the next delivery");
+  await agent.close();
+});
+
+// local() keeps each World's queue in its process, so a message that comes back
+// stays with the agent that handed off; a resume continues the turn there (next test).
+if (durabilityKind !== "local") {
+  test("a hand-off stops a turn at its next step, and another agent continues it, each step once", async () => {
+    const durability = await durabilityFor();
+    const events = [];
+    const onEvent = (event) => { if (event.type === "session.handoff" || event.type === "session.deadline") events.push(event.type); };
+    const first = createAgent({ durability, onEvent });
+    const second = createAgent({ durability, onEvent });
+    const session = first.session();
+    let started;
+    let release;
+    const holding = new Promise((resolve) => { started = resolve; });
+    holds.set("kappa-1", { started: () => started(), released: new Promise((resolve) => { release = resolve; }) });
+    const before = ran.length;
+    // An agent joins its process's queue once used.
+    await second.newSessionId();
+    const turn = session.prompt("kappa", { messageId: "turn-k" });
+    await holding;
+    const handedOff = first.handOff();
+    release();
+    await handedOff;
+    holds.delete("kappa-1");
+    const { text, result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "kappa-0 kappa-1 kappa-2");
+    assert.deepEqual(ran.slice(before), ["turn-k:0", "turn-k:1", "turn-k:2"], "each step ran once");
+    const lines = await readLines(session.stream(0), 16);
+    assert.equal(lines.filter((line) => line.type === "turn_yield").length, 1);
+    const log = await first[Symbol.for("libfx.durableInternals")].openLog(session.id);
+    const releases = (await log.read()).map(({ entry }) => entry).filter((entry) => entry?.k === "release");
+    assert.ok(releases.length > 0);
+    assert.ok(releases.every((entry) => entry.cutoff === undefined), "a yield is not a cut-off");
+    assert.deepEqual(events, [], "nothing was cut off");
+    await first.close();
+    await second.close();
+  });
+
+  test("a hand-off cuts off a step that outlasts its bound, as the deadline does, and the next delivery runs it once", async () => {
+    const durability = await durabilityFor();
+    const events = [];
+    const first = createAgent({ durability, onEvent: (event) => { if (event.type === "session.handoff" || event.type === "session.deadline") events.push(event.type); } });
+    const second = createAgent({ durability });
+    const session = first.session();
+    let started;
+    const holding = new Promise((resolve) => { started = resolve; });
+    holds.set("lambda-1", { started: () => started(), released: new Promise(() => {}) });
+    const before = ran.length;
+    // An agent joins its process's queue once used.
+    await second.newSessionId();
+    const turn = session.prompt("lambda", { messageId: "turn-l" });
+    await holding;
+    holds.delete("lambda-1");
+    await first.handOff({ within: 20 });
+    assert.deepEqual(events, ["session.handoff"]);
+    const { text, result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "lambda-0 lambda-1 lambda-2");
+    assert.deepEqual(ran.slice(before), ["turn-l:0", "turn-l:1", "turn-l:2"], "the cut-off step ran once, in the next delivery");
+    const log = await first[Symbol.for("libfx.durableInternals")].openLog(session.id);
+    const cutoffs = (await log.read()).map(({ entry }) => entry).filter((entry) => entry?.k === "release" && entry.cutoff !== undefined);
+    assert.deepEqual(cutoffs.map((entry) => entry.cutoff), ["turn-l"], "the bound's release names the turn it cut off");
+    await first.close();
+    await second.close();
+  });
+
+  test("a later hand-off's bound cuts off a step that an earlier hand-off without one left running", async () => {
+    const durability = await durabilityFor();
+    const events = [];
+    const first = createAgent({ durability, onEvent: (event) => { if (event.type === "session.handoff" || event.type === "session.deadline") events.push(event.type); } });
+    const second = createAgent({ durability });
+    const session = first.session();
+    let started;
+    const holding = new Promise((resolve) => { started = resolve; });
+    holds.set("phi2-1", { started: () => started(), released: new Promise(() => {}) });
+    const before = ran.length;
+    // An agent joins its process's queue once used.
+    await second.newSessionId();
+    const turn = session.prompt("phi2", { messageId: "turn-phi2" });
+    await holding;
+    holds.delete("phi2-1");
+    // Without a bound, the first hand-off waits on a step that never returns;
+    // the second one's bound cuts it off, as SIGTERM's does after a deploy's,
+    // and a third, longer bound leaves that cut-off where it is.
+    const unbounded = first.handOff();
+    const bounded = first.handOff({ within: 20 });
+    const longer = first.handOff({ within: 600_000 });
+    await Promise.all([unbounded, bounded, longer]);
+    assert.deepEqual(events, ["session.handoff"]);
+    const { text, result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "phi2-0 phi2-1 phi2-2");
+    assert.deepEqual(ran.slice(before), ["turn-phi2:0", "turn-phi2:1", "turn-phi2:2"], "the cut-off step ran once, in the next delivery");
+    await first.close();
+    await second.close();
+  });
+}
+
+if (durabilityKind === "local") {
+  test("on local(), a hand-off's turn continues at the next resume, each step once", async () => {
+    const durability = await durabilityFor();
+    const first = createAgent({ durability });
+    const second = createAgent({ durability });
+    const session = first.session();
+    let started;
+    let release;
+    const holding = new Promise((resolve) => { started = resolve; });
+    holds.set("nu-1", { started: () => started(), released: new Promise((resolve) => { release = resolve; }) });
+    const before = ran.length;
+    const turn = session.prompt("nu", { messageId: "turn-n" });
+    await holding;
+    const handedOff = first.handOff();
+    release();
+    await handedOff;
+    holds.delete("nu-1");
+    void second.session(session.id).resume().result.catch(() => {});
+    const { text, result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "nu-0 nu-1 nu-2");
+    assert.deepEqual(ran.slice(before), ["turn-n:0", "turn-n:1", "turn-n:2"], "each step ran once");
+    const log = await first[Symbol.for("libfx.durableInternals")].openLog(session.id);
+    const releases = (await log.read()).map(({ entry }) => entry).filter((entry) => entry?.k === "release");
+    assert.ok(releases.every((entry) => entry.cutoff === undefined), "a yield is not a cut-off");
+    await first.close();
+    await second.close();
+  });
+}
+
+test("an agent that took a hand-off sends each delivery back to the queue unread", async () => {
+  const durability = await durabilityFor();
+  const agent = createAgent({ durability });
+  // A delivery names its session by id, so the id is minted first.
+  const sessionId = await agent.newSessionId();
+  // With nothing running, the hand-off ends at once.
+  await agent.handOff();
+  const opens = opened.count;
+  const result = await agent[Symbol.for("libfx.durableInternals")].deliver(
+    { type: "prompt", sessionId, messageId: "turn-m", agent: agent.name },
+    { messageId: "delivery-m", attempt: 0 },
+  );
+  assert.deepEqual(result, { timeoutSeconds: 2 }, "the queue delivers it again later, to another process");
+  assert.equal(opened.count, opens, "no engine opened");
+  await agent.close();
+});
+
+test("a hand-off's bound must be a number of milliseconds a timer can wait", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  await assert.rejects(agent.handOff({ within: -1 }), TypeError);
+  await assert.rejects(agent.handOff({ within: "5" }), TypeError);
+  // setTimeout runs a longer delay at once, which would cut every turn off.
+  await assert.rejects(agent.handOff({ within: 2 ** 31 }), TypeError);
+  await agent.handOff({ within: 2 ** 31 - 1 });
   await agent.close();
 });
 
