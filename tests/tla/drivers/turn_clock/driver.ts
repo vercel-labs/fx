@@ -429,6 +429,7 @@ if (options.selfCheck) {
     const dir = join(out, `mutant-${index}`);
     mkdirSync(dir, { recursive: true });
     cpSync(join(REPO_ROOT, "src", "core", "output", "compaction_activity.zig"), join(dir, "compaction_activity.zig"));
+    cpSync(join(REPO_ROOT, "src", "core", "output", "compaction_progress.zig"), join(dir, "compaction_progress.zig"));
     writeFileSync(join(dir, "turn_clock.zig"), source.replace(mutant.target, mutant.planted));
     const name = `turn_clock_lab_mutant_${index}`;
     const bin = buildLab(join(dir, "turn_clock.zig"), out, name);

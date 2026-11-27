@@ -55,8 +55,11 @@ const substitutions: Record<string, string[]> = {
   MixedBuilds: ["RevokeOnReplay"],
   StoreLockBudget: ["Budget", "Slack", "Tolerance"],
   RefreshLease: ["RefreshMax", "Budget", "Slack", "Tolerance"],
-  ConfigEdit: ["Names", "Classes", "Checked", "KeyScan", "GuardRemove", "Atomic"],
+  ErrorData: ["Cap", "MaxSize", "MaxChar", "Carry"],
+  Connect: ["Std"],
+  ConfigEdit: ["Names", "Classes", "Checked", "KeyScan", "GuardRemove", "Atomic", "Deep"],
   McpRules: ["Tools", "OwnRules"],
+  SubagentAccess: ["Servers", "MaxRuns", "MaxViews", "Bridge", "DeniedFirst"],
   WireDepth: ["Limit", "Capacity", "EngineLimit", "MaxDepth"],
 };
 

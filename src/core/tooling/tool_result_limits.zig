@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const tool_result_cut_marker = @import("../shared/tool_result_cut_marker.zig");
 const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
@@ -56,7 +57,7 @@ pub fn prepareModelOutputWithTruncation(
         .text = sanitized,
         .max_bytes = max_bytes,
         .marker = try scratch.print(
-            "\n... [tool result truncated for {s}: original {d} bytes; cap is {d} bytes]\n",
+            tool_result_cut_marker.cut_marker_format,
             .{ tool_name, sanitized.len, max_bytes },
         ),
         .trace_scope = "tool",

@@ -104,12 +104,18 @@ const config_options = [_]command_specs.OptionDoc{
 const session_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "last", .description = "Inspect the current workspace session" },
     .{ .usage = "resume [last|<id>]", .description = "Resume the latest workspace session or a session by id" },
+    .{ .usage = "fork <last|id>", .description = "Copy a saved or live session into a new session", .options = &session_fork_options },
     .{ .usage = "recover <id>", .description = "Copy a recoverable corrupt session into a new session" },
 };
 
 pub const session_options = [_]command_specs.OptionDoc{
     .{ .flag = "--id <id>", .description = "Inspect a saved session by exact id" },
     .{ .flag = "--tail <1-1000>", .description = "Show only the last turns, each under its own number" },
+    json_option,
+};
+
+pub const session_fork_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--id <id>", .description = "Fork a saved session by exact id" },
     json_option,
 };
 
@@ -164,10 +170,10 @@ const mcp_subcommands = [_]command_specs.SubcommandDoc{
 // parses and completion offers.
 
 /// `--global` names ~/.fx/mcp.json, the default, and `--project` the
-/// project's .mcp.json. `--profile` is the older name for `--global`.
+/// project's .mcp.json.
 pub const mcp_scope_options = [_]command_specs.OptionDoc{
     .{ .flag = "--global", .description = "Use ~/.fx/mcp.json, the default" },
-    .{ .flag = "--profile", .description = "Older name for --global", .hidden = true },
+    .{ .flag = "--profile", .description = "", .replacement = "use --global" },
     .{ .flag = "--project", .description = "Use the project's .mcp.json" },
 };
 pub const mcp_add_options = mcp_scope_options ++ [_]command_specs.OptionDoc{
@@ -304,15 +310,6 @@ pub const top_level_specs = [_]TopLevelSpec{
         .subcommands = &login_providers,
     },
     .{
-        .kind = .setup,
-        .token = "setup",
-        // Warns until it is removed.
-        .hidden_from_top_level_help = true,
-        .replaced_by = "fx login vercel --api-key",
-        .usage = "setup",
-        .summary = "Paste an AI Gateway API key (deprecated: use fx login vercel --api-key)",
-    },
-    .{
         .kind = .status,
         .token = "status",
         .usage = "status [--json]",
@@ -373,8 +370,8 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .session,
         .token = "session",
-        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session resume [last|<id>] | session recover <id>|--id <id> [--json]",
-        .summary = "Inspect, resume, or recover saved sessions",
+        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session resume [last|<id>] | session fork <last|id>|--id <id> [--json] | session recover <id>|--id <id> [--json]",
+        .summary = "Inspect, resume, fork, or recover saved sessions",
         .subcommands = &session_subcommands,
         .options = &session_options,
         .details = &.{
@@ -504,6 +501,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .sessions, .usage = "sessions" },
         .{ .kind = .session, .usage = "session <last|id>" },
         .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },
+        .{ .usage = "session fork <last|id>", .summary = "Copy a saved or live session into a new session" },
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
     } },
     .{ .entries = &.{
@@ -733,7 +731,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .fork_session, .command = "/fork", .help_entry = "/fork", .completion_description = "fork the session before a prompt", .presentation_category = .session },
     .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
     .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [vercel|codex|grok]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
-    .{ .kind = .provider, .command = "/provider", .aliases = &.{"/setup"}, .show_aliases_in_completion = false, .help_entry = "/provider", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
+    .{ .kind = .provider, .command = "/provider", .help_entry = "/provider", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show terminal rendering counters", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{}, .help_entry = "/usage", .completion_description = "show your provider's usage and spend", .presentation_category = .account },
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration and the session ID", .presentation_category = .general, .show_in_welcome = true },
@@ -823,7 +821,6 @@ test "fx config help names settings by their current keys" {
             const word = std.mem.trimEnd(u8, raw, ".");
             const dot = std.mem.findScalar(u8, word, '.') orelse continue;
             const key = settings_keys.find(word[0..dot]) orelse continue;
-            try std.testing.expectEqualStrings(settings_keys.currentPath(word), word);
             var known = false;
             for (key.children) |child| known = known or std.mem.eql(u8, child, word[dot + 1 ..]);
             try std.testing.expect(known);

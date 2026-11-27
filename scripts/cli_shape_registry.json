@@ -121,6 +121,14 @@
       "job": "diagnostics",
       "stability": "stable"
     },
+    "FX_TEST_ACP_PERMISSION_READY": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_ACP_PERMISSION_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_ACP_PROMPT_REAP_READY": {
       "job": "test",
       "stability": "internal"
@@ -237,6 +245,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_MCP_IDLE_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_OAUTH_ISSUER_URL": {
       "job": "test",
       "stability": "internal"
@@ -246,6 +258,14 @@
       "stability": "internal"
     },
     "FX_TEST_OPENAI_CODEX_RESPONSES_URL": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_REPORT_DELIVERY_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_REPORT_DELIVERY_RELEASE": {
       "job": "test",
       "stability": "internal"
     },
@@ -262,6 +282,14 @@
       "stability": "internal"
     },
     "FX_TEST_SHELL_QUIET_NOTICE_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SHELL_YIELD_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SHELL_YIELD_RELEASE": {
       "job": "test",
       "stability": "internal"
     },
@@ -313,6 +341,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_SUBAGENT_START_FAIL": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SUBAGENT_START_HELD": {
       "job": "test",
       "stability": "internal"
@@ -354,6 +386,22 @@
       "stability": "internal"
     },
     "FX_TEST_USAGE_CLOCK_FILE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_WEB_FETCH_DNS_READY": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_WEB_FETCH_DNS_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_WORKSPACE_CAPTURE_START_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_WORKSPACE_CAPTURE_START_RELEASE": {
       "job": "test",
       "stability": "internal"
     },
@@ -512,9 +560,7 @@
     "flag_names": {
       "--resume-": "Prefix of the removed --resume-<id> alias, kept so the removed spelling fails with a hint."
     },
-    "setting_keys": {
-      "statusLine": "Older spelling of status_line, still read so existing settings files keep working; fx writes only status_line."
-    }
+    "setting_keys": {}
   },
   "hand_parsed_files": {
     "src/builtins/skills.zig": "Reads a pasted npx skills add command line, another program's flags.",

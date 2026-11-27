@@ -10,11 +10,13 @@
 # tests/tla/drivers/*.mjs, the Node-API and WebAssembly core entry points,
 # src/acp/, src/core/hosts/, or src/core/session_manager/.
 #
-# mcp: the two TLA+ MCP jobs, the engine models and driver and the host models
-# and drivers, model-check tests/tla/mcp/ and tests/tla/mcp_host/ and drive the
-# MCP engine and fx along them. They run in parallel and take about 20 minutes
-# each. A pull request runs them only when it touches src/mcp/,
-# src/core/mcp_host/, src/core/mcp/, those models, their drivers in
+# mcp: the TLA+ MCP jobs, the engine models and driver and the host models and
+# drivers (three parts of one job: the SignIn model, the other models, and the
+# drivers), model-check tests/tla/mcp/ and tests/tla/mcp_host/ and drive the
+# MCP engine and fx along them. They run in parallel and take 7 to 28 minutes.
+# A pull request runs them only when it touches src/mcp/,
+# src/core/mcp_host/, src/core/mcp/, src/core/shared/net_connect.zig (the
+# connect its model Connect.tla checks), those models, their drivers in
 # tests/tla/drivers/mcp/, tests/tla/drivers/mcp_host/, and
 # tests/tla/drivers/lib/, the MCP fixtures in tests/e2e/fixtures/, or the
 # helpers the drivers load: tests/e2e/tmux-helpers.ts,
@@ -28,15 +30,17 @@
 # tests/tla/drivers/lib/ and tests/tla/drivers/graph.mjs.
 #
 # subagent: the TLA+ subagent and session-write models job model-checks the
-# design configs of tests/tla/subagent/ and the session-write and live
-# sessions models in tests/tla/session/, and drives a built fx along them,
-# which takes a few minutes. A pull request runs it only when it touches
+# design configs of tests/tla/subagent/ and the session-write, live sessions,
+# and accepted-input models in tests/tla/session/, and drives a built fx along
+# them, which takes a few minutes. A pull request runs it only when it touches
 # src/core/subagent/, src/core/session/, src/core/agent/worker_runtime.zig,
-# src/core/agent/runtime/parallel_execution.zig, those models, their drivers
-# in tests/tla/drivers/subagent/, tests/tla/drivers/session/write.test.ts and
-# tests/tla/drivers/session/live.test.ts,
-# the shared code in tests/tla/lib/ and tests/tla/drivers/lib/, or the
-# helpers the drivers load: tests/e2e/tmux-helpers.ts and
+# src/core/agent/runtime/parallel_execution.zig,
+# src/core/app/app_session_runtime.zig, those models, their drivers in
+# tests/tla/drivers/subagent/, tests/tla/drivers/session/write.test.ts,
+# tests/tla/drivers/session/live.test.ts, and
+# tests/tla/drivers/session/accepted-input.test.ts, the shared code in
+# tests/tla/lib/ and tests/tla/drivers/lib/, or the helpers those drivers load:
+# tests/e2e/tmux-helpers.ts, tests/e2e/saved-sessions.ts, and
 # tests/evals/eval-helpers.ts.
 #
 # acp: the TLA+ ACP models and drivers job model-checks tests/tla/acp/ and
@@ -146,8 +150,8 @@ while IFS= read -r path; do
       require_transcript_window "$path: shared driver code changed"
       require_subagent "$path: shared driver code changed"
       require_acp "$path: shared driver code changed" ;;
-    tests/tla/drivers/subagent/* | tests/tla/drivers/session/write.test.ts | tests/tla/drivers/session/live.test.ts)
-      require_subagent "$path: subagent, session-write, or live sessions driver changed" ;;
+    tests/tla/drivers/subagent/* | tests/tla/drivers/session/write.test.ts | tests/tla/drivers/session/live.test.ts | tests/tla/drivers/session/accepted-input.test.ts)
+      require_subagent "$path: subagent, session-write, live sessions, or accepted-input driver changed" ;;
     tests/tla/drivers/transcript_window/*)
       require_transcript_window "$path: transcript window driver changed" ;;
     tests/tla/drivers/graph.mjs)
@@ -165,7 +169,7 @@ while IFS= read -r path; do
       require_acp "$path: ACP code changed" ;;
     src/core/hosts/* | src/core/session_manager/*)
       require_libfx "$path: code libfx owns changed" ;;
-    src/mcp/* | src/core/mcp_host/* | src/core/mcp/*)
+    src/mcp/* | src/core/mcp_host/* | src/core/mcp/* | src/core/shared/net_connect.zig)
       require_mcp "$path: MCP code changed" ;;
     tests/tla/mcp/* | tests/tla/mcp_host/*)
       require_mcp "$path: MCP model changed" ;;
@@ -173,10 +177,10 @@ while IFS= read -r path; do
       require_transcript_window "$path: transcript window code changed" ;;
     tests/tla/transcript_window/*)
       require_transcript_window "$path: transcript window model changed" ;;
-    src/core/subagent/* | src/core/session/* | src/core/agent/worker_runtime.zig | src/core/agent/runtime/parallel_execution.zig)
-      require_subagent "$path: subagent or session-write code changed" ;;
-    tests/tla/subagent/* | tests/tla/session/SessionWrite* | tests/tla/session/session-write* | tests/tla/session/LiveSessions* | tests/tla/session/live-*)
-      require_subagent "$path: subagent, session-write, or live sessions model changed" ;;
+    src/core/subagent/* | src/core/session/* | src/core/agent/worker_runtime.zig | src/core/agent/runtime/parallel_execution.zig | src/core/app/app_session_runtime.zig)
+      require_subagent "$path: subagent, session, or accepted-input code changed" ;;
+    tests/tla/subagent/* | tests/tla/session/SessionWrite* | tests/tla/session/session-write* | tests/tla/session/LiveSessions* | tests/tla/session/live-* | tests/tla/session/AcceptedInput* | tests/tla/session/accepted-*)
+      require_subagent "$path: subagent, session-write, live sessions, or accepted-input model changed" ;;
     tests/tla/acp/*)
       require_acp "$path: ACP model changed" ;;
     tests/tla/lib/*)
@@ -188,7 +192,9 @@ while IFS= read -r path; do
       require_acp "$path: a file the ACP drivers load changed" ;;
     tests/evals/eval-helpers.ts)
       require_mcp "$path: a file the MCP drivers load changed"
-      require_subagent "$path: a file the subagent drivers load changed" ;;
+      require_subagent "$path: a file the subagent and session drivers load changed" ;;
+    tests/e2e/saved-sessions.ts)
+      require_subagent "$path: a file the accepted-input driver loads changed" ;;
     tests/e2e/fixtures/mcp-* | tests/e2e/render-lab/tape.ts)
       require_mcp "$path: a file the MCP drivers load changed" ;;
   esac

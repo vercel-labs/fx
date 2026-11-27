@@ -57,6 +57,85 @@ pub fn steeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
     return alloc.print(steering_open ++ "{s}" ++ steering_close, .{text});
 }
 
+/// Whether `message` is the user's steering: in the envelope a turn sends it
+/// in, or restored from a saved turn without it. A parent's steering, a
+/// subagent's report, and fx's own prompts are not.
+pub fn isUserSteering(message: ChatMessage) bool {
+    if (message.role != .user or message.recovery_prompt) return false;
+    const content = message.content orelse return false;
+    if (inUserSteeringEnvelope(content)) return true;
+    return message.restored_steering and isBareSteering(content) and !std.mem.startsWith(u8, content, parent_steering_label);
+}
+
+fn inUserSteeringEnvelope(content: []const u8) bool {
+    return envelopeBody(content, steering_open, steering_close) != null;
+}
+
+/// The text between `open` and `close`, or null when `content` is not
+/// wrapped in them. A text shorter than both together, whose start and end
+/// share characters, is not wrapped.
+fn envelopeBody(content: []const u8, open: []const u8, close: []const u8) ?[]const u8 {
+    if (content.len < open.len + close.len) return null;
+    if (!std.mem.startsWith(u8, content, open) or !std.mem.endsWith(u8, content, close)) return null;
+    return content[open.len .. content.len - close.len];
+}
+
+test "text whose envelope markers overlap is not in the envelope" {
+    // Each open marker ends with the newline its close marker starts with.
+    const user_overlap = steering_open ++ steering_close[1..];
+    const parent_overlap = parent_steering_open ++ parent_steering_close[1..];
+    try std.testing.expect(steeringText(user_overlap) == null);
+    try std.testing.expect(steeringText(parent_overlap) == null);
+    try std.testing.expect(!isUserSteering(.{ .role = .user, .content = user_overlap }));
+    // Restored without an envelope, such words are the user's own text.
+    try std.testing.expect(isUserSteering(.{ .role = .user, .content = parent_overlap, .restored_steering = true }));
+    try std.testing.expectEqualStrings("", steeringText(steering_open ++ steering_close).?);
+}
+
+test "no cut of an envelope's markers is in the envelope" {
+    const envelopes = [_][]const u8{ steering_open ++ steering_close, parent_steering_open ++ parent_steering_close };
+    for (envelopes) |whole| {
+        for (0..whole.len) |cut| {
+            try std.testing.expect(steeringText(whole[0..cut]) == null);
+            try std.testing.expect(steeringText(whole[whole.len - cut ..]) == null);
+        }
+        try std.testing.expectEqualStrings("", steeringText(whole).?);
+    }
+}
+
+/// Whether saved steering `text` was kept without its envelope: it is not
+/// empty, which only marks a checkpoint boundary, not a subagent's frame or
+/// still in an envelope, and not fx's own `resume_notice`.
+fn isBareSteering(text: []const u8) bool {
+    return text.len > 0 and steeringText(text) == null and !std.mem.eql(u8, text, resume_notice);
+}
+
+test "only the user's steering counts as the user's steering" {
+    const alloc = std.testing.allocator;
+    const user = try steeringMessage(alloc, "whats going on ?");
+    defer alloc.free(user);
+    const parent = try parentSteeringMessage(alloc, "review this");
+    defer alloc.free(parent);
+    // A subagent's report that quotes the user's envelope is still the subagent's.
+    const quoting = try std.mem.concat(alloc, u8, &.{ agent_frame.report_header, user });
+    defer alloc.free(quoting);
+    try std.testing.expect(!isUserSteering(.{ .role = .user, .content = quoting }));
+    try std.testing.expect(!isUserSteering(.{ .role = .user, .content = quoting, .restored_steering = true }));
+    // Restored from a saved turn, the user's words have no envelope.
+    try std.testing.expect(isUserSteering(.{ .role = .user, .content = "whats going on ?", .restored_steering = true }));
+    try std.testing.expect(isUserSteering(.{ .role = .user, .content = user, .restored_steering = true }));
+    try std.testing.expect(!isUserSteering(.{ .role = .user, .content = parent_steering_label ++ "review this", .restored_steering = true }));
+    try std.testing.expect(!isUserSteering(.{ .role = .user, .content = resume_notice, .restored_steering = true }));
+    try std.testing.expect(!isUserSteering(.{ .role = .user, .content = "", .restored_steering = true }));
+    try std.testing.expect(isUserSteering(.{ .role = .user, .content = user }));
+    try std.testing.expect(!isUserSteering(.{ .role = .user, .content = user, .recovery_prompt = true }));
+    try std.testing.expect(!isUserSteering(.{ .role = .assistant, .content = user }));
+    try std.testing.expect(!isUserSteering(.{ .role = .user, .content = parent }));
+    try std.testing.expect(!isUserSteering(.{ .role = .user, .content = agent_frame.report_header ++ "{}" }));
+    try std.testing.expect(!isUserSteering(.{ .role = .user, .content = "plain prompt" }));
+    try std.testing.expect(!isUserSteering(.{ .role = .user }));
+}
+
 test "steering message tells the model to apply the update and continue" {
     const message = try steeringMessage(std.testing.allocator, "focus on rendering");
     defer std.testing.allocator.free(message);
@@ -461,6 +540,7 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
             .text = copy,
             .assistant_prefix = prefix_copy,
             .after_tool_step_count = tool_step_count,
+            .input_id = message.input_id,
         }) catch |err| {
             alloc.free(copy);
             if (prefix_copy) |prefix| alloc.free(prefix);
@@ -572,7 +652,7 @@ pub fn rewrapRestoredSteering(arena: Allocator, messages: []const ChatMessage) A
     for (messages, 0..) |message, index| {
         if (!message.restored_steering) continue;
         const text = message.content orelse continue;
-        if (text.len == 0 or steeringText(text) != null or std.mem.eql(u8, text, resume_notice)) continue;
+        if (!isBareSteering(text)) continue;
         const projected = result orelse try arena.dupe(ChatMessage, messages);
         result = projected;
         projected[index].content = if (std.mem.startsWith(u8, text, parent_steering_label))
@@ -655,12 +735,9 @@ fn steeringText(content: []const u8) ?[]const u8 {
     // A subagent's report or message a boundary took keeps its frame, which
     // names it as untrusted agent output wherever it is replayed.
     if (agent_frame.isFrame(content)) return content;
-    if (std.mem.startsWith(u8, content, parent_steering_open) and std.mem.endsWith(u8, content, parent_steering_close)) {
-        // Keep the sender label in persisted text and ordinary history replay.
-        return content[parent_steering_open.len .. content.len - parent_steering_close.len];
-    }
-    if (!std.mem.startsWith(u8, content, steering_open) or !std.mem.endsWith(u8, content, steering_close)) return null;
-    return content[steering_open.len .. content.len - steering_close.len];
+    // Keep the sender label in persisted text and ordinary history replay.
+    if (envelopeBody(content, parent_steering_open, parent_steering_close)) |body| return body;
+    return envelopeBody(content, steering_open, steering_close);
 }
 
 /// Which steering and feedback a cancelled turn keeps is modeled in
@@ -1286,6 +1363,7 @@ pub fn applyToolResultMemory(
     prepared.command_process_presentation = source_memory.command_process_presentation;
     prepared.terminal_action_presentation = source_memory.terminal_action_presentation;
     prepared.quiet_crossing = source_memory.quiet_crossing;
+    prepared.subagent_started = source_memory.subagent_started;
     const source_covers_full_file =
         source_memory.model_view_covers_full_file orelse return;
     prepared.model_view_covers_full_file =
@@ -3021,4 +3099,25 @@ test "transcript does not mark native web_search as provider resource placeholde
 
     try std.testing.expect(!records[0].provider_native);
     try std.testing.expectEqualStrings("bounded search output", records[0].output);
+}
+
+test "eb03: buildExecutionMemory carries ChatMessage.input_id to PersistedSteering.input_id" {
+    const alloc = std.testing.allocator;
+    const framed = try steeringMessage(alloc, "user steer");
+    defer alloc.free(framed);
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = framed, .input_id = 55 },
+        .{ .role = .user, .content = "Continue.", .recovery_prompt = true },
+    };
+    const execution = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, execution);
+    try std.testing.expectEqual(@as(usize, 2), execution.steering.len);
+    try std.testing.expectEqual(@as(?u64, 55), execution.steering[0].input_id);
+    try std.testing.expectEqual(@as(?u64, null), execution.steering[1].input_id);
+
+    const interrupted = try buildInterruptedExecutionMemory(alloc, &messages, null);
+    defer types.freeExecutionMemory(alloc, interrupted);
+    try std.testing.expectEqual(@as(usize, 2), interrupted.steering.len);
+    try std.testing.expectEqual(@as(?u64, 55), interrupted.steering[0].input_id);
+    try std.testing.expectEqual(@as(?u64, null), interrupted.steering[1].input_id);
 }

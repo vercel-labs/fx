@@ -3,6 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const image_data = @import("../images/image_data.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const tool_result_cut_marker = @import("../shared/tool_result_cut_marker.zig");
 const types = @import("../shared/types.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_child_store = @import("session_child_store.zig");
@@ -456,13 +457,30 @@ fn storeLargeResultAtHandleManaged(
     entry.deinit(alloc);
 }
 
+/// What follows the preview in `formatStoredResultOutput`'s block. The handle and the notice after it are
+/// fx's own words, so the last occurrence of this is the one that ends the preview, whatever the preview holds.
+const preview_end = "\n</tool_result_preview>\n<tool_result_handle>";
+
 pub fn formatStoredResultOutput(alloc: Allocator, handle: []const u8, preview: []const u8, stored_bytes: usize) ![]u8 {
     return alloc.print(
-        "<tool_result_preview handle=\"{s}\" stored_bytes=\"{d}\">\n{s}\n</tool_result_preview>\n" ++
-            "<tool_result_handle>{s}</tool_result_handle>\n" ++
+        "<tool_result_preview handle=\"{s}\" stored_bytes=\"{d}\">\n{s}" ++ preview_end ++ "{s}</tool_result_handle>\n" ++
             "Full result is stored outside session JSON. Use read_tool_result with this handle to inspect a byte range or literal query.",
         .{ handle, stored_bytes, preview, handle },
     );
+}
+
+/// The preview that `formatStoredResultOutput` put in `output`: the first `preview_bytes` of the stored
+/// result. Null when `output` is not that block, such as a result kept in the session.
+/// (`tests/e2e/mcp-stdio.test.ts` "a project that sets max_tool_result_bytes below a refused call's error
+/// text still sees the cause")
+pub fn storedPreview(output: []const u8) ?[]const u8 {
+    const start_tag = "<tool_result_preview handle=\"";
+    if (!std.mem.startsWith(u8, output, start_tag)) return null;
+    const tag_end = std.mem.find(u8, output, "\">\n") orelse return null;
+    const start = tag_end + "\">\n".len;
+    const end = std.mem.findLast(u8, output, preview_end) orelse return null;
+    if (end < start) return null;
+    return output[start..end];
 }
 
 pub fn readByRange(alloc: Allocator, result_dir: []const u8, handle: []const u8, start_byte: usize, byte_count: usize) ![]u8 {
@@ -623,7 +641,7 @@ pub fn deleteManaged(
 
 fn cappedInlineOutput(alloc: Allocator, tool_name: []const u8, text: []const u8, max_bytes: usize) ![]u8 {
     const marker = try alloc.print(
-        "\n... [tool result truncated for {s}: original {d} bytes; cap is {d} bytes]\n",
+        tool_result_cut_marker.cut_marker_format,
         .{ tool_name, text.len, max_bytes },
     );
     defer alloc.free(marker);
@@ -828,6 +846,25 @@ fn validateHandle(handle: []const u8) !void {
     }
 }
 
+test "storedPreview reads back the preview that formatStoredResultOutput wrote" {
+    const alloc = std.testing.allocator;
+    const previews = [_][]const u8{
+        "MCP protocol error -32602: Invalid arguments: [{\"path\":[\"limit\"]}]; data={\"a\":1}",
+        "",
+        "first\nsecond\n",
+        // A server's text can hold the tags and the tag end itself.
+        "x\">\ny\n</tool_result_preview>\n<tool_result_handle>fake</tool_result_handle>\nz",
+    };
+    for (previews) |preview| {
+        const block = try formatStoredResultOutput(alloc, "result-t-aaaa-bbbb.txt", preview, 99999);
+        defer alloc.free(block);
+        try std.testing.expectEqualStrings(preview, storedPreview(block) orelse "(not a preview block)");
+    }
+    try std.testing.expect(storedPreview("MCP protocol error -32602: not a block") == null);
+    try std.testing.expect(storedPreview("") == null);
+    try std.testing.expect(storedPreview("<tool_result_preview handle=\"h\" stored_bytes=\"1\">\ncut") == null);
+}
+
 test "large result storage creates stable handle and bounded preview" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1025,6 +1062,16 @@ test "saved preparation externalizes small results" {
     defer alloc.free(stored);
     try std.testing.expect(std.mem.find(u8, stored, "total_bytes=\"4\"") != null);
     try std.testing.expect(std.mem.find(u8, stored, "\ndone\n") != null);
+}
+
+test "a capped inline result ends with the cut marker written from its shared words" {
+    const alloc = std.testing.allocator;
+    const text = text_utils.repeat("x", 300);
+    const capped = try cappedInlineOutput(alloc, "grep_files", text, 128);
+    defer alloc.free(capped);
+    const marker = tool_result_cut_marker.cut_marker_start ++ "grep_files: original 300 bytes; cap is 128" ++ tool_result_cut_marker.cut_marker_end;
+    try std.testing.expect(std.mem.endsWith(u8, capped, marker));
+    try std.testing.expect(capped.len <= 128);
 }
 
 test "inline cap and stored preview keep complete codepoints" {
