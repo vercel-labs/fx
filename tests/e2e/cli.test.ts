@@ -21,8 +21,8 @@ import { join, sep } from "node:path";
 import {
   cleanupIsolatedTestHome,
   createIsolatedTestHome,
-  envWithoutFxHome,
   FX_BIN,
+  fxChildEnv,
   HAS_API_KEY,
   REPO_ROOT,
   runFx,
@@ -4499,10 +4499,7 @@ describe("cli: models", () => {
       });
       const proc = Bun.spawn([FX_BIN, "models", "--json"], {
         cwd: REPO_ROOT,
-        env: {
-          ...envWithoutFxHome(),
-          ...modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
-        },
+        env: fxChildEnv(modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`)),
         stdout: "pipe",
         stderr: "pipe",
       });
