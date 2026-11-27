@@ -128,8 +128,12 @@ jobs:
       - name: Walk fx ask turns along the malformed tool call model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/malformed.ts --self-check
 
+      - name: Walk fx ask turns along the output limit model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/output_limit.ts --self-check
+
       - name: Walk fx acp along the ACP EOF model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/acp_eof/
+
       - name: Walk fx along the web_fetch DNS model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/web_fetch_dns/
       - name: Walk fx along the terminal hang-up model
