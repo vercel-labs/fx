@@ -569,6 +569,11 @@ test "replaceBinary fallback copy keeps the new binary executable" {
     try tmp.dir.setFilePermissions(io_mod.getIo(), "fx-src", std.Io.File.Permissions.fromMode(0o555), .{});
     // Cleanup needs fx-src writable again; if this fails, only the temp dir is left, and cleanup ignores that.
     defer tmp.dir.setFilePermissions(io_mod.getIo(), "fx-src", std.Io.File.Permissions.fromMode(0o755), .{}) catch {};
+    // Root and CAP_DAC_OVERRIDE write into fx-src whatever its mode, so the rename
+    // succeeds, the copy never runs, and this test has nothing to prove.
+    if (tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "fx-src/mode-probe", .data = "" })) |_| {
+        return error.SkipZigTest;
+    } else |_| {}
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
     const new_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-src", "fx-new" });
