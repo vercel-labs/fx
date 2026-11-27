@@ -1139,9 +1139,7 @@ fn pushLiveEvent(raw: *anyopaque, event: worker_runtime.WorkerEvent) !void {
     defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
     // The report reads a continued answer whole, since the saved turn's last
     // message holds only its last part.
-    if (event == .finish_prompt) if (event.finish_prompt.continued_answer) |text| context.turn.setContinuedAnswer(text) catch |err| {
-        debug_trace.logf("subagent", "continued answer dropped bytes={d}: {s}; the report reads the saved last part", .{ text.len, @errorName(err) });
-    };
+    if (event == .finish_prompt) if (event.finish_prompt.continued_answer) |text| try context.turn.setContinuedAnswer(text);
     context.turn.appendLiveEvent(event);
 }
 

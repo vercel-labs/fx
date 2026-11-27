@@ -7634,7 +7634,7 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
           expect(input.filter((item: { type?: string }) => item.type === "function_call")).toEqual([]);
         }
       } else {
-        // The reply that finishes a cut answer joins it, so the answer is whole.
+        // What fx shows joins the parts of a cut answer, so the answer is whole.
         const answer = limited ? "LIMITED_ANSWERRECOVERED_OK" : "RECOVERED_OK";
         expect(output.final_output).toBe(answer);
         if (limited) {
@@ -7648,7 +7648,10 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
         expect(detail.code).toBe(0);
         const history = JSON.parse(detail.stdout).history;
         expect(history).toHaveLength(1);
-        expect(history[0].assistant).toBe(answer);
+        // The saved turn keeps a cut part as the turn sent it, so its last
+        // message is the reply that finished the answer.
+        expect(history[0].assistant).toBe("RECOVERED_OK");
+        if (limited) expect(JSON.stringify(history[0].execution)).toContain("LIMITED_ANSWER");
         expect(history[0].execution.tool_steps).toEqual([]);
         if (mode === "partial") expect(direct!.bodies[1]).not.toContain("DISCARDED_PREVIEW");
       }

@@ -331,6 +331,8 @@ pub const TurnContext = struct {
     /// The whole answer of the run's turn when cut replies began it, for the
     /// parent's report: the saved turn's last message holds only its last
     /// part. Owned by `alloc`.
+    /// No lock: the main loop sets it before the run's `Completion` finishes,
+    /// and the slot thread reads it after that mutex, as `failure_diagnostic` does.
     continued_answer: ?[]u8 = null,
     committed: bool = false,
     /// Where the child's workspace captures go while
