@@ -1480,6 +1480,8 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
 
 /// The v1 roots of the paged listing in progress, kept for the page its
 /// last cursor names, so one listing reads v1's folder once.
+/// A connection keeps at most one, freed by its next `session/list` or when the
+/// connection ends. It is a snapshot: a v1 session deleted during a listing still shows on its later pages.
 pub const SessionListing = struct {
     v1_roots: session_adapter.V1Roots,
     next_updated_at_ms: i64,
@@ -1510,13 +1512,17 @@ fn takeV1Roots(
     if (held) |listing| {
         if (continuation) |position| {
             if (listing.continuesAt(position)) {
+                debug_trace.logf("acp", "session operation=list v1_roots=reused", .{});
                 state.alloc.free(listing.next_id);
                 return listing.v1_roots;
             }
         }
+        const reason: []const u8 = if (continuation == null) "new_listing" else "other_cursor";
+        debug_trace.logf("acp", "session operation=list v1_roots=dropped reason={s}", .{reason});
         var stale = listing;
         stale.deinit(state.alloc);
     }
+    debug_trace.logf("acp", "session operation=list v1_roots=read", .{});
     return session_adapter.readV1Roots(v2_store, state.alloc);
 }
 
@@ -3678,6 +3684,47 @@ test "a switch away from a session drops the reports its host queued and closes 
     try std.testing.expect(state.active_session == null);
 }
 
+/// One `session/list` answer read back from the test's capture file: its session ids in order, and its nextCursor.
+const ListedPage = struct {
+    ids: []const []const u8,
+    next_cursor: ?[]const u8,
+};
+
+fn listOnePage(
+    state: *server.ServerState,
+    arena: Allocator,
+    capture: *std.Io.File,
+    request_id: i64,
+    cursor: ?[]const u8,
+) !ListedPage {
+    var params_raw: ?[]const u8 = null;
+    if (cursor) |value| {
+        var params_out: std.Io.Writer.Allocating = .init(arena);
+        try std.json.Stringify.value(.{ .cursor = value }, .{}, &params_out.writer);
+        params_raw = params_out.written();
+    }
+    var msg = jsonrpc.Message{ .id = .{ .integer = request_id }, .method = "session/list", .params_raw = params_raw };
+    try handleListSessions(state, arena, &msg);
+
+    const captured = try readCaptured(capture, arena);
+    var lines = std.mem.splitScalar(u8, captured, '\n');
+    var last_line: []const u8 = "";
+    while (lines.next()) |raw| {
+        const text = std.mem.trim(u8, raw, " \r\t");
+        if (text.len > 0) last_line = text;
+    }
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, last_line, .{});
+    const result = parsed.object.get("result") orelse return error.TestUnexpectedResult;
+    const sessions = result.object.get("sessions") orelse return error.TestUnexpectedResult;
+    var ids: std.ArrayList([]const u8) = .empty;
+    for (sessions.array.items) |item| {
+        const id = (item.object.get("sessionId") orelse return error.TestUnexpectedResult).string;
+        try ids.append(arena, id);
+    }
+    const next_cursor = if (result.object.get("nextCursor")) |value| value.string else null;
+    return .{ .ids = ids.items, .next_cursor = next_cursor };
+}
+
 test "a paged session/list reads v1's sessions once for the whole listing" {
     const alloc = std.testing.allocator;
     const io = io_mod.getIo();
@@ -3737,7 +3784,7 @@ test "a paged session/list reads v1's sessions once for the whole listing" {
     defer alloc.free(tmp_path);
     const trace_path = try std.Io.Dir.path.join(alloc, &.{ tmp_path, "trace.log" });
     defer alloc.free(trace_path);
-    try debug_trace.configureForTestWithScopes(alloc, trace_path, "core");
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "core,acp");
     defer debug_trace.resetForTest();
 
     // Page through the listing as a client does, following each nextCursor.
@@ -3750,6 +3797,7 @@ test "a paged session/list reads v1's sessions once for the whole listing" {
     var pages: usize = 0;
     var next_id: i64 = 10;
     var cursor: ?[]const u8 = null;
+    var listed_ids: std.ArrayList([]const u8) = .empty;
     while (pages < max_list_pages) {
         pages += 1;
         var params_raw: ?[]const u8 = null;
@@ -3777,6 +3825,7 @@ test "a paged session/list reads v1's sessions once for the whole listing" {
             total_ids += 1;
             if (std.mem.eql(u8, id, v1_id)) v1_hits += 1;
             try seen.put(id, {});
+            try listed_ids.append(arena, id);
         }
         cursor = if (result.object.get("nextCursor")) |value| value.string else null;
         if (cursor == null) break;
@@ -3788,15 +3837,53 @@ test "a paged session/list reads v1's sessions once for the whole listing" {
     try std.testing.expectEqual(total_ids, seen.count());
     try std.testing.expectEqual(@as(usize, 1), v1_hits);
 
+    // An abandoned listing: page 1 with no cursor, never followed. It keeps its roots until the restart drops them.
+    const abandoned = try listOnePage(&state, arena, &capture, next_id, null);
+    next_id += 1;
+    try std.testing.expect(abandoned.ids.len <= listed_ids.items.len);
+    for (abandoned.ids, 0..) |id, index| try std.testing.expectEqualStrings(listed_ids.items[index], id);
+
+    // A restart: page 1 with no cursor, page 2 from its cursor (the listing ends), then page 2 again.
+    const restart_first = try listOnePage(&state, arena, &capture, next_id, null);
+    next_id += 1;
+    const restart_cursor = restart_first.next_cursor orelse return error.TestUnexpectedResult;
+    const restart_second = try listOnePage(&state, arena, &capture, next_id, restart_cursor);
+    next_id += 1;
+    try std.testing.expect(restart_second.next_cursor == null);
+    const repeated = try listOnePage(&state, arena, &capture, next_id, restart_cursor);
+
+    try std.testing.expectEqual(listed_ids.items.len, restart_first.ids.len + restart_second.ids.len);
+    for (restart_first.ids, 0..) |id, index| try std.testing.expectEqualStrings(listed_ids.items[index], id);
+    for (restart_second.ids, 0..) |id, index| {
+        try std.testing.expectEqualStrings(listed_ids.items[restart_first.ids.len + index], id);
+    }
+    try std.testing.expectEqual(restart_second.ids.len, repeated.ids.len);
+    for (repeated.ids, 0..) |id, index| try std.testing.expectEqualStrings(restart_second.ids[index], id);
+
     // Closing the trace flushes it to disk before it is read.
     debug_trace.resetForTest();
     const trace = try tmp.dir.readFileAlloc(io, "trace.log", arena, .limited(1 << 20));
-    var reused_reads: usize = 0;
+    var catalog_reads: usize = 0;
+    var v1_roots_reused: usize = 0;
+    var v1_roots_read: usize = 0;
+    var v1_roots_dropped: usize = 0;
+    var dropped_by_new_listing: usize = 0;
     var trace_lines = std.mem.splitScalar(u8, trace, '\n');
     while (trace_lines.next()) |trace_line| {
-        if (std.mem.find(u8, trace_line, "session catalog cache reused=") != null) reused_reads += 1;
+        if (std.mem.find(u8, trace_line, "session catalog cache reused=") != null) catalog_reads += 1;
+        if (std.mem.find(u8, trace_line, "session operation=list v1_roots=reused") != null) v1_roots_reused += 1;
+        if (std.mem.find(u8, trace_line, "session operation=list v1_roots=read") != null) v1_roots_read += 1;
+        if (std.mem.find(u8, trace_line, "session operation=list v1_roots=dropped") != null) v1_roots_dropped += 1;
+        if (std.mem.find(u8, trace_line, "v1_roots=dropped reason=new_listing") != null) dropped_by_new_listing += 1;
     }
-    try std.testing.expectEqual(@as(usize, 1), reused_reads);
+    // Four reads: the first listing, the abandoned page 1, the restart's page 1, and the repeated cursor.
+    // Two reuses: page 2 of the first listing and page 2 of the restart. The restart drops the abandoned
+    // listing's roots, as a new listing. The repeated cursor reads again, since the restart's listing has ended.
+    try std.testing.expectEqual(@as(usize, 4), catalog_reads);
+    try std.testing.expectEqual(@as(usize, 2), v1_roots_reused);
+    try std.testing.expectEqual(@as(usize, 4), v1_roots_read);
+    try std.testing.expectEqual(@as(usize, 1), v1_roots_dropped);
+    try std.testing.expectEqual(@as(usize, 1), dropped_by_new_listing);
 }
 
 test "a reload under another cwd and a libfx/new drop what the host they replace queued" {
