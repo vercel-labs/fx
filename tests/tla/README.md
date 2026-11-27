@@ -1,6 +1,6 @@
 # TLA+ models
 
-TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK, MCP, transcript window, subagent, session-write, live sessions, and ACP models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides; the `fx mcp call` model on `main` and on pull requests labeled `ci:tla-mcp-call`; and the recovery, gateway_open, agent_runtime, and compaction_progress models, each with its driver, on every pull request. Run the others when you change the behavior they describe.
+TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK, MCP, transcript window, managed_execution, subagent, session-write, live sessions, and ACP models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides; the `fx mcp call` model on `main` and on pull requests labeled `ci:tla-mcp-call`; and the recovery, gateway_open, agent_runtime, and compaction_progress models, each with its driver, on every pull request. Run the others when you change the behavior they describe.
 
 | Folder | What it models | Checker |
 |---|---|---|
@@ -93,6 +93,10 @@ CI's `TLA+ transcript window model` job runs `transcript_window/check.sh --ci` o
 ## Subagent and session-write models in CI
 
 CI's `TLA+ subagent and session-write models` job runs the design configs of `subagent/check.sh` (`steer-queue`, `steer-queue-deep`, `stop-message`, `stop-message-deep`, `quiet-relay`, `quiet-relay-deep`, and `wait-nudge`) and the session-write, live sessions, and accepted-input configs of `session/check.sh` (`session-write` and its three witnesses, `live-holds`, `live-simulate`, the three `live-witness-*` configs, and `accepted-design-a`, `accepted-design-a2`, `accepted-design-b`), then the drivers `drivers/subagent/driver.ts`, `drivers/subagent/stop-message.test.ts`, `drivers/subagent/main-mail.test.ts`, `drivers/subagent/quiet-relay.test.ts`, `drivers/session/write.test.ts`, `drivers/session/live.test.ts`, and `drivers/session/accepted-input.test.ts` against the built fx. It runs on `main` and on pull requests that change the subagent, session, or accepted-input code, these models, their drivers, or the files the drivers load. The planted bugs and the configs of fx's old defects run only by hand, with both `check.sh` scripts and no arguments.
+
+## Shell quiet notice model in CI
+
+CI's `TLA+ shell quiet notice model` job runs the design configs of `managed_execution/check.sh` (`quiet-wait` and `quiet-wait-deep`), `bun tests/tla/drivers/managed_execution/walk.ts` on `quiet_notice.zig` through `lab.zig`, and `bun tests/tla/drivers/managed_execution/binary.ts` against the built fx. It runs on `main` and on pull requests that change the quiet-wait code, its model, its drivers, or the files the drivers load. The planted bugs, `--self-check` mutants, and `drivers/managed_execution/stress.ts` run only by hand.
 
 ## ACP in CI
 

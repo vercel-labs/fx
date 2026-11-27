@@ -43,21 +43,31 @@
 # tests/e2e/tmux-helpers.ts, tests/e2e/saved-sessions.ts, and
 # tests/evals/eval-helpers.ts.
 #
+# managed_execution: the TLA+ shell quiet notice model job model-checks the
+# design configs of tests/tla/managed_execution/ and drives quiet_notice.zig
+# and a built fx along the model. A pull request runs it only when it touches
+# src/core/execution/quiet_notice.zig,
+# src/core/execution/managed_execution.zig, src/tools/shell/, that model, its
+# drivers in tests/tla/drivers/managed_execution/, the shared code in
+# tests/tla/lib/, tests/tla/drivers/lib/, and tests/tla/drivers/graph.mjs, or
+# the helpers those drivers load: tests/e2e/tmux-helpers.ts and
+# tests/evals/eval-helpers.ts.
+#
 # acp: the TLA+ ACP models and drivers job model-checks tests/tla/acp/ and
 # drives the built fx acp along those models. A pull request runs it only when
 # it touches src/acp/, those models, their drivers in tests/tla/drivers/acp/,
 # the code they share: tests/tla/drivers/lib/ and tests/tla/lib/, or the fake
 # Gateway the drivers load from tests/e2e/tmux-helpers.ts.
 #
-# All five run when the change touches build.zig, build.zig.zon,
+# All six run when the change touches build.zig, build.zig.zon,
 # .github/workflows/ci.yml, or this script. A change to shared code the checks
 # also run, such as the agent loop, is checked by the run on main. Set
 # CI_NEED_REQUESTED to a reason to force every check.
 #
-# Writes libfx, mcp, transcript_window, subagent, and acp, each true or false,
-# to $GITHUB_OUTPUT and the reasons to $GITHUB_STEP_SUMMARY when those files
-# are set. Exits non-zero when either revision cannot be read, so the checks
-# fail instead of passing without having looked at the change.
+# Writes libfx, mcp, transcript_window, subagent, managed_execution, and acp,
+# each true or false, to $GITHUB_OUTPUT and the reasons to $GITHUB_STEP_SUMMARY
+# when those files are set. Exits non-zero when either revision cannot be read,
+# so the checks fail instead of passing without having looked at the change.
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
@@ -72,11 +82,13 @@ libfx=false
 mcp=false
 transcript_window=false
 subagent=false
+managed_execution=false
 acp=false
 libfx_reasons=()
 mcp_reasons=()
 transcript_window_reasons=()
 subagent_reasons=()
+managed_execution_reasons=()
 acp_reasons=()
 
 require_libfx() {
@@ -99,6 +111,11 @@ require_subagent() {
   subagent_reasons+=("$1")
 }
 
+require_managed_execution() {
+  managed_execution=true
+  managed_execution_reasons+=("$1")
+}
+
 require_acp() {
   acp=true
   acp_reasons+=("$1")
@@ -109,6 +126,7 @@ require_all() {
   require_mcp "$1"
   require_transcript_window "$1"
   require_subagent "$1"
+  require_managed_execution "$1"
   require_acp "$1"
 }
 
@@ -119,7 +137,10 @@ for revision in "$base" "$head"; do
   fi
 done
 
-if ! changed_files="$(git diff --name-only --no-renames "$base" "$head")"; then
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+if ! git -c core.quotePath=false diff --name-only --no-renames -z "$base" "$head" > "$tmp"; then
   printf 'error: git diff %s %s failed; CI cannot decide which checks to run\n' "$base" "$head" >&2
   exit 1
 fi
@@ -128,7 +149,7 @@ if [ -n "${CI_NEED_REQUESTED:-}" ]; then
   require_all "$CI_NEED_REQUESTED"
 fi
 
-while IFS= read -r path; do
+while IFS= read -r -d '' path; do
   [ -n "$path" ] || continue
   case "$path" in
     .github/workflows/ci.yml | scripts/detect-ci-need.sh)
@@ -149,14 +170,18 @@ while IFS= read -r path; do
       require_mcp "$path: shared driver code changed"
       require_transcript_window "$path: shared driver code changed"
       require_subagent "$path: shared driver code changed"
+      require_managed_execution "$path: shared driver code changed"
       require_acp "$path: shared driver code changed" ;;
     tests/tla/drivers/subagent/* | tests/tla/drivers/session/write.test.ts | tests/tla/drivers/session/live.test.ts | tests/tla/drivers/session/accepted-input.test.ts)
       require_subagent "$path: subagent, session-write, live sessions, or accepted-input driver changed" ;;
+    tests/tla/drivers/managed_execution/*)
+      require_managed_execution "$path: shell quiet notice driver changed" ;;
     tests/tla/drivers/transcript_window/*)
       require_transcript_window "$path: transcript window driver changed" ;;
     tests/tla/drivers/graph.mjs)
       require_libfx "$path: shared driver code changed"
-      require_transcript_window "$path: shared driver code changed" ;;
+      require_transcript_window "$path: shared driver code changed"
+      require_managed_execution "$path: shared driver code changed" ;;
     tests/tla/drivers/*.mjs)
       # The other drivers' folders hold other models' code.
       if [[ "${path#tests/tla/drivers/}" != */* ]]; then
@@ -177,6 +202,10 @@ while IFS= read -r path; do
       require_transcript_window "$path: transcript window code changed" ;;
     tests/tla/transcript_window/*)
       require_transcript_window "$path: transcript window model changed" ;;
+    src/core/execution/quiet_notice.zig | src/core/execution/managed_execution.zig | src/tools/shell/*)
+      require_managed_execution "$path: shell quiet notice code changed" ;;
+    tests/tla/managed_execution/*)
+      require_managed_execution "$path: shell quiet notice model changed" ;;
     src/core/subagent/* | src/core/session/* | src/core/agent/worker_runtime.zig | src/core/agent/runtime/parallel_execution.zig | src/core/app/app_session_runtime.zig)
       require_subagent "$path: subagent, session, or accepted-input code changed" ;;
     tests/tla/subagent/* | tests/tla/session/SessionWrite* | tests/tla/session/session-write* | tests/tla/session/LiveSessions* | tests/tla/session/live-* | tests/tla/session/AcceptedInput* | tests/tla/session/accepted-*)
@@ -185,20 +214,23 @@ while IFS= read -r path; do
       require_acp "$path: ACP model changed" ;;
     tests/tla/lib/*)
       require_subagent "$path: shared model-check code changed"
+      require_managed_execution "$path: shared model-check code changed"
       require_acp "$path: shared TLC script changed" ;;
     tests/e2e/tmux-helpers.ts)
       require_mcp "$path: a file the MCP drivers load changed"
-      require_subagent "$path: a file the subagent drivers load changed"
+      require_subagent "$path: a file the subagent and session drivers load changed"
+      require_managed_execution "$path: a file the shell quiet notice driver loads changed"
       require_acp "$path: a file the ACP drivers load changed" ;;
     tests/evals/eval-helpers.ts)
       require_mcp "$path: a file the MCP drivers load changed"
-      require_subagent "$path: a file the subagent and session drivers load changed" ;;
+      require_subagent "$path: a file the subagent and session drivers load changed"
+      require_managed_execution "$path: a file the shell quiet notice driver loads changed" ;;
     tests/e2e/saved-sessions.ts)
       require_subagent "$path: a file the accepted-input driver loads changed" ;;
     tests/e2e/fixtures/mcp-* | tests/e2e/render-lab/tape.ts)
       require_mcp "$path: a file the MCP drivers load changed" ;;
   esac
-done <<<"$changed_files"
+done < "$tmp"
 
 # Prints whether one check runs, and why. The reasons follow the name and
 # whether it is needed.
@@ -229,6 +261,7 @@ report libfx "$libfx" ${libfx_reasons[@]+"${libfx_reasons[@]}"}
 report MCP "$mcp" ${mcp_reasons[@]+"${mcp_reasons[@]}"}
 report "transcript window" "$transcript_window" ${transcript_window_reasons[@]+"${transcript_window_reasons[@]}"}
 report "subagent and session-write" "$subagent" ${subagent_reasons[@]+"${subagent_reasons[@]}"}
+report "shell quiet notice" "$managed_execution" ${managed_execution_reasons[@]+"${managed_execution_reasons[@]}"}
 report ACP "$acp" ${acp_reasons[@]+"${acp_reasons[@]}"}
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
@@ -237,6 +270,7 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
     printf 'mcp=%s\n' "$mcp"
     printf 'transcript_window=%s\n' "$transcript_window"
     printf 'subagent=%s\n' "$subagent"
+    printf 'managed_execution=%s\n' "$managed_execution"
     printf 'acp=%s\n' "$acp"
   } >>"$GITHUB_OUTPUT"
 fi

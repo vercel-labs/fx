@@ -232,7 +232,7 @@ CI retries a failed end-to-end file once. A file that passes only on the retry g
 
 When the detector can't read the change, the `macOS arm64` check fails instead of passing.
 
-`scripts/detect-ci-need.sh` decides whether a pull request runs CI's four model checks. The libfx durable-session model check takes about 40 minutes and runs when the change touches:
+`scripts/detect-ci-need.sh` decides whether a pull request runs CI's six model checks. The libfx durable-session model check takes about 40 minutes and runs when the change touches:
 
 - `sdk/`
 - The SDK models in `tests/tla/sdk/` or their drivers in `tests/tla/drivers/*.mjs`
@@ -257,13 +257,19 @@ The `TLA+ subagent and session-write models` job takes a few minutes and runs it
 - The models in `tests/tla/subagent/`, the session-write and live sessions models in `tests/tla/session/`, or their drivers in `tests/tla/drivers/subagent/`, `tests/tla/drivers/session/write.test.ts`, and `tests/tla/drivers/session/live.test.ts`
 - The shared code in `tests/tla/lib/` and `tests/tla/drivers/lib/`, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`
 
+The `TLA+ shell quiet notice model` job takes about 2 minutes and runs its checks when the change touches:
+
+- `src/core/execution/quiet_notice.zig`, `src/core/execution/managed_execution.zig`, or `src/tools/shell/`
+- The model in `tests/tla/managed_execution/` or its drivers in `tests/tla/drivers/managed_execution/`
+- The shared code in `tests/tla/lib/`, `tests/tla/drivers/lib/`, and `tests/tla/drivers/graph.mjs`, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`
+
 The `TLA+ ACP models and drivers` job takes about 5 minutes and runs its checks when the change touches:
 
 - `src/acp/`
 - The models in `tests/tla/acp/` or their drivers in `tests/tla/drivers/acp/`
 - The code those drivers share: `tests/tla/drivers/lib/` and `tests/tla/lib/`, or the fake Gateway they load from `tests/e2e/tmux-helpers.ts`
 
-All five run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
+All six run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
 
 Other workflows and benchmark jobs also report on pull requests, such as the `Examples` workflow when `examples/` changes and the `Shell command overhead` benchmark. Only the five checks above are required to merge, but look into any check that fails. Two of the others need more explanation:
 
