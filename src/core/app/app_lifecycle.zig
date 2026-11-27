@@ -1079,11 +1079,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
             .col = 1,
         };
     };
-    const start_row = blk: {
-        var row = cursor.row;
-        if (cursor.col > 1 and row < cfg.shell.layout.rows) row += 1;
-        break :blk row;
-    };
+    const start_row = clampLaunchStartRow(cursor, cfg.shell.layout.rows);
     var launch_start_row = start_row;
     const effective_startup_min_body_rows = if (cfg.takes_over_screen) kept: {
         // Scrolling here would move the old screen up until the first frame
@@ -1103,6 +1099,13 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     try cfg.shell.initViewportWithReservedRows(cfg.metrics, launch_start_row, effective_startup_min_body_rows);
 
     return state;
+}
+
+fn clampLaunchStartRow(cursor: CursorPosition, rows: u16) u16 {
+    if (rows == 0) return 1;
+    var row = @min(@max(cursor.row, 1), rows);
+    if (cursor.col > 1 and row < rows) row += 1;
+    return row;
 }
 
 fn prepareStartupViewport(
@@ -1695,7 +1698,7 @@ fn emitShutdownCleanupAndResume(shell: *TranscriptRuntime, metrics: *Metrics) vo
     // erasing from a clamped startup row or printing a newline would disturb
     // the previous screen (for example during an upgrade relaunch fallback).
     if (!shell.has_committed_frame and !shell.footer_viewport.has_frame) {
-        // Best-effort cursor restore during shutdown; caller is already exiting.
+        // Best-effort visibility restore during shutdown; caller is already exiting.
         _ = writeLifecycleTerminalBytes(shell, metrics, "\x1b[?25h") catch {};
         return;
     }
@@ -2652,6 +2655,16 @@ test "prepare startup viewport with welcome reservation does not push ten blank 
     try std.testing.expectEqual(@as(u16, 2), ui_render.welcome_message_reserved_rows);
     try std.testing.expectEqual(@as(u16, 44), launch_row);
     try std.testing.expectEqualStrings("\x1b[49;1H\n", bytes);
+}
+
+test "clamp launch start row bounds out-of-range terminal replies" {
+    try std.testing.expectEqual(@as(u16, 1), clampLaunchStartRow(.{ .row = 0, .col = 1 }, 49));
+    try std.testing.expectEqual(@as(u16, 1), clampLaunchStartRow(.{ .row = 1, .col = 1 }, 49));
+    try std.testing.expectEqual(@as(u16, 11), clampLaunchStartRow(.{ .row = 10, .col = 5 }, 49));
+    try std.testing.expectEqual(@as(u16, 49), clampLaunchStartRow(.{ .row = 49, .col = 5 }, 49));
+    try std.testing.expectEqual(@as(u16, 49), clampLaunchStartRow(.{ .row = 60000, .col = 1 }, 49));
+    try std.testing.expectEqual(@as(u16, 49), clampLaunchStartRow(.{ .row = 60000, .col = 8 }, 49));
+    try std.testing.expectEqual(@as(u16, 1), clampLaunchStartRow(.{ .row = 60000, .col = 1 }, 0));
 }
 
 test "shutdown cleanup erases from footer frame top after frame commit" {
