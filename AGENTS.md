@@ -460,7 +460,7 @@ Releases are prepared by hand in a release PR. The maintainer controls the chang
 
 To prepare a release:
 
-1. Run the validate-only release on the `main` commit the release will ship: `gh workflow run release.yml --ref main -f validate_only=true`. It takes about as long as a release build and publishes nothing. A failure means a PGSO training, behavior, size, or performance gate failed on code that would ship. Fix it on `main` and run it again, and continue only when it passes.
+1. Run the validate-only release on current `main`, the code the release PR will build on: `gh workflow run release.yml --ref main -f validate_only=true`. It takes about as long as a release build and publishes nothing. A failure means a PGSO training, behavior, size, or performance gate failed on code that would ship. Fix it on `main` and run it again, and continue only when it passes.
 2. Create a branch (e.g. `prepare-v0.3.0`)
 3. Bump `pub const version` in `src/main.zig`
 4. Write the changelog entry in `CHANGELOG.md` at the top, under a new `## <version>` heading, wrapped in `<!-- release:start -->` and `<!-- release:end -->` markers. Remove the markers from the previous release entry so only the new release has them.
