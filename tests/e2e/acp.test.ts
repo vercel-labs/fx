@@ -8647,6 +8647,53 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP v2 Preview clients can fall back to a v1 session",
+    async () => {
+      const fixture = createConfiguredProviderFixture();
+      try {
+        client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+
+        const initialized = await client.request(
+          "initialize",
+          {
+            protocolVersion: 2,
+            capabilities: { auth: { terminal: {} } },
+            info: { name: "preview-client", version: "1.0.0" },
+          },
+          1,
+        ) as any;
+        expect(initialized.error).toBeUndefined();
+        expect(initialized.result).toMatchObject({
+          protocolVersion: 1,
+          agentCapabilities: {},
+          agentInfo: { name: "fx" },
+        });
+        expect(initialized.result.capabilities).toBeUndefined();
+        expect(initialized.result.info).toBeUndefined();
+
+        const created = await client.request(
+          "session/new",
+          { cwd: fixture.workspace, mcpServers: [] },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        expect(typeof created.result.sessionId).toBe("string");
+        const { promptResult } = await runPrompt(client, "Reply to the v1 session.");
+        expect(promptResult.error).toBeUndefined();
+        expect(promptResult.result.stopReason).toBe("end_turn");
+        expect(fixture.requests).toHaveLength(1);
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        fixture.close();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "prompt before session creation returns the canonical no-session error",
     async () => {
       const root = createIsolatedRoot("fx-acp-prompt-without-session-");
