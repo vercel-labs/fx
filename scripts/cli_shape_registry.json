@@ -377,6 +377,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_UPGRADE_CHECK_INTERVAL_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_USAGE_CLOCK_FILE": {
       "job": "test",
       "stability": "internal"
