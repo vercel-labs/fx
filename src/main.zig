@@ -5752,6 +5752,7 @@ test {
     _ = @import("core/execution/command_runner.zig");
     _ = @import("core/permissions/direct_command.zig");
     _ = @import("core/permissions/auto_classifier.zig");
+    _ = @import("core/permissions/review_record.zig");
     _ = @import("core/permissions/command_admission.zig");
     _ = @import("core/mcp/tool_result.zig");
     _ = @import("core/mcp/tool_search.zig");

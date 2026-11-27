@@ -6,6 +6,7 @@ const diff_mod = @import("../output/diff.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const io_mod = @import("../shared/io.zig");
 const permissions = @import("permissions.zig");
+const review_record = @import("review_record.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -290,12 +291,10 @@ pub const AttemptLog = struct {
     items: [capacity]Attempt = undefined,
     len: u8 = 0,
 
-    /// Adds one send that started at `started_ms`. Sends past `capacity` are
-    /// not kept.
-    pub fn add(self: *AttemptLog, result: AttemptLog.Result, started_ms: i64) void {
+    /// Adds one send that took `elapsed_ms`. Sends past `capacity` are not kept.
+    pub fn addElapsed(self: *AttemptLog, result: AttemptLog.Result, elapsed_ms: u32) void {
         if (self.len >= capacity) return;
-        const elapsed = io_mod.milliTimestamp() - started_ms;
-        self.items[self.len] = .{ .result = result, .elapsed_ms = @intCast(std.math.clamp(elapsed, 0, std.math.maxInt(u32))) };
+        self.items[self.len] = .{ .result = result, .elapsed_ms = elapsed_ms };
         self.len += 1;
     }
 
@@ -303,6 +302,52 @@ pub const AttemptLog = struct {
         return self.items[0..self.len];
     }
 };
+
+/// Milliseconds from `started_ms` to now, clamped to the range of a u32.
+fn elapsedSince(started_ms: i64) u32 {
+    const elapsed = io_mod.milliTimestamp() - started_ms;
+    return @intCast(std.math.clamp(elapsed, 0, std.math.maxInt(u32)));
+}
+
+/// Where one review's sends are reported: the attempt log and, when recording
+/// is on, the review record. `decide` builds one for each review.
+const SendReport = struct {
+    log: ?*AttemptLog,
+    review: []const u8,
+    target_call_id: []const u8,
+    model: []const u8,
+    payload: []const u8,
+
+    /// Records one finished send that started at `started_ms`. `answer` is the
+    /// reviewer's answer when the send completed, and empty otherwise. With no
+    /// attempt log and recording off, this returns before it reads the clock
+    /// or allocates.
+    fn finish(self: SendReport, attempt: u8, result: AttemptLog.Result, started_ms: i64, answer: []const u8) void {
+        const recording = review_record.enabled();
+        if (self.log == null and !recording) return;
+        const elapsed_ms = elapsedSince(started_ms);
+        if (self.log) |log| log.addElapsed(result, elapsed_ms);
+        if (!recording) return;
+        review_record.append(.{
+            .target_call_id = self.target_call_id,
+            .attempt = attempt,
+            .review = self.review,
+            .model = self.model,
+            .payload = self.payload,
+            .result = @tagName(result),
+            .elapsed_ms = elapsed_ms,
+            .answer = answer,
+        });
+    }
+};
+
+/// The reviewer's answer in a completion: the first tool call's arguments,
+/// else the text content, else empty. Borrowed from `completion`, so it
+/// allocates nothing.
+fn answerText(completion: types.ModelCompletion) []const u8 {
+    if (completion.tool_calls.len > 0) return completion.tool_calls[0].arguments_json;
+    return completion.content orelse "";
+}
 
 pub const OwnedCompletion = struct {
     completion: types.ModelCompletion,
@@ -598,6 +643,16 @@ pub const Reviewer = struct {
     /// Whether `decide` clears a caution whose quote fails the proof check.
     const CautionQuotes = enum { checked, unchecked };
 
+    /// Which review a send belongs to. `review` runs the first review with
+    /// checked quotes; `confirmCaution` runs the fresh second review with
+    /// unchecked quotes, and it is the only caller that passes `.unchecked`.
+    fn reviewLabel(quotes: CautionQuotes) []const u8 {
+        return switch (quotes) {
+            .checked => "first",
+            .unchecked => "confirm",
+        };
+    }
+
     /// Sends `prompt` and returns its decision, retrying one transport
     /// failure and one malformed completion.
     fn decide(
@@ -612,7 +667,13 @@ pub const Reviewer = struct {
         var recovery_available = true;
         var transport_retry_available = true;
         var attempt: u8 = 1;
-        const attempt_log = prompt.request.attempt_log;
+        const report: SendReport = .{
+            .log = prompt.request.attempt_log,
+            .review = reviewLabel(quotes),
+            .target_call_id = review_turn.target_call_id,
+            .model = self.model,
+            .payload = prompt.payload,
+        };
         var send_deadline = deadline;
         while (true) {
             checkBudget(send_deadline, cancel_flag) catch |err| return constructionFailure(err);
@@ -640,7 +701,7 @@ pub const Reviewer = struct {
                 break :failed switch (err) {
                     error.OutOfMemory, error.Cancelled => return err,
                     else => {
-                        if (attempt_log) |log| log.add(.call_failed, send_started_ms);
+                        report.finish(attempt, .call_failed, send_started_ms, "");
                         if (!transport_retry_available) return .{ .invalid = .transport_call_failed };
                         transport_retry_available = false;
                         attempt += 1;
@@ -660,11 +721,11 @@ pub const Reviewer = struct {
             } });
             switch (transport_outcome) {
                 .cancelled => {
-                    if (attempt_log) |log| log.add(.cancelled, send_started_ms);
+                    report.finish(attempt, .cancelled, send_started_ms, "");
                     return error.Cancelled;
                 },
                 .timed_out, .transient_failure => {
-                    if (attempt_log) |log| log.add(if (transport_outcome == .timed_out) .timed_out else .transient_failure, send_started_ms);
+                    report.finish(attempt, if (transport_outcome == .timed_out) .timed_out else .transient_failure, send_started_ms, "");
                     // One retry with a fresh deadline; permanent failures and
                     // cancellation are never retried.
                     const reason: InvalidReason = if (transport_outcome == .timed_out)
@@ -682,14 +743,14 @@ pub const Reviewer = struct {
                     );
                 },
                 .permanent_failure => {
-                    if (attempt_log) |log| log.add(.permanent_failure, send_started_ms);
+                    report.finish(attempt, .permanent_failure, send_started_ms, "");
                     return .{ .invalid = .transport_permanent };
                 },
                 .completion => |*owned| {
                     defer owned.deinit(alloc);
                     checkBudget(send_deadline, cancel_flag) catch |err| return constructionFailure(err);
                     const parsed = try parseCompletion(alloc, owned.completion);
-                    if (attempt_log) |log| log.add(if (parsed == .invalid and parsed.invalid.is_malformed_completion()) .malformed else .answered, send_started_ms);
+                    report.finish(attempt, if (parsed == .invalid and parsed.invalid.is_malformed_completion()) .malformed else .answered, send_started_ms, answerText(owned.completion));
                     if (!recovery_available or parsed != .invalid or !parsed.invalid.is_malformed_completion()) {
                         return switch (quotes) {
                             .checked => self.requireCautionProof(alloc, parsed, owned.completion, prompt.request, prompt.trusted_root_context),
@@ -2637,6 +2698,16 @@ test "a review logs each send so /trace can show a retried timeout" {
     try std.testing.expectEqual(@as(usize, 2), log.slice().len);
     try std.testing.expectEqual(AttemptLog.Result.timed_out, log.slice()[0].result);
     try std.testing.expectEqual(AttemptLog.Result.answered, log.slice()[1].result);
+}
+
+test "review sends are labeled by quote mode and answers come from the completion" {
+    try std.testing.expectEqualStrings("first", Reviewer.reviewLabel(.checked));
+    try std.testing.expectEqualStrings("confirm", Reviewer.reviewLabel(.unchecked));
+
+    try std.testing.expectEqualStrings("", answerText(.{}));
+    try std.testing.expectEqualStrings("plain answer", answerText(.{ .content = "plain answer" }));
+    const calls = [_]types.ToolCall{.{ .id = "review", .name = tool_name, .arguments_json = "{\"decision\":\"clear\"}" }};
+    try std.testing.expectEqualStrings("{\"decision\":\"clear\"}", answerText(.{ .content = "ignored", .tool_calls = &calls }));
 }
 
 test "a reviewer without quotable answers keeps its bare caution" {

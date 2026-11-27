@@ -29,6 +29,10 @@
       "job": "diagnostics",
       "stability": "stable"
     },
+    "FX_DEBUG_REVIEW_RECORD": {
+      "job": "diagnostics",
+      "stability": "stable"
+    },
     "FX_DISABLE_KEYCHAIN": {
       "job": "credentials",
       "stability": "stable"

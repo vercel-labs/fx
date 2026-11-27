@@ -25,6 +25,7 @@ const managed_skills_dir_name = "skills";
 const logs_dir_name = "logs";
 const trace_log_file_name = "trace.log";
 const recordings_dir_name = "recordings";
+const review_records_dir_name = "review-records";
 
 /// The folder `FX_HOME` names, set once at startup by `useFxHome` before any
 /// other thread runs. Null means fx keeps its files in `~/.fx`.
@@ -222,6 +223,12 @@ pub fn recordingsDir(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{recordings_dir_name});
 }
 
+/// The folder where `FX_DEBUG_REVIEW_RECORD=1` saves each auto-mode review
+/// request and the reviewer's answer. It sits under the profile folder.
+pub fn reviewRecordsDir(alloc: Allocator, home: []const u8) ![]u8 {
+    return rootPath(alloc, home, &.{review_records_dir_name});
+}
+
 test "profile path helpers preserve current default locations" {
     const alloc = std.testing.allocator;
 
@@ -290,6 +297,10 @@ test "profile path helpers preserve current default locations" {
     const recordings = try recordingsDir(alloc, "/tmp/fake-home");
     defer alloc.free(recordings);
     try std.testing.expectEqualStrings("/tmp/fake-home/.fx/recordings", recordings);
+
+    const review_records = try reviewRecordsDir(alloc, "/tmp/fake-home");
+    defer alloc.free(review_records);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/review-records", review_records);
 }
 
 test "FX_HOME moves every profile path and how messages name it" {
