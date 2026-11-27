@@ -6257,6 +6257,82 @@ test("update runs the manual upgrade", async () => {
 }, UPGRADE_TIMEOUT);
 
 test.skipIf(!tmuxAvailable())(
+  "a newer dev release replaces the update that waits for ctrl+g",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-newer-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ update_channel: "dev" }));
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+    const firstRevision = "1111111111111111111111111111111111111111";
+    const newestRevision = "2222222222222222222222222222222222222222";
+
+    let active: TmuxSession | null = null;
+    const gateway = startFakeGateway([]);
+    const release = startUpgradeServer(root, argvLogPath, { revision: firstRevision });
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: realpathSync(workspace),
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      expect(readFileSync(installedFx, "utf8")).toContain(`# fake fx release ${firstRevision}`);
+
+      // A second dev release comes out while the first waits for Ctrl+G. The
+      // next check installs it over the waiting one, and the footer keeps
+      // offering the reload.
+      release.setRevision(newestRevision);
+      const deadline = Date.now() + UPGRADE_TIMEOUT;
+      while (!readFileSync(installedFx, "utf8").includes(`# fake fx release ${newestRevision}`)) {
+        if (Date.now() > deadline) {
+          throw new Error(`the newer dev release was never installed:\n${readFileSync(installedFx, "utf8").slice(0, 200)}`);
+        }
+        await Bun.sleep(100);
+      }
+      expect(await active.capturePane()).toContain("update ready: ctrl+g to reload");
+
+      await active.sendHexBytes(["07"]);
+      await active.waitForText("fx has been updated to", UPGRADE_TIMEOUT);
+      // One relaunch, of the file that holds the newest release.
+      const launches = readFileSync(argvLogPath, "utf8").trim().split("\n").map((line) => line.split("\t"));
+      expect(launches).toHaveLength(1);
+      expect(launches[0]![0]).toBe(installedFx);
+      expect(launches[0]).toContain("--upgrade-relaunch");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      release.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
   "TTY upgrade prints bold fx version header before output",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-upgrade-tty-header-")));
@@ -12151,24 +12227,6 @@ function drainScrollbackFacts(scrollback: string, lines: number) {
   };
 }
 
-/// The history in `scrollback` once and in order, except for a few rows
-/// right at its end: when the transcript grows in the frame after the history
-/// is handed off, the rows at the old screen top can be painted over before
-/// they reach scrollback. That loss is not this test's subject.
-function expectHistoryNearlyOnceInOrder(scrollback: string, lines: number) {
-  const numbers = scrollback.split("\n").flatMap((row) => {
-    const match = DRAIN_HISTORY.exec(row);
-    return match ? [Number(match[1])] : [];
-  });
-  const seen = new Set(numbers);
-  const missing: number[] = [];
-  for (let n = 1; n <= lines; n++) if (!seen.has(n)) missing.push(n);
-  expect(numbers.length - seen.size).toBe(0);
-  expect(numbers.every((n, i) => i === 0 || n > numbers[i - 1]!)).toBe(true);
-  expect(missing.length).toBeLessThanOrEqual(8);
-  for (const n of missing) expect(n).toBeGreaterThan(lines - 40);
-}
-
 /// The publication frames in the trace: the rows each one planned before the
 /// footer grew, the rows the frame that saw the taller footer planned, and
 /// how many frames after it still left part of the history unwritten.
@@ -12289,7 +12347,7 @@ async function resumeLongHistory(options: DrainCase) {
     const frames = drainFrames(trace());
     expect(readFileSync(stderrPath, "utf8")).toBe("");
     passed = true;
-    return { scrollback: drainScrollbackFacts(scrollback, options.lines), scrollbackText: scrollback, pastedScrollback, frames };
+    return { scrollback: drainScrollbackFacts(scrollback, options.lines), pastedScrollback, frames };
   } finally {
     if (!passed) console.error(`resume drain evidence kept: ${root}; steps=${steps} held=${held}`);
     hold.dispose();
@@ -12331,8 +12389,9 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
     expect(result.frames.finish_frame_rows).toBeGreaterThan(DRAIN_ROWS_PER_FRAME);
     expect(result.frames.partial_frames_after).toBe(0);
     for (const rows of result.frames.before) expect(rows).toBeLessThanOrEqual(DRAIN_ROWS_PER_FRAME);
-    expectHistoryNearlyOnceInOrder(result.scrollbackText, 6000);
-    expect(result.scrollback).toMatchObject({ prompt_rows: 1, prompt_below_history: true });
+    expect(result.scrollback).toEqual({
+      history_rows: 6000, repeats: 0, out_of_order: 0, first_missing: [], prompt_rows: 1, prompt_below_history: true,
+    });
   }, TIMEOUT * 4);
 
   test("fx --resume with a prompt, 18000 lines: the history lands once, in order, and keys typed during the long frame reach the composer", async () => {
@@ -12375,13 +12434,14 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
     expectFinishedDrain(result, 6000);
   }, TIMEOUT * 4);
 
-  test("a request sent again at resume writes the history at once, and a restored prompt comes back once", async () => {
+  for (const lines of [40, 6000]) test(`a request sent again at resume writes the history at once, and a restored prompt comes back once, ${lines} lines`, async () => {
     // A prompt that waited in the queue when fx was killed comes back in the
     // composer once the resumed history is written. The killed turn's request
     // goes out again at resume, and its activity row makes the footer taller,
     // so the history is written in one frame while that request waits. The
     // prompt waits behind a stalled MCP call, as in the restore tests above.
-    const lines = 6000;
+    // 40 lines fit in the first frame, so no batches run; the notices that
+    // land right after it must not paint over its last rows either.
     const root = mkdtempSync(join(tmpdir(), "fx-resume-drain-restore-"));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
@@ -12464,9 +12524,9 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
       await terminal.waitForPane((pane) => composerText(pane) === queuedPrompt, TIMEOUT);
       expect(resumedRequests).toBe(1);
       const frames = drainFrames(trace());
-      expect(frames.finished).toBe(true);
       expect(frames.committed).toBe(true);
-      expect(frames.finish_frame_rows).toBeGreaterThan(DRAIN_ROWS_PER_FRAME);
+      expect(frames.finished).toBe(lines > 40);
+      if (frames.finished) expect(frames.finish_frame_rows).toBeGreaterThan(DRAIN_ROWS_PER_FRAME);
       expect(frames.partial_frames_after).toBe(0);
       for (const rows of frames.before) expect(rows).toBeLessThanOrEqual(DRAIN_ROWS_PER_FRAME);
 
@@ -12475,7 +12535,7 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
       expect(composerText(settled)).toBe(queuedPrompt);
       const scrollback = await terminal.captureFullScrollback();
       expect(countOccurrences(scrollback, RESTORE_SINGULAR_NOTICE)).toBe(1);
-      expectHistoryNearlyOnceInOrder(scrollback, lines);
+      expect(drainScrollbackFacts(scrollback, lines)).toMatchObject({ history_rows: lines, repeats: 0, out_of_order: 0, first_missing: [] });
       // The restored prompt waits in the composer; it was never sent.
       expect(gateway.requests.some((request) => request.body.includes(queuedPrompt))).toBe(false);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

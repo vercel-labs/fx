@@ -347,6 +347,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    outputs:
+      skipped: ${{ steps.confirm.outputs.skip == 'true' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -363,18 +365,41 @@ jobs:
           name: libfx-package
       - run: sha256sum --check libfx-packages.sha256
 
-      - name: Confirm dev publish still targets main
+      - name: Confirm dev publish moves the dev tag forward
+        id: confirm
         if: needs.metadata.outputs.channel == 'dev'
         env:
           RELEASE_SHA: ${{ needs.metadata.outputs.sha }}
         run: |
-          MAIN_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
-          if [ "$MAIN_SHA" != "$RELEASE_SHA" ]; then
-            echo "::error::main advanced to ${MAIN_SHA}; refusing to move the dev channel to stale ${RELEASE_SHA}"
-            exit 1
+          set -euo pipefail
+          # Move forward only. CI on main often ends after newer commits merge,
+          # and the npm environment can hold this job for approval, so this
+          # build may be behind main and still newer than the dev tag. Dev
+          # versions end in .g<first 12 characters of the commit>.
+          CURRENT_VERSION=$(npm view libfx dist-tags.dev --registry=https://registry.npmjs.org/) || CURRENT_VERSION=""
+          CURRENT_SHA=""
+          if [[ "$CURRENT_VERSION" =~ \.g([0-9a-f]{12})$ ]]; then
+            CURRENT_SHA=$(git rev-parse --verify --quiet "${BASH_REMATCH[1]}^{commit}") || CURRENT_SHA=""
+          fi
+          if [ -z "$CURRENT_SHA" ]; then
+            echo "::warning::could not read a commit from the libfx dev tag '${CURRENT_VERSION}'; only main's newest commit may replace it"
+          fi
+          if [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" != "$RELEASE_SHA" ] &&
+            git merge-base --is-ancestor "$RELEASE_SHA" "$CURRENT_SHA"; then
+            echo "the dev tag names libfx@${CURRENT_VERSION}, which already includes ${RELEASE_SHA}; skipping this publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$CURRENT_SHA" ] && git merge-base --is-ancestor "$CURRENT_SHA" "$RELEASE_SHA"; then
+            echo "the dev tag names libfx@${CURRENT_VERSION}; moving it to ${RELEASE_SHA}"
+          else
+            MAIN_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
+            if [ "$MAIN_SHA" != "$RELEASE_SHA" ]; then
+              echo "::warning::main advanced to ${MAIN_SHA} and the dev tag names no commit in the history of ${RELEASE_SHA}; skipping this publish"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       - name: Publish the verified archive with npm trusted publishing
+        if: steps.confirm.outputs.skip != 'true'
         env:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
           NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}
@@ -410,6 +435,7 @@ jobs:
 
   verify-published:
     needs: [metadata, publish]
+    if: needs.publish.outputs.skipped != 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
