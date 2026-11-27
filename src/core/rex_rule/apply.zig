@@ -397,9 +397,7 @@ fn addRuleEdits(edit: *Edit, paths: Paths, pid: u32, observed: Observed, state: 
 
     const unchanged = try initUnchanged(a, files.init_path, edit.original);
     if (!unchanged) {
-        if (edit.fx_lua_created) {
-            deleteIfPresent(files.fx_lua_path) catch |err| traceStep("undo fx.lua", err);
-        }
+        if (edit.fx_lua_created) deleteOwnFxLua(a, files.fx_lua_path, "undo fx.lua");
         return traced(.skipped, "init.lua changed while fx worked");
     }
 
@@ -454,9 +452,7 @@ fn rollback(edit: *Edit) void {
         const fx_created_init = edit.original == null;
         removeOwnLine(edit.alloc, edit.files.init_path, fx_created_init) catch |err| traceStep("remove our line", err);
     }
-    if (edit.fx_lua_created) {
-        deleteIfPresent(edit.files.fx_lua_path) catch |err| traceStep("delete fx.lua", err);
-    }
+    if (edit.fx_lua_created) deleteOwnFxLua(edit.alloc, edit.files.fx_lua_path, "delete fx.lua");
     _ = reloadRex(edit.rex, "rollback");
 }
 
@@ -515,11 +511,7 @@ fn removeRuleEdits(
         }
     }
 
-    // Look at fx.lua again: the person may have replaced it with their own since fx looked.
-    const fx_lua_still_ours = (observeFxLua(a, files.fx_lua_path) catch .foreign) == .ours;
-    if (fx_lua == .ours and fx_lua_still_ours) {
-        deleteIfPresent(files.fx_lua_path) catch |err| traceStep("delete fx.lua", err);
-    }
+    if (fx_lua == .ours) deleteOwnFxLua(a, files.fx_lua_path, "delete fx.lua");
     _ = reloadRex(rex, "after the removal");
     var next_state = state;
     next_state.added = try withoutEntry(a, state.added, files.config_dir);
@@ -557,6 +549,17 @@ fn writeReplacingPrivate(a: std.mem.Allocator, path: []const u8, bytes: []const 
     const io = io_mod.getIo();
     (try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .permissions = private_file_mode })).close(io);
     try io_mod.writeFileAtomic(a, path, bytes);
+}
+
+/// Deletes fx.lua only while it is still fx's own. The person may have written
+/// their own file over it since fx wrote or last read it.
+fn deleteOwnFxLua(a: std.mem.Allocator, path: []const u8, step: []const u8) void {
+    const still_ours = (observeFxLua(a, path) catch .foreign) == .ours;
+    if (!still_ours) {
+        debug_trace.logf(trace_scope, "kept fx.lua: it is no longer fx's own step={s}", .{step});
+        return;
+    }
+    deleteIfPresent(path) catch |err| traceStep(step, err);
 }
 
 fn deleteIfPresent(path: []const u8) !void {
@@ -1035,6 +1038,29 @@ test "rex apply: an fx.lua the person writes while fx works is not written over"
     try expectFile(a, fx_lua, foreign_fx_lua_text);
     try expectFile(a, init, original_text);
     try testing.expectEqual(@as(usize, 0), rex_state.reload_calls);
+}
+
+test "rex apply: a rollback keeps an fx.lua the person wrote during the attempt" {
+    var fx = try Fixture.create();
+    defer fx.deinit();
+    const a = fx.alloc();
+    const p = fx.paths;
+    const init = try pathIn(a, p.config_dir, init_name);
+    const fx_lua = try pathIn(a, p.config_dir, fx_lua_name);
+    try makeDir(p.config_dir);
+    // No init.lua, so the first check is the one after fx's edit; the person writes
+    // their own fx.lua during it, and the check fails, so fx rolls back.
+    var rex_state: FakeRex = .{
+        .pid = test_pid,
+        .before = .no_rule,
+        .after = .trusted,
+        .check_mode = .fail_on_our_line,
+        .foreign_fx_lua_at = fx_lua,
+    };
+
+    try testing.expectEqual(Outcome.rolled_back, run(a, rex_state.rex(), p, test_pid, true));
+    try expectFile(a, fx_lua, foreign_fx_lua_text);
+    try testing.expect(!fileExists(init));
 }
 
 test "rex apply: the person's empty init.lua stays when the setting is turned off" {
