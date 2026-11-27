@@ -7481,18 +7481,50 @@ fn spacedCommandDetailForTest(alloc: std.mem.Allocator, entry_id: u32, command: 
     return detail;
 }
 
-test "a command sent with a space after it shows its short form while it runs and after it ends" {
+/// A narrow, the default, and a wide terminal, in columns.
+const row_test_widths = [_]u16{ 40, 120, 200 };
+
+/// Checks that `entries` show as `want` live and after a resume at each of
+/// row_test_widths. One comparison holds every width, so a failure shows the
+/// rows at all of them.
+fn expectRowsAtEveryWidthForTest(alloc: std.mem.Allocator, entries: []const TranscriptEntry, details: []const ToolDetailRecord, want: []const u8) !void {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const live_details = try scratch.dupe(ToolDetailRecord, details);
+    for (live_details) |*detail| {
+        if (!detail.subagent_report) detail.presentation_group_id = .{ .turn_id = 1, .anchor_step_id = 1 };
+    }
+    const View = struct { name: []const u8, details: []const ToolDetailRecord };
+    var expected: std.Io.Writer.Allocating = .init(scratch);
+    var actual: std.Io.Writer.Allocating = .init(scratch);
+    for (row_test_widths) |cols| {
+        for ([_]View{ .{ .name = "resumed", .details = details }, .{ .name = "live", .details = live_details } }) |view| {
+            const painted = try paintedGroupForTest(scratch, entries, view.details, cols);
+            const text = try visibleLinesForTest(scratch, painted, cols);
+            try expected.writer.print("{d} {s}: {s}\n", .{ cols, view.name, want });
+            try actual.writer.print("{d} {s}: {s}\n", .{ cols, view.name, std.mem.trim(u8, text, "\n") });
+        }
+    }
+    try std.testing.expectEqualStrings(expected.written(), actual.written());
+}
+
+test "a command sent with a space after it shows its short form after it ends" {
     const alloc = std.testing.allocator;
     const detail = try spacedCommandDetailForTest(alloc, 1, spaced_command_for_test);
     defer alloc.free(detail.arguments_json.?);
     const ran = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Ran " ++ spaced_command_for_test ++ "\n", .class = .tool_status } }};
-    try expectLiveAndResumedRowsForTest(alloc, &ran, &.{detail}, "● Ran grep ✓");
+    try expectRowsAtEveryWidthForTest(alloc, &ran, &.{detail}, "● Ran grep ✓");
+}
 
+test "a command sent with a space after it shows its short form while it runs" {
+    const alloc = std.testing.allocator;
+    var detail = try spacedCommandDetailForTest(alloc, 1, spaced_command_for_test);
+    defer alloc.free(detail.arguments_json.?);
+    detail.outcome = null;
+    detail.command_process_presentation = null;
     const running = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Running " ++ spaced_command_for_test ++ "\n", .class = .tool_status } }};
-    var running_detail = detail;
-    running_detail.outcome = null;
-    running_detail.command_process_presentation = null;
-    try expectLiveAndResumedRowsForTest(alloc, &running, &.{running_detail}, "● Running grep");
+    try expectRowsAtEveryWidthForTest(alloc, &running, &.{detail}, "● Running grep");
 }
 
 test "a command sent with a space after it joins the command row before it" {
@@ -7505,7 +7537,7 @@ test "a command sent with a space after it joins the command row before it" {
         .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran ls\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran " ++ spaced_command_for_test ++ "\n", .class = .tool_status } },
     };
-    try expectLiveAndResumedRowsForTest(alloc, &entries, &.{ listed, detail }, "● Ran ls, grep · 2 calls ✓");
+    try expectRowsAtEveryWidthForTest(alloc, &entries, &.{ listed, detail }, "● Ran ls, grep · 2 calls ✓");
 }
 
 test "a long command sent with a space after it shows its short form when core cut its status short" {
@@ -7515,7 +7547,7 @@ test "a long command sent with a space after it shows its short form when core c
     defer alloc.free(detail.arguments_json.?);
     // Core keeps 117 bytes of the command and marks the cut.
     const cut = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Ran " ++ command[0..117] ++ "...\n", .class = .tool_status } }};
-    try expectLiveAndResumedRowsForTest(alloc, &cut, &.{detail}, "● Ran grep, find ✓");
+    try expectRowsAtEveryWidthForTest(alloc, &cut, &.{detail}, "● Ran grep, find ✓");
 }
 
 test "a space after a one-step command does not count toward the length that keeps its text" {
@@ -7537,17 +7569,27 @@ test "a failed command sent with a space after it colors the command, not its ex
     detail.command_action_label = @constCast("Ran");
     detail.command_process_presentation = .{ .exit_code = 1 };
     const exited = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 " ++ command ++ " \n", .class = .tool_status } }};
-    var group = try build(alloc, &exited, &.{detail}, 120);
-    defer group.deinit(alloc);
 
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
     const variant: code_highlight.Theme = if (shared_theme.current().light) .light else .dark;
-    const colored = try code_highlight.highlight(scratch_state.allocator(), command, code_highlight_languages.resolve("sh").?, variant, null);
+    const colored = try code_highlight.highlight(scratch, command, code_highlight_languages.resolve("sh").?, variant, null);
     try std.testing.expect(!std.mem.eql(u8, colored, command));
-    const row = group.entry_actions.items[0].override.bytes;
-    const label_at = std.mem.find(u8, row, "Exited 1") orelse return error.TestExpectedExitLabel;
-    try std.testing.expectStringStartsWith(row[label_at..], try std.mem.concat(scratch_state.allocator(), u8, &.{ "Exited 1 ", colored }));
+    const want = try std.mem.concat(scratch, u8, &.{ "Exited 1 ", colored });
+    // One comparison holds every width, so a failure shows the row at all of them.
+    var expected: std.Io.Writer.Allocating = .init(scratch);
+    var actual: std.Io.Writer.Allocating = .init(scratch);
+    for (row_test_widths) |cols| {
+        var group = try build(alloc, &exited, &.{detail}, cols);
+        defer group.deinit(alloc);
+        const row = group.entry_actions.items[0].override.bytes;
+        const label_at = std.mem.find(u8, row, "Exited 1") orelse return error.TestExpectedExitLabel;
+        const shown = row[label_at..];
+        try expected.writer.print("{d}: {s}\n", .{ cols, want });
+        try actual.writer.print("{d}: {s}\n", .{ cols, shown[0..@min(shown.len, want.len)] });
+    }
+    try std.testing.expectEqualStrings(expected.written(), actual.written());
 }
 
 fn knownLabelPrefix(phrase: []const u8) ?usize {
