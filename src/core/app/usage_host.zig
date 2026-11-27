@@ -6,6 +6,7 @@ const std = @import("std");
 const usage = @import("../../usage/usage.zig");
 const client = @import("../../gateway/client.zig");
 const js_host_stream_provider = @import("../../gateway/js_host_stream_provider.zig");
+const catalog_fetch_failure = @import("../../gateway/catalog_fetch_failure.zig");
 const stream_provider = @import("../agent/stream_provider.zig");
 const host_target = @import("../hosts/target.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -15,6 +16,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const stored_login_testing = @import("../auth/stored_login_testing.zig");
+const raw_answer_testing = @import("../../gateway/raw_answer_testing.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -227,7 +229,9 @@ fn send(
                 @tagName(request.service),
                 @errorName(err),
             });
-            return error.Unavailable;
+            // The size cap is fx's own limit, so classify does not sort it.
+            const malformed = err == error.UsageResponseTooLarge or catalog_fetch_failure.classify(err).category == .malformed_response;
+            return if (malformed) error.BadResponse else error.Unavailable;
         },
     };
     debug_trace.logf("usage", "usage fetch service={s} status={d}", .{
@@ -292,4 +296,42 @@ test "a clock file given as a relative path is not read" {
     defer io_mod.resetEnvironForTest();
     const before = io_mod.milliTimestamp();
     try std.testing.expect(now(null) >= before);
+}
+
+/// One usage GET to a loopback gateway that sends `answer` once.
+fn sendUsageAnswer(answer: []const u8) !usage.Response {
+    const alloc = std.testing.allocator;
+    var server = try raw_answer_testing.AnswerServer.start(alloc, answer);
+    const base = try server.url(alloc, "");
+    defer alloc.free(base);
+    const env = try raw_answer_testing.Env.install(alloc, &[_][2][]const u8{.{ "FX_GATEWAY_BASE_URL", base }});
+    defer env.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    const result = send(alloc, .{ .service = .gateway, .path = "/v1/report", .bearer = "usage-key", .team = null }, &cancel, null);
+    try server.finish();
+    return result;
+}
+
+test "a usage answer cut inside its Content-Length reads as a bad response" {
+    try std.testing.expectError(error.BadResponse, sendUsageAnswer("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"results\":[]}"));
+}
+
+test "a usage answer cut inside a chunk reads as a bad response" {
+    try std.testing.expectError(error.BadResponse, sendUsageAnswer("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nb\r\n{\"data\":[]}\r\n"));
+}
+
+test "a usage GET that gets no answer still reads as unavailable" {
+    try std.testing.expectError(error.Unavailable, sendUsageAnswer(""));
+}
+
+test "a usage answer larger than the size cap reads as a bad response" {
+    const alloc = std.testing.allocator;
+    const body_len = 2 * 1024 * 1024;
+    const head = try alloc.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body_len});
+    defer alloc.free(head);
+    const answer = try alloc.alloc(u8, head.len + body_len);
+    defer alloc.free(answer);
+    @memcpy(answer[0..head.len], head);
+    @memset(answer[head.len..], 'x');
+    try std.testing.expectError(error.BadResponse, sendUsageAnswer(answer));
 }

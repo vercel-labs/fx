@@ -5693,6 +5693,7 @@ test {
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
     _ = @import("core/app/usage_host.zig");
+    _ = @import("usage/usage.zig");
     _ = credits_lookup;
     _ = @import("core/app/app_entry_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");

@@ -48,7 +48,9 @@ pub const Response = struct {
     body: []u8,
 };
 
-pub const FetchError = error{ Cancelled, Unavailable, OutOfMemory };
+/// `Unavailable` means no usable answer arrived. `BadResponse` means an answer
+/// arrived but cannot be used.
+pub const FetchError = error{ Cancelled, Unavailable, BadResponse, OutOfMemory };
 
 pub const Host = struct {
     ctx: ?*anyopaque = null,
@@ -936,6 +938,7 @@ fn get(run: *Run, request: Request) error{Stop}![]u8 {
     const dashboard = run.dashboard;
     const response = dashboard.host.fetch_fn(dashboard.host.ctx, dashboard.gpa, request, &dashboard.cancel) catch |err| return run.fail(switch (err) {
         error.Cancelled => .cancelled,
+        error.BadResponse => .{ .failed = .bad_response },
         error.Unavailable, error.OutOfMemory => .{ .failed = .network },
     });
     if (response.status == 200) return response.body;
@@ -991,6 +994,8 @@ const FakeGateway = struct {
     /// What `renew_fn` offers for the refused token; null offers nothing.
     renewed_bearer: ?[]const u8 = null,
     renewals: usize = 0,
+    /// When set, every request fails with this error, as the host's send does.
+    fail_with: ?FetchError = null,
 
     const today_body = "{\"results\":[{\"model\":\"anthropic/claude-opus-5.5\",\"request_count\":10,\"input_tokens\":5,\"total_cost\":2.5}]}";
     const window_body = "{\"results\":[{\"model\":\"anthropic/claude-opus-5.5\",\"request_count\":90,\"total_cost\":40},{\"model\":\"openai/gpt-5.6-luna\",\"request_count\":7,\"total_cost\":0.5}]}";
@@ -1043,6 +1048,7 @@ const FakeGateway = struct {
         while (self.held.load(.acquire)) std.atomic.spinLoopHint();
         self.mutex.lockUncancelable(testing.io);
         defer self.mutex.unlock(testing.io);
+        if (self.fail_with) |err| return err;
         const i = self.count;
         self.count += 1;
         @memcpy(self.paths[i][0..request.path.len], request.path);
@@ -1470,6 +1476,36 @@ test "a refused refresh keeps the cached numbers and says why" {
     defer today.deinit();
     try testing.expectEqual(Status{ .failed = .refused }, today.status);
     try testing.expectApproxEqAbs(@as(f64, 2.5), today.of(.today).totals.total_cost, 1e-9);
+}
+
+test "an answer that arrived but cannot be read shows as a bad response, not a network failure" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{ .fail_with = error.BadResponse };
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    defer dashboard.deinit();
+    dashboard.open(member);
+    dashboard.waitForFetch();
+    var snapshot = try dashboard.snapshot(testing.allocator);
+    defer snapshot.deinit();
+    try testing.expectEqual(Status{ .failed = .bad_response }, snapshot.status);
+}
+
+test "a fetch that cannot connect still shows as a network failure" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{ .fail_with = error.Unavailable };
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    defer dashboard.deinit();
+    dashboard.open(member);
+    dashboard.waitForFetch();
+    var snapshot = try dashboard.snapshot(testing.allocator);
+    defer snapshot.deinit();
+    try testing.expectEqual(Status{ .failed = .network }, snapshot.status);
 }
 
 test "a sign-in another fx renewed is refused once, then fetched with the new token from then on" {

@@ -442,8 +442,13 @@ const UsageGetOperation = struct {
             .limited(usage_response_max_bytes),
         ) catch |err| switch (err) {
             error.StreamTooLong => return error.UsageResponseTooLarge,
+            error.ReadFailed => return bodyReadError(&response),
             else => return err,
         };
+        if (plainBodyCutOff(&response, body.len)) {
+            self.alloc.free(body);
+            return error.HttpBodyCutOff;
+        }
         return .{ .status = response.head.status, .body = body };
     }
 };
@@ -451,12 +456,13 @@ const UsageGetOperation = struct {
 pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8) !GetResult {
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
-    return fetchGatewayGet(alloc, api_key, path, &client);
+    return fetchGatewayGet(alloc, api_key, path, &client, false);
 }
 
 /// The GET of `fetchGatewayGetResult`, on `client`, or with no client on an
-/// open job (`fetchOnOpenJob`).
-fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8, client: ?*std.http.Client) !GetResult {
+/// open job (`fetchOnOpenJob`, or `fetchWholeBodyOnOpenJob` when
+/// `require_whole_body` is set). The flag applies to an open job only.
+fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8, client: ?*std.http.Client, require_whole_body: bool) !GetResult {
     const default_url = try alloc.print("{s}{s}", .{ gatewayBaseUrl(), path });
     defer alloc.free(default_url);
     const url = try resolveE2eGatewayUrl(e2e_gateway_credits_url_env, default_url);
@@ -481,7 +487,13 @@ fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const
         .response_writer = &out.writer,
         .redirect_behavior = .unhandled,
     };
-    const result = if (client) |own| try fetchWithClient(own, options) else try fetchOnOpenJob(options);
+    std.debug.assert(client == null or !require_whole_body);
+    const result = if (client) |own|
+        try fetchWithClient(own, options)
+    else if (require_whole_body)
+        try fetchWholeBodyOnOpenJob(options)
+    else
+        try fetchOnOpenJob(options);
 
     return .{
         .status = result.status,
@@ -512,7 +524,7 @@ const GatewayGetOperation = struct {
     path: []const u8,
 
     fn run(self: *@This()) !GetResult {
-        return fetchGatewayGet(self.alloc, self.api_key, self.path, null);
+        return fetchGatewayGet(self.alloc, self.api_key, self.path, null, true);
     }
 };
 
@@ -670,6 +682,9 @@ fn fetchGatewayJsonAtUrlCore(
 /// than growing memory without bound.
 const max_gateway_json_bytes: usize = 16 * 1024 * 1024;
 
+/// std's zstd decoder asserts that its buffer holds a window and one block.
+const zstd_decompress_buffer_bytes: usize = std.compress.zstd.default_window_len + std.compress.zstd.block_size_max;
+
 fn decodeGatewayJsonBody(
     alloc: std.mem.Allocator,
     encoding: std.http.ContentEncoding,
@@ -679,7 +694,7 @@ fn decodeGatewayJsonBody(
     if (encoding == .identity) return readGatewayJsonBody(alloc, raw_reader, max_bytes);
     const decompress_buffer: []u8 = switch (encoding) {
         .identity => unreachable,
-        .zstd => try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max),
+        .zstd => try alloc.alloc(u8, zstd_decompress_buffer_bytes),
         .deflate, .gzip => try alloc.alloc(u8, std.compress.flate.max_window_len),
         .compress => return error.UnsupportedCompressionMethod,
     };
@@ -2999,7 +3014,7 @@ fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchO
     const client_alloc = req.client.allocator;
     const decompress_buffer: []u8 = switch (response.head.content_encoding) {
         .identity => &.{},
-        .zstd => options.decompress_buffer orelse try client_alloc.alloc(u8, std.compress.zstd.default_window_len),
+        .zstd => options.decompress_buffer orelse try client_alloc.alloc(u8, zstd_decompress_buffer_bytes),
         .deflate, .gzip => options.decompress_buffer orelse try client_alloc.alloc(u8, std.compress.flate.max_window_len),
         .compress => return error.UnsupportedCompressionMethod,
     };
@@ -11609,6 +11624,126 @@ test "fetchWholeBodyOnOpenJob keeps the status of an error answer whose body is 
 test "fetchWholeBodyOnOpenJob accepts a complete chunked answer whose Content-Length is wrong" {
     const result = try fetchOneLoopbackAnswer("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nContent-Length: 4096\r\nConnection: close\r\n\r\nb\r\n{\"data\":[]}\r\n0\r\n\r\n", true);
     try std.testing.expectEqual(std.http.Status.ok, result.status);
+}
+
+test "usage GET reports a 200 body cut inside its Content-Length as cut off" {
+    const alloc = std.testing.allocator;
+    var server = try raw_answer_testing.AnswerServer.start(alloc, short_plain_answer);
+    const url = try server.url(alloc, "/v1/usage");
+    defer alloc.free(url);
+    var cancel = std.atomic.Value(bool).init(false);
+    const result = fetchUsageGet(alloc, "usage-key", null, .none, url, &cancel);
+    try server.finish();
+    try std.testing.expectError(error.HttpBodyCutOff, result);
+}
+
+test "usage GET returns a whole 200 body" {
+    const alloc = std.testing.allocator;
+    var server = try raw_answer_testing.AnswerServer.start(alloc, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}");
+    const url = try server.url(alloc, "/v1/usage");
+    defer alloc.free(url);
+    var cancel = std.atomic.Value(bool).init(false);
+    const result = fetchUsageGet(alloc, "usage-key", null, .none, url, &cancel);
+    try server.finish();
+    var fetched = try result;
+    defer fetched.deinit(alloc);
+    try std.testing.expectEqual(std.http.Status.ok, fetched.status);
+    try std.testing.expectEqualStrings("{\"data\":[]}", fetched.body);
+}
+
+test "usage GET keeps the status of a 503 whose body is short" {
+    const alloc = std.testing.allocator;
+    var server = try raw_answer_testing.AnswerServer.start(alloc, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"error\":");
+    const url = try server.url(alloc, "/v1/usage");
+    defer alloc.free(url);
+    var cancel = std.atomic.Value(bool).init(false);
+    const result = fetchUsageGet(alloc, "usage-key", null, .none, url, &cancel);
+    try server.finish();
+    var fetched = try result;
+    defer fetched.deinit(alloc);
+    try std.testing.expectEqual(std.http.Status.service_unavailable, fetched.status);
+}
+
+test "usage GET reports a chunked answer cut before its last chunk as HttpChunkTruncated" {
+    const alloc = std.testing.allocator;
+    var server = try raw_answer_testing.AnswerServer.start(alloc, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nb\r\n{\"data\":[]}\r\n");
+    const url = try server.url(alloc, "/v1/usage");
+    defer alloc.free(url);
+    var cancel = std.atomic.Value(bool).init(false);
+    const result = fetchUsageGet(alloc, "usage-key", null, .none, url, &cancel);
+    try server.finish();
+    try std.testing.expectError(error.HttpChunkTruncated, result);
+}
+
+test "credits GET reports a 200 body cut inside its Content-Length as cut off" {
+    const alloc = std.testing.allocator;
+    var server = try raw_answer_testing.AnswerServer.start(alloc, short_plain_answer);
+    const url = try server.url(alloc, "/v1/credits");
+    defer alloc.free(url);
+    const env = try raw_answer_testing.Env.install(alloc, &[_][2][]const u8{.{ e2e_gateway_credits_url_env, url }});
+    defer env.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    const result = fetchGatewayGetResultCancellable(alloc, "credits-key", "/v1/credits", &cancel);
+    try server.finish();
+    try std.testing.expectError(error.HttpBodyCutOff, result);
+}
+
+test "credits GET returns a whole 200 body" {
+    const alloc = std.testing.allocator;
+    var server = try raw_answer_testing.AnswerServer.start(alloc, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}");
+    const url = try server.url(alloc, "/v1/credits");
+    defer alloc.free(url);
+    const env = try raw_answer_testing.Env.install(alloc, &[_][2][]const u8{.{ e2e_gateway_credits_url_env, url }});
+    defer env.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    const result = fetchGatewayGetResultCancellable(alloc, "credits-key", "/v1/credits", &cancel);
+    try server.finish();
+    var fetched = try result;
+    defer fetched.deinit(alloc);
+    try std.testing.expectEqual(std.http.Status.ok, fetched.status);
+    try std.testing.expectEqualStrings("{\"data\":[]}", fetched.body);
+}
+
+test "API key validator GET keeps status 200 for a 200 body cut inside its Content-Length" {
+    const alloc = std.testing.allocator;
+    var server = try raw_answer_testing.AnswerServer.start(alloc, short_plain_answer);
+    const url = try server.url(alloc, "/v1/models");
+    defer alloc.free(url);
+    const env = try raw_answer_testing.Env.install(alloc, &[_][2][]const u8{.{ e2e_gateway_credits_url_env, url }});
+    defer env.deinit();
+    const result = fetchGatewayGetResult(alloc, "validator-key", "/v1/models");
+    try server.finish();
+    var fetched = try result;
+    defer fetched.deinit(alloc);
+    try std.testing.expectEqual(std.http.Status.ok, fetched.status);
+}
+
+test "fetchOnRequest decodes a zstd answer into the caller's writer" {
+    const alloc = std.testing.allocator;
+    // A raw-block zstd frame for {"data":[]}: magic, a single-segment header, then one last raw block.
+    const answer = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: 20\r\nConnection: close\r\n\r\n" ++
+        "\x28\xb5\x2f\xfd\x20\x0b\x59\x00\x00{\"data\":[]}";
+    var server = try raw_answer_testing.AnswerServer.start(alloc, answer);
+    const url = try server.url(alloc, "/v1/models");
+    defer alloc.free(url);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const options: std.http.Client.FetchOptions = .{
+        .location = .{ .url = url },
+        .method = .GET,
+        .headers = .{ .accept_encoding = .omit },
+        .redirect_behavior = .unhandled,
+        .response_writer = &out.writer,
+    };
+    var opened = try openRequestOnJob(fetchMethod(options), try fetchUri(options), fetchRequestOptions(options));
+    defer opened.deinit();
+    // std refuses a zstd answer unless the request itself accepts zstd; the Accept-Encoding header alone does not.
+    opened.request.accept_encoding[@backingInt(std.http.ContentEncoding.zstd)] = true;
+    const result = fetchOnRequest(&opened.request, options, false);
+    try server.finish();
+    const fetched = try result;
+    try std.testing.expectEqual(std.http.Status.ok, fetched.status);
+    try std.testing.expectEqualStrings("{\"data\":[]}", out.written());
 }
 
 fn readLoopbackGatewayRequest(zio: std.Io, stream: std.Io.net.Stream, fixture: *LoopbackGatewayFixture) !void {
