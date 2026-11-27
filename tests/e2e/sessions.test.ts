@@ -3903,6 +3903,164 @@ test("fx ask runs a subagent as a v2 child with its own log, recorded in the par
   }
 }, TIMEOUT * 2);
 
+test("fx ask: a subagent's approval request goes to main, and main's approve lets the command run", async () => {
+  const fixture = createFixture("fx-v2-subagent-approval-approve-");
+  // A subagent that asks before it runs a command: fx ask has no screen for
+  // it, so its parent hears and answers with the subagent tool.
+  const profileDir = join(fixture.home, ".fx", "agents", "asker");
+  mkdirSync(profileDir, { recursive: true });
+  writeFileSync(join(profileDir, "profile.json"), JSON.stringify({ description: "Runs one command", tools: ["shell"], permission_mode: "ask" }));
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body) && !body.includes("call_child_shell")) {
+      await waitForRootTurnCommitted(fixture.home);
+      return fakeGatewayToolCall("call_child_shell", "shell", { request: { action: "run", command: "touch approved.txt" } });
+    }
+    if (isChildRequest(body)) return fakeGatewayFinalText("CHILD_RAN");
+    if (body.includes("I wait for your approval to run") && !body.includes("call_main_approve")) {
+      return fakeGatewayToolCall("call_main_approve", "subagent", { action: "approve", agent: "asker" });
+    }
+    if (body.includes("call_main_approve") && !isReportTurn(body)) return fakeGatewayFinalText("MAIN_APPROVED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("PARENT_DONE");
+    if (body.includes("delegate-asker")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-asker", "subagent", { request: { action: "message", agent: "asker", profile: "asker", message: "Touch approved.txt." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const result = await ask(fixture, gateway, ["Delegate the command."]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    const output = JSON.parse(result.stdout);
+    expect(existsSync(join(fixture.workspace, "approved.txt"))).toBe(true);
+    expect(output.output).toContain("PARENT_DONE");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("fx ask: main's deny refuses a subagent's approval request with its reason", async () => {
+  const fixture = createFixture("fx-v2-subagent-approval-deny-");
+  const profileDir = join(fixture.home, ".fx", "agents", "asker");
+  mkdirSync(profileDir, { recursive: true });
+  writeFileSync(join(profileDir, "profile.json"), JSON.stringify({ description: "Runs one command", tools: ["shell"], permission_mode: "ask" }));
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body) && !body.includes("call_child_shell")) {
+      await waitForRootTurnCommitted(fixture.home);
+      return fakeGatewayToolCall("call_child_shell", "shell", { request: { action: "run", command: "touch approved.txt" } });
+    }
+    if (isChildRequest(body)) return fakeGatewayFinalText(body.includes("not in this workspace") ? "CHILD_SAW_DENY" : "CHILD_NO_REASON");
+    if (body.includes("I wait for your approval to run") && !body.includes("call_main_deny")) {
+      return fakeGatewayToolCall("call_main_deny", "subagent", { action: "deny", agent: "asker", message: "not in this workspace" });
+    }
+    if (body.includes("call_main_deny") && !isReportTurn(body)) return fakeGatewayFinalText("MAIN_DENIED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("PARENT_DONE");
+    if (body.includes("delegate-asker")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-asker", "subagent", { request: { action: "message", agent: "asker", profile: "asker", message: "Touch approved.txt." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const result = await ask(fixture, gateway, ["Delegate the command."]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    const output = JSON.parse(result.stdout);
+    expect(existsSync(join(fixture.workspace, "approved.txt"))).toBe(false);
+    expect(output.output).toContain("PARENT_DONE");
+    // The child read the reason main gave, and never ran the command.
+    const lines = childLines(fixture.home, output.session_id);
+    const childLog = logLines(fixture.home, lines[0].child) as any[];
+    expect(JSON.stringify(childLog)).toContain("CHILD_SAW_DENY");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("fx ask: main's approve is refused when main's own review holds the action", async () => {
+  const fixture = createFixture("fx-v2-subagent-approval-caution-");
+  // The same subagent as the approve test, but main's own safety review holds
+  // the child's command, so approve must refuse it (RULES.md R4.2, R4.3).
+  const profileDir = join(fixture.home, ".fx", "agents", "asker");
+  mkdirSync(profileDir, { recursive: true });
+  writeFileSync(join(profileDir, "profile.json"), JSON.stringify({ description: "Runs one command", tools: ["shell"], permission_mode: "ask" }));
+  let childAfter: string | null = null;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body) && !body.includes("call_child_shell")) {
+      await waitForRootTurnCommitted(fixture.home);
+      return fakeGatewayToolCall("call_child_shell", "shell", { request: { action: "run", command: "touch approved.txt" } });
+    }
+    if (isChildRequest(body)) {
+      childAfter = body;
+      return fakeGatewayFinalText(body.includes("Action held after safety review") ? "CHILD_SAW_REFUSAL" : "CHILD_NO_REASON");
+    }
+    if (body.includes("I wait for your approval to run") && !body.includes("call_main_approve")) {
+      return fakeGatewayToolCall("call_main_approve", "subagent", { action: "approve", agent: "asker" });
+    }
+    if (body.includes("call_main_approve") && !isReportTurn(body)) return fakeGatewayFinalText("MAIN_APPROVED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("PARENT_DONE");
+    if (body.includes("delegate-asker")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-asker", "subagent", { request: { action: "message", agent: "asker", profile: "asker", message: "Touch approved.txt." } });
+  }, { classifierDecision: "caution" });
+  try {
+    // Main's own delegate call needs no approval, so only the child's command
+    // reaches the review, which holds it.
+    const result = await ask(fixture, gateway, ["Delegate the command."]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    const output = JSON.parse(result.stdout);
+    expect(output.output).toContain("PARENT_DONE");
+    // The held command never ran, and the child read the review's reason.
+    expect(existsSync(join(fixture.workspace, "approved.txt"))).toBe(false);
+    expect(childAfter).not.toBeNull();
+    expect(childAfter!).toContain("Action held after safety review");
+    const lines = childLines(fixture.home, output.session_id);
+    const childLog = logLines(fixture.home, lines[0].child) as any[];
+    expect(JSON.stringify(childLog)).toContain("CHILD_SAW_REFUSAL");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("fx ask: a subagent's approval request that main leaves unanswered is refused when main's turn ends", async () => {
+  const fixture = createFixture("fx-v2-subagent-approval-unanswered-");
+  const profileDir = join(fixture.home, ".fx", "agents", "asker");
+  mkdirSync(profileDir, { recursive: true });
+  writeFileSync(join(profileDir, "profile.json"), JSON.stringify({ description: "Runs one command", tools: ["shell"], permission_mode: "ask" }));
+  let childAfter: string | null = null;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body) && !body.includes("call_child_shell")) {
+      await waitForRootTurnCommitted(fixture.home);
+      return fakeGatewayToolCall("call_child_shell", "shell", { request: { action: "run", command: "touch approved.txt" } });
+    }
+    if (isChildRequest(body)) {
+      childAfter = body;
+      return fakeGatewayFinalText(body.includes("ended its turn without answering") ? "CHILD_SAW_FALLBACK" : "CHILD_NO_REASON");
+    }
+    // Main reads the note and ends its turn without answering it. The report
+    // turn carries the note in its history, so it is not this turn.
+    if (!isReportTurn(body) && body.includes("I wait for your approval to run")) return fakeGatewayFinalText("MAIN_IGNORED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("PARENT_DONE");
+    if (body.includes("delegate-asker")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-asker", "subagent", { request: { action: "message", agent: "asker", profile: "asker", message: "Touch approved.txt." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const result = await ask(fixture, gateway, ["Delegate the command."]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    const output = JSON.parse(result.stdout);
+    // The fallback refused the request, the child reported, and main answered
+    // the report: the ask ends instead of waiting for ever.
+    expect(output.output).toContain("PARENT_DONE");
+    expect(existsSync(join(fixture.workspace, "approved.txt"))).toBe(false);
+    expect(childAfter).not.toBeNull();
+    expect(childAfter!).toContain("ended its turn without answering");
+    const lines = childLines(fixture.home, output.session_id);
+    const childLog = logLines(fixture.home, lines[0].child) as any[];
+    expect(JSON.stringify(childLog)).toContain("CHILD_SAW_FALLBACK");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
 test("a named subagent keeps its id, history and instructions across fx ask runs", async () => {
   const fixture = createFixture("fx-v2-subagent-named-");
   const childBodies: string[] = [];
