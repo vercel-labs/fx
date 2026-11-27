@@ -7,9 +7,10 @@
 (* path (normal exit, signal/hangup, Ctrl+Z suspend; set again on resume). *)
 (* When the person pastes with mode 5522 on, the terminal sends an         *)
 (* unsolicited listing: OK(pw) -> DATA(mime list) -> DONE. fx records the  *)
-(* input owner when the listing finishes (DONE), picks image/png only when *)
-(* that recorded owner is composer and image/png is listed (else a text    *)
-(* MIME, else notice/drop), and sends one read with pw.                    *)
+(* input owner when the listing finishes (DONE), picks text first (even  *)
+(* if image/png is also listed), picks image/png only when the list has no *)
+(* text and that recorded owner is composer (else notice/drop), and sends  *)
+(* one read with pw.                                                      *)
 (*                                                                         *)
 (* Keys the person types can arrive between any two packets and may change *)
 (* the current owner; they are never mistaken for reply bytes, and listing *)
@@ -45,7 +46,7 @@ ASSUME Mutation \in {"none", "current_today", "paste_uses_current_owner",
                      "rearm_after_denial"}
 
 Owners == {"composer", "modal", "decision"}
-MimeLists == {"png_text", "text", "unknown", "empty"}
+MimeLists == {"png_only", "png_text", "text", "unknown", "empty"}
 Settlements == {"attach", "text_paste", "notice"}
 
 VARIABLES
@@ -68,7 +69,8 @@ VARIABLES
     pastesStarted,    \* number of paste events started
     activePaste,      \* paste index (1..MaxPastes) owning current listing/read, or 0
     settledCount,     \* [1..MaxPastes -> Nat]: number of settlements per paste
-    imgCompPaste,     \* [1..MaxPastes -> BOOLEAN]: paste was image-in-composer
+    imgCompPaste,     \* [1..MaxPastes -> BOOLEAN]: paste was png-only in composer
+    pngTextCompPaste, \* [1..MaxPastes -> BOOLEAN]: paste was png+text in composer
     postDenialPaste,  \* [1..MaxPastes -> BOOLEAN]: paste arrived after denial
     attachedPaste,    \* [1..MaxPastes -> BOOLEAN]: paste settled as attach
     failedPaste,      \* [1..MaxPastes -> BOOLEAN]: paste failed / dropped busy
@@ -83,9 +85,9 @@ VARIABLES
 vars == <<mode5522, pasteEventsDenied, lifecycle, activeOwner, pasteOwner,
           recordedOwner, phase, discardListing, ctrlVOpen, openReads,
           listingMimes, readKind, pwState, term, wire, leaked, pastesStarted,
-          activePaste, settledCount, imgCompPaste, postDenialPaste,
-          attachedPaste, failedPaste, lastSettlement, textOwner,
-          lastAttachOwner, keys, ctrlVs, suspends, rearms>>
+          activePaste, settledCount, imgCompPaste, pngTextCompPaste,
+          postDenialPaste, attachedPaste, failedPaste, lastSettlement,
+          textOwner, lastAttachOwner, keys, ctrlVs, suspends, rearms>>
 
 Tokens ==
     {<<"key", o>> : o \in Owners}
@@ -115,6 +117,7 @@ TypeOK ==
     /\ activePaste \in 0..MaxPastes
     /\ settledCount \in [1..MaxPastes -> 0..2]
     /\ imgCompPaste \in [1..MaxPastes -> BOOLEAN]
+    /\ pngTextCompPaste \in [1..MaxPastes -> BOOLEAN]
     /\ postDenialPaste \in [1..MaxPastes -> BOOLEAN]
     /\ attachedPaste \in [1..MaxPastes -> BOOLEAN]
     /\ failedPaste \in [1..MaxPastes -> BOOLEAN]
@@ -147,6 +150,7 @@ Init ==
     /\ activePaste = 0
     /\ settledCount = [p \in 1..MaxPastes |-> 0]
     /\ imgCompPaste = [p \in 1..MaxPastes |-> FALSE]
+    /\ pngTextCompPaste = [p \in 1..MaxPastes |-> FALSE]
     /\ postDenialPaste = [p \in 1..MaxPastes |-> FALSE]
     /\ attachedPaste = [p \in 1..MaxPastes |-> FALSE]
     /\ failedPaste = [p \in 1..MaxPastes |-> FALSE]
@@ -171,8 +175,9 @@ TypeKey ==
                    pasteOwner, recordedOwner, phase, discardListing, ctrlVOpen,
                    openReads, listingMimes, readKind, pwState, term, leaked,
                    pastesStarted, activePaste, settledCount, imgCompPaste,
-                   postDenialPaste, attachedPaste, failedPaste, lastSettlement,
-                   textOwner, lastAttachOwner, ctrlVs, suspends, rearms>>
+                   pngTextCompPaste, postDenialPaste, attachedPaste,
+                   failedPaste, lastSettlement, textOwner, lastAttachOwner,
+                   ctrlVs, suspends, rearms>>
 
 StartCtrlV ==
     /\ lifecycle = "running"
@@ -186,8 +191,9 @@ StartCtrlV ==
                    pasteOwner, recordedOwner, phase, discardListing,
                    listingMimes, readKind, pwState, term, wire, leaked,
                    pastesStarted, activePaste, settledCount, imgCompPaste,
-                   postDenialPaste, attachedPaste, failedPaste, lastSettlement,
-                   textOwner, lastAttachOwner, keys, suspends, rearms>>
+                   pngTextCompPaste, postDenialPaste, attachedPaste,
+                   failedPaste, lastSettlement, textOwner, lastAttachOwner,
+                   keys, suspends, rearms>>
 
 FinishCtrlV ==
     /\ lifecycle = "running"
@@ -198,8 +204,9 @@ FinishCtrlV ==
                    pasteOwner, recordedOwner, phase, discardListing,
                    listingMimes, readKind, pwState, term, wire, leaked,
                    pastesStarted, activePaste, settledCount, imgCompPaste,
-                   postDenialPaste, attachedPaste, failedPaste, lastSettlement,
-                   textOwner, lastAttachOwner, keys, ctrlVs, suspends, rearms>>
+                   pngTextCompPaste, postDenialPaste, attachedPaste,
+                   failedPaste, lastSettlement, textOwner, lastAttachOwner,
+                   keys, ctrlVs, suspends, rearms>>
 
 PersonPaste ==
     /\ lifecycle = "running"
@@ -210,7 +217,7 @@ PersonPaste ==
        /\ postDenialPaste' = [postDenialPaste EXCEPT ![p] = pasteEventsDenied]
        /\ \E m \in MimeLists :
             /\ imgCompPaste' = [imgCompPaste EXCEPT ![p] =
-                                (activeOwner = "composer" /\ m = "png_text"
+                                (activeOwner = "composer" /\ m = "png_only"
                                  /\ ~ctrlVOpen /\ phase = "idle" /\ wire = <<>>
                                  /\ ~pasteEventsDenied)]
             /\ IF mode5522 = "on"
@@ -223,8 +230,9 @@ PersonPaste ==
     /\ UNCHANGED <<mode5522, pasteEventsDenied, lifecycle, activeOwner,
                    pasteOwner, recordedOwner, phase, discardListing, ctrlVOpen,
                    openReads, listingMimes, readKind, wire, leaked, activePaste,
-                   settledCount, attachedPaste, failedPaste, lastSettlement,
-                   textOwner, lastAttachOwner, keys, ctrlVs, suspends, rearms>>
+                   settledCount, pngTextCompPaste, attachedPaste, failedPaste,
+                   lastSettlement, textOwner, lastAttachOwner, keys, ctrlVs,
+                   suspends, rearms>>
 
 ExitNormal ==
     /\ lifecycle = "running"
@@ -233,9 +241,9 @@ ExitNormal ==
     /\ UNCHANGED <<pasteEventsDenied, activeOwner, pasteOwner, recordedOwner,
                    phase, discardListing, ctrlVOpen, openReads, listingMimes,
                    readKind, pwState, term, wire, leaked, pastesStarted,
-                   activePaste, settledCount, imgCompPaste, postDenialPaste,
-                   attachedPaste, failedPaste, lastSettlement, textOwner,
-                   lastAttachOwner, keys, ctrlVs, suspends, rearms>>
+                   activePaste, settledCount, imgCompPaste, pngTextCompPaste,
+                   postDenialPaste, attachedPaste, failedPaste, lastSettlement,
+                   textOwner, lastAttachOwner, keys, ctrlVs, suspends, rearms>>
 
 ExitSignalOrHangup ==
     /\ lifecycle = "running"
@@ -244,9 +252,9 @@ ExitSignalOrHangup ==
     /\ UNCHANGED <<pasteEventsDenied, activeOwner, pasteOwner, recordedOwner,
                    phase, discardListing, ctrlVOpen, openReads, listingMimes,
                    readKind, pwState, term, wire, leaked, pastesStarted,
-                   activePaste, settledCount, imgCompPaste, postDenialPaste,
-                   attachedPaste, failedPaste, lastSettlement, textOwner,
-                   lastAttachOwner, keys, ctrlVs, suspends, rearms>>
+                   activePaste, settledCount, imgCompPaste, pngTextCompPaste,
+                   postDenialPaste, attachedPaste, failedPaste, lastSettlement,
+                   textOwner, lastAttachOwner, keys, ctrlVs, suspends, rearms>>
 
 Suspend ==
     /\ lifecycle = "running"
@@ -257,9 +265,9 @@ Suspend ==
     /\ UNCHANGED <<pasteEventsDenied, activeOwner, pasteOwner, recordedOwner,
                    phase, discardListing, ctrlVOpen, openReads, listingMimes,
                    readKind, pwState, term, wire, leaked, pastesStarted,
-                   activePaste, settledCount, imgCompPaste, postDenialPaste,
-                   attachedPaste, failedPaste, lastSettlement, textOwner,
-                   lastAttachOwner, keys, ctrlVs, rearms>>
+                   activePaste, settledCount, imgCompPaste, pngTextCompPaste,
+                   postDenialPaste, attachedPaste, failedPaste, lastSettlement,
+                   textOwner, lastAttachOwner, keys, ctrlVs, rearms>>
 
 Resume ==
     /\ lifecycle = "suspended"
@@ -272,12 +280,13 @@ Resume ==
     /\ UNCHANGED <<pasteEventsDenied, activeOwner, pasteOwner, recordedOwner,
                    phase, discardListing, ctrlVOpen, openReads, listingMimes,
                    readKind, pwState, term, wire, leaked, pastesStarted,
-                   activePaste, settledCount, imgCompPaste, postDenialPaste,
-                   attachedPaste, failedPaste, lastSettlement, textOwner,
-                   lastAttachOwner, keys, ctrlVs, suspends, rearms>>
+                   activePaste, settledCount, imgCompPaste, pngTextCompPaste,
+                   postDenialPaste, attachedPaste, failedPaste, lastSettlement,
+                   textOwner, lastAttachOwner, keys, ctrlVs, suspends, rearms>>
 
 RearmOrResetMode ==
     /\ lifecycle = "running"
+    /\ mode5522 = "off"
     /\ rearms < 1
     /\ rearms' = rearms + 1
     /\ mode5522' = IF Mutation = "current_today"
@@ -289,8 +298,9 @@ RearmOrResetMode ==
                    recordedOwner, phase, discardListing, ctrlVOpen, openReads,
                    listingMimes, readKind, pwState, term, wire, leaked,
                    pastesStarted, activePaste, settledCount, imgCompPaste,
-                   postDenialPaste, attachedPaste, failedPaste, lastSettlement,
-                   textOwner, lastAttachOwner, keys, ctrlVs, suspends>>
+                   pngTextCompPaste, postDenialPaste, attachedPaste,
+                   failedPaste, lastSettlement, textOwner, lastAttachOwner,
+                   keys, ctrlVs, suspends>>
 
 -----------------------------------------------------------------------------
 (* Terminal packet transmission (keys may interleave between any packets). *)
@@ -304,8 +314,9 @@ TerminalSendPacket ==
                    pasteOwner, recordedOwner, phase, discardListing, ctrlVOpen,
                    openReads, listingMimes, readKind, pwState, leaked,
                    pastesStarted, activePaste, settledCount, imgCompPaste,
-                   postDenialPaste, attachedPaste, failedPaste, lastSettlement,
-                   textOwner, lastAttachOwner, keys, ctrlVs, suspends, rearms>>
+                   pngTextCompPaste, postDenialPaste, attachedPaste,
+                   failedPaste, lastSettlement, textOwner, lastAttachOwner,
+                   keys, ctrlVs, suspends, rearms>>
 
 TerminalPrepareReply ==
     /\ lifecycle = "running"
@@ -337,8 +348,9 @@ TerminalPrepareReply ==
                    pasteOwner, recordedOwner, phase, discardListing, ctrlVOpen,
                    openReads, listingMimes, readKind, wire, leaked,
                    pastesStarted, activePaste, settledCount, imgCompPaste,
-                   postDenialPaste, attachedPaste, lastSettlement,
-                   textOwner, lastAttachOwner, keys, ctrlVs, suspends, rearms>>
+                   pngTextCompPaste, postDenialPaste, attachedPaste,
+                   lastSettlement, textOwner, lastAttachOwner, keys, ctrlVs,
+                   suspends, rearms>>
 
 -----------------------------------------------------------------------------
 (* fx reads tokens from the input stream.                                  *)
@@ -365,9 +377,9 @@ Read ==
                 /\ UNCHANGED <<mode5522, pasteEventsDenied, pasteOwner,
                                recordedOwner, phase, discardListing, openReads,
                                listingMimes, readKind, activePaste,
-                               settledCount, imgCompPaste, attachedPaste,
-                               failedPaste, lastSettlement, textOwner,
-                               lastAttachOwner>>
+                               settledCount, imgCompPaste, pngTextCompPaste,
+                               attachedPaste, failedPaste, lastSettlement,
+                               textOwner, lastAttachOwner>>
             [] tok[1] = "bracketed_paste" ->
                 LET p == tok[2] IN
                 /\ recordedOwner' = [recordedOwner EXCEPT ![p] = activeOwner]
@@ -375,7 +387,7 @@ Read ==
                 /\ UNCHANGED <<mode5522, pasteEventsDenied, activeOwner,
                                pasteOwner, phase, discardListing, openReads,
                                listingMimes, readKind, activePaste,
-                               imgCompPaste, failedPaste>>
+                               imgCompPaste, pngTextCompPaste, failedPaste>>
             [] tok[1] = "list_ok" ->
                 LET p == tok[2]
                     m == tok[3]
@@ -384,7 +396,8 @@ Read ==
                        THEN UNCHANGED <<pasteOwner, recordedOwner, phase,
                                       discardListing, openReads, listingMimes,
                                       readKind, activePaste, settledCount,
-                                      imgCompPaste, attachedPaste, failedPaste,
+                                      imgCompPaste, pngTextCompPaste,
+                                      attachedPaste, failedPaste,
                                       lastSettlement, textOwner, lastAttachOwner>>
                        ELSE IF (ctrlVOpen \/ phase # "idle")
                                /\ Mutation # "listing_while_busy_accepted"
@@ -394,7 +407,8 @@ Read ==
                             /\ Settle(p, "notice", "none")
                             /\ UNCHANGED <<pasteOwner, recordedOwner, phase,
                                            openReads, listingMimes, readKind,
-                                           activePaste, imgCompPaste>>
+                                           activePaste, imgCompPaste,
+                                           pngTextCompPaste>>
                        ELSE
                             /\ phase' = "listing"
                             /\ activePaste' = p
@@ -403,23 +417,24 @@ Read ==
                             /\ UNCHANGED <<pasteOwner, recordedOwner,
                                            discardListing, readKind,
                                            settledCount, imgCompPaste,
-                                           attachedPaste, failedPaste,
-                                           lastSettlement, textOwner,
-                                           lastAttachOwner>>)
+                                           pngTextCompPaste, attachedPaste,
+                                           failedPaste, lastSettlement,
+                                           textOwner, lastAttachOwner>>)
             [] tok[1] = "list_data" ->
                 UNCHANGED <<mode5522, pasteEventsDenied, activeOwner, pasteOwner,
                                recordedOwner, phase, discardListing, openReads,
                                listingMimes, readKind, activePaste,
-                               settledCount, imgCompPaste, attachedPaste,
-                               failedPaste, lastSettlement, textOwner,
-                               lastAttachOwner>>
+                               settledCount, imgCompPaste, pngTextCompPaste,
+                               attachedPaste, failedPaste, lastSettlement,
+                               textOwner, lastAttachOwner>>
             [] tok[1] = "list_done" ->
                 /\ UNCHANGED <<mode5522, pasteEventsDenied, activeOwner>>
                 /\ (IF discardListing
                     THEN /\ discardListing' = FALSE
                          /\ UNCHANGED <<pasteOwner, recordedOwner, phase, openReads,
                                         listingMimes, readKind, activePaste,
-                                        settledCount, imgCompPaste, attachedPaste,
+                                        settledCount, imgCompPaste,
+                                        pngTextCompPaste, attachedPaste,
                                         failedPaste, lastSettlement, textOwner,
                                         lastAttachOwner>>
                     ELSE IF phase = "listing"
@@ -427,12 +442,16 @@ Read ==
                              canAttach == (owner = "composer")
                                           \/ (Mutation = "paste_attach_in_modal"
                                               /\ owner = "modal")
+                             hasText == listingMimes \in {"png_text", "text"}
+                             pickImage == ~hasText /\ listingMimes = "png_only" /\ canAttach
                          IN /\ recordedOwner' = [recordedOwner EXCEPT ![activePaste] = owner]
                             /\ IF owner # "composer"
                                THEN imgCompPaste' = [imgCompPaste EXCEPT ![activePaste] = FALSE]
                                ELSE UNCHANGED imgCompPaste
-                            /\ IF owner = "decision"
-                                  \/ listingMimes \in {"empty", "unknown"}
+                            /\ IF owner = "composer" /\ listingMimes = "png_text"
+                               THEN pngTextCompPaste' = [pngTextCompPaste EXCEPT ![activePaste] = TRUE]
+                               ELSE UNCHANGED pngTextCompPaste
+                            /\ IF owner = "decision" \/ (~hasText /\ ~pickImage)
                                THEN /\ phase' = "idle"
                                     /\ pasteOwner' = "none"
                                     /\ listingMimes' = "none"
@@ -441,8 +460,7 @@ Read ==
                                     /\ Settle(activePaste, "notice", owner)
                                     /\ activePaste' = 0
                                     /\ UNCHANGED <<discardListing, failedPaste>>
-                               ELSE LET chosen == IF canAttach /\ listingMimes = "png_text"
-                                                  THEN "image" ELSE "text"
+                               ELSE LET chosen == IF pickImage THEN "image" ELSE "text"
                                     IN /\ phase' = "await_reply"
                                        /\ readKind' = chosen
                                        /\ listingMimes' = "none"
@@ -455,9 +473,9 @@ Read ==
                                                       lastAttachOwner>>
                     ELSE UNCHANGED <<pasteOwner, recordedOwner, phase, discardListing,
                                    openReads, listingMimes, readKind, activePaste,
-                                   settledCount, imgCompPaste, attachedPaste,
-                                   failedPaste, lastSettlement, textOwner,
-                                   lastAttachOwner>>)
+                                   settledCount, imgCompPaste, pngTextCompPaste,
+                                   attachedPaste, failedPaste, lastSettlement,
+                                   textOwner, lastAttachOwner>>)
             [] tok[1] = "reply_ok" ->
                 /\ IF phase = "await_reply"
                    THEN phase' = "receiving"
@@ -465,16 +483,16 @@ Read ==
                 /\ UNCHANGED <<mode5522, pasteEventsDenied, activeOwner,
                                pasteOwner, recordedOwner, discardListing,
                                openReads, listingMimes, readKind, activePaste,
-                               settledCount, imgCompPaste, attachedPaste,
-                               failedPaste, lastSettlement, textOwner,
-                               lastAttachOwner>>
+                               settledCount, imgCompPaste, pngTextCompPaste,
+                               attachedPaste, failedPaste, lastSettlement,
+                               textOwner, lastAttachOwner>>
             [] tok[1] = "reply_data" ->
                 UNCHANGED <<mode5522, pasteEventsDenied, activeOwner, pasteOwner,
                                recordedOwner, phase, discardListing, openReads,
                                listingMimes, readKind, activePaste,
-                               settledCount, imgCompPaste, attachedPaste,
-                               failedPaste, lastSettlement, textOwner,
-                               lastAttachOwner>>
+                               settledCount, imgCompPaste, pngTextCompPaste,
+                               attachedPaste, failedPaste, lastSettlement,
+                               textOwner, lastAttachOwner>>
             [] tok[1] = "reply_done" ->
                 /\ UNCHANGED <<mode5522, pasteEventsDenied, activeOwner>>
                 /\ (IF phase = "receiving"
@@ -488,12 +506,13 @@ Read ==
                             /\ Settle(activePaste, kind, dest)
                             /\ activePaste' = 0
                             /\ UNCHANGED <<recordedOwner, discardListing,
-                                           listingMimes, imgCompPaste, failedPaste>>
+                                           listingMimes, imgCompPaste,
+                                           pngTextCompPaste, failedPaste>>
                     ELSE UNCHANGED <<pasteOwner, recordedOwner, phase, discardListing,
                                    openReads, listingMimes, readKind, activePaste,
-                                   settledCount, imgCompPaste, attachedPaste,
-                                   failedPaste, lastSettlement, textOwner,
-                                   lastAttachOwner>>)
+                                   settledCount, imgCompPaste, pngTextCompPaste,
+                                   attachedPaste, failedPaste, lastSettlement,
+                                   textOwner, lastAttachOwner>>)
             [] tok[1] = "reply_eperm" ->
                 /\ UNCHANGED activeOwner
                 /\ (IF phase \in {"await_reply", "receiving"}
@@ -507,13 +526,13 @@ Read ==
                          /\ Settle(activePaste, "notice", "none")
                          /\ activePaste' = 0
                          /\ UNCHANGED <<recordedOwner, discardListing, listingMimes,
-                                        imgCompPaste>>
+                                        imgCompPaste, pngTextCompPaste>>
                     ELSE UNCHANGED <<mode5522, pasteEventsDenied, pasteOwner,
                                    recordedOwner, phase, discardListing,
                                    openReads, listingMimes, readKind, activePaste,
-                                   settledCount, imgCompPaste, attachedPaste,
-                                   failedPaste, lastSettlement, textOwner,
-                                   lastAttachOwner>>)
+                                   settledCount, imgCompPaste, pngTextCompPaste,
+                                   attachedPaste, failedPaste, lastSettlement,
+                                   textOwner, lastAttachOwner>>)
     /\ UNCHANGED <<lifecycle, ctrlVOpen, pwState, term, leaked, pastesStarted,
                    postDenialPaste, keys, ctrlVs, suspends, rearms>>
 
@@ -533,7 +552,8 @@ ReplyTimeout ==
     /\ UNCHANGED <<mode5522, pasteEventsDenied, lifecycle, activeOwner,
                    recordedOwner, discardListing, ctrlVOpen, listingMimes,
                    pwState, term, wire, leaked, pastesStarted, imgCompPaste,
-                   postDenialPaste, keys, ctrlVs, suspends, rearms>>
+                   pngTextCompPaste, postDenialPaste, keys, ctrlVs, suspends,
+                   rearms>>
 
 -----------------------------------------------------------------------------
 
@@ -579,10 +599,16 @@ EveryPasteEventSettles ==
     (\E p \in 1..pastesStarted : settledCount[p] = 0 /\ lifecycle = "running") ~>
         ((\A p \in 1..pastesStarted : settledCount[p] = 1) \/ lifecycle = "exited")
 
-PasteWithImageAttaches ==
+ImageOnlyPasteAttaches ==
     \A p \in 1..MaxPastes :
         (imgCompPaste[p] /\ ~failedPaste[p] /\ lifecycle = "running") ~>
             (attachedPaste[p] \/ failedPaste[p] \/ ~imgCompPaste[p] \/ lifecycle = "exited")
+
+PngTextPasteIsText ==
+    \A p \in 1..MaxPastes :
+        pngTextCompPaste[p] =>
+            /\ ~attachedPaste[p]
+            /\ (settledCount[p] = 1 /\ ~failedPaste[p]) => (textOwner[p] = "composer")
 
 PostDenialPasteIsText ==
     \A p \in 1..MaxPastes :

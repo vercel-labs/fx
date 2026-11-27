@@ -1,10 +1,10 @@
 stateDiagram-v2
     [*] --> IdleWithPasteModeOn: fx starts outside tmux and turns on paste events
-    [*] --> ImageDroppedToday: Today's code never turns on paste events [breaks PasteWithImageAttaches]
+    [*] --> ImageDroppedToday: Today's code never turns on paste events [breaks ImageOnlyPasteAttaches]
 
     IdleWithPasteModeOn --> ReadingMimeList: You paste (terminal sends OK with password)
-    ReadingMimeList --> WaitingForReply: Listing finishes (records owner); fx requests image (composer) or text (composer or modal)
-    ReadingMimeList --> IdleWithPasteModeOn: Decision prompt or empty/unknown list (no read; notice or drop)
+    ReadingMimeList --> WaitingForReply: Listing finishes (records owner); fx requests text if listed, else image (composer only)
+    ReadingMimeList --> IdleWithPasteModeOn: Decision prompt, empty/unknown list, or image-only outside composer (no read; notice or drop)
 
     WaitingForReply --> ReceivingPayload: Terminal starts reply with OK
     WaitingForReply --> IdleWithPasteModeOn: Reply times out (notice)
