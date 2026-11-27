@@ -5829,6 +5829,7 @@ test {
     _ = @import("builtins/gateway.zig");
     _ = @import("builtins/gateway/typesafe_permission_reviewer.zig");
     _ = @import("builtins/hooks.zig");
+    _ = @import("core/shared/child_wait.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/output/full_transcript_metadata.zig");

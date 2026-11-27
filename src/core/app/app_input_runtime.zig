@@ -10208,6 +10208,17 @@ test "app_input_runtime decision prompt owns and discards bracketed paste" {
 
 test "app_input_runtime rejects same-epoch paste suffix without submitting it" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "same-epoch-paste-suffix.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "keep");
@@ -10223,6 +10234,12 @@ test "app_input_runtime rejects same-epoch paste suffix without submitting it" {
     try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
     try std.testing.expectEqual(@as(usize, 2), app.notice_write_count);
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
+
+    debug_trace.shutdown();
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "paste suffix dropped owner=composer bytes=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "reason=same_delivery_as_end_marker") != null);
 
     try feedRoutingBytes(&app, "\r");
     try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
@@ -10445,6 +10462,7 @@ test "app_input_runtime empty composer paste checks the clipboard for an image" 
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
     try std.testing.expectEqual(notices_before + 1, app.notice_write_count);
+    try std.testing.expectEqualStrings("no image found on clipboard", app.notice_body.items);
     debug_trace.shutdown();
 
     const trace = try readTraceFileForTest(alloc, trace_path);

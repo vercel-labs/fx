@@ -373,17 +373,18 @@ pub fn PasteEditRuntime(comptime App: type) type {
             return app.model_cache.menu.active;
         }
 
-        pub fn finalizePastedBlock(app: *App, agent: *AppAgent, max_input_len: usize) !void {
-            if (app.input_runtime.paste.buffer.items.len == 0) {
-                // xterm.js terminals send an empty paste for Cmd+V when the clipboard holds only an image.
-                if (modelPickerBorrowsComposer(app)) {
-                    debug_trace.logf("input", "composer paste empty action=none reason=model_picker_borrows_composer", .{});
-                    return;
-                }
-                debug_trace.logf("input", "composer paste empty action=clipboard_image", .{});
-                try image_commands.Commands(App).attachClipboard(app);
+        /// xterm.js terminals send an empty paste for Cmd+V when the clipboard holds only an image.
+        fn checkClipboardOnEmptyPaste(app: *App) !void {
+            if (modelPickerBorrowsComposer(app)) {
+                debug_trace.logf("input", "composer paste empty action=none reason=model_picker_borrows_composer", .{});
                 return;
             }
+            debug_trace.logf("input", "composer paste empty action=clipboard_image", .{});
+            try image_commands.Commands(App).attachClipboard(app);
+        }
+
+        pub fn finalizePastedBlock(app: *App, agent: *AppAgent, max_input_len: usize) !void {
+            if (app.input_runtime.paste.buffer.items.len == 0) return checkClipboardOnEmptyPaste(app);
 
             // Inline image paths create pending attachments, not pasted-text blocks.
             if (image_attachments.hasImagePathToken(app.input_runtime.paste.buffer.items)) {
