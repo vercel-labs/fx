@@ -2139,6 +2139,21 @@ fn writeShellSnapshotNotice(ctx: *AskContext) void {
     ctx.writeStderr("\n") catch return;
 }
 
+/// Writes a shell run's notice lines to stderr, each once, when the call ends. Raw and
+/// quiet output show them; `--json` output is unchanged, and a terminal shows them in the row.
+fn writeShellRunNotice(ctx: *AskContext, memory: types.ToolResultMemory) void {
+    if (ctx.output_mode != .raw and ctx.output_mode != .quiet) return;
+    const notice = memory.notice orelse return;
+    var lines = std.mem.splitScalar(u8, notice, '\n');
+    while (lines.next()) |line| {
+        // A line that cannot be written leaves nothing else to report, so the rest is dropped.
+        const safe_line = ctx.alloc.print("{f}", .{text_utils.terminalSafe(line)}) catch return;
+        defer ctx.alloc.free(safe_line);
+        ctx.writeStderr(safe_line) catch return;
+        ctx.writeStderr("\n") catch return;
+    }
+}
+
 fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     writeShellSnapshotNotice(ctx);
     const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
@@ -3444,6 +3459,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             // Report a fallback right after the command it affected; a later
             // recapture in the same run would otherwise clear it unseen.
             writeShellSnapshotNotice(ctx);
+            if (value.result_memory) |memory| writeShellRunNotice(ctx, memory);
         },
     }
 }

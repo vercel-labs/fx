@@ -1971,6 +1971,11 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
     else
         null;
     errdefer if (result) |value| alloc.free(value);
+    const notice = if (source.notice) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (notice) |value| alloc.free(value);
     const result_handle = if (source.result_handle) |value|
         try alloc.dupe(u8, value)
     else
@@ -2010,6 +2015,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .command_display = command_display,
         .command_action_label = command_action_label,
         .result = result,
+        .notice = notice,
         .result_handle = result_handle,
         .command_artifact_handle = command_artifact_handle,
         .command_output_replay = command_output_replay,

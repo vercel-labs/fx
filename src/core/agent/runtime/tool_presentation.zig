@@ -17,6 +17,7 @@ const result_store = @import("../../session/result_store.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
+const tool_result_notice = @import("../../tooling/shell_result_notice.zig");
 const tool_result_display = @import("../../tooling/tool_result_display.zig");
 const read_result_presentation = @import("../../tooling/read_tool_result_presentation.zig");
 const command_result_mapping = if (@import("builtin").is_test)
@@ -1526,6 +1527,7 @@ pub fn finishExecutedToolStatus(
     if (shell_command) {
         presentation_memory.output_handle = null;
         presentation_memory.preview = presentation_result;
+        presentation_memory.notice = try tool_result_notice.visibleNotice(arena, result.model_output);
     }
     const command_artifact_handle = if (activity_kind == .command and
         !shell_command)

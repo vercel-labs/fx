@@ -4865,6 +4865,7 @@ const PendingToolDetailStart = struct {
 
 const PendingToolDetailTerminal = struct {
     result: ?[]u8 = null,
+    notice: ?[]u8 = null,
     result_handle: ?[]u8 = null,
     command_artifact_handle: ?[]u8 = null,
     command_output_replay: ?types.CommandOutputReplay = null,
@@ -4875,6 +4876,7 @@ const PendingToolDetailTerminal = struct {
 
     fn deinit(self: *PendingToolDetailTerminal, alloc: Allocator) void {
         if (self.result) |value| alloc.free(value);
+        if (self.notice) |value| alloc.free(value);
         if (self.result_handle) |value| alloc.free(value);
         if (self.command_artifact_handle) |value| alloc.free(value);
         if (self.command_output_replay) |replay| {
@@ -7344,6 +7346,9 @@ pub const TranscriptRuntime = struct {
         var pending: PendingToolDetailTerminal = .{};
         errdefer pending.deinit(alloc);
         if (result) |value| pending.result = try alloc.dupe(u8, value);
+        if (result_memory) |memory| {
+            if (memory.notice) |text| pending.notice = try alloc.dupe(u8, text);
+        }
         const result_handle = if (result_memory) |memory| memory.output_handle else null;
         if (result_handle) |handle| pending.result_handle = try alloc.dupe(u8, handle);
         if (command_artifact_handle) |handle| {
@@ -7397,6 +7402,11 @@ pub const TranscriptRuntime = struct {
             if (detail.result) |old| alloc.free(old);
             detail.result = owned;
             pending.result = null;
+        }
+        if (pending.notice) |owned| {
+            if (detail.notice) |old| alloc.free(old);
+            detail.notice = owned;
+            pending.notice = null;
         }
         if (pending.result_handle) |owned| {
             if (detail.result_handle) |old| alloc.free(old);

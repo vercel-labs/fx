@@ -5860,6 +5860,7 @@ test {
     _ = @import("core/hosts/browser_capabilities.zig");
     _ = @import("core/tooling/tool_args.zig");
     _ = @import("core/tooling/tool_result_errors.zig");
+    _ = @import("core/tooling/shell_result_notice.zig");
     _ = @import("core/tooling/tool_runtime.zig");
     _ = @import("core/tooling/tool_specs.zig");
     _ = @import("core/tooling/toolbox.zig");

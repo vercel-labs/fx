@@ -1445,6 +1445,9 @@ pub const ToolResultMemory = struct {
     tool_image_handle: ?[]const u8 = null,
     output_handle: ?[]const u8 = null,
     preview: ?[]const u8 = null,
+    /// The notice lines of a shell run's result, joined by newlines, without the shell snapshot
+    /// warning (`shell_result_notice.visibleNotice`). The person sees them; the model sees the result.
+    notice: ?[]const u8 = null,
     output_bytes: usize = 0,
     stored_output_bytes: usize = 0,
     truncated: bool = false,

@@ -3367,3 +3367,51 @@ describe("a placed run's result through the host: the runner's lines pass throug
     });
   }, TIMEOUT * 2);
 });
+
+describe("the notice of a shell run reaches the person in the TUI and in plain fx ask (D7)", () => {
+  const UNAME_RULE = { command: "uname -s*", runner: "local" };
+  const UNAME_LINE = "fx: ran on local because of your rule for uname -s*";
+
+  test.skipIf(!HAS_TMUX)("the TUI draws the reason line under the uname row, once, and nothing runs in the sandbox", async () => {
+    await withSandboxFixture(
+      shellCall({ command: "uname -s", runner: "remote" }),
+      async (fixture) => {
+        const session = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: fixture.workspace,
+          width: 200,
+          env: { ...gatewayEnv(fixture.home, fixture.gateway), ...fixture.setup.env, FX_PERMISSION_MODE: "full-access" },
+        });
+        sessions.push(session);
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("Run it.");
+        await session.waitForText(UNAME_LINE, TIMEOUT);
+        const lines = (await session.captureFullScrollback()).split("\n");
+        const at = lines.findIndex((line) => line.includes(UNAME_LINE));
+        expect(at).toBeGreaterThan(0);
+        expect(lines.filter((line) => line.includes(UNAME_LINE))).toHaveLength(1);
+        expect(lines[at]).toContain(`├ ${UNAME_LINE}`);
+        expect(lines[at - 1]).toContain("uname -s");
+        expect(execEvents(fixture)).toEqual([]);
+      },
+      () => ({ rules: [UNAME_RULE] }),
+    );
+  }, TIMEOUT * 2);
+
+  test("plain fx ask writes the reason line to stderr once, and nothing runs in the sandbox", async () => {
+    await withSandboxFixture(
+      shellCall({ command: "uname -s", runner: "remote" }),
+      async (fixture) => {
+        const result = await runFx(["ask", "--permission-mode", "full-access", "Run it."], {
+          cwd: fixture.workspace,
+          timeoutMs: TIMEOUT,
+          env: { ...gatewayEnv(fixture.home, fixture.gateway), ...fixture.setup.env },
+        });
+        expect(result.code).toBe(0);
+        expect(result.stderr.split("\n").filter((line) => line === UNAME_LINE)).toHaveLength(1);
+        expect(execEvents(fixture)).toEqual([]);
+      },
+      () => ({ rules: [UNAME_RULE] }),
+    );
+  }, TIMEOUT * 2);
+});

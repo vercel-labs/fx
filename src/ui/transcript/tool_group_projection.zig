@@ -1079,6 +1079,41 @@ test "a reason cut at its byte cap ends with an ellipsis" {
     try std.testing.expectEqualStrings("● Exited 1 sh check.sh · " ++ want_reason ++ "…", firstLineForTest(text));
 }
 
+test "a shell row draws the notice of its result under it, once" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Ran uname -s\n", .class = .tool_status } }};
+    var details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"uname -s\"}", 0, "{\"output_delta\":\"Darwin\\n\",\"exit_code\":0}")};
+    details[0].command_display = @constCast("uname -s");
+    details[0].notice = @constCast("fx: ran on local because of your rule for uname -s*");
+    const painted = try paintedGroupForTest(alloc, &entries, &details, 120);
+    defer alloc.free(painted);
+    const text = try visibleLinesForTest(alloc, painted, 120);
+    defer alloc.free(text);
+    const line = "├ fx: ran on local because of your rule for uname -s*";
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, line));
+    try std.testing.expect(std.mem.find(u8, text, "  " ++ line) != null);
+}
+
+test "a command row keeps the notice of a call that a later call joined" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran uname -s\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran echo hi\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{
+        storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"uname -s\"}", 0, "{\"output_delta\":\"Darwin\\n\",\"exit_code\":0}"),
+        storyCommandDetail(2, "{\"action\":\"run\",\"command\":\"echo hi\"}", 0, "{\"output_delta\":\"hi\\n\",\"exit_code\":0}"),
+    };
+    details[0].command_display = @constCast("uname -s");
+    details[0].notice = @constCast("fx: ran on local because of your rule for uname -s*");
+    details[1].command_display = @constCast("echo hi");
+    const painted = try paintedGroupForTest(alloc, &entries, &details, 120);
+    defer alloc.free(painted);
+    const text = try visibleLinesForTest(alloc, painted, 120);
+    defer alloc.free(text);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "├ fx: ran on local because of your rule for uname -s*"));
+}
+
 test "a failed command's reason leaves out escapes with intermediate bytes and OSC links" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2241,6 +2276,9 @@ const StoryRow = struct {
     search_paths: std.ArrayList([]const u8) = .empty,
     /// The calls of a `.commands` row, in order.
     combined: std.ArrayList(*const ToolDetailRecord) = .empty,
+    /// The notice lines of the row's calls, in call order, each once. They stay under the row when a
+    /// later call takes over its status, such as a poll of a background run (`addCallNotices`).
+    notices: std.ArrayList([]const u8) = .empty,
     /// The files a `.read` row read, or the patterns a `.search` row looked
     /// for, each once, in the order of their first call.
     names: std.ArrayList([]const u8) = .empty,
@@ -4222,6 +4260,14 @@ fn shellCallNeverRan(scratch: std.mem.Allocator, record: *const ToolDetailRecord
     return correction != null;
 }
 
+/// Adds a call's notice lines to its row, once for the call, in the call's order
+/// (`ToolDetailRecord.notice`).
+fn addCallNotices(scratch: std.mem.Allocator, row: *StoryRow, detail: ?*const ToolDetailRecord) !void {
+    const notice = (detail orelse return).notice orelse return;
+    var lines = std.mem.splitScalar(u8, notice, '\n');
+    while (lines.next()) |line| try row.notices.append(scratch, line);
+}
+
 /// Why a shell call never ran, as core's status says it, such as
 /// "2 invalid fields". Null when its result names no wrong field.
 fn neverRanReason(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
@@ -4898,6 +4944,7 @@ fn collectStoryRows(
                     }
                     try last.combined.append(scratch, detail.?);
                     last.count += 1;
+                    try addCallNotices(scratch, last, detail);
                     last.entry = entry;
                     last.entry_id = entry_id;
                     last.detail = detail;
@@ -4910,6 +4957,7 @@ fn collectStoryRows(
             break :new &rows.items[rows.items.len - 1];
         };
         target.count += 1;
+        try addCallNotices(scratch, target, detail);
         if (storyRowCallFailed(scratch, detail)) target.failures += 1;
         if (rechecksEndedCommand(scratch, target.detail, detail)) continue :calls;
         target.entry = entry;
@@ -6242,6 +6290,11 @@ fn writeRowDetails(
     if (subagentStatusContinuation(row.entry, row.detail)) |continuation| {
         const clipped_continuation = try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ indent, continuation }), cols);
         try writeChildLine(alloc, writer, lines, row.entry_id, style.text_style, clipped_continuation, childLineClose(style));
+    }
+    for (row.notices.items) |notice| {
+        const safe_notice = try terminalSafeText(scratch, notice);
+        const clipped_notice = try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ indent, "├ ", safe_notice }), cols);
+        try writeChildLine(alloc, writer, lines, row.entry_id, style.text_style, clipped_notice, childLineClose(style));
     }
 }
 

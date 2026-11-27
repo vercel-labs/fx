@@ -64,6 +64,9 @@ pub const ToolDetailRecord = struct {
     command_display: ?[]u8 = null,
     command_action_label: ?[]u8 = null,
     result: ?[]u8 = null,
+    /// The notice lines of a shell run's result, joined by newlines, as the person sees them
+    /// (`ToolResultMemory.notice`). Only the call's own end sets it.
+    notice: ?[]u8 = null,
     result_handle: ?[]u8 = null,
     command_artifact_handle: ?[]u8 = null,
     command_output_replay: ?types.CommandOutputReplay = null,
@@ -115,6 +118,7 @@ pub const ToolDetailRecord = struct {
         if (self.command_display) |value| alloc.free(value);
         if (self.command_action_label) |value| alloc.free(value);
         if (self.result) |value| alloc.free(value);
+        if (self.notice) |value| alloc.free(value);
         if (self.result_handle) |value| alloc.free(value);
         if (self.command_artifact_handle) |value| alloc.free(value);
         if (self.command_output_replay) |replay| {

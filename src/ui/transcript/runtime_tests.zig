@@ -16354,6 +16354,19 @@ test "recorded tool finality stays independent of a live turn with the same numb
     try std.testing.expectEqual(@as(?usize, null), runtime.notebook.transcript_release.finality_floor(finished.finality, runtime.finalizedToolTurnWatermark(), null));
 }
 
+test "a snapshot copy of a shell result keeps the notice the person sees" {
+    const alloc = std.testing.allocator;
+    var copy = try transcript_store.cloneToolDetailForSnapshot(alloc, .{
+        .entry_id = 4,
+        .tool_name = @constCast("shell"),
+        .activity_kind = .command,
+        .arguments_json = @constCast("{}"),
+        .notice = @constCast("fx: ran on local because of your rule for uname -s*"),
+    });
+    defer copy.deinit(alloc);
+    try std.testing.expectEqualStrings("fx: ran on local because of your rule for uname -s*", copy.notice.?);
+}
+
 test "recorded tool finality survives an owned snapshot after source retirement" {
     const alloc = std.testing.allocator;
     var restored = TranscriptRuntime{ .layout = transcriptTestLayout(88, 24, 20) };
