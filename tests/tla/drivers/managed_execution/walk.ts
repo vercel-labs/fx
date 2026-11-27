@@ -1,13 +1,13 @@
 // Walks fx's quiet notice (src/core/execution/quiet_notice.zig) along its
 // model, tests/tla/managed_execution/QuietWait.tla.
 //
-// TLC writes the model's state graph. Three of its variables (`under`,
-// `outDuring`, `spellCrosses`) and the last result are history the code does not
-// keep. Edges that look the same to the code, the same action from the same
-// visible state to the same visible state, are walked once: the driver walks to
-// each such edge along a shortest path, so every transition the code can tell
-// apart is checked at least once, and then follows seeded random paths. Each
-// model step becomes operations for lab.zig, which runs the real module at
+// TLC writes the model's state graph. Four of its variables (`under`,
+// `outDuring`, `spellCrosses`, `heldLate`) and the last result are history the
+// code does not keep. Edges that look the same to the code, the same action from
+// the same visible state to the same visible state, are walked once: the driver
+// walks to each such edge along a shortest path, so every transition the code
+// can tell apart is checked at least once, and then follows seeded random paths.
+// Each model step becomes operations for lab.zig, which runs the real module at
 // the times the driver's clock gives. After every step the lab's state, and
 // the end, crossing, arm, and notice of every wait that ends, must match the
 // model.
@@ -33,6 +33,7 @@ type Result = {
   running: boolean;
   waiting: boolean;
   armed: boolean;
+  held: boolean;
   quiet_ms: number;
   end: string | null;
   crossed: boolean | null;
@@ -140,7 +141,7 @@ async function loadGraph(out: string): Promise<Graph> {
 
 // What the code can see of a model state: everything but the ghosts and the
 // last result.
-const codeView = (s: Model) => JSON.stringify([s.cmd, s.quiet, s.waiting, s.ceil, s.waitAge, s.armed, s.polled]);
+const codeView = (s: Model) => JSON.stringify([s.cmd, s.quiet, s.waiting, s.ceil, s.waitAge, s.armed, s.polled, s.held, s.steerDue]);
 
 // The operations one model step becomes, at the driver's clock `now` after
 // the step's time has passed.
@@ -148,6 +149,8 @@ function opsFor(label: string, t: Model, now: number): Op[] {
   switch (label) {
     case "Output": return [{ op: "output", now }];
     case "Finish": return [{ op: "finish", now }];
+    case "Hold": return [{ op: "hold", now }];
+    case "Release": return [{ op: "release", now }];
     case "Begin": return [{ op: "begin", now, ceiling: t.ceil * TickMs }];
     case "Poll": return [{ op: "poll", now }];
     case "Steer": return [{ op: "steer", now }];
@@ -275,6 +278,7 @@ function check(walks: Walk[], graph: Graph, results: Result[], tamper: boolean):
       if (step.label === "Init") return;
       expect("running", t.cmd === "running", real.running);
       expect("waiting", t.waiting, real.waiting);
+      expect("held", t.held, real.held);
       expect("quiet ticks", t.quiet, Math.min(Math.floor(real.quiet_ms / TickMs), QSat));
       if (t.waiting) expect("armed", t.armed, real.armed);
       if (step.label !== "Poll" && step.label !== "Steer") return;

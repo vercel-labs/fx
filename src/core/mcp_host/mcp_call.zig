@@ -26,6 +26,9 @@ pub const protocol_version: u32 = 1;
 /// The requests a state can hold at once.
 pub const max_slots = 16;
 
+/// How long a request may wait for a shell call to follow its command.
+pub const follow_wait_ms: u32 = 120_000;
+
 /// Requests held at once, abandoned ones included, unless the shell asks for
 /// fewer.
 pub const default_capacity: u8 = 8;
@@ -73,7 +76,7 @@ pub const Outcome = enum { ok, tool_error, failed };
 pub const ReplyOutcome = enum { ok, tool_error, failed, denied };
 
 /// Why a request was not admitted, in the order the checks run.
-pub const Refusal = enum { closed, unauthorized, unsupported_version, busy };
+pub const Refusal = enum { closed, unauthorized, unsupported_version, not_followed, busy };
 
 /// User data, or an answer about it, that the core discards.
 pub const Drop = enum {
@@ -88,6 +91,7 @@ pub const Drop = enum {
 pub const Owner = struct {
     id: OwnerId,
     token: Token,
+    followed: bool = false,
 };
 
 pub const Entry = struct {
@@ -119,6 +123,10 @@ pub const Event = union(enum) {
     stopped,
     /// A subagent started and got its own token.
     owner_added: struct { owner: OwnerId, token: Token },
+    /// A shell call now follows this owner and lends its permission check.
+    owner_followed: OwnerId,
+    /// A shell call stopped following this owner; with `cancel`, its work is let go.
+    owner_unfollowed: struct { owner: OwnerId, cancel: bool },
     /// A subagent ended.
     owner_removed: OwnerId,
     /// A client sent one complete request line.
@@ -176,6 +184,8 @@ pub fn step(state: State, event: Event) Output {
         .started => |token| onStarted(state, token),
         .stopped => onStopped(state),
         .owner_added => |added| onOwnerAdded(state, added.owner, added.token),
+        .owner_followed => |owner| onOwnerFollowed(state, owner),
+        .owner_unfollowed => |unfollowed| onOwnerUnfollowed(state, unfollowed.owner, unfollowed.cancel),
         .owner_removed => |owner| onOwnerRemoved(state, owner),
         .request => |request| onRequest(state, request.token, request.version),
         .authorized => |answer| onAuthorized(state, answer.id, answer.decision),
@@ -236,11 +246,39 @@ fn onOwnerRemoved(state: State, owner: OwnerId) Output {
     return out;
 }
 
+fn onOwnerFollowed(state: State, owner: OwnerId) Output {
+    if (owner == .main) return quiet(state);
+    const index = ownerSlot(state, owner) orelse return quiet(state);
+    var next = state;
+    next.owners[index].?.followed = true;
+    return quiet(next);
+}
+
+fn onOwnerUnfollowed(state: State, owner: OwnerId, cancel: bool) Output {
+    if (owner == .main) return quiet(state);
+    const index = ownerSlot(state, owner) orelse return quiet(state);
+    var out: Output = .{ .state = state };
+    out.state.owners[index].?.followed = false;
+    if (cancel) abandonWhere(&out, owner);
+    return out;
+}
+
+fn isFollowed(state: State, owner: OwnerId) bool {
+    if (owner == .main) return true;
+    const index = ownerSlot(state, owner) orelse return false;
+    return state.owners[index].?.followed;
+}
+
+pub fn followWaitOver(waited_ms: i64, limit_ms: u32) bool {
+    return waited_ms >= @as(i64, limit_ms);
+}
+
 /// The first check a request fails, if any.
 fn refusal(state: State, owner: ?OwnerId, version: u32) ?Refusal {
     if (!state.open) return .closed;
     if (owner == null) return .unauthorized;
     if (version != protocol_version) return .unsupported_version;
+    if (!isFollowed(state, owner.?)) return .not_followed;
     if (held(state) >= state.capacity) return .busy;
     return null;
 }
@@ -510,6 +548,7 @@ test "a subagent's requests act for it, and its end lets them go" {
     const two = run(State.init(2), &.{
         .{ .started = main_token },
         .{ .owner_added = .{ .owner = child, .token = child_token } },
+        .{ .owner_followed = child },
         .{ .request = .{ .token = child_token, .version = 1 } },
         .{ .request = .{ .token = child_token, .version = 1 } },
     });
@@ -578,7 +617,7 @@ test "abstract lists registrations by owner and entries by id" {
 /// Seeded random events over a small id range, with the answers the model's
 /// environment can give: late, duplicated, and for requests never admitted.
 fn randomEvent(random: std.Random) Event {
-    const pick = random.uintLessThan(u8, 10);
+    const pick = random.uintLessThan(u8, 12);
     const any_id = rid(random.uintLessThan(u64, 6));
     const tokens = [_]Token{ main_token, child_token, forged_token };
     return switch (pick) {
@@ -589,6 +628,8 @@ fn randomEvent(random: std.Random) Event {
         5 => .{ .authorized = .{ .id = any_id, .decision = if (random.boolean()) .allow else .deny } },
         6 => .{ .call_finished = .{ .id = any_id, .outcome = random.enumValue(Outcome) } },
         7 => .{ .reply_done = .{ .id = any_id, .delivery = if (random.boolean()) .delivered else .lost } },
+        8 => .{ .owner_followed = child },
+        9 => .{ .owner_unfollowed = .{ .owner = child, .cancel = random.boolean() } },
         else => .{ .client_gone = any_id },
     };
 }
@@ -625,4 +666,103 @@ test "seeded random event sequences keep the bounds and run at most one call per
             }
         }
     }
+}
+
+test "an unfollowed owner's request is refused not_followed and is admitted after owner_followed" {
+    const added = run(State.init(2), &.{
+        .{ .started = main_token },
+        .{ .owner_added = .{ .owner = child, .token = child_token } },
+    });
+    const refused = step(added, .{ .request = .{ .token = child_token, .version = 1 } });
+    try testing.expectEqual(Effect{ .refuse = .not_followed }, single(refused));
+    try testing.expectEqual(@as(u64, 0), refused.state.next);
+    try testing.expectEqual(@as(usize, 0), held(refused.state));
+
+    try testing.expectEqual(@as(usize, 0), step(refused.state, .{ .owner_followed = .main }).len);
+    try testing.expectEqual(@as(usize, 0), step(refused.state, .{ .owner_followed = @fromBackingInt(99) }).len);
+    try testing.expectEqual(@as(usize, 0), step(refused.state, .{ .owner_unfollowed = .{ .owner = .main, .cancel = true } }).len);
+    try testing.expectEqual(@as(usize, 0), step(refused.state, .{ .owner_unfollowed = .{ .owner = @fromBackingInt(99), .cancel = true } }).len);
+
+    const followed = step(refused.state, .{ .owner_followed = child });
+    try testing.expectEqual(@as(usize, 0), followed.len);
+    const admitted = step(followed.state, .{ .request = .{ .token = child_token, .version = 1 } });
+    try testing.expectEqual(Effect{ .authorize = .{ .id = rid(0), .owner = child } }, single(admitted));
+}
+
+test "the refusal order checks version before not_followed and not_followed before busy" {
+    const full = run(State.init(2), &.{
+        .{ .started = main_token },
+        .{ .owner_added = .{ .owner = child, .token = child_token } },
+        .{ .request = .{ .token = main_token, .version = 1 } },
+        .{ .request = .{ .token = main_token, .version = 1 } },
+    });
+    try testing.expectEqual(Effect{ .refuse = .unsupported_version }, single(step(full, .{ .request = .{ .token = child_token, .version = 2 } })));
+    try testing.expectEqual(Effect{ .refuse = .not_followed }, single(step(full, .{ .request = .{ .token = child_token, .version = 1 } })));
+    const followed = step(full, .{ .owner_followed = child });
+    try testing.expectEqual(Effect{ .refuse = .busy }, single(step(followed.state, .{ .request = .{ .token = child_token, .version = 1 } })));
+}
+
+test "owner_unfollowed without cancel keeps running work and the token" {
+    const calling = run(State.init(2), &.{
+        .{ .started = main_token },
+        .{ .owner_added = .{ .owner = child, .token = child_token } },
+        .{ .owner_followed = child },
+        .{ .request = .{ .token = child_token, .version = 1 } },
+        .{ .request = .{ .token = child_token, .version = 1 } },
+        .{ .authorized = .{ .id = rid(0), .decision = .allow } },
+    });
+    const unfollowed = step(calling, .{ .owner_unfollowed = .{ .owner = child, .cancel = false } });
+    try testing.expectEqual(@as(usize, 0), unfollowed.len);
+    try testing.expectEqual(Stage.calling, unfollowed.state.slots[0].?.stage);
+    try testing.expectEqual(Stage.authorizing, unfollowed.state.slots[1].?.stage);
+    try testing.expectEqual(Effect{ .refuse = .not_followed }, single(step(unfollowed.state, .{ .request = .{ .token = child_token, .version = 1 } })));
+    try testing.expectEqual(Effect{ .reply = .{ .id = rid(0), .outcome = .ok } }, single(step(unfollowed.state, .{ .call_finished = .{ .id = rid(0), .outcome = .ok } })));
+    try testing.expectEqual(Effect{ .call = .{ .id = rid(1), .owner = child } }, single(step(unfollowed.state, .{ .authorized = .{ .id = rid(1), .decision = .allow } })));
+}
+
+test "owner_unfollowed with cancel lets work go and keeps the token" {
+    const active = run(State.init(2), &.{
+        .{ .started = main_token },
+        .{ .owner_added = .{ .owner = child, .token = child_token } },
+        .{ .owner_followed = child },
+        .{ .request = .{ .token = child_token, .version = 1 } },
+        .{ .request = .{ .token = child_token, .version = 1 } },
+        .{ .authorized = .{ .id = rid(0), .decision = .allow } },
+    });
+    const cancelled = step(active, .{ .owner_unfollowed = .{ .owner = child, .cancel = true } });
+    try testing.expectEqual(@as(usize, 2), cancelled.len);
+    try testing.expectEqual(Effect{ .cancel = rid(0) }, cancelled.buffer[0]);
+    try testing.expectEqual(Effect{ .withdraw = rid(1) }, cancelled.buffer[1]);
+    try testing.expectEqual(Stage.abandoned_call, cancelled.state.slots[0].?.stage);
+    try testing.expectEqual(Stage.abandoned_auth, cancelled.state.slots[1].?.stage);
+    try testing.expectEqual(Effect{ .refuse = .not_followed }, single(step(cancelled.state, .{ .request = .{ .token = child_token, .version = 1 } })));
+    const drained = run(cancelled.state, &.{
+        .{ .call_finished = .{ .id = rid(0), .outcome = .failed } },
+        .{ .authorized = .{ .id = rid(1), .decision = .deny } },
+        .{ .owner_followed = child },
+    });
+    try testing.expectEqual(Effect{ .authorize = .{ .id = rid(2), .owner = child } }, single(step(drained, .{ .request = .{ .token = child_token, .version = 1 } })));
+}
+
+test "owner_removed still ends a followed owner" {
+    const calling = run(State.init(2), &.{
+        .{ .started = main_token },
+        .{ .owner_added = .{ .owner = child, .token = child_token } },
+        .{ .owner_followed = child },
+        .{ .request = .{ .token = child_token, .version = 1 } },
+        .{ .authorized = .{ .id = rid(0), .decision = .allow } },
+    });
+    const ended = step(calling, .{ .owner_removed = child });
+    try testing.expectEqual(Effect{ .cancel = rid(0) }, single(ended));
+    try testing.expect(ownerSlot(ended.state, child) == null);
+    try testing.expectEqual(Effect{ .refuse = .unauthorized }, single(step(ended.state, .{ .request = .{ .token = child_token, .version = 1 } })));
+}
+
+test "followWaitOver reports true at and past the limit and false below it" {
+    try testing.expect(!followWaitOver(-1, follow_wait_ms));
+    try testing.expect(!followWaitOver(0, follow_wait_ms));
+    try testing.expect(!followWaitOver(follow_wait_ms - 1, follow_wait_ms));
+    try testing.expect(followWaitOver(follow_wait_ms, follow_wait_ms));
+    try testing.expect(followWaitOver(follow_wait_ms + 1, follow_wait_ms));
+    try testing.expect(followWaitOver(0, 0));
 }

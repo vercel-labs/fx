@@ -5302,6 +5302,29 @@ describe("fx mcp call", () => {
       ? readWire(root.wireLogPath).filter((entry) => entry.message.method === "tools/call")
       : [];
 
+  // The trace line a call writes once it waits at the bridge for a shell call
+  // to follow its command. A build without that wait never writes it.
+  const WAITING_CALL_TRACE = "waits for a shell call to follow its command";
+  const traceLogFor = (root: FixtureRoot) => join(root.root, "mcp-call-trace.log");
+  const withCallTrace = (root: FixtureRoot, activeGateway: ReturnType<typeof startFakeGateway>) => ({
+    ...fixtureEnv(root, activeGateway),
+    FX_TRACE_LOG: traceLogFor(root),
+    FX_TRACE_SCOPES: "mcp-call",
+  });
+  const fileText = (path: string) => (existsSync(path) ? readFileSync(path, "utf8") : "");
+  // Polls a file for `text`, for at most `timeoutMs`. Returns whether it came.
+  const waitForFileText = async (path: string, text: string, timeoutMs: number) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!fileText(path).includes(text) && Date.now() < deadline) await Bun.sleep(50);
+    return fileText(path).includes(text);
+  };
+  // Polls a file until it has text, for at most `timeoutMs`. Returns "" if none came.
+  const waitForFileValue = async (path: string, timeoutMs: number) => {
+    const deadline = Date.now() + timeoutMs;
+    while (fileText(path).trim() === "" && Date.now() < deadline) await Bun.sleep(50);
+    return fileText(path).trim();
+  };
+
   test("a command saves a big MCP result to a file, and only what it prints reaches the model", async () => {
     const root = bridgeRoot("bridge-file");
     let seen = "";
@@ -5660,6 +5683,106 @@ describe("fx mcp call", () => {
     expect(toolCalls(root)).toHaveLength(0);
   }, 90_000);
 
+  test("a subagent's command keeps its own fx mcp call after its run call returns", async () => {
+    const root = bridgeRoot("bridge-subagent-outlives");
+    const call = `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hello"}'`;
+    // The file go is written only after the subagent's run call has returned.
+    const childCommand = `${call} > first.json; while [ ! -f go ]; do sleep 0.1; done; ${call} > second.json 2> second.err; echo "second_exit=$?"`;
+    let runResult: Record<string, unknown> = {};
+    let interactOutput = "";
+    const activeGateway = startDynamicFakeGateway(async (body) => {
+      // The parent's turn after the subagent's receipt.
+      if (body.includes('"toolCallId":"create_bridge_child"')) return fakeGatewayFinalText("BRIDGE_PARENT_DONE");
+      if (body.includes('"toolCallId":"child_interact"')) {
+        interactOutput = shellOutput(toolResultText(body, "child_interact"));
+        return fakeGatewayFinalText("BRIDGE_CHILD_DONE");
+      }
+      if (body.includes('"toolCallId":"child_run"')) {
+        runResult = JSON.parse(toolResultText(body, "child_run"));
+        writeFileSync(join(root.workspace, "go"), "");
+        await waitForFileText(traceLogFor(root), WAITING_CALL_TRACE, 10_000);
+        return fakeGatewayToolCall("child_interact", "shell", {
+          action: "interact",
+          session_id: runResult.session_id,
+          yield_time_ms: 30_000,
+        });
+      }
+      if (body.includes("BRIDGE_CHILD_TASK")) {
+        return fakeGatewayToolCall("child_run", "shell", { action: "run", command: childCommand, yield_time_ms: 1000 });
+      }
+      if (body.includes("BRIDGE_PARENT_TASK")) {
+        return fakeGatewayToolCall("create_bridge_child", "subagent", {
+          request: { action: "message", agent: "bridge", message: "BRIDGE_CHILD_TASK" },
+        });
+      }
+      return fakeGatewayFinalText("unexpected bridge subagent request");
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = activeGateway;
+    const result = await runFx(["ask", "--json", "--full-access", "BRIDGE_PARENT_TASK"], {
+      cwd: root.workspace,
+      env: withCallTrace(root, activeGateway),
+      timeoutMs: 60_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_PARENT_DONE");
+    expect(interactOutput).toContain("second_exit=0");
+    expect(readFileSync(join(root.workspace, "second.json"), "utf8").trimEnd().endsWith("BRIDGE_TAIL:hello")).toBe(true);
+  }, 90_000);
+
+  test("a parent's interact on a subagent's command does not lend the parent's access to its calls", async () => {
+    const root = bridgeRoot("bridge-parent-steal-subagent");
+    mkdirSync(join(root.home, ".fx", "agents", "limited"), { recursive: true });
+    writeFileSync(
+      join(root.home, ".fx", "agents", "limited", "profile.json"),
+      JSON.stringify({ description: "No MCP access", mcp_servers: [] }),
+    );
+    const childCommand = `while [ ! -f go ]; do sleep 0.1; done; "${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"escalated"}' > out.json 2> err.txt; echo $? > call.code`;
+    let childSessionId = "";
+    const activeGateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes('"toolCallId":"parent_interact"')) return fakeGatewayFinalText("BRIDGE_PARENT_DONE");
+      if (body.includes("Subagent report")) {
+        writeFileSync(join(root.workspace, "go"), "");
+        await waitForFileText(traceLogFor(root), WAITING_CALL_TRACE, 10_000);
+        return fakeGatewayToolCall("parent_interact", "shell", {
+          action: "interact",
+          session_id: childSessionId,
+          yield_time_ms: 10_000,
+        });
+      }
+      if (body.includes('"toolCallId":"create_bridge_child"')) return fakeGatewayFinalText("BRIDGE_PARENT_WAIT");
+      if (body.includes('"toolCallId":"child_run"')) {
+        childSessionId = String(JSON.parse(toolResultText(body, "child_run")).session_id);
+        return fakeGatewayFinalText("BRIDGE_CHILD_DONE");
+      }
+      if (body.includes("BRIDGE_CHILD_TASK")) {
+        return fakeGatewayToolCall("child_run", "shell", { action: "run", command: childCommand, yield_time_ms: 1000 });
+      }
+      if (body.includes("BRIDGE_PARENT_TASK")) {
+        return fakeGatewayToolCall("create_bridge_child", "subagent", {
+          request: { action: "message", agent: "limited", message: "BRIDGE_CHILD_TASK" },
+        });
+      }
+      return fakeGatewayFinalText("unexpected bridge subagent request");
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = activeGateway;
+    const result = await runFx(["ask", "--json", "--full-access", "BRIDGE_PARENT_TASK"], {
+      cwd: root.workspace,
+      env: { ...withCallTrace(root, activeGateway), FX_TEST_MCP_CALL_FOLLOW_WAIT_MS: "1500" },
+      timeoutMs: 60_000,
+    });
+    const callCode = await waitForFileValue(join(root.workspace, "call.code"), 10_000);
+    expect(result.code).toBe(0);
+    expect(toolCalls(root)).toHaveLength(0);
+    expect(callCode).toBe("3");
+    expect(fileText(join(root.workspace, "err.txt"))).toContain("interact");
+  }, 90_000);
+
   // What the command printed, from the shell tool's result.
   const shellOutput = (result: string): string => JSON.parse(result).output_delta;
 
@@ -5687,19 +5810,22 @@ describe("fx mcp call", () => {
     expect(toolCalls(root).map((entry) => entry.message.params?.arguments?.text)).toEqual(["0", "1", "2"]);
   }, 90_000);
 
-  test("a command still running after its run call returns is told its fx mcp calls stop, and a later call says why", async () => {
+  test("a command keeps fx mcp call after its run call returns, and a later interact runs its call", async () => {
     const root = bridgeRoot("bridge-run-returned");
     const call = `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hello"}'`;
     // The command waits for the file go, which the test creates only after
     // the run call has returned, so the second call runs after that return.
     const command = `${call} > first.json; while [ ! -f go ]; do sleep 0.1; done; ${call} > second.json 2> second.err; echo "second_exit=$?"`;
     let runResult: Record<string, unknown> = {};
+    let callsBeforeInteract = -1;
     let interactOutput = "";
-    gateway = startFakeGateway([
+    const activeGateway = startFakeGateway([
       fakeGatewayToolCall("run_call", "shell", { action: "run", command, yield_time_ms: 1000 }),
-      (body: string) => {
+      async (body: string) => {
         runResult = JSON.parse(toolResultText(body, "run_call"));
         writeFileSync(join(root.workspace, "go"), "");
+        await waitForFileText(traceLogFor(root), WAITING_CALL_TRACE, 10_000);
+        callsBeforeInteract = toolCalls(root).length;
         return fakeGatewayToolCall("interact_call", "shell", {
           action: "interact",
           session_id: runResult.session_id,
@@ -5713,20 +5839,178 @@ describe("fx mcp call", () => {
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
+    gateway = activeGateway;
     const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Run the command."], {
       cwd: root.workspace,
-      env: fixtureEnv(root, gateway),
+      env: withCallTrace(root, activeGateway),
       timeoutMs: 60_000,
     });
     expect(typeof runResult.mcp_call_notice).toBe("string");
-    expect(String(runResult.mcp_call_notice)).toContain("exit 3");
-    expect(interactOutput).toContain("second_exit=3");
+    expect(String(runResult.mcp_call_notice)).toContain("interact");
+    expect(String(runResult.mcp_call_notice)).not.toContain("exit 3");
+    // The second call has not reached the server before the interact.
+    expect(callsBeforeInteract).toBe(1);
+    expect(interactOutput).toContain("second_exit=0");
+    expect(readFileSync(join(root.workspace, "second.json"), "utf8").trimEnd().endsWith("BRIDGE_TAIL:hello")).toBe(true);
+    expect(toolCalls(root)).toHaveLength(2);
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout).output).toContain("DONE");
     // The first call ran while the run call was still running.
     expect(readFileSync(join(root.workspace, "first.json"), "utf8").length).toBeGreaterThan(0);
-    expect(readFileSync(join(root.workspace, "second.err"), "utf8")).toContain("has returned");
   }, 90_000);
+
+  test("a call that waits 2 minutes with no shell call to follow its command exits 3 and says to use interact", async () => {
+    const root = bridgeRoot("bridge-follow-timeout");
+    // The command makes its call only after the file go, which the test writes
+    // once the run call has returned. Then it writes the call's exit code.
+    const command = `while [ ! -f go ]; do sleep 0.1; done; "${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hello"}' > out.txt 2> err.txt; echo $? > code.txt`;
+    let codeFile = "";
+    const activeGateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command, yield_time_ms: 1000 }),
+      async () => {
+        // The model does not interact. It lets the command's call run, waits for its exit code, then ends its turn.
+        writeFileSync(join(root.workspace, "go"), "");
+        codeFile = await waitForFileValue(join(root.workspace, "code.txt"), 15_000);
+        return fakeGatewayFinalText("WAITED");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = activeGateway;
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Run the command."], {
+      cwd: root.workspace,
+      env: { ...fixtureEnv(root, activeGateway), FX_TEST_MCP_CALL_FOLLOW_WAIT_MS: "1500" },
+      timeoutMs: 40_000,
+    });
+    expect(codeFile).toBe("3");
+    expect(fileText(join(root.workspace, "err.txt"))).toContain("interact");
+    expect(toolCalls(root)).toHaveLength(0);
+    expect(result.code).toBe(0);
+  }, 60_000);
+
+  test("a call from a command's background child after the command ended never runs, and exits 3", async () => {
+    const root = bridgeRoot("bridge-background-late");
+    // A second command keeps the bridge open for the whole test so the late
+    // call actually reaches the bridge and meets `owner_removed` rather than a
+    // closed socket.
+    const keepCommand = `while [ ! -f done_keep ]; do sleep 0.1; done`;
+    // The child detaches with setsid, as a daemon does, since the command's
+    // natural end stops the children left in its session (command_runner.zig,
+    // "natural command completion keeps a daemon that detached after setsid").
+    // The command waits for the child's ready file, written after setsid, so
+    // the child has left the session before the command ends. The child waits
+    // for the file go, which the test writes only after the command has ended.
+    const childScript = `: > child.ready; while [ ! -f go ]; do sleep 0.1; done; "${FX_BIN}" mcp call ${TOOL_NAME} "{\\"text\\":\\"late\\"}" > late.json 2> late.err; echo $? > late.code`;
+    const command = `perl -MPOSIX -e 'setsid; exec @ARGV' /bin/sh -c '${childScript}' > child.log 2>&1 & i=0; while [ ! -f child.ready ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; echo started`;
+    let runResult: Record<string, unknown> = {};
+    let lateCode = "";
+    const activeGateway = startFakeGateway([
+      fakeGatewayToolCall("keep_call", "shell", { action: "run", command: keepCommand, yield_time_ms: 0 }),
+      () => fakeGatewayToolCall("run_call", "shell", { action: "run", command, yield_time_ms: 30_000 }),
+      async (body: string) => {
+        runResult = JSON.parse(toolResultText(body, "run_call"));
+        writeFileSync(join(root.workspace, "go"), "");
+        lateCode = await waitForFileValue(join(root.workspace, "late.code"), 15_000);
+        writeFileSync(join(root.workspace, "done_keep"), "");
+        return fakeGatewayFinalText("LATE_DONE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = activeGateway;
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Run the command."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, activeGateway),
+      timeoutMs: 40_000,
+    });
+    expect(runResult.state).toBe("completed");
+    expect(lateCode).toBe("3");
+    const lateErr = fileText(join(root.workspace, "late.err"));
+    expect(lateErr).toContain("has ended");
+    expect(lateErr).not.toContain("2 minutes");
+    expect(toolCalls(root)).toHaveLength(0);
+    expect(result.code).toBe(0);
+  }, 60_000);
+
+  test("fx exits while a command's call waits for a shell call to follow it, and the call never runs", async () => {
+    const root = bridgeRoot("bridge-waiting-at-exit");
+    const traceLog = traceLogFor(root);
+    const activeGateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command: `sleep 1; ${command}`, yield_time_ms: 0 }),
+      async () => {
+        // The turn ends once the command's call has started to wait.
+        await waitForFileText(traceLog, WAITING_CALL_TRACE, 10_000);
+        return fakeGatewayFinalText("BRIDGE_LEFT_WAITING");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = activeGateway;
+    const started = Date.now();
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Save the list to a file."], {
+      cwd: root.workspace,
+      env: withCallTrace(root, activeGateway),
+      timeoutMs: 40_000,
+    });
+    expect(result.code).toBe(0);
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_LEFT_WAITING");
+    // stderr holds only the progress lines of `fx ask`.
+    expect(result.stderr).not.toMatch(/panic|leaked/i);
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 60_000);
+
+  test("a waiting call whose own client was killed never runs, even after interact follows", async () => {
+    const root = bridgeRoot("bridge-client-killed");
+    // The command starts the call in the background only after the file start,
+    // which the test writes once the run call has returned. It records the
+    // call's pid, then waits for the file go, which is written only after
+    // interact returns while the command still runs.
+    const command = `while [ ! -f start ]; do sleep 0.1; done; "${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hello"}' > waited.json 2> waited.err & echo $! > client.pid; while [ ! -f go ]; do sleep 0.1; done; echo "command_done"`;
+    let runResult: Record<string, unknown> = {};
+    let interactResult: Record<string, unknown> = {};
+    let killError = "";
+    const activeGateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command, yield_time_ms: 1000 }),
+      async (body: string) => {
+        runResult = JSON.parse(toolResultText(body, "run_call"));
+        writeFileSync(join(root.workspace, "start"), "");
+        await waitForFileText(traceLogFor(root), WAITING_CALL_TRACE, 10_000);
+        const clientPid = Number(await waitForFileValue(join(root.workspace, "client.pid"), 5_000));
+        try {
+          // Only the call's own pid: a pid below 1 would signal a whole process group.
+          if (!Number.isInteger(clientPid) || clientPid < 1) throw new Error(`no client pid (got "${clientPid}")`);
+          process.kill(clientPid, "SIGKILL");
+        } catch (error) {
+          killError = String(error);
+        }
+        return fakeGatewayToolCall("interact_call", "shell", {
+          action: "interact",
+          session_id: runResult.session_id,
+          yield_time_ms: 500,
+        });
+      },
+      (body: string) => {
+        interactResult = JSON.parse(toolResultText(body, "interact_call"));
+        writeFileSync(join(root.workspace, "go"), "");
+        return fakeGatewayFinalText("KILLED_CLIENT_DONE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = activeGateway;
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Run the command."], {
+      cwd: root.workspace,
+      env: withCallTrace(root, activeGateway),
+      timeoutMs: 40_000,
+    });
+    expect(toolCalls(root)).toHaveLength(0);
+    expect(result.code).toBe(0);
+    // The test killed a live client: the call was waiting, not already gone.
+    expect(killError).toBe("");
+    expect(interactResult.state).toBe("running");
+    expect(interactResult.mcp_call_notice).toBeUndefined();
+  }, 60_000);
 
   test("a structured result that is only one result string saves as that text", async () => {
     const root = bridgeRoot("bridge-wrapped", {}, { mode: "wrapped_text" });
@@ -6030,6 +6314,277 @@ describe("fx mcp call", () => {
     },
     90_000,
   );
+
+  // How many tools/call requests the server has seen, once `count` of them
+  // came or `timeoutMs` passed.
+  const waitForToolCalls = async (root: FixtureRoot, count: number, timeoutMs: number) => {
+    const deadline = Date.now() + timeoutMs;
+    while (toolCalls(root).length < count && Date.now() < deadline) await Bun.sleep(50);
+    return toolCalls(root).length;
+  };
+
+  // A command waits for the file go, then makes one call. Its run returns at
+  // once. The test writes go after that, and answers with an interact, which
+  // runs the call under the interact's permission checks. `answer` is the key
+  // pressed at the call's prompt. Whether the prompt came is returned, so the
+  // test asserts it after the exit code.
+  const interactRunsWaitingCall = async (label: string, answer: "1" | "3", finalText: string) => {
+    const root = bridgeRoot(label, {}, { expectedElicitation: "both" });
+    const stderrPath = join(root.root, "stderr.log");
+    const command = `while [ ! -f go ]; do sleep 0.1; done; "${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hello"}' > out.txt 2> err.txt; echo "call_exit=$?"`;
+    let interactOutput = "";
+    const activeGateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command, yield_time_ms: 1000 }),
+      async (body: string) => {
+        const runResult = JSON.parse(toolResultText(body, "run_call"));
+        writeFileSync(join(root.workspace, "go"), "");
+        await waitForFileText(traceLogFor(root), WAITING_CALL_TRACE, 10_000);
+        return fakeGatewayToolCall("interact_call", "shell", {
+          action: "interact",
+          session_id: runResult.session_id,
+          yield_time_ms: 30_000,
+        });
+      },
+      (body: string) => {
+        interactOutput = shellOutput(toolResultText(body, "interact_call"));
+        return fakeGatewayFinalText(finalText);
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = activeGateway;
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 140,
+      height: 40,
+      stderrPath,
+      env: { ...withCallTrace(root, activeGateway), FX_PERMISSION_MODE: "ask" },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Run the command.");
+    await tui.waitForText("Would you like to run the following command?", 20_000);
+    await tui.sendKeys("1");
+    // The interact that runs the call asks for its own approval first, in ask
+    // mode. Then the call asks. Without either prompt, the turn ends on its
+    // final text.
+    const shellPrompt = "  shell interact";
+    const mcpPrompt = "Allow this MCP tool call?";
+    const first = await tui.waitForPane(
+      (screen) => screen.includes(shellPrompt) || screen.includes(mcpPrompt) || (screen.includes(finalText) && turnSettled(screen)),
+      40_000,
+    );
+    if (first.includes(shellPrompt)) await tui.sendKeys("1");
+    const pane = await tui.waitForPane(
+      (screen) => screen.includes(mcpPrompt) || (screen.includes(finalText) && turnSettled(screen)),
+      40_000,
+    );
+    const asked = pane.includes(mcpPrompt);
+    if (asked) await tui.sendKeys(answer);
+    await tui.waitForPane((screen) => screen.includes(finalText) && turnSettled(screen), 30_000);
+    return { root, asked, interactOutput, stderrPath };
+  };
+
+  test.skipIf(!tmuxAvailable())(
+    "in the TUI, steering while a command makes its calls does not stop them, and a later interact runs the rest",
+    async () => {
+      const root = bridgeRoot("bridge-tui-steer-calls", {}, { expectedElicitation: "both" });
+      const stderrPath = join(root.root, "stderr.log");
+      const call = `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hello"}'`;
+      // Call 1 runs at once. Calls 2 to 4 wait for the file go, which the test
+      // writes after the run returns for steering. The run's yield is long, so
+      // only the steering message can end its wait.
+      const command = [
+        `${call} > first.json`,
+        `while [ ! -f go ]; do sleep 0.1; done`,
+        `${call} > second.json; a=$?`,
+        `${call} > third.json; b=$?`,
+        `${call} > fourth.json; c=$?`,
+        `echo "exits=$a $b $c"`,
+      ].join("\n");
+      let interactOutput = "";
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command, yield_time_ms: 60_000 }),
+        async (body: string) => {
+          const runResult = JSON.parse(toolResultText(body, "run_call"));
+          writeFileSync(join(root.workspace, "go"), "");
+          await waitForFileText(traceLogFor(root), WAITING_CALL_TRACE, 10_000);
+          return fakeGatewayToolCall("interact_call", "shell", {
+            action: "interact",
+            session_id: runResult.session_id,
+            yield_time_ms: 30_000,
+          });
+        },
+        (body: string) => {
+          interactOutput = shellOutput(toolResultText(body, "interact_call"));
+          return fakeGatewayFinalText("STEER_CALLS_DONE");
+        },
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: { ...withCallTrace(root, activeGateway), FX_PERMISSION_MODE: "full-access" },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Run the command.");
+      expect(await waitForToolCalls(root, 1, 30_000)).toBe(1);
+      await tui.sendText("Steer: keep going.");
+      await tui.waitForPane((pane) => pane.includes("STEER_CALLS_DONE") && turnSettled(pane), 60_000);
+      expect(interactOutput).toContain("exits=0 0 0");
+      expect(toolCalls(root)).toHaveLength(4);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    120_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "in the TUI, a waiting call asks for approval during the interact that runs it, and runs only when approved",
+    async () => {
+      const run = await interactRunsWaitingCall("bridge-tui-approve-waiting", "1", "WAITING_APPROVED_DONE");
+      expect(run.interactOutput).toContain("call_exit=0");
+      expect(toolCalls(run.root)).toHaveLength(1);
+      expect(run.asked).toBe(true);
+      expect(readFileSync(run.stderrPath, "utf8")).toBe("");
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "in the TUI, a waiting call that the user denies during the interact exits 5 and never runs",
+    async () => {
+      const run = await interactRunsWaitingCall("bridge-tui-deny-waiting", "3", "WAITING_DENIED_DONE");
+      expect(run.interactOutput).toContain("call_exit=5");
+      expect(toolCalls(run.root)).toHaveLength(0);
+      expect(run.asked).toBe(true);
+      expect(readFileSync(run.stderrPath, "utf8")).toBe("");
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "in the TUI, Esc during the interact that runs a command's call cancels that call, and the command goes on",
+    async () => {
+      const root = bridgeRoot("bridge-tui-esc-waiting", {}, {
+        mode: "stall_operation",
+        operationTimeoutMs: 30_000,
+        expectedElicitation: "both",
+      });
+      const stderrPath = join(root.root, "stderr.log");
+      const afterCancelPath = join(root.workspace, "after_cancel.txt");
+      // The call never answers, so it runs until it is cancelled. The command
+      // then writes its exit code, and goes on.
+      const command = `while [ ! -f go ]; do sleep 0.1; done; "${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hello"}' > out.txt 2> err.txt; code=$?; echo "after_cancel code=$code" > after_cancel.txt`;
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command, yield_time_ms: 1000 }),
+        async (body: string) => {
+          const runResult = JSON.parse(toolResultText(body, "run_call"));
+          writeFileSync(join(root.workspace, "go"), "");
+          await waitForFileText(traceLogFor(root), WAITING_CALL_TRACE, 10_000);
+          return fakeGatewayToolCall("interact_call", "shell", {
+            action: "interact",
+            session_id: runResult.session_id,
+            yield_time_ms: 30_000,
+          });
+        },
+        fakeGatewayFinalText("ESC_INTERACT_DONE"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: { ...withCallTrace(root, activeGateway), FX_PERMISSION_MODE: "full-access" },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Save the list to a file.");
+      const running = await tui.waitForPane(
+        (pane) => pane.includes(`Using ${TOOL_ROW}`) || pane.includes("ESC_INTERACT_DONE"),
+        60_000,
+      );
+      expect(running).toContain(`Using ${TOOL_ROW}`);
+      expect(toolCalls(root)).toHaveLength(1);
+      await tui.sendInterruptEscapePair(10_000);
+      await tui.waitForText(`Cancelled using ${TOOL_ROW}`, 10_000);
+      expect(await waitForFileText(afterCancelPath, "after_cancel", 20_000)).toBe(true);
+      expect(fileText(afterCancelPath)).toMatch(/after_cancel code=[1-9]\d*/);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "in the TUI, a call that an interact runs shows in that interact's group, live and after --resume",
+    async () => {
+      const root = bridgeRoot("bridge-tui-interact-group", {}, { expectedElicitation: "both" });
+      const stderrPath = join(root.root, "stderr.log");
+      const command = `while [ ! -f go ]; do sleep 0.1; done; "${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hello"}' > out.txt 2> err.txt; echo "call_exit=$?"`;
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command, yield_time_ms: 1000 }),
+        async (body: string) => {
+          const runResult = JSON.parse(toolResultText(body, "run_call"));
+          writeFileSync(join(root.workspace, "go"), "");
+          await waitForFileText(traceLogFor(root), WAITING_CALL_TRACE, 10_000);
+          return fakeGatewayToolCall("interact_call", "shell", {
+            action: "interact",
+            session_id: runResult.session_id,
+            yield_time_ms: 30_000,
+          });
+        },
+        fakeGatewayFinalText("INTERACT_GROUP_DONE"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      const env = { ...withCallTrace(root, activeGateway), FX_PERMISSION_MODE: "full-access" };
+      tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 140, height: 40, stderrPath, env });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Run the command.");
+      await tui.waitForPane((pane) => pane.includes("INTERACT_GROUP_DONE") && turnSettled(pane), 60_000);
+      await tui.waitForComposer(10_000);
+      const live = await tui.captureFullScrollback();
+      expect(live.split(`Used ${TOOL_ROW}`)).toHaveLength(2);
+      expect(toolCalls(root)).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+
+      const resumedStderrPath = join(root.root, "resumed-stderr.log");
+      tui = await TmuxSession.create({
+        cmd: `${JSON.stringify(FX_BIN)} --resume last`,
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath: resumedStderrPath,
+        env,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.waitForText("INTERACT_GROUP_DONE", 15_000);
+      const resumed = await tui.captureFullScrollback();
+      expect(resumed.split(`Used ${TOOL_ROW}`)).toHaveLength(2);
+      expect(activeGateway.requests).toHaveLength(3);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+    },
+    120_000,
+  );
+
 });
 
 // A deny rule names an MCP tool. In full access fx skips its permission

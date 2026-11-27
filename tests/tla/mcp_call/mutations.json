@@ -25,8 +25,8 @@
     {
       "id": "S4",
       "breaks": "Load is checked before the token, so a client without one learns the bridge is busy.",
-      "find": "[] t \\notin InUse -> \"unauthorized\"\n      [] v # 1 -> \"unsupported_version\"\n      [] Cardinality(entries) >= MaxInFlight -> \"busy\"",
-      "replace": "[] Cardinality(entries) >= MaxInFlight -> \"busy\"\n      [] t \\notin InUse -> \"unauthorized\"\n      [] v # 1 -> \"unsupported_version\"",
+      "find": "[] t \\notin InUse -> \"unauthorized\"\n      [] v # 1 -> \"unsupported_version\"\n      [] ~IsFollowed(TokenOwner(t)) -> \"not_followed\"\n      [] Cardinality(entries) >= MaxInFlight -> \"busy\"",
+      "replace": "[] Cardinality(entries) >= MaxInFlight -> \"busy\"\n      [] t \\notin InUse -> \"unauthorized\"\n      [] v # 1 -> \"unsupported_version\"\n      [] ~IsFollowed(TokenOwner(t)) -> \"not_followed\"",
       "expect": "RefusalsAreQuiet"
     },
     {
@@ -60,8 +60,8 @@
     {
       "id": "S9",
       "breaks": "A subagent's end leaves its prompts and calls running.",
-      "find": "/\\ AbandonAll({e \\in entries : e.owner = o})",
-      "replace": "/\\ AbandonAll({})",
+      "find": "/\\ registered' = {r \\in registered : r.owner # o}\n            /\\ followed' = followed \\ {o}\n            /\\ AbandonAll({e \\in entries : e.owner = o})",
+      "replace": "/\\ registered' = {r \\in registered : r.owner # o}\n            /\\ followed' = followed \\ {o}\n            /\\ AbandonAll({})",
       "expect": "LiveWorkHasOwner"
     },
     {
@@ -126,6 +126,34 @@
       "find": "[] Holds(i, {\"abandoned_auth\"}) ->\n              /\\ entries' = Remove(i)",
       "replace": "[] Holds(i, {\"abandoned_auth\"}) ->\n              /\\ entries' = entries",
       "expect": "Drained"
+    },
+    {
+      "id": "S19",
+      "breaks": "An unfollowed owner's request is admitted.",
+      "find": "[] ~IsFollowed(TokenOwner(t)) -> \"not_followed\"",
+      "replace": "[] FALSE -> \"not_followed\"",
+      "expect": "AdmitOnlyFollowed"
+    },
+    {
+      "id": "S20",
+      "breaks": "Unfollow removes the owner instead of keeping it.",
+      "find": "THEN /\\ registered' = registered\n            /\\ followed' = followed \\ {o}",
+      "replace": "THEN /\\ registered' = {r \\in registered : r.owner # o}\n            /\\ followed' = followed \\ {o}",
+      "expect": "UnfollowKeepsOwner"
+    },
+    {
+      "id": "S21",
+      "breaks": "Unfollow with cancel leaves the owner's work running.",
+      "find": "IF cancel\n               THEN AbandonAll({e \\in entries : e.owner = o})",
+      "replace": "IF cancel\n               THEN /\\ out' = {}\n                    /\\ UNCHANGED entries",
+      "expect": "CancelLetsGo"
+    },
+    {
+      "id": "S22-today-unregister-on-return",
+      "breaks": "Today's bug: returning from the shell call unregisters the owner and drops its access before the command ends.",
+      "find": "THEN /\\ registered' = registered\n            /\\ followed' = followed \\ {o}\n            /\\ IF cancel\n               THEN AbandonAll({e \\in entries : e.owner = o})\n               ELSE /\\ out' = {}\n                    /\\ UNCHANGED entries",
+      "replace": "THEN /\\ registered' = {r \\in registered : r.owner # o}\n            /\\ followed' = followed \\ {o}\n            /\\ AbandonAll({e \\in entries : e.owner = o})",
+      "expect": "UnfollowKeepsOwner"
     }
   ],
   "code": [
@@ -153,8 +181,8 @@
     {
       "id": "C4",
       "breaks": "Load is checked before the token, so a client without one learns the bridge is busy.",
-      "find": "    if (owner == null) return .unauthorized;\n    if (version != protocol_version) return .unsupported_version;\n    if (held(state) >= state.capacity) return .busy;\n",
-      "replace": "    if (held(state) >= state.capacity) return .busy;\n    if (owner == null) return .unauthorized;\n    if (version != protocol_version) return .unsupported_version;\n",
+      "find": "    if (owner == null) return .unauthorized;\n    if (version != protocol_version) return .unsupported_version;\n    if (!isFollowed(state, owner.?)) return .not_followed;\n    if (held(state) >= state.capacity) return .busy;\n",
+      "replace": "    if (held(state) >= state.capacity) return .busy;\n    if (owner == null) return .unauthorized;\n    if (version != protocol_version) return .unsupported_version;\n    if (!isFollowed(state, owner.?)) return .not_followed;\n",
       "expect": "RefusalsAreQuiet"
     },
     {
@@ -254,6 +282,27 @@
       "find": "    const id: RequestId = @fromBackingInt(state.next);\n",
       "replace": "    const id: RequestId = @fromBackingInt(state.next + 1);\n",
       "expect": "IdsBelowNext"
+    },
+    {
+      "id": "C19",
+      "breaks": "An unfollowed owner's request is admitted.",
+      "find": "    if (!isFollowed(state, owner.?)) return .not_followed;\n",
+      "replace": "",
+      "expect": "AdmitOnlyFollowed"
+    },
+    {
+      "id": "C20",
+      "breaks": "Unfollow removes the owner instead of keeping it.",
+      "find": "    out.state.owners[index].?.followed = false;\n    if (cancel) abandonWhere(&out, owner);\n",
+      "replace": "    out.state.owners[index] = null;\n    if (cancel) abandonWhere(&out, owner);\n",
+      "expect": "UnfollowKeepsOwner"
+    },
+    {
+      "id": "C21",
+      "breaks": "Unfollow with cancel leaves the owner's work running.",
+      "find": "    if (cancel) abandonWhere(&out, owner);\n",
+      "replace": "    _ = cancel;\n",
+      "expect": "CancelLetsGo"
     }
   ]
 }

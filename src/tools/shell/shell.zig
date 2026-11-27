@@ -742,11 +742,16 @@ fn callRun(
             .{@errorName(err)},
         ) };
     };
+    const timeout_ms = if (input.timeout_ms) |value|
+        std.math.cast(usize, value) orelse return unavailable(ctx)
+    else
+        ctx.command_timeout_ms;
     var execution_id_buffer: [64]u8 = undefined;
     const execution_id = runtime.generatedId(&execution_id_buffer) catch |err|
         return runtimeFailure(ctx, err);
-    // While this call runs, its command can reach the session's MCP tools
-    // with `fx mcp call`, as this agent (`mcp_call_bridge.zig`).
+    // While its command runs, it can reach the session's MCP tools with
+    // `fx mcp call`, as this agent (`mcp_call_bridge.zig`). This call serves
+    // those requests while it waits, and a later `interact` once it returns.
     const bridge_registration: ?*mcp_call_bridge.Registration = if (comptime mcp_call_bridge.supported) registration: {
         const capability = ctx.mcp_call_capability orelse break :registration null;
         break :registration mcp_call_bridge.register(capability) catch |err| {
@@ -754,7 +759,7 @@ fn callRun(
             break :registration null;
         };
     } else null;
-    defer if (comptime mcp_call_bridge.supported) if (bridge_registration) |registration| mcp_call_bridge.unregister(registration);
+    defer if (comptime mcp_call_bridge.supported) if (bridge_registration) |registration| mcp_call_bridge.unfollow(registration, isCancelled(ctx));
     var prepared = runtime.startCaptured(ctx.allocator, .{
         .execution_id = execution_id,
         .command = command,
@@ -763,11 +768,9 @@ fn callRun(
         .authority = authority,
         .extra_environment = if (bridge_registration) |registration| registration.environment() else &.{},
         .yield_hold = if (bridge_registration) |registration| &registration.hold else null,
+        .end_notice = if (comptime mcp_call_bridge.supported) (if (bridge_registration) |registration| bridgeEndNotice(registration) else null) else null,
         .max_output_bytes = ctx.max_command_output_bytes,
-        .timeout_ms = if (input.timeout_ms) |value|
-            std.math.cast(usize, value) orelse return unavailable(ctx)
-        else
-            ctx.command_timeout_ms,
+        .timeout_ms = timeout_ms,
         .command_artifact_dir = ctx.command_artifact_dir,
         .replay_capability = ctx.session_child_capability,
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
@@ -839,6 +842,17 @@ fn attachResultField(
     };
 }
 
+/// Tells the bridge when a command that can use `fx mcp call` ends, so its
+/// token ends with it rather than with the shell call that started it.
+fn bridgeEndNotice(registration: *const mcp_call_bridge.Registration) managed_execution.EndNotice {
+    return .{ .id = mcp_call_bridge.commandId(registration), .notify = mcp_call_bridge.commandEnded };
+}
+
+fn isCancelled(ctx: tool_dispatch.DispatchContext) bool {
+    const flag = ctx.cancel_flag orelse return false;
+    return flag.load(.seq_cst);
+}
+
 fn commandCalledBridge(registration: ?*mcp_call_bridge.Registration) bool {
     if (comptime !mcp_call_bridge.supported) return false;
     const live = registration orelse return false;
@@ -871,8 +885,7 @@ fn withJsonStringField(
 const steering_notice = "New steering arrived, so this call returned while the command keeps running. " ++
     "Read the steering first. The session stays yours: use interact with this session_id to follow it, or stop to end it.";
 
-const mcp_call_notice = "This command used fx mcp call, and this call returned while it still runs, so its later fx mcp call commands exit 3. If it still needs them, stop it. " ++
-    mcp_call_capability.short_checks_advice;
+const mcp_call_notice = "This command used fx mcp call and still runs. Its later fx mcp call commands wait until a shell call checks on it: call shell interact with this session_id within 2 minutes to let them run.";
 
 fn steerYieldRequested(ctx: tool_dispatch.DispatchContext) bool {
     const flag = ctx.tool_yield_flag orelse return false;
@@ -1455,15 +1468,29 @@ fn callInteract(
         return callTtyInteract(ctx, input, yield_time_ms);
     }
     if (chars.len != 0) return runtimeFailure(ctx, error.InvalidBackend);
+    // While this call waits, it serves the command's `fx mcp call` requests,
+    // which wait when no shell call follows the command.
+    const follower: ?*mcp_call_bridge.Registration = if (comptime mcp_call_bridge.supported) follow: {
+        const capability = ctx.mcp_call_capability orelse break :follow null;
+        const id = runtime.endNoticeId(session_id) orelse break :follow null;
+        break :follow mcp_call_bridge.follow(id, capability);
+    } else null;
+    defer if (comptime mcp_call_bridge.supported) if (follower) |registration| mcp_call_bridge.unfollow(registration, isCancelled(ctx));
     var prepared = runtime.waitOrYield(
         ctx.allocator,
         session_id,
         yield_time_ms,
         ctx.cancel_flag,
         ctx.tool_yield_flag,
+        if (follower) |registration| &registration.hold else null,
     ) catch |err| return runtimeFailure(ctx, err);
     defer prepared.deinit(ctx.allocator);
-    return finishPrepared(withoutSteeringYield(ctx, yield_time_ms), runtime, &prepared, .command);
+    const result = try finishPrepared(withoutSteeringYield(ctx, yield_time_ms), runtime, &prepared, .command);
+    if (!mcpCallNoticeDue(prepared.snapshot.state, commandCalledBridge(follower))) return result;
+    return attachResultField(ctx.allocator, result, "mcp_call_notice", mcp_call_notice) catch |err| {
+        result.deinit(ctx.allocator);
+        return err;
+    };
 }
 
 fn callStop(
@@ -3408,7 +3435,7 @@ test "a command returned for steering tells the model it still runs" {
     try std.testing.expect(steerYieldRequested(.{ .allocator = alloc, .tool_yield_flag = &flag }));
 }
 
-test "a run result tells the model a running command's fx mcp calls stop" {
+test "a run result tells the model a running command's fx mcp calls wait for interact" {
     const alloc = std.testing.allocator;
     const body = try alloc.dupe(u8, "{\"state\":\"running\",\"session_id\":\"shell-2\"}");
     const updated = try attachResultField(alloc, .{ .success = body }, "mcp_call_notice", mcp_call_notice);
@@ -3416,10 +3443,13 @@ test "a run result tells the model a running command's fx mcp calls stop" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, updated.success, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("shell-2", parsed.value.object.get("session_id").?.string);
-    try std.testing.expectEqualStrings(mcp_call_notice, parsed.value.object.get("mcp_call_notice").?.string);
+    const notice = parsed.value.object.get("mcp_call_notice").?.string;
+    try std.testing.expectEqualStrings(mcp_call_notice, notice);
+    try std.testing.expect(std.mem.find(u8, notice, "shell interact") != null);
+    try std.testing.expect(std.mem.find(u8, notice, "2 minutes") != null);
 }
 
-test "only a running command that used fx mcp call gets the notice" {
+test "only a running command that used fx mcp call gets the interact notice" {
     const State = managed_execution.SnapshotState;
     try std.testing.expect(mcpCallNoticeDue(.running, true));
     try std.testing.expect(!mcpCallNoticeDue(.running, false));

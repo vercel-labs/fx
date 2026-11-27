@@ -22,12 +22,14 @@ export const PINNED_TLC_VERSION = "TLC2 Version 2.19 of 08 August 2024 (rev: 5a4
 export type Registered = { owner: string; token: string };
 export type Entry = { id: number; owner: string; stage: string };
 export type Effect = { kind: string; id?: number; owner?: string; reason?: string; outcome?: string; what?: string };
-export type CoreState = { open: boolean; next: number; registered: Registered[]; entries: Entry[] };
+export type CoreState = { open: boolean; next: number; registered: Registered[]; followed: string[]; entries: Entry[] };
 export type Shown = CoreState & { out: Effect[] };
 export type Act =
   | { name: "Init" | "Stopped" | "Crash" }
   | { name: "Started"; token: string }
   | { name: "OwnerAdded"; owner: string; token: string }
+  | { name: "Follow"; owner: string }
+  | { name: "Unfollow"; owner: string; cancel: boolean }
   | { name: "OwnerRemoved"; owner: string }
   | { name: "Request"; token: string; version: number }
   | { name: "Authorized"; id: number; allow: boolean }
@@ -38,6 +40,8 @@ export type Event =
   | { event: "stopped" | "crash" }
   | { event: "started"; token: string }
   | { event: "owner_added"; owner: string; token: string }
+  | { event: "owner_followed"; owner: string }
+  | { event: "owner_unfollowed"; owner: string; cancel: boolean }
   | { event: "owner_removed"; owner: string }
   | { event: "request"; token: string; version: number }
   | { event: "authorized"; id: number; allow: boolean }
@@ -74,15 +78,15 @@ const sorted = <T>(items: T[]): T[] => [...items].sort((a, b) => (canonical(a) <
 /// What a state shows, with every set in one order: the model prints sets,
 /// the harness prints lists, and both are compared as sets.
 export function shownOf(state: Record<string, unknown>): Shown {
-  const { open, next, registered, entries, out } = state as Shown;
-  return { open, next, registered: sorted(registered), entries: sorted(entries), out: sorted(out) };
+  const { open, next, registered, followed, entries, out } = state as Shown;
+  return { open, next, registered: sorted(registered), followed: sorted(followed), entries: sorted(entries), out: sorted(out) };
 }
 
 /// The core variables of a state, without the step's effects and event:
 /// what the next step depends on.
 export function coreOf(state: Record<string, unknown>): CoreState {
-  const { open, next, registered, entries } = shownOf(state);
-  return { open, next, registered, entries };
+  const { open, next, registered, followed, entries } = shownOf(state);
+  return { open, next, registered, followed, entries };
 }
 
 /// A JSON value as TLA+: objects are records, arrays are sequences.
@@ -198,8 +202,13 @@ export class Harness {
   }
 
   private parse(line: string): Shown {
-    const parsed = JSON.parse(line) as { state: CoreState; out: Effect[] };
-    return shownOf({ ...parsed.state, out: parsed.out });
+    const parsed = JSON.parse(line) as {
+      state: { open: boolean; next: number; registered: (Registered & { followed: boolean })[]; entries: Entry[] };
+      out: Effect[];
+    };
+    const followed = parsed.state.registered.filter((r) => r.followed && r.owner !== "main").map((r) => r.owner);
+    const registered = parsed.state.registered.map(({ owner, token }) => ({ owner, token }));
+    return shownOf({ ...parsed.state, registered, followed, out: parsed.out });
   }
 
   async send(event: Event): Promise<Shown> {
@@ -232,6 +241,8 @@ export function eventFor(act: Act): Event {
     case "Started": return { event: "started", token: act.token };
     case "Stopped": return { event: "stopped" };
     case "OwnerAdded": return { event: "owner_added", owner: act.owner, token: act.token };
+    case "Follow": return { event: "owner_followed", owner: act.owner };
+    case "Unfollow": return { event: "owner_unfollowed", owner: act.owner, cancel: act.cancel };
     case "OwnerRemoved": return { event: "owner_removed", owner: act.owner };
     case "Request": return { event: "request", token: act.token, version: act.version };
     case "Authorized": return { event: "authorized", id: act.id, allow: act.allow };
@@ -249,6 +260,8 @@ export function actFor(event: Event): Act {
     case "started": return { name: "Started", token: event.token };
     case "stopped": return { name: "Stopped" };
     case "owner_added": return { name: "OwnerAdded", owner: event.owner, token: event.token };
+    case "owner_followed": return { name: "Follow", owner: event.owner };
+    case "owner_unfollowed": return { name: "Unfollow", owner: event.owner, cancel: event.cancel };
     case "owner_removed": return { name: "OwnerRemoved", owner: event.owner };
     case "request": return { name: "Request", token: event.token, version: event.version };
     case "authorized": return { name: "Authorized", id: event.id, allow: event.allow };

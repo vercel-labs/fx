@@ -7,8 +7,9 @@
 //! it without first inspecting it.
 //!
 //! The call meets the same permission rules, prompt, and review as a direct
-//! call of the tool by the agent that ran the command. It works only while
-//! that shell call runs.
+//! call of the tool by the agent that ran the command. It works while that
+//! command runs. When the shell call that started the command returns first,
+//! a call waits until a shell call follows the command with `interact`.
 //!
 //! `fx mcp call list SERVER`, `search QUERY`, and `help TOOL` print plain
 //! text about the tools that agent may use, so a command can find a tool and
@@ -30,8 +31,8 @@ pub const exit = struct {
     pub const failed: u8 = 1;
     /// A usage mistake, as for every `fx mcp` verb.
     pub const usage: u8 = 2;
-    /// No running fx shell call to reach: outside fx, after the shell call
-    /// ended, or another fx version.
+    /// No running fx shell command to reach: outside fx, after the command
+    /// ended, no shell call followed within 2 minutes, or another fx version.
     pub const unavailable: u8 = 3;
     /// Too many calls are running; nothing ran.
     pub const busy: u8 = 4;
@@ -172,6 +173,10 @@ fn printReply(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, operatio
             return exit.denied;
         },
         .refused => {
+            if (reply.header.reason == .not_followed) {
+                try err.writeAll("fx mcp call: this call did not run, because no fx shell call checked on its command for 2 minutes. Check on the command with shell interact, then run the call again.\n");
+                return exit.unavailable;
+            }
             try err.writeAll("fx mcp call: ");
             try writeTerminalSafeLine(arena, err, reply.bytes);
             return if (reply.header.reason == .busy) exit.busy else if (reply.header.reason == .malformed or reply.header.reason == .too_large) exit.usage else exit.unavailable;
@@ -294,12 +299,12 @@ fn repeatedValues(items: []const std.json.Value, key: []const u8, out: *[max_hin
 }
 
 fn unavailable(err: *Writer) !u8 {
-    try err.writeAll("fx mcp call: no running fx shell call to reach. It works only in a command that fx's shell tool runs, while that call runs.\n");
+    try err.writeAll("fx mcp call: no running fx shell call to reach. It works only in a command that fx's shell tool runs, until that command ends.\n");
     return exit.unavailable;
 }
 
 fn shellCallReturned(err: *Writer, cause: anyerror) !u8 {
-    try err.print("fx mcp call: cannot reach fx ({s}). The fx shell call that ran this command has returned, or fx has exited. " ++ capability_mod.short_checks_advice ++ "\n", .{@errorName(cause)});
+    try err.print("fx mcp call: cannot reach fx ({s}). The command that ran this call has ended, or fx has exited.\n", .{@errorName(cause)});
     return exit.unavailable;
 }
 
@@ -577,4 +582,23 @@ test "a shape summary stays bounded on deep, wide, and odd input" {
         \\wrote 55 bytes of JSON: [2 × {"a\u001bb": "x", "c,d": "y"}]
     , odd_summary);
     try std.testing.expect(std.mem.findScalar(u8, odd_summary, 0x1b) == null);
+}
+
+test "a not_followed refusal exits 3 and tells the model to use shell interact" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const asked: wire.Operation = .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } };
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const code = try printReply(arena, std.testing.io, &out.writer, &err.writer, asked, .{
+        .header = .{ .status = .refused, .reason = .not_followed, .bytes = 0 },
+        .bytes = "",
+    });
+    try std.testing.expectEqual(exit.unavailable, code);
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    try std.testing.expectEqualStrings(
+        "fx mcp call: this call did not run, because no fx shell call checked on its command for 2 minutes. Check on the command with shell interact, then run the call again.\n",
+        err.written(),
+    );
 }

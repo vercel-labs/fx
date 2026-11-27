@@ -486,7 +486,7 @@ pub fn render(alloc: Allocator, entries: []const Entry, limits: Limits) Allocato
 /// (`mcp_call_capability.supported`), so the model is never told to use it
 /// there.
 pub const mcp_call_hint = if (mcp_call_capability.supported)
-    "When an MCP tool's result would be large or needs filtering, run it from a shell command instead: fx mcp call TOOL_NAME '<JSON arguments>' > FILE. Only what the command prints returns to you. It works only while that shell call runs. " ++ mcp_call_capability.short_checks_advice ++ "\n"
+    "When an MCP tool's result would be large or needs filtering, run it from a shell command instead: fx mcp call TOOL_NAME '<JSON arguments>' > FILE. Only what the command prints returns to you. It works until that command ends. If the shell call returns while the command still runs, its fx mcp call commands wait until you check on it with shell interact.\n"
 else
     "";
 

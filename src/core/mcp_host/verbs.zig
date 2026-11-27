@@ -345,15 +345,16 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
             \\  list prints every tool of SERVER and search the tools that best
             \\  match QUERY, one per line: the name, a tab, and the description.
             \\  help prints the arguments TOOL takes and what it does.
-            \\  Works only in a command that fx's shell tool runs, while that shell
-            \\  call runs, so check a slow job with one short shell call per check,
-            \\  not one long loop. Asks permission as a direct call of TOOL would;
-            \\  list, search, and help need none and show only the tools that agent
-            \\  may use.
+            \\  Works only in a command that fx's shell tool runs, until that command
+            \\  ends. When the shell call returns first, the command's calls wait
+            \\  until a shell interact checks on it, for up to 2 minutes. Asks
+            \\  permission as a direct call of TOOL would; list, search, and help
+            \\  need none and show only the tools that agent may use.
             \\  Exits 0 on success, 1 when the call fails, 2 for a usage mistake,
-            \\  3 outside a running fx shell call, 4 when too many calls are
-            \\  running, 5 when permission is not granted, and 6 when the tool
-            \\  returns an error.
+            \\  3 outside a command fx's shell tool runs, after that command ends,
+            \\  after 2 minutes with no shell call checking on it, or against another
+            \\  fx version, 4 when too many calls are running, 5 when permission is
+            \\  not granted, and 6 when the tool returns an error.
             \\
         , .{ p, p, p, p }),
     }
