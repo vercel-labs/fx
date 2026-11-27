@@ -586,8 +586,9 @@ fn skipBlankLines(message: []const u8, start: usize) usize {
 }
 
 /// Borrows at most `max_message_layout_rows` visible row slices; measurement and
-/// painting share this layout. Blank lines take no row, so a preview never shows
-/// an empty row or a lone `…` for them.
+/// painting share this layout. Blank lines around text take no row, so a preview
+/// never shows an empty row or a lone `…` for them. A message with no text, such
+/// as a queued image-only one, keeps its single row so its marker still shows.
 pub fn steering_message_layout(
     message: []const u8,
     width: u16,
@@ -598,8 +599,8 @@ pub fn steering_message_layout(
         .content_width = if (waits_for_boundary) width -| 2 else width,
     };
     const limit = @min(row_limit, max_message_layout_rows);
-    var offset: usize = skipBlankLines(message, 0);
-    if (offset == message.len) return layout;
+    const first_text = skipBlankLines(message, 0);
+    var offset: usize = if (first_text == message.len) 0 else first_text;
     while (layout.row_count < limit) {
         const start = offset;
         var cells: usize = 0;
@@ -716,9 +717,13 @@ test "steering preview layout skips blank lines, so they draw no empty row or lo
     try std.testing.expectEqualStrings("only line", trailing.rows[0]);
     try std.testing.expect(!trailing.truncated);
 
-    const blank = steering_message_layout(" \n\t\n", 20, false, 2);
-    try std.testing.expectEqual(@as(u16, 0), blank.row_count);
-    try std.testing.expect(!blank.truncated);
+    // A message with no text keeps one row, as a queued image-only message needs.
+    for ([_][]const u8{ "", " \n\t\n" }) |no_text| {
+        const blank = steering_message_layout(no_text, 20, false, 2);
+        try std.testing.expectEqual(@as(u16, 1), blank.row_count);
+        try std.testing.expect(!blank.truncated);
+    }
+    try std.testing.expectEqual(@as(u16, 2), steeringBannerRowsForMessages(&.{" \n "}, true, 80));
 
     // A queued steering message with a blank line reserves its two real rows.
     try std.testing.expectEqual(@as(u16, 3), steeringBannerRowsForMessages(&.{"first\n\nthird"}, true, 80));
