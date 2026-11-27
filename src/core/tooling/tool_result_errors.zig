@@ -292,6 +292,8 @@ fn heldSuggestion(
 ) []const u8 {
     if (heldByMalformedResponse(reason, review_cause))
         return "The action did not run because the reviewer did not return a valid decision. Continue with a different safe action or retry in a later turn.";
+    if (heldByUnreadStoredAnswers(reason, review_cause))
+        return "The action did not run because the review could not read all of the user's answers to the earlier question. Ask again with fewer or shorter questions, or continue with a different safe action.";
     return permissionDeniedSuggestion(reason);
 }
 
@@ -649,6 +651,10 @@ test "a review that cleared without reading stored answers is held as unavailabl
     try std.testing.expectEqualStrings("stored_answers_unread", detail.get("review_cause").?.string);
     try std.testing.expectEqualStrings("review_unavailable", detail.get("reason").?.string);
     try std.testing.expect(detail.get("held").?.bool);
+    try std.testing.expectEqualStrings(
+        "The action did not run because the review could not read all of the user's answers to the earlier question. Ask again with fewer or shorter questions, or continue with a different safe action.",
+        detail.get("suggestion").?.string,
+    );
 }
 
 test "review hold JSON preserves typed reasons apart from permission denial" {

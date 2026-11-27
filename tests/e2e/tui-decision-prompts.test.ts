@@ -4383,6 +4383,43 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "auto-mode stored answers: a reviewer that keeps calling the read tool after it is withdrawn is held, and fx keeps running",
+    async () => {
+      const stillRunning = "Still running after the held action.";
+      const ctx = await launchScenario(
+        [
+          outerToolCalls([{ id: "stored_batch_1", name: "ask_user_question", input: { questions: storedAnswerBatch(BIG_BATCH_QUESTION_BYTES) } }]),
+          outerToolCalls([{ id: "stored_action_1", name: "shell", input: { request: { action: "run", command: STALE_COMMAND } } }]),
+          outerText(STORED_ANSWERS_DONE),
+          outerText(stillRunning),
+        ],
+        "input,permission",
+        {},
+        "auto",
+        () => fakeGatewayToolCall("read_loop", STORED_READ_TOOL, { handle: "answers-1", start_byte: 1, byte_count: 100 }),
+      );
+      writeFileSync(join(ctx.root.workspace, STALE_FIXTURE), "stale\n");
+      await ctx.session.sendText("Ask me the batch, then run the action.");
+      await waitForPaneState(ctx.session, "stored batch page 1", (value) =>
+        value.includes(`Question 1 of ${FULL_QUESTION_BATCH}`), TIMEOUT);
+      await ctx.session.sendLiteralText("1".repeat(FULL_QUESTION_BATCH));
+      await ctx.session.waitForText(STORED_ANSWERS_DONE, TIMEOUT);
+      expect(ctx.gateway.classifierRequests.length).toBeLessThanOrEqual(10);
+      expect(existsSync(join(ctx.root.workspace, STALE_FIXTURE))).toBe(true);
+      await assertProcessAliveAndClean(ctx);
+      await ctx.session.sendText("Still there?");
+      await ctx.session.waitForText(stillRunning, TIMEOUT);
+      await assertProcessAliveAndClean(ctx);
+      expect(ctx.gateway.classifierRequests.length).toBeLessThanOrEqual(10);
+      await ctx.session.sendText("/quit");
+      expect(await ctx.session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      expect(ctx.session.recordedExitStatus()).toBe(0);
+      expect(readFileSync(ctx.stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "compaction keeps the answer to a question asked through toolbox as the user's words",
     async () => {
       expect(await compactedRulesAfterAnswer(TOOLBOX_QUESTION_CALL, TOOLBOX_QUESTION_SETTINGS)).toEqual([ANSWER_RULE]);

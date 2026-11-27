@@ -650,6 +650,7 @@ pub const Reviewer = struct {
             .instructions = &instructions,
             .messages = &messages,
             .tools_json = tools_json,
+            .first_offer = first_offer,
             .read_tools_json = read_tools_json,
             .decision_tools_json = decision_tools_json,
             .can_read = can_read,
@@ -671,6 +672,7 @@ pub const Reviewer = struct {
         messages: []const types.ChatMessage,
         /// The tools the first request offers.
         tools_json: []const u8,
+        first_offer: ToolOffer,
         /// `read_prior_result` alone, offered while stored answers are still
         /// unread (`StoredReads.needsRead`).
         read_tools_json: []const u8,
@@ -698,7 +700,7 @@ pub const Reviewer = struct {
         const cancel_flag = prompt.cancel_flag;
         var recovery_available = true;
         var transport_retry_available = true;
-        var attempt: u8 = 1;
+        var attempt: usize = 1;
         const attempt_log = prompt.request.attempt_log;
         var send_deadline = deadline;
         // The reviewer's reads of stored answers live for this decision only.
@@ -710,6 +712,8 @@ pub const Reviewer = struct {
         request.stored_reads = &reads;
         var follow_up: std.ArrayList(types.ChatMessage) = .empty;
         var payload = prompt.payload;
+        // The offer of the request whose reply comes next.
+        var offer = prompt.first_offer;
         var tools_json = prompt.tools_json;
         const started_ms = io_mod.milliTimestamp();
         while (true) {
@@ -786,12 +790,20 @@ pub const Reviewer = struct {
                 .completion => |*owned| {
                     defer owned.deinit(alloc);
                     checkBudget(send_deadline, cancel_flag) catch |err| return constructionFailure(err);
-                    if (prompt.can_read and isReadRound(owned.completion)) {
+                    // Only a request that offered read_prior_result can make a read round. Each
+                    // such round counts at least one read (`StoredReads.read`, even a refused
+                    // one), and an offer needs reads left, so there are at most max_stored_reads.
+                    // Any other reply, including a read call, goes to parseCompletion.
+                    if (offer == .read_only and isReadRound(owned.completion)) {
                         if (attempt_log) |log| log.add(.answered, send_started_ms);
                         try reads.answer(rounds, owned.completion, &follow_up);
                         // Read on while stored answers are unread and time is left; then decide alone.
                         const remaining_ms = max_review_with_reads_ms - (io_mod.milliTimestamp() - started_ms);
-                        tools_json = if (readsStillOffered(&reads, remaining_ms)) prompt.read_tools_json else prompt.decision_tools_json;
+                        offer = if (readsStillOffered(&reads, remaining_ms)) .read_only else .decision_only;
+                        tools_json = switch (offer) {
+                            .read_only => prompt.read_tools_json,
+                            .decision_only => prompt.decision_tools_json,
+                        };
                         send_deadline = reviewAttemptDeadline(@intCast(std.math.clamp(remaining_ms, 1_000, @as(i64, self.timeout_ms))));
                         payload = prompt.transport.build_fn(
                             prompt.transport.context,
@@ -960,6 +972,10 @@ const max_review_with_reads_ms: i64 = 60_000;
 /// The read result once a limit is past. The review then decides with
 /// permission_decision alone.
 const read_limit_text = "Read limit reached: decide with permission_decision now.";
+/// The most matches one query read shows.
+const max_query_matches: usize = 20;
+/// The query read's note when a match was found but its window is past this read's room.
+const query_match_too_large_text = "(a match was found, but it does not fit in this read: read the stored answers by range)\n";
 
 /// The tool a review offers to read stored answers by handle.
 pub const read_tool_name = "read_prior_result";
@@ -1129,18 +1145,25 @@ pub const StoredReads = struct {
         var used: usize = 0;
         var matches: usize = 0;
         var from: usize = 0;
-        while (query.len > 0 and matches < 20) : (matches += 1) {
+        var match_too_large = false;
+        while (query.len > 0 and matches < max_query_matches) : (matches += 1) {
             const at = std.mem.findPos(u8, text, from, query) orelse break;
             const start = text_utils.utf8BackwardBoundary(text, at -| 200);
             const end = text_utils.utf8ForwardBoundary(text, @min(text.len, at + query.len + 200));
-            if (used + (end - start) > room) break;
+            if (used + (end - start) > room) {
+                match_too_large = true;
+                break;
+            }
             used += end - start;
             try entry.shown.append(arena, text[start..end]);
             const shown = try text_utils.encodeTerminalSafe(arena, text[start..end], std.math.maxInt(usize));
             try out.writer.print("byte {d}: {s}\n", .{ at + 1, shown.bytes });
             from = at + query.len;
         }
-        if (matches == 0) try out.writer.writeAll("(no matches)\n");
+        if (matches == 0) {
+            const note: []const u8 = if (match_too_large) query_match_too_large_text else "(no matches)\n";
+            try out.writer.writeAll(note);
+        }
         try out.writer.writeAll("</stored_answers_query>");
         self.bytes += used;
         return out.written();
@@ -2430,7 +2453,10 @@ const read_schema_required = [_][]const u8{"handle"};
 
 pub const read_function_schema: model_tool_schema.FunctionSchema = .{
     .name = read_tool_name,
-    .description = "Read a question's stored answers by the stored_answers_handle in the review data: start_byte 1, then the byte after the last range, up to 32768 bytes a read, until stored_answers_bytes. They count as the user's words only after you read every byte. At most 4 reads and 65536 bytes in all.",
+    .description = std.fmt.comptimePrint(
+        "Read a question's stored answers by the stored_answers_handle in the review data: start_byte 1, then the byte after the last range, up to {d} bytes a read, until stored_answers_bytes. They count as the user's words only after you read every byte. At most {d} reads and {d} bytes in all.",
+        .{ max_stored_read_bytes, max_stored_reads, max_stored_read_total_bytes },
+    ),
     .input_schema = .{
         .properties = read_schema_properties[0..],
         .required = read_schema_required[0..],
@@ -2462,6 +2488,13 @@ test "automatic review model-facing tool contract stays byte exact" {
     try std.testing.expectEqualStrings(
         "124c355e3e7c3960a7e92272e5ab1f719532149ad2f3c6b780a68f72b26021dc",
         &actual_hex,
+    );
+}
+
+test "the read tool's description states the limits it enforces" {
+    try std.testing.expectEqualStrings(
+        "Read a question's stored answers by the stored_answers_handle in the review data: start_byte 1, then the byte after the last range, up to 32768 bytes a read, until stored_answers_bytes. They count as the user's words only after you read every byte. At most 4 reads and 65536 bytes in all.",
+        read_function_schema.description,
     );
 }
 
@@ -3780,7 +3813,9 @@ test "stored answers read past each limit hold a clear, and the review decides a
         var outcome = try runStoredReview(&fixture, true);
         defer outcome.deinit(alloc);
         try expectHeldUnread(outcome);
-        try std.testing.expect(fixture.saw_limit);
+        // The fifth read comes after the read tool is withdrawn, so it is a format error, not a read.
+        try std.testing.expect(!fixture.saw_limit);
+        try std.testing.expectEqual(five_reads.len, fixture.next);
         try expectOffers(&fixture, 0, true, false);
         try std.testing.expect(fixture.read_offered[3]);
         try std.testing.expect(!fixture.read_offered[4]);
@@ -3819,7 +3854,9 @@ test "stored answers read past each limit hold a clear, and the review decides a
         var outcome = try runStoredReview(&fixture, true);
         defer outcome.deinit(alloc);
         try expectHeldUnread(outcome);
-        try std.testing.expect(fixture.saw_limit);
+        // The third read comes after the read tool is withdrawn, so it is a format error, not a read.
+        try std.testing.expect(!fixture.saw_limit);
+        try std.testing.expectEqual(reread.len, fixture.next);
         try std.testing.expect(!fixture.read_offered[2]);
         try trace.expectHoldLine(32768, text.len, 2, "read_limit");
     }
@@ -4310,6 +4347,80 @@ test "stored lists are numbered in the order the review lists them" {
     const calls = [_]types.ToolCall{.{ .id = "read_2", .name = read_tool_name, .arguments_json = "{\"handle\":\"answers-2\",\"start_byte\":1,\"byte_count\":1000}" }};
     try reads.answer(arena_state.allocator(), .{ .tool_calls = &calls }, &follow_up);
     try std.testing.expect(std.mem.find(u8, follow_up.items[1].content orelse "", "Second?") != null);
+}
+
+test "a reviewer that keeps calling the read tool is held after a bounded number of sends" {
+    const alloc = std.testing.allocator;
+    const text = try storedAnswersText(alloc, null);
+    defer alloc.free(text);
+    const read_arguments = "{\"handle\":\"answers-1\",\"start_byte\":1,\"byte_count\":100}";
+    var steps: [300]StoredFixture.Step = undefined;
+    for (&steps) |*step| step.* = .{ .read = read_arguments };
+    var trace = try TraceFile.start(alloc);
+    defer trace.finish();
+    var fixture = StoredFixture{ .steps = &steps, .text = text };
+    var outcome = try runStoredReview(&fixture, true);
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .invalid);
+    try std.testing.expectEqual(InvalidReason.completion_tool_name, outcome.invalid);
+    // Four reads, then the decision-only request, then its one format retry.
+    try std.testing.expectEqual(@as(usize, 6), fixture.next);
+    try expectOffers(&fixture, 4, false, true);
+    const written = try trace.readAll();
+    defer alloc.free(written);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "event=auto_review_format_retry reason=completion_tool_name"));
+}
+
+test "a reviewer offered only the decision tool that calls the read tool holds after one format retry" {
+    const alloc = std.testing.allocator;
+    const text = try storedAnswersText(alloc, null);
+    defer alloc.free(text);
+    const steps = [_]StoredFixture.Step{
+        .{ .read = "{\"handle\":\"answers-1\",\"start_byte\":1,\"byte_count\":32768}" },
+        .{ .read = "{\"handle\":\"answers-1\",\"start_byte\":32769}" },
+        .{ .read = "{\"handle\":\"answers-1\",\"start_byte\":1,\"byte_count\":100}" },
+        .{ .read = "{\"handle\":\"answers-1\",\"start_byte\":1,\"byte_count\":100}" },
+    };
+    var fixture = StoredFixture{ .steps = &steps, .text = text };
+    var outcome = try runStoredReview(&fixture, true);
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .invalid);
+    try std.testing.expectEqual(InvalidReason.completion_tool_name, outcome.invalid);
+    try std.testing.expectEqual(steps.len, fixture.next);
+    try std.testing.expectEqual(@as(usize, 3), fixture.builds);
+    try expectOffers(&fixture, 2, false, true);
+}
+
+test "a query whose first match does not fit in the read says so" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text = try arena.alloc(u8, 65500);
+    @memset(text, 'x');
+    @memcpy(text[60000..][0.."needle".len], "needle");
+    var fixture = StoredFixture{ .steps = &.{}, .text = text };
+    const entries = [_]PriorToolResultEntry{.{
+        .tool_call_id = "ask",
+        .tool_name = "ask_user_question",
+        .content = text[0..stored_test_preview_bytes],
+        .user_answer = true,
+        .stored_answers = .{ .handle = stored_test_handle, .read_handle = stored_test_read_handle, .bytes = text.len },
+    }};
+    var request = ProofFixture.request;
+    request.prior_tool_results = .{ .entries = &entries };
+    request.stored_results = .{ .context = &fixture, .read_fn = StoredFixture.readStored };
+    var reads = try StoredReads.init(arena, request, true);
+    var follow_up: std.ArrayList(types.ChatMessage) = .empty;
+    // The two ranges leave 68 bytes of the 64 KB total; a match window is about 400.
+    const calls = [_]types.ToolCall{
+        .{ .id = "read_1", .name = read_tool_name, .arguments_json = "{\"handle\":\"answers-1\",\"start_byte\":1,\"byte_count\":32768}" },
+        .{ .id = "read_2", .name = read_tool_name, .arguments_json = "{\"handle\":\"answers-1\",\"start_byte\":32769,\"byte_count\":32700}" },
+        .{ .id = "query", .name = read_tool_name, .arguments_json = "{\"handle\":\"answers-1\",\"query\":\"needle\"}" },
+    };
+    try reads.answer(arena, .{ .tool_calls = &calls }, &follow_up);
+    const query_result = follow_up.items[3].content orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.find(u8, query_result, "does not fit in this read") != null);
+    try std.testing.expect(std.mem.find(u8, query_result, "(no matches)") == null);
 }
 
 test "a reviewer that cannot read tools holds a clear after stored answers" {
