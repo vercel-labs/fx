@@ -10,6 +10,7 @@ const build_options = @import("build_options");
 const debug_trace = @import("../shared/debug_trace.zig");
 const hold_marker = @import("../shared/hold_marker.zig");
 const io_mod = @import("../shared/io.zig");
+const test_markers = @import("../shared/test_markers.zig");
 
 const max_hold_ms = 60_000;
 
@@ -30,18 +31,13 @@ pub fn holdCatalogLoad(cancel_requested: *const std.atomic.Value(bool)) void {
             reason = "cancelled";
             break;
         }
-        if (pathExists(release)) {
+        if (test_markers.pathExists(release)) {
             reason = "released";
             break;
         }
         io_mod.sleep(std.time.ns_per_ms);
     }
     debug_trace.logf("core", "session picker load hold ended reason={s}", .{reason});
-}
-
-fn pathExists(path: []const u8) bool {
-    std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
-    return true;
 }
 
 test "a test build skips the session picker load hold" {
