@@ -3341,6 +3341,8 @@ test "a request whose local address leaves the machine fails at once as a lost c
 /// thinking model alone and turn a dead connection into a failed read: a reset
 /// at the first probe after the network returns, or `ConnectionTimedOut` once
 /// every probe goes unanswered. Both are retried like any dropped stream.
+/// Keepalive runs only while no sent data waits for an acknowledgment, so the
+/// same budget also caps how long sent data may go unacknowledged.
 const dead_peer_probe = struct {
     /// Silence before the first probe.
     const idle_s: c_int = 15;
@@ -3349,6 +3351,8 @@ const dead_peer_probe = struct {
     const interval_s: c_int = 5;
     /// Unanswered probes before the read fails: 15 s + 6 x 5 s = 45 s.
     const count: c_int = 6;
+    /// Sent data unacknowledged this long drops the connection.
+    const unacked_s: c_int = idle_s + interval_s * count;
 };
 
 const SocketOption = struct { level: i32, name: u32, value: c_int };
@@ -3361,12 +3365,14 @@ const dead_peer_probe_options: []const SocketOption = switch (builtin.target.os.
         .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPALIVE, .value = dead_peer_probe.idle_s },
         .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPINTVL, .value = dead_peer_probe.interval_s },
         .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPCNT, .value = dead_peer_probe.count },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.RXT_CONNDROPTIME, .value = dead_peer_probe.unacked_s },
     },
     .linux => &.{
         .{ .level = std.posix.SOL.SOCKET, .name = std.posix.SO.KEEPALIVE, .value = 1 },
         .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPIDLE, .value = dead_peer_probe.idle_s },
         .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPINTVL, .value = dead_peer_probe.interval_s },
         .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPCNT, .value = dead_peer_probe.count },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.USER_TIMEOUT, .value = dead_peer_probe.unacked_s * std.time.ms_per_s },
     },
     else => &.{},
 };
@@ -3428,6 +3434,18 @@ test "a watched model connection probes for a dead peer" {
         // BSD reports a set flag as its bit, not as 1.
         if (option.value == 1) try std.testing.expect(value != 0) else try std.testing.expectEqual(option.value, value);
     }
+}
+
+test "dead-peer probes also drop data the peer never acknowledges" {
+    const expected: SocketOption = switch (builtin.target.os.tag) {
+        .macos => .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.RXT_CONNDROPTIME, .value = dead_peer_probe.unacked_s },
+        .linux => .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.USER_TIMEOUT, .value = dead_peer_probe.unacked_s * std.time.ms_per_s },
+        else => return error.SkipZigTest,
+    };
+    for (dead_peer_probe_options) |option| {
+        if (option.level == expected.level and option.name == expected.name) return std.testing.expectEqual(expected.value, option.value);
+    }
+    return error.TestExpectedUnackedDataLimit;
 }
 
 test "a refused probe option is reported instead of failing the request" {
