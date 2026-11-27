@@ -61,7 +61,7 @@ pub const FileRequest = union(enum) {
 };
 
 /// Mirrors `reports.Rule` in `src/core/subagent/reports.zig`. The bridge module
-/// may not import subagent code, so `src/core/tooling/tool_runtime.zig` checks
+/// may not import subagent code, so `src/core/tooling/bash_tool_requests.zig` checks
 /// at compile time that both enums have the same fields in the same order.
 pub const AgentReport = enum {
     final,

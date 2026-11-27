@@ -65,21 +65,7 @@ const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_bridge = @import("../tool_bridge/tool_bridge.zig");
 const mcp_call_capability = tool_bridge.capability;
-const subagent_reports = @import("../subagent/reports.zig");
-
-// capability.AgentReport mirrors reports.Rule, since the bridge module may not
-// import subagent code. This is the one file that imports both, so it checks them.
-comptime {
-    const mirror = @typeInfo(mcp_call_capability.AgentReport).@"enum".field_names;
-    const source = @typeInfo(subagent_reports.Rule).@"enum".field_names;
-    for (0..@max(mirror.len, source.len)) |index| {
-        const mirror_name = if (index < mirror.len) mirror[index] else "(no field)";
-        const source_name = if (index < source.len) source[index] else "(no field)";
-        if (!std.mem.eql(u8, mirror_name, source_name)) {
-            @compileError("capability.AgentReport must mirror reports.Rule field for field: AgentReport has " ++ mirror_name ++ " where reports.Rule has " ++ source_name);
-        }
-    }
-}
+const bash_tool_requests = @import("bash_tool_requests.zig");
 const model_tool_schema = @import("model_tool_schema.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const capability_retrieval = @import("capability_retrieval.zig");
@@ -1153,82 +1139,12 @@ fn bridgeBashToolCall(
     request_id: []const u8,
     operation: mcp_call_capability.BashToolRequest,
 ) !ToolCall {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    switch (operation) {
-        .skill_list => return .{
-            .id = request_id,
-            .name = "toolbox",
-            .arguments_json = "{\"search\":\"\"}",
-            .toolbox_lookup = .{ .permission = "capability_search", .target = "*" },
-        },
-        .skill_open => |req| {
-            try out.writer.writeAll("{\"open\":");
-            try std.json.Stringify.value(req.name, .{}, &out.writer);
-            try out.writer.writeAll(",\"kind\":\"skill\"");
-            if (req.resource) |resource| {
-                try out.writer.writeAll(",\"resource\":");
-                try std.json.Stringify.value(resource, .{}, &out.writer);
-            }
-            try out.writer.writeByte('}');
-            const target_name = (try toolbox.skillNamed(arena, ctx.skill_locations, req.name)) orelse req.name;
-            return .{
-                .id = request_id,
-                .name = "toolbox",
-                .arguments_json = out.written(),
-                .toolbox_lookup = .{ .permission = "skill", .target = target_name },
-            };
-        },
-        .agent_message => |req| {
-            try out.writer.writeAll("{\"action\":\"message\",\"agent\":");
-            try std.json.Stringify.value(req.agent, .{}, &out.writer);
-            try out.writer.writeAll(",\"message\":");
-            try std.json.Stringify.value(req.message, .{}, &out.writer);
-            if (req.instructions) |instructions| {
-                try out.writer.writeAll(",\"instructions\":");
-                try std.json.Stringify.value(instructions, .{}, &out.writer);
-            }
-            if (req.model) |model| {
-                try out.writer.writeAll(",\"model\":");
-                try std.json.Stringify.value(model, .{}, &out.writer);
-            }
-            if (req.effort) |effort| {
-                try out.writer.writeAll(",\"effort\":");
-                try std.json.Stringify.value(effort, .{}, &out.writer);
-            }
-            if (req.profile) |profile| {
-                try out.writer.writeAll(",\"profile\":");
-                try std.json.Stringify.value(profile, .{}, &out.writer);
-            }
-            if (req.report) |report| {
-                try out.writer.writeAll(",\"report\":");
-                try std.json.Stringify.value(report.name(), .{}, &out.writer);
-            }
-            try out.writer.writeByte('}');
-            return .{ .id = request_id, .name = "subagent", .arguments_json = out.written() };
-        },
-        .agent_wait => return .{ .id = request_id, .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" },
-        .agent_status => |maybe_agent| {
-            try out.writer.writeAll("{\"action\":\"status\"");
-            if (maybe_agent) |agent| {
-                try out.writer.writeAll(",\"agent\":");
-                try std.json.Stringify.value(agent, .{}, &out.writer);
-            }
-            try out.writer.writeByte('}');
-            return .{ .id = request_id, .name = "subagent", .arguments_json = out.written() };
-        },
-        .agent_stop => |agent| {
-            try out.writer.writeAll("{\"action\":\"stop\",\"agent\":");
-            try std.json.Stringify.value(agent, .{}, &out.writer);
-            try out.writer.writeByte('}');
-            return .{ .id = request_id, .name = "subagent", .arguments_json = out.written() };
-        },
-        .agent_close => |agent| {
-            try out.writer.writeAll("{\"action\":\"close\",\"agent\":");
-            try std.json.Stringify.value(agent, .{}, &out.writer);
-            try out.writer.writeByte('}');
-            return .{ .id = request_id, .name = "subagent", .arguments_json = out.written() };
-        },
-    }
+    // Only a skill open needs the session's skill locations, so the lookup happens here.
+    const skill_target = switch (operation) {
+        .skill_open => |req| (try toolbox.skillNamed(arena, ctx.skill_locations, req.name)) orelse req.name,
+        else => "",
+    };
+    return bash_tool_requests.toolCall(arena, request_id, operation, skill_target);
 }
 
 const BridgeAuthority = union(enum) {
@@ -1652,42 +1568,7 @@ fn runBridgeSkillList(ctx: Context, arena: Allocator) anyerror!mcp_call_capabili
         skill_runtime.traceDiagnostics("skill_list", discovery.diagnostics);
         break :blk discovery.skills;
     };
-    const cap = toolbox.max_menu_bytes;
-    // Reserve room for the worst-case truncation line so total bytes never exceed `cap`.
-    const max_notice = "[skill list truncated at 32768-byte limit; 18446744073709551615 more omitted]\n";
-    var out: std.Io.Writer.Allocating = .init(arena);
-    var written_count: usize = 0;
-    var truncated = false;
-    for (skills) |skill| {
-        var line: std.Io.Writer.Allocating = .init(arena);
-        try writeSingleLineField(&line.writer, skill.name);
-        try line.writer.writeByte('\t');
-        try writeSingleLineField(&line.writer, skill.description);
-        try line.writer.writeByte('\n');
-        const line_bytes = line.written();
-        if (out.written().len + line_bytes.len + max_notice.len > cap) {
-            truncated = true;
-            break;
-        }
-        try out.writer.writeAll(line_bytes);
-        written_count += 1;
-    }
-    if (truncated) {
-        const omitted = skills.len - written_count;
-        try out.writer.print("[skill list truncated at {d}-byte limit; {d} more omitted]\n", .{ cap, omitted });
-    }
-    return .{ .status = .ok, .bytes = out.written() };
-}
-
-fn writeSingleLineField(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
-    var start: usize = 0;
-    for (text, 0..) |byte, index| {
-        if (byte != '\t' and byte != '\n' and byte != '\r') continue;
-        if (index > start) try w.print("{f}", .{text_utils.terminalSafe(text[start..index])});
-        try w.writeByte(' ');
-        start = index + 1;
-    }
-    if (start < text.len) try w.print("{f}", .{text_utils.terminalSafe(text[start..])});
+    return .{ .status = .ok, .bytes = try bash_tool_requests.skillListText(arena, skills, toolbox.max_menu_bytes) };
 }
 
 fn runBridgeSkillOpen(
@@ -1739,7 +1620,7 @@ fn runBridgeSkillOpen(
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Cancelled => return error.Cancelled,
-                else => return .{ .status = .tool_error, .bytes = try skillOpenFailureText(arena, req.name, req.resource, err) },
+                else => return .{ .status = .tool_error, .bytes = try bash_tool_requests.skillOpenFailureText(arena, req.name, req.resource, err) },
             };
             return switch (result) {
                 .loaded => |loaded| .{ .status = .ok, .bytes = loaded.model_output },
@@ -1753,35 +1634,6 @@ fn runBridgeSkillOpen(
 /// error says what is wrong and what to do next. The last arm names an
 /// unexpected error, so no failure is shown as a bare error name. The text has
 /// no command name: `fx tool` writes `fx tool skill open:` before it.
-/// The longest encoded skill name or resource that a failure text shows. A
-/// longer one is cut on a token boundary and ends with "...".
-const skill_open_field_bytes: usize = 200;
-
-/// A skill name or resource from a program, as text fit to draw and to send
-/// to the model: terminal-safe, and at most `skill_open_field_bytes` bytes.
-fn skillOpenField(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
-    return (try text_utils.encodeTerminalSafe(arena, raw, skill_open_field_bytes)).bytes;
-}
-
-fn skillOpenFailureText(arena: Allocator, raw_name: []const u8, raw_resource: ?[]const u8, err: anyerror) Allocator.Error![]const u8 {
-    const name = try skillOpenField(arena, raw_name);
-    const resource = if (raw_resource) |raw| try skillOpenField(arena, raw) else null;
-    const shown = resource orelse "SKILL.md";
-    return switch (err) {
-        error.FileNotFound => if (resource) |path|
-            arena.print("resource {s} was not found in skill {s}; check the path, which is relative to the skill folder.", .{ path, name })
-        else
-            arena.print("no skill named {s}; run skill list to see the names.", .{name}),
-        error.InvalidSkillResourcePath => arena.print("resource {s} is not a valid path in skill {s}; use a relative path inside the skill folder with no .. parts.", .{ shown, name }),
-        error.IsDir => arena.print("resource {s} is a folder, not a file, in skill {s}; name a file inside it.", .{ shown, name }),
-        error.SkillResourceNotRegularFile => arena.print("resource {s} in skill {s} is not a regular file (a folder, a link, a pipe, or a device); name a regular file inside the skill folder.", .{ shown, name }),
-        error.AccessDenied => arena.print("resource {s} in skill {s} cannot be read: permission denied; check the file's permissions.", .{ shown, name }),
-        error.SkillFileLimitExceeded => arena.print("resource {s} in skill {s} is larger than the skill_file_bytes limit; raise skill_file_bytes to read it.", .{ shown, name }),
-        error.SkillResourceChanged, error.ChangedSkillWasLoaded => arena.print("resource {s} in skill {s} changed while fx read it; open it again.", .{ shown, name }),
-        else => arena.print("could not read {s} in skill {s} ({s}); open it again, and report it if this repeats.", .{ shown, name, @errorName(err) }),
-    };
-}
-
 fn runBridgeAgentCall(
     ctx: Context,
     arena: Allocator,
@@ -3640,13 +3492,6 @@ test "bridged skill open target lookup propagates OutOfMemory from a location's 
     return error.TestUnexpectedResult;
 }
 
-test "bridged skill open names a missing skill and the command that lists names" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const text = try skillOpenFailureText(arena_state.allocator(), "alpha", null, error.FileNotFound);
-    try std.testing.expectEqualStrings("no skill named alpha; run skill list to see the names.", text);
-}
-
 test "bridged skill open names a bad resource path, a missing resource, and a folder, with the next step" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -3680,77 +3525,6 @@ test "bridged skill open names a bad resource path, a missing resource, and a fo
         try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
         try std.testing.expectEqualStrings(case.expected, outcome.bytes);
     }
-}
-
-test "bridged skill open read failures name the file, what is wrong, and the next step" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const cases = [_]struct { err: anyerror, resource: ?[]const u8, expected: []const u8 }{
-        .{
-            .err = error.AccessDenied,
-            .resource = null,
-            .expected = "resource SKILL.md in skill alpha cannot be read: permission denied; check the file's permissions.",
-        },
-        .{
-            .err = error.SkillFileLimitExceeded,
-            .resource = "big.txt",
-            .expected = "resource big.txt in skill alpha is larger than the skill_file_bytes limit; raise skill_file_bytes to read it.",
-        },
-        .{
-            .err = error.SkillResourceChanged,
-            .resource = "big.txt",
-            .expected = "resource big.txt in skill alpha changed while fx read it; open it again.",
-        },
-        .{
-            .err = error.NoSpaceLeft,
-            .resource = null,
-            .expected = "could not read SKILL.md in skill alpha (NoSpaceLeft); open it again, and report it if this repeats.",
-        },
-    };
-    for (cases) |case| {
-        const text = try skillOpenFailureText(arena, "alpha", case.resource, case.err);
-        try std.testing.expectEqualStrings(case.expected, text);
-    }
-}
-
-test "bridged skill open shows a program's name and resource terminal-safe and cut to 200 bytes" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var hostile_buf: [5 + 300]u8 = undefined;
-    @memcpy(hostile_buf[0..5], "\x1b[31m");
-    @memset(hostile_buf[5..], 'a');
-    const hostile: []const u8 = &hostile_buf;
-
-    const missing = try skillOpenFailureText(arena, hostile, null, error.FileNotFound);
-    const missing_prefix = "no skill named ";
-    const missing_suffix = "; run skill list to see the names.";
-    try std.testing.expect(std.mem.startsWith(u8, missing, missing_prefix));
-    try std.testing.expect(std.mem.endsWith(u8, missing, missing_suffix));
-    const shown_name = missing[missing_prefix.len .. missing.len - missing_suffix.len];
-    try std.testing.expect(shown_name.len <= 200);
-    try std.testing.expect(std.mem.endsWith(u8, shown_name, "..."));
-    try std.testing.expect(std.mem.findScalar(u8, shown_name, 0x1b) == null);
-
-    const resource_text = try skillOpenFailureText(arena, "alpha", hostile, error.FileNotFound);
-    const resource_prefix = "resource ";
-    const resource_end = " was not found in skill alpha";
-    try std.testing.expect(std.mem.startsWith(u8, resource_text, resource_prefix));
-    const end = std.mem.find(u8, resource_text, resource_end) orelse return error.TestUnexpectedResult;
-    const shown_resource = resource_text[resource_prefix.len..end];
-    try std.testing.expect(shown_resource.len <= 200);
-    try std.testing.expect(std.mem.findScalar(u8, shown_resource, 0x1b) == null);
-}
-
-test "bridged skill open names a resource that is not a regular file, with the next step" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const text = try skillOpenFailureText(arena_state.allocator(), "demo", "pipe", error.SkillResourceNotRegularFile);
-    try std.testing.expectEqualStrings(
-        "resource pipe in skill demo is not a regular file (a folder, a link, a pipe, or a device); name a regular file inside the skill folder.",
-        text,
-    );
 }
 
 const RunCommandBackendState = struct {
