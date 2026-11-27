@@ -426,7 +426,7 @@ pub fn Runtime(comptime App: type) type {
                 .metrics = &app.metrics,
                 .terminal_title = deps.terminal_title,
                 .footer_rows = footer_rows,
-                .startup_min_body_rows = ui_render.welcome_message_reserved_rows,
+                .startup_min_body_rows = if (app.requested_resume != null) 0 else ui_render.welcome_message_reserved_rows,
                 .takes_over_screen = launch_overrides.upgrade_relaunch,
                 .default_model = default_model,
                 .default_agent_step_limit = default_agent_step_limit,
@@ -583,6 +583,7 @@ pub fn Runtime(comptime App: type) type {
             app_permission_runtime.Runtime(App).initMode(app, agent, permission_mode);
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
             app.agent_step_limit = startup.agent_step_limit;
+            if (comptime @hasField(App, "personal_shortcuts")) app.personal_shortcuts.map = startup.personal_shortcuts;
             agent.worker.agent_turn_settings.max_tool_result_bytes = startup.max_tool_result_bytes;
             agent.worker.agent_turn_settings.auto_compact_percent = startup.auto_compact_percent;
             if (comptime @hasField(App, "context_limits")) app.context_limits = startup.context_limits;
@@ -771,6 +772,7 @@ const TestCapture = struct {
     alloc: Allocator,
     bootstrap_calls: usize = 0,
     footer_rows: u16 = 0,
+    startup_min_body_rows: u16 = 0,
     default_model: []const u8 = "",
     default_agent_step_limit: usize = 0,
     fx_version: []const u8 = "",
@@ -962,6 +964,7 @@ fn bootstrapInteractiveAppForTest(cfg: app_lifecycle.BootstrapConfig) !app_lifec
     const capture = active_capture.?;
     capture.bootstrap_calls += 1;
     capture.footer_rows = cfg.footer_rows;
+    capture.startup_min_body_rows = cfg.startup_min_body_rows;
     capture.default_model = cfg.default_model;
     capture.default_agent_step_limit = cfg.default_agent_step_limit;
     capture.fx_version = cfg.fx_version;
@@ -1534,4 +1537,25 @@ test "app_bootstrap_runtime records a full-only session assembly record" {
     try std.testing.expect(std.mem.find(u8, record, "model: model-x") != null);
     try std.testing.expect(std.mem.find(u8, record, "skills: 0 in catalog") != null);
     try std.testing.expect(std.mem.find(u8, record, "mcp: none") != null);
+}
+
+test "app_bootstrap_runtime reserves welcome rows only for fresh launches" {
+    const alloc = std.testing.allocator;
+    {
+        var capture = TestCapture.init(alloc);
+        var app = TestApp.init(alloc);
+        defer app.deinit();
+
+        try runBootstrapForTest(&app, &capture);
+        try std.testing.expectEqual(ui_render.welcome_message_reserved_rows, capture.startup_min_body_rows);
+    }
+    {
+        var capture = TestCapture.init(alloc);
+        var app = TestApp.init(alloc);
+        defer app.deinit();
+        app.requested_resume = 1;
+
+        try runBootstrapForTest(&app, &capture);
+        try std.testing.expectEqual(@as(u16, 0), capture.startup_min_body_rows);
+    }
 }

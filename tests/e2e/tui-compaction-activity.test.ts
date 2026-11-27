@@ -839,6 +839,10 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await reopened.sendKeys("C-o");
         await reopened.waitForComposer(5000);
         expect(await reopened.captureFullScrollbackEscapes()).not.toMatch(COMPACTION_OUTPUT);
+        // Typing /quit while the resumed history is still being written grows
+        // the footer, so fx writes the rest at once, and the quit waits until
+        // the terminal takes it. That can outlast close's wait on a slow runner.
+        await f.waitForResumeHandoff();
         await f.close();
         expect(f.counts()).toEqual(cancelledCounts);
         expect(f.savedEvents().startsWith(cancelledEvents)).toBe(true);
@@ -1384,7 +1388,8 @@ async function readAroundNotice(middle: NoticeMiddle) {
       await live.waitForText("Next turn will use reasoning effort high", 10_000);
       releaseSecondRead();
     }
-    const liveRows = noticeTurnRows((await live.waitForPane(noticeTurnDone, 20_000)).split("\n"));
+    const livePane = await live.waitForPane(noticeTurnDone, 20_000);
+    const liveRows = noticeTurnRows(livePane.split("\n"));
     await live.sendKeys("C-o");
     await live.waitForText("esc close · pgup/pgdn scroll", 5000);
     await live.sendKeys("End");
@@ -1401,7 +1406,7 @@ async function readAroundNotice(middle: NoticeMiddle) {
     expect(await resumed.waitForSessionEnd(10_000)).toBe(true);
     for (const path of stderrPaths) expect(readFileSync(path, "utf8")).toBe("");
     passed = true;
-    return { liveRows, fullRows, resumedRows };
+    return { liveRows, livePane, fullRows, resumedRows };
   } finally {
     if (!passed) {
       if (terminal) writeFileSync(join(root, "failure.scrollback.txt"), await terminal.captureFullScrollback());
@@ -1445,14 +1450,17 @@ describe.skipIf(!tmuxAvailable())("tui: tool rows around a notice in the middle 
   }, 120_000);
 
   test("provider error: the calls after the reason fx showed while it waited draw below it, and share one row after resume", async () => {
-    const { liveRows, fullRows, resumedRows } = await readAroundNotice("provider-error");
+    const { liveRows, livePane, fullRows, resumedRows } = await readAroundNotice("provider-error");
     expect(liveRows).toEqual([
       `┃ ${NOTICE_PROMPT}`,
       "● Read a.txt",
-      `! system: API access denied · HTTP 403 · invalid_request_error: ${NOTICE_REJECTION}`,
+      `⚠ ${NOTICE_REJECTION}`,
       "● Read b.txt, c.txt",
       `  ${NOTICE_DONE}`,
     ]);
+    expect(livePane).not.toContain("system:");
+    expect(livePane).not.toContain("HTTP 403");
+    expect(fullRows.join("\n")).toContain("HTTP 403 · invalid_request_error");
     expectFullTranscriptOrder(fullRows, ["● Read a.txt", NOTICE_REJECTION, "● Read b.txt", "● Read c.txt", NOTICE_DONE]);
     expect(resumedRows).toEqual([`┃ ${NOTICE_PROMPT}`, "● Read a.txt, b.txt, c.txt", `  ${NOTICE_DONE}`]);
   }, 120_000);

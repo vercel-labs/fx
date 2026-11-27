@@ -756,10 +756,9 @@ fn deliverSemanticThematicRule(raw: *anyopaque, out: *std.ArrayList(u8)) !void {
     stream_ctx.recordSemanticBoundary();
 }
 
-pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, arena: Allocator, disposition: types.ProviderCompletionDisposition) !void {
+pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, disposition: types.ProviderCompletionDisposition) !void {
     if (disposition != .length_limited) return;
-    const line = try arena.print("response hit provider length limit; output may be incomplete", .{});
-    try hooks.push_system_notice(hooks.ctx, line);
+    try hooks.pushWarningNotice("The response hit the provider's length limit and may be incomplete.");
 }
 
 /// Shows a cut reply's text, then `blocker`, which says why the turn stopped,
@@ -906,7 +905,7 @@ const NoticeCapture = struct {
         };
     }
 
-    fn appendRuntimeContext(_: *anyopaque, _: Allocator, _: *std.ArrayList(ChatMessage)) !void {}
+    fn appendRuntimeContext(_: *anyopaque, _: Allocator, _: []const u8, _: *std.ArrayList(ChatMessage)) !void {}
 
     fn requestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: PermissionMode, _: []const PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8, _: ?[]const u8) !command_admission.PermissionOutcome {
         return .{
@@ -1036,7 +1035,7 @@ const StreamCapture = struct {
         };
     }
 
-    fn noopAppendRuntimeContext(_: *anyopaque, _: Allocator, _: *std.ArrayList(ChatMessage)) !void {}
+    fn noopAppendRuntimeContext(_: *anyopaque, _: Allocator, _: []const u8, _: *std.ArrayList(ChatMessage)) !void {}
     fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: PermissionMode, _: []const PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8, _: ?[]const u8) !command_admission.PermissionOutcome {
         return .{ .decision = .once, .execution_authority = .ordinary };
     }
@@ -1649,10 +1648,18 @@ test "streamed presentation preserves ANSI OSC 8 code fence and table spans" {
     const test_paths_module = try alloc.print("-Mtest_paths={s}", .{test_paths_path});
     defer alloc.free(test_paths_module);
 
+    // `debug_trace.zig` reads `trace_log` from `build_options`; the nested
+    // compile is a fx build with the trace log on.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build_options.zig", .data = "pub const trace_log = true;\n" });
+    const build_options_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "build_options.zig");
+    defer alloc.free(build_options_path);
+    const build_options_module = try alloc.print("-Mbuild_options={s}", .{build_options_path});
+    defer alloc.free(build_options_module);
+
     const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
     defer alloc.free(cwd);
     const result = try std.process.run(alloc, std.testing.io, .{
-        .argv = &.{ "zig", "test", "-lc", "--dep", "test_paths", "-Mroot=src/main.zig", test_paths_module, "--test-filter", ansi_span_test_name },
+        .argv = &.{ "zig", "test", "-lc", "--dep", "test_paths", "--dep", "build_options", "-Mroot=src/main.zig", test_paths_module, build_options_module, "--test-filter", ansi_span_test_name },
         .cwd = .{ .path = cwd },
         .environ_map = &environ,
         .stdout_limit = .limited(64 * 1024),
@@ -2435,13 +2442,10 @@ test "emitProviderLengthNotice emits exact length notice" {
     defer capture.deinit(alloc);
     const hooks = capture.hooks();
 
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-
-    try emitProviderLengthNotice(&hooks, arena_state.allocator(), .length_limited);
+    try emitProviderLengthNotice(&hooks, .length_limited);
 
     try std.testing.expectEqual(@as(usize, 1), capture.notices.items.len);
-    try std.testing.expectEqualStrings("response hit provider length limit; output may be incomplete", capture.notices.items[0]);
+    try std.testing.expectEqualStrings("The response hit the provider's length limit and may be incomplete.", capture.notices.items[0]);
 }
 
 test "emitProviderLengthNotice ignores non-length finish reasons" {
@@ -2450,10 +2454,7 @@ test "emitProviderLengthNotice ignores non-length finish reasons" {
     defer capture.deinit(alloc);
     const hooks = capture.hooks();
 
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-
-    try emitProviderLengthNotice(&hooks, arena_state.allocator(), .completed);
+    try emitProviderLengthNotice(&hooks, .completed);
 
     try std.testing.expectEqual(@as(usize, 0), capture.notices.items.len);
 }

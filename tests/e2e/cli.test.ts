@@ -1765,6 +1765,53 @@ describe("cli: status", () => {
     TIMEOUT,
   );
 
+  test("shortcut edits use key identity and preserve unrelated bindings", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fx-shortcut-identity-"));
+    try {
+      const profile = join(home, ".fx");
+      mkdirSync(profile);
+      const file = join(profile, "settings.json");
+      writeFileSync(file, JSON.stringify({ theme: "light", shortcuts: { "Alt+Ctrl+K": "/model", F8: "/model" } }));
+      const config = (...args: string[]) => runFx(["config", ...args], {
+        cwd: home, env: { ...NO_GATEWAY_AUTH, ...NO_SETTING_ENV, HOME: home, FX_HOME: profile },
+      });
+      const original = readFileSync(file, "utf8");
+      const restricted = await config("set", "shortcuts.f9", "/permissions ask");
+      expect(restricted.code).toBe(2);
+      expect(restricted.stderr).toContain("not available from shortcuts");
+      expect(readFileSync(file, "utf8")).toBe(original);
+      const reserved = await config("set", "shortcuts.ctrl+c", "/fast");
+      expect(reserved.code).toBe(2);
+      expect(reserved.stderr).toContain("ctrl+c is reserved for fx: interrupts a running turn and exits");
+      expect(reserved.stderr).not.toContain("use a key chord");
+      expect(readFileSync(file, "utf8")).toBe(original);
+      const key = "shortcuts.ctrl+alt+k";
+      expect((await config("get", key)).code).toBe(0);
+      const alias = await config("get", "shortcuts.CTRL+ALT+k");
+      expect([alias.code, alias.stdout.trim()]).toEqual([0, "/model"]);
+      const before = readFileSync(file, "utf8");
+      const occupied = await config("set", key, "/fast");
+      expect(occupied.code).toBe(1);
+      expect(occupied.stderr).toContain("already has a shortcut");
+      expect(readFileSync(file, "utf8")).toBe(before);
+      expect((await config("unset", key)).code).toBe(0);
+      expect((await config("get", key)).code).toBe(1);
+      expect((await config("set", key, "/fast")).code).toBe(0);
+      expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({
+        theme: "light", shortcuts: { F8: "/model", "ctrl+alt+k": "/fast" },
+      });
+      const preset = JSON.stringify({ provider: "gateway", model: "openai/gpt-5", effort: "high", fast_mode: true });
+      expect((await config("set", "shortcuts.ctrl+1", preset)).code).toBe(0);
+      expect((await config("get", "shortcuts.ctrl+1.model")).stdout.trim()).toBe("openai/gpt-5");
+      expect((await config("unset", "shortcuts.ctrl+1")).code).toBe(0);
+      expect((await config("unset", key)).code).toBe(0);
+      expect((await config("unset", "shortcuts.F8")).code).toBe(0);
+      expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ theme: "light" });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
   test(
     "tool placement moves built-in tools through fx config and --tool-placement",
     async () => {
@@ -8095,4 +8142,84 @@ describe("fx login Token Pass status", () => {
       rmSync(home, { recursive: true, force: true });
     }
   }, TIMEOUT);
+
+  test(
+    "fx ask --model names the requested model in turn context and keeps the stable prefix unchanged",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace);
+      const modelA = "openai/gpt-5.5";
+      const modelB = "anthropic/claude-opus-4.6";
+      const modelC = "anthropic/claude-sonnet-4.6";
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("ASK_MODEL_A_OK"),
+        fakeGatewayFinalText("ASK_MODEL_B_OK"),
+        fakeGatewayFinalText("ASK_MODEL_C_OK"),
+      ], {
+        models: [
+          { id: modelA, type: "language", tags: ["tool-use"] },
+          { id: modelB, type: "language", tags: ["tool-use"] },
+          { id: modelC, type: "language", tags: ["tool-use"] },
+        ],
+      });
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "fake-ask-model-id-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const askA = await runFx(["ask", "--json", "--no-save", "--model", modelA, "Which model are you?"], {
+          cwd: workspace,
+          env,
+          timeoutMs: TIMEOUT,
+        });
+        expect(askA.code, askA.stderr).toBe(0);
+        const askB = await runFx(["ask", "--json", "--no-save", "--model", modelB, "Which model are you?"], {
+          cwd: workspace,
+          env,
+          timeoutMs: TIMEOUT,
+        });
+        expect(askB.code, askB.stderr).toBe(0);
+        const askC = await runFx(["ask", "--json", "--no-save", "--model", modelC, "Which model are you?"], {
+          cwd: workspace,
+          env,
+          timeoutMs: TIMEOUT,
+        });
+        expect(askC.code, askC.stderr).toBe(0);
+        expect(gateway.requests).toHaveLength(3);
+
+        const reqA = JSON.parse(gateway.requests[0]!.body) as { prompt: Array<{ role: string; content: unknown; providerOptions?: unknown }> };
+        const reqB = JSON.parse(gateway.requests[1]!.body) as { prompt: Array<{ role: string; content: unknown; providerOptions?: unknown }> };
+        const reqC = JSON.parse(gateway.requests[2]!.body) as { prompt: Array<{ role: string; content: unknown; providerOptions?: unknown }> };
+        const sysText = (content: unknown) => typeof content === "string" ? content : JSON.stringify(content);
+        const turnIdxA = reqA.prompt.findIndex((m) => m.role === "system" && sysText(m.content).includes("<fx-turn-context>"));
+        const turnIdxB = reqB.prompt.findIndex((m) => m.role === "system" && sysText(m.content).includes("<fx-turn-context>"));
+        const turnIdxC = reqC.prompt.findIndex((m) => m.role === "system" && sysText(m.content).includes("<fx-turn-context>"));
+        expect(turnIdxA).toBeGreaterThan(0);
+        expect(turnIdxB).toBe(turnIdxA);
+        expect(turnIdxC).toBe(turnIdxA);
+
+        const turnA = sysText(reqA.prompt[turnIdxA]!.content);
+        const turnB = sysText(reqB.prompt[turnIdxB]!.content);
+        const turnC = sysText(reqC.prompt[turnIdxC]!.content);
+        expect(turnA).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelA}\\n`));
+        expect(turnB).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelB}\\n`));
+        expect(turnC).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${modelC}\\n`));
+        // The stable prefix text before <fx-turn-context> stays identical across model families,
+        // and within the same caching family even the cache breakpoints stay byte-for-byte identical.
+        expect(reqB.prompt.slice(0, turnIdxB).map((m) => m.content)).toEqual(reqA.prompt.slice(0, turnIdxA).map((m) => m.content));
+        expect(JSON.stringify(reqC.prompt.slice(0, turnIdxC))).toBe(JSON.stringify(reqB.prompt.slice(0, turnIdxB)));
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
 });

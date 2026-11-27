@@ -430,7 +430,7 @@ async function compactAndWait(tui: TmuxSession, root: FixtureRoot, timeoutMs: nu
   const after = readFileSync(eventsPath, "utf8");
   expect(after.startsWith(before)).toBe(true);
   expect(compactionCount(after)).toBe(checkpoints + 1);
-  expect(pane).not.toContain("request failed:");
+  expect(pane).not.toContain("Request failed:");
   expect(pane).not.toContain("Compaction failed.");
 }
 
@@ -8829,9 +8829,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath, isolated: true });
       await tui.waitForComposer(15_000);
       await tui.sendText("Read sentinel.txt six times, then finish.");
-      const automatic = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("REPLAY_TURN_DONE") || text.includes("request failed:")), 30_000);
+      const automatic = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("REPLAY_TURN_DONE") || text.includes("Request failed:")), 30_000);
       expect(automatic).toContain("REPLAY_TURN_DONE");
-      expect(automatic).not.toContain("request failed:");
+      expect(automatic).not.toContain("Request failed:");
       expect(summaries).toBe(1);
       await tui.sendText("Remember the result and acknowledge this short follow-up.");
       await tui.waitForPane((text) => text.includes("RECENT_TURN_DONE") && hasEmptyComposer(text) && turnSettled(text), 15_000);
@@ -9048,8 +9048,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
         await tui.waitForComposer(15000);
         await tui.sendText("Run the fixture command, then search its output.");
-        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("READ_TEXT_COMPLETE") || text.includes("request failed:")), 30000);
-        expect(pane).not.toContain("request failed:");
+        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("READ_TEXT_COMPLETE") || text.includes("Request failed:")), 30000);
+        expect(pane).not.toContain("Request failed:");
         expect(pane).toContain("READ_TEXT_COMPLETE");
         expect(readOutput).toContain(`${marker} found`);
         expect(readOutput).not.toContain("must be an object");
@@ -9113,8 +9113,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
         await tui.waitForComposer(15000);
         await tui.sendText("Run the fixture command, then search its output for a long text.");
-        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("READ_LONG_COMPLETE") || text.includes("request failed:")), 30000);
-        expect(pane).not.toContain("request failed:");
+        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("READ_LONG_COMPLETE") || text.includes("Request failed:")), 30000);
+        expect(pane).not.toContain("Request failed:");
         expect(pane).toContain("READ_LONG_COMPLETE");
         expect(readOutput).not.toContain("must be an object");
         // The row says what the call does, as it does for a short query, and
@@ -9241,8 +9241,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
           await tui.waitForComposer(15000);
           await tui.sendText("Run and retrieve the fixture output, then read the small follow-up file.");
-          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("RETRIEVAL_TURN_COMPLETE") || text.includes("request failed:")), 30000);
-          expect(pane).not.toContain("request failed:");
+          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("RETRIEVAL_TURN_COMPLETE") || text.includes("Request failed:")), 30000);
+          expect(pane).not.toContain("Request failed:");
           expect(pane).toContain("RETRIEVAL_TURN_COMPLETE");
           // The read names the command whose saved output it searches, by the
           // short form the command's own row shows.
@@ -9657,8 +9657,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const before = readFileSync(logPath, "utf8");
           expect(before).toContain('"reason":"cancelled"');
           await tui.sendText("Read the follow-up file and briefly acknowledge it. Do not rerun the child.");
-          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("CANCEL_FOLLOWUP_COMPLETE") || text.includes("request failed:")), 20000);
-          expect(pane).not.toContain("request failed:");
+          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("CANCEL_FOLLOWUP_COMPLETE") || text.includes("Request failed:")), 20000);
+          expect(pane).not.toContain("Request failed:");
           expect(pane).toContain("CANCEL_FOLLOWUP_COMPLETE");
           if (trigger === "manual") {
             await compactAndWait(tui, root, 20000);
@@ -15019,7 +15019,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       expect(json.output).toContain("visible partial output");
       expect(json.output).not.toContain("did not run them");
       expect(json.tool_calls).toEqual([]);
-      expect(result.stderr).toContain("response hit provider length limit");
+      expect(result.stderr).toContain("[notice] The response hit the provider's length limit and may be incomplete.");
       expect(result.stderr).toContain("3 times in a row before its tool calls were complete, so fx did not run them.");
       expect(existsSync(sentinelPath)).toBe(false);
       // Two notes, then the third cut reply in a row ends the turn.
@@ -15061,7 +15061,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
 
       expect(result.code).toBe(1);
       expect(result.stdout).toContain("visible partial output");
-      expect(result.stderr).toContain("response hit provider length limit");
+      expect(result.stderr).toContain("[notice] The response hit the provider's length limit and may be incomplete.");
       expect(existsSync(sentinelPath)).toBe(false);
       // Two notes, then the third cut reply in a row ends the turn.
       expect(gateway.requestCount()).toBe(3);
@@ -17276,3 +17276,127 @@ test("main's own quiet command gets the notice and no relay, since main has no p
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 45_000);
+
+test("a subagent started with its own model names that child model in its turn context", async () => {
+  const root = createFixtureRoot("subagent-own-model");
+  const childModel = "anthropic/claude-opus-4.6";
+  const childPrompt = "SUBAGENT_OWN_MODEL_TASK";
+  const gateway = startDynamicFakeGateway((body) => {
+    const latest = latestUserText(body);
+    if (latest.includes(childPrompt) && !latest.includes("Start the helper")) {
+      return fakeGatewayFinalText("SUBAGENT_MODEL_REPLY");
+    }
+    if (latest.includes(REPORT_HEADER) || hasToolResultAnywhere(body, "child-model-call")) {
+      return fakeGatewayFinalText("MAIN_SAW_CHILD_MODEL");
+    }
+    return fakeGatewayToolCall("child-model-call", "subagent", {
+      request: {
+        action: "message",
+        agent: "helper",
+        message: childPrompt,
+        model: childModel,
+      },
+    });
+  }, {
+    models: [
+      { id: MODEL, type: "language", tags: ["tool-use"] },
+      { id: childModel, type: "language", tags: ["tool-use"] },
+    ],
+  });
+
+  try {
+    const result = await runFx(["ask", "--json", "--full-access", "Start the helper on its own model."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+      timeoutMs: 30_000,
+    });
+    expect(result.code, result.stderr).toBe(0);
+    expect(parseAskJson(result.stdout).output).toContain("MAIN_SAW_CHILD_MODEL");
+
+    const childReq = gateway.requests.find((request) => request.headers.get("ai-language-model-id") === childModel);
+    const mainReq = gateway.requests.find((request) => request.headers.get("ai-language-model-id") === MODEL);
+    expect(childReq).toBeDefined();
+    expect(mainReq).toBeDefined();
+
+    const childSystem = gatewayRequest(childReq!.body).prompt
+      .filter((m) => m.role === "system")
+      .map((m) => contentText(m.content))
+      .join("\n");
+    const mainSystem = gatewayRequest(mainReq!.body).prompt
+      .filter((m) => m.role === "system")
+      .map((m) => contentText(m.content))
+      .join("\n");
+
+    expect(childSystem).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${childModel}\\n`));
+    expect(childSystem).not.toContain(`model: ${MODEL}`);
+    expect(mainSystem).toMatch(new RegExp(`date_utc: \\d{4}-\\d{2}-\\d{2}\\nmodel: ${MODEL}\\n`));
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45_000);
+
+test("a repeated subagent message with the same model and effort is delivered and completes", async () => {
+  const root = createFixtureRoot("subagent-repeat-same-settings");
+  const childModel = "anthropic/claude-opus-4.6";
+  let secondSendToolResult = "";
+  const sendWithSettings = (id: string, message: string) =>
+    fakeGatewaySse([
+      {
+        type: "tool-call",
+        toolCallId: id,
+        toolName: "subagent",
+        input: {
+          request: {
+            action: "message",
+            agent: "reviewer",
+            message,
+            model: childModel,
+            effort: "low",
+          },
+        },
+      },
+      finishWithUsage("tool-calls", 100, 10, 1),
+    ]);
+  const gateway = startDynamicFakeGateway((body) => {
+    if (!body.includes('"name":"subagent"')) {
+      if (body.includes("SECOND_REVIEW_TASK")) return fakeGatewayFinalText("REVIEW_TWO_DONE");
+      return fakeGatewayFinalText("REVIEW_ONE_DONE");
+    }
+    if (hasCurrentToolResult(body, "send_two")) {
+      secondSendToolResult = toolResultOutput(body, "send_two");
+      return fakeGatewayFinalText("SECOND_DISPATCHED");
+    }
+    const reports = allReports(body);
+    if (reports.some((report) => String(report.output).includes("REVIEW_TWO_DONE"))) {
+      return fakeGatewayFinalText("ALL_REVIEWS_DONE");
+    }
+    if (reports.some((report) => String(report.output).includes("REVIEW_ONE_DONE"))) {
+      return sendWithSettings("send_two", "SECOND_REVIEW_TASK");
+    }
+    if (hasCurrentToolResult(body, "send_one")) return fakeGatewayFinalText("FIRST_DISPATCHED");
+    return sendWithSettings("send_one", "FIRST_REVIEW_TASK");
+  }, {
+    classifierDecision: "clear",
+    models: [
+      { id: MODEL, type: "language", tags: ["tool-use"] },
+      { id: childModel, type: "language", tags: ["tool-use"] },
+    ],
+  });
+
+  try {
+    const result = await runFx(["ask", "--yolo", "--json", "--", "Send two tasks to reviewer with the same model and effort."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+      timeoutMs: 40_000,
+    });
+    expect(result.code).toBe(0);
+    expect(secondSendToolResult).toContain('"ok":true');
+    expect(secondSendToolResult).not.toContain("override_after_create");
+    const json = parseAskJson(result.stdout);
+    expect(json.final_output).toBe("ALL_REVIEWS_DONE");
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 60_000);
