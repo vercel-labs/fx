@@ -86,7 +86,7 @@ const MODEL = "openai/gpt-5.5";
 const CORRECTION = "The previous candidate used a different language";
 const CONTROL = "<response_language_control>";
 // The notice fx prints when it ends a turn for its language.
-const FAILURE = "The model response used a different language than your request";
+const FAILURE = "The model answered in a different language.\n└ Retry, or name the language in your message.";
 const tlaDir = join(TLA_ROOT, "agent_runtime");
 
 const english = (text: string, labels: Partial<Labels> = {}): Prompt => ({
