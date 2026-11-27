@@ -1607,9 +1607,7 @@ fn assignmentValueSpan(
     if (text[quote_at] == '"' or text[quote_at] == '\'') {
         const quote = text[quote_at];
         const content_start = quote_at + 1;
-        var end = content_start;
-        while (end < text.len and text[end] != '\n' and text[end] != '\r' and text[end] != quote) : (end += 1) {}
-        if (escaped and end < text.len and text[end] == quote and text[end - 1] == '\\') end -= 1;
+        const end = quotedAssignmentValueEnd(text, content_start, quote, escaped);
         const value_len = end - content_start;
         if (value_len >= 1) return .{ .prefix_end = content_start, .value_len = value_len };
         return null;
@@ -1629,6 +1627,29 @@ fn assignmentValueSpan(
     while (end < text.len and text[end] != '\n' and text[end] != '\r' and !std.ascii.isWhitespace(text[end]) and text[end] != '"' and text[end] != '\'') : (end += 1) {}
     if (end == value_start) return null;
     return .{ .prefix_end = value_start, .value_len = end - value_start };
+}
+
+fn quotedAssignmentValueEnd(text: []const u8, start: usize, quote: u8, json_encoded: bool) usize {
+    var backslashes: usize = 0;
+    var end = start;
+    while (end < text.len and text[end] != '\n' and text[end] != '\r') : (end += 1) {
+        const byte = text[end];
+        if (byte == quote) {
+            if (quote == '\'') return if (json_encoded and backslashes > 0) end - 1 else end;
+            if (!json_encoded) {
+                if (backslashes % 2 == 0) return end;
+            } else {
+                // A raw JSON quote ends the string. Otherwise one backslash
+                // encodes the quote, and every remaining pair is a shell backslash.
+                if (backslashes % 2 == 0) return end;
+                if (backslashes % 4 == 1) return end - 1;
+            }
+        } else if (json_encoded and byte == '"' and backslashes % 2 == 0) {
+            return end;
+        }
+        backslashes = if (byte == '\\') backslashes + 1 else 0;
+    }
+    return end;
 }
 
 fn sensitiveAssignmentKey(key: []const u8) bool {
@@ -1877,6 +1898,25 @@ test "maskSecrets masks a double-quoted assignment inside a JSON string" {
             "{\"output_delta\":\"TOKEN=\\\"[redacted]\\\"\\n\"}",
         masked,
     );
+}
+
+test "maskSecrets masks a quoted assignment through an escaped inner quote" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const input =
+        \\API_KEY="before\"after" ; echo ok
+        \\{"command":"API_KEY=\"before\\\"after\" ; echo ok"}
+        \\{"command":"API_KEY=\"before\\\\\" ; echo ok"}
+        \\{"command":"API_KEY=\"before\\\"after
+    ;
+    const expected =
+        \\API_KEY="[redacted]" ; echo ok
+        \\{"command":"API_KEY=\"[redacted]\" ; echo ok"}
+        \\{"command":"API_KEY=\"[redacted]\" ; echo ok"}
+        \\{"command":"API_KEY=\"[redacted]
+    ;
+    try std.testing.expectEqualStrings(expected, try maskSecretsCutShort(arena, input));
 }
 
 test "maskSecrets preserves non-sensitive quoted assignments" {
