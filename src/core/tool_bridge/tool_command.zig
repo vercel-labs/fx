@@ -44,7 +44,7 @@ pub const Command = union(enum) {
         };
     }
 
-    pub fn readsStdin(self: Command) bool {
+    fn readsStdin(self: Command) bool {
         return switch (self) {
             .edit, .write => true,
             .skill_list, .skill_open, .agent_message, .agent_wait, .agent_status, .agent_stop, .agent_close => false,

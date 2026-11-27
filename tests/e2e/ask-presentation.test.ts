@@ -3867,6 +3867,40 @@ describe("slice 6 break-it", () => {
     expect(out).toContain("out=fx tool skill open: resource pipe in skill demo is not a regular file (a folder, a link, a pipe, or a device); name a regular file inside the skill folder.");
     expect(out).not.toContain("SkillResourceNotRegularFile");
   }, 15_000);
+
+  test("attack 12 (location): skill open skill:x exits 6 with the location message, not an MCP failure", async () => {
+    const root = createRoot();
+    const skillDir = join(root.workspace, ".fx", "skills", "demo");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(
+      join(skillDir, "SKILL.md"),
+      "---\nname: demo\ndescription: Demo skill\n---\n\nBODY\n",
+    );
+
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("location_bash", "bash", {
+        command: [
+          'out_loc=$(skill open skill:x 2>&1); rc_loc=$?',
+          'printf "rc=%d\\\\nout=%s\\\\n" "$rc_loc" "$out_loc"',
+        ].join("\n"),
+      }),
+      fakeGatewayFinalText("Location check done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--quiet", "--yolo", ...BASH_SETTING, "Open a malformed skill location."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: 10_000 },
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic:");
+    const out = (JSON.parse(toolResultText(gateway.requests[1]!.body, "location_bash")) as { value: string }).value;
+    expect(out).toContain("rc=6");
+    expect(out).toContain("out=fx tool skill open: skill:x is not a skill location fx can read; use a name from skill list.");
+    expect(out).not.toContain("The MCP call failed");
+    expect(out).not.toContain("InvalidSkillLocation");
+  }, 15_000);
 });
 
 

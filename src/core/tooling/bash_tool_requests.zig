@@ -113,20 +113,22 @@ pub fn toolCall(
     }
 }
 
+const truncated_fmt = "[skill list truncated at {d}-byte limit; {d} more omitted]\n";
+
 /// The skill list a bash program reads: one `NAME<TAB>DESCRIPTION` line per skill,
-/// kept within `cap` bytes. Skills that do not fit are left out, and the last line
-/// counts them.
-pub fn skillListText(arena: Allocator, skills: []const skill_contract.Skill, cap: usize) ![]const u8 {
+/// kept within `cap` bytes. A description longer than `description_bytes` is cut.
+/// Skills that do not fit are left out, and the last line counts them.
+pub fn skillListText(arena: Allocator, skills: []const skill_contract.Skill, cap: usize, description_bytes: usize) ![]const u8 {
     // Reserve room for the worst-case truncation line so total bytes never exceed `cap`.
-    const max_notice = "[skill list truncated at 32768-byte limit; 18446744073709551615 more omitted]\n";
+    const max_notice = std.fmt.comptimePrint(truncated_fmt, .{ std.math.maxInt(usize), std.math.maxInt(usize) });
     var out: std.Io.Writer.Allocating = .init(arena);
     var written_count: usize = 0;
     var truncated = false;
     for (skills) |skill| {
         var line: std.Io.Writer.Allocating = .init(arena);
-        try writeSingleLineField(&line.writer, skill.name);
+        try line.writer.writeAll((try text_utils.encodeTerminalSafeInline(arena, skill.name, skill_contract.max_name_bytes)).bytes);
         try line.writer.writeByte('\t');
-        try writeSingleLineField(&line.writer, skill.description);
+        try line.writer.writeAll((try text_utils.encodeTerminalSafeInline(arena, skill.description, description_bytes)).bytes);
         try line.writer.writeByte('\n');
         const line_bytes = line.written();
         if (out.written().len + line_bytes.len + max_notice.len > cap) {
@@ -138,20 +140,9 @@ pub fn skillListText(arena: Allocator, skills: []const skill_contract.Skill, cap
     }
     if (truncated) {
         const omitted = skills.len - written_count;
-        try out.writer.print("[skill list truncated at {d}-byte limit; {d} more omitted]\n", .{ cap, omitted });
+        try out.writer.print(truncated_fmt, .{ cap, omitted });
     }
     return out.written();
-}
-
-fn writeSingleLineField(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
-    var start: usize = 0;
-    for (text, 0..) |byte, index| {
-        if (byte != '\t' and byte != '\n' and byte != '\r') continue;
-        if (index > start) try w.print("{f}", .{text_utils.terminalSafe(text[start..index])});
-        try w.writeByte(' ');
-        start = index + 1;
-    }
-    if (start < text.len) try w.print("{f}", .{text_utils.terminalSafe(text[start..])});
 }
 
 /// The longest encoded skill name or resource that a failure text shows. A
@@ -176,6 +167,7 @@ pub fn skillOpenFailureText(arena: Allocator, raw_name: []const u8, raw_resource
         error.InvalidSkillResourcePath => arena.print("resource {s} is not a valid path in skill {s}; use a relative path inside the skill folder with no .. parts.", .{ shown, name }),
         error.IsDir => arena.print("resource {s} is a folder, not a file, in skill {s}; name a file inside it.", .{ shown, name }),
         error.SkillResourceNotRegularFile => arena.print("resource {s} in skill {s} is not a regular file (a folder, a link, a pipe, or a device); name a regular file inside the skill folder.", .{ shown, name }),
+        error.InvalidSkillLocation, error.StaleSkillLocation => arena.print("{s} is not a skill location fx can read; use a name from skill list.", .{name}),
         error.AccessDenied => arena.print("resource {s} in skill {s} cannot be read: permission denied; check the file's permissions.", .{ shown, name }),
         error.SkillFileLimitExceeded => arena.print("resource {s} in skill {s} is larger than the skill_file_bytes limit; raise skill_file_bytes to read it.", .{ shown, name }),
         error.SkillResourceChanged, error.ChangedSkillWasLoaded => arena.print("resource {s} in skill {s} changed while fx read it; open it again.", .{ shown, name }),
@@ -249,6 +241,29 @@ test "bridged skill open shows a program's name and resource terminal-safe and c
     const shown_resource = resource_text[resource_prefix.len..end];
     try std.testing.expect(shown_resource.len <= 200);
     try std.testing.expect(std.mem.findScalar(u8, shown_resource, 0x1b) == null);
+}
+
+test "bridged skill open names a skill location fx cannot read, with the next step" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const expected = "skill:x is not a skill location fx can read; use a name from skill list.";
+    try std.testing.expectEqualStrings(expected, try skillOpenFailureText(arena, "skill:x", null, error.InvalidSkillLocation));
+    try std.testing.expectEqualStrings(expected, try skillOpenFailureText(arena, "skill:x", null, error.StaleSkillLocation));
+}
+
+test "bridged skill list cuts a description longer than the context limit, with an ellipsis" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var long_buf: [300]u8 = undefined;
+    @memset(&long_buf, 'd');
+    const skills = [_]skill_contract.Skill{.{ .name = "alpha", .description = &long_buf, .path = "/workspace/.fx/skills/alpha/SKILL.md", .source = .workspace_fx }};
+    const out = try skillListText(arena, &skills, 32 * 1024, 64);
+    const tab = std.mem.findScalar(u8, out, '\t') orelse return error.TestUnexpectedResult;
+    const description = out[tab + 1 .. out.len - 1];
+    try std.testing.expect(description.len <= 64);
+    try std.testing.expect(std.mem.endsWith(u8, description, "..."));
 }
 
 test "bridged skill open names a resource that is not a regular file, with the next step" {

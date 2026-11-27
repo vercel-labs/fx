@@ -1568,7 +1568,8 @@ fn runBridgeSkillList(ctx: Context, arena: Allocator) anyerror!mcp_call_capabili
         skill_runtime.traceDiagnostics("skill_list", discovery.diagnostics);
         break :blk discovery.skills;
     };
-    return .{ .status = .ok, .bytes = try bash_tool_requests.skillListText(arena, skills, toolbox.max_menu_bytes) };
+    const description_bytes = ctx.context_limits.skill_description_bytes.effectiveBytes();
+    return .{ .status = .ok, .bytes = try bash_tool_requests.skillListText(arena, skills, toolbox.max_menu_bytes, description_bytes) };
 }
 
 fn runBridgeSkillOpen(
@@ -1583,7 +1584,10 @@ fn runBridgeSkillOpen(
     var resolved_location: ?[]const u8 = null;
 
     if (ctx.skill_locations) |locations| {
-        const maybe_path = try locations.resolve(arena, req.name);
+        const maybe_path = locations.resolve(arena, req.name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .status = .tool_error, .bytes = try bash_tool_requests.skillOpenFailureText(arena, req.name, req.resource, err) },
+        };
         if (std.mem.startsWith(u8, req.name, "skill:") or !std.mem.eql(u8, maybe_path, req.name)) {
             by_location = true;
             resolved_location = maybe_path;
@@ -2127,12 +2131,11 @@ fn fileToolActivityKind(tool: []const u8) types.ToolActivityKind {
     return if (std.mem.eql(u8, tool, "write_file")) .write else .edit;
 }
 
-/// A file's name in a row: the path, shortened at a character boundary when long.
+/// A file's or a program's name in a row: terminal-safe and on one line, and
+/// shortened at a token boundary when long. It is escaped here, once, so a row
+/// shows the name as the program wrote it.
 fn rowPath(arena: Allocator, path: []const u8) Allocator.Error![]const u8 {
-    if (path.len <= max_row_path_bytes) return path;
-    var end: usize = max_row_path_bytes - "...".len;
-    while (end > 0 and !std.unicode.utf8ValidateSlice(path[0..end])) end -= 1;
-    return arena.print("{s}...", .{path[0..end]});
+    return (try text_utils.encodeTerminalSafeInline(arena, path, max_row_path_bytes)).bytes;
 }
 
 /// The arguments a file row carries: the path alone, never the change's content.
@@ -3525,6 +3528,54 @@ test "bridged skill open names a bad resource path, a missing resource, and a fo
         try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
         try std.testing.expectEqualStrings(case.expected, outcome.bytes);
     }
+}
+
+test "a row path shows a program's escapes once, and a clean path is unchanged" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("a\\x1b[31m b.txt", try rowPath(arena, "a\x1b[31m\nb.txt"));
+    try std.testing.expectEqualStrings("src/main.zig", try rowPath(arena, "src/main.zig"));
+}
+
+test "a bridged skill row shows a program's name escaped once, never raw" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace/.fx/skills");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace);
+    const skills_dir = try std.Io.Dir.path.join(arena, &.{ workspace, ".fx", "skills" });
+    try setTestHome(null);
+    defer io_mod.resetEnvironForTest();
+
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = workspace, .skills_dir = skills_dir, .permission_mode = .yolo, .cancel_flag = &cancel };
+    defer rt.deinit(alloc);
+    var rows = RowRecorder{ .alloc = alloc };
+    defer rows.deinit();
+    var ctx = rt.context();
+    ctx.nested_tool_lifecycle = .{ .context = @ptrCast(&rows), .push_fn = RowRecorder.push, .save_bridge_call_fn = RowRecorder.save };
+    ctx.output_chunk_lifecycle_id = .{ .turn_id = 4, .call_id = "shell-call-1" };
+    var state = McpCallBridgeState{ .runtime = ctx, .file_ops = true };
+
+    const allowed = switch (try authorizeBridgeBashTool(@ptrCast(&state), arena, "fx-mcp-call-48", .{ .skill_open = .{ .name = "bad\x1b[31m\nname" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    _ = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-48", "skill open", "", allowed, &cancel);
+
+    var shown_once = false;
+    // The row's own styling escapes are fine; the program's raw escape must not appear.
+    for (rows.lines.items) |line| {
+        try std.testing.expect(std.mem.find(u8, line, "bad\x1b") == null);
+        try std.testing.expect(std.mem.find(u8, line, "\\\\x1b") == null);
+        if (std.mem.find(u8, line, "bad\\x1b[31m name") != null) shown_once = true;
+    }
+    try std.testing.expect(shown_once);
 }
 
 const RunCommandBackendState = struct {

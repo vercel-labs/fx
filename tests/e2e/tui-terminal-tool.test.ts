@@ -1769,6 +1769,10 @@ test.skipIf(!tmuxAvailable())(
     // Raw ESC before AGENT_ESC / SKILL_ESC must not reach screen as an ANSI escape sequence
     expect(escapes).not.toContain("\x1b[31mAGENT_ESC");
     expect(escapes).not.toContain("\x1b[31mSKILL_ESC");
+    // The escape shows once, as escaped text: never doubled into a second backslash.
+    const grid = (await active.capturePaneGrid()).join("\n");
+    expect(grid).toContain("SKILL_ESC");
+    expect(grid).not.toContain("\\\\x1b");
 
     await active.sendText("/quit");
     expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);

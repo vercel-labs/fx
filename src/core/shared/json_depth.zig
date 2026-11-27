@@ -1,7 +1,8 @@
 //! A nesting limit for JSON that a provider sends, and for an MCP config file
 //! that `fx mcp add` and `remove` rewrite, checked on the raw text before fx
-//! parses it. std.json parses any depth, but std.json.Stringify stops past
-//! 256 levels in safe builds, and a recursive walk can run out of stack, so
+//! stringifies or walks the parsed value. std.json parses any depth, but
+//! std.json.Stringify stops past 256 levels in safe builds, and a recursive
+//! walk can run out of stack, so
 //! text deeper than this must never reach either one.
 const std = @import("std");
 const text_utils = @import("text_utils.zig");
