@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const command_policy = @import("command_policy.zig");
+const diff = @import("../output/diff.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
@@ -856,27 +857,32 @@ fn isPathTokenByte(byte: u8) bool {
     };
 }
 
-/// `encoded_cwd` is the terminal-safe directory the command runs in, or null
-/// when it runs in the workspace root.
+/// `cwd` is the raw resolved directory, or null when it is the workspace root.
 /// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatRunCommandPermissionLabel(
     alloc: Allocator,
     command: []const u8,
-    encoded_cwd: ?[]const u8,
+    cwd: ?[]const u8,
 ) ![]const u8 {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
-    const encoded = try text_utils.encodeTerminalSafe(
+    const prefix = "shell.run ";
+    const cwd_separator = " @ ";
+    const suffix = try commandApprovalLabelSuffix(scratch, "shell", command);
+    const fixed_bytes = prefix.len + suffix.len + if (cwd != null) cwd_separator.len else 0;
+    if (fixed_bytes > diff.max_encoded_label_bytes) return error.LabelTooLong;
+    const preview_bytes = diff.max_encoded_label_bytes - fixed_bytes;
+    const encoded_command = try text_utils.encodeTerminalSafe(
         scratch,
         command,
-        max_run_command_activity_bytes,
+        @min(max_run_command_activity_bytes, preview_bytes),
     );
-    const suffix = try commandApprovalLabelSuffix(scratch, "shell", command);
-    if (encoded_cwd) |cwd| {
-        return alloc.print("shell.run {s} @ {s}{s}", .{ encoded.bytes, cwd, suffix });
+    if (cwd) |path| {
+        const encoded_cwd = try text_utils.encodeTerminalSafe(scratch, path, preview_bytes - encoded_command.bytes.len);
+        return alloc.print("{s}{s}{s}{s}{s}", .{ prefix, encoded_command.bytes, cwd_separator, encoded_cwd.bytes, suffix });
     }
-    return alloc.print("shell.run {s}{s}", .{ encoded.bytes, suffix });
+    return alloc.print("{s}{s}{s}", .{ prefix, encoded_command.bytes, suffix });
 }
 
 pub fn isAdvertisedDynamicMcpName(registry: tool_dispatch.Registry, name: []const u8, advertised: []const []const u8) bool {
@@ -1794,6 +1800,24 @@ test "tool presentation formats permission labels" {
     defer alloc.free(assigned);
     try expectContains(assigned, "risk: command may remove files forcefully");
     try expectContains(assigned, "safer: inspect targets first");
+}
+
+test "shell approval label budgets command, cwd, and risk suffix together" {
+    const alloc = std.testing.allocator;
+    const command = "git reset --hard";
+    const cwd = "/work/" ++ text_utils.repeat("\t", diff.max_encoded_label_bytes / 4);
+    const label = try formatRunCommandPermissionLabel(alloc, command, cwd);
+    defer alloc.free(label);
+
+    try std.testing.expect(label.len <= diff.max_encoded_label_bytes);
+    try std.testing.expect(std.mem.startsWith(u8, label, "shell.run git reset --hard @ /work/\\x09"));
+    try expectContains(label, "... (risk: command may discard version-control state;");
+    try std.testing.expect(std.mem.endsWith(u8, label, "safer: inspect git status first and revert only the intended files)"));
+
+    const permission_request = @import("../permissions/permission_request.zig");
+    var owned = try permission_request.OwnedPermissionRequest.dupe(alloc, .{ .label = label });
+    defer owned.deinit(alloc);
+    try std.testing.expectEqualStrings(label, owned.label);
 }
 
 test "tool presentation preserves plain action fallbacks" {

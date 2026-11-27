@@ -2591,19 +2591,19 @@ fn interactivePermissionRequest(
                 .amendment_allowed = true,
             };
         }
-        const encoded_cwd: ?[]const u8 = if (std.mem.eql(u8, context.resolved_cwd, input.workspace_root))
+        const cwd: ?[]const u8 = if (std.mem.eql(u8, context.resolved_cwd, input.workspace_root))
             null
         else
-            (try text_utils.encodeTerminalSafe(
-                arena,
-                context.resolved_cwd,
-                permission_request.max_tool_arguments_preview_bytes,
-            )).bytes;
+            context.resolved_cwd;
+        const encoded_cwd = if (cwd) |path|
+            (try text_utils.encodeTerminalSafe(arena, path, permission_request.max_tool_arguments_preview_bytes)).bytes
+        else
+            null;
         return .{
             .label = try tool_presentation.formatRunCommandPermissionLabel(
                 arena,
                 context.command,
-                encoded_cwd,
+                cwd,
             ),
             .command = try command_environment.formatApprovalCommand(
                 arena,
