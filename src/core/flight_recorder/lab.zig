@@ -11,7 +11,6 @@ pub const min_payload_bytes: usize = 4 + 8;
 const default_sync_ms: u32 = 1000;
 pub const default_max_session_bytes: u64 = 1024 * 1024 * 1024;
 pub const max_gap_file_bytes: usize = 1024 * 1024;
-const no_progress_sentinel: u64 = std.math.maxInt(u64);
 // Tells a test driver that the recorder runs and its progress file is mapped.
 const ready_line = "{\"ready\":true}\n";
 

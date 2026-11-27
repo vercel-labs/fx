@@ -48,6 +48,8 @@ const SealedEntry = struct {
     index: u64,
     bytes: u64,
     mtime_ns: i96,
+    /// The mtime of the oldest sealed segment of the same instance, set by `orderOldestFirst`.
+    instance_mtime_ns: i96 = 0,
 };
 
 const GapRecord = struct {
@@ -560,7 +562,7 @@ pub const Writer = struct {
 
         if (total_bytes <= self.max_session_bytes or sealed.items.len == 0) return;
 
-        std.mem.sort(SealedEntry, sealed.items, {}, sealedOlderThan);
+        orderOldestFirst(sealed.items);
 
         for (sealed.items) |entry| {
             if (total_bytes <= self.max_session_bytes) break;
@@ -571,11 +573,23 @@ pub const Writer = struct {
         }
     }
 
+    /// Evicts the instance whose oldest segment is oldest first, and keeps index order inside one instance.
+    fn orderOldestFirst(items: []SealedEntry) void {
+        for (items) |*item| {
+            item.instance_mtime_ns = item.mtime_ns;
+            for (items) |other| {
+                if (other.instance == item.instance and other.mtime_ns < item.instance_mtime_ns) {
+                    item.instance_mtime_ns = other.mtime_ns;
+                }
+            }
+        }
+        std.mem.sort(SealedEntry, items, {}, sealedOlderThan);
+    }
+
     fn sealedOlderThan(_: void, a: SealedEntry, b: SealedEntry) bool {
-        if (a.instance == b.instance) return a.index < b.index;
-        if (a.mtime_ns != b.mtime_ns) return a.mtime_ns < b.mtime_ns;
-        if (a.index != b.index) return a.index < b.index;
-        return a.instance < b.instance;
+        if (a.instance_mtime_ns != b.instance_mtime_ns) return a.instance_mtime_ns < b.instance_mtime_ns;
+        if (a.instance != b.instance) return a.instance < b.instance;
+        return a.index < b.index;
     }
 
     fn writeGapRecord(self: *Writer, entry: SealedEntry) !u64 {
@@ -682,4 +696,24 @@ test "a switched-away segment stays unsealed while in_flight is nonzero" {
     _ = seg0.in_flight.fetchSub(1, .release);
     w.stop();
     _ = try tmp.dir.statFile(testing.io, "0000000000002222-00000000.seg", .{});
+}
+
+test "eviction order is the same for every input order: instances by oldest segment, then index" {
+    var names: [3][1]u8 = .{ "a".*, "b".*, "c".* };
+    const a: SealedEntry = .{ .name = &names[0], .instance = 2, .index = 0, .bytes = 1, .mtime_ns = 100 };
+    const b: SealedEntry = .{ .name = &names[1], .instance = 1, .index = 5, .bytes = 1, .mtime_ns = 50 };
+    const c: SealedEntry = .{ .name = &names[2], .instance = 2, .index = 1, .bytes = 1, .mtime_ns = 40 };
+    const orders = [_][3]SealedEntry{
+        .{ a, b, c }, .{ a, c, b }, .{ b, a, c },
+        .{ b, c, a }, .{ c, a, b }, .{ c, b, a },
+    };
+    for (orders) |order| {
+        var items = order;
+        Writer.orderOldestFirst(&items);
+        try testing.expectEqual(@as(u64, 2), items[0].instance);
+        try testing.expectEqual(@as(u64, 0), items[0].index);
+        try testing.expectEqual(@as(u64, 2), items[1].instance);
+        try testing.expectEqual(@as(u64, 1), items[1].index);
+        try testing.expectEqual(@as(u64, 1), items[2].instance);
+    }
 }

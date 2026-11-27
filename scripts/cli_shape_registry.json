@@ -556,6 +556,7 @@
   },
   "hand_parsed_files": {
     "src/builtins/skills.zig": "Reads a pasted npx skills add command line, another program's flags.",
+    "src/core/flight_recorder/lab.zig": "Reads the flags of flight-recorder-lab, a test-only program for tests/tla/drivers/flight_recorder/ that is not part of fx.",
     "src/core/shell_command/command_classification.zig": "Classifies shell commands the agent runs, another program's flags.",
     "src/core/shell_command/command_effect.zig": "Reads the flags of git and other commands the agent runs.",
     "src/core/shell_command/command_lex.zig": "Reads the flags of timeout, env, and other wrapper commands the agent runs.",
