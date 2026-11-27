@@ -3213,6 +3213,7 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     v2.appendProgressWithRecord(
         progress.user,
         progress.execution,
+        progress.saved_execution,
         .{ .calls = progress.running_calls, .assistant = progress.running_assistant },
         progress.recovery_record,
     ) catch |err| {

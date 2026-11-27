@@ -86,6 +86,8 @@ jobs:
       - name: Model-check the compaction row's number
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/compaction_progress/check.sh
 
+      - name: Model-check ACP EOF outbound requests
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/acp_eof/check.sh design-a design-b
       - name: Model-check web_fetch DNS cancellation
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/web_fetch_dns/check.sh design-b design-a
 
@@ -124,6 +126,8 @@ jobs:
       - name: Walk fx ask turns along the malformed tool call model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/malformed.ts --self-check
 
+      - name: Walk fx acp along the ACP EOF model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/acp_eof/
       - name: Walk fx along the web_fetch DNS model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/web_fetch_dns/
 

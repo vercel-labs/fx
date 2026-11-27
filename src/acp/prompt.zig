@@ -32,6 +32,7 @@ const image_attachments = @import("../core/images/image_attachments.zig");
 const image_data = @import("../core/images/image_data.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
+const prompt_test_controls = @import("prompt_test_controls.zig");
 const server = @import("server.zig");
 const mcp_host = @import("../core/mcp_host/host.zig");
 const sessions = @import("sessions.zig");
@@ -934,9 +935,13 @@ fn callHostTool(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const state: *server.ServerState = @ptrCast(@alignCast(raw_state));
     if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+    if (server.outboundClosedOrCancelled(state)) return error.Cancelled;
     const outbound_id = (server.beginOutboundRequest(state, .host_tool) catch
         return .{ .failure = try alloc.dupe(u8, "Host tool request failed") }) orelse
-        return .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
+        return if (server.outboundClosedOrCancelled(state))
+            error.Cancelled
+        else
+            .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
     var awaiting = true;
     errdefer if (awaiting) {
         server.cancelOutboundRequest(state, outbound_id);
@@ -2875,7 +2880,13 @@ fn requestAcpPermission(
     try writeValidatedToolArguments(alloc, &validated_arguments.writer, call.arguments_json);
 
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const request_id = server.beginPermissionRequest(ctx.state) orelse return error.PermissionRequestAlreadyPending;
+    prompt_test_controls.pauseBeforePermissionInsert();
+    if (server.outboundClosedOrCancelled(ctx.state)) return error.Cancelled;
+    const request_id = server.beginPermissionRequest(ctx.state) orelse
+        return if (server.outboundClosedOrCancelled(ctx.state))
+            error.Cancelled
+        else
+            error.PermissionRequestAlreadyPending;
     errdefer {
         server.cancelPermissionRequest(ctx.state, request_id);
         _ = server.awaitPermissionDecision(ctx.state, request_id);
@@ -3267,7 +3278,7 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const v2 = session.v2 orelse return;
-    v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }) catch |err| {
+    v2.appendProgressWithRecord(progress.user, progress.execution, progress.saved_execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }, .keep) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
     };
 }
@@ -3407,8 +3418,13 @@ fn appendJournalToolIntent(raw_ctx: *anyopaque, progress: agent_runtime.TurnProg
 /// Waits until the host holds every journal event sent so far.
 fn flushJournal(state: *server.ServerState, alloc: Allocator, session_id: []const u8) !void {
     if (comptime host_target.is_wasm) return js_host_journal.flush();
+    if (server.outboundClosedOrCancelled(state)) return error.Cancelled;
     const outbound_id = (server.beginOutboundRequest(state, .journal) catch
-        return error.JournalFlushFailed) orelse return error.JournalFlushFailed;
+        return error.JournalFlushFailed) orelse
+        return if (server.outboundClosedOrCancelled(state))
+            error.Cancelled
+        else
+            error.JournalFlushFailed;
     var awaiting = true;
     errdefer if (awaiting) {
         server.cancelOutboundRequest(state, outbound_id);

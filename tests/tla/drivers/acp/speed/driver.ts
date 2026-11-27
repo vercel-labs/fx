@@ -11,6 +11,7 @@
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fxChildEnv } from "../../../../evals/eval-helpers";
 import { REPO_ROOT, outDir } from "../../lib/tlc";
 import { sha256File, sha256Text, tlcToolchain, utcStamp, writeJson } from "./tlc";
 import { Acp, NO_VIEW, type Observation, type View, laneOf, validate, viewOf } from "./trace";
@@ -145,8 +146,7 @@ async function runPlan(plan: Plan, worktree: string, helpers: Helpers, dir: stri
   }, { models: () => CATALOG });
 
   const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries({
-    ...process.env,
+  for (const [key, value] of Object.entries(fxChildEnv({
     NO_COLOR: "1",
     HOME: home,
     AI_GATEWAY_API_KEY: "acp-speed-fake-key",
@@ -160,7 +160,7 @@ async function runPlan(plan: Plan, worktree: string, helpers: Helpers, dir: stri
     FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_TRACE_LOG: join(dir, "fx-trace.log"),
     FX_TRACE_SCOPES: "acp,catalog",
-  })) {
+  }))) {
     if (value === undefined) continue;
     // FX_PROVIDER and FX_MODEL are process overrides: fx then resumes every
     // chat on the process's model instead of the chat's saved one, which no

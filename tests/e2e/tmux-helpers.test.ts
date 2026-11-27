@@ -17,8 +17,10 @@ import {
   buildEvalProcessEnv,
   cleanupIsolatedTestHome,
   createIsolatedTestHome,
+  DEFAULT_UNSET_ENV_KEYS,
   envWithoutFxHome,
   FX_BIN,
+  fxChildEnv,
   needsProcessSnapshot,
   REPO_ROOT,
   runFx,
@@ -77,10 +79,14 @@ const ISOLATED_KEYS = [
   "FX_TEST_SUBAGENT_START_RELEASE",
   "FX_TEST_WORKSPACE_CAPTURE_START_HELD",
   "FX_TEST_WORKSPACE_CAPTURE_START_RELEASE",
+  "FX_TEST_WEB_FETCH_DNS_READY",
+  "FX_TEST_WEB_FETCH_DNS_RELEASE",
   "FX_TEST_GREP_RELEASE",
   "FX_TEST_ACP_PROMPT_TERMINAL_READY",
   "FX_TEST_ACP_PROMPT_REAP_READY",
   "FX_TEST_ACP_PROMPT_RELEASE",
+  "FX_TEST_ACP_PERMISSION_READY",
+  "FX_TEST_ACP_PERMISSION_RELEASE",
 ] as const;
 const tmuxFxTest = test.skipIf(!tmuxAvailable() || !existsSync(FX_BIN));
 const HELD_ENV_REPLY = "NO_HOLD_REACHED_FX";
@@ -739,6 +745,25 @@ test("envWithoutFxHome drops FX_HOME and keeps the rest", () => {
 
   expect(envWithoutFxHome(env)).toEqual({ HOME: "/Users/example", PATH: "/usr/bin" });
   expect(env.FX_HOME).toBe("/Users/example/profile");
+});
+
+test("fxChildEnv drops every name on the unset list and keeps the caller's own", () => {
+  const inherited: Record<string, string> = { PATH: "/usr/bin" };
+  for (const key of DEFAULT_UNSET_ENV_KEYS) inherited[key] = `stale-${key.toLowerCase()}`;
+
+  expect(fxChildEnv({}, { inherited })).toEqual({ PATH: "/usr/bin" });
+  expect(fxChildEnv({ HOME: "/Users/example", FX_HOME: "/Users/example/profile", NO_COLOR: undefined }, { inherited })).toEqual({
+    PATH: "/usr/bin",
+    HOME: "/Users/example",
+    FX_HOME: "/Users/example/profile",
+    NO_COLOR: undefined,
+  });
+  expect(fxChildEnv({}, { inherited, keepCredentials: true })).toEqual({
+    PATH: "/usr/bin",
+    AI_GATEWAY_API_KEY: "stale-ai_gateway_api_key",
+    VERCEL_OIDC_TOKEN: "stale-vercel_oidc_token",
+  });
+  expect(inherited.FX_TEST_SHELL_YIELD_HELD).toBe("stale-fx_test_shell_yield_held");
 });
 
 test("buildEvalProcessEnv drops the inherited FX_HOME", () => {
