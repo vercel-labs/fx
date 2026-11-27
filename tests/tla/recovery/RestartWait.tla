@@ -38,7 +38,7 @@ CONSTANTS
     Bug         \* "none", or the name of one planted defect
 
 Bugs == {"none", "stop_at_boundary", "hold_ignores_flag",
-         "cancel_while_releasing", "release_early"}
+         "cancel_while_releasing", "release_early", "auto_ignores_draft"}
 
 ASSUME /\ Faults \in BOOLEAN
        /\ Bug \in Bugs
@@ -55,15 +55,19 @@ VARIABLES
     wait,       \* the restart, as the main loop sees it
     st,         \* each agent's turn
     asked,      \* each worker's stop request (yield_requested)
-    released    \* each worker's release (yield_released)
+    released,   \* each worker's release (yield_released)
+    draft,      \* whether the composer holds a draft, paste, image, or pending send
+    autoStarted \* whether the automatic idle trigger started the restart
 
-vars == <<wait, st, asked, released>>
+vars == <<wait, st, asked, released, draft, autoStarted>>
 
 TypeOK ==
     /\ wait \in Waits
     /\ st \in [Agents -> Sts]
     /\ asked \in [Agents -> BOOLEAN]
     /\ released \in [Agents -> BOOLEAN]
+    /\ draft \in BOOLEAN
+    /\ autoStarted \in BOOLEAN
 
 None == [a \in Agents |-> FALSE]
 All  == [a \in Agents |-> TRUE]
@@ -73,6 +77,8 @@ Init ==
     /\ st = [a \in Agents |-> "idle"]
     /\ asked = None
     /\ released = None
+    /\ draft = FALSE
+    /\ autoStarted = FALSE
 
 -----------------------------------------------------------------------------
 (* The agents' workers.                                                    *)
@@ -81,14 +87,14 @@ Init ==
 Start(a) ==
     /\ wait # "exited" /\ st[a] = "idle" /\ ~asked[a]
     /\ st' = [st EXCEPT ![a] = "run"]
-    /\ UNCHANGED <<wait, asked, released>>
+    /\ UNCHANGED <<wait, asked, released, draft, autoStarted>>
 
 \* The turn ends on its own: its answer, or a provider that never stops
 \* between steps.
 End(a) ==
     /\ Faults /\ st[a] = "run"
     /\ st' = [st EXCEPT ![a] = "idle"]
-    /\ UNCHANGED <<wait, asked, released>>
+    /\ UNCHANGED <<wait, asked, released, draft, autoStarted>>
 
 \* The turn reaches its save before a model request and reads the stop
 \* request there. Planted defect stop_at_boundary, fx before the cancel:
@@ -96,7 +102,7 @@ End(a) ==
 Boundary(a) ==
     /\ st[a] = "run" /\ asked[a]
     /\ st' = [st EXCEPT ![a] = IF Bug = "stop_at_boundary" THEN "stopped" ELSE "check"]
-    /\ UNCHANGED <<wait, asked, released>>
+    /\ UNCHANGED <<wait, asked, released, draft, autoStarted>>
 
 \* The clean record and the marker are saved, and the turn holds, unless a
 \* cancel cleared the request after the read: then it goes on. Planted
@@ -104,26 +110,37 @@ Boundary(a) ==
 Hold(a) ==
     /\ st[a] = "check"
     /\ st' = [st EXCEPT ![a] = IF asked[a] \/ Bug = "hold_ignores_flag" THEN "held" ELSE "run"]
-    /\ UNCHANGED <<wait, asked, released>>
+    /\ UNCHANGED <<wait, asked, released, draft, autoStarted>>
 
 \* The clean record does not land: the turn goes on, and its next boundary
 \* asks again (request_recovery.zig closeForYield).
 SaveFails(a) ==
     /\ Faults /\ st[a] = "check"
     /\ st' = [st EXCEPT ![a] = "run"]
-    /\ UNCHANGED <<wait, asked, released>>
+    /\ UNCHANGED <<wait, asked, released, draft, autoStarted>>
 
 \* A released turn returns from its hold: it stops for the restart.
 Return(a) ==
     /\ st[a] = "held" /\ released[a]
     /\ st' = [st EXCEPT ![a] = "stopped"]
-    /\ UNCHANGED <<wait, asked, released>>
+    /\ UNCHANGED <<wait, asked, released, draft, autoStarted>>
 
 \* Esc twice, or /quit: the turn ends cancelled, wherever it is.
 Esc(a) ==
     /\ Faults /\ st[a] \in {"run", "check", "held"}
     /\ st' = [st EXCEPT ![a] = "idle"]
-    /\ UNCHANGED <<wait, asked, released>>
+    /\ UNCHANGED <<wait, asked, released, draft, autoStarted>>
+
+\* The person types or clears a draft in the composer while idle or between restarts.
+TypeDraft ==
+    /\ wait = "none" /\ ~draft
+    /\ draft' = TRUE
+    /\ UNCHANGED <<wait, st, asked, released, autoStarted>>
+
+ClearDraft ==
+    /\ wait = "none" /\ draft
+    /\ draft' = FALSE
+    /\ UNCHANGED <<wait, st, asked, released, autoStarted>>
 
 -----------------------------------------------------------------------------
 (* The main loop.                                                          *)
@@ -133,7 +150,23 @@ CtrlG ==
     /\ wait = "none" /\ \E a \in Agents : st[a] = "run"
     /\ wait' = "waiting"
     /\ asked' = All
-    /\ UNCHANGED <<st, released>>
+    /\ UNCHANGED <<st, released, draft, autoStarted>>
+
+\* When fx is idle and an update is ready, fx restarts by itself on the
+\* same exit path. Planted defect auto_ignores_draft: the automatic trigger
+\* fires even when a draft exists in the composer.
+Idle ==
+    /\ wait = "none"
+    /\ ~draft
+    /\ \A a \in Agents : st[a] = "idle"
+
+AutoRestart ==
+    /\ wait = "none"
+    /\ \A a \in Agents : st[a] = "idle"
+    /\ (~draft \/ Bug = "auto_ignores_draft")
+    /\ wait' = "exited"
+    /\ autoStarted' = TRUE
+    /\ UNCHANGED <<st, asked, released, draft>>
 
 \* A tick once every turn holds or has ended: the held turns are released.
 \* Planted defect release_early: it releases while a turn still runs.
@@ -142,14 +175,14 @@ Release ==
     /\ \A a \in Agents : st[a] \in {"idle", "held"} \/ Bug = "release_early"
     /\ wait' = "releasing"
     /\ released' = All
-    /\ UNCHANGED <<st, asked>>
+    /\ UNCHANGED <<st, asked, draft, autoStarted>>
 
 \* A tick once no turn runs: fx exits for the relaunch.
 Exit ==
     /\ wait = "releasing"
     /\ \A a \in Agents : st[a] \in {"idle", "stopped"}
     /\ wait' = "exited"
-    /\ UNCHANGED <<st, asked, released>>
+    /\ UNCHANGED <<st, asked, released, draft, autoStarted>>
 
 \* A second Ctrl+G while the restart waits cancels it: the requests clear
 \* and each held turn goes on. Planted defect cancel_while_releasing: it
@@ -161,6 +194,7 @@ Cancel ==
     /\ asked' = None
     /\ released' = None
     /\ st' = [a \in Agents |-> IF st[a] = "held" THEN "run" ELSE st[a]]
+    /\ UNCHANGED <<draft, autoStarted>>
 
 \* fx has exited.
 Done ==
@@ -171,7 +205,8 @@ Next ==
     \/ \E a \in Agents :
           \/ Start(a) \/ End(a) \/ Boundary(a) \/ Hold(a) \/ SaveFails(a)
           \/ Return(a) \/ Esc(a)
-    \/ CtrlG \/ Release \/ Exit \/ Cancel \/ Done
+    \/ TypeDraft \/ ClearDraft
+    \/ CtrlG \/ AutoRestart \/ Release \/ Exit \/ Cancel \/ Done
 
 \* fx's own steps happen; the person's (Start, Esc, CtrlG, Cancel) and a
 \* turn's own end may not.
@@ -201,6 +236,10 @@ NoUncancellableWait ==
 \* fx exits only when every turn has stopped or ended.
 ExitOnlyWhenStopped ==
     wait = "exited" => \A a \in Agents : st[a] \in {"idle", "stopped"}
+
+\* An automatic restart never starts while a turn runs or a draft exists.
+AutoRestartOnlyWhenIdle ==
+    autoStarted => (~draft /\ \A a \in Agents : st[a] \in {"idle", "stopped"})
 
 \* A waiting restart ends: fx restarts, or the person cancels it.
 WaitEnds == (wait = "waiting") ~> (wait \in {"none", "exited"})

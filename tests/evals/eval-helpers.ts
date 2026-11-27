@@ -523,6 +523,8 @@ export const DEFAULT_UNSET_ENV_KEYS = [
   "FX_TEST_GATEWAY_MODELS_URL",
   "FX_TEST_GATEWAY_CREDITS_URL",
   "FX_TEST_UPGRADE_BASE_URL",
+  "FX_TEST_UPGRADE_CHECK_INTERVAL_MS",
+  "FX_TEST_UPGRADE_IDLE_QUIET_MS",
   "FX_PERMISSION_MODE",
   "FX_HOME",
   // A developer's terminal recording would start on every test's fx, and the

@@ -109,6 +109,19 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
+function manualUpgradeEnv(
+  home: string,
+  gateway: ReturnType<typeof startFakeGateway> | ReturnType<typeof startDynamicFakeGateway>,
+  release: { baseUrl: string },
+) {
+  return {
+    ...gatewayEnv(home, gateway),
+    FX_AUTO_UPGRADE: "1",
+    FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+    FX_TEST_UPGRADE_IDLE_QUIET_MS: "3600000",
+  };
+}
+
 function gatewayEnv(
   home: string,
   gateway: ReturnType<typeof startFakeGateway>,
@@ -6285,9 +6298,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: realpathSync(workspace),
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
         },
         stderrPath,
@@ -6426,9 +6437,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "core,session",
         },
@@ -6586,9 +6595,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
         },
         stderrPath,
         width: 110,
@@ -6689,9 +6696,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker",
           FX_RECORD: tapeBefore,
@@ -6857,9 +6862,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,upgrade",
         },
@@ -6997,9 +7000,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,upgrade",
         },
@@ -7162,10 +7163,8 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
+          ...manualUpgradeEnv(home, gateway, release),
           FX_MODEL: "anthropic/claude-fable-5.2",
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "session,recovery",
         },
@@ -7299,10 +7298,8 @@ test.skipIf(!tmuxAvailable())(
     });
     const release = startUpgradeServer(root, argvLogPath);
     const upgradeEnv = {
-      ...gatewayEnv(home, gateway),
+      ...manualUpgradeEnv(home, gateway, release),
       FX_MODEL: model,
-      FX_AUTO_UPGRADE: "1",
-      FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
     };
     let active: TmuxSession | null = null;
 
@@ -7416,9 +7413,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
         },
         stderrPath,
         width: 110,
@@ -7583,9 +7578,7 @@ async function captureCtrlGRelaunch(options: {
       cmd: `/bin/sh -c ${shellQuote(gatedLaunch)}`,
       cwd: workspaceRoot,
       env: {
-        ...gatewayEnv(home, gateway),
-        FX_AUTO_UPGRADE: "1",
-        FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+        ...manualUpgradeEnv(home, gateway, release),
       },
       stderrPath,
       width: size.cols,
@@ -7769,9 +7762,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_PERMISSION_MODE: "full-access",
           FX_RECORD: tapeBefore,
         },
@@ -7917,10 +7908,8 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
+          ...manualUpgradeEnv(home, gateway, release),
           FX_MODEL: "anthropic/claude-fable-5.2",
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
           FX_PERMISSION_MODE: "full-access",
         },
         stderrPath,
@@ -8032,9 +8021,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_PERMISSION_MODE: "full-access",
         },
         stderrPath,
@@ -8122,9 +8109,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_PERMISSION_MODE: "full-access",
           FX_TEST_STEER_YIELD_GRACE_MS: "600000",
         },
@@ -8243,9 +8228,7 @@ test.skipIf(!tmuxAvailable())(
         cmd: shellQuote(installedFx),
         cwd: workspaceRoot,
         env: {
-          ...gatewayEnv(home, gateway),
-          FX_AUTO_UPGRADE: "1",
-          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          ...manualUpgradeEnv(home, gateway, release),
           FX_PERMISSION_MODE: "full-access",
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "worker",
@@ -8297,6 +8280,466 @@ test.skipIf(!tmuxAvailable())(
     } finally {
       releaseMain();
       releaseSolo();
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "idle update auto-restart restarts without ctrl+g and resumes with the screen in place",
+  async () => {
+    const size = { cols: 110, rows: 32 };
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-auto-restart-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    const capturePath = join(root, "pane-output.bin");
+    const launchGate = join(root, "launch-gate");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const prompt = "Save history before idle auto-restart.";
+    const reply = [
+      "IDLE_AUTO_FIRST_LINE",
+      ...Array.from({ length: 24 }, (_, index) => `idle auto filler paragraph ${index + 1}`),
+      "IDLE_AUTO_LAST_LINE",
+    ].join("\n\n");
+    const gateway = startFakeGateway([fakeGatewayFinalText(reply)]);
+    const release = startUpgradeServer(root, argvLogPath);
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      const gatedLaunch = `while [ ! -e ${shellQuote(launchGate)} ]; do sleep 0.02; done; exec ${shellQuote(installedFx)}`;
+      active = await TmuxSession.create({
+        cmd: `/bin/sh -c ${shellQuote(gatedLaunch)}`,
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "100",
+        },
+        stderrPath,
+        width: size.cols,
+        height: size.rows,
+        startupWaitMs: 0,
+      });
+      active.startPaneOutputCapture(capturePath);
+      writeFileSync(launchGate, "");
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText(prompt);
+      await active.waitForPane(
+        (pane) => pane.includes("IDLE_AUTO_LAST_LINE") && hasEmptyComposer(pane) && turnSettled(pane),
+        TIMEOUT,
+      );
+      const version = (await runFx(["--version"])).stdout.trim();
+      const updatedNotice = `✓ fx has been updated to v${version} (notes)`;
+
+      // No Ctrl+G is sent; once the update is ready and the quiet window
+      // elapses while idle, fx restarts on its own.
+      await waitForScrollback(active, updatedNotice, UPGRADE_TIMEOUT * 2);
+      await active.waitForComposer(TIMEOUT);
+      const resumed = await active.waitForStableScrollback(
+        (scrollback) =>
+          scrollback.includes(updatedNotice) &&
+          scrollback.includes("IDLE_AUTO_LAST_LINE"),
+        TIMEOUT,
+        250,
+      );
+      await settledCaptureLength(capturePath);
+      expect(countOccurrences(resumed, prompt)).toBe(1);
+      expect(countOccurrences(resumed, "IDLE_AUTO_FIRST_LINE")).toBe(1);
+      expect(countOccurrences(resumed, "IDLE_AUTO_LAST_LINE")).toBe(1);
+      expect(countOccurrences(resumed, updatedNotice)).toBe(1);
+      expect(
+        readFileSync(argvLogPath, "utf8")
+          .trim()
+          .split("\n")
+          .some((line) => line.startsWith(`${installedFx}\tresume\t`) && line.includes("\t--upgrade-relaunch")),
+      ).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).not.toContain("relaunch failed");
+
+      const bytes = readFileSync(capturePath);
+      const lastLineAt = bytes.indexOf(Buffer.from("IDLE_AUTO_LAST_LINE"));
+      expect(lastLineAt).toBeGreaterThanOrEqual(0);
+      const relaunchBytes = bytes.subarray(lastLineAt);
+      const resets = [Buffer.from("\x1b[2J"), Buffer.from("\x1bc")]
+        .map((seq) => relaunchBytes.indexOf(seq))
+        .filter((idx) => idx >= 0);
+      expect(resets.length).toBeGreaterThan(0);
+      const gapLength = lastLineAt + Math.min(...resets);
+      const gap = replayPaneBytes(root, home, "idle-auto-gap", size, bytes.subarray(0, gapLength));
+      expect(gap.join("\n")).toContain("IDLE_AUTO_LAST_LINE");
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "idle update auto-restart holds while a composer draft exists until it is cleared",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-auto-draft-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const gateway = startFakeGateway([]);
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "100",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendLiteralText("HOLD_DRAFT");
+      await active.waitForPane((pane) => composerContains(pane, "HOLD_DRAFT"), TIMEOUT);
+
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      await active.waitForStableScrollback(
+        (scrollback) => scrollback.includes("update ready: ctrl+g to reload") && composerContains(scrollback, "HOLD_DRAFT"),
+        TIMEOUT,
+        250,
+      );
+      expect(relaunched()).toBe(false);
+      expect(await active.capturePane()).toContain("update ready: ctrl+g to reload");
+
+      const version = (await runFx(["--version"])).stdout.trim();
+      await active.sendKeys(Array.from({ length: "HOLD_DRAFT".length }, () => "BSpace").join(" "));
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, UPGRADE_TIMEOUT);
+      expect(relaunched()).toBe(true);
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "idle update auto-restart holds while a subagent works until it finishes",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-auto-subagent-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const soloAsked = signal();
+    let releaseSolo = () => {};
+    const soloReleased = new Promise<void>((resolve) => {
+      releaseSolo = resolve;
+    });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes("SOLO_TASK") && !body.includes('"main_solo"')) {
+        soloAsked.fire();
+        await soloReleased;
+        return fakeGatewayFinalText("SOLO_DONE");
+      }
+      if (body.includes("SOLO_DONE")) return fakeGatewayFinalText("MAIN_SAW_REPORT");
+      if (!body.includes('"main_solo"')) {
+        return fakeGatewayToolCall("main_solo", "subagent", {
+          request: { action: "message", agent: "solo", message: "SOLO_TASK" },
+        });
+      }
+      return fakeGatewayFinalText("MAIN_DONE");
+    });
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "100",
+          FX_PERMISSION_MODE: "full-access",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("AUTO_SUBAGENT start solo");
+      await active.waitForPane((pane) => pane.includes("MAIN_DONE") && turnSettled(pane), TIMEOUT);
+      await soloAsked.fired;
+      await active.waitForComposer(TIMEOUT);
+
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      await active.waitForStableScrollback(
+        (scrollback) => scrollback.includes("update ready: ctrl+g to reload"),
+        TIMEOUT,
+        250,
+      );
+      expect(relaunched()).toBe(false);
+
+      const version = (await runFx(["--version"])).stdout.trim();
+      releaseSolo();
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, UPGRADE_TIMEOUT);
+      expect(relaunched()).toBe(true);
+      await active.waitForText("MAIN_SAW_REPORT", TIMEOUT);
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      releaseSolo();
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "idle update auto-restart holds while a background shell session runs",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-auto-bgshell-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    const releaseFifo = join(root, "release.fifo");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    execFileSync("mkfifo", [releaseFifo]);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const gateway = startFakeGateway([
+      fakeShellRun("call_bg_shell", `cat ${shellQuote(releaseFifo)}`, { yield_time_ms: 50 }),
+      fakeGatewayFinalText("BG_SHELL_STARTED"),
+    ]);
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "100",
+          FX_PERMISSION_MODE: "full-access",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Start a background shell.");
+      await active.waitForPane((pane) => pane.includes("BG_SHELL_STARTED") && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
+
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      await active.waitForStableScrollback(
+        (scrollback) => scrollback.includes("update ready: ctrl+g to reload") && scrollback.includes("BG_SHELL_STARTED"),
+        TIMEOUT,
+        250,
+      );
+      expect(relaunched()).toBe(false);
+      expect(await active.capturePane()).toContain("update ready: ctrl+g to reload");
+
+      const version = (await runFx(["--version"])).stdout.trim();
+      writeFileSync(releaseFifo, "done\n");
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, UPGRADE_TIMEOUT);
+      expect(relaunched()).toBe(true);
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      try {
+        closeSync(openSync(releaseFifo, constants.O_WRONLY | constants.O_NONBLOCK));
+      } catch {}
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "idle update auto-restart holds while a turn runs and restarts after the turn ends",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-auto-turn-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const turnAsked = signal();
+    let releaseTurn = () => {};
+    const turnReleased = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    const gateway = startDynamicFakeGateway(async () => {
+      turnAsked.fire();
+      await turnReleased;
+      return fakeGatewayFinalText("RUNNING_TURN_FINISHED_DONE");
+    });
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_CHECK_INTERVAL_MS: "200",
+          FX_TEST_UPGRADE_IDLE_QUIET_MS: "100",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Hold this running turn until the update is ready.");
+      await turnAsked.fired;
+
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      await active.waitForStableScrollback(
+        (scrollback) => scrollback.includes("update ready: ctrl+g to reload"),
+        TIMEOUT,
+        250,
+      );
+      expect(relaunched()).toBe(false);
+      expect(await active.capturePane()).not.toContain("fx restarts for the upgrade");
+
+      const version = (await runFx(["--version"])).stdout.trim();
+      releaseTurn();
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, UPGRADE_TIMEOUT);
+      expect(relaunched()).toBe(true);
+      await active.waitForText("RUNNING_TURN_FINISHED_DONE", TIMEOUT);
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      releaseTurn();
       if (active) {
         try {
           await active.sendText("/quit");

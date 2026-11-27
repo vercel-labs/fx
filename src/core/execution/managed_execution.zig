@@ -1497,6 +1497,23 @@ pub const Runtime = struct {
         return self.background_cancel.load(.acquire);
     }
 
+    /// Whether any captured background shell or registered TTY command is
+    /// still starting, running, or stopping on this runtime.
+    pub fn hasRunningExecution(self: *Runtime) bool {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        if (self.pending_admissions > 0) return true;
+        for (self.entries) |candidate| {
+            const entry = candidate orelse continue;
+            entry.mutex.lockUncancelable(zio);
+            const running = !entry.isTerminal();
+            entry.mutex.unlock(zio);
+            if (running) return true;
+        }
+        return false;
+    }
+
     fn stopAllAndJoin(self: *Runtime, mode: StopMode) void {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);

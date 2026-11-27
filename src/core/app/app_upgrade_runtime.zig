@@ -5,6 +5,7 @@ const app_agents_runtime = @import("app_agents_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const io_mod = @import("../shared/io.zig");
 const upgrade_helpers = @import("../upgrade/upgrade_helpers.zig");
 const editor_state = @import("../input/editor_state.zig");
 const paste_framing = @import("../input/paste_framing.zig");
@@ -39,6 +40,21 @@ const restart_waits_for_subagents_notice = "fx restarts for the upgrade when the
 const restart_cancelled_notice = "restart cancelled; Ctrl+G restarts for the upgrade later";
 const restart_releasing_notice = "fx is restarting for the upgrade now";
 
+/// Quiet time after the last key press before an idle automatic update restart
+/// starts (`collectUpgradeFacts`).
+pub const idle_restart_quiet_ms: i64 = 2000;
+const idle_quiet_env_name = "FX_TEST_UPGRADE_IDLE_QUIET_MS";
+
+fn idleRestartQuietMs() i64 {
+    return parseIdleRestartQuietMs(io_mod.getenv(idle_quiet_env_name));
+}
+
+fn parseIdleRestartQuietMs(text: ?[]const u8) i64 {
+    const value = text orelse return idle_restart_quiet_ms;
+    const ms = std.fmt.parseInt(u32, value, 10) catch return idle_restart_quiet_ms;
+    return if (ms > 0) @intCast(ms) else idle_restart_quiet_ms;
+}
+
 /// Whether `App` can stop running turns between steps for the restart.
 /// Without it, Ctrl+G still refuses while a response streams.
 /// A host that never upgrades itself, such as the browser terminal, has no restart to wait for.
@@ -64,6 +80,36 @@ pub fn Runtime(comptime App: type) type {
                 if (comptime @hasDecl(@TypeOf(app.upgrader), "takeRenderDirty")) {
                     if (app.upgrader.takeRenderDirty()) requestFooterRender(app);
                 }
+            }
+            const now_ms = currentTimestampMs(app);
+            syncReadySince(app, now_ms);
+            _ = tryIdleAutoUpgrade(
+                app,
+                agents.screenAgentOf(app),
+                now_ms,
+                idleRestartQuietMs(),
+                .{},
+            );
+        }
+
+        fn syncReadySince(app: *App, now_ms: i64) void {
+            if (comptime !(@hasField(App, "upgrader") and
+                @hasField(@FieldType(App, "upgrader"), "ready_since_ms")))
+            {
+                return;
+            }
+            if (app.upgrader.getState() == auto_upgrade.State.ready) {
+                if (app.upgrader.ready_since_ms == null) app.upgrader.ready_since_ms = now_ms;
+            } else {
+                app.upgrader.ready_since_ms = null;
+            }
+        }
+
+        pub fn noteUserInput(app: *App, now_ms: i64) void {
+            if (comptime @hasField(App, "upgrader") and
+                @hasField(@FieldType(App, "upgrader"), "last_user_input_ms"))
+            {
+                app.upgrader.last_user_input_ms = now_ms;
             }
         }
 
@@ -352,6 +398,118 @@ pub fn Runtime(comptime App: type) type {
         fn requestFooterRender(app: *App) void {
             if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
         }
+
+        fn currentTimestampMs(app: *const App) i64 {
+            if (comptime @hasField(App, "test_now_ms")) {
+                if (app.test_now_ms) |now_ms| return now_ms;
+            }
+            return io_mod.milliTimestamp();
+        }
+
+        fn hasRunningShellOrTtySession(app: *App) bool {
+            if (comptime agents.hasAgentField(App, "managed_executions")) {
+                if (app.main_agent.managed_executions.hasRunningExecution()) return true;
+                if (comptime @hasField(App, "child_agents")) {
+                    for (app.child_agents.items) |child| {
+                        if (child.agent.managed_executions.hasRunningExecution()) return true;
+                    }
+                }
+            }
+            if (comptime @hasField(App, "terminal_client") and
+                @hasDecl(@FieldType(App, "terminal_client"), "hasRunningSession"))
+            {
+                if (app.terminal_client.hasRunningSession()) return true;
+            }
+            return false;
+        }
+
+        fn idleRestartQuietElapsed(app: *const App, now_ms: i64, quiet_ms: i64) bool {
+            if (comptime @hasField(App, "upgrader") and
+                @hasField(@FieldType(App, "upgrader"), "ready_since_ms"))
+            {
+                const ready_ms = app.upgrader.ready_since_ms orelse return false;
+                if (now_ms - ready_ms < quiet_ms) return false;
+            }
+            if (comptime @hasField(App, "upgrader") and
+                @hasField(@FieldType(App, "upgrader"), "last_user_input_ms"))
+            {
+                if (app.upgrader.last_user_input_ms) |last_ms| {
+                    if (now_ms - last_ms < quiet_ms) return false;
+                }
+            }
+            return true;
+        }
+
+        fn isIdleForAutoRestart(
+            app: *App,
+            agent: *AppAgent,
+            now_ms: i64,
+            quiet_ms: i64,
+        ) bool {
+            if (comptime !runtime_profile.allows(App, .auto_upgrade)) return false;
+            if (!autoUpgradeEnabled(app)) return false;
+            if (comptime @hasField(App, "should_exit")) {
+                if (app.should_exit) return false;
+            }
+            if (comptime @hasField(App, "upgrader")) {
+                if (app.upgrader.getState() != auto_upgrade.State.ready) return false;
+                if (comptime @hasField(@FieldType(App, "upgrader"), "restart")) {
+                    if (app.upgrader.restart != .none) return false;
+                }
+                if (comptime @hasField(@FieldType(App, "upgrader"), "auto_restart_failed")) {
+                    if (app.upgrader.auto_restart_failed) return false;
+                }
+            }
+            if (comptime @hasDecl(App, "anyTurnRunning")) {
+                if (app.anyTurnRunning()) return false;
+            }
+            if (comptime @hasDecl(App, "anySubagentWorking")) {
+                if (app.anySubagentWorking()) return false;
+            }
+            if (comptime agents.hasAgentField(App, "stream")) {
+                if (agent.stream.active) return false;
+            }
+            if (upgradeUnavailableNotice(app, agent) != null) return false;
+            if (comptime @hasDecl(App, "needsUserElsewhere")) {
+                var name_buf: [32]u8 = undefined;
+                if (app.needsUserElsewhere(&name_buf) != null) return false;
+            }
+            if (comptime @hasDecl(App, "queuedWorkElsewhere")) {
+                var queue_name_buf: [32]u8 = undefined;
+                if (app.queuedWorkElsewhere(&queue_name_buf) != null) return false;
+            }
+            if (hasRunningShellOrTtySession(app)) return false;
+            return idleRestartQuietElapsed(app, now_ms, quiet_ms);
+        }
+
+        fn tryIdleAutoUpgrade(
+            app: *App,
+            agent: *AppAgent,
+            now_ms: i64,
+            quiet_ms: i64,
+            deps: Deps,
+        ) bool {
+            if (!isIdleForAutoRestart(app, agent, now_ms, quiet_ms)) return false;
+            const outcome = applyReadyUpgradeWithDeps(app, agent, deps) catch |err| {
+                debug_trace.logf("upgrade", "event=idle_auto_restart_failed err={s}", .{@errorName(err)});
+                if (comptime @hasField(App, "upgrader") and
+                    @hasField(@FieldType(App, "upgrader"), "auto_restart_failed"))
+                {
+                    app.upgrader.auto_restart_failed = true;
+                }
+                return false;
+            };
+            if (outcome != .relaunch_requested) {
+                if (comptime @hasField(App, "upgrader") and
+                    @hasField(@FieldType(App, "upgrader"), "auto_restart_failed"))
+                {
+                    app.upgrader.auto_restart_failed = true;
+                }
+                return false;
+            }
+            debug_trace.logf("upgrade", "event=idle_auto_restart_started", .{});
+            return true;
+        }
     };
 }
 
@@ -368,6 +526,9 @@ const TestUpgrader = struct {
     render_dirty: bool = false,
     restart: auto_upgrade.RestartWait = .none,
     cancel_count: usize = 0,
+    last_user_input_ms: ?i64 = null,
+    ready_since_ms: ?i64 = null,
+    auto_restart_failed: bool = false,
 
     fn getState(self: *TestUpgrader) auto_upgrade.State {
         return self.state;
@@ -427,10 +588,67 @@ const TestShell = struct {
     render_requests: TestRenderRequests = .{},
 };
 
+const TestToggle = struct {
+    active: bool = false,
+
+    pub fn isActive(self: *const TestToggle) bool {
+        return self.active;
+    }
+};
+
+const TestSessionPersistence = struct {
+    session_picker: struct { active: bool = false } = .{},
+};
+
+const TestManagedExecutions = struct {
+    running: bool = false,
+
+    pub fn hasRunningExecution(self: *const TestManagedExecutions) bool {
+        return self.running;
+    }
+};
+
+const TestAuth = struct {
+    api_key_entry: bool = false,
+
+    pub fn apiKeyEntryActive(self: *const TestAuth) bool {
+        return self.api_key_entry;
+    }
+};
+
+const TestSubagents = struct {
+    view_active: bool = false,
+
+    pub fn isViewActive(self: *const TestSubagents) bool {
+        return self.view_active;
+    }
+};
+
+const TestTerminal = struct {
+    full_transcript_active: bool = false,
+
+    pub fn fullTranscriptScreenActive(self: *const TestTerminal) bool {
+        return self.full_transcript_active;
+    }
+};
+
+const TestTerminalClient = struct {
+    running: bool = false,
+
+    pub fn hasRunningSession(self: *const TestTerminalClient) bool {
+        return self.running;
+    }
+};
+
 const TestAgent = struct {
     worker: TestWorker = .{},
     stream: struct { active: bool = false } = .{},
     submission: struct { pending: ?u8 = null } = .{},
+    pending_images: std.ArrayList(u8) = .empty,
+    question_prompt: TestToggle = .{},
+    approval_prompt: TestToggle = .{},
+    session_persistence: TestSessionPersistence = .{},
+    managed_executions: TestManagedExecutions = .{},
     role: enum { instance, subagent } = .instance,
     /// Whether this agent holds the resume handoff an upgrade asked for.
     upgrade_handoff: bool = false,
@@ -448,9 +666,14 @@ const TestApp = struct {
     child_agents: std.ArrayList(*TestChild) = .empty,
     input_runtime: TestInputRuntime = .{},
     terminal_input_runtime: TestTerminalInputRuntime = .{},
+    auth: TestAuth = .{},
+    subagents: TestSubagents = .{},
+    terminal: TestTerminal = .{},
+    terminal_client: TestTerminalClient = .{},
     shell: TestShell = .{},
     should_exit: bool = false,
     session_id: ?[]const u8 = "session-123",
+    test_now_ms: ?i64 = null,
     notices: std.ArrayList(u8) = .empty,
     prepare_count: usize = 0,
     request_handoff_count: usize = 0,
@@ -471,6 +694,9 @@ const TestApp = struct {
 
     fn deinit(self: *TestApp) void {
         self.input_runtime.edit_state.deinit(self.alloc);
+        self.input_runtime.paste.deinit(self.alloc);
+        self.main_agent.pending_images.deinit(self.alloc);
+        for (self.child_agents.items) |child| child.agent.pending_images.deinit(self.alloc);
         self.notices.deinit(self.alloc);
         self.child_agents.deinit(self.alloc);
     }
@@ -1065,4 +1291,409 @@ test "app_upgrade_runtime rejects mid key sequence before reload" {
     try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
     try std.testing.expectEqual(@as(usize, 0), deps.path_count);
     try std.testing.expect(std.mem.find(u8, app.notices.items, "finish the key sequence") != null);
+}
+
+fn expectAutoRestartHeldUntilCleared(app: *TestApp, clear: *const fn (*TestApp) void) !void {
+    if (app.upgrader.state == .ready and app.upgrader.ready_since_ms == null) {
+        app.upgrader.ready_since_ms = 10_000;
+    }
+    if (app.test_now_ms == null) {
+        app.test_now_ms = 12_000;
+    }
+    Runtime(TestApp).collectUpgradeFacts(app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 0), app.relaunch_path_len);
+
+    clear(app);
+    Runtime(TestApp).collectUpgradeFacts(app);
+    try std.testing.expect(app.should_exit);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+    try std.testing.expect(app.relaunch_path_len > 0);
+}
+
+test "app_upgrade_runtime auto-restarts when idle and auto_upgrade is on" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.upgrader.ready_since_ms = 10_000;
+    app.test_now_ms = 12_000;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+
+    try std.testing.expect(app.should_exit);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 1), app.request_handoff_count);
+    try std.testing.expect(app.relaunch_path_len > 0);
+}
+
+test "app_upgrade_runtime auto-restart stays off when auto_upgrade is disabled" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.auto_upgrade_enabled = false;
+    app.upgrader.state = .ready;
+    app.upgrader.ready_since_ms = 10_000;
+    app.test_now_ms = 12_000;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 0), app.relaunch_path_len);
+}
+
+test "app_upgrade_runtime auto-restart waits until update state is ready" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .downloading;
+    app.test_now_ms = 10_000;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expect(app.upgrader.ready_since_ms == null);
+
+    app.upgrader.state = .ready;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(@as(?i64, 10_000), app.upgrader.ready_since_ms);
+
+    app.test_now_ms = 12_000;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(app.should_exit);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+}
+
+test "app_upgrade_runtime waits quiet time after .ready even when idle for a long time" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .downloading;
+    app.upgrader.last_user_input_ms = 1_000;
+    app.test_now_ms = 100_000;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+
+    // .ready lands after a long idle period: must draw notice first and wait
+    // the full quiet window after .ready before restarting.
+    app.upgrader.state = .ready;
+    app.upgrader.render_dirty = true;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.render_requests.footer_count);
+    try std.testing.expectEqual(@as(?i64, 100_000), app.upgrader.ready_since_ms);
+
+    app.test_now_ms = 101_999;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+
+    app.test_now_ms = 102_000;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(app.should_exit);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+}
+
+test "app_upgrade_runtime auto-restart holds while a turn is running" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.turn_running = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a subagent is working" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.subagent_working = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.subagent_working = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a restart already waits" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    app.upgrader.restart = .waiting;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(@as(usize, 0), app.prepare_count);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.waiting, app.upgrader.restart);
+}
+
+test "app_upgrade_runtime auto-restart holds while prompts are queued" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.main_agent.worker.queued_count = 1;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.main_agent.worker.queued_count = 0;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while composer has draft text" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    try app.input_runtime.edit_state.input.appendSlice(app.alloc, "draft");
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.input_runtime.edit_state.input.clearRetainingCapacity();
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a paste is active" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.input_runtime.paste.begin(.composer, 1024);
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.input_runtime.paste.finishHandled();
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while pending images exist" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    try app.main_agent.pending_images.append(app.alloc, 1);
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.main_agent.pending_images.clearRetainingCapacity();
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a sent prompt waits to go out" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.main_agent.submission.pending = 1;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.main_agent.submission.pending = null;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a question is open" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.main_agent.question_prompt.active = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.main_agent.question_prompt.active = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while an approval is open" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.main_agent.approval_prompt.active = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.main_agent.approval_prompt.active = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds during API key entry" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.auth.api_key_entry = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.auth.api_key_entry = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while subagent view is open" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.subagents.view_active = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.subagents.view_active = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while session picker is open" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.main_agent.session_persistence.session_picker.active = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.main_agent.session_persistence.session_picker.active = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while full transcript screen is open" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.terminal.full_transcript_active = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.terminal.full_transcript_active = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a terminal key sequence is pending" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.terminal_input_runtime.terminal_action_pending = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.terminal_input_runtime.terminal_action_pending = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while another agent needs the user" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.needs_user_elsewhere = .{ .name = "reviewer", .doing = .needs_approval };
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.needs_user_elsewhere = null;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while another instance has queued prompts" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.queued_elsewhere = "fx 2";
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.queued_elsewhere = null;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a background shell session runs" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.main_agent.managed_executions.running = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.main_agent.managed_executions.running = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a child background shell session runs" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    var child = TestChild{};
+    child.agent.managed_executions.running = true;
+    try app.child_agents.append(app.alloc, &child);
+    app.upgrader.state = .ready;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.child_agents.items[0].agent.managed_executions.running = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds while a tty session runs" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.terminal_client.running = true;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.terminal_client.running = false;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime auto-restart holds during the quiet time after a key press" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.upgrader.ready_since_ms = 1_000;
+    app.upgrader.last_user_input_ms = 10_000;
+    app.test_now_ms = 11_999;
+
+    try expectAutoRestartHeldUntilCleared(&app, struct {
+        fn clear(target: *TestApp) void {
+            target.test_now_ms = 12_000;
+        }
+    }.clear);
+}
+
+test "app_upgrade_runtime parses idle quiet time override" {
+    try std.testing.expectEqual(@as(i64, 2000), idle_restart_quiet_ms);
+    try std.testing.expectEqual(idle_restart_quiet_ms, parseIdleRestartQuietMs(null));
+    try std.testing.expectEqual(idle_restart_quiet_ms, parseIdleRestartQuietMs("0"));
+    try std.testing.expectEqual(idle_restart_quiet_ms, parseIdleRestartQuietMs("-5"));
+    try std.testing.expectEqual(idle_restart_quiet_ms, parseIdleRestartQuietMs("fast"));
+    try std.testing.expectEqual(@as(i64, 150), parseIdleRestartQuietMs("150"));
+    try std.testing.expectEqual(@as(i64, 3_600_000), parseIdleRestartQuietMs("3600000"));
+}
+
+test "app_upgrade_runtime idle auto-restart does not repeat failed relaunch notices" {
+    var app = TestApp{
+        .alloc = std.testing.allocator,
+        .session_id = null,
+    };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.upgrader.ready_since_ms = 10_000;
+    app.test_now_ms = 12_000;
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
+    try std.testing.expect(app.upgrader.auto_restart_failed);
+
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
 }

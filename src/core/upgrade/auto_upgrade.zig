@@ -144,6 +144,13 @@ pub const AutoUpgrade = struct {
     /// Main loop only. Ctrl+G accepted the upgrade while turns ran
     /// (`app_upgrade_runtime` `collectUpgradeFacts`).
     restart: RestartWait = .none,
+    /// Main loop only. Timestamp of the last key press routed to the app.
+    last_user_input_ms: ?i64 = null,
+    /// Main loop only. Timestamp when `state` was first observed as `.ready`.
+    ready_since_ms: ?i64 = null,
+    /// Main loop only. Set if an automatic idle restart failed to prepare a
+    /// relaunch, so `collectUpgradeFacts` does not repeat the error notice.
+    auto_restart_failed: bool = false,
 
     pub fn configure_channel(self: *AutoUpgrade, selected: update_target.Channel) void {
         self.selected_channel = selected;

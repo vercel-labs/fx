@@ -636,6 +636,10 @@ const UnsupportedRegistry = struct {
         return true;
     }
 
+    pub fn hasLiveSession(_: *UnsupportedRegistry) bool {
+        return false;
+    }
+
     pub fn deinit(self: *UnsupportedRegistry) void {
         self.* = undefined;
     }
@@ -794,6 +798,17 @@ const SupportedRegistry = struct {
         self.mutex.lockUncancelable(zio);
         defer self.mutex.unlock(zio);
         return self.exiting;
+    }
+
+    pub fn hasLiveSession(self: *SupportedRegistry) bool {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        for (self.sessions) |maybe_session| {
+            const session = maybe_session orelse continue;
+            if (session.isLive()) return true;
+        }
+        return false;
     }
 
     pub fn deinit(self: *SupportedRegistry) void {

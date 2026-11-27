@@ -382,6 +382,7 @@ test.skipIf(SKIP_TMUX)("tui generates a title in the fresh session an upgrade re
         ...baseEnv(root, gateway),
         FX_AUTO_UPGRADE: "1",
         FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+        FX_TEST_UPGRADE_IDLE_QUIET_MS: "3600000",
       },
     });
     await tui.waitForStableComposer(15000);

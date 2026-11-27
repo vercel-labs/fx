@@ -454,6 +454,21 @@ pub const Runtime = struct {
     /// Waits until `timeout_ms` for backend threads that the exit close left
     /// draining, so a test can free the backend. fx's own exit never waits
     /// past its budget, and keeps such a backend allocated instead.
+    /// Whether any owned TTY terminal session is still starting or running.
+    pub fn hasRunningSession(self: *Runtime) bool {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        const pending = self.active_count > 0 or self.queue.len > 0;
+        self.mutex.unlock(zio);
+        if (pending) return true;
+
+        self.backend_mutex.lockUncancelable(zio);
+        const backend = self.backend;
+        self.backend_mutex.unlock(zio);
+        if (backend) |value| return value.registry.hasLiveSession();
+        return false;
+    }
+
     pub fn joinExitDrainForTest(self: *Runtime, timeout_ms: i64) void {
         const zio = io_mod.getIo();
         self.backend_mutex.lockUncancelable(zio);

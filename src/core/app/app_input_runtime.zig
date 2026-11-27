@@ -625,6 +625,13 @@ pub fn Runtime(comptime App: type) type {
             max_prompt_history: usize,
         ) !?u8 {
             if (!ingress.has_routing_work()) return null;
+            if (ingress.event) |event| {
+                const user_key = switch (event) {
+                    .paste_byte, .raw => true,
+                    .action => |decoded| decoded.action != .ignore,
+                };
+                if (user_key) app_upgrade_runtime.Runtime(App).noteUserInput(app, io_mod.milliTimestamp());
+            }
             if (comptime @hasField(App, "trust")) {
                 if (try app_trust_runtime.Runtime(App).routeIngress(app, ingress)) return null;
             }
@@ -709,6 +716,7 @@ pub fn Runtime(comptime App: type) type {
                 terminalPasteActive(app),
             );
             if (ingress.event) |event| {
+                app_upgrade_runtime.Runtime(App).noteUserInput(app, now);
                 switch (event) {
                     .action => |decoded| {
                         std.debug.assert(decoded.action == .escape);
@@ -733,6 +741,7 @@ pub fn Runtime(comptime App: type) type {
                 if (agents.screenAgentOf(app).session_persistence.pending_live_session_policy != null or
                     app.terminal_input_runtime.hasDeferredSessionInput())
                 {
+                    app_upgrade_runtime.Runtime(App).noteUserInput(app, io_mod.milliTimestamp());
                     if (try app.terminal_input_runtime.deferSessionInputByte(app.alloc, byte, input_limits.composer_bytes)) return;
                     if (agents.screenAgentOf(app).session_persistence.pending_live_session_policy != null) {
                         try session_rt.cancelPendingLiveSessionForInputLimit(app, agents.screenAgentOf(app));
