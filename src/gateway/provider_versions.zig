@@ -4,6 +4,7 @@ const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_client = @import("client.zig");
 const json_decode = @import("../core/shared/json_decode.zig");
+const raw_answer_testing = @import("raw_answer_testing.zig");
 
 const Allocator = std.mem.Allocator;
 const lookup_timeout_ms = 3000;
@@ -79,7 +80,7 @@ const LookupOperation = struct {
         const buffer = try self.alloc.alloc(u8, max_response_bytes + 1);
         defer self.alloc.free(buffer);
         var writer = std.Io.Writer.fixed(buffer);
-        const result = try gateway_client.fetchOnOpenJob(.{
+        const result = try gateway_client.fetchWholeBodyOnOpenJob(.{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = .{
@@ -142,4 +143,18 @@ test "a version lookup ends at its deadline during a lookup that hangs" {
     const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     try std.testing.expectError(error.ProviderVersionUnavailable, fetch(&context, std.testing.allocator, .grok));
     try std.testing.expect(stuck_lookup_testing.elapsedMsSince(started) < 1_000);
+}
+
+test "a grok version body cut inside its Content-Length is an unavailable version, not a shorter one" {
+    const alloc = std.testing.allocator;
+    const answer: []const u8 = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nConnection: close\r\n\r\n0.162.1";
+    const server = try raw_answer_testing.AnswerServer.start(alloc, answer);
+    const url = try server.url(alloc, "/cli/stable");
+    defer alloc.free(url);
+    const env = try raw_answer_testing.Env.install(alloc, &[_][2][]const u8{.{ "FX_TEST_GROK_VERSION_URL", url }});
+    defer env.deinit();
+    var never_cancelled = std.atomic.Value(bool).init(false);
+    const result = resolve(alloc, .grok, &never_cancelled, null);
+    try server.finish();
+    try std.testing.expectError(error.ProviderVersionUnavailable, result);
 }

@@ -11,7 +11,18 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { FX_BIN, REPO_ROOT, providerVersionTestEnv } from "../evals/eval-helpers";
+import {
+  CREDENTIAL_ENV_KEYS,
+  DEFAULT_UNSET_ENV_KEYS,
+  FX_BIN,
+  REPO_ROOT,
+  providerVersionTestEnv,
+} from "../evals/eval-helpers";
+
+// A pane inherits the tmux server's environment, which a developer's shell
+// may have filled, so a test's tmux launch drops the same names as every
+// other launcher of fx.
+export { DEFAULT_UNSET_ENV_KEYS, fxChildEnv } from "../evals/eval-helpers";
 
 let sessionCounter = 0;
 
@@ -19,55 +30,6 @@ export const FAKE_GATEWAY_MODEL = "openai/gpt-5";
 const TMUX_CAPTURE_MAX_BUFFER = 32 * 1024 * 1024;
 const TMUX_HEX_CHUNK_BYTES = 256;
 const COMPOSER_LINE = /^[ \t]*(?:┃|❯|>)(?:[ \t]|$)/;
-const AUTH_ENV_KEYS = [
-  "AI_GATEWAY_API_KEY",
-  "VERCEL_OIDC_TOKEN",
-] as const;
-export const DEFAULT_UNSET_ENV_KEYS = [
-  ...AUTH_ENV_KEYS,
-  "FX_TEST_GATEWAY_CHAT_URL",
-  "FX_TEST_GATEWAY_MODELS_URL",
-  "FX_TEST_GATEWAY_CREDITS_URL",
-  "FX_TEST_UPGRADE_BASE_URL",
-  "FX_PERMISSION_MODE",
-  "FX_HOME",
-  // A pane inherits the tmux server's environment, which a developer's shell
-  // may have filled: their terminal recording would start on every test's fx,
-  // and the bridge of the fx session that started the server would point
-  // `fx mcp call` at that session.
-  "FX_DEBUG_RECORD",
-  "FX_DEBUG_RECORD_SILENT_BANNER",
-  "FX_RECORD",
-  "FX_RECORD_INPUT",
-  "FX_MCP_CALL_SOCKET",
-  "FX_MCP_CALL_TOKEN",
-  // fx reads its test holds in release builds, so a hold left there would
-  // stop every test's fx at it. A test that sets one passes it in `env`.
-  "FX_TEST_REPORT_DELIVERY_HELD",
-  "FX_TEST_REPORT_DELIVERY_RELEASE",
-  "FX_TEST_SESSION_WRITE_HELD",
-  "FX_TEST_SESSION_WRITE_RELEASE",
-  "FX_TEST_SHELL_YIELD_HELD",
-  "FX_TEST_SHELL_YIELD_RELEASE",
-  "FX_TEST_SUBAGENT_CLOSE_HELD",
-  "FX_TEST_SUBAGENT_CLOSE_RELEASE",
-  "FX_TEST_SUBAGENT_END_HELD",
-  "FX_TEST_SUBAGENT_END_RELEASE",
-  "FX_TEST_SUBAGENT_PUBLISH_HELD",
-  "FX_TEST_SUBAGENT_PUBLISH_RELEASE",
-  "FX_TEST_SUBAGENT_SETTLE_HELD",
-  "FX_TEST_SUBAGENT_SETTLE_RELEASE",
-  "FX_TEST_SUBAGENT_START_HELD",
-  "FX_TEST_SUBAGENT_START_RELEASE",
-  "FX_TEST_WORKSPACE_CAPTURE_START_HELD",
-  "FX_TEST_WORKSPACE_CAPTURE_START_RELEASE",
-  "FX_TEST_GREP_RELEASE",
-  "FX_TEST_ACP_PROMPT_TERMINAL_READY",
-  "FX_TEST_ACP_PROMPT_REAP_READY",
-  "FX_TEST_ACP_PROMPT_RELEASE",
-  "FX_TEST_ACP_PERMISSION_READY",
-  "FX_TEST_ACP_PERMISSION_RELEASE",
-] as const;
 const MIRRORED_ENV_KEYS = [
   "FX_GATEWAY_BASE_URL",
   "FX_GATEWAY_CHAT_URL",
@@ -837,7 +799,7 @@ export class TmuxSession {
     const exitStatusPath = join(tmpdir(), `${name}.exit-status`);
     rmSync(exitStatusPath, { force: true });
 
-    const authEnvKeys = new Set<string>(AUTH_ENV_KEYS);
+    const authEnvKeys = new Set<string>(CREDENTIAL_ENV_KEYS);
     const unsetArgs = Object.entries(env).flatMap(([key, value]) =>
       value === undefined ? ["-u", shellQuote(key)] : []
     );
@@ -1027,7 +989,7 @@ export class TmuxSession {
     }
     const session = new TmuxSession(name, exitStatusPath, resolvedSocketName);
     try {
-      for (const key of AUTH_ENV_KEYS) {
+      for (const key of CREDENTIAL_ENV_KEYS) {
         try {
           execFileSync(
             "tmux",
