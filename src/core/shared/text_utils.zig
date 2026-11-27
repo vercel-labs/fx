@@ -1494,19 +1494,12 @@ fn matchesAwsAccessKey(text: []const u8, start: usize) ?SecretSpan {
 fn matchesBasicAuthUrl(text: []const u8, start: usize) ?SecretSpan {
     const prefix_len = urlSchemeLen(text[start..]) orelse return null;
     const credential_start = start + prefix_len;
-    var i = credential_start;
-    var colon: ?usize = null;
-    while (i < text.len and text[i] != '\n' and text[i] != '\r' and !std.ascii.isWhitespace(text[i])) : (i += 1) {
-        if (text[i] == '/' or text[i] == '?' or text[i] == '#') return null;
-        if (text[i] == ':' and colon == null) colon = i;
-        if (text[i] == '@') {
-            if (colon != null and i > credential_start) {
-                return .{ .prefix_end = credential_start, .value_len = i - credential_start, .kind = "url_credentials" };
-            }
-            return null;
-        }
-    }
-    return null;
+    const authority_end = firstDelimiter(text, credential_start, "/?# \t\r\n\x0b\x0c");
+    const host_start = urlUserInfoEnd(text, credential_start, authority_end);
+    if (host_start == credential_start) return null;
+    const credentials = text[credential_start .. host_start - 1];
+    if (std.mem.findScalar(u8, credentials, ':') == null) return null;
+    return .{ .prefix_end = credential_start, .value_len = credentials.len, .kind = "url_credentials" };
 }
 
 /// The most bytes of a URL scheme that `urlSchemeLen` reads.
@@ -1893,6 +1886,8 @@ test "maskSecrets masks the credentials of a URL with any scheme" {
         .{ "conn postgres://admin:hunter2pass@db.internal:5432/app", "conn postgres://[redacted]@db.internal:5432/app" },
         .{ "redis://:hunter2pass@cache:6379", "redis://[redacted]@cache:6379" },
         .{ "git+ssh://u:hunter2pass@h/x.git", "git+ssh://[redacted]@h/x.git" },
+        .{ "postgres://user:example@credential@db.internal/app", "postgres://[redacted]@db.internal/app" },
+        .{ "https://user:example@host/path@name", "https://[redacted]@host/path@name" },
         .{ "https://user:hunter2pass@host/v1", "https://[redacted]@host/v1" },
         // No password, or no credentials at all.
         .{ "ssh://git@github.com/x.git", "ssh://git@github.com/x.git" },
