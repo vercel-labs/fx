@@ -8,6 +8,7 @@ import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN, runFx } from "
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewaySerializedToolCall,
   fakeGatewayToolCall,
   startDynamicFakeGateway,
   startFakeGateway,
@@ -1802,6 +1803,85 @@ describe("remote setup in a terminal (AC-25)", () => {
     });
   }, TIMEOUT * 3);
 
+  test.skipIf(!tmuxAvailable())("AC-25: width 80 keeps both Reason lines and the remote command output intact without garbling", async () => {
+    const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
+    await withSetup({ teams: [fakeTeam, fakeSecondTeam] }, async (setup) => {
+      await withSandboxFixture(
+        [
+          fakeGatewayToolCall("call-1", "shell", { command: "printf 'remote-out-%s\\n' ok-42" }),
+          (body: string) => {
+            const raw = toolResultsIn(body).at(-1) ?? "{}";
+            const output = (JSON.parse(raw) as { output_delta?: string }).output_delta ?? "";
+            return fakeGatewayFinalText(output);
+          },
+        ],
+        async (fixture) => {
+          const width = 80;
+          const script = `${shellQuote(FX_BIN)} ask --permission-mode full-access ${shellQuote("Run it.")}; code=$?; printf '\\n__FX_EXIT_%s__\\n' "$code"; exit "$code"`;
+          const cmd = `/bin/sh -c ${shellQuote(script)}`;
+          const session = await TmuxSession.create({
+            cmd,
+            cwd: fixture.workspace,
+            width,
+            remainOnExit: true,
+            env: { ...gatewayEnv(fixture.home, fixture.gateway), ...setup.env },
+          });
+          sessions.push(session);
+          await session.waitForText("Which Vercel team should remote commands use?", TIMEOUT);
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          await session.waitForText("Pick a project in fx-test-team", TIMEOUT);
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          await session.waitForText("Submit, Edit, Decline, or Cancel", TIMEOUT);
+          await session.sendLiteral("1");
+          await session.sendKeys("Enter");
+          await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+
+          expectRemoteWritten(fixture, fakeTeam, fakeTeam.projects[0]!, fakeUser.id);
+          const started = events(fixture).find((event) => event.ev === "start" && JSON.stringify(event.argv).includes("ok-42"));
+          expect(started).toBeDefined();
+          expect(events(fixture).some((event) => event.ev === "exit" && event.id === started!.id && event.code === 0)).toBe(true);
+
+          const scrollback = await session.captureFullScrollback();
+          const lines = scrollback.split("\n").map((line) => line.trimEnd());
+          const teamReason = "Reason: Which Vercel team should remote commands use?";
+          const projectReason = `Reason: Pick a project in ${fakeTeam.slug}. fx will copy this repository's files to a sandbox in the project you pick, for remote commands.`;
+          const outputText = "remote-out-ok-42";
+
+          expect(lines).toContain(teamReason);
+
+          // At 80 columns the project Reason line can wrap over several rows. A row that fills the
+          // width was cut inside a word, so the next row joins it with no space; any other break fell on a space.
+          const projectReasonStart = lines.findIndex((line) => line.startsWith("Reason: Pick a project in "));
+          expect(projectReasonStart).toBeGreaterThanOrEqual(0);
+          let joinedProjectReason = lines[projectReasonStart] ?? "";
+          let previousRow = joinedProjectReason;
+          for (let row = projectReasonStart + 1; !joinedProjectReason.endsWith("remote commands.") && row < lines.length; row += 1) {
+            const line = lines[row] ?? "";
+            joinedProjectReason += previousRow.length === width ? line : ` ${line}`;
+            previousRow = line;
+          }
+          expect(joinedProjectReason).toBe(projectReason);
+
+          expect(lines.some((line) => line.trim() === outputText)).toBe(true);
+
+          const formPattern = /fx asks|Reason:|Which Vercel team|Pick a project|Another project|Choose a number|Submit, Edit, Decline|Current values/;
+          const commandOutputPattern = /remote-out-ok-42|Running printf/;
+          for (const line of lines) {
+            expect(formPattern.test(line) && commandOutputPattern.test(line)).toBe(false);
+          }
+        },
+        () => ({ remote: undefined, rules: [{ command: "printf*", runner: "remote" }] }),
+        true,
+        setup,
+      );
+    });
+  }, TIMEOUT * 3);
+
   test.skipIf(!tmuxAvailable())("AC-25: a fresh profile with a remote rule, and a listed project picked: the other-name question never appears", async () => {
     await withSetup({ teams: [fakeTeam, fakeSecondTeam] }, async (setup) => {
       await withSandboxFixture(
@@ -3436,6 +3516,14 @@ describe("a placed run's result through the host: the runner's lines pass throug
   }, TIMEOUT * 2);
 });
 
+// `fx ask` as a person runs it in a terminal: its exit code is printed on a line of its
+// own, and the pane stays after fx exits, so the scrollback can be read at the end.
+function askInTerminal(): string {
+  const quote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
+  const script = `${quote(FX_BIN)} ask --permission-mode full-access ${quote("Run it.")}; code=$?; printf '\\n__FX_EXIT_%s__\\n' "$code"; exit "$code"`;
+  return `/bin/sh -c ${quote(script)}`;
+}
+
 describe("the notice of a shell run reaches the person in the TUI and in plain fx ask (D7)", () => {
   const UNAME_RULE = { command: "uname -s*", runner: "local" };
   const UNAME_LINE = "fx: ran on local because of your rule for uname -s*";
@@ -3477,6 +3565,31 @@ describe("the notice of a shell run reaches the person in the TUI and in plain f
         });
         expect(result.code).toBe(0);
         expect(result.stderr.split("\n").filter((line) => line === UNAME_LINE)).toHaveLength(1);
+        expect(execEvents(fixture)).toEqual([]);
+      },
+      () => ({ rules: [UNAME_RULE] }),
+    );
+  }, TIMEOUT * 2);
+
+  test.skipIf(!HAS_TMUX)("fx ask in a terminal draws the uname reason line under its row once, and nothing runs in the sandbox", async () => {
+    await withSandboxFixture(
+      shellCall({ command: "uname -s", runner: "remote" }),
+      async (fixture) => {
+        const session = await TmuxSession.create({
+          cmd: askInTerminal(),
+          cwd: fixture.workspace,
+          width: 200,
+          remainOnExit: true,
+          env: { ...gatewayEnv(fixture.home, fixture.gateway), ...fixture.setup.env },
+        });
+        sessions.push(session);
+        await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+        const lines = (await session.captureFullScrollback()).split("\n");
+        const at = lines.findIndex((line) => line.includes(UNAME_LINE));
+        expect(at).toBeGreaterThan(0);
+        expect(lines.filter((line) => line.includes(UNAME_LINE))).toHaveLength(1);
+        expect(lines[at]).toContain(`├ ${UNAME_LINE}`);
+        expect(lines[at - 1]).toContain("uname -s");
         expect(execEvents(fixture)).toEqual([]);
       },
       () => ({ rules: [UNAME_RULE] }),
@@ -3568,5 +3681,37 @@ describe("shell rows and group headers name non-local runners (D8)", () => {
       },
     );
   }, TIMEOUT * 2);
+
+  test.skipIf(!HAS_TMUX)(
+    "fx ask in a terminal shows Running on remote for the remote row and plain Running for the local row in one run",
+    async () => {
+      await withSandboxFixture(
+        [
+          fakeGatewayToolCall("call-1", "shell", { command: "sleep 2; echo done" }),
+          // The text before the second call ends the first call's group, so each row is its own group.
+          fakeGatewaySerializedToolCall("call-2", "shell", JSON.stringify({ command: "echo local-ok" }), "Remote done.\n"),
+          fakeGatewayFinalText("Local done.\n"),
+        ],
+        async (fixture) => {
+          const session = await TmuxSession.create({
+            cmd: askInTerminal(),
+            cwd: fixture.workspace,
+            width: 200,
+            remainOnExit: true,
+            env: { ...gatewayEnv(fixture.home, fixture.gateway), ...fixture.setup.env },
+          });
+          sessions.push(session);
+          await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+          const scrollback = await session.captureFullScrollback();
+          expect(scrollback).toContain("Local done.");
+          expect(scrollback).toContain("● Running on remote sleep 2; echo done");
+          expect(scrollback).toContain("● Running echo local-ok");
+          expect(scrollback).not.toContain("on remote echo local-ok");
+        },
+        () => ({ rules: [{ command: "sleep 2*", runner: "remote" }] }),
+      );
+    },
+    TIMEOUT * 2,
+  );
 });
 
