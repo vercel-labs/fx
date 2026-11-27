@@ -43,15 +43,29 @@
 \* `listedDrop` are what a reader of the pages would say: the count is right when it matches them. The core's trace
 \* (src/mcp/core/catalog.zig) does not show the count, which `Server` keeps, so CatalogTrace.tla leaves it free;
 \* `TrackDrops` turns the choice off, so the stress bounds keep their size.
+\*
+\* A page refused for an HTTP status that says the server can't answer now (429, 503: src/mcp/server.zig
+\* `httpListRefusal`, `listUnavailable`) is refused like any other, with the same transitions and no other retry, but
+\* `fx mcp show` calls it unavailable, not refused. `unavail` says so, and goes with the refusal: it is set by the
+\* page that was refused for such a status (`PageRefused(TRUE)`), and a published list, a new process, a refusal of
+\* another kind and a page whose line fx could not read take it back, while a listing the server never answered
+\* leaves it. The core's trace does not show the status, so CatalogTrace.tla leaves the kind free, and `TrackKind`
+\* turns the choice off for the stress bounds. Which status a refusal had is not checked as a state property: the
+\* action that sets `unavail` is the only record of it, so a property over a copy of it would hold by how it is written.
+\* The rule that a refusal of another kind takes it back is pinned by the code's tests (src/mcp/server.zig).
 EXTENDS Naturals
 
 CONSTANTS
     MaxPages,      \* pages per listing (100 in fx)
     MaxGen,        \* invalidations, bounds the state space
     MaxProcesses,
-    TrackDrops     \* whether a page may leave tools out (the smoke bounds do, the stress bounds do not)
+    TrackDrops,    \* whether a page may leave tools out (the smoke bounds do, the stress bounds do not)
+    TrackKind      \* whether a refusal may be for a temporary status (the smoke bounds do, the stress bounds do not)
 
-ASSUME MaxPages \in Nat \ {0} /\ MaxGen \in Nat /\ MaxProcesses \in Nat \ {0} /\ TrackDrops \in BOOLEAN
+ASSUME MaxPages \in Nat \ {0} /\ MaxGen \in Nat /\ MaxProcesses \in Nat \ {0} /\ TrackDrops \in BOOLEAN /\ TrackKind \in BOOLEAN
+
+\* The kinds a refusal may have.
+Kinds == IF TrackKind THEN BOOLEAN ELSE {FALSE}
 
 VARIABLES
     era,           \* the current process's era: "none" before the first, "modern", "legacy"
@@ -81,16 +95,17 @@ VARIABLES
     gatherDrop,    \* the engine's count of the running listing: a page so far left tools out
     dropped,       \* the published list's count: the list left tools out
     runDrop,       \* ghost: a page of the running listing left tools out
-    listedDrop     \* ghost: a page of the published list left tools out
+    listedDrop,    \* ghost: a page of the published list left tools out
+    unavail        \* the last refusal was for a status that says the server is temporarily unavailable
 
 vars == <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, listing,
           startGen, page, restarts, zeroTtl, lapsed, pending, waiting, answer,
           refused, servedStale, extraFetch, lastAnswer, graceLine,
-          gatherDrop, dropped, runDrop, listedDrop>>
+          gatherDrop, dropped, runDrop, listedDrop, unavail>>
 
 dropVars == <<gatherDrop, dropped, runDrop, listedDrop>>
 
-refusedVars == <<refused, lastAnswer, graceLine>>
+refusedVars == <<refused, lastAnswer, graceLine, unavail>>
 
 listingVars == <<listing, startGen, page, restarts, zeroTtl, lapsed, pending, waiting, answer>>
 
@@ -120,6 +135,7 @@ Init ==
     /\ dropped = FALSE
     /\ runDrop = FALSE
     /\ listedDrop = FALSE
+    /\ unavail = FALSE
 
 \* Mark the current list stale and move to a new generation.
 Invalidated ==
@@ -139,6 +155,7 @@ ProcessStarted(e) ==
     /\ refused' = FALSE
     /\ lastAnswer' = "none"
     /\ graceLine' = "none"
+    /\ unavail' = FALSE
     /\ UNCHANGED <<cacheGen, cachedZero, cachedLapsed, listingVars, servedStale, extraFetch>>
     /\ UNCHANGED dropVars
 
@@ -185,6 +202,7 @@ Finish(z, l) ==
     /\ refused' = FALSE
     /\ lastAnswer' = "list"
     /\ graceLine' = "none"
+    /\ unavail' = FALSE
     /\ UNCHANGED <<startGen, restarts>>
 
 \* A complete page. `more`: it has a nextCursor (an empty string is a
@@ -246,6 +264,7 @@ InvalidCursor ==
                /\ graceLine' = "none"
                /\ refused' = TRUE
                /\ lastAnswer' = "refused"
+               /\ unavail' = FALSE
                /\ UNCHANGED <<startGen, page, restarts, zeroTtl, lapsed>>
     /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, servedStale, extraFetch>>
 
@@ -253,12 +272,14 @@ InvalidCursor ==
 \* error (including -32602 on the first page), input_required (MRTR-07: never
 \* cached), or a malformed result. The listing fails: an answer that failed is
 \* never cached, and its waiters may get the last list. The refusal is kept.
-PageRefused ==
+PageRefused(k) ==
     /\ pending # "none"
+    /\ k \in Kinds
     /\ Failed
     /\ graceLine' = "none"
     /\ refused' = TRUE
     /\ lastAnswer' = "refused"
+    /\ unavail' = k
     /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,
                    page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>
 
@@ -272,6 +293,7 @@ PageFailed ==
     /\ graceLine' = "none"
     /\ refused' = refused
     /\ lastAnswer' = lastAnswer
+    /\ unavail' = unavail
     /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,
                    page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>
 
@@ -301,6 +323,7 @@ PageUnreadable ==
     /\ refused' = TRUE
     /\ lastAnswer' = "unreadable"
     /\ graceLine' = "own"
+    /\ unavail' = FALSE
     /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,
                    page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>
 
@@ -312,11 +335,12 @@ PageSharedGrace ==
     /\ Failed
     /\ lastAnswer' = lastAnswer
     /\ refused' = refused
+    /\ unavail' = unavail
     /\ graceLine' = IF refused' /\ ~refused THEN "shared-refused" ELSE "shared"
     /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,
                    page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>
 
-Answer == (\E m, z, l, d \in BOOLEAN : PageReceived(m, z, l, d)) \/ InvalidCursor \/ PageRefused \/ PageUnreadable \/ PageSharedGrace \/ PageFailed
+Answer == (\E m, z, l, d \in BOOLEAN : PageReceived(m, z, l, d)) \/ InvalidCursor \/ (\E k \in BOOLEAN : PageRefused(k)) \/ PageUnreadable \/ PageSharedGrace \/ PageFailed
 
 Next ==
     \/ \E e \in {"modern", "legacy"} : ProcessStarted(e)
@@ -413,6 +437,10 @@ GatheredCountIsOfTheRunningListing == gatherDrop = runDrop
 
 \* Nothing is left counted when no listing runs: what a discarded or failed listing counted does not reach the next.
 IdleGathersNothing == listing = "idle" => (~gatherDrop /\ ~runDrop)
+
+\* "Unavailable" never outlives its refusal: a published list, a new process and a page whose line fx could not read all
+\* take it back, and a listing that the server never answered leaves it as it was.
+UnavailableOnlyWhileRefused == unavail => (refused /\ lastAnswer = "refused")
 
 \* Everyone who needs the list gets an answer.
 EveryNeedAnswered == waiting ~> ~waiting
