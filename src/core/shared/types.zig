@@ -3049,6 +3049,11 @@ pub const FinishedPrompt = struct {
     turn: HistoryTurn,
     /// Owned display-only text; never serialized as conversation history.
     presentation_text: ?[]const u8 = null,
+    /// Owned. The whole answer when replies cut off at their output limit
+    /// began it, for a subagent's report: the saved turn keeps each part as
+    /// the turn sent it, so its last message is only the last part. Null
+    /// otherwise.
+    continued_answer: ?[]const u8 = null,
     summary: ?TurnSummary = null,
     terminal_projection: FinishedPromptProjection = .history_default,
     terminal_outcome: ?TurnPresentationOutcome = null,
@@ -3368,6 +3373,7 @@ pub fn freeHistoryTurnSlice(alloc: std.mem.Allocator, turns: []HistoryTurn) void
 pub fn freeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) void {
     freeHistoryTurn(alloc, finished.turn);
     if (finished.presentation_text) |text| alloc.free(text);
+    if (finished.continued_answer) |text| alloc.free(text);
     if (finished.snapshot_file_ownership) |ownership| ownership.release();
 }
 
@@ -3508,10 +3514,13 @@ pub fn dupeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) !F
     const turn = try dupeHistoryTurn(alloc, finished.turn);
     errdefer freeHistoryTurn(alloc, turn);
     const presentation_text = if (finished.presentation_text) |text| try alloc.dupe(u8, text) else null;
+    errdefer if (presentation_text) |text| alloc.free(text);
+    const continued_answer = if (finished.continued_answer) |text| try alloc.dupe(u8, text) else null;
     if (finished.snapshot_file_ownership) |ownership| ownership.retain();
     return .{
         .turn = turn,
         .presentation_text = presentation_text,
+        .continued_answer = continued_answer,
         .summary = finished.summary,
         .terminal_projection = finished.terminal_projection,
         .terminal_outcome = finished.terminal_outcome,
@@ -4599,12 +4608,15 @@ test "HistoryTurn helpers duplicate and free owned turns" {
         .terminal_projection = .assistant_text,
         .terminal_outcome = .completed,
         .presentation_text = try alloc.dupe(u8, "Earlier reply.\nI stopped here."),
+        .continued_answer = try alloc.dupe(u8, "Earlier reply.\nI stopped here."),
     };
     const finished_copy = try dupeFinishedPrompt(alloc, finished_original);
     try std.testing.expectEqual(FinishedPromptProjection.assistant_text, finished_copy.terminal_projection);
     try std.testing.expectEqual(@as(?TurnPresentationOutcome, .completed), finished_copy.terminal_outcome);
     try std.testing.expectEqualStrings(finished_original.presentation_text.?, finished_copy.presentation_text.?);
     try std.testing.expect(finished_original.presentation_text.?.ptr != finished_copy.presentation_text.?.ptr);
+    try std.testing.expectEqualStrings(finished_original.continued_answer.?, finished_copy.continued_answer.?);
+    try std.testing.expect(finished_original.continued_answer.?.ptr != finished_copy.continued_answer.?.ptr);
     freeFinishedPrompt(alloc, finished_copy);
     freeFinishedPrompt(alloc, finished_original);
 }

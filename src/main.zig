@@ -8634,6 +8634,74 @@ test "a subagent's run ends only once the turn carrying its work id is saved" {
     try App.AgentsAppRuntime.visit(&app, child, &completion, Check.run);
 }
 
+test "a subagent's run end keeps a continued answer for its report" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    var completion: agents.ChildRunCompletion = .{};
+    var turn_context = subagent_execution.TurnContext.initHosted(alloc, 8);
+    defer turn_context.deinit();
+    var child_run = try testChildRun(alloc, &resolver, false, null);
+    child_run.work_id = try alloc.dupe(u8, "work-1");
+    child_run.completion = &completion;
+    child_run.turn = &turn_context;
+    App.AgentsAppRuntime.installChildRun(&app, child, child_run);
+
+    const Check = struct {
+        fn run(done: *agents.ChildRunCompletion, a: *App, agent: *agents.Agent) anyerror!void {
+            // The saved turn keeps only the last part of the cut answer.
+            const saved: types.FinishedPrompt = .{
+                .turn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("task"), .work_id = @constCast("work-1") },
+                    .assistant = @constCast("and the rest."),
+                } },
+                .continued_answer = "First part, and the rest.",
+            };
+            App.AgentsAppRuntime.commitChildTurn(a, agent, saved);
+            try std.testing.expectEqual(agents.ChildRunCompletion.Outcome.completed, done.outcome.?);
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, &completion, Check.run);
+    try std.testing.expectEqualStrings("First part, and the rest.", turn_context.continued_answer orelse "");
+}
+
+test "a subagent's run end keeps no continued answer when its turn has none" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    var completion: agents.ChildRunCompletion = .{};
+    var turn_context = subagent_execution.TurnContext.initHosted(alloc, 8);
+    defer turn_context.deinit();
+    var child_run = try testChildRun(alloc, &resolver, false, null);
+    child_run.work_id = try alloc.dupe(u8, "work-1");
+    child_run.completion = &completion;
+    child_run.turn = &turn_context;
+    App.AgentsAppRuntime.installChildRun(&app, child, child_run);
+
+    const Check = struct {
+        fn run(done: *agents.ChildRunCompletion, a: *App, agent: *agents.Agent) anyerror!void {
+            const saved: types.FinishedPrompt = .{ .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("task"), .work_id = @constCast("work-1") },
+                .assistant = @constCast("answer"),
+            } } };
+            App.AgentsAppRuntime.commitChildTurn(a, agent, saved);
+            try std.testing.expectEqual(agents.ChildRunCompletion.Outcome.completed, done.outcome.?);
+        }
+    };
+    try App.AgentsAppRuntime.visit(&app, child, &completion, Check.run);
+    try std.testing.expect(turn_context.continued_answer == null);
+}
+
 test "a subagent turn a cut reply failed tells its parent output_limit, and a provider's own error stays first" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };

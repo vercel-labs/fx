@@ -819,10 +819,13 @@ test "common Stop sees a cut answer joined with the reply that finished it" {
         types.ProviderCompletionDisposition.completed,
         handler.seen_disposition.?,
     );
+    // The saved turn keeps the part as the turn sent it.
     try std.testing.expectEqualStrings(
-        "candidate and the rest",
+        " and the rest",
         deps.history_turns.items[0].assistant.execution.tool_steps[0].assistant.?,
     );
+    try std.testing.expectEqualStrings("candidate and the rest", deps.finish_presentation_text orelse "");
+    try std.testing.expectEqualStrings("candidate and the rest", deps.finish_continued_answer orelse "");
     // A finished turn carries no provider disposition to finalization.
     try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, null), deps.finalized_disposition);
 }

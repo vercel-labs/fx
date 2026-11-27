@@ -318,48 +318,39 @@ fn outputLimitTextNote(arena: Allocator, limit: ?u32, text: bool, again: bool) !
 }
 
 /// The text of replies cut off before any tool call, which a later reply
-/// completes. fx joins the parts, so the turn's final text, its saved turn,
-/// and a subagent's report hold the whole answer once
-/// (`tests/tla/agent_runtime/OutputLimit.tla` AnswerHasEveryPart).
+/// completes. Only what fx shows joins the parts: the turn keeps each part and
+/// fx's note as it sent them, so the next turn's request starts with this
+/// turn's last one (`tests/tla/saved_turn/SavedTurn.tla` NextExtendsLast),
+/// while the screen, `fx ask`, and a subagent's report hold the whole answer
+/// once (`tests/tla/agent_runtime/OutputLimit.tla` AnswerHasEveryPart).
 const ContinuedAnswer = struct {
     text: std.ArrayList(u8) = .empty,
-    /// Where the first part's message starts in the turn's suffix, and where
-    /// the last note after a part ends.
-    suffix_start: ?usize = null,
-    suffix_end: usize = 0,
+    begun: bool = false,
 
-    /// Keeps `part`, a cut reply's text, before its message joins a suffix of
-    /// `suffix_len` messages.
-    fn begin(self: *ContinuedAnswer, arena: Allocator, suffix_len: usize, part: []const u8) !void {
-        if (self.suffix_start == null) self.suffix_start = suffix_len;
+    /// Keeps `part`, a cut reply's text.
+    fn begin(self: *ContinuedAnswer, arena: Allocator, part: []const u8) !void {
+        self.begun = true;
         try self.text.appendSlice(arena, part);
-    }
-
-    fn noteEnd(self: *ContinuedAnswer, suffix_len: usize) void {
-        if (self.suffix_start != null) self.suffix_end = suffix_len;
     }
 
     fn forget(self: *ContinuedAnswer) void {
         self.text.clearRetainingCapacity();
-        self.suffix_start = null;
-        self.suffix_end = 0;
+        self.begun = false;
     }
 
     /// Ends the answer at tool activity: its parts stay in the turn as
     /// replies of their own, and fx stops joining them into the final text.
     fn endAtToolActivity(self: *ContinuedAnswer, reason: []const u8) void {
-        if (self.suffix_start == null) return;
+        if (!self.begun) return;
         debug_trace.logf("agent", "continued answer not joined: {s} ended it, so its {d} bytes stay replies of their own", .{ reason, self.text.items.len });
         self.forget();
     }
 
-    /// The whole answer, ending with `last`, the reply that finishes it. The
-    /// parts' messages and fx's notes leave `suffix` when nothing came after
-    /// them, so the saved turn holds the answer once.
-    fn finish(self: *ContinuedAnswer, arena: Allocator, last: []const u8, suffix: *std.ArrayList(ChatMessage)) ![]const u8 {
+    /// The whole answer, ending with `last`, the reply that finishes it, or
+    /// null when no cut reply began one. The arena owns it.
+    fn finish(self: *ContinuedAnswer, arena: Allocator, last: []const u8) !?[]const u8 {
         defer self.forget();
-        const start = self.suffix_start orelse return last;
-        if (suffix.items.len == self.suffix_end) suffix.shrinkRetainingCapacity(start);
+        if (!self.begun) return null;
         return try std.mem.concat(arena, u8, &.{ self.text.items, last });
     }
 };
@@ -11118,7 +11109,7 @@ fn processQueuedPromptLoop(
                 .ask_smaller_steps, .continue_text, .act_now => {
                     try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
                     try stream_ctx.provisional_statuses.finishCutStarts(deps, stream_ctx.alloc, arena, turn_id, completion.tool_calls);
-                    if (action == .continue_text) try continued_answer.begin(arena, within_turn_suffix.items.len, partial_assistant);
+                    if (action == .continue_text) try continued_answer.begin(arena, partial_assistant);
                     // The model sees the text it wrote before the cut, so it
                     // goes on from there. The text is copied, since the
                     // stream's buffer is freed before the next request. A
@@ -11132,7 +11123,6 @@ fn processQueuedPromptLoop(
                         .provider_replay = try cutReplyReplay(deps, arena, provider_replay, &.{}, true),
                     });
                     try within_turn_suffix.append(arena, .{ .role = .user, .content = note, .recovery_prompt = true });
-                    continued_answer.noteEnd(within_turn_suffix.items.len);
                     continue :agent_steps_loop;
                 },
                 .end_turn => unreachable,
@@ -11166,11 +11156,17 @@ fn processQueuedPromptLoop(
             });
             const tool_calls = calls.complete.len + calls.cut > 0;
             const blocker = try outputLimitEndNotice(arena, sent_output_limit, output_limit_cuts, tool_calls);
-            // A reply cut before any tool call ends the answer it continued:
-            // the turn keeps every part, then says why it stopped. Only this
-            // reply's text is shown, since the earlier parts already were.
-            const earlier = if (tool_calls) "" else try continued_answer.finish(arena, "", &within_turn_suffix);
-            const assistant_text = try runtime_assistant_stream.finishLengthLimitedToolCallCompletion(deps, arena, completion, stream_ctx.raw_text.items.len, earlier, blocker);
+            // A reply cut before any tool call ends the answer it continued.
+            // The saved turn keeps each earlier part as the turn sent it, so
+            // this reply's message holds only its own text and why the turn
+            // stopped; what fx shows holds every part. Only this reply's text
+            // is shown now, since the earlier parts already were.
+            const earlier = if (tool_calls) null else try continued_answer.finish(arena, "");
+            const assistant_text = try runtime_assistant_stream.finishLengthLimitedToolCallCompletion(deps, arena, completion, stream_ctx.raw_text.items.len, blocker);
+            const shown_text: ?[]const u8 = if (earlier) |parts|
+                try runtime_assistant_stream.lengthLimitedText(arena, try std.mem.concat(arena, u8, &.{ parts, completion.content orelse "" }), blocker)
+            else
+                null;
             debug_trace.eventf("agent", "provider_completion_blocked", step_ctx, "finish_reason={s} tool_calls={d}", .{
                 finish_reason.label(),
                 completion.tool_calls.len,
@@ -11182,11 +11178,13 @@ fn processQueuedPromptLoop(
                 continue :agent_steps_loop;
             }
             if (stop_state.retained_candidate != null) {
-                const persisted_text = try runtime_finalization.stopTerminalText(
+                var persisted_text = try runtime_finalization.shownTerminalText(
                     arena,
                     stop_state.retained_candidate,
                     assistant_text,
+                    shown_text orelse assistant_text,
                 );
+                persisted_text.continued_answer = shown_text;
                 stop_state.terminal_materializing = true;
                 try finishCommonAssistantTerminal(
                     deps,
@@ -11214,18 +11212,21 @@ fn processQueuedPromptLoop(
             } };
             types.setHistoryTurnSummary(&turn, completed_summary);
             try deps.propagate_history_turn(deps.ctx, turn);
-            try finalization.finish(.failed, .length_limited, .{
-                .turn = try types.dupeHistoryTurn(std.heap.c_allocator, turn),
+            try finalization.finish(.failed, .length_limited, try types.dupeFinishedPrompt(std.heap.c_allocator, .{
+                .turn = turn,
                 .summary = completed_summary,
-            });
+                .presentation_text = shown_text,
+                .continued_answer = shown_text,
+            }));
             finish_trace.finish("provider_length");
             return;
         }
 
         if (completion.tool_calls.len == 0) {
-            // This reply finishes an answer that cut replies began, so the
-            // turn's text is every part of it.
-            const answer = try continued_answer.finish(arena, partial_assistant, &within_turn_suffix);
+            // This reply finishes an answer that cut replies began, so what fx
+            // shows is every part of it.
+            const joined = try continued_answer.finish(arena, partial_assistant);
+            const answer = joined orelse partial_assistant;
             const has_content =
                 std.mem.trim(u8, answer, " \t\r\n").len > 0;
             const empty_other = finish_reason == .other and !has_content;
@@ -11260,7 +11261,18 @@ fn processQueuedPromptLoop(
             const raw_final = if (has_content) answer else if (empty_other) "" else empty_final;
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
             const rendered = if (final_text.len > 0) final_text else empty_final;
-            const history_text = try arena.dupe(u8, raw_final);
+            // The saved turn keeps a continued answer's parts and fx's notes as
+            // the turn sent them, so its last message is this reply alone
+            // (`tests/tla/saved_turn/SavedTurn.tla` NextExtendsLast).
+            const saved_final = if (joined == null)
+                raw_final
+            else if (std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0)
+                partial_assistant
+            else
+                empty_final;
+            const history_text = try arena.dupe(u8, saved_final);
+            // What fx shows, what `fx ask` prints, and what a subagent reports.
+            const shown_text = if (joined != null) raw_final else history_text;
             const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
 
             // After the nudge the check below has closed the turn to mail, so a
@@ -11315,11 +11327,13 @@ fn processQueuedPromptLoop(
                 }
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
-                const persisted_text = try runtime_finalization.stopTerminalText(
+                var persisted_text = try runtime_finalization.shownTerminalText(
                     arena,
                     stop_state.retained_candidate,
                     history_text,
+                    shown_text,
                 );
+                if (joined != null) persisted_text.continued_answer = shown_text;
                 stop_state.terminal_materializing =
                     stop_state.retained_candidate != null;
                 if (has_content and disposition == .completed) try persistFinalReplyCheckpoint(
@@ -11361,7 +11375,7 @@ fn processQueuedPromptLoop(
                 .provider_replay = history_replay,
                 .standalone_response = true,
             });
-            stop_state.retained_candidate = history_text;
+            stop_state.retained_candidate = shown_text;
             stop_state.latest_partial = null;
             if (!has_content) {
                 try deps.push_text(deps.ctx, .{ .operational = rendered });
@@ -11425,7 +11439,7 @@ fn processQueuedPromptLoop(
                         job,
                         within_turn_suffix.items,
                         &summary_accumulator,
-                        .{ .history = "", .presentation = history_text },
+                        .{ .history = "", .presentation = shown_text, .continued_answer = if (joined != null) shown_text else null },
                         .completed,
                         if (disposition == .length_limited)
                             .length_limited
@@ -14348,6 +14362,7 @@ pub fn finishCommonAssistantTerminal(
         trace_outcome,
         replay,
         presentation_text,
+        assistant_text.continued_answer,
     );
 }
 
@@ -14364,6 +14379,7 @@ fn finishCommonAssistantTerminalWithExecution(
     trace_outcome: []const u8,
     replay: ?types.ProviderReplay,
     presentation_text: ?[]const u8,
+    continued_answer: ?[]const u8,
 ) !void {
     try runtime_finalization.finishAssistantTerminalWithExecution(
         deps,
@@ -14378,6 +14394,7 @@ fn finishCommonAssistantTerminalWithExecution(
         trace_outcome,
         replay,
         presentation_text,
+        continued_answer,
     );
 }
 

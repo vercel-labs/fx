@@ -96,6 +96,18 @@ test "a hosted run's turn context leaves saving to the child's own agent" {
     try std.testing.expect(!turn.committed);
 }
 
+test "a turn's continued answer is replaced by the last one and taken once" {
+    var turn = TurnContext.initHosted(std.testing.allocator, 8);
+    defer turn.deinit();
+    try turn.setContinuedAnswer("First part, ");
+    try turn.setContinuedAnswer("First part, and the rest.");
+    const taken = turn.takeContinuedAnswer().?;
+    defer std.testing.allocator.free(taken);
+    try std.testing.expectEqualStrings("First part, and the rest.", taken);
+    try std.testing.expect(turn.continued_answer == null);
+    try std.testing.expect(turn.takeContinuedAnswer() == null);
+}
+
 test "child compaction preserves work identity and permits final commit" {
     const alloc = std.testing.allocator;
     var parent: child_state.TestParent = undefined;
@@ -316,6 +328,10 @@ pub const TurnContext = struct {
     /// This child's event queue, which only the main loop drains.
     /// Borrowed from the subagent host for the turn.
     failure_diagnostic: ?types.ModelFailureDiagnostic = null,
+    /// The whole answer of the run's turn when cut replies began it, for the
+    /// parent's report: the saved turn's last message holds only its last
+    /// part. Owned by `alloc`.
+    continued_answer: ?[]u8 = null,
     committed: bool = false,
     /// Where the child's workspace captures go while
     /// `experimental.workspace_capture` is on; null when it is off. A hosted
@@ -412,6 +428,7 @@ pub const TurnContext = struct {
         self.worker.deinit(self.alloc);
         self.runtime.deinit(self.alloc);
         self.turn_capture.deinit();
+        if (self.continued_answer) |text| self.alloc.free(text);
         self.* = undefined;
     }
 
@@ -426,6 +443,19 @@ pub const TurnContext = struct {
 
     pub fn failureDiagnostic(self: *const TurnContext) ?types.ModelFailureDiagnostic {
         return self.failure_diagnostic;
+    }
+
+    /// Keeps a copy of `text` as the turn's continued answer.
+    pub fn setContinuedAnswer(self: *TurnContext, text: []const u8) Allocator.Error!void {
+        const owned = try self.alloc.dupe(u8, text);
+        if (self.continued_answer) |old| self.alloc.free(old);
+        self.continued_answer = owned;
+    }
+
+    /// Gives the continued answer to the caller, who frees it with `alloc`.
+    pub fn takeContinuedAnswer(self: *TurnContext) ?[]u8 {
+        defer self.continued_answer = null;
+        return self.continued_answer;
     }
 
     pub fn sessionRuntime(self: *TurnContext) *session.SessionRuntime {

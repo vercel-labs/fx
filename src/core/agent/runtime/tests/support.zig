@@ -586,6 +586,7 @@ pub const FakeAgentRuntimeDeps = struct {
     terminal_lease_cleanup_index: usize = 0,
     finish_assistant_text: ?[]u8 = null,
     finish_presentation_text: ?[]u8 = null,
+    finish_continued_answer: ?[]u8 = null,
     finish_user_input_id: ?u64 = null,
     finish_summary: ?types.TurnSummary = null,
     finish_projection: ?types.FinishedPromptProjection = null,
@@ -805,6 +806,7 @@ pub const FakeAgentRuntimeDeps = struct {
         self.execute_timeout_started_ms.deinit(self.alloc);
         if (self.finish_assistant_text) |value| self.alloc.free(value);
         if (self.finish_presentation_text) |value| self.alloc.free(value);
+        if (self.finish_continued_answer) |value| self.alloc.free(value);
         freeStringList(self.alloc, &self.terminal_lease_cleanup_ids);
         if (self.history_assistant_text) |value| self.alloc.free(value);
         if (self.background_history_log_path) |value| self.alloc.free(value);
@@ -1881,6 +1883,11 @@ pub const FakeAgentRuntimeDeps = struct {
                 self.finish_presentation_text = null;
                 if (finished.presentation_text) |value| {
                     self.finish_presentation_text = try self.alloc.dupe(u8, value);
+                }
+                if (self.finish_continued_answer) |value| self.alloc.free(value);
+                self.finish_continued_answer = null;
+                if (finished.continued_answer) |value| {
+                    self.finish_continued_answer = try self.alloc.dupe(u8, value);
                 }
                 switch (finished.turn) {
                     .assistant => |entry| {

@@ -156,8 +156,9 @@ pub const WorkEnd = struct {
     outcome: child_state.Outcome,
     failure: ?types.ModelFailureDiagnostic = null,
     report_owed: bool,
-    /// The work's reply, for a work the host can't find by its id: a turn
-    /// the user started carries none in the child's log. Borrowed.
+    /// The work's reply when the child's log cannot give it whole: a turn the
+    /// user started carries none there, and a continued answer saves only its
+    /// last part. Borrowed.
     reply: ?[]const u8 = null,
     /// Who started the work and why it was cancelled, or that the user
     /// closed a completed work, for its report.
@@ -1422,6 +1423,7 @@ fn slotMain(slot: *Slot) void {
             .outcome = outcome.outcome,
             .failure = outcome.failure,
             .report_owed = finished.report_owed,
+            .reply = outcome.reply,
             .end = end,
             .leftovers = slot.leftovers.items,
             .dropped_by_user = dropped_by_user,
@@ -1452,9 +1454,12 @@ const OneOutcome = struct {
     work_id: []u8,
     outcome: child_state.Outcome,
     failure: ?types.ModelFailureDiagnostic = null,
+    /// The continued answer, for the report (`TurnContext.continued_answer`). Owned.
+    reply: ?[]u8 = null,
 
     fn deinit(self: OneOutcome, alloc: Allocator) void {
         alloc.free(self.work_id);
+        if (self.reply) |text| alloc.free(text);
     }
 };
 
@@ -1575,15 +1580,18 @@ fn runOne(slot: *Slot) OneOutcome {
                 turn.failureDiagnostic() orelse execution.failureDiagnosticValue("agent_execution", @errorName(err))
             else
                 null,
+            .reply = turn.takeContinuedAnswer(),
         };
     };
     if (interruptedByTeardown(slot)) return .{
         .work_id = work_id,
         .outcome = .interrupted,
+        .reply = turn.takeContinuedAnswer(),
     };
     if (slot.cancel.load(.seq_cst)) return .{
         .work_id = work_id,
         .outcome = .cancelled,
+        .reply = turn.takeContinuedAnswer(),
     };
     return .{
         .work_id = work_id,
@@ -1591,6 +1599,7 @@ fn runOne(slot: *Slot) OneOutcome {
             .completed => .completed,
             .awaiting_approval, .paused => .interrupted,
         },
+        .reply = turn.takeContinuedAnswer(),
     };
 }
 

@@ -1916,6 +1916,89 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT * 2);
 
+  test("a continued answer shows each part once, and the next request and a resume keep the parts as the turn sent them", async () => {
+    const cutText = () => fakeGatewaySse([
+      { type: "text-start", id: "cut_text" },
+      { type: "text-delta", id: "cut_text", delta: "The first half of the TUI answer" },
+      { type: "text-end", id: "cut_text" },
+      { type: "finish", finishReason: { unified: "length", raw: "length" } },
+    ]);
+    const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+      "fx-tui-continued-answer-",
+      [cutText, fakeGatewayFinalText(", and its second half."), fakeGatewayFinalText("LATER_PROMPT_OK")],
+      { models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 1_000_000 }] },
+    );
+    await session!.sendText("Answer briefly.");
+    await session!.waitForPane((pane) => pane.replace(/\s+/g, " ").includes("its second half.") && turnSettled(pane), TIMEOUT);
+    await session!.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(2);
+    const flat = (await session!.captureFullScrollback()).replace(/\s+/g, " ");
+    const occurrences = (text: string) => flat.split(text).length - 1;
+    expect(occurrences("The first half of the TUI answer")).toBe(1);
+    expect(occurrences("its second half.")).toBe(1);
+    expect(flat).toContain("Asking the model to continue from where it stopped.");
+    expect(flat).not.toContain("Your last reply reached");
+
+    await session!.sendText("Go on.");
+    await session!.waitForPane((pane) => pane.includes("LATER_PROMPT_OK") && turnSettled(pane), TIMEOUT);
+    await session!.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(3);
+    // The messages after the turn's first user message, as `role: text`.
+    const messagesAfterFirstPrompt = (raw: string): string[] => {
+      const prompt = (JSON.parse(raw) as { prompt: any[] }).prompt;
+      const first = prompt.findIndex((item) => item.role === "user" && contentText(item.content).startsWith("Answer briefly."));
+      expect(first).toBeGreaterThanOrEqual(0);
+      return prompt.slice(first + 1).map((item) => `${item.role}: ${contentText(item.content)}`);
+    };
+    const last = messagesAfterFirstPrompt(queuedGateway.requests[1]!.body);
+    const next = messagesAfterFirstPrompt(queuedGateway.requests[2]!.body);
+    expect(next.slice(0, last.length)).toEqual(last);
+    expect(next[last.length]).toBe("assistant: , and its second half.");
+
+    await session!.sendText("/quit");
+    expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+    const home = join(root!, "home");
+    const workspace = join(root!, "workspace");
+    const sessionIds = rootSessionIds(home);
+    expect(sessionIds).toHaveLength(1);
+    const resumedStderrPath = join(root!, "resumed-stderr.log");
+    await session!.kill();
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume '${sessionIds[0]!}'`,
+      cwd: workspace,
+      width: 72,
+      height: 24,
+      minimumHistoryLines: 200,
+      stderrPath: resumedStderrPath,
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-route-recovery-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: MODEL,
+      },
+    });
+    session = resumed;
+    await resumed.waitForPane((pane) => hasEmptyComposer(pane) && pane.includes("LATER_PROMPT_OK"), TIMEOUT);
+    await resumed.waitForStableComposer(TIMEOUT);
+    const resumedFlat = (await resumed.captureFullScrollback()).replace(/\s+/g, " ");
+    const resumedOccurrences = (text: string) => resumedFlat.split(text).length - 1;
+    expect(resumedOccurrences("The first half of the TUI answer")).toBe(1);
+    expect(resumedOccurrences("its second half.")).toBe(1);
+    expect(resumedFlat).toContain("LATER_PROMPT_OK");
+    expect(resumedFlat).not.toContain("Your last reply reached");
+    await resumed.sendText("/quit");
+    expect(await resumed.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+  }, TIMEOUT * 2);
+
   test("two empty replies that stop for another reason show the stop and its reason instead of Done.", async () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-empty-other-")));
     const home = join(root, "home");

@@ -11741,6 +11741,94 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
     }
   }, 15_000);
 
+  test("a subagent's report holds every part of an answer cut at its output limit", async () => {
+    const root = createFixtureRoot("subagent-cut-report");
+    const tracePath = join(root.root, "trace.log");
+    const childTask = "Reply in two parts after the held response.";
+    const childAnswer = "The child's first part, and its second part.";
+    const cutPart = (part: string) => fakeGatewaySse([
+      { type: "text-start", id: "child_cut" },
+      { type: "text-delta", id: "child_cut", delta: part },
+      { type: "text-end", id: "child_cut" },
+      {
+        type: "finish",
+        finishReason: { unified: "length", raw: "length" },
+        usage: { inputTokens: { total: 3 }, outputTokens: { total: 4096 } },
+      },
+    ]);
+    let reportTurns = 0;
+    let childRequests = 0;
+    let answerInReport = -1;
+    // Holds the child's first reply until the parent's request that carries
+    // the `terminal_result` tool result has arrived.
+    let releaseChildReply!: () => void;
+    const parentHasResult = new Promise<void>((resolve) => {
+      releaseChildReply = resolve;
+    });
+    const gateway = startDynamicFakeGateway((body) => {
+      if (body.includes(REPORT_HEADER)) {
+        // The child's reply arrives as the child's message, never as a tool result.
+        reportTurns += 1;
+        answerInReport = body.split(childAnswer).length - 1;
+        expect(body).toContain("completed");
+        return fakeGatewayFinalText("TERMINAL_SUBAGENT_OK");
+      }
+      if (hasCurrentToolResult(body, "terminal_result")) {
+        releaseChildReply();
+        const result = JSON.parse(toolResultOutput(body, "terminal_result")) as {
+          ok: boolean;
+          result?: string;
+          error_code?: string;
+        };
+        expect(result.ok).toBe(true);
+        expect(result.result).toContain("Sent to tester");
+        expect(result.result).not.toContain(childAnswer);
+        expect(result.error_code ?? null).toBeNull();
+        return fakeGatewayFinalText("PARENT_TURN_DONE");
+      }
+      if (body.includes(childTask)) {
+        childRequests += 1;
+        // The child's second request goes on from its cut part.
+        if (childRequests > 1) return fakeGatewayFinalText(" and its second part.");
+        return parentHasResult.then(() => cutPart("The child's first part,"));
+      }
+      return fakeGatewayToolCall("terminal_result", "subagent", {
+        request: { action: "message", agent: "tester", message: childTask },
+      });
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Exercise terminal child completion."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 10_000,
+        },
+      );
+      if (result.code !== 0) {
+        const trace = existsSync(tracePath)
+          ? readFileSync(tracePath, "utf8")
+          : "<no trace>";
+        throw new Error(
+          `cut child report failed: code=${result.code}\nstdout=${result.stdout}\nstderr=${result.stderr}\ntrace=${trace}`,
+        );
+      }
+      const output = parseAskJson(result.stdout).output;
+      expect(output).toContain("PARENT_TURN_DONE");
+      expect(output).toContain("TERMINAL_SUBAGENT_OK");
+      expect(output.indexOf("PARENT_TURN_DONE")).toBeLessThan(output.indexOf("TERMINAL_SUBAGENT_OK"));
+      expect(reportTurns).toBe(1);
+      expect(answerInReport).toBe(1);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   // Main tends to start a new subagent for each task and leave the finished
   // ones idle. A new subagent's start names the idle ones, and each report
   // says its subagent is idle, so main can send related work to one that
@@ -13063,6 +13151,57 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
     expect(bodies[1]!.maxOutputTokens).toBe(32_768);
     expect(result.stderr).toContain("Asking the model to continue from where it stopped.");
     expect(trace).toContain("action=continue_text");
+  }, 40_000);
+
+  /** The messages after the turn's first user message in one request, as
+   * `role: text`, so two requests can be compared message by message. */
+  function messagesAfterFirstPrompt(raw: string): string[] {
+    const prompt = (JSON.parse(raw) as { prompt: PromptMessage[] }).prompt;
+    const first = prompt.findIndex((item) => item.role === "user" && contentText(item.content).startsWith("Answer briefly."));
+    expect(first).toBeGreaterThanOrEqual(0);
+    return prompt.slice(first + 1).map((item) => `${item.role}: ${contentText(item.content)}`);
+  }
+
+  test("the next turn after an answer cut at its output limit starts with that turn's last request", async () => {
+    const root = createFixtureRoot("cut-text-next-turn");
+    const tracePath = join(root.root, "trace.log");
+    const replies: Array<() => Response> = [
+      cutTextReply("The first half of the answer"),
+      () => fakeGatewayFinalText(", and the second half."),
+      () => fakeGatewayFinalText("The next answer."),
+    ];
+    let index = 0;
+    const gateway = startDynamicFakeGateway(
+      () => (replies[index++] ?? (() => new Response("unexpected request", { status: 500 })))(),
+      { models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 1_000_000 }] },
+    );
+    try {
+      const env = fixtureEnv(root, gateway, tracePath);
+      const first = await runFx(["ask", "--json", "--auto", "Answer briefly."], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 30_000,
+      });
+      expect(first.code).toBe(0);
+      const firstJson = parseAskJson(first.stdout);
+      expect(firstJson.final_output).toBe("The first half of the answer, and the second half.");
+
+      const second = await runFx(["ask", "--json", "--auto", "--resume", firstJson.session_id, "Go on."], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 30_000,
+      });
+      expect(second.code).toBe(0);
+      expect(gateway.requests).toHaveLength(3);
+
+      const last = messagesAfterFirstPrompt(gateway.requests[1]!.body);
+      const next = messagesAfterFirstPrompt(gateway.requests[2]!.body);
+      expect(next.slice(0, last.length)).toEqual(last);
+      expect(next[last.length]).toBe("assistant: , and the second half.");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
   }, 40_000);
 
   test("a reply that spent its limit before a cut-off tool call is asked for again in smaller steps at low effort without running the call", async () => {

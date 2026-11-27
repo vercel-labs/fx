@@ -762,28 +762,29 @@ pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, arena: Allocator
     try hooks.push_system_notice(hooks.ctx, line);
 }
 
+/// What a turn a cut reply ended shows or saves: `text`, normalized for
+/// display, then why the turn stopped.
+pub fn lengthLimitedText(arena: Allocator, text: []const u8, blocker: []const u8) ![]const u8 {
+    return textThenBlocker(arena, try normalizeAssistantTextForDisplay(arena, text), blocker);
+}
+
+fn textThenBlocker(arena: Allocator, whole: []const u8, blocker: []const u8) ![]const u8 {
+    return if (whole.len > 0) try arena.print("{s}\n\n{s}", .{ whole, blocker }) else blocker;
+}
+
 /// Shows a cut reply's text, then `blocker`, which says why the turn stopped,
-/// and returns the turn's final text: `earlier`, the parts of an answer that
-/// earlier cut replies wrote and that were already shown, then the reply's
-/// text, then `blocker`.
+/// and returns the text the turn saves for this reply: its text, then
+/// `blocker`.
 pub fn finishLengthLimitedToolCallCompletion(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
     completion: types.ModelCompletion,
     streamed_content_len: usize,
-    earlier: []const u8,
     blocker: []const u8,
 ) ![]const u8 {
     const has_content = completion.content != null and completion.content.?.len > 0;
     const normalized = if (has_content) try normalizeAssistantTextForDisplay(arena, completion.content.?) else "";
-    const whole = if (earlier.len == 0)
-        normalized
-    else
-        try normalizeAssistantTextForDisplay(arena, try std.mem.concat(arena, u8, &.{ earlier, completion.content orelse "" }));
-    const rendered = if (whole.len > 0)
-        try arena.print("{s}\n\n{s}", .{ whole, blocker })
-    else
-        blocker;
+    const rendered = try textThenBlocker(arena, normalized, blocker);
 
     if (!has_content or streamed_content_len == 0) {
         if (has_content) {

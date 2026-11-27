@@ -11673,10 +11673,17 @@ test "processQueuedPrompt joins an answer cut at its output limit with the reply
     try expectShownText(&hooks, "The reply reached its output limit and was cut off. Asking the model to continue from where it stopped. The next requests allow 32768 output tokens.");
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
     try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
-    try std.testing.expectEqualStrings("Partial answer and the rest.", hooks.finish_assistant_text.?);
-    // The saved turn holds the answer once: the part and fx's note leave it.
+    // What fx shows joins the parts. The saved turn keeps the part and fx's
+    // note as the turn sent them, so the next turn's request starts with this
+    // turn's last one (`tests/tla/saved_turn/SavedTurn.tla` NextExtendsLast).
+    try std.testing.expectEqualStrings("Partial answer and the rest.", hooks.finish_presentation_text orelse "");
+    try std.testing.expectEqualStrings("Partial answer and the rest.", hooks.finish_continued_answer orelse "");
+    try std.testing.expectEqualStrings(" and the rest.", hooks.finish_assistant_text.?);
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items[0].assistant.execution.steering.len);
+    const steering = hooks.history_turns.items[0].assistant.execution.steering;
+    try std.testing.expectEqual(@as(usize, 1), steering.len);
+    try std.testing.expectEqualStrings("Partial answer", steering[0].assistant_prefix.?);
+    try std.testing.expect(std.mem.find(u8, steering[0].text, "Your last reply reached its output limit and was cut off.") != null);
     try std.testing.expect(
         logIndex(&hooks, "event:turn_finished").? <
             logIndex(&hooks, "event:finish_prompt").?,
@@ -11703,9 +11710,16 @@ test "processQueuedPrompt ends the turn on the third reply in a row cut before a
     try expectBodyContainsInOrder(&gateway, 2, &.{ "Part one. ", "Part two. ", "reached the output limit of 32768 tokens again and was cut off." });
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     try std.testing.expectEqual(types.ProviderCompletionDisposition.length_limited, hooks.finalized_disposition.?);
-    const text = hooks.finish_assistant_text.?;
+    const text = hooks.finish_presentation_text orelse "";
     try std.testing.expect(std.mem.find(u8, text, "Part one. Part two. Part three.") != null);
     try std.testing.expect(std.mem.find(u8, text, "The reply reached the output limit of 32768 tokens 3 times in a row before it was complete, so fx stopped the turn.") != null);
+    try std.testing.expectEqualStrings(text, hooks.finish_continued_answer orelse "");
+    // The saved turn keeps the earlier parts as the turn sent them; its last
+    // message holds only the third part and why the turn stopped.
+    const saved = hooks.finish_assistant_text.?;
+    try std.testing.expect(std.mem.find(u8, saved, "Part one.") == null);
+    try std.testing.expect(std.mem.find(u8, saved, "Part three.") != null);
+    try std.testing.expect(std.mem.find(u8, saved, "3 times in a row before it was complete, so fx stopped the turn.") != null);
 }
 
 test "processQueuedPrompt shows a continued answer's text once when the turn ends on cut replies with no text" {
@@ -11731,10 +11745,21 @@ test "processQueuedPrompt shows a continued answer's text once when the turn end
     var shown: usize = 0;
     for (hooks.texts.items) |text| shown += std.mem.count(u8, text, "Alpha.");
     try std.testing.expectEqual(@as(usize, 1), shown);
-    // The saved text holds the part once, then why the turn stopped.
+    // What fx shows holds the part once, then why the turn stopped. The saved
+    // turn keeps the part as the turn sent it, so its last message says only
+    // why the turn stopped.
+    const shown_text = hooks.finish_presentation_text orelse "";
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, shown_text, "Alpha."));
+    try std.testing.expectEqualStrings(shown_text, hooks.finish_continued_answer orelse "");
+    try std.testing.expect(std.mem.find(u8, shown_text, "3 times in a row before it was complete, so fx stopped the turn.") != null);
     const saved = hooks.finish_assistant_text.?;
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, saved, "Alpha."));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, saved, "Alpha."));
     try std.testing.expect(std.mem.find(u8, saved, "3 times in a row before it was complete, so fx stopped the turn.") != null);
+    var kept: usize = 0;
+    for (hooks.history_turns.items[0].assistant.execution.steering) |item| {
+        if (item.assistant_prefix) |prefix| kept += std.mem.count(u8, prefix, "Alpha.");
+    }
+    try std.testing.expectEqual(@as(usize, 1), kept);
 }
 
 test "processQueuedPrompt shows a short cut part that waited for the language check before the answer goes on" {
@@ -11764,7 +11789,10 @@ test "processQueuedPrompt shows a short cut part that waited for the language ch
     var rest: usize = 0;
     for (hooks.assistant_sources.items) |text| rest += std.mem.count(u8, text, "and more text here.");
     try std.testing.expectEqual(@as(usize, 1), rest);
-    try std.testing.expectEqualStrings("Beta. and more text here.", hooks.finish_assistant_text.?);
+    // What fx shows joins the held part and the rest; the saved turn keeps
+    // the part as the turn sent it, and its last message is the rest.
+    try std.testing.expectEqualStrings("Beta. and more text here.", hooks.finish_presentation_text orelse "");
+    try std.testing.expectEqualStrings(" and more text here.", hooks.finish_assistant_text.?);
 }
 
 test "processQueuedPrompt keeps a cut reply's text as its own reply once tools run after it" {
@@ -11788,6 +11816,10 @@ test "processQueuedPrompt keeps a cut reply's text as its own reply once tools r
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expectEqualStrings("Read it.", hooks.finish_assistant_text.?);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    // Tool activity ended the answer, so nothing joins: fx shows and saves
+    // the last reply alone, as before.
+    try std.testing.expect(hooks.finish_presentation_text == null);
+    try std.testing.expect(hooks.finish_continued_answer == null);
 }
 
 test "processQueuedPrompt review continuation appends active review prompt after write tool" {
