@@ -16,7 +16,7 @@
 \*     in the ghost `graceLine`. `refused` is matched in every step.
 \*   - `page_received` carries `lapse`, which the core works out from the
 \*     pages' arrival times; the model takes it as given.
-\*   - Whether a refusal was for a temporary status (`unavail`, `kindTruth`) is not in the core's trace either: `Server`
+\*   - Whether a refusal was for a temporary status (`unavail`) is not in the core's trace either: `Server`
 \*     keeps the status. TrackKind is FALSE, so a refusal never has the kind here.
 \*   - The count of tools a page leaves out (`gatherDrop`, `dropped` and their ghosts) is not in the core's trace: `Server`
 \*     keeps it. A page may leave tools out or not (`d`), and TrackDrops is FALSE, so it never does here.
