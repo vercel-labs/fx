@@ -4,7 +4,7 @@
 
 <!-- release:start -->
 
-**Subagents are more reliable. The tool view is refreshed, with one short row per call. Shell commands run 3.1× to 4.8× faster, about 24 to 37 ms instead of about 115 ms.**
+**Subagents are more reliable. The tool view is refreshed, with one short row per call. Your model's provider can compact long conversations, and replies show each word formatted as it arrives. Shell commands run 3.1× to 4.8× faster.**
 
 ### Improvements
 
@@ -16,9 +16,12 @@
 - A toolbox call's row names its tool while its arguments stream in.
 - The compaction row shows how much of the summary is written and counts its own time.
 - Ctrl+O opens at once after a compaction.
-- Shell commands run 3.1× to 4.8× faster with an MCP server configured, about 24 to 37 ms instead of about 115 ms.
+- Streamed replies show each word formatted as it arrives, with the first word in a median 18.4 ms instead of 287.3 ms.
+- Shell commands run 3.1× to 4.8× faster with an MCP server configured.
 - `shell` can wait up to 5 minutes for a command when the model asks.
 - Long command output keeps its newest lines.
+- Captured shell commands return as soon as they end, and a model step no longer waits for the request watcher's 10 ms tick.
+- A shell result tells the model when its command's `fx mcp call` calls will stop working.
 - Shell results send the model an output handle only when the output was cut, so later requests carry less.
 - `fx doctor` finishes in about 7 s on a large profile where it ran for more than 14 minutes, and `--deep` keeps the full check.
 - fx resends a reply the content filter blocked up to three times before it asks you.
@@ -32,9 +35,11 @@
 - A read skipped because of new folder rules tells the model to send it again.
 - The model picker leaves out a fast variant when Fast mode runs it.
 - `/trace` includes auto mode reviews, git state, settings, and skills.
+- Codex and custom `openai-responses` connections send the system prompt as the first input item, so later turns keep it in the prompt cache.
 
 ### New Features
 
+- On models whose provider can compact a conversation, the provider writes the compaction, and fx keeps the newest 4 turns unchanged.
 - fx sessions in one profile share each stdio MCP server, so several terminals run one copy of it.
 - A stdio MCP server with no call for 10 minutes stops, and the next call starts it again.
 - `"shared": false` in a server's config keeps one copy per session.
@@ -65,6 +70,14 @@
 - An MCP HTTP link that loses several calls in a row restarts.
 - `web_fetch` handles 204 and 304 responses.
 - Max effort goes to AI Gateway unchanged, and fx says when the Gateway leaves out an effort.
+- Tool calls after an answered question show in a new row below it.
+- The agent list shows how long a subagent's turn has run, not its current call.
+- `wait` no longer says no report will arrive while one is on its way.
+- A subagent status call no longer shows `Managing` for a moment.
+- A message from a subagent you typed on keeps who started its turn.
+- ACP sessions read the profile's MCP servers as the terminal app does: a bad entry is skipped and the others load.
+- `fx status` and `fx doctor` show a profile's good MCP servers when one entry is bad.
+- `fx mcp call list` and `search` say a server needs its variable, not a login.
 
 ### Security
 

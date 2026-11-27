@@ -50,7 +50,10 @@ pub fn execute(
             var completion = completion_value;
             defer completion.deinit();
             if (completion.response) |*response| {
-                return contracts.OwnedResult.init(ctx.alloc, response.value.view());
+                return contracts.OwnedResult.init(ctx.alloc, response.value.view()) catch |err| {
+                    endUndeliveredStart(ctx.runtime, request, response.value.view());
+                    return err;
+                };
             }
             return failure(
                 ctx,
@@ -83,6 +86,27 @@ pub fn execute(
             cancellation_sent = true;
         }
         io_mod.sleep(2 * std.time.ns_per_ms);
+    }
+}
+
+/// A start that kept its in-flight mark for a caller that never receives the
+/// result has no one to end it.
+fn endUndeliveredStart(
+    runtime: *client.Runtime,
+    request: contracts.ActionRequest,
+    result: contracts.Result,
+) void {
+    const start = switch (request) {
+        .start => |value| value,
+        else => return,
+    };
+    if (!start.retain_in_flight) return;
+    switch (result) {
+        .success => |success| switch (success) {
+            .start => |value| runtime.endStart(value.session.session_id),
+            else => {},
+        },
+        .failure => {},
     }
 }
 

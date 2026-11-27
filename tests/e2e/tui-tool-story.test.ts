@@ -210,6 +210,24 @@ const PRINTED_CODE_THEN_FAILED: StoryStep[] = [
   { at: 1, text: "The file is missing." },
 ];
 
+// A check that prints two counts, then a heading and the lines it found
+// under it, and fails because it found them.
+const LISTED_THEN_FAILED: StoryStep[] = [
+  {
+    at: 0,
+    calls: [sh("echo 'staged: 2' && echo 'left over: 0' && echo 'Tracked personal paths found:' && ! grep -rn createWindow desktop/src && echo surface-ok && sh build.sh && echo build-ok")],
+  },
+  { at: 1, text: "The check found the paths." },
+];
+
+// Three commands that fail with their messages between escape sequences: a
+// style reset as `tput sgr0` writes it, and OSC 8 links that end with ST and
+// with BEL.
+const ESCAPED_MESSAGES: StoryStep[] = [
+  { at: 0, calls: [sh("sh styled-build.sh"), sh("sh linked-check.sh"), sh("sh bel-linked-check.sh")] },
+  { at: 3, text: "The build and both checks failed." },
+];
+
 const SUBAGENTS: StoryStep[] = [
   {
     at: 0,
@@ -292,15 +310,18 @@ async function runStory(
     height?: number;
     settings?: Record<string, unknown>;
     childReply?: (task: string) => string | Promise<string>;
+    /** Record the bytes fx writes to the returned `tape`. */
+    record?: boolean;
   },
 ) {
   const root = createStoryRoot(options.settings);
   roots.push(root);
   const gateway = startStoryGateway(steps, options.childReply);
   gateways.push(gateway);
+  const tape = options.record ? join(root.root, "live.fxtape") : undefined;
   const session = await TmuxSession.create({
     cwd: root.workspace,
-    env: storyEnv(root, gateway),
+    env: tape ? { ...storyEnv(root, gateway), FX_RECORD: tape } : storyEnv(root, gateway),
     width: options.width ?? 110,
     height: options.height ?? 60,
   });
@@ -311,7 +332,7 @@ async function runStory(
   // and the saved turn come after them.
   await session.waitForPane((pane) => pane.includes(options.finalText) && turnSettled(pane), TIMEOUT);
   const pane = await session.waitForComposer(TIMEOUT);
-  return { root, gateway, session, pane };
+  return { root, gateway, session, pane, tape };
 }
 
 function paneLines(pane: string): string[] {
@@ -1096,15 +1117,83 @@ test.skipIf(!tmuxAvailable())(
     });
     const lines = paneLines(pane);
     // The reason is ls's own message, not a printed line that names "error",
-    // without the words that say who spoke, and at most 40 columns.
+    // without the words that say who spoke, and whole on a row with room.
     const row = lines.find((line) => /^● Exited \d+ printf, ls · /.test(line));
     expect(row).toBeDefined();
     const reason = row!.replace(/^● Exited \d+ printf, ls · /, "").replace(/ ✗$/, "");
-    expect(reason).toMatch(/^(No such file or directory|cannot access 'missing-file': No such f…)$/);
-    expect([...reason].length).toBeLessThanOrEqual(40);
+    expect(reason).toMatch(/^(No such file or directory|cannot access 'missing-file': No such file or directory)$/);
     expect(lines.some((line) => line.includes("error_code") || line.includes('get("error")'))).toBe(false);
   },
   TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a failed check says the heading of the list it printed, live and after resume",
+  async () => {
+    // On a narrow row the command names fewer of its steps so the reason
+    // stays in view, and the reason clips at the edge.
+    const rows: Array<[number, string]> = [
+      [110, "● Exited 1 echo, grep, echo +2 more · Tracked personal paths found"],
+      [48, "● Exited 1 echo +4 more · Tracked personal path…"],
+    ];
+    const failedRow = (pane: string) => paneLines(pane).find((line) => line.startsWith("● Exited 1 "));
+    for (const [width, want] of rows) {
+      const { root, gateway, session, pane } = await runStory(LISTED_THEN_FAILED, {
+        prompt: "check the tracked paths",
+        finalText: "The check found the paths.",
+        width,
+      });
+      expect(failedRow(pane)).toBe(want);
+
+      await session.kill();
+      sessions.splice(sessions.indexOf(session), 1);
+      const resumed = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume last`,
+        cwd: root.workspace,
+        env: storyEnv(root, gateway),
+        width,
+        height: 60,
+      });
+      sessions.push(resumed);
+      await resumed.waitForText("The check found the paths.", TIMEOUT);
+      expect(failedRow(await resumed.waitForComposer(TIMEOUT))).toBe(want);
+    }
+  },
+  TIMEOUT * 4,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a failed command's reason leaves out the escape sequences around its message, live and after resume",
+  async () => {
+    const finalText = "The build and both checks failed.";
+    const { root, gateway, session, pane, tape } = await runStory(ESCAPED_MESSAGES, {
+      prompt: "run the build and the checks",
+      finalText,
+      record: true,
+    });
+    const want = [
+      "├ Exited 1 sh styled-build.sh · Build failed",
+      "├ Exited 1 sh linked-check.sh · Problems found",
+      "└ Exited 1 sh bel-linked-check.sh · Problems found",
+    ];
+    const failedRows = (lines: string[]) => lines.filter((line) => /^[├└] Exited 1 /.test(line));
+    expect(failedRows(paneLines(pane))).toEqual(want);
+    // None of the output's escapes reaches the terminal, not even as bytes
+    // the terminal would hide.
+    const noOutputEscapes = (recorded: string) => {
+      const bytes = readFileSync(recorded).toString("latin1");
+      for (const escape of ["\x1b(B", "\x1b)0", "\x1b#8", "\x1b%G", "file:///x"]) expect(bytes).not.toContain(escape);
+    };
+    noOutputEscapes(tape!);
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumedTape = join(root.root, "resumed.fxtape");
+    const { lines } = await resumeStory(root, gateway, finalText, resumedTape, { ready: /^ {2}Ran 3 commands /m });
+    expect(failedRows(lines)).toEqual(want);
+    noOutputEscapes(resumedTape);
+  },
+  TIMEOUT * 3,
 );
 
 test.skipIf(!tmuxAvailable())(

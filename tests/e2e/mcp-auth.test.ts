@@ -18,7 +18,7 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { traceReportNames, waitForNewTraceReport, type TraceReport } from "./trace-report";
 import { spawnSync } from "node:child_process";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
 import { startIdleDropProxy } from "./fixtures/idle-drop-proxy";
 import { startLegacyStreamableHttpFixture } from "./fixtures/mcp-legacy-remote";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
@@ -1062,7 +1062,7 @@ describe("MCP login", () => {
     expect(new URL(opened.searchParams.get("redirect_uri")!).hostname).toBe("127.0.0.1");
     expect(auth.tokenExchanges).toBe(1);
     expect(login.stdout).not.toContain(ACCESS_INITIAL);
-    expect(await statusOf(root)).toBe("signed_in");
+    expect(await statusOf(root)).toBe("saved_login");
 
     const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
     expect(show.stderr).toBe("");
@@ -1091,7 +1091,7 @@ describe("MCP login", () => {
     const root = createRoot(auth);
     const env = v2Env(root);
     seedV2Credential(root, auth, { revocation_endpoint: null });
-    expect(await statusOf(root)).toBe("signed_in");
+    expect(await statusOf(root)).toBe("saved_login");
 
     const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
     expect(logout.stdout).toBe("Signed out of fixture here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
@@ -1221,7 +1221,7 @@ describe("MCP login", () => {
     // After the sign-in, the kept revocation goes, and nothing stays kept.
     expect(revokedTokens(auth)).toEqual([REFRESH_INITIAL, REFRESH_INITIAL]);
     expect(existsSync(keptSignOuts(root))).toBe(false);
-    expect(await statusOf(root)).toBe("signed_in");
+    expect(await statusOf(root)).toBe("saved_login");
   }, 60_000);
 
   test("an fx mcp login that fails sends no kept sign-out and keeps it", async () => {
@@ -1254,6 +1254,32 @@ describe("MCP login", () => {
     expect(existsSync(keptSignOuts(root))).toBe(false);
   }, 60_000);
 
+  // `list` never connects: a login it finds saved is only saved, so it says that. A server fx connected, and
+  // that took the login, is ready.
+  test("fx mcp list says saved login for a server it hasn't started, and show says ready once it connected", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    seedV2Credential(root, auth);
+    const list = await runFx(["mcp", "list"], { cwd: root.workspace, env });
+    expect(list.code).toBe(0);
+    expect(list.stdout).toMatch(/^fixture +~\/\.fx\/mcp\.json +http +saved login$/m);
+    expect(list.stdout).not.toContain("signed in");
+    const listJson = await runFx(["mcp", "list", "--json"], { cwd: root.workspace, env });
+    expect(listJson.code).toBe(0);
+    expect(JSON.parse(listJson.stdout).servers).toHaveLength(1);
+    expect(JSON.parse(listJson.stdout).servers[0]).toMatchObject({ name: "fixture", transport: "http", status: "saved_login" });
+    expect(auth.protectedToolCalls).toBe(0);
+    // The same saved login, once fx connected and the server accepted it.
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.code).toBe(0);
+    expect(show.stdout).toMatch(/^ {2}status {5}ready, 1 tool$/m);
+    expect(show.stdout).not.toContain("saved login");
+    const showJson = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(JSON.parse(showJson.stdout)).toMatchObject({ name: "fixture", status: "ready" });
+  }, 60_000);
+
   test("fx mcp login says why the server refused the sign-in, in its words", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url, { rejectCodeExchange: true });
@@ -1264,7 +1290,7 @@ describe("MCP login", () => {
     expect(login.stderr).toBe("Couldn't sign in to fixture: it didn't accept the sign-in (invalid_grant).\n");
     // The one exchange, refused.
     expect(auth.tokenExchanges).toBe(1);
-    expect(await statusOf(root)).not.toBe("signed_in");
+    expect(await statusOf(root)).not.toBe("saved_login");
   }, 30_000);
 
   // ---- A server that refuses a login says so ----
@@ -1870,7 +1896,7 @@ describe("MCP login", () => {
     const root = createRoot(auth, true, "http", auth.url, false);
     const child = Bun.spawn([FX_BIN, "mcp", "login", "--no-browser", "fixture"], {
       cwd: root.workspace,
-      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      env: Object.fromEntries(Object.entries(fxChildEnv(v2Env(root))).filter(([, v]) => v !== undefined)) as Record<string, string>,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
@@ -1904,7 +1930,7 @@ describe("MCP login", () => {
     const root = createRoot(auth, true, "http", auth.url, false);
     const child = Bun.spawn([FX_BIN, "mcp", "login", "--no-browser", "fixture"], {
       cwd: root.workspace,
-      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      env: Object.fromEntries(Object.entries(fxChildEnv(v2Env(root))).filter(([, v]) => v !== undefined)) as Record<string, string>,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
@@ -1952,7 +1978,7 @@ describe("MCP login", () => {
     writeFileSync(profile, JSON.stringify(config));
     const child = Bun.spawn([FX_BIN, "mcp", "login", "--no-browser", "fixture"], {
       cwd: root.workspace,
-      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      env: Object.fromEntries(Object.entries(fxChildEnv(v2Env(root))).filter(([, v]) => v !== undefined)) as Record<string, string>,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
@@ -2061,7 +2087,7 @@ describe("MCP login", () => {
     const root = createRoot(auth, true, "http", auth.url, false);
     const child = Bun.spawn([FX_BIN, "mcp", "login", "--no-browser", "fixture"], {
       cwd: root.workspace,
-      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      env: Object.fromEntries(Object.entries(fxChildEnv(v2Env(root))).filter(([, v]) => v !== undefined)) as Record<string, string>,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
@@ -2095,7 +2121,7 @@ describe("MCP login", () => {
     // A server that isn't configured: fx says so on stderr and exits 1, with nothing on stdout.
     const child = Bun.spawn([FX_BIN, "mcp", "login", "--no-browser", "nosuchserver"], {
       cwd: root.workspace,
-      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      env: Object.fromEntries(Object.entries(fxChildEnv(v2Env(root))).filter(([, v]) => v !== undefined)) as Record<string, string>,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
@@ -2662,7 +2688,7 @@ describe("MCP login", () => {
     expect(login.code).toBe(1);
     expect(login.stderr).toBe("Couldn't sign in to fixture: it didn't accept the sign-in (its token has characters OAuth doesn't allow).\n");
     expect(auth.tokenExchanges).toBe(1);
-    expect(await statusOf(root)).not.toBe("signed_in");
+    expect(await statusOf(root)).not.toBe("saved_login");
     const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
     expect(show.signal).toBeNull();
     expect(JSON.parse(show.stdout).status).toBe("needs_login");
@@ -2975,6 +3001,7 @@ describe("MCP login", () => {
     const screen = await tui.capturePane();
     expect(screen).toMatch(/ status +needs login/);
     expect(screen).not.toContain("signed in");
+    expect(screen).not.toContain("saved login");
     expect(screen).not.toContain("Log out");
   }, 90_000);
 
@@ -3496,7 +3523,7 @@ describe("MCP login", () => {
     expect(login.stderr).toBe("");
     expectExit0(login);
     expect(auth.tokenExchanges).toBe(1);
-    expect(await statusOf(root)).toBe("signed_in");
+    expect(await statusOf(root)).toBe("saved_login");
   }, 60_000);
 
   test("fx mcp login explains servers it can't sign in to", async () => {
@@ -3623,7 +3650,7 @@ describe("MCP login", () => {
     expect(auth.refreshes).toBe(0);
     expect(auth.protectedToolCalls).toBe(0);
     expect(readFileSync(store, "utf8")).not.toContain("\"name\":\"fixture\"");
-    expect(await statusOf(root)).not.toBe("signed_in");
+    expect(await statusOf(root)).not.toBe("saved_login");
   }, 60_000);
 
   test.skipIf(!tmuxAvailable())("/mcp logout with no saved login says so and leaves the running server alone", async () => {

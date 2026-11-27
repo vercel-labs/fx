@@ -277,6 +277,14 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_SHELL_YIELD_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SHELL_YIELD_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SKIP_ONBOARDING": {
       "job": "test",
       "stability": "internal"
@@ -370,6 +378,14 @@
       "stability": "internal"
     },
     "FX_TEST_USAGE_CLOCK_FILE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_WEB_FETCH_DNS_READY": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_WEB_FETCH_DNS_RELEASE": {
       "job": "test",
       "stability": "internal"
     },

@@ -20,7 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { FX_BIN, HAS_API_KEY, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, HAS_API_KEY, providerVersionTestEnv, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import {
   AUTO_EXA_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
@@ -710,7 +710,8 @@ class AcpClient {
     omitHome?: boolean;
   }): Promise<AcpClient> {
     const args = opts?.args ?? ["acp"];
-    const inheritedEnv: Record<string, string | undefined> = { ...process.env };
+    // The model-backed tests below start fx on the developer's own key.
+    const inheritedEnv: Record<string, string | undefined> = fxChildEnv({}, { keepCredentials: true });
     if (opts?.omitHome) delete inheritedEnv.HOME;
     for (const [key, value] of Object.entries(opts?.env ?? {})) {
       if (value === undefined) {
@@ -872,6 +873,14 @@ class AcpClient {
   /** False once the agent process has exited or been killed. */
   isRunning(): boolean {
     return this.proc.exitCode === null && this.proc.signalCode === null;
+  }
+
+  kill(signal: NodeJS.Signals = "SIGKILL"): boolean {
+    return this.proc.kill(signal);
+  }
+
+  get signalCode(): NodeJS.Signals | null {
+    return this.proc.signalCode;
   }
 
   async close(): Promise<void> {
@@ -2961,7 +2970,7 @@ describe("acp: model-independent", () => {
       ]);
       const proc = nodeSpawn(FX_BIN, ["acp"], {
         cwd: root.workspace,
-        env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+        env: fxChildEnv({ ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" }),
         stdio: ["pipe", "pipe", "pipe"],
       });
       try {
@@ -3086,7 +3095,7 @@ describe("acp: model-independent", () => {
       ]);
       const proc = nodeSpawn(FX_BIN, ["acp"], {
         cwd: root.workspace,
-        env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+        env: fxChildEnv({ ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" }),
         stdio: ["pipe", "pipe", "pipe"],
       });
       try {
@@ -3242,6 +3251,55 @@ describe("acp: model-independent", () => {
         await client.close();
         // The ACP process owned the terminal itself: no host daemon state.
         expect(existsSync(join(root.root, "home", ".fx", "terminal-host-v7"))).toBe(false);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP shell TTY results leave out charset designations",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-charset-");
+      const toolCallId = "acp_shell_tty_charset";
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall(toolCallId, "shell", {
+          request: {
+            action: "run",
+            cwd: root.workspace,
+            // What `tput sgr0` and ncurses line drawing send on xterm terminfo.
+            command: "printf 'TTY_A\\033(B\\033[mC TTY_\\033(0lqqk\\033(B_END\\n'",
+            shell: {
+              kind: "executable",
+              path: TERMINAL_FIXTURE_SHELL,
+              clean_start: true,
+            },
+            tty: true,
+            yield_time_ms: 30_000,
+          },
+        }),
+        finalText("ACP charset shell complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        client.setPermissionOption("allow_once");
+        await startAutoSession(client);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
+        const result = await runPrompt(client, "Run the charset fixture.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(2);
+        const toolResult = acpToolResultText(gateway.requests[1]!.body, toolCallId);
+        expect(toolResult).toContain('"backend":"tty"');
+        expect(toolResult).toContain("TTY_AC TTY_lqqk_END");
+        expect(toolResult).not.toContain("TTY_ABC");
+        expect(client.stderr).toBe("");
       } finally {
         await client?.close();
         gateway.stop();
@@ -5013,6 +5071,185 @@ describe("acp: model-independent", () => {
         await client?.close();
         gateway.stop();
         server.stop(true);
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "an ACP steer sent during a held MCP call is reported after fx is killed and the session is loaded",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-steer-kill-");
+      const httpFixture = startModernMcpHttpFixture("stall_call");
+      const steerText = "ACP_STEER_DURING_HELD_MCP_CALL";
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_stall_steer", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_stall_steer", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "hold" } }),
+        finalText("SHOULD_NOT_RUN_AFTER_KILL"),
+      ]);
+      try {
+        const env = fakeGatewayEnv(root, gateway);
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [acpHttpServer(httpFixture, "stall")] },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "full-access" }, 3);
+
+        sendPrompt(client, 10, "Call the held MCP tool.");
+        await waitForCondition(
+          "held MCP call",
+          () => httpFixture.requests.some((entry) => entry.message.method === "tools/call"),
+          TIMEOUT,
+        );
+
+        sendSteeringPrompt(client, 11, steerText);
+        // A rejected non-steer prompt proves the reader loop processed the steer.
+        sendPrompt(client, 12, "barrier");
+        const barrier = await readResponse(client, 12);
+        expect(barrier.error.code).toBe(-32600);
+
+        const requestsBeforeKill = gateway.requests.length;
+        const exited = client.waitForExit();
+        client.kill("SIGKILL");
+        await exited;
+        expect(client.signalCode).toBe("SIGKILL");
+        client = null;
+
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 20);
+        client.send({
+          jsonrpc: "2.0",
+          id: 21,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const loaded = await readUntilResponses(client, [21]);
+        expect(loaded.responses.get(21)!.error).toBeUndefined();
+        const updates = loaded.messages
+          .filter((message) => message.method === "session/update")
+          .map((message) => message.params.update);
+        const noticeText = updates
+          .filter((update) => update.sessionUpdate === "agent_message_chunk")
+          .map((update) => update.content?.text ?? "")
+          .join("\n");
+        expect(noticeText).toContain("1 prompt you sent before fx stopped was not delivered:");
+        expect(noticeText).toContain(steerText);
+        expect(gateway.requests).toHaveLength(requestsBeforeKill);
+
+        // Reloading again does not re-report the withdrawn pending prompt.
+        client.send({
+          jsonrpc: "2.0",
+          id: 22,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const reloaded = await readUntilResponses(client, [22]);
+        expect(reloaded.responses.get(22)!.error).toBeUndefined();
+        const reloadedText = reloaded.messages
+          .filter((message) => message.method === "session/update")
+          .map((message) => message.params.update?.content?.text ?? "")
+          .join("\n");
+        expect(reloadedText).not.toContain("was not delivered:");
+        expect(reloadedText).not.toContain(steerText);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        httpFixture.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a withdrawn ACP steer is not reported after a kill",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-steer-withdraw-kill-");
+      const httpFixture = startModernMcpHttpFixture("stall_call");
+      const steerText = "WITHDRAWN_ACP_STEER";
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_stall_withdraw", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_stall_withdraw", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "hold" } }),
+        finalText("SHOULD_NOT_RUN"),
+      ]);
+      try {
+        const env = fakeGatewayEnv(root, gateway);
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [acpHttpServer(httpFixture, "withdraw")] },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "full-access" }, 3);
+
+        sendPrompt(client, 10, "Call the held MCP tool.");
+        await waitForCondition(
+          "held MCP call",
+          () => httpFixture.requests.some((entry) => entry.message.method === "tools/call"),
+          TIMEOUT,
+        );
+
+        sendSteeringPrompt(client, 11, steerText);
+        sendPrompt(client, 12, "barrier");
+        expect((await readResponse(client, 12)).error.code).toBe(-32600);
+
+        client.send({
+          jsonrpc: "2.0",
+          method: "$/cancel_request",
+          params: { requestId: 11 },
+        });
+        sendPrompt(client, 13, "barrier-after-withdraw");
+        const afterWithdraw = await readUntilResponses(client, [11, 13]);
+        expect(afterWithdraw.responses.get(11)!.result?.stopReason).toBe("cancelled");
+        expect(afterWithdraw.responses.get(11)!.result?._meta?.fx?.steering).toBe("dropped");
+        expect(afterWithdraw.responses.get(13)!.error.code).toBe(-32600);
+
+        const log = readFileSync(join(sessionDir(root.home, sessionId), "log.jsonl"), "utf8");
+        const kinds = log.trimEnd().split("\n")
+          .filter((line) => line.length > 0)
+          .map((line) => JSON.parse(line).kind);
+        expect(kinds).toContain("input_accepted");
+        expect(kinds).toContain("input_withdrawn");
+
+        const exited = client.waitForExit();
+        client.kill("SIGKILL");
+        await exited;
+        expect(client.signalCode).toBe("SIGKILL");
+        client = null;
+
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 20);
+        client.send({
+          jsonrpc: "2.0",
+          id: 21,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const loaded = await readUntilResponses(client, [21]);
+        expect(loaded.responses.get(21)!.error).toBeUndefined();
+        const updatesText = loaded.messages
+          .filter((message) => message.method === "session/update")
+          .map((message) => message.params.update?.content?.text ?? "")
+          .join("\n");
+        expect(updatesText).not.toContain("was not delivered:");
+        expect(updatesText).not.toContain(steerText);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        httpFixture.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },
@@ -7083,6 +7320,82 @@ describe("acp: model-independent", () => {
     LIVE_TIMEOUT,
   );
 
+  // The user hears that fx declined the form, on the path the client's capabilities pick, in fx's words alone.
+  for (const advertised of [true, false]) {
+    test(
+      `a form fx refuses is told to ${advertised ? "an editor that shows notices as a session notice" : "an editor with no notices as an operational message"}`,
+      async () => {
+        const sentinel = "S10_SECRET_SENTINEL_7f3c";
+        const declined = "MCP server 'fixture' asked for input, and fx declined it: fx can't show the form: it is invalid, has a field type fx doesn't support, or asks for a secret.";
+        const root = createIsolatedRoot(`fx-acp-mcp-declined-${advertised ? "notice" : "message"}-`);
+        const pidPath = join(root.root, "mcp-declined.pid");
+        const gateway = startFakeGateway([
+          fakeGatewayToolCall("select_secret", "toolbox", { open: MCP_TOOL_NAME }),
+          fakeGatewayToolCall("call_secret", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "secret" } }),
+          finalText("Secret form declined"),
+        ]);
+        const directRequests: Array<Record<string, unknown>> = [];
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          await client.request(
+            "initialize",
+            {
+              protocolVersion: 1,
+              clientCapabilities: { elicitation: { form: {} }, ...(advertised ? { session: { notices: {} } } : {}) },
+            },
+            1,
+          );
+          const created = await client.request(
+            "session/new",
+            {
+              cwd: root.workspace,
+              mcpServers: [acpStdioServer("unused", pidPath, "mrtr_secret_required", { FX_MCP_EXPECT_ELICITATION: "form" })],
+            },
+            2,
+          ) as any;
+          expect(created.error).toBeUndefined();
+          await client.readLine();
+          await client.request("session/set_mode", { modeId: "auto" }, 3);
+          client.setElicitationHandler((params) => {
+            directRequests.push(params);
+            return { action: "accept", content: {} };
+          });
+
+          const prompt = await runPrompt(client, "Call the MCP fixture that attempts a secret form.", TIMEOUT);
+          expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+          expect(directRequests).toHaveLength(0);
+          const updates = prompt.messages.map((message) => message.params?.update).filter(Boolean);
+          const notices = updates.filter((update) => update.sessionUpdate === "notice");
+          const texts = updates
+            .filter((update) => update.sessionUpdate === "agent_message_chunk")
+            .map((update) => update.content?.text ?? "");
+          if (advertised) {
+            // The session notice path: one notice, and nothing in the conversation.
+            expect(notices.map((notice) => notice.title)).toEqual([declined]);
+            expect(notices[0].severity).toBe("info");
+            expect(texts.join("")).not.toContain("fx declined it");
+          } else {
+            // The operational message path: no notice update, one message.
+            expect(notices).toEqual([]);
+            expect(texts.filter((text) => text.includes(declined))).toHaveLength(1);
+          }
+          // The form was still declined: the call did not go on.
+          expect(gateway.requests.map((request) => request.body).join("\n")).not.toContain("continued after elicitation");
+          // fx's reason only: no field, value or control byte of the server's form.
+          expect(JSON.stringify(prompt.messages)).not.toContain(sentinel);
+          expect(JSON.stringify(prompt.messages)).not.toContain("accessToken");
+          expect(client.stderr).not.toContain(sentinel);
+        } finally {
+          await client?.close();
+          if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      LIVE_TIMEOUT,
+    );
+  }
+
   test(
     `ACP URL consent completes only after modern MCP retry without prefetching`,
     async () => {
@@ -8326,7 +8639,7 @@ describe("acp: model-independent", () => {
     });
     const proc = nodeSpawn(FX_BIN, ["acp"], {
       cwd: root.workspace,
-      env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+      env: fxChildEnv({ ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" }),
       stdio: ["pipe", "pipe", "pipe"],
     });
     try {
@@ -11461,7 +11774,7 @@ describe("acp: model-independent", () => {
       ]);
       const proc = nodeSpawn(FX_BIN, ["acp"], {
         cwd: root.workspace,
-        env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+        env: fxChildEnv({ ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" }),
         stdio: ["pipe", "pipe", "pipe"],
       });
       let client: AcpClient | undefined;

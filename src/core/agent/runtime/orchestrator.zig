@@ -26,7 +26,9 @@ const text_utils = @import("../../shared/text_utils.zig");
 const model_context_encoding = @import("../../shared/model_context_encoding.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const io_mod = @import("../../shared/io.zig");
+const quiesce = @import("../../quiesce/quiesce.zig");
 const host_target = @import("../../hosts/target.zig");
+const runtime_profile = @import("../../hosts/runtime_profile.zig");
 const secret = @import("../../auth/secret.zig");
 const auth_transition = @import("../../auth/auth_transition.zig");
 const credentials = @import("../../auth/credentials.zig");
@@ -653,6 +655,7 @@ fn append_steering_guidance(
         try within_turn_suffix.append(arena, .{
             .role = .user,
             .content = try framedMessage(arena, message.author, message.text),
+            .input_id = message.input_id,
         });
         if (message.author == .child) subagent_reports.traceTaken(arena, .{}, message.text);
     }
@@ -4613,8 +4616,9 @@ fn persistPromptBeforeCapture(
         const execution = runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages) catch |err| break :saved err;
         const projected = finalization.persistedExecution(arena, execution) catch |err| break :saved err;
         append(deps.ctx, .{
-            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
+            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
             .execution = projected,
+            .saved_execution = finalization.savedExecution(execution),
         }) catch |err| break :saved err;
         return;
     };
@@ -4643,8 +4647,9 @@ fn appendRunningToolCalls(
     const issuing = current_turn_messages[current_turn_messages.len - 1];
     std.debug.assert(issuing.role == .assistant and issuing.tool_calls.len == calls.len);
     try append(deps.ctx, .{
-        .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
+        .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
         .execution = try finalization.persistedExecution(arena, execution),
+        .saved_execution = finalization.savedExecution(execution),
         .running_calls = running,
         .running_assistant = issuing.content,
     });
@@ -4800,9 +4805,9 @@ fn persistRecoveryCheckpointWithAction(
         current_turn_messages,
     );
     const projected = try finalization.persistedExecution(arena, execution);
-    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author };
+    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id };
     // Every completed piece reaches the session before the next request.
-    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected, .recovery_record = record });
+    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected, .saved_execution = finalization.savedExecution(execution), .recovery_record = record });
     const effect = deps.recovery_checkpoint orelse return;
     try effect.set(deps.ctx, .{
         .turn_id = job.turn_id,
@@ -4884,6 +4889,67 @@ fn persistFinalReplyCheckpoint(
     );
 }
 
+/// Whether a turn asked to stop for its host's restart can stop here: its
+/// request's record is in the session log, and the host marks the turn
+/// as yielded, so the next launch continues it. A host that saves no
+/// session has neither, so its turn goes on to its end, as a turn on a
+/// provider other than the gateway does. The first refused stop of a turn
+/// writes a trace line that says why; the next boundary asks again.
+fn canStopForRestart(
+    deps: *const AgentRuntimeDeps,
+    request_recovery: *runtime_request_recovery.RequestRecovery,
+    skip_traced: *bool,
+    trace_ctx: TraceContext,
+) bool {
+    const reason: []const u8 = if (deps.mark_turn_yielded == null)
+        "no_turn_marker"
+    else if (!request_recovery.recordSaved())
+        "no_saved_record"
+    else
+        return true;
+    if (!skip_traced.*) {
+        skip_traced.* = true;
+        debug_trace.eventf("agent", "turn_yield_skipped", trace_ctx, "reason={s}", .{reason});
+    }
+    return false;
+}
+
+/// Stops the turn between steps for its host, once its request's clean
+/// record is saved: marked clean, as a closing fx saves it, so the next
+/// launch resumes it without counting a death, and the session marks the turn
+/// as yielded, so the launch continues it as the same turn
+/// (`tests/tla/recovery/Resume.tla` Relaunch, NoFalseCrashQuestion).
+/// Its start capture is settled first, so it never lands after the marker.
+/// Only a turn `canStopForRestart` allows gets here. When the clean record does
+/// not land, nothing is marked and it returns false: the request is still
+/// open with its send's record, so the turn goes on and the next boundary
+/// asks again (`Resume.tla` YieldSaveFails). A marker that cannot be written
+/// after a saved record leaves a turn the next launch resumes from that
+/// record, with the resume note: nothing is lost.
+fn yieldTurn(
+    deps: *const AgentRuntimeDeps,
+    request_recovery: *runtime_request_recovery.RequestRecovery,
+    trace_ctx: TraceContext,
+) bool {
+    // The turn's start capture is saved first (D98), so the record and the
+    // marker after it stay the turn's newest items (`interruptedRequest`).
+    if (deps.start_workspace_capture) |capture| capture(deps.ctx, false, .settle);
+    if (!request_recovery.closeForYield()) {
+        debug_trace.eventf("agent", "turn_yield_skipped", trace_ctx, "reason=closing_save_failed", .{});
+        return false;
+    }
+    var marked = false;
+    if (deps.mark_turn_yielded) |mark| {
+        if (mark(deps.ctx)) {
+            marked = true;
+        } else |err| {
+            debug_trace.logf("agent", "event=turn_yield_unmarked err={s} reason=marker_write_failed", .{@errorName(err)});
+        }
+    }
+    debug_trace.eventf("agent", "turn_yielded", trace_ctx, "record_saved=true marked={}", .{marked});
+    return true;
+}
+
 /// A checkpoint `persistFinalReplyCheckpoint` saved holds the reply its turn
 /// was ending with. Recovery delivers it as the turn's reply instead of
 /// asking the model again (`tests/tla/durable/Resumption.tla`
@@ -4921,7 +4987,7 @@ const CompactionSource = struct {
         const execution = try runtime_execution_memory.buildExecutionMemory(self.arena, self.current_turn_messages);
         try effect.set(deps.ctx, .{
             .turn_id = job.turn_id,
-            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
+            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
             .assistant_source = @constCast(""),
             .execution = try self.finalization.persistedExecution(self.arena, execution),
             .cause = .compaction_prepared,
@@ -6251,7 +6317,17 @@ fn restorePromptAfterTerminalFailure(
     if (prompt.len == 0) return;
     restore(deps.ctx, prompt) catch |err| {
         debug_trace.logf("agent", "failed to restore terminal-failure prompt err={s}", .{@errorName(err)});
+        return;
     };
+    if (comptime runtime_profile.host.durable_sessions) {
+        if (job.input_id) |input_id| {
+            if (deps.withdraw_accepted_input) |withdraw| {
+                withdraw(deps.ctx, input_id) catch |err| {
+                    debug_trace.logf("agent", "failed to withdraw restored terminal-failure prompt err={s}", .{@errorName(err)});
+                };
+            }
+        }
+    }
 }
 
 // A cancelled or stall-stopped turn's durable checkpoint dies with it;
@@ -7107,10 +7183,13 @@ fn processQueuedPromptInner(
         "history_turns={d} gateway_messages_before={d} interrupted_turns={d} history_turn_kinds={s}",
         .{ active_history.len, history_messages_before, interrupted_turns, history_turn_kinds },
     );
-    // A resumed request continues the turn fx stopped: superseded resume
-    // turns are dropped and the stopped turn is projected without its abort
-    // note, as a steering continuation is.
-    const resumed_request = job.recovery_resume != null;
+    // A resumed request continues the turn fx stopped, so the stopped turn is
+    // projected without its abort note, as a steering continuation is, and
+    // superseded resumes are dropped. A turn that continues a yielded one
+    // projects its history as that turn did, so it is a resumed request when
+    // the yielded turn was one. A resume's prompt is the resume prompt, so the
+    // prompt tells us which.
+    const resumed_request = job.recovery_resume != null and (!job.continues_yielded_turn or session_runtime.isResumePrompt(job.prompt));
     const resumed_history = if (resumed_request) session_runtime.withoutSupersededResumes(job.history) else job.history;
     if (job.delivery.isContinuation() or resumed_request) {
         try session_runtime.appendSteeringActiveContextHistoryChatMessages(
@@ -7211,8 +7290,11 @@ fn processQueuedPromptInner(
         agent,
     ) catch |err| {
         // A turn that yielded stays open for the host to resume, so nothing
-        // it did is finished as a failure.
-        if (err == error.TurnYielded) return err;
+        // it did is finished as a failure, and its trace says it yielded.
+        if (err == error.TurnYielded) {
+            finish_trace.finish("yielded");
+            return err;
+        }
         if (stop_state.retained_candidate != null and
             !stop_state.terminal_materializing and
             finalization.state == .open)
@@ -8514,7 +8596,16 @@ fn processQueuedPromptLoop(
     var restore_recovery_source = job.recovery_checkpoint != null;
     // The turn's first model request resumes the one a previous fx process
     // left unfinished, when there is one.
-    var recovery_resume = job.recovery_resume;
+    // A turn that continues a yielded one sends the request the yield
+    // stopped, so the recovery module shows no retry for it.
+    var recovery_resume: ?types.RecoveryResume = if (job.recovery_resume) |resumed|
+        .{ .record = resumed.record, .stale = resumed.stale, .continues = job.continues_yielded_turn }
+    else
+        null;
+    // Whether this prompt has sent a request yet, for a host that stops the
+    // turn between steps (`src/core/quiesce/`).
+    var turn_quiesce: quiesce.State = .{};
+    var yield_skip_traced = false;
     // The session sends one runtime context ahead of the history; a change
     // joins the conversation instead (D94).
     var runtime_context = try runtime_context_state.State.init(
@@ -9187,7 +9278,7 @@ fn processQueuedPromptLoop(
                     agent.compaction_requested = false;
                     // The pending user is source too, even before the first tool.
                     const active_prefix: types.AssistantHistoryTurn = .{
-                        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
+                        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
                         .assistant = @constCast(""),
                         .execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]),
                     };
@@ -9379,6 +9470,23 @@ fn processQueuedPromptLoop(
             } else {
                 // No write goes before this send, so its record goes now.
                 request_recovery.flushRecord();
+            }
+
+            // The turn is saved and its request is next: a host that asked
+            // the turn to stop, as Ctrl+G does, gets it here, once the
+            // prompt has sent its first request. Only the gateway path saves
+            // the turn before its send, so only it stops here, and only when
+            // the next launch can continue it (`canStopForRestart`); any
+            // other turn goes on, and the restart waits for it to end.
+            const stop_requested = if (config.yield_flag) |flag| flag.load(.seq_cst) else false;
+            if (job.provider == .gateway and quiesce.step(&turn_quiesce, .{ .boundary = .{
+                .now_ms = io_mod.milliTimestamp(),
+                .stop_requested = stop_requested,
+                .kind = if (recovery_cause == .compaction_prepared) .compaction else .request,
+            } }) == .yield and canStopForRestart(deps, &request_recovery, &yield_skip_traced, step_ctx)) {
+                // A stop whose clean record does not land leaves the turn
+                // going on; the next boundary asks again.
+                if (yieldTurn(deps, &request_recovery, step_ctx)) return error.TurnYielded;
             }
 
             disarmCacheWarming(deps);
@@ -11012,9 +11120,10 @@ fn processQueuedPromptLoop(
             const finish_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items);
             const completed_summary = summary_accumulator.finish();
             var turn: HistoryTurn = .{ .assistant = .{
-                .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
+                .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
                 .assistant = @constCast(assistant_text),
                 .execution = try finalization.persistedExecution(arena, finish_execution),
+                .saved_execution = finalization.savedExecution(finish_execution),
             } };
             types.setHistoryTurnSummary(&turn, completed_summary);
             try deps.propagate_history_turn(deps.ctx, turn);
@@ -11628,9 +11737,7 @@ fn processQueuedPromptLoop(
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
         empty_reply_nudged = false;
         if (step_has_content) {
-            const first_tool_is_ask = effective_tool_calls.len > 0 and
-                runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, effective_tool_calls[0]) == .ask;
-            if (!first_tool_is_ask) try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+            try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
             silent_tool_steps = 0;
         } else {
             silent_tool_steps += 1;
@@ -14096,9 +14203,10 @@ fn finishFailedTurnWithNotice(
     );
     const completed_summary = summary_accumulator.finish();
     var turn: HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
+        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
         .assistant = @constCast(notice),
         .execution = try finalization.persistedExecution(arena, execution_memory),
+        .saved_execution = finalization.savedExecution(execution_memory),
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     try deps.propagate_history_turn(deps.ctx, turn);
@@ -14259,4 +14367,157 @@ test "malformed duplicate unauthorized and path Vision calls settle no image ids
         &catalog,
     ));
     try std.testing.expectEqual(@as(usize, 0), settled_ids.items.len);
+}
+
+test "eb03: append_steering_guidance carries SteeringMessage.input_id onto ChatMessage" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    const guidance = [_]worker_runtime.SteeringMessage{
+        .{ .text = @constCast("steer one"), .author = .user, .input_id = 33 },
+        .{ .text = @constCast("child note"), .author = .child, .input_id = null },
+    };
+    try append_steering_guidance(arena, &suffix, &guidance);
+    try std.testing.expectEqual(@as(usize, 2), suffix.items.len);
+    try std.testing.expectEqual(@as(?u64, 33), suffix.items[0].input_id);
+    try std.testing.expectEqual(@as(?u64, null), suffix.items[1].input_id);
+}
+
+test "eb03: UserTurn carries job.input_id in turn-piece writes, checkpoints, and restorePromptAfterTerminalFailure" {
+    const support = @import("tests/support.zig");
+    const alloc = std.testing.allocator;
+    const Capture = struct {
+        piece_ids: [4]?u64 = @splat(null),
+        piece_count: usize = 0,
+        checkpoint_ids: [2]?u64 = @splat(null),
+        checkpoint_count: usize = 0,
+        withdrawn_id: ?u64 = null,
+        restored_count: usize = 0,
+
+        fn appendPiece(raw: *anyopaque, progress: runtime_deps.TurnProgress) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.piece_ids[self.piece_count] = progress.user.input_id;
+            self.piece_count += 1;
+        }
+        fn setCheckpoint(raw: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkpoint_ids[self.checkpoint_count] = checkpoint.user.input_id;
+            self.checkpoint_count += 1;
+        }
+        fn clearCheckpoint(_: *anyopaque) !void {}
+        fn restorePrompt(raw: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.restored_count += 1;
+        }
+        fn withdrawInput(raw: *anyopaque, id: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.withdrawn_id = id;
+        }
+    };
+
+    var fake = support.FakeAgentRuntimeDeps.init(alloc);
+    defer fake.deinit();
+    var capture = Capture{};
+    var test_deps = fake.deps();
+    test_deps.ctx = &capture;
+    test_deps.append_turn_piece = Capture.appendPiece;
+    test_deps.recovery_checkpoint = .{
+        .set = Capture.setCheckpoint,
+        .clear = Capture.clearCheckpoint,
+    };
+    test_deps.restore_failed_prompt = Capture.restorePrompt;
+    test_deps.withdraw_accepted_input = Capture.withdrawInput;
+
+    var guard = TurnFinalizationGuard.init(&test_deps, 10, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, "/tmp"));
+    defer guard.deinit();
+
+    const job: QueuedPrompt = .{
+        .turn_id = 10,
+        .input_id = 64,
+        .prompt = @constCast("run check"),
+        .images = &.{},
+        .model = @constCast("gateway/model"),
+        .api_key = @constCast("key"),
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+    };
+    const call = types.ToolCall{
+        .id = "call_1",
+        .name = "read_file",
+        .arguments_json = "{}",
+    };
+    const msgs = [_]ChatMessage{.{ .role = .assistant, .tool_calls = &.{call} }};
+
+    persistPromptBeforeCapture(&test_deps, &guard, job, &.{});
+    try appendRunningToolCalls(&test_deps, &guard, job, &msgs, &.{call});
+    try persistRecoveryCheckpointWithAction(
+        &test_deps,
+        &guard,
+        job,
+        &.{},
+        "",
+        "gateway/model",
+        false,
+        false,
+        0,
+        false,
+        .network_interrupted,
+        .retrying_request,
+        .none,
+        .{},
+        .keep,
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var compaction_source: CompactionSource = .{
+        .deps = &test_deps,
+        .finalization = &guard,
+        .arena = arena_state.allocator(),
+        .job = job,
+        .current_turn_messages = &.{},
+        .route_model = "gateway/model",
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .consumed_attempts = 0,
+        .tool_evidence = .none,
+        .trace_ctx = .{},
+    };
+    try CompactionSource.persist(&compaction_source);
+
+    try std.testing.expectEqual(@as(usize, 3), capture.piece_count);
+    for (0..3) |i| try std.testing.expectEqual(@as(?u64, 64), capture.piece_ids[i]);
+    try std.testing.expectEqual(@as(usize, 2), capture.checkpoint_count);
+    for (0..2) |i| try std.testing.expectEqual(@as(?u64, 64), capture.checkpoint_ids[i]);
+
+    var fixture = support.PromptFixture{};
+    restorePromptAfterTerminalFailure(&test_deps, job, fixture.config());
+    try std.testing.expectEqual(@as(usize, 1), capture.restored_count);
+    try std.testing.expectEqual(@as(?u64, 64), capture.withdrawn_id);
+
+    var notice_fake = support.FakeAgentRuntimeDeps.init(alloc);
+    defer notice_fake.deinit();
+    var notice_deps = notice_fake.deps();
+    var notice_guard = TurnFinalizationGuard.init(&notice_deps, 11, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, "/tmp"));
+    defer notice_guard.deinit();
+    var summary = runtime_telemetry.TurnSummaryAccumulator.init(0, job.prompt);
+    var stop_state: CommonStopState = .{};
+    var trace: runtime_finalization.PromptFinishTrace = .{ .ctx = .{} };
+    try finishFailedTurnWithNotice(
+        &notice_deps,
+        &notice_guard,
+        arena_state.allocator(),
+        job,
+        &.{},
+        &summary,
+        &stop_state,
+        &trace,
+        "notice text",
+        "failed_notice",
+    );
+    try std.testing.expectEqual(@as(usize, 1), notice_fake.history_turns.items.len);
+    try std.testing.expectEqual(@as(?u64, 64), notice_fake.history_turns.items[0].assistant.user.input_id);
+    try std.testing.expectEqual(@as(?u64, 64), notice_fake.finish_user_input_id);
 }

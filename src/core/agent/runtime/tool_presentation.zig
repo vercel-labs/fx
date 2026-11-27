@@ -859,13 +859,44 @@ pub fn activityKind(registry: tool_dispatch.Registry, tool_name: []const u8) typ
     return tool_dispatch.toolActivityKind(registry, tool_name);
 }
 
+/// What a call does, as its rows show it. A toolbox run of a built-in tool
+/// does what the call fx runs for it does (`toolbox.shownBuiltinRun`), so a
+/// question asked through toolbox is a question, as a direct one is.
 pub fn activityKindForCall(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
     call: ToolCall,
 ) types.ToolActivityKind {
     if (tooling_presentation.isProviderSearchAlias(call.name)) return .read;
-    return tool_dispatch.toolActivityKindForCall(alloc, registry, call);
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const shown = toolbox.shownBuiltinRun(scratch_state.allocator(), registry, call) catch |err| blk: {
+        // Out of memory keeps the toolbox call's own kind, as a call whose
+        // arguments don't parse keeps its tool's static kind.
+        debug_trace.logf("tool", "toolbox run kind not resolved call={s} err={s}", .{ call.id, @errorName(err) });
+        break :blk null;
+    };
+    return tool_dispatch.toolActivityKindForCall(alloc, registry, shown orelse call);
+}
+
+test "a toolbox run of a built-in tool does what that tool does" {
+    const registry = test_builtin_tools.advertisement_set.registry;
+    const cases = [_]struct { arguments: []const u8, kind: types.ToolActivityKind }{
+        .{ .arguments = "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}", .kind = .ask },
+        .{ .arguments = "{\"run\":\"ask_user_question\",\"arguments\":\"{\\\"questions\\\":[]}\"}", .kind = .ask },
+        .{ .arguments = "{\"run\":\"read_file\",\"arguments\":{\"path\":\"a\"}}", .kind = .read },
+        // Toolbox's own kinds: a run of an MCP tool, a search, and a run that
+        // also opens, which toolbox refuses.
+        .{ .arguments = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .kind = .mcp },
+        .{ .arguments = "{\"search\":\"files\"}", .kind = .read },
+        .{ .arguments = "{\"run\":\"ask_user_question\",\"open\":\"skill\"}", .kind = .write },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "t", .name = toolbox.tool_name, .arguments_json = case.arguments };
+        try std.testing.expectEqual(case.kind, activityKindForCall(std.testing.allocator, registry, call));
+    }
+    const carried: ToolCall = .{ .id = "t", .name = "ask_user_question", .arguments_json = "{\"questions\":[]}", .carried_by = toolbox.tool_name };
+    try std.testing.expectEqual(types.ToolActivityKind.ask, activityKindForCall(std.testing.allocator, registry, carried));
 }
 
 /// How a streaming toolbox call's row reads when it runs a built-in tool.

@@ -23,7 +23,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
@@ -221,7 +221,7 @@ async function waitForSettledChild(fixture: Fixture, id: string, children: numbe
 function spawnAsk(fixture: Fixture, gateway: any, args: string[], cwd = fixture.workspace) {
   const child = spawn(FX_BIN, ["ask", "--json", "--auto", ...args], {
     cwd,
-    env: { ...process.env, ...env(fixture, gateway) } as Record<string, string>,
+    env: fxChildEnv({ ...env(fixture, gateway), FX_SOUND: "0" }) as Record<string, string>,
     stdio: "ignore",
   });
   const exited = new Promise((resolve) => child.on("exit", resolve));
@@ -251,7 +251,7 @@ function askWithSizeLimit(fixture: Fixture, gateway: any, blocks: number, args: 
     const child = spawn(
       "/bin/sh",
       ["-c", `trap '' XFSZ; ulimit -f ${blocks}; exec "$0" "$@"`, FX_BIN, "ask", "--json", "--auto", ...args],
-      { cwd: fixture.workspace, env: { ...process.env, ...env(fixture, gateway) } as Record<string, string> },
+      { cwd: fixture.workspace, env: fxChildEnv(env(fixture, gateway)) as Record<string, string> },
     );
     let stdout = "";
     let stderr = "";
@@ -570,6 +570,47 @@ test("fx ask sends the turn's request while its start capture runs, and saves th
   }
 }, TIMEOUT);
 
+test("fx started by runFx or spawnAsk ignores a start capture hold left in the developer's environment, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-inherited-hold-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const held = join(fixture.root, "inherited-held");
+  const release = join(fixture.root, "inherited-release");
+  // The release comes with the first request, so an fx that takes the hold
+  // still finishes and leaves its marker behind.
+  const gateway = startDynamicFakeGateway(() => {
+    writeFileSync(release, "");
+    return fakeGatewayFinalText("DONE");
+  });
+  const before = {
+    held: process.env.FX_TEST_WORKSPACE_CAPTURE_START_HELD,
+    release: process.env.FX_TEST_WORKSPACE_CAPTURE_START_RELEASE,
+  };
+  process.env.FX_TEST_WORKSPACE_CAPTURE_START_HELD = held;
+  process.env.FX_TEST_WORKSPACE_CAPTURE_START_RELEASE = release;
+  try {
+    const run = await runFx(["ask", "--json", "--auto", "First."], { cwd: fixture.workspace, env: env(fixture, gateway), timeoutMs: TIMEOUT });
+    const runHeld = existsSync(held);
+    rmSync(held, { force: true });
+    const { exited } = spawnAsk(fixture, gateway, ["Second."]);
+    const spawnedCode = await exited;
+    expect({
+      runFx: { code: run.code, held: runHeld },
+      spawnAsk: { code: spawnedCode, held: existsSync(held) },
+    }).toEqual({
+      runFx: { code: 0, held: false },
+      spawnAsk: { code: 0, held: false },
+    });
+  } finally {
+    if (before.held === undefined) delete process.env.FX_TEST_WORKSPACE_CAPTURE_START_HELD;
+    else process.env.FX_TEST_WORKSPACE_CAPTURE_START_HELD = before.held;
+    if (before.release === undefined) delete process.env.FX_TEST_WORKSPACE_CAPTURE_START_RELEASE;
+    else process.env.FX_TEST_WORKSPACE_CAPTURE_START_RELEASE = before.release;
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
 test("fx ask killed while its start capture is held keeps the prompt, and the resumed turn records its own captures, with experimental.workspace_capture", async () => {
   const fixture = createFixture("fx-v2-capture-kill-");
   makeCaptureRepository(fixture);
@@ -589,7 +630,7 @@ test("fx ask killed while its start capture is held keeps the prompt, and the re
   try {
     const child = spawn(FX_BIN, ["ask", "--json", "--auto", "Before the kill."], {
       cwd: fixture.workspace,
-      env: { ...process.env, ...env(fixture, gateway), FX_TEST_WORKSPACE_CAPTURE_START_HELD: held, FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: release } as Record<string, string>,
+      env: fxChildEnv({ ...env(fixture, gateway), FX_TEST_WORKSPACE_CAPTURE_START_HELD: held, FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: release }) as Record<string, string>,
       stdio: "ignore",
     });
     const exited = new Promise((resolve) => child.on("exit", resolve));
@@ -614,6 +655,34 @@ test("fx ask killed while its start capture is held keeps the prompt, and the re
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }, TIMEOUT);
+
+test("fx ask finishes and leaves a FIFO alone when one sits at its start capture's hold marker, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-fifo-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  // Nothing ever reads this FIFO, so opening it to write the marker would
+  // block fx for good.
+  const held = join(fixture.root, "start-capture-held");
+  const release = join(fixture.root, "start-capture-release");
+  const mkfifo = Bun.spawnSync(["mkfifo", held]);
+  expect(mkfifo.exitCode).toBe(0);
+  const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FIFO_LEFT_ALONE"));
+  try {
+    const result = await runFx(["ask", "--json", "--auto", "Say done."], {
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway), FX_TEST_WORKSPACE_CAPTURE_START_HELD: held, FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: release },
+      timeoutMs: TIMEOUT,
+    });
+    expect({ code: result.code, timedOut: result.timedOut }).toEqual({ code: 0, timedOut: false });
+    expect(JSON.parse(result.stdout).output).toContain("FIFO_LEFT_ALONE");
+    expect(statSync(held).isFIFO()).toBe(true);
+    // The start capture skipped its hold and still ran.
+    expect(workspaceCaptures(fixture, JSON.parse(result.stdout).session_id).map((record) => record.phase)).toEqual(["start", "end"]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
 
 test("fx ask never captures a repository at the home folder that a tool writes in, with experimental.workspace_capture", async () => {
   const fixture = createFixture("fx-v2-capture-home-");
@@ -1160,7 +1229,7 @@ test("fx ask killed in the middle of a turn resumes with that turn interrupted",
 
     const child = spawn(FX_BIN, ["ask", "--json", "--auto", "--resume", id, "This turn is killed."], {
       cwd: fixture.workspace,
-      env: { ...process.env, ...env(fixture, gateway) } as Record<string, string>,
+      env: fxChildEnv(env(fixture, gateway)) as Record<string, string>,
       stdio: "ignore",
     });
     await reachedStall;
@@ -2863,7 +2932,7 @@ class AcpRpc {
       : ["/bin/sh", ["-c", `trap '' XFSZ; ulimit -f ${limitBlocks}; exec "$0" "$@"`, FX_BIN, "acp"]];
     this.proc = spawn(command, args, {
       cwd: fixture.workspace,
-      env: { ...process.env, ...env(fixture, gateway), ...extraEnv } as Record<string, string>,
+      env: fxChildEnv({ ...env(fixture, gateway), ...extraEnv }) as Record<string, string>,
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.exited = new Promise((resolve) => this.proc.on("exit", (code) => resolve(code)));
@@ -5668,10 +5737,15 @@ test.skipIf(!tmuxAvailable())("text typed while the app answers steers that turn
     // Steering continues the turn it interrupts: one committed turn that
     // holds the steering, and nothing interrupted.
     const id = onlySessionId(fixture.home);
-    const kinds = logLines(fixture.home, id).map((line) => line.kind);
+    const lines = logLines(fixture.home, id);
+    const kinds = lines.map((line) => line.kind);
     expect(kinds.filter((kind) => kind === "turn_committed")).toHaveLength(1);
     expect(kinds).not.toContain("turn_interrupted");
-    expect(countIn(readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"), "utf8"), steering)).toBe(1);
+    expect(
+      lines.filter(
+        (line) => line.kind === "item" && JSON.stringify(line).includes(steering),
+      ),
+    ).toHaveLength(1);
 
     const resumed = await startApp(fixture, gateway, ["-c"]);
     const shown = await scrollbackContains(resumed.session, "STEERED_ANSWER");
@@ -6781,11 +6855,66 @@ function fillDisk(mountpoint: string) {
 
 type GridAttempt = { entered: boolean; said: string };
 
+const GRID_RESTORE_SINGULAR_NOTICE = "1 prompt you sent before fx stopped was not delivered. It is back in the composer.";
+
+function gridComposerText(pane: string): string {
+  const lines = pane.split("\n");
+  const lastIndex = lines.findLastIndex((line) => isComposerLine(line));
+  if (lastIndex < 0) return "";
+  let startIndex = lastIndex;
+  while (startIndex > 0 && isComposerLine(lines[startIndex - 1]!)) {
+    startIndex -= 1;
+  }
+  return lines
+    .slice(startIndex, lastIndex + 1)
+    .map((line) => {
+      const trimmedStart = line.trimStart();
+      if (trimmedStart.startsWith("┃ ")) return trimmedStart.slice(2).trimEnd();
+      if (trimmedStart.startsWith("┃")) return trimmedStart.slice(1).trimEnd();
+      if (trimmedStart.startsWith("❯ ")) return trimmedStart.slice(2).trimEnd();
+      if (trimmedStart.startsWith("> ")) return trimmedStart.slice(2).trimEnd();
+      return trimmedStart.slice(1).trimEnd();
+    })
+    .join("\n");
+}
+
+function hasPendingAcceptedPromptInLog(logPath: string, promptText: string): boolean {
+  let lines: LogLine[];
+  try {
+    lines = readFileSync(logPath, "utf8")
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .flatMap((line) => {
+        try {
+          return [JSON.parse(line) as LogLine];
+        } catch {
+          return [];
+        }
+      });
+  } catch {
+    return false;
+  }
+  const settledIds = new Set(
+    lines
+      .filter((line) => line.kind === "input_delivered" || line.kind === "input_withdrawn")
+      .map((line) => line.id),
+  );
+  return lines.some(
+    (line) =>
+      line.kind === "input_accepted" &&
+      line.text === promptText &&
+      typeof line.id === "number" &&
+      !settledIds.has(line.id),
+  );
+}
+
 /// Enters the case through `entry` and asks for `token`. Under `limit`, the
 /// host runs with that file-size limit.
-async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: string, limit?: number): Promise<GridAttempt> {
+async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: string, limit?: number, previousToken?: string): Promise<GridAttempt> {
   const prompt = `Grid token ${token}.`;
   const answer = `GRID_ANSWER_${token}`;
+  const previousPrompt = previousToken !== undefined ? `Grid token ${previousToken}.` : undefined;
+  const acceptRestoredPrior = previousPrompt !== undefined && hasPendingAcceptedPromptInLog(c.log, previousPrompt);
   switch (gridHost(entry)) {
     case "ask": {
       const args = entry === "ask-id" ? ["--resume", c.id, prompt] : entry === "ask-last" ? ["--resume", "last", prompt] : [prompt];
@@ -6805,6 +6934,10 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         cmd = join(c.harness, `limited-${token}.sh`);
         writeFileSync(cmd, `#!/bin/sh\ntrap '' XFSZ\nulimit -f ${limit}\nexec '${FX_BIN}' ${args}\n`, { mode: 0o700 });
       }
+      const paneShowsRestoredPrior = (pane: string) =>
+        acceptRestoredPrior &&
+        pane.replace(/\s+/g, " ").includes(GRID_RESTORE_SINGULAR_NOTICE) &&
+        gridComposerText(pane) === previousPrompt;
       const session = await TmuxSession.create({ cmd, cwd: c.fixture.workspace, env: { ...env(c.fixture, gateway), NO_COLOR: "1" }, stderrPath, remainOnExit: true });
       // The pane stays after fx exits, so its end is the exit status the
       // pane's wrapper records; tmux can mark the pane dead many seconds later.
@@ -6821,13 +6954,22 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         let settled = false;
         const died = (async () => {
           while (!settled && !exited()) await Bun.sleep(50);
-          return "exited";
+          return "exited" as const;
         })();
-        let started = await Promise.race([session.waitForComposer(TIMEOUT).then(() => "composer", () => "neither"), died]);
+        let started: "composer" | "restored" | "neither" | "exited" = await Promise.race([
+          acceptRestoredPrior
+            ? session.waitForPane(paneShowsRestoredPrior, TIMEOUT).then(() => "restored" as const, () => "neither" as const)
+            : session.waitForComposer(TIMEOUT).then(() => "composer" as const, () => "neither" as const),
+          died,
+        ]);
         settled = true;
         if (started === "neither" && exited()) started = "exited";
         if (started === "exited") return { entered: false, said: readFileSync(stderrPath, "utf8") };
         if (started === "neither") throw new Error(`${entry}: the app neither showed its composer nor exited`);
+        if (started === "restored") {
+          await session.sendKeys("C-u");
+          await session.waitForComposer(TIMEOUT);
+        }
         await session.waitForStableComposer(TIMEOUT, 300);
         await session.sendText(prompt);
         let screen = "";
@@ -6989,7 +7131,7 @@ async function gridRow(exit: GridExit, entry: GridEntry) {
           if (cause !== "damaged") {
             await clear();
             clear = async () => {};
-            const second = await gridEnter(entry, c, gateway, retry, limit);
+            const second = await gridEnter(entry, c, gateway, retry, limit, token);
             expect(second.entered, `${label} after the fault cleared: ${second.said}`).toBe(true);
             expectGridHistory(exit, asked(retry)!, `${label} after the fault cleared`);
           }
