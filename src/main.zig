@@ -5655,6 +5655,7 @@ test {
     _ = @import("core/mcp_host/login_words.zig");
     _ = @import("core/mcp/tool_lookup.zig");
     _ = @import("core/recovery/recovery.zig");
+    _ = @import("core/flight_recorder/flight_recorder.zig");
     _ = @import("core/quiesce/quiesce.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");

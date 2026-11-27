@@ -216,6 +216,23 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench-file-index", "Build file_index search benchmark");
     bench_step.dependOn(&install_bench.step);
 
+    // --- flight recorder lab (test-only executable) ---
+    const flight_recorder_lab = b.addExecutable(.{
+        .name = "flight-recorder-lab",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/core/flight_recorder/lab.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const install_flight_recorder_lab = b.addInstallArtifact(flight_recorder_lab, .{});
+    const flight_recorder_lab_step = b.step(
+        "flight-recorder-lab",
+        "Build the flight recorder test lab executable",
+    );
+    flight_recorder_lab_step.dependOn(&install_flight_recorder_lab.step);
+
     const run_bench = b.addRunArtifact(file_index_bench);
     run_bench.step.dependOn(&install_bench.step);
     run_bench.addPassthruArgs();

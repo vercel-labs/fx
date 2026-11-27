@@ -105,6 +105,7 @@
     {"name": "turn_clock", "module": "fx", "test": "the turn clock keeps its laws on fuzzed event sequences", "iterations": 2000000},
     {"name": "compaction_progress", "module": "fx", "test": "the notes count keeps its laws on fuzzed replies", "iterations": 2000000},
     {"name": "secret_pieces", "module": "fx", "test": "maskSecretPieces masks every piece of a wrapped value and keeps other bytes on fuzzed rows", "iterations": 400000},
-    {"name": "gateway_json_decode", "module": "fx", "test": "gateway JSON body decode stays bounded and round-trips gzip on fuzzed bytes", "iterations": 20000}
+    {"name": "gateway_json_decode", "module": "fx", "test": "gateway JSON body decode stays bounded and round-trips gzip on fuzzed bytes", "iterations": 20000},
+    {"name": "flight_recorder_segment", "module": "fx", "test": "a flight recorder segment reads or is refused on fuzzed bytes, and a written segment reads back the same", "iterations": 75000}
   ]
 }
