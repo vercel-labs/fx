@@ -2777,7 +2777,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
-                        .body = "This build has no Google sign-in client yet. Use Gemini API key.",
+                        .body = "This build has no Google client secret, so it cannot sign in with Google. Use Gemini API key.",
                     });
                     return;
                 }
@@ -2809,7 +2809,7 @@ pub fn Runtime(comptime App: type) type {
                 }
             else if (source == .google_subscription)
                 switch (err) {
-                    error.GoogleClientNotConfigured => .{ .topic = "auth", .tone = .@"error", .body = "This build has no Google sign-in client yet. Use Gemini API key." },
+                    error.GoogleClientNotConfigured => .{ .topic = "auth", .tone = .@"error", .body = "This build has no Google client secret, so it cannot sign in with Google. Use Gemini API key." },
                     error.GoogleScopeMissing => .{ .topic = "auth", .tone = .@"error", .body = "Google did not grant permission to run Gemini models on your Google AI Pro or Ultra plan." },
                     error.GoogleOAuthStateMismatch => .{ .topic = "auth", .tone = .@"error", .body = "Google sign-in could not be verified. The current credential is unchanged." },
                     error.GoogleAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "Google sign-in was denied. The current credential is unchanged." },

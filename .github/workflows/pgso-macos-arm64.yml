@@ -14,6 +14,10 @@ on:
       artifact-id:
         description: Qualified PGSO evidence artifact ID
         value: ${{ jobs.aggregate.outputs.artifact-id }}
+    secrets:
+      FX_GOOGLE_OAUTH_CLIENT_SECRET:
+        description: fx's Google OAuth client secret, built into the binary for plan sign-in
+        required: false
   workflow_dispatch:
   pull_request:
     paths:
@@ -66,6 +70,8 @@ jobs:
         run: python3 -m unittest discover -s scripts/pgso/tests -v
 
       - name: Build immutable seed artifacts
+        env:
+          FX_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.FX_GOOGLE_OAUTH_CLIENT_SECRET }}
         run: |
           python3 -m scripts.pgso build \
             --llvm-bin "${{ steps.setup.outputs.llvm-bin }}" \

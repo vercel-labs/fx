@@ -2851,7 +2851,7 @@ fn handleGoogleLoginError(alloc: Allocator, deps: RunDeps, err: anyerror) !RunRe
         error.GoogleClientNotConfigured => {
             try writeStderr(
                 deps,
-                "fx login google: this build has no Google sign-in client yet. Use fx login google --api-key.\n",
+                "fx login google: this build has no Google client secret, so it cannot sign in with Google. Use fx login google --api-key.\n",
             );
             return .handled_failure;
         },
@@ -7138,7 +7138,7 @@ test "login google --api-key refuses without a terminal and saves nothing" {
     try std.testing.expect((try gemini_api_key.load(alloc)) == null);
 }
 
-test "login google without --api-key exits 1 when no Google sign-in client is configured" {
+test "login google without --api-key exits 1 when the build has no Google client secret" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7161,7 +7161,7 @@ test "login google without --api-key exits 1 when no Google sign-in client is co
 
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "fx login google: this build has no Google sign-in client yet. Use fx login google --api-key.\n",
+        "fx login google: this build has no Google client secret, so it cannot sign in with Google. Use fx login google --api-key.\n",
         capture.stderr.written(),
     );
     try std.testing.expectEqualStrings("", capture.stdout.written());

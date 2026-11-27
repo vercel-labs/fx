@@ -58,3 +58,6 @@ benchmarks/baseline.json
 .vibe/
 .windsurf/
 .zencoder/
+
+# fx's Google OAuth client secret for hand builds (build.zig).
+/.google-oauth-client-secret

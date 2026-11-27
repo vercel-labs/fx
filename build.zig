@@ -59,6 +59,7 @@ pub fn build(b: *std.Build) void {
     // binary uses, such as its E2E test controls.
     build_options.addOption(bool, "libfx", false);
     build_options.addOption(bool, "builtin_tools", true);
+    build_options.addOption([]const u8, "google_oauth_client_secret", readGoogleOAuthClientSecret(b));
 
     const fuzz_corpora = readFuzzCorpora(b);
     const fuzz_corpus = addFuzzCorpusModule(b, fuzz_corpora);
@@ -392,6 +393,8 @@ fn addWasmArtifact(
     wasm_options.addOption(WasmSurface, "wasm_surface", surface);
     wasm_options.addOption(bool, "libfx", true);
     wasm_options.addOption(bool, "builtin_tools", true);
+    // libfx has no Google plan sign-in, so it never carries the secret.
+    wasm_options.addOption([]const u8, "google_oauth_client_secret", "");
 
     const wasm_root = switch (surface) {
         .core => "src/wasm_core_main.zig",
@@ -440,6 +443,7 @@ fn addNapiArtifact(
     napi_options.addOption(bool, "libfx", true);
     // libfx agents run only the host's tools, so the addon leaves fx's out.
     napi_options.addOption(bool, "builtin_tools", false);
+    napi_options.addOption([]const u8, "google_oauth_client_secret", "");
 
     const root = switch (surface) {
         .core => "src/napi_core_main.zig",
@@ -563,6 +567,28 @@ fn sessionManagerModule(
     });
     module.addImport("build_options", options.createModule());
     return module;
+}
+
+/// fx's Google Desktop OAuth client secret, which stays out of the source:
+/// the `google-oauth-client-secret` option, else FX_GOOGLE_OAUTH_CLIENT_SECRET
+/// (release workflows set it), else the git-ignored
+/// `.google-oauth-client-secret` file for hand builds. Empty when none is
+/// set; plan sign-in then says the build has no Google client secret.
+fn readGoogleOAuthClientSecret(b: *std.Build) []const u8 {
+    const value = b.option(
+        []const u8,
+        "google-oauth-client-secret",
+        "fx's Google Desktop OAuth client secret, for Google AI Ultra plan sign-in",
+    ) orelse b.graph.environ_map.get("FX_GOOGLE_OAUTH_CLIENT_SECRET") orelse readGoogleOAuthClientSecretFile(b);
+    return std.mem.trim(u8, value, " \t\r\n");
+}
+
+fn readGoogleOAuthClientSecretFile(b: *std.Build) []const u8 {
+    const path = b.pathJoin(&.{ b.root.sub_path, ".google-oauth-client-secret" });
+    return b.root.root_dir.handle.readFileAlloc(b.graph.io, path, b.allocator, .limited(4096)) catch |err| switch (err) {
+        error.FileNotFound => "",
+        else => std.debug.panic("could not read .google-oauth-client-secret: {t}", .{err}),
+    };
 }
 
 fn readAppVersion(b: *std.Build) []const u8 {

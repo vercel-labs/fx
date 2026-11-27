@@ -44,6 +44,8 @@ jobs:
           version: "0.17.1"
 
       - name: Build dev binary
+        env:
+          FX_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.FX_GOOGLE_OAUTH_CLIENT_SECRET }}
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dupdate-channel=dev
 
       - name: Package

@@ -76,6 +76,8 @@ jobs:
       actions: read
       contents: read
     uses: ./.github/workflows/pgso-linux-arm64.yml
+    secrets:
+      FX_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.FX_GOOGLE_OAUTH_CLIENT_SECRET }}
     with:
       # Keep release evidence long enough to serve as the main control for
       # manual PGSO comparisons.
@@ -88,6 +90,8 @@ jobs:
       actions: read
       contents: read
     uses: ./.github/workflows/pgso-linux-x86_64.yml
+    secrets:
+      FX_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.FX_GOOGLE_OAUTH_CLIENT_SECRET }}
     with:
       evidence-retention-days: 90
 
@@ -185,6 +189,8 @@ jobs:
           version: "0.17.1"
 
       - name: Build
+        env:
+          FX_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.FX_GOOGLE_OAUTH_CLIENT_SECRET }}
         run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos
 
       - name: Sign and notarize
@@ -227,6 +233,8 @@ jobs:
       actions: read
       contents: read
     uses: ./.github/workflows/pgso-macos-arm64.yml
+    secrets:
+      FX_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.FX_GOOGLE_OAUTH_CLIENT_SECRET }}
     with:
       # Keep release evidence long enough to serve as the main control for
       # manual PGSO comparisons.

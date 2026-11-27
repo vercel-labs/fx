@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const browser_callback = @import("browser_callback.zig");
 const credentials = @import("credentials.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -44,10 +45,11 @@ pub const http_date_len: usize = 29;
 
 const placeholder_client_id = "GOOGLE_DESKTOP_CLIENT_ID_PLACEHOLDER";
 const placeholder_client_secret = "GOOGLE_DESKTOP_CLIENT_SECRET_PLACEHOLDER";
-// fx's Desktop app client in the `fx-cli` Google Cloud project. Google treats a
-// Desktop client secret as not confidential. Forks must register their own client.
+// fx's Desktop app client in the `fx-cli` Google Cloud project. Forks must
+// register their own client. The secret comes from the build (build.zig
+// `readGoogleOAuthClientSecret`) and is empty in builds without it.
 const fx_desktop_client_id = "4117256784-doof8aerdr54fofhim6jcsajalvrp9gf.apps.googleusercontent.com";
-const fx_desktop_client_secret = placeholder_client_secret;
+const fx_desktop_client_secret = build_options.google_oauth_client_secret;
 // Unit tests keep the placeholder so that no test can reach Google with fx's client.
 pub const client_id = if (builtin.is_test) placeholder_client_id else fx_desktop_client_id;
 pub const client_secret = if (builtin.is_test) placeholder_client_secret else fx_desktop_client_secret;
