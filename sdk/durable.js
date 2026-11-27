@@ -212,6 +212,7 @@ export function memory({ maxDurationMs, reserveMs } = {}) {
 }
 
 // setTimeout runs a longer delay at once, which would cut off each step as it starts.
+// The other copy is maxTimerDelayMs in sdk/durable/world.mjs; change both together.
 const maxTimerDelayMs = 2 ** 31 - 1;
 
 function checkDurations(name, { maxDurationMs, reserveMs }) {

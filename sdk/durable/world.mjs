@@ -6,6 +6,7 @@ const durabilityTag = Symbol.for("libfx.durability");
 
 // setTimeout and setInterval run a longer delay at once. This module imports
 // nothing from libfx, so it keeps its own copy of the limit.
+// The other copy is maxTimerDelayMs in sdk/durable.js; change both together.
 const maxTimerDelayMs = 2 ** 31 - 1;
 
 /**
