@@ -7,14 +7,14 @@
 //! writes took the due records, and when to let them go
 //! (`tests/e2e/gateway-stream-lifecycle.test.ts`, "a compaction commit while
 //! a subagent finishes lists each record once";
-//! `tests/tla/drivers/session/write.test.ts`). Only those tests set the
+//! `tests/tla/drivers/session/write.test.ts`). Only tests set the
 //! controls, so the libfx artifacts leave them out.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
+const hold_marker = @import("../shared/hold_marker.zig");
 
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 const max_hold_ms = 60_000;
 
 var holds = std.atomic.Value(u32).init(0);
@@ -51,21 +51,11 @@ pub fn holdDueRecords(count: usize) void {
     const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ release, n }) catch return;
     var count_buf: [32]u8 = undefined;
     const contents = std.mem.print(&count_buf, "records_due count={d}", .{count}) catch return;
-    writeMarker(marker, contents) catch return;
+    hold_marker.write(marker, contents) catch return;
     const deadline = io_mod.milliTimestamp() + max_hold_ms;
     while (!pathExists(release) and !pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
         io_mod.sleep(std.time.ns_per_ms);
     }
-}
-
-fn writeMarker(path: []const u8, contents: []const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{
-        .truncate = true,
-        .permissions = private_file_permissions,
-    });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), contents);
-    try file.sync(io_mod.getIo());
 }
 
 fn pathExists(path: []const u8) bool {

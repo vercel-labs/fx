@@ -402,6 +402,29 @@ pub const ModelOverrideResolver = struct {
     }
 };
 
+/// Checks a subagent's waiting call as if the parent made it, under the
+/// parent's own permission mode, rules, grants, reviewer and prompter.
+/// Null means allowed; otherwise the reason it was refused, owned by `arena`.
+pub const ApprovalCheck = struct {
+    context: *anyopaque,
+    check_fn: *const fn (*anyopaque, Allocator, types.ToolCall) anyerror!?[]const u8,
+};
+
+/// What a child reads when main's own check could not be made (R4.2).
+const unchecked_approval_feedback = "fx could not check this request against your parent's permissions, so it was refused.";
+
+/// What a subagent reads when its parent stopped it before answering.
+const stopped_approval_feedback = "Your parent stopped you before answering this request. Do not retry it.";
+
+/// What a subagent reads when its parent closed it before answering.
+const parent_closed_approval_feedback = "Your parent closed you before answering this request. Do not retry it.";
+
+/// What a subagent reads when the person closed it before its request was answered.
+const user_closed_approval_feedback = "The person closed you before this request was answered. Do not retry it.";
+
+/// What a child reads when fx ask refuses a request main left unanswered.
+const unanswered_approval_feedback = "Your parent ended its turn without answering, so this request was refused.";
+
 pub const ExecuteOptions = struct {
     observer: ?*execution_observation.Observer = null,
     caller_id: []const u8,
@@ -420,6 +443,8 @@ pub const ExecuteOptions = struct {
     /// The caller's turn so far, oldest first, ending with the reply that
     /// made this call. `wait` reads it for a user message with no answer.
     turn_messages: []const types.ChatMessage = &.{},
+    /// Checks a subagent's waiting call as the caller's own, for `approve`.
+    approval_check: ?ApprovalCheck = null,
     progress: ?ProgressSink = null,
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?ModelOverrideResolver = null,
@@ -652,6 +677,7 @@ pub const Runtime = struct {
         self.managed.on_end = .{ .context = self, .end_fn = workEnded };
         self.managed.authority_resolver = &self.authority_resolver;
         self.managed.approvals = &self.approvals;
+        self.managed.approval_note = .{ .context = self, .note_fn = noteApprovalHook };
     }
 
     /// Opens child `child_id`'s session for its own agent to hold, as main
@@ -894,6 +920,14 @@ pub const Runtime = struct {
             .close => {
                 if (!from_root) return self.refuse(alloc, .{ .caller_unavailable = .not_owner });
                 return self.closeNamed(alloc, request.close.agent);
+            },
+            .approve => {
+                if (!from_root) return self.refuse(alloc, .{ .caller_unavailable = .not_owner });
+                return self.answerApproval(alloc, request.approve.agent, .once, null, options.approval_check);
+            },
+            .deny => {
+                if (!from_root) return self.refuse(alloc, .{ .caller_unavailable = .not_owner });
+                return self.answerApproval(alloc, request.deny.agent, .deny, request.deny.message, null);
             },
             .message => {},
         }
@@ -1267,8 +1301,8 @@ pub const Runtime = struct {
         return worker.waitForPostOrNudge();
     }
 
-    pub const TreeWake = enum { mail, quiet, stopped };
-    const cancel_poll: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
+    pub const TreeWake = enum { mail, quiet, stopped, approvals_unanswered };
+    pub const cancel_poll: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
 
     /// For a runtime that finishes only once its tree is quiet, as `fx ask`
     /// does: blocks until mail is queued for `worker`, nothing in this host
@@ -1277,14 +1311,30 @@ pub const Runtime = struct {
     /// behind.
     /// A set `cancel` stops it too. It is rechecked every `cancel_poll`, so
     /// a signal handler may set it without waking anything.
-    pub fn awaitMailOrQuiet(self: *Runtime, worker: *worker_runtime.WorkerRuntime, cancel: ?*const std.atomic.Value(bool)) TreeWake {
+    /// `refuse_unanswered` is fx ask's: when the only work left is approval
+    /// requests main had in its turn and left unanswered, it returns
+    /// `.approvals_unanswered` so the caller can refuse them
+    /// (`tests/tla/subagent/ParentApproval.tla` `Fallback`). ACP passes false,
+    /// since a person can still answer there.
+    pub fn awaitMailOrQuiet(
+        self: *Runtime,
+        worker: *worker_runtime.WorkerRuntime,
+        cancel: ?*const std.atomic.Value(bool),
+        refuse_unanswered: bool,
+    ) TreeWake {
         self.setWaiter(worker);
         defer self.setWaiter(null);
         while (true) {
             if (cancel) |flag| if (flag.load(.seq_cst)) return .stopped;
             if (worker.queuedPromptCount() > 0) return .mail;
             if (!self.anyWorking()) return .quiet;
-            const wake = if (cancel != null)
+            // The registry check is cheap and the phase read loads the state
+            // store, so the cheap one decides first.
+            if (refuse_unanswered and self.approvals.allPendingNoted(self.root_id) and self.onlyApprovalWaits()) return .approvals_unanswered;
+            // With the fallback on, the timed wait is the wake: the mark after
+            // `PostNote` wakes nobody, and each re-check finds it
+            // (`ParentApproval.tla` `Wake`).
+            const wake = if (cancel != null or refuse_unanswered)
                 worker.waitForPostOrNudgeTimeout(cancel_poll) orelse continue
             else
                 worker.waitForPostOrNudge();
@@ -1294,6 +1344,37 @@ pub const Runtime = struct {
                 .stopped => return .stopped,
             }
         }
+    }
+
+    /// Whether every child that still works waits on an approval the registry
+    /// holds: its turn does not run, and no message waits for it. Refusing
+    /// those requests then leaves nothing here running.
+    fn onlyApprovalWaits(self: *Runtime) bool {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        if (self.pending.items.len > 0 or self.busy.items.len == 0) return false;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = self.managed.state_store.load(arena.allocator()) catch |err| {
+            debug_trace.logf("mailbox", "approval wait check failed err={s}", .{@errorName(err)});
+            return false;
+        };
+        for (self.busy.items) |id| {
+            const child = registry.findById(id) orelse return false;
+            if (child.phase != .awaiting_approval) return false;
+        }
+        return true;
+    }
+
+    /// fx ask's fallback: refuses every approval request main's turn left
+    /// unanswered, with the reason the subagents read, and returns how many.
+    /// Logged so none is dropped silently (RULES.md R3.8).
+    pub fn refuseUnansweredApprovals(self: *Runtime) usize {
+        const counts = self.approvals.refuseNoted(self.root_id, unanswered_approval_feedback);
+        debug_trace.eventf("mailbox", "approvals_refused_unanswered", .{}, "owner={s} refused={d} gone={d}", .{ self.ownerName(), counts.accepted, counts.gone });
+        return counts.accepted + counts.gone;
     }
 
     /// How trace lines name this host's owner: `main` for a root host, as the
@@ -2634,6 +2715,13 @@ pub const Runtime = struct {
             const child = registry.findPersistent(agent) orelse break :blk null;
             break :blk try a.dupe(u8, child.id);
         } orelse return self.refuseNotOpen(alloc, agent);
+        // Refuse the request the child waits on before the stop takes
+        // admission: the stopper holds admission and the owner's mutex while it
+        // waits for the child's worker, and `refuseChild` takes neither (it
+        // releases the registry mutex before it answers the worker), so the
+        // note path's worker -> registry order and this registry -> owner ->
+        // worker order cannot cycle (the E1 rule).
+        _ = self.approvals.refuseChild(child_id, stopped_approval_feedback);
         const dropped, const stopped = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
@@ -2659,6 +2747,130 @@ pub const Runtime = struct {
             try a.print("Stopped {s}: its turn ended{s}{s}.", .{ agent, if (dropped > 0) ", and " else "", dropped_text })
         else
             try a.print("{s} was not working{s}{s}.", .{ agent, if (dropped > 0) "; " else "", dropped_text });
+        return self.encodeManaged(alloc, .{ .ok = true, .result = text });
+    }
+
+    /// `approve` and `deny`: answers the one approval request `agent` waits
+    /// on. `approve` carries the parent's own authority (RULES.md R4.1,
+    /// R4.3): the subagent's exact call is checked as if the parent made it,
+    /// and a check that refuses, fails, or cannot be made refuses the request
+    /// (R4.2). `deny` only refuses, so it needs no check. The request is
+    /// allowed once, or refused with the reason the child reads.
+    fn answerApproval(
+        self: *Runtime,
+        alloc: Allocator,
+        agent: []const u8,
+        decision: types.ToolPermissionDecision,
+        feedback: ?[]const u8,
+        approval_check: ?ApprovalCheck,
+    ) !ManagedExecutionResult {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const child_id = blk: {
+            var lock = self.managed.state_store.acquireLock();
+            defer lock.release();
+            var registry = try self.managed.state_store.load(a);
+            const child = registry.findPersistent(agent) orelse break :blk null;
+            break :blk try a.dupe(u8, child.id);
+        } orelse return self.refuseNotOpen(alloc, agent);
+        var pending = (try self.approvals.firstPendingForChild(a, child_id)) orelse
+            return self.encodeManaged(alloc, .{
+                .ok = true,
+                .result = try a.print("{s} has no approval request waiting.", .{agent}),
+            });
+        defer pending.deinit(a);
+        const label = pending.request.view().label;
+        // No lock is held here: the check can wait for the user or the
+        // reviewer. The request can end meanwhile, which `resolve` reports.
+        var unchecked = approval_check == null;
+        var denial: ?[]const u8 = null;
+        if (decision != .deny) {
+            if (approval_check) |check| {
+                denial = check.check_fn(check.context, a, pending.call) catch |err| blk: {
+                    debug_trace.logf("subagent", "approval check failed agent={s} err={s}", .{ agent, @errorName(err) });
+                    unchecked = true;
+                    break :blk null;
+                };
+            }
+        }
+        if (decision != .deny and (unchecked or denial != null)) {
+            const reason = denial orelse unchecked_approval_feedback;
+            const resolution = self.approvals.resolve(
+                pending.request_id,
+                pending.child_id,
+                .deny,
+                reason,
+                io_mod.milliTimestamp(),
+            ) catch |err| switch (err) {
+                // The request ended while the check ran: its worker is gone, so
+                // the answer has nowhere to go, and the parent must not read
+                // otherwise.
+                error.RequestNotFound => {
+                    debug_trace.eventf("subagent", "approval_answer_dropped", .{}, "agent={s} reason=request_ended", .{agent});
+                    return self.encodeManaged(alloc, .{
+                        .ok = true,
+                        .result = try a.print("{s}'s request: {s} is no longer waiting.", .{ agent, label }),
+                    });
+                },
+                else => |other| {
+                    debug_trace.logf("subagent", "approval answer failed agent={s} err={s}", .{ agent, @errorName(other) });
+                    return self.encodeManaged(alloc, .{
+                        .ok = false,
+                        .error_code = "approval_not_answered",
+                        .result = try a.print("fx could not answer {s}'s approval request: {s}. Call status, then try again.", .{ agent, @errorName(other) }),
+                    });
+                },
+            };
+            if (resolution == .rejected) {
+                debug_trace.eventf("subagent", "approval_answer_dropped", .{}, "agent={s} reason=worker_gone", .{agent});
+                return self.encodeManaged(alloc, .{
+                    .ok = true,
+                    .result = try a.print("{s}'s request: {s} is no longer waiting.", .{ agent, label }),
+                });
+            }
+            const text = if (denial) |why|
+                try a.print("Refused {s}'s request: {s}. Your permissions did not allow it: {s}", .{ agent, label, why })
+            else
+                try a.print("Refused {s}'s request: {s}. fx cannot check it against your permissions here.", .{ agent, label });
+            return self.encodeManaged(alloc, .{ .ok = true, .result = text });
+        }
+        const resolution = self.approvals.resolve(
+            pending.request_id,
+            pending.child_id,
+            decision,
+            feedback,
+            io_mod.milliTimestamp(),
+        ) catch |err| switch (err) {
+            // The request ended before this answer: the child already stopped
+            // waiting, and the parent must not read otherwise.
+            error.RequestNotFound => {
+                debug_trace.eventf("subagent", "approval_answer_dropped", .{}, "agent={s} reason=request_ended", .{agent});
+                return self.encodeManaged(alloc, .{
+                    .ok = true,
+                    .result = try a.print("{s}'s request: {s} is no longer waiting.", .{ agent, label }),
+                });
+            },
+            else => |other| {
+                debug_trace.logf("subagent", "approval answer failed agent={s} err={s}", .{ agent, @errorName(other) });
+                return self.encodeManaged(alloc, .{
+                    .ok = false,
+                    .error_code = "approval_not_answered",
+                    .result = try a.print("fx could not answer {s}'s approval request: {s}. Call status, then try again.", .{ agent, @errorName(other) }),
+                });
+            },
+        };
+        if (resolution == .rejected) {
+            debug_trace.eventf("subagent", "approval_answer_dropped", .{}, "agent={s} reason=worker_gone", .{agent});
+            return self.encodeManaged(alloc, .{
+                .ok = true,
+                .result = try a.print("{s}'s request: {s} is no longer waiting.", .{ agent, label }),
+            });
+        }
+        const text = if (decision == .deny)
+            try a.print("Refused {s}'s request: {s}.", .{ agent, label })
+        else
+            try a.print("Allowed {s}'s request: {s}.", .{ agent, label });
         return self.encodeManaged(alloc, .{ .ok = true, .result = text });
     }
 
@@ -2699,6 +2911,10 @@ pub const Runtime = struct {
             @memcpy(name_buf[0..value.len], value);
             break :blk name_buf[0..value.len];
         };
+        // As a stop does, refuse the request this child waits on before the
+        // close takes admission, so the call is refused with the reason and
+        // nothing runs. `refuseChild` holds no lock across its wait (see it).
+        _ = self.approvals.refuseChild(child_id, if (by == .user) user_closed_approval_feedback else parent_closed_approval_feedback);
         const result: Closed, const settle_now = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
@@ -2988,6 +3204,45 @@ pub const Runtime = struct {
             debug_trace.logf("mailbox", "waiting note lost child={s} err={s}", .{ child_id, @errorName(err) });
     }
 
+    /// The person answered `child_id`'s request on its own screen, so its
+    /// registry binding goes with it: main's later answer finds nothing and
+    /// reads that the request is no longer waiting
+    /// (`tests/tla/subagent/TuiParentApproval.tla` AnswerOnce).
+    pub fn withdrawAnsweredApproval(self: *Runtime, child_id: []const u8) usize {
+        return self.approvals.withdrawChild(child_id);
+    }
+
+    /// Tells the owner, as child `child_id`'s own message, that it waits on
+    /// the owner's approval for `label`, so a parent that would otherwise
+    /// wait hears of it. A note for a child that is closing or gone, or one
+    /// the parent's queue refuses, is dropped with a trace line.
+    /// Returns whether the note was posted: false means the parent was not
+    /// told, and the request is refused at once by its observer.
+    pub fn noteChildApproval(self: *Runtime, child_id: []const u8, name: []const u8, label: []const u8) bool {
+        if (!self.childListed(child_id)) {
+            debug_trace.eventf("mailbox", "approval_note_dropped", .{}, "child={s} reason=closed", .{child_id});
+            return false;
+        }
+        const sink = self.report_sink orelse {
+            debug_trace.eventf("mailbox", "approval_note_dropped", .{}, "child={s} reason=no_parent", .{child_id});
+            return false;
+        };
+        var stored: [live_metrics.max_label_bytes]u8 = undefined;
+        const action = stored[0..live_metrics.storeLabel(&stored, label)];
+        var buffer: [live_metrics.max_label_bytes + 384]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        writer.print("fx: I wait for your approval to run: {s}. Answer with the subagent tool, action \"approve\" or \"deny\" and agent \"{s}\"; deny's message tells me why. Ask the user first only when the action is risky or you cannot judge it.", .{ action, name }) catch {
+            debug_trace.eventf("mailbox", "approval_note_dropped", .{}, "child={s} reason=too_long", .{child_id});
+            return false;
+        };
+        sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = writer.buffered() } }) catch |err| {
+            debug_trace.eventf("mailbox", "approval_note_dropped", .{}, "child={s} reason={s}", .{ child_id, @errorName(err) });
+            return false;
+        };
+        debug_trace.eventf("mailbox", "approval_note_posted", .{}, "child={s}", .{child_id});
+        return true;
+    }
+
     /// Tells the owner, as child `child_id`'s own message, that a shell
     /// command of its running turn crossed the quiet limit, once for each
     /// quiet spell, so a parent that waits on it hears of a command that may
@@ -3008,6 +3263,26 @@ pub const Runtime = struct {
         sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = writer.buffered() } }) catch |err|
             return debug_trace.eventf("mailbox", "quiet_note_dropped", .{}, "child={s} reason={s} quiet_ms={d}", .{ child_id, @errorName(err), crossing.quiet_ms });
         debug_trace.eventf("mailbox", "quiet_note_posted", .{}, "child={s} quiet_ms={d}", .{ child_id, crossing.quiet_ms });
+    }
+
+    /// Whether `child_id` is still one of this host's children, read from the
+    /// state store alone. A note is posted under the child's worker mutex,
+    /// which a parent's stop or close waits for while it holds
+    /// `admission_mutex`, so the note cannot use `childOpen`: taking that
+    /// mutex there would deadlock the two (E1 lock map). A child that is
+    /// closing but still listed lets its one note through, as a child's own
+    /// message does; the slot's end settles it.
+    fn childListed(self: *Runtime, child_id: []const u8) bool {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        const registry = self.managed.state_store.load(arena.allocator()) catch |err| {
+            debug_trace.logf("mailbox", "approval note check failed child={s} err={s}", .{ child_id, @errorName(err) });
+            return false;
+        };
+        for (registry.children) |child| if (std.mem.eql(u8, child.id, child_id)) return true;
+        return false;
     }
 
     /// Whether `child_id` is one of this host's children and not closing.
@@ -3142,6 +3417,7 @@ pub const Runtime = struct {
             },
             .authority_resolver = &self.authority_resolver,
             .approvals = &self.approvals,
+            .approval_note = .{ .context = self, .note_fn = noteApprovalHook },
         };
     }
 
@@ -3315,7 +3591,7 @@ pub const Runtime = struct {
         );
         defer active.deinit(alloc);
         switch (request) {
-            .wait, .status, .stop, .close => unreachable,
+            .wait, .status, .stop, .close, .approve, .deny => unreachable,
             .message => |message| {
                 if (registry.findPersistent(message.agent)) |child| {
                     // Closing, it takes nothing; once gone, the name starts a new one.
@@ -3762,13 +4038,13 @@ fn callToolResult(runtime: *Runtime, arena: Allocator, input: model_contract.Req
 /// while its subagents keep working (`WorkerRuntime.requestYield`).
 fn nudgedWaitResult(restarting: bool) []const u8 {
     return if (restarting)
-        "fx is restarting for an upgrade, so this wait ends here. The subagents keep working, and their reports arrive after the restart."
+        "fx may restart for an upgrade, so this wait ends here. The subagents keep working, and their reports still arrive."
     else
         "A subagent's turn ended without a report. Call status to see where things stand, or wait again.";
 }
 
-test "a wait that the upgrade's restart ends says the reports come after it" {
-    try std.testing.expect(std.mem.find(u8, nudgedWaitResult(true), "reports arrive after the restart") != null);
+test "a wait that the upgrade's restart ends says the reports still arrive" {
+    try std.testing.expect(std.mem.find(u8, nudgedWaitResult(true), "their reports still arrive") != null);
     try std.testing.expectEqualStrings(
         "A subagent's turn ended without a report. Call status to see where things stand, or wait again.",
         nudgedWaitResult(false),
@@ -9444,15 +9720,17 @@ fn admissionFrom(
         .grants = snapshot.grants,
         .permission_state = snapshot.permission_state,
         .integration_names = snapshot.integrations,
-        .authority_generation = if (snapshot.mcp_view) |view|
-            mcp_access.authorityGeneration(view)
-        else
-            0,
         .mcp_view = snapshot.mcp_view,
     }) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.AdmissionFailed,
     };
+}
+
+/// Relays a child's approval request to its parent, for the owner's hook.
+fn noteApprovalHook(raw: *anyopaque, child_id: []const u8, name: []const u8, label: []const u8) bool {
+    const self: *Runtime = @ptrCast(@alignCast(raw));
+    return self.noteChildApproval(child_id, name, label);
 }
 
 fn bindChild(
@@ -11626,4 +11904,504 @@ test "every message main sends has one account in every window of a subagent's s
     }
     if (broken > 0) std.debug.print("\nTABLE {d} of {d} cells break the rule or could not be driven\n", .{ broken, cells });
     try std.testing.expectEqual(@as(usize, 0), broken);
+}
+
+/// The worker route of a subagent waiting on an approval. It records the
+/// answer it accepts, as the child's worker would deliver it.
+const ApprovalWorker = struct {
+    decision: ?types.ToolPermissionDecision = null,
+    feedback_buf: [256]u8 = undefined,
+    feedback_len: usize = 0,
+    released: usize = 0,
+
+    fn route(self: *ApprovalWorker) approval_registry.WorkerRoute {
+        return .{
+            .context = self,
+            .submit_fn = submit,
+            .cancel_fn = cancel,
+            .pin_fn = pin,
+            .release_fn = release,
+        };
+    }
+
+    fn submit(
+        raw: *anyopaque,
+        _: u64,
+        response: permission_request.OwnedPermissionResponse,
+        _: ?worker_runtime.WorkerRuntime.PermissionCommit,
+    ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+        const self: *ApprovalWorker = @ptrCast(@alignCast(raw));
+        var owned = response;
+        defer owned.deinit();
+        self.decision = owned.decision;
+        self.feedback_len = 0;
+        if (owned.feedback) |feedback| {
+            const length = @min(feedback.len, self.feedback_buf.len);
+            @memcpy(self.feedback_buf[0..length], feedback[0..length]);
+            self.feedback_len = length;
+        }
+        return .accepted;
+    }
+
+    fn cancel(_: *anyopaque) void {}
+
+    fn pin(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn release(raw: *anyopaque) void {
+        const self: *ApprovalWorker = @ptrCast(@alignCast(raw));
+        self.released += 1;
+    }
+
+    fn feedbackText(self: *const ApprovalWorker) []const u8 {
+        return self.feedback_buf[0..self.feedback_len];
+    }
+};
+
+/// A host whose store holds an open, idle subagent named reviewer, so an
+/// approval can be registered against it as its turn would.
+const ApprovalFixture = struct {
+    arena_state: std.heap.ArenaAllocator,
+    parent: child_state.TestParent,
+    mailbox: MailboxFixture,
+    worker: ApprovalWorker,
+    runtime: *Runtime,
+
+    fn init(self: *ApprovalFixture) !void {
+        const alloc = std.testing.allocator;
+        self.mailbox = .{};
+        self.worker = .{};
+        self.arena_state = std.heap.ArenaAllocator.init(alloc);
+        errdefer self.arena_state.deinit();
+        try self.parent.init(alloc);
+        errdefer self.parent.deinit();
+        var registry = try child_state.Registry.init(alloc, self.parent.parent.id());
+        defer registry.deinit(alloc);
+        try registry.appendPersistent(alloc, "child-1", "reviewer", "", .{ .id = @constCast("work-1"), .message = @constCast("old task"), .created_at_ms = 1 });
+        try registry.finish(alloc, "child-1", "work-1", .completed, null);
+        try self.parent.stateStore().save(alloc, registry);
+        self.runtime = try mailboxRuntime(alloc, &self.mailbox, &self.parent);
+    }
+
+    fn deinit(self: *ApprovalFixture) void {
+        self.runtime.deinit();
+        self.mailbox.deinit();
+        self.parent.deinit();
+        self.arena_state.deinit();
+    }
+
+    fn arena(self: *ApprovalFixture) Allocator {
+        return self.arena_state.allocator();
+    }
+
+    /// Registers the request reviewer waits on, as its turn does when a tool
+    /// call needs approval.
+    fn register(self: *ApprovalFixture, label: []const u8) !void {
+        try self.runtime.approvals.registerTool(
+            "approval-1",
+            "child-1",
+            self.runtime.root_id,
+            "work-1",
+            .{ .id = 7, .label = label },
+            .{ .id = "call-1", .name = "write_file", .arguments_json = "{\"path\":\"parent-approved.txt\"}" },
+            &.{},
+            self.worker.route(),
+            7,
+        );
+    }
+};
+
+test "approve allows the request a subagent waits on, once" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+    var check = FakeApprovalCheck{ .expected_name = "write_file", .expected_arguments = "{\"path\":\"parent-approved.txt\"}" };
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, check.hook());
+    try expectAnswerHas(result.body, "Allowed reviewer's request: run touch marker.");
+    try std.testing.expect(check.saw_call);
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .once), t.worker.decision);
+    try std.testing.expectEqualStrings("", t.worker.feedbackText());
+    try std.testing.expectEqual(@as(usize, 1), t.worker.released);
+
+    // The answer was the one request it had; a second call finds none.
+    const again = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, check.hook());
+    try expectAnswerHas(again.body, "reviewer has no approval request waiting.");
+}
+
+test "deny refuses the request a subagent waits on and passes its reason" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .deny, "not now", null);
+    try expectAnswerHas(result.body, "Refused reviewer's request: run touch marker.");
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), t.worker.decision);
+    try std.testing.expectEqualStrings("not now", t.worker.feedbackText());
+    try std.testing.expectEqual(@as(usize, 1), t.worker.released);
+}
+
+test "a subagent with nothing waiting is told so, and an unknown one is refused" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, null);
+    try expectAnswerHas(result.body, "reviewer has no approval request waiting.");
+    try std.testing.expect(t.worker.decision == null);
+
+    const unknown = try t.runtime.answerApproval(t.arena(), "ghost", .once, null, null);
+    try std.testing.expect(!unknown.success);
+    try std.testing.expect(std.mem.find(u8, unknown.body, "child_unavailable") != null);
+}
+
+test "approve runs the parent's own check, and its allow lets the request run" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+    var check = FakeApprovalCheck{ .expected_name = "write_file", .expected_arguments = "{\"path\":\"parent-approved.txt\"}" };
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, check.hook());
+    try expectAnswerHas(result.body, "Allowed reviewer's request: run touch marker.");
+    // The check saw the exact call the subagent registered, not the label.
+    try std.testing.expect(check.saw_call);
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .once), t.worker.decision);
+    try std.testing.expectEqualStrings("", t.worker.feedbackText());
+}
+
+test "approve refuses the request when the parent's own check refuses it" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+    var check = FakeApprovalCheck{
+        .expected_name = "write_file",
+        .expected_arguments = "{\"path\":\"parent-approved.txt\"}",
+        .verdict = "the safety review held it",
+    };
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, check.hook());
+    try std.testing.expect(check.saw_call);
+    try expectAnswerHas(result.body, "Your permissions did not allow it");
+    try expectAnswerHas(result.body, "the safety review held it");
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), t.worker.decision);
+    try std.testing.expectEqualStrings("the safety review held it", t.worker.feedbackText());
+}
+
+test "approve with no way to check refuses the request" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, null);
+    try expectAnswerHas(result.body, "fx cannot check it against your permissions here");
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), t.worker.decision);
+    try expectAnswerHas(t.worker.feedbackText(), "could not check this request against your parent's permissions");
+}
+
+test "a failing check refuses the request" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+    var check = FakeApprovalCheck{
+        .expected_name = "write_file",
+        .expected_arguments = "{\"path\":\"parent-approved.txt\"}",
+        .fail = true,
+    };
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, check.hook());
+    try std.testing.expect(check.saw_call);
+    try expectAnswerHas(result.body, "fx cannot check it against your permissions here");
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), t.worker.decision);
+    try expectAnswerHas(t.worker.feedbackText(), "could not check this request against your parent's permissions");
+}
+
+/// A stand-in for main's own permission check: it records whether it was
+/// given the registered call, then allows, refuses with a reason, or fails.
+const FakeApprovalCheck = struct {
+    expected_name: []const u8,
+    expected_arguments: []const u8,
+    verdict: ?[]const u8 = null,
+    fail: bool = false,
+    saw_call: bool = false,
+
+    fn check(raw: *anyopaque, _: Allocator, call: types.ToolCall) anyerror!?[]const u8 {
+        const self: *FakeApprovalCheck = @ptrCast(@alignCast(raw));
+        self.saw_call = std.mem.eql(u8, call.name, self.expected_name) and
+            std.mem.eql(u8, call.arguments_json, self.expected_arguments);
+        if (self.fail) return error.ReviewUnavailable;
+        return self.verdict;
+    }
+
+    fn hook(self: *FakeApprovalCheck) ApprovalCheck {
+        return .{ .context = self, .check_fn = check };
+    }
+};
+
+test "a note tells the parent that a subagent waits on its approval" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    const Capture = struct {
+        posts: usize = 0,
+        text: ?[]u8 = null,
+
+        fn post(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            switch (delivery) {
+                .report => return,
+                .message => |message| {
+                    self.posts += 1;
+                    if (self.text) |old| std.testing.allocator.free(old);
+                    self.text = try std.testing.allocator.dupe(u8, message.text);
+                },
+            }
+        }
+
+        fn deinit(self: *@This()) void {
+            if (self.text) |text| std.testing.allocator.free(text);
+        }
+    };
+    var capture: Capture = .{};
+    defer capture.deinit();
+    t.runtime.report_sink = .{ .context = &capture, .post_fn = Capture.post };
+
+    // A child this host does not have posts nothing.
+    try std.testing.expect(!t.runtime.noteChildApproval("no-such-child", "ghost", "run touch marker"));
+    try std.testing.expectEqual(@as(usize, 0), capture.posts);
+
+    try std.testing.expect(t.runtime.noteChildApproval("child-1", "reviewer", "run touch marker"));
+    try std.testing.expectEqual(@as(usize, 1), capture.posts);
+    try expectAnswerHas(capture.text.?, "I wait for your approval to run: run touch marker");
+    try expectAnswerHas(capture.text.?, "agent \"reviewer\"");
+}
+
+test "a note with no parent to post to reports false" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    t.runtime.report_sink = null;
+
+    // The observer refuses the request at once on false, so this must not be
+    // mistaken for a note nobody had to receive.
+    try std.testing.expect(!t.runtime.noteChildApproval("child-1", "reviewer", "run touch marker"));
+}
+
+test "the waiting loop answers the fallback after a request is marked noted" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    const alloc = std.testing.allocator;
+    try t.register("run touch marker");
+    // The child waits on the approval, and the host sees it working.
+    try t.runtime.busy.append(alloc, try alloc.dupe(u8, "child-1"));
+    var children = try t.runtime.managed.state_store.load(t.arena());
+    const child = children.findById("child-1") orelse return error.TestUnexpectedResult;
+    child.phase = .awaiting_approval;
+    try t.runtime.managed.state_store.save(t.arena(), children);
+    // A registered request whose note has not gone out is not the fallback's.
+    try std.testing.expect(!t.runtime.approvals.allPendingNoted(t.runtime.root_id));
+
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var cancel = std.atomic.Value(bool).init(false);
+    var result: ?Runtime.TreeWake = null;
+    var done: std.Io.Event = .unset;
+    const Runner = struct {
+        fn run(rt: *Runtime, w: *worker_runtime.WorkerRuntime, c: *std.atomic.Value(bool), out: *?Runtime.TreeWake, event: *std.Io.Event) void {
+            out.* = rt.awaitMailOrQuiet(w, c, true);
+            event.set(io_mod.getIo());
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ t.runtime, &worker, &cancel, &result, &done });
+    defer {
+        cancel.store(true, .seq_cst);
+        thread.join();
+    }
+    // The note is marked while the loop waits. Its `cancel_poll` re-check is
+    // the wake (`awaitMailOrQuiet`), so no nudge is needed.
+    t.runtime.approvals.markNoted("approval-1");
+    done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } }) catch return error.Timeout;
+    try std.testing.expectEqual(@as(?Runtime.TreeWake, .approvals_unanswered), result);
+}
+
+/// Holds a parent's stop inside its admission section, so a test can prove the
+/// approval note never waits for that mutex.
+const AdmissionHold = struct {
+    var held: std.Io.Event = .unset;
+    var go: std.Io.Event = .unset;
+
+    fn inStop(_: []const u8) void {
+        held.set(io_mod.getIo());
+        go.waitUncancelable(io_mod.getIo());
+    }
+
+    fn arm() void {
+        held = .unset;
+        go = .unset;
+        end_test_controls.test_hold_stop = inStop;
+    }
+
+    fn clear() void {
+        end_test_controls.test_hold_stop = null;
+    }
+
+    fn release() void {
+        go.set(io_mod.getIo());
+    }
+
+    fn waitHeld() !void {
+        held.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } }) catch return error.Timeout;
+    }
+};
+
+test "an approval note posts while a stop holds admission, and never waits for it" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    const Notes = struct {
+        posts: usize = 0,
+
+        fn post(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            switch (delivery) {
+                .report => return,
+                .message => self.posts += 1,
+            }
+        }
+    };
+    var notes: Notes = .{};
+    t.runtime.report_sink = .{ .context = &notes, .post_fn = Notes.post };
+
+    AdmissionHold.arm();
+    defer AdmissionHold.clear();
+    // The stop takes `admission_mutex` and keeps it until `release`.
+    const Stop = struct {
+        fn run(rt: *Runtime, arena: Allocator, done: *std.Io.Event) void {
+            // The stop's own answer is not what this test reads: it holds
+            // admission while the note is posted.
+            _ = rt.stopChild(arena, "reviewer") catch {};
+            done.set(io_mod.getIo());
+        }
+    };
+    var stop_done: std.Io.Event = .unset;
+    const stop_thread = try std.Thread.spawn(.{}, Stop.run, .{ t.runtime, t.arena(), &stop_done });
+    AdmissionHold.waitHeld() catch {
+        AdmissionHold.release();
+        stop_thread.join();
+        return error.TestUnexpectedResult;
+    };
+
+    // The note runs on its own thread, as it does inside a child's observation,
+    // which holds that child's worker mutex.
+    const Note = struct {
+        fn run(rt: *Runtime, out: *?bool, done: *std.Io.Event) void {
+            out.* = rt.noteChildApproval("child-1", "reviewer", "run touch marker");
+            done.set(io_mod.getIo());
+        }
+    };
+    var noted: ?bool = null;
+    var note_done: std.Io.Event = .unset;
+    const note_thread = try std.Thread.spawn(.{}, Note.run, .{ t.runtime, &noted, &note_done });
+    note_done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } }) catch {
+        // The note waited for the stop's admission mutex: the stop would now
+        // wait for the worker the note runs under.
+        AdmissionHold.release();
+        stop_thread.join();
+        note_thread.join();
+        return error.TestUnexpectedResult;
+    };
+    AdmissionHold.release();
+    stop_thread.join();
+    note_thread.join();
+    try std.testing.expectEqual(true, noted.?);
+    try std.testing.expectEqual(@as(usize, 1), notes.posts);
+}
+
+test "an answer whose request ends during the check says it is no longer waiting" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+    // The request ends while main's check runs, as a stop of that child ends it.
+    const Check = struct {
+        approvals: *approval_registry.Registry,
+
+        fn check(raw: *anyopaque, _: Allocator, _: types.ToolCall) anyerror!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.approvals.withdraw("approval-1");
+            return null;
+        }
+
+        fn hook(self: *@This()) ApprovalCheck {
+            return .{ .context = self, .check_fn = check };
+        }
+    };
+    var check = Check{ .approvals = &t.runtime.approvals };
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, check.hook());
+    try expectAnswerHas(result.body, "reviewer's request: run touch marker is no longer waiting.");
+    // Nothing reached the worker: the request had already ended.
+    try std.testing.expect(t.worker.decision == null);
+}
+
+test "a stop refuses the child's waiting request once, with the reason" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+
+    const stopped = try t.runtime.stopChild(t.arena(), "reviewer");
+    // The fixture's work already ended, so the stop answers that it was not
+    // working; the refusal is what this test reads.
+    try expectAnswerHas(stopped.body, "reviewer");
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), t.worker.decision);
+    try expectAnswerHas(t.worker.feedbackText(), "Your parent stopped you before answering this request");
+    try std.testing.expect((try t.runtime.approvals.firstPendingForChild(t.arena(), "child-1")) == null);
+
+    // A second stop finds nothing to refuse.
+    t.worker = .{};
+    _ = try t.runtime.stopChild(t.arena(), "reviewer");
+    try std.testing.expect(t.worker.decision == null);
+    try std.testing.expectEqualStrings("", t.worker.feedbackText());
+}
+
+test "a close refuses the child's waiting request with the reason of who closed it" {
+    for ([_]Runtime.CloseBy{ .parent, .user }) |by| {
+        var t: ApprovalFixture = undefined;
+        try t.init();
+        defer t.deinit();
+        try t.register("run touch marker");
+
+        // The close's own result is not what this test reads: the refusal comes first.
+        _ = t.runtime.closeChild("child-1", by) catch |err| switch (err) {
+            error.CloseNotSaved => null,
+            else => return err,
+        };
+        try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), t.worker.decision);
+        if (by == .user) {
+            try expectAnswerHas(t.worker.feedbackText(), "The person closed you before this request was answered");
+        } else {
+            try expectAnswerHas(t.worker.feedbackText(), "Your parent closed you before answering this request");
+        }
+        try std.testing.expect((try t.runtime.approvals.firstPendingForChild(t.arena(), "child-1")) == null);
+    }
+}
+
+test "a stop or close with nothing waiting refuses nothing" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+
+    _ = try t.runtime.stopChild(t.arena(), "reviewer");
+    try std.testing.expect(t.worker.decision == null);
+    // The close's own result is not what this test reads.
+    _ = try t.runtime.closeChild("child-1", .parent);
+    try std.testing.expect(t.worker.decision == null);
 }

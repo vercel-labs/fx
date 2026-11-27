@@ -8,6 +8,7 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const app_runtime_setup = @import("app_runtime_setup.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_trust_runtime = @import("app_trust_runtime.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
@@ -456,6 +457,9 @@ pub fn Runtime(comptime App: type) type {
             }
 
             app.workspace_root = startup.takeWorkspaceRoot();
+            if (comptime @hasField(App, "trust")) {
+                try app_trust_runtime.Runtime(App).begin(app);
+            }
             if (comptime @hasDecl(App, "adoptWorkspaceAccess")) {
                 app.adoptWorkspaceAccess(startup.takeWorkspaceAccess());
             }
@@ -652,6 +656,9 @@ pub fn Runtime(comptime App: type) type {
                 skill_runtime.traceDiagnostics("interactive_startup", loaded.diagnostics);
                 try app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
                 loaded = .{};
+            }
+            if (comptime @hasField(App, "trust")) {
+                try app_trust_runtime.Runtime(App).refreshFacts(app);
             }
 
             if (app.requested_resume == null) {

@@ -215,7 +215,35 @@ pub const TurnPresentationOutcome = enum {
 pub const TurnFinished = struct {
     turn_id: u64,
     outcome: TurnPresentationOutcome,
+    /// How the turn's last model reply ended, when one did. A subagent's
+    /// parent reads it to say why a failed turn failed.
+    disposition: ?ProviderCompletionDisposition = null,
 };
+
+/// Why a turn failed when its reply was cut off at the output limit, in the
+/// failure a subagent's parent sees in place of `agent_turn_failed`.
+const output_limit_failure = "output_limit: the reply was cut off at its output-token limit";
+
+/// The failure a turn that ended this way reports, when its own reason says
+/// more than that it failed.
+pub fn turnFailureFor(finished: TurnFinished) ?ModelFailureDiagnostic {
+    if (finished.outcome != .failed) return null;
+    const disposition = finished.disposition orelse return null;
+    return switch (disposition) {
+        .length_limited => ModelFailureDiagnostic.init(output_limit_failure),
+        else => null,
+    };
+}
+
+test "a turn that a cut reply failed reports the output limit" {
+    try std.testing.expectEqualStrings(
+        "output_limit: the reply was cut off at its output-token limit",
+        turnFailureFor(.{ .turn_id = 1, .outcome = .failed, .disposition = .length_limited }).?.view(),
+    );
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .completed, .disposition = .length_limited }) == null);
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .failed }) == null);
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .failed, .disposition = .completed }) == null);
+}
 
 pub const ToolLifecycleId = struct {
     turn_id: u64,
@@ -1453,9 +1481,9 @@ pub const ToolResultMemory = struct {
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
     terminal_action_presentation: ?TerminalActionPresentation = null,
-    /// Set on a running shell result whose wait ended when its command
-    /// crossed the quiet limit (`src/core/execution/quiet_notice.zig`), for
-    /// the note fx relays to a subagent's parent. Only the tool's end event
+    /// Set on a running shell result whose wait ended past the quiet limit
+    /// after seeing the command under it (`src/core/execution/quiet_notice.zig`),
+    /// for the note fx relays to a subagent's parent. Only the tool's end event
     /// reads it; the session never saves it.
     quiet_crossing: ?QuietCrossing = null,
     /// A `subagent` message that made a new subagent, so its row reads
@@ -2888,6 +2916,10 @@ pub const AssistantHistoryTurn = struct {
     assistant: []u8,
     execution: ExecutionMemory = .{},
     provider_replay: ?ProviderReplay = null,
+    /// The whole turn, when a compaction inside it cut steps out of
+    /// `execution`: the session log saves it, and resume leaves the cut steps
+    /// out again (D87). fx's history never keeps it (`dropSavedExecution`).
+    saved_execution: ?ExecutionMemory = null,
 };
 
 /// What a turn write does with the recovery module's record for the model
@@ -2939,6 +2971,8 @@ pub const InterruptedHistoryTurn = struct {
     /// (`turn_yielded`), and a later turn goes on from it. Only a session's
     /// replay sets it, and nothing saves it.
     yielded: bool = false,
+    /// As `AssistantHistoryTurn.saved_execution`.
+    saved_execution: ?ExecutionMemory = null,
 };
 
 pub const CompactedSummaryHistoryTurn = struct {
@@ -2965,8 +2999,14 @@ pub const HistoryTurn = union(enum) {
 
 pub fn setHistoryTurnSummary(turn: *HistoryTurn, summary: TurnSummary) void {
     switch (turn.*) {
-        .assistant => |*entry| entry.execution.turn_summary = summary,
-        .interrupted => |*entry| entry.execution.turn_summary = summary,
+        .assistant => |*entry| {
+            entry.execution.turn_summary = summary;
+            if (entry.saved_execution) |*whole| whole.turn_summary = summary;
+        },
+        .interrupted => |*entry| {
+            entry.execution.turn_summary = summary;
+            if (entry.saved_execution) |*whole| whole.turn_summary = summary;
+        },
         .compacted_summary => {},
     }
 }
@@ -3270,6 +3310,7 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
             alloc.free(entry.assistant);
             if (entry.provider_replay) |replay| freeProviderReplay(alloc, replay);
             freeExecutionMemory(alloc, entry.execution);
+            if (entry.saved_execution) |saved| freeExecutionMemory(alloc, saved);
         },
         .interrupted => |entry| {
             freeUserTurn(alloc, entry.user);
@@ -3277,12 +3318,44 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
             if (entry.tool_call) |tool_call| freeToolCall(alloc, tool_call);
             freeCompletedToolNames(alloc, entry.completed_tool_names);
             freeExecutionMemory(alloc, entry.execution);
+            if (entry.saved_execution) |saved| freeExecutionMemory(alloc, saved);
             if (entry.cancelled_command) |presentation| {
                 freeCancelledCommandPresentation(alloc, presentation);
             }
             if (entry.cancelled_wait) |presentation| freeCancelledWaitPresentation(alloc, presentation);
         },
     }
+}
+
+/// `turn` as the session log saves it: its whole execution in place of the
+/// part fx's history keeps, when a compaction inside it cut steps (D87).
+/// Borrows `turn`.
+pub fn savedHistoryTurn(turn: HistoryTurn) HistoryTurn {
+    var saved = turn;
+    switch (saved) {
+        .assistant => |*entry| if (entry.saved_execution) |whole| {
+            entry.execution = whole;
+            entry.saved_execution = null;
+        },
+        .interrupted => |*entry| if (entry.saved_execution) |whole| {
+            entry.execution = whole;
+            entry.saved_execution = null;
+        },
+        .compacted_summary => {},
+    }
+    return saved;
+}
+
+/// Frees `turn`'s whole execution, which only the session log saves, so fx's
+/// history keeps what the model is sent and nothing more.
+pub fn dropSavedExecution(alloc: std.mem.Allocator, turn: *HistoryTurn) void {
+    const saved = switch (turn.*) {
+        .assistant => |*entry| &entry.saved_execution,
+        .interrupted => |*entry| &entry.saved_execution,
+        .compacted_summary => return,
+    };
+    if (saved.*) |whole| freeExecutionMemory(alloc, whole);
+    saved.* = null;
 }
 
 pub fn freeHistoryTurnSlice(alloc: std.mem.Allocator, turns: []HistoryTurn) void {
@@ -3331,12 +3404,15 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
 
             const execution = try dupeExecutionMemory(alloc, entry.execution);
             errdefer freeExecutionMemory(alloc, execution);
+            const saved_execution = if (entry.saved_execution) |saved| try dupeExecutionMemory(alloc, saved) else null;
+            errdefer if (saved_execution) |saved| freeExecutionMemory(alloc, saved);
             const replay = if (entry.provider_replay) |value| try dupeProviderReplay(alloc, value) else null;
             break :blk .{ .assistant = .{
                 .user = user,
                 .assistant = assistant,
                 .execution = execution,
                 .provider_replay = replay,
+                .saved_execution = saved_execution,
             } };
         },
         .interrupted => |entry| blk: {
@@ -3367,6 +3443,8 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
             errdefer if (cancelled_wait) |presentation| freeCancelledWaitPresentation(alloc, presentation);
 
             const execution = try dupeExecutionMemory(alloc, entry.execution);
+            errdefer freeExecutionMemory(alloc, execution);
+            const saved_execution = if (entry.saved_execution) |saved| try dupeExecutionMemory(alloc, saved) else null;
 
             break :blk .{ .interrupted = .{
                 .user = user,
@@ -3380,6 +3458,7 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .cancellation_origin = entry.cancellation_origin,
                 .stopped_by_exit = entry.stopped_by_exit,
                 .yielded = entry.yielded,
+                .saved_execution = saved_execution,
             } };
         },
     };

@@ -17,8 +17,10 @@ import { FX_BIN, REPO_ROOT } from "../../evals/eval-helpers";
 import {
   DEFAULT_UNSET_ENV_KEYS,
   fakeGatewayTitleDefault,
+  fxChildEnv,
   isVolatileTokenStatusRow,
   TITLE_GENERATION_MARKER,
+  TMUX_NO_CONFIG,
 } from "../tmux-helpers";
 import {
   ACTIVE_TOOL_MARKER,
@@ -2108,6 +2110,13 @@ export function renderLabPaneCommand(shell: string, assignments: Record<string, 
   ].join(" ");
 }
 
+/// The tmux arguments that start a render-lab session running `command`. A
+/// server they start loads no config, so a developer's tmux.conf cannot
+/// change what render-lab records.
+export function renderLabSessionArgs(name: string, width: number, height: number, cwd: string, command: string): string[] {
+  return [...TMUX_NO_CONFIG, "new-session", "-d", "-s", name, "-x", String(width), "-y", String(height), "-c", cwd, command];
+}
+
 class RenderLabTmux {
   readonly name: string;
   readonly fixture: Fixture;
@@ -2129,6 +2138,7 @@ class RenderLabTmux {
     const command = renderLabPaneCommand(zshPath(), {
       FX_DISABLE_KEYCHAIN: "1",
       FX_TEST_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_WORKSPACE_TRUST: "1",
       HOME: opts.fixture.home,
       ZDOTDIR: opts.fixture.zdotdir,
       HISTFILE: opts.fixture.histfile,
@@ -2140,22 +2150,7 @@ class RenderLabTmux {
       SHELL_A_BEFORE_THIRD: opts.manifest.markers.shell[2] ?? "",
     });
 
-    tmux(
-      [
-        "new-session",
-        "-d",
-        "-s",
-        name,
-        "-x",
-        String(opts.width),
-        "-y",
-        String(opts.height),
-        "-c",
-        opts.fixture.work,
-        command,
-      ],
-      env,
-    );
+    tmux(renderLabSessionArgs(name, opts.width, opts.height, opts.fixture.work, command), env);
     const session = new RenderLabTmux(name, opts.fixture);
     await sleep(800);
     await session.waitForPane((pane) => pane.includes(PROMPT_TEXT), 10_000);
@@ -2327,11 +2322,10 @@ function preflightBinaryOnly(): void {
 }
 
 function testEnv(fixture: Fixture, manifest: RenderLabManifest): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  delete env.AI_GATEWAY_API_KEY;
-  delete env.VERCEL_OIDC_TOKEN;
+  const env: NodeJS.ProcessEnv = fxChildEnv();
   env.FX_DISABLE_KEYCHAIN = "1";
   env.FX_TEST_SKIP_ONBOARDING = "1";
+  env.FX_TEST_SKIP_WORKSPACE_TRUST = "1";
   env.HOME = fixture.home;
   env.ZDOTDIR = fixture.zdotdir;
   env.HISTFILE = fixture.histfile;
@@ -2634,7 +2628,7 @@ function tmux(args: string[], env?: NodeJS.ProcessEnv): string {
   return execFileSync("tmux", args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-    env: env ? { ...process.env, ...env } : process.env,
+    env: env ?? process.env,
   });
 }
 

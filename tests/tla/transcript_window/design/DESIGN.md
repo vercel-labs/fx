@@ -59,8 +59,10 @@ current code.
   a resize clears the screen, because the summary's recap counts the turn's
   tool calls. A resumed transcript holds every entry until a frame has
   repainted it from the entries: its first paint is the prepared resume
-  flow, so the reset before that paint keeps them, and the paint leaves no
-  commit anchor to tell which rows are on screen. A transcript that another
+  flow, so the reset before that paint keeps them, and the commit anchor
+  that paint leaves holds the prepared flow's rows, not the entries'. The
+  anchor stays, so the next frame scrolls the rows it moves past into
+  terminal history instead of painting over them. A transcript that another
   agent's replaces on the screen after that first paint stops holding them.
   Nothing trims the transcript by bytes any more, so command output is
   bounded per command (`command_output_block_cap`, 1 MiB).

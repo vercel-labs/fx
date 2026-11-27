@@ -3,18 +3,18 @@
 //
 //   sessions   60 quiet sessions alive at once, near the runtime's 64, each
 //              result with its time fields, then each stopped
-//   flood      200 MB of output while a wait is open, then quiet: the wait
-//              ends at the limit after the last byte, not during the flood
-//   rearm      a command that prints a line every 1.5 limits; 100 waits in a
-//              row, each begun past the limit, re-armed by the next line, and
-//              ended at the crossing after it
+//   flood      200 MB of output while 5 s waits run, then quiet: the wait after
+//              the flood reports the notice at its ceiling
+//   rearm      a command that prints a line when signaled at each wait's start;
+//              100 5 s waits in a row, each begun past the limit, re-armed by
+//              the new line, and crossing again at its ceiling
 //
 // Usage (from the repository root, after zig build):
 //   bun tests/tla/drivers/managed_execution/stress.ts
 //   bun tests/tla/drivers/managed_execution/stress.ts --rounds 300
 //
 // Exit codes: 0 every check held, 1 a check failed, 2 a harness failure.
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { binary, targetHelpers, testEnvironment } from "../lib/context";
@@ -53,15 +53,21 @@ function shellResult(body: string, callId: string): Record<string, any> {
   throw new Error(`missing tool result for ${callId}`);
 }
 
-type Step = (body: string, now: number) => Response | null;
+type Step = (body: string, now: number, workspace: string) => Response | null;
 
 // Runs one fx ask that plays `next` as the model until it returns null, then
 // ends the turn. Returns the failed checks.
-async function play(name: string, limitMs: number, next: Step, out: string): Promise<string[]> {
+async function play(
+  name: string,
+  limitMs: number,
+  next: Step,
+  out: string,
+): Promise<{ failures: string[]; trace: string }> {
   const { startDynamicFakeGateway, fakeGatewayFinalText } = await targetHelpers();
   const root = realpathSync(mkdtempSync(join(tmpdir(), `fx-quiet-stress-${name}-`)));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
+  const tracePath = join(root, "trace.log");
   mkdirSync(join(home, ".fx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   writeFileSync(join(home, ".fx", "settings.json"), "{}");
@@ -69,7 +75,7 @@ async function play(name: string, limitMs: number, next: Step, out: string): Pro
   const gateway = startDynamicFakeGateway((body: string) => {
     if (failures.length > 0) return fakeGatewayFinalText("Stress failed.");
     try {
-      return next(body, Date.now()) ?? fakeGatewayFinalText("Stress done.");
+      return next(body, Date.now(), workspace) ?? fakeGatewayFinalText("Stress done.");
     } catch (error) {
       failures.push(error instanceof Error ? error.message : String(error));
       return fakeGatewayFinalText("Stress failed.");
@@ -88,6 +94,8 @@ async function play(name: string, limitMs: number, next: Step, out: string): Pro
         FX_MODEL: MODEL,
         FX_MAX_AGENT_STEPS: "1000",
         FX_TEST_SHELL_QUIET_NOTICE_MS: String(limitMs),
+        FX_TRACE_LOG: tracePath,
+        FX_TRACE_SCOPES: "shell",
       }),
       stdout: "pipe",
       stderr: "pipe",
@@ -97,11 +105,12 @@ async function play(name: string, limitMs: number, next: Step, out: string): Pro
       new Response(proc.stderr).text(),
       proc.exited,
     ]);
+    const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
     writeFileSync(join(out, `${name}.log`), `${stdout}\n[stderr]\n${stderr}\n`);
     if (exitCode !== 0) failures.push(`fx exited ${exitCode}: ${stderr.slice(0, 400)}`);
     if (!stdout.includes("Stress done.") && failures.length === 0) failures.push("the turn did not end with the final reply");
     console.log(`${name}: ${failures.length === 0 ? "ok" : "FAIL"} in ${Math.round(performance.now() - started)} ms`);
-    return failures;
+    return { failures, trace };
   } finally {
     gateway.stop();
     rmSync(root, { recursive: true, force: true });
@@ -116,7 +125,7 @@ async function sessions(out: string): Promise<string[]> {
   const { fakeGatewayToolCall } = await targetHelpers();
   const ids: string[] = [];
   let step = 0;
-  return await play("sessions", 1_000, (body) => {
+  const { failures } = await play("sessions", 1_000, (body) => {
     const n = options.sessions;
     const k = step++;
     if (k > 0 && k <= n) {
@@ -140,15 +149,19 @@ async function sessions(out: string): Promise<string[]> {
     }
     return null;
   }, out);
+  return failures;
 }
 
 async function flood(out: string): Promise<string[]> {
   const { fakeGatewayToolCall } = await targetHelpers();
-  const limitMs = 1_000;
+  const limitMs = 150;
+  const maxWaits = 30;
   let step = 0;
   let sessionId = "";
   let waitStarted = 0;
-  return await play("flood", limitMs, (body, now) => {
+  let sawFloodEnd = false;
+  let totalWaited = 0;
+  const { failures } = await play("flood", limitMs, (body, now) => {
     const k = step++;
     if (k === 0) {
       return fakeGatewayToolCall("flood_run", "shell", {
@@ -163,41 +176,54 @@ async function flood(out: string): Promise<string[]> {
     if (k === 1) {
       sessionId = shellResult(body, "flood_run").session_id;
       waitStarted = Date.now();
-      return fakeGatewayToolCall("flood_wait", "shell", {
-        request: { action: "interact", session_id: sessionId, yield_time_ms: 300_000 },
+      return fakeGatewayToolCall("flood_wait_0", "shell", {
+        request: { action: "interact", session_id: sessionId, yield_time_ms: 5_000 },
       });
     }
-    if (k === 2) {
+    const waitIndex = k - 2;
+    if (waitIndex < maxWaits) {
       const waited = now - waitStarted;
-      const result = shellResult(body, "flood_wait");
+      totalWaited += waited;
+      const result = shellResult(body, `flood_wait_${waitIndex}`);
+      check(waited >= 5_000, `flood wait ${waitIndex} ended early after ${waited} ms`);
       check(result.state === "running", `flood state ${result.state}`);
-      check(typeof result.quiet_notice === "string", "flood wait ended without the notice");
-      check(result.quiet_ms >= limitMs && result.quiet_ms < limitMs + 1_000, `flood quiet_ms ${result.quiet_ms}`);
-      // The wait ended at the limit after the last output, so the flood's
-      // own length is the rest of the running time.
-      check(result.running_ms - result.quiet_ms > 0, `flood running_ms ${result.running_ms}`);
-      console.log(`flood: ${options.floodMb} MB, wait ${waited} ms, running ${result.running_ms} ms, quiet ${result.quiet_ms} ms`);
-      return fakeGatewayToolCall("flood_stop", "shell", { request: { action: "stop", session_id: sessionId } });
+      if (typeof result.output_delta === "string" && result.output_delta.includes("FLOOD-END")) {
+        sawFloodEnd = true;
+      }
+      if (sawFloodEnd && typeof result.quiet_notice === "string") {
+        check(result.quiet_ms >= limitMs, `flood quiet_ms ${result.quiet_ms}`);
+        check(result.running_ms - result.quiet_ms > 0, `flood running_ms ${result.running_ms}`);
+        console.log(`flood: ${options.floodMb} MB, ${waitIndex + 1} waits (${totalWaited} ms), running ${result.running_ms} ms, quiet ${result.quiet_ms} ms`);
+        step = maxWaits + 2;
+        return fakeGatewayToolCall("flood_stop", "shell", { request: { action: "stop", session_id: sessionId } });
+      }
+      if (waitIndex + 1 < maxWaits) {
+        waitStarted = Date.now();
+        return fakeGatewayToolCall(`flood_wait_${waitIndex + 1}`, "shell", {
+          request: { action: "interact", session_id: sessionId, yield_time_ms: 5_000 },
+        });
+      }
+      throw new Error(`flood did not settle with quiet_notice within ${maxWaits} waits`);
     }
     return null;
   }, out);
+  return failures;
 }
 
 async function rearm(out: string): Promise<string[]> {
   const { fakeGatewayToolCall } = await targetHelpers();
-  const limitMs = 200;
-  const periodS = 0.3;
+  const limitMs = 150;
   let step = 0;
   let sessionId = "";
   let waitStarted = 0;
   const waits: number[] = [];
-  return await play("rearm", limitMs, (body, now) => {
+  const { failures, trace } = await play("rearm", limitMs, (body, now, workspace) => {
     const k = step++;
     if (k === 0) {
       return fakeGatewayToolCall("rearm_run", "shell", {
         request: {
           action: "run",
-          command: `i=0; while [ $i -lt ${options.rounds * 6} ]; do printf "tick-$i\\n"; i=$((i+1)); sleep ${periodS}; done; sleep 60`,
+          command: "i=0; while :; do if [ -f \"step-$i\" ]; then rm -f \"step-$i\"; printf 'tick-%d\\n' \"$i\"; i=$((i+1)); fi; sleep 0.05; done",
           profile: "clean",
           yield_time_ms: 0,
         },
@@ -207,17 +233,19 @@ async function rearm(out: string): Promise<string[]> {
       sessionId = shellResult(body, "rearm_run").session_id;
     } else if (k <= options.rounds + 1) {
       const result = shellResult(body, `rearm_wait_${k - 2}`);
-      waits.push(now - waitStarted);
+      const waited = now - waitStarted;
+      waits.push(waited);
+      check(waited >= 5_000, `wait ${k - 2} ended early after ${waited} ms`);
       check(result.state === "running", `wait ${k - 2} state ${result.state}`);
-      check(typeof result.quiet_notice === "string", `wait ${k - 2} ended without the notice after ${now - waitStarted} ms`);
-      check(result.quiet_ms >= limitMs && result.quiet_ms < limitMs + 250, `wait ${k - 2} quiet_ms ${result.quiet_ms}`);
-      check(result.output_delta.includes("tick-"), `wait ${k - 2} carried no new line`);
-      // Each wait ended at a crossing, long before its 5 second yield.
-      check(now - waitStarted < 2_000, `wait ${k - 2} took ${now - waitStarted} ms`);
+      check(typeof result.quiet_notice === "string", `wait ${k - 2} ended without the notice after ${waited} ms`);
+      check(result.quiet_ms >= limitMs && result.quiet_ms < 5_500, `wait ${k - 2} quiet_ms ${result.quiet_ms}`);
+      check(result.output_delta.includes(`tick-${k - 2}`), `wait ${k - 2} carried no new line`);
     }
     if (k <= options.rounds) {
+      const round = k - 1;
+      writeFileSync(join(workspace, `step-${round}`), "");
       waitStarted = Date.now();
-      return fakeGatewayToolCall(`rearm_wait_${k - 1}`, "shell", {
+      return fakeGatewayToolCall(`rearm_wait_${round}`, "shell", {
         request: { action: "interact", session_id: sessionId, yield_time_ms: 5_000 },
       });
     }
@@ -229,6 +257,9 @@ async function rearm(out: string): Promise<string[]> {
     }
     return null;
   }, out);
+  const crossings = trace.split("\n").filter((line) => line.includes("event=quiet_crossing")).length;
+  if (crossings !== options.rounds) failures.push(`expected ${options.rounds} quiet_crossing events, got ${crossings}`);
+  return failures;
 }
 
 const out = outDir("managed-execution-stress");

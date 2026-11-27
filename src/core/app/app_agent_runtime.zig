@@ -242,18 +242,20 @@ pub fn Runtime(comptime App: type) type {
             ctx.permission_state_override = &run.admission.permission_state;
             ctx.advertised_dynamic_tool_names = run.admission.integration_names;
             ctx.mcp_access = if (run.admission.mcp_view) |*view|
-                .{ .scoped = .{
-                    .captured = view,
-                    .admission_authority_generation = run.admission.authority_generation,
-                    .live = .{ .context = run, .resolve_fn = resolveChildLiveMcpView },
-                } }
+                .{ .scoped = .{ .captured = view } }
             else
                 .disabled;
             // A child's `subagent` calls go to its own host, which the tool
             // context already holds, as main's go to main's.
-            // A child's approvals and questions go to its own worker, as
-            // main's do, for main's runs and the user's alike; main's screen
-            // borrows them while the child is hidden.
+            // A run main started asks through its turn, so the request is
+            // registered and main is told; it still waits on this child's own
+            // worker, whose screen shows it too. A turn the person typed has no
+            // turn of main's, so it keeps the worker's prompter and stays with
+            // the person (`tests/tla/subagent/TuiParentApproval.tla`
+            // TypedStaysWithPerson).
+            if (run.turn) |turn| {
+                if (run.startedByParent()) ctx.permission_prompter = turn.permissionPrompter();
+            }
             ctx.interactive = false;
             ctx.ask_user_questions = true;
             ctx.provider = run.admission.provider;
@@ -289,15 +291,6 @@ pub fn Runtime(comptime App: type) type {
         /// through the child's profile, which gives the same mode again.
         fn userPermissionMode(run: *const agents.ChildRun) ?types.PermissionMode {
             return if (run.inFlight()) null else run.admission.permission_mode;
-        }
-
-        fn resolveChildLiveMcpView(raw: *anyopaque, alloc: Allocator) !tool_mcp_runtime.ResolvedLiveView {
-            const run: *agents.ChildRun = @ptrCast(@alignCast(raw));
-            var authority = if (userPermissionMode(run)) |mode|
-                try run.authority_resolver.resolveForUser(alloc, run.child_id, mode)
-            else
-                try run.authority_resolver.resolve(alloc, run.child_id);
-            return subagent_execution.liveMcpViewFrom(alloc, &authority);
         }
 
         fn resolveChildLiveToolAction(

@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
 import { contentText } from "./conditional-guidance-oracle";
 import { LARGE_TOOL, OTHER_TOOL, SMALL_TOOL, runPaths, seen, type PathName, type PathsRun } from "./mcp-rules-paths";
 import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
@@ -4613,7 +4613,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       fakeGatewayFinalText("Unexpected continuation."),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     const proc = Bun.spawn([join(REPO_ROOT, "zig-out", "bin", "fx"), "ask", "--json", "--auto", "--no-save", "Find the fixture tool"], {
-      cwd: root.workspace, env: { ...process.env, ...fixtureEnv(root, gateway) }, stdout: "ignore", stderr: "ignore",
+      cwd: root.workspace, env: fxChildEnv(fixtureEnv(root, gateway)), stdout: "ignore", stderr: "ignore",
     });
     try {
       const deadline = Date.now() + 5_000;
@@ -5565,7 +5565,7 @@ describe("fx mcp call", () => {
   };
   const runClient = async (env: Record<string, string | undefined>) => {
     const child = Bun.spawn([FX_BIN, "mcp", "call", TOOL_NAME, '{"text":"hello"}'], {
-      env: { ...process.env, FX_MCP_CALL_SOCKET: undefined, FX_MCP_CALL_TOKEN: undefined, FX_SOUND: "0", ...env },
+      env: fxChildEnv({ FX_MCP_CALL_SOCKET: undefined, FX_MCP_CALL_TOKEN: undefined, FX_SOUND: "0", ...env }),
       stdout: "pipe",
       stderr: "pipe",
     });
