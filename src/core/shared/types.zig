@@ -580,6 +580,9 @@ pub const RouteRecoveryStatus = struct {
         unsafe_assistant_output,
         unsafe_tool_start,
         content_filter,
+        /// The provider's cybersecurity safeguard blocked the request, and
+        /// fx did not resend it.
+        cyber_policy,
     };
 
     kind: Kind,
@@ -628,6 +631,7 @@ pub const RouteRecoveryStatus = struct {
             .unsafe_assistant_output,
             .unsafe_tool_start,
             .content_filter,
+            .cyber_policy,
             => false,
         };
     }
@@ -639,8 +643,9 @@ pub const RouteRecoveryStatus = struct {
     pub const Report = struct {
         state: ReportedState,
         attempt: usize,
-        /// The status's `failure`, by its tag name.
-        cause: ?recovery.Failure.Kind = null,
+        /// The status's `failure` by its tag name, or `cyber_policy` for a
+        /// cyber policy block.
+        cause: ?[]const u8 = null,
         need: ?recovery.Status.Need = null,
         /// Omitted when the status has no wording: `recovered` and
         /// `failed` report only the attempt and the cause.
@@ -652,7 +657,7 @@ pub const RouteRecoveryStatus = struct {
             try writer.print(",\"attempt\":{d}", .{self.attempt});
             if (self.cause) |cause| {
                 try writer.writeAll(",\"cause\":");
-                try std.json.Stringify.value(@tagName(cause), .{}, writer);
+                try std.json.Stringify.value(cause, .{}, writer);
             }
             if (self.need) |need| {
                 try writer.writeAll(",\"need\":");
@@ -672,10 +677,16 @@ pub const RouteRecoveryStatus = struct {
         return .{
             .state = self.reportedState(),
             .attempt = self.attempt,
-            .cause = self.failure,
+            .cause = self.reportedCause(),
             .need = self.need,
             .message = if (message.len == 0) null else message,
         };
+    }
+
+    fn reportedCause(self: RouteRecoveryStatus) ?[]const u8 {
+        if (self.kind == .cyber_policy) return @tagName(ProviderFailureCause.cyber_policy);
+        const failure = self.failure orelse return null;
+        return @tagName(failure);
     }
 
     /// The `state` that `fx ask --json` and ACP report, written as its tag.
@@ -703,6 +714,7 @@ pub const RouteRecoveryStatus = struct {
             .unsafe_assistant_output,
             .unsafe_tool_start,
             .content_filter,
+            .cyber_policy,
             => .failed,
         };
     }
@@ -719,6 +731,7 @@ pub const RouteRecoveryStatus = struct {
             .unsafe_assistant_output,
             .unsafe_tool_start,
             .content_filter,
+            .cyber_policy,
             => .danger,
         };
     }
@@ -745,7 +758,23 @@ pub const RouteRecoveryStatus = struct {
                 "context preserved",
             ),
             .content_filter => self.fixedFailureLabel(buf, "blocked", "content filter"),
+            .cyber_policy => self.blockedLabel(buf, cyber_policy_block_name),
         };
+    }
+
+    /// How fx names a cyber policy block, before the provider's own message.
+    pub const cyber_policy_block_name = "Blocked by the provider's cyber policy";
+
+    /// `name`, then the provider's own message, which carries its guidance.
+    fn blockedLabel(self: RouteRecoveryStatus, buf: []u8, name: []const u8) []const u8 {
+        const diagnostic = self.diagnostic orelse
+            return std.mem.print(buf, "⚠ {s}", .{name}) catch "⚠ Model response failed";
+        var words: [ModelFailureDiagnostic.max_bytes]u8 = undefined;
+        return std.mem.print(
+            buf,
+            "⚠ {s} · {s}",
+            .{ name, diagnostic.humanText(&words) },
+        ) catch "⚠ Model response failed";
     }
 
     fn fixedFailureLabel(
@@ -885,6 +914,21 @@ test "recovery reports write the shape fx ask and ACP share" {
         .{
             .status = .{ .kind = .unsafe_tool_start, .attempt = 1 },
             .json = "{\"state\":\"failed\",\"attempt\":1,\"message\":\"⚠ Tool state needs review · context preserved\"}",
+        },
+        // A cyber policy block reports its own cause, whatever the module
+        // last handled.
+        .{
+            .status = .{
+                .kind = .cyber_policy,
+                .attempt = 1,
+                .failure = .server,
+                .diagnostic = ModelFailureDiagnostic.init("cyber_policy: This content was flagged."),
+            },
+            .json = "{\"state\":\"failed\",\"attempt\":1,\"cause\":\"cyber_policy\",\"message\":\"⚠ Blocked by the provider's cyber policy · cyber_policy: This content was flagged.\"}",
+        },
+        .{
+            .status = .{ .kind = .cyber_policy, .attempt = 1 },
+            .json = "{\"state\":\"failed\",\"attempt\":1,\"cause\":\"cyber_policy\",\"message\":\"⚠ Blocked by the provider's cyber policy\"}",
         },
     };
     for (cases) |case| {
@@ -2378,7 +2422,14 @@ pub const ProviderFailureCause = enum {
     uncoded_error,
     /// A stream that finished with an error that no error event explained.
     unexplained_error_finish,
+    /// The provider's cybersecurity safeguard blocked the request or its
+    /// output. fx reports it by this name and never resends it.
+    cyber_policy,
 };
+
+/// The error code a provider's cybersecurity safeguard sends, in an error
+/// event or an HTTP error body.
+pub const cyber_policy_code = "cyber_policy";
 
 pub const ProviderServiceTier = enum {
     standard,

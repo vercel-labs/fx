@@ -1423,6 +1423,38 @@ describe("custom connection on openai-responses: encrypted reasoning", () => {
   }, 25000);
 });
 
+// A cyber policy block on a Responses connection whose message the reader
+// cuts short inside the connection's echoed key: the cyber notice and status
+// show none of the key.
+test("custom connection on openai-responses: a cyber policy block cut inside the echoed key shows none of it", async () => {
+  // The detail keeps 253 bytes and "...", so 13 bytes of the key would show.
+  const pad = 253 - 13 - "cyber_policy: Key ".length;
+  const f = fixture(undefined, {
+    [responsesFake.path]: body => responsesFake.failedStream(
+      body.model,
+      "cyber_policy",
+      `${"x".repeat(pad)}Key ${f.env.FX_TEST_PROVIDER_TOKEN} was flagged for possible cybersecurity risk.`,
+    ),
+  });
+  try {
+    connection(f, "remote").protocol = "openai-responses";
+    f.save();
+    const result = await runFx(["ask", "--json", "--no-save", "say hello"], {
+      cwd: f.workspace,
+      env: { ...f.env, FX_PROVIDER: "remote" },
+      timeoutMs: 20000,
+    });
+    const json = JSON.parse(result.stdout);
+    const tokenStart = f.env.FX_TEST_PROVIDER_TOKEN.slice(0, 8);
+
+    expect(result.code).toBe(1);
+    expect(json.recovery?.cause).toBe("cyber_policy");
+    expect(json.recovery?.message).not.toContain(tokenStart);
+    expect(result.stderr).toContain("Blocked by the provider's cyber policy");
+    expect(result.stderr).not.toContain(tokenStart);
+  } finally { f.close(); }
+}, 25000);
+
 describe("automatic permission review on a custom connection", () => {
   test.each([
     { name: "a review model the settings do not declare", declared: undefined, defaults: { max_output_tokens: 300 }, limit: 300 },

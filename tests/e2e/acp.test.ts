@@ -15526,3 +15526,72 @@ test("ACP keeps an idle Claude session's cache warm until the next session repla
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 45000);
+
+// A cyber policy block is reported, never sent again: not by a repair, a
+// resend, or the Claude cache warmer pinging the blocked request later. The
+// warmer arms before the prompt answers, so its trace shows whether a ping
+// could follow; only the request with the tool call may arm it.
+for (const variant of ["post-tool HTTP", "post-tool stream", "first stream"] as const) {
+  test(`ACP sends nothing more after a ${variant} cyber policy block`, async () => {
+    const root = createIsolatedRoot("fx-acp-cyber-policy-");
+    const tracePath = join(root.root, "trace.log");
+    const message = "This content was flagged for possible cybersecurity risk.";
+    let modelRequests = 0;
+    const gateway = startDynamicFakeGateway(() => {
+      modelRequests += 1;
+      if (variant !== "first stream" && modelRequests === 1) {
+        return fakeGatewayToolCall("notes_1", "read_file", { path: "notes.md" });
+      }
+      if (variant === "post-tool HTTP") {
+        return new Response(JSON.stringify({ error: { type: "cyber_policy", message } }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return fakeGatewaySse([{ type: "error", error: { type: "cyber_policy", message } }]);
+    }, {
+      models: [{
+        id: "anthropic/claude-opus-5.5",
+        type: "language",
+        tags: ["explicit-caching", "reasoning", "tool-use"],
+        context_window: 1_000_000,
+        max_tokens: 64_000,
+        reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+      }],
+    });
+    let client: AcpClient | undefined;
+    try {
+      writeFileSync(join(root.workspace, "notes.md"), "notes\n");
+      client = await AcpClient.create({
+        cwd: root.workspace,
+        env: {
+          ...fakeGatewayEnv(root, gateway),
+          FX_MODEL: "anthropic/claude-opus-5.5",
+          FX_TRACE: "1",
+          FX_TRACE_LOG: tracePath,
+        },
+      });
+      await client.request("initialize", { protocolVersion: 1 }, 1);
+      const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+      if (created.error) throw new Error(JSON.stringify(created));
+      sendPrompt(client, 3, "inspect the notes");
+      const messages = await readUntilResponses(client, [3]);
+      const blockedRequests = variant === "first stream" ? 1 : 2;
+      expect(gateway.requests).toHaveLength(blockedRequests);
+      expect(JSON.stringify(messages)).toContain('"cause":"cyber_policy"');
+      const trace = readFileSync(tracePath, "utf8");
+      const armed = trace.split("\n").filter((line) => line.includes("[cache_warming] event=armed"));
+      expect(armed).toHaveLength(variant === "first stream" ? 0 : 1);
+      if (armed.length === 1) {
+        expect(trace.slice(trace.indexOf(armed[0]!))).toContain("[cache_warming] event=disarmed why=request");
+      }
+      expect(trace).not.toContain("assistant_prefill_recovery");
+      expect(gateway.requests).toHaveLength(blockedRequests);
+      expect(client.stderr).toBe("");
+    } finally {
+      await client?.close();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45000);
+}

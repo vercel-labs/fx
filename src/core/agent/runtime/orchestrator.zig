@@ -5383,7 +5383,7 @@ fn failureStatus(failure: agent_stream_provider.Failure) std.http.Status {
 
 fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
     return switch (kind) {
-        .invalid_request => .bad_request,
+        .invalid_request, .cyber_policy => .bad_request,
         .unauthorized => .unauthorized,
         .forbidden => .forbidden,
         .request_too_large => .payload_too_large,
@@ -5405,6 +5405,8 @@ fn needsUserFailureKind(
     failure: agent_stream_provider.Failure,
     credential_source: ?types.CredentialSource,
 ) ?runtime_request_recovery.Failure.Kind {
+    // A cyber policy block is reported, never sent again.
+    if (failure.kind == .cyber_policy) return null;
     if (failure.kind == .quota_exhausted or
         gateway_error_format.namesOutOfCredits(alloc, failure.detail orelse ""))
     {
@@ -5420,6 +5422,7 @@ fn needsUserFailureKind(
         .unauthorized => if (signInRepairs(credential_source)) .sign_in else null,
         // 429 and 5xx retry.
         .rate_limited, .quota_exhausted, .server_error, .bad_gateway, .unavailable, .gateway_timeout => null,
+        .cyber_policy => null,
     };
 }
 
@@ -6307,6 +6310,90 @@ fn pushTerminalProviderFailureStatus(
     });
 }
 
+/// Reports a cyber policy block as the request's terminal status, which
+/// `fx ask --json` and ACP report with the cause `cyber_policy`.
+fn pushCyberPolicyStatus(
+    request: *runtime_request_recovery.RequestRecovery,
+    diagnostic: types.ModelFailureDiagnostic,
+) !void {
+    try request.replaceStatus(.{
+        .kind = .cyber_policy,
+        .attempt = request.attempt(),
+        .diagnostic = diagnostic,
+    });
+}
+
+/// The most a cyber policy notice shows of the provider's message. The
+/// gateway keeps up to 600 bytes of it, more than a diagnostic holds, and
+/// making it terminal-safe can make it longer.
+const cyber_policy_notice_max_bytes = 1024;
+
+/// `detail` with every copy of the request's credential masked, as sent and
+/// as JSON escapes it, and with its start masked where the provider's text
+/// was cut short inside it. The cyber notice and its status show more of the
+/// provider's text than other errors do, so they must not show more of a
+/// key. `arena` owns the result.
+fn withoutCredential(arena: Allocator, detail: []const u8, credential: []const u8) ![]const u8 {
+    const masked = try arena.dupe(u8, detail);
+    if (credential.len == 0) return masked;
+    const escaped = try std.json.Stringify.valueAlloc(arena, credential, .{});
+    const escaped_credential = escaped[1 .. escaped.len - 1];
+    for ([_][]const u8{ credential, escaped_credential }) |form| {
+        text_utils.maskLiteral(masked, form);
+        maskCutCredentialStart(masked, form);
+    }
+    return masked;
+}
+
+/// Masks the end of `text` where it is the start of `credential`, as it is
+/// when the provider's text was cut short inside the key, before the "..."
+/// such a cut can append.
+fn maskCutCredentialStart(text: []u8, credential: []const u8) void {
+    const cut_marker = "...";
+    const end = if (std.mem.endsWith(u8, text, cut_marker)) text.len - cut_marker.len else text.len;
+    var len = @min(end, credential.len -| 1);
+    while (len > 0) : (len -= 1) {
+        if (std.mem.endsWith(u8, text[0..end], credential[0..len])) {
+            @memset(text[end - len .. end], '*');
+            return;
+        }
+    }
+}
+
+test "withoutCredential masks a whole key, its escaped form, and a key the text was cut short inside" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const key = "test-credential-0123456789";
+    const Case = struct { detail: []const u8, credential: []const u8, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .detail = "cyber_policy: key " ++ key ++ " flagged", .credential = key, .expected = "cyber_policy: key " ++ text_utils.repeat("*", key.len) ++ " flagged" },
+        .{ .detail = "cyber_policy: {\"key\":\"test\\\"credential\"}", .credential = "test\"credential", .expected = "cyber_policy: {\"key\":\"" ++ text_utils.repeat("*", 16) ++ "\"}" },
+        .{ .detail = "cyber_policy: apply via test-cred", .credential = key, .expected = "cyber_policy: apply via " ++ text_utils.repeat("*", 9) },
+        // The text cut short inside the key, with the "..." a cut appends.
+        .{ .detail = "cyber_policy: apply via test-cred...", .credential = key, .expected = "cyber_policy: apply via " ++ text_utils.repeat("*", 9) ++ "..." },
+        .{ .detail = "cyber_policy: nothing to hide", .credential = key, .expected = "cyber_policy: nothing to hide" },
+        .{ .detail = "cyber_policy: key " ++ key, .credential = "", .expected = "cyber_policy: key " ++ key },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.expected, try withoutCredential(arena, case.detail, case.credential));
+    }
+}
+
+/// The notice for a cyber policy block: fx's name for it, then the
+/// provider's whole message, masked and made terminal-safe. Falls back to
+/// `diagnostic` when the provider sent no message. `arena` owns the result.
+fn cyberPolicyNotice(
+    arena: Allocator,
+    detail: []const u8,
+    diagnostic: types.ModelFailureDiagnostic,
+) ![]const u8 {
+    var encoded = try maskedTerminalSafe(arena, std.mem.trim(u8, detail, " \t\r\n"), cyber_policy_notice_max_bytes);
+    defer encoded.deinit(arena);
+    const message = if (encoded.bytes.len > 0) encoded.bytes else diagnostic.view();
+    return arena.print("{s} · {s}", .{ types.RouteRecoveryStatus.cyber_policy_block_name, message });
+}
+
 /// A resend that had to reconcile uncertain tool evidence returned another
 /// tool call. fx cannot prove the earlier call didn't run, so the turn stops
 /// with its checkpoint kept for the user to inspect, as before; only the
@@ -6446,17 +6533,28 @@ fn prepareExternalFailureDiagnostic(
         null;
     defer if (owned_source) |source| alloc.free(source);
     const source = owned_source orelse if (trimmed.len > 0) trimmed else fallback;
-    const masked = try text_utils.maskSecrets(alloc, source);
-    defer if (masked.ptr != source.ptr) alloc.free(masked);
+    return safeFailureDiagnostic(alloc, source, fallback);
+}
 
-    var encoded = try text_utils.encodeTerminalSafe(
-        alloc,
-        masked,
-        types.ModelFailureDiagnostic.max_bytes,
-    );
+/// `source` masked, made terminal-safe, and bounded as a diagnostic, or
+/// `fallback` when nothing is left of it.
+fn safeFailureDiagnostic(
+    alloc: Allocator,
+    source: []const u8,
+    fallback: []const u8,
+) !types.ModelFailureDiagnostic {
+    var encoded = try maskedTerminalSafe(alloc, source, types.ModelFailureDiagnostic.max_bytes);
     defer encoded.deinit(alloc);
     if (encoded.bytes.len == 0) return types.ModelFailureDiagnostic.init(fallback);
     return types.ModelFailureDiagnostic.init(encoded.bytes);
+}
+
+/// Provider text as fx shows it: secrets masked, made terminal-safe, and at
+/// most `max_bytes`. The caller owns the result.
+fn maskedTerminalSafe(alloc: Allocator, source: []const u8, max_bytes: usize) !text_utils.EncodedText {
+    const masked = try text_utils.maskSecrets(alloc, source);
+    defer if (masked.ptr != source.ptr) alloc.free(masked);
+    return text_utils.encodeTerminalSafe(alloc, masked, max_bytes);
 }
 
 fn hasDiagnosticIdentifier(text: []const u8) bool {
@@ -9870,7 +9968,8 @@ fn processQueuedPromptLoop(
                 if (deps.record_usage) |record| record(deps.ctx, completion.usage) catch |err| {
                     debug_trace.logf("agent", "event=usage_not_saved err={s}", .{@errorName(err)});
                 };
-                armCacheWarming(deps, .{
+                // A ping would send the blocked request again.
+                if (completion.provider_failure_cause != .cyber_policy) armCacheWarming(deps, .{
                     .candidate = .{
                         .gateway_with_direct_credential = job.provider == .gateway and
                             job.credential_source != .host_managed and active_api_key.len > 0,
@@ -10074,8 +10173,11 @@ fn processQueuedPromptLoop(
             summary_accumulator.addThinkingWait(gateway_wait_started_ms, stream_ctx.first_model_output_at_ms orelse gateway_wait_finished_ms);
 
             // `assistant_prefill_recovery_used` caps this repair at one resend
-            // per step; it does not go through the recovery module.
+            // per step; it does not go through the recovery module. A cyber
+            // policy block is never repaired, whatever its text says.
+            const policy_blocked = if (response_failure) |failure| failure.kind == .cyber_policy else false;
             const prefill_tool_name: ?[]const u8 = if (!assistant_prefill_recovery_used and
+                !policy_blocked and
                 streamReplaySafe(&stream_ctx))
                 postToolAssistantPrefillRejection(
                     if (response_failure) |failure| failureStatus(failure) else .ok,
@@ -10406,7 +10508,7 @@ fn processQueuedPromptLoop(
                 // elsewhere the turn ends as other non-retryable endings do.
                 const failure_kind: ?runtime_request_recovery.Failure.Kind = if (content_filtered)
                     .content_filter
-                else if (failure_cause == .non_retryable)
+                else if (failure_cause == .non_retryable or failure_cause == .cyber_policy)
                     null
                 else
                     runtime_request_recovery.failureKind(cause);
@@ -10606,8 +10708,16 @@ fn processQueuedPromptLoop(
                     completionContentBytes(attempt_completion),
                     attempt_completion.tool_calls.len,
                 });
-                if (attempt_completion.provider_failure_cause == .non_retryable) {
-                    try deps.push_system_notice(deps.ctx, diagnostic.view());
+                const failure_cause = attempt_completion.provider_failure_cause;
+                if (failure_cause == .non_retryable or failure_cause == .cyber_policy) {
+                    if (failure_cause == .cyber_policy) {
+                        const detail = try withoutCredential(arena, attempt_completion.provider_failure_detail orelse "", active_api_key);
+                        const cyber_diagnostic = try prepareExternalFailureDiagnostic(arena, detail, types.cyber_policy_code);
+                        try deps.push_system_notice(deps.ctx, try cyberPolicyNotice(arena, detail, cyber_diagnostic));
+                        try pushCyberPolicyStatus(&request_recovery, cyber_diagnostic);
+                    } else {
+                        try deps.push_system_notice(deps.ctx, diagnostic.view());
+                    }
                     restorePromptAfterTerminalFailure(deps, job, config);
                     const failed_assistant_source = stream_ctx.interruption_source_or("");
                     if (stop_state.retained_candidate == null and
@@ -10740,6 +10850,14 @@ fn processQueuedPromptLoop(
             if (!http_failure_notice_shown) {
                 const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
                 try deps.push_http_error(deps.ctx, failureStatus(failure), http_detail, job.credential_source);
+            }
+            if (failure.kind == .cyber_policy) {
+                const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
+                const message = try gateway_error_format.formatHttpRecoveryDiagnostic(arena, failureStatus(failure), http_detail);
+                try pushCyberPolicyStatus(
+                    &request_recovery,
+                    try safeFailureDiagnostic(arena, message, types.cyber_policy_code),
+                );
             }
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;

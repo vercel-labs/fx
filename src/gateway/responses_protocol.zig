@@ -1198,6 +1198,8 @@ pub const Reducer = struct {
             null
         else if (std.mem.eql(u8, code, "rate_limit_exceeded"))
             .rate_limited
+        else if (std.mem.eql(u8, code, types.cyber_policy_code))
+            .cyber_policy
         else
             .non_retryable;
     }
@@ -1981,6 +1983,25 @@ test "Responses terminal failure classification is conservative and diagnostics 
     try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
     try std.testing.expectEqual(types.ProviderFailureCause.non_retryable, completion.provider_failure_cause.?);
     try std.testing.expect(completion.provider_failure_detail.?.len > 0);
+}
+
+test "Responses names a cyber policy failure as its own cause" {
+    for ([_][]const u8{
+        "{\"type\":\"response.failed\",\"response\":{\"id\":\"resp_cyber\",\"error\":{\"code\":\"cyber_policy\",\"message\":\"This content was flagged for possible cybersecurity risk.\"}}}",
+        "{\"type\":\"error\",\"code\":\"cyber_policy\",\"message\":\"This content was flagged for possible cybersecurity risk.\"}",
+    }) |event| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(event);
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+        try std.testing.expectEqualStrings("cyber_policy", @tagName(completion.provider_failure_cause.?));
+        try std.testing.expectEqualStrings(
+            "cyber_policy: This content was flagged for possible cybersecurity risk.",
+            completion.provider_failure_detail.?,
+        );
+    }
 }
 
 test "Responses terminal metadata rejects contradictions before publishing final text" {
