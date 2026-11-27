@@ -8426,6 +8426,7 @@ fn processQueuedPromptLoop(
 
         debug_trace.logf("agent", "step start step={d} limit={d} messages={d}", .{ current_step_index, config.agent_step_limit, gateway_instructions.items.len + gateway_messages.items.len });
         debug_trace.eventf("agent", "step_begin", step_ctx, "step_index={d} step_limit={d} gateway_messages={d}", .{ current_step_index, config.agent_step_limit, gateway_instructions.items.len + gateway_messages.items.len });
+        if (deps.model_step_started) |notify| notify(deps.ctx, turn_id, current_step_index);
 
         var stream_ctx = runtime_assistant_stream.StreamChunkContext{
             .hooks = deps,

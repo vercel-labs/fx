@@ -1,0 +1,44 @@
+```mermaid
+stateDiagram-v2
+    [*] --> Starting : user runs fx ask
+    Starting --> ErrorResultWritten : fails before first model step (bad flags, missing auth)
+    Starting --> Running : run_started written to event sink
+
+    Running --> ModelStreaming : model request starts (step_start emitted)
+    ModelStreaming --> RecoveryWait : transient failure (recovery emitted, ticker armed)
+    RecoveryWait --> ModelStreaming : wait expires (resend)
+    ModelStreaming --> ParallelTools : model calls tools (step_end emitted)
+    ParallelTools --> ParallelTools : tool finishes out of order (tool_start/tool_end emitted)
+    ParallelTools --> Running : all tools in batch finish
+
+    ModelStreaming --> Finalizing : model finishes final answer (step_end emitted)
+    Finalizing --> Done : run_finished to sink + exact --json result on stdout
+
+    Running --> Cancelling : SIGTERM arrives
+    ModelStreaming --> Cancelling : SIGTERM arrives
+    RecoveryWait --> Cancelling : SIGTERM arrives
+    ParallelTools --> Cancelling : SIGTERM arrives
+    Finalizing --> Cancelling : SIGTERM arrives
+
+    Cancelling --> CancelledBroken : [current / mutant-buffered / mutant-skip-cancel] events buffered or cancel dropped (violates NoEventLostOnSigterm)
+    Cancelling --> DoneCancelled : [design-a / design-b] cancel event flushed, prior events kept
+
+    Running --> Killed : SIGKILL arrives (all prior flushed event lines remain valid JSONL)
+    ModelStreaming --> Killed : SIGKILL arrives
+    ParallelTools --> Killed : SIGKILL arrives
+
+    note right of CancelledBroken
+        Shortest path to broken NoEventLostOnSigterm (current-sigterm):
+        Starting -> Running -> Cancelling -> CancelledBroken (exit 143, empty stdout).
+        Other broken mutants:
+        - mutant-unlocked: parallel tool B races tool A -> ValidJsonPerLine
+        - mutant-no-final: Finalizing omits final JSON -> FinalResultMatchesJson
+        - mutant-file-abort: Design B event file ENOSPC aborts turn -> FileFullDoesNotAbortTurn
+        - mutant-stdout-clobber: Design B writes events to stdout -> IgnoreEventsGetsResult
+    end note
+```
+
+Events omitted from chart to keep <= 20 arrows:
+- `SinkFails` (stdout closed/full in Design A stops emitting; event file full in Design B latches and continues stdout)
+- `TickerEmit` (concurrent recovery/notice refresh serialized under mutex)
+- `SIGKILL` from `RecoveryWait`, `Cancelling`, and `Finalizing`

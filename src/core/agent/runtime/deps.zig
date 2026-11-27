@@ -360,6 +360,7 @@ pub const AgentRuntimeDeps = struct {
     confirm_session_writer: ?*const fn (ctx: *anyopaque) anyerror!void = null,
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,
+    model_step_started: ?*const fn (ctx: *anyopaque, turn_id: u64, step: usize) void = null,
     push_text: *const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void,
     push_reasoning_delta: ?*const fn (ctx: *anyopaque, delta: []const u8) anyerror!void = null,
     push_tool_lifecycle: *const fn (ctx: *anyopaque, event: types.ToolLifecycleEvent) anyerror!void = discardToolLifecycle,
