@@ -92,11 +92,34 @@ fn presenceInProfile() host.SecretStorePresence {
         .follow_symlinks = false,
     }) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
     defer fx_dir.close(io_mod.getIo());
-    const stat = fx_dir.statFile(io_mod.getIo(), profile_paths.gemini_api_key_file_name, .{
+    var file = fx_dir.openFile(io_mod.getIo(), profile_paths.gemini_api_key_file_name, .{
+        .mode = .read_only,
+        .allow_directory = false,
         .follow_symlinks = false,
+        .resolve_beneath = true,
     }) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
+    defer file.close(io_mod.getIo());
+
+    const stat = file.stat(io_mod.getIo()) catch return .unavailable;
     if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) return .unavailable;
-    return if (stat.size == 0) .missing else .present;
+
+    var read_buf: [512]u8 = undefined;
+    defer std.crypto.secureZero(u8, &read_buf);
+    var r = file.reader(io_mod.getIo(), &read_buf);
+    var total_bytes: usize = 0;
+    var has_non_whitespace = false;
+    while (true) {
+        var chunk: [256]u8 = undefined;
+        defer std.crypto.secureZero(u8, &chunk);
+        const n = r.interface.readSliceShort(&chunk) catch return .unavailable;
+        if (n == 0) break;
+        total_bytes += n;
+        if (total_bytes >= max_key_file_bytes) return .unavailable;
+        if (!has_non_whitespace and std.mem.trim(u8, chunk[0..n], " \t\r\n").len > 0) {
+            has_non_whitespace = true;
+        }
+    }
+    return if (has_non_whitespace) .present else .missing;
 }
 
 fn loadFromProfile(alloc: Allocator) host.SecretStoreLoadError!?[]u8 {
@@ -159,7 +182,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) host.SecretStoreLoadError!
     var borrowed = false;
     defer if (!borrowed) secret.zeroAndFree(alloc, bytes);
 
-    const trimmed = std.mem.trim(u8, bytes, "\r\n");
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
     if (trimmed.len == 0) return null;
     if (trimmed.len == bytes.len) {
         borrowed = true;
@@ -340,4 +363,20 @@ test "gemini key backend label names the store that keeps the key" {
 test "gemini key interactive store prompts only where save uses the Keychain" {
     // Test builds never use the Keychain, so this returns before any prompt.
     try std.testing.expect(!(try storeInteractive()));
+}
+
+test "gemini key presence treats whitespace-only and newline-only files as missing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+    defer alloc.free(home);
+    const env = try TestEnv.install(alloc, home);
+    defer env.deinit();
+
+    for ([_][]const u8{ "\n\n", "  \t \r\n " }) |blank| {
+        try save(alloc, blank);
+        try std.testing.expectEqual(host.SecretStorePresence.missing, presence());
+        try std.testing.expect((try load(alloc)) == null);
+    }
 }

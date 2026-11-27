@@ -684,7 +684,11 @@ fn streamAgentCompletion(
     const shared_pool: ?*http_pool.HttpPool = if (context) |ctx| @ptrCast(@alignCast(ctx)) else null;
     const credential_source = request.credential.credentialSource();
     if (credential_source == .configured) return agent_stream_provider_contract.failResult(error.ConfiguredCredentialCannotAuthorizeGateway);
-    if (credential_source == .chatgpt_subscription or credential_source == .grok_subscription) {
+    if (credential_source == .chatgpt_subscription or
+        credential_source == .grok_subscription or
+        credential_source == .google_subscription or
+        credential_source == .gemini_api_key)
+    {
         return agent_stream_provider_contract.failResult(
             error.SubscriptionCredentialCannotAuthorizeGateway,
         );
@@ -805,6 +809,12 @@ fn fetchCredits(
     }
     if (input.credential_source == .grok_subscription) {
         return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for a Grok subscription.");
+    }
+    if (input.credential_source == .google_subscription) {
+        return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for a Google AI Pro or Ultra plan.");
+    }
+    if (input.credential_source == .gemini_api_key) {
+        return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for a Gemini API key.");
     }
     var local_cancel = std.atomic.Value(bool).init(false);
     return fetchCreditsWithFetch(
@@ -3833,5 +3843,40 @@ test "gateway catalog reads the Token Pass marks and nothing else as one" {
     for (catalog.items) |entry| {
         const marked = std.mem.eql(u8, entry.id, "zai/glm-5.3") or std.mem.eql(u8, entry.id, "acme/new-pass-model");
         try std.testing.expectEqual(marked, entry.token_pass);
+    }
+}
+
+test "Gateway stream and credits refuse Google subscription and Gemini API key credentials" {
+    var cancelled = std.atomic.Value(bool).init(false);
+    var delivery: agent_stream_provider_contract.DeliveryCertainty = .{};
+    var evidence: agent_stream_provider_contract.AttemptEvidence = .{};
+    const Ignore = struct {
+        fn event(_: *anyopaque, _: agent_stream_provider_contract.Event) void {}
+    };
+
+    for ([_]credentials.Source{ .google_subscription, .gemini_api_key }) |source| {
+        try std.testing.expectError(error.SubscriptionCredentialCannotAuthorizeGateway, streamAgentCompletion(null, std.testing.allocator, .{
+            .credential = .{ .direct = .{ .secret_bytes = "google-secret", .source = source } },
+            .model = "google/gemini-2.5-pro",
+            .retry_count = 1,
+            .messages = &.{},
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &evidence,
+            .events = .{ .context = &cancelled, .emit_fn = Ignore.event },
+            .cancel_flag = &cancelled,
+        }));
+
+        var snapshot = fetchCredits(null, std.testing.allocator, .{
+            .credential = "google-secret",
+            .credential_source = source,
+            .tenant = null,
+        });
+        defer snapshot.deinit(std.testing.allocator);
+        try std.testing.expect(snapshot.err_message != null);
+        try std.testing.expect(std.mem.startsWith(u8, snapshot.err_message.?, "AI Gateway credits are unavailable for a "));
     }
 }

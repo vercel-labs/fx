@@ -178,6 +178,15 @@ const BrowserLoginContext = struct {
     fn submitManualUrl(self: *BrowserLoginContext, alloc: Allocator, input: []const u8) !void {
         const target = try parseManualCallbackTargetAlloc(alloc, input, self.redirect_uri);
         errdefer secret.zeroAndFree(alloc, target);
+        if (parseBrowserCallbackTarget(alloc, target, self.state)) |cb| {
+            var owned = cb;
+            owned.deinit(alloc);
+        } else |err| switch (err) {
+            error.GoogleOAuthStateMismatch => return error.GoogleOAuthStateMismatch,
+            error.InvalidGoogleOAuthCallback => return error.InvalidGoogleCallbackUrl,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Cancelled, error.GoogleAuthorizationFailed => {},
+        }
 
         self.manual_url_mutex.lockUncancelable(io_mod.getIo());
         defer self.manual_url_mutex.unlock(io_mod.getIo());
@@ -346,8 +355,17 @@ fn pollBrowserToken(
     defer if (manual_callback) |*callback| callback.deinit(alloc);
 
     const code = if (manual_target) |target| blk: {
+        manual_callback = parseBrowserCallbackTarget(alloc, target, context.state) catch |err| switch (err) {
+            error.GoogleOAuthStateMismatch => {
+                debug_trace.logf("auth", "Google manual callback ignored: state mismatch", .{});
+                return .pending;
+            },
+            else => {
+                context.closeListener();
+                return err;
+            },
+        };
         context.closeListener();
-        manual_callback = try parseBrowserCallbackTarget(alloc, target, context.state);
         break :blk manual_callback.?.code;
     } else blk: {
         const listener = &(context.listener orelse return error.GoogleOAuthCallbackListenerFailed);
@@ -426,7 +444,12 @@ fn classifyBrowserCallback(
 ) browser_callback.ParseResult(BrowserCallback) {
     const context: *BrowserCallbackParserContext = @ptrCast(@alignCast(raw.?));
     const callback = parseBrowserCallbackTarget(alloc, target, context.expected_state) catch |err| switch (err) {
-        error.InvalidGoogleOAuthCallback => return .unrelated,
+        error.InvalidGoogleOAuthCallback, error.GoogleOAuthStateMismatch => {
+            if (err == error.GoogleOAuthStateMismatch) {
+                debug_trace.logf("auth", "Google callback ignored: state belongs to another attempt", .{});
+            }
+            return .unrelated;
+        },
         else => return .{ .failed = err },
     };
     return .{ .accepted = callback };
@@ -583,8 +606,18 @@ pub fn runLoginWithOptions(
             return error.Interrupted;
         }
         if (try stdin_url.poll()) |pasted| {
-            _ = try runtime.submitManualCode(alloc, pasted);
-            stdin_url.clear();
+            defer stdin_url.clear();
+            _ = runtime.submitManualCode(alloc, pasted) catch |err| switch (err) {
+                error.InvalidGoogleCallbackUrl => {
+                    try writeStdout("Paste the full callback URL from your browser (http://127.0.0.1:.../oauth2callback?...).\n");
+                    continue;
+                },
+                error.GoogleOAuthStateMismatch => {
+                    try writeStdout("Ignored callback URL for a different sign-in attempt. Paste the current callback URL or finish in the browser.\n");
+                    continue;
+                },
+                else => return err,
+            };
         }
         switch (runtime.pollTransition(alloc)) {
             // The callback listener and the pasted URL have no event to wait on
@@ -632,7 +665,6 @@ const StdinManualUrlReader = struct {
         @memcpy(self.buffer[self.len..][0..line_end], chunk[0..line_end]);
         self.len += line_end;
         if (line_end < read_len) {
-            self.closed = true;
             return self.buffer[0..self.len];
         }
         return null;
@@ -1172,6 +1204,15 @@ pub fn revokeToken(
     defer response.deinit(alloc);
 
     const status = effectiveHttpStatus(response);
+    if (status == 400) {
+        if (parseErrorCodeAlloc(alloc, response.body)) |err_code| {
+            defer alloc.free(err_code);
+            if (std.mem.eql(u8, err_code, "invalid_token")) {
+                debug_trace.logf("auth", "Google token revoke accepted status=400 error=invalid_token", .{});
+                return;
+            }
+        }
+    }
     if (status < 200 or status >= 300) {
         debug_trace.logf("auth", "Google token revoke rejected status={d}", .{status});
         return error.GoogleRevokeFailed;
@@ -2529,5 +2570,255 @@ test "Google signOutOnDevice removes local login without revoking, and failed di
     try testing.expect(!retry_res.failed);
     try testing.expectEqual(@as(usize, 1), ok.calls);
     try testing.expect(!ok.saw_dpop);
+    try pending_revocation.expectKept(pending_revocation.Place.of(.google), &.{});
+}
+
+test "Google wrong-state paste drops paste, keeps listener open, and allows browser callback to finish" {
+    const alloc = testing.allocator;
+    var home = try TestHome.initDefaultClient(alloc);
+    defer home.deinit();
+
+    const ExchangeTransport = struct {
+        nonce: []const u8 = "",
+        fn execute(raw: ?*anyopaque, a: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const id_tok = try buildTestIdToken(a, accepted_issuer_https, "test-client-id", nowSeconds() + 3600, self.nonce, "sub-google-paste-recover", "recover@example.com");
+            defer a.free(id_tok);
+            const body = try a.print(
+                "{{\"access_token\":\"ya29.recovered-access\",\"refresh_token\":\"1//recovered-refresh\",\"expires_in\":3599,\"token_type\":\"Bearer\",\"scope\":\"openid email {s}\",\"id_token\":\"{s}\"}}",
+                .{ required_scope, id_tok },
+            );
+            return .{ .disposition = .accepted, .status = 200, .body = body };
+        }
+    };
+
+    var transport = ExchangeTransport{};
+    var browser = try prepareBrowserSignIn(alloc, .{
+        .client_id = "test-client-id",
+        .client_secret = "test-client-secret",
+    }, .{});
+    defer {
+        browser.prepared.deinit(alloc);
+        browser.context.deinit(alloc);
+        alloc.destroy(browser.context);
+    }
+    transport.nonce = browser.context.nonce;
+
+    const wrong_paste = try alloc.print("{s}?code=4%2Fwrong-paste&state=stale-state", .{browser.context.redirect_uri});
+    defer alloc.free(wrong_paste);
+    const wrong_target = try parseManualCallbackTargetAlloc(alloc, wrong_paste, browser.context.redirect_uri);
+    browser.context.manual_url = wrong_target;
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromSeconds(5),
+    });
+    const first_poll = try pollBrowserToken(
+        browser.context,
+        alloc,
+        .{ .context = &transport, .execute_fn = ExchangeTransport.execute },
+        browser.prepared.metadata,
+        "test-client-id",
+        "",
+        &cancel_flag,
+        deadline,
+    );
+    try testing.expect(first_poll == .pending);
+    try testing.expect(browser.context.listener != null);
+    try testing.expect(browser.context.manual_url == null);
+
+    // The listener stayed open, so a real browser callback with the matching state finishes the sign-in.
+    const port = browser.context.listener.?.socket.address.getPort();
+    const CallbackSender = struct {
+        port: u16,
+        state: []const u8,
+        fn send(self: @This()) void {
+            const addr = std.Io.net.IpAddress.parse("127.0.0.1", self.port) catch return;
+            var stream = addr.connect(io_mod.getIo(), .{ .mode = .stream }) catch return;
+            defer stream.close(io_mod.getIo());
+            var wbuf: [512]u8 = undefined;
+            var w = stream.writer(io_mod.getIo(), &wbuf);
+            w.interface.print("GET /oauth2callback?code=4%2Fgood-code&state={s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", .{self.state}) catch return;
+            w.interface.flush() catch return;
+        }
+    };
+    const sender = try std.Thread.spawn(.{}, CallbackSender.send, .{CallbackSender{ .port = port, .state = browser.context.state }});
+    defer sender.join();
+
+    var second_poll: oauth.PollResult = .pending;
+    while (second_poll == .pending) {
+        second_poll = try pollBrowserToken(
+            browser.context,
+            alloc,
+            .{ .context = &transport, .execute_fn = ExchangeTransport.execute },
+            browser.prepared.metadata,
+            "test-client-id",
+            "",
+            &cancel_flag,
+            deadline,
+        );
+    }
+    switch (second_poll) {
+        .success => |tokens| {
+            var owned = tokens;
+            defer owned.deinit(alloc);
+            try testing.expectEqualStrings("ya29.recovered-access", owned.access_token);
+        },
+        else => return error.ExpectedTokensAfterRecovery,
+    }
+    try testing.expect(browser.context.listener == null);
+
+    // Via SignInRuntime: submitManualCode refuses mismatched state and a valid paste still finishes.
+    var runtime: login_flow.SignInRuntime = .{};
+    defer runtime.deinit(alloc);
+    try testing.expect(try startSignIn(&runtime, alloc, .{ .context = &transport, .execute_fn = ExchangeTransport.execute }));
+    var params = try AuthQueryParams.fromRuntime(alloc, &runtime);
+    defer params.deinit(alloc);
+    transport.nonce = params.nonce;
+
+    const bad_runtime_paste = try alloc.print("{s}?code=4%2Fbad&state=wrong-state", .{params.redirect_uri});
+    defer alloc.free(bad_runtime_paste);
+    try testing.expectError(error.GoogleOAuthStateMismatch, runtime.submitManualCode(alloc, bad_runtime_paste));
+
+    const good_runtime_paste = try alloc.print("{s}?code=4%2Fgood&state={s}", .{ params.redirect_uri, params.state });
+    defer alloc.free(good_runtime_paste);
+    try testing.expect(try runtime.submitManualCode(alloc, good_runtime_paste));
+
+    switch (waitSignInTransition(alloc, &runtime)) {
+        .succeeded => |completion| {
+            var owned = completion;
+            defer owned.deinit(alloc);
+            try testing.expect(owned == .google);
+            try testing.expectEqualStrings("sub-google-paste-recover", owned.google.subject);
+        },
+        else => return error.TestExpectedSucceededSignIn,
+    }
+}
+
+test "Google browser callback classifier ignores state mismatch as unrelated" {
+    const alloc = testing.allocator;
+    var parser_ctx = BrowserCallbackParserContext{ .expected_state = "expected-state" };
+
+    switch (classifyBrowserCallback(&parser_ctx, alloc, "/oauth2callback?code=c&state=wrong-state")) {
+        .unrelated => {},
+        else => return error.ExpectedUnrelatedCallback,
+    }
+    switch (classifyBrowserCallback(&parser_ctx, alloc, "/oauth2callback?error=access_denied&state=wrong-state")) {
+        .unrelated => {},
+        else => return error.ExpectedUnrelatedCallback,
+    }
+
+    var listener = try bindBrowserCallback();
+    defer listener.deinit(io_mod.getIo());
+    const port = listener.socket.address.getPort();
+
+    const ClientSender = struct {
+        port: u16,
+        first_status_line: [64]u8 = @splat(0),
+        first_status_len: usize = 0,
+
+        fn send(self: *@This()) void {
+            const addr = std.Io.net.IpAddress.parse("127.0.0.1", self.port) catch return;
+            {
+                var stream = addr.connect(io_mod.getIo(), .{ .mode = .stream }) catch return;
+                defer stream.close(io_mod.getIo());
+                var wbuf: [256]u8 = undefined;
+                var w = stream.writer(io_mod.getIo(), &wbuf);
+                w.interface.writeAll("GET /oauth2callback?code=wrong&state=stale HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") catch return;
+                w.interface.flush() catch return;
+                var buf: [256]u8 = undefined;
+                var r = stream.reader(io_mod.getIo(), &buf);
+                const n = r.interface.readSliceShort(&self.first_status_line) catch 0;
+                self.first_status_len = n;
+            }
+            {
+                var stream = addr.connect(io_mod.getIo(), .{ .mode = .stream }) catch return;
+                defer stream.close(io_mod.getIo());
+                var wbuf: [256]u8 = undefined;
+                var w = stream.writer(io_mod.getIo(), &wbuf);
+                w.interface.writeAll("GET /oauth2callback?code=good-code&state=expected-state HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") catch return;
+                w.interface.flush() catch return;
+            }
+        }
+    };
+
+    var sender = ClientSender{ .port = port };
+    const thread = try std.Thread.spawn(.{}, ClientSender.send, .{&sender});
+    defer thread.join();
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var accepted: ?browser_callback.Accepted(BrowserCallback) = null;
+    while (accepted == null) {
+        accepted = try awaitBrowserCallback(alloc, &listener, "expected-state", &cancel_flag);
+    }
+    defer {
+        accepted.?.callback.deinit(alloc);
+        accepted.?.deinit();
+    }
+    try testing.expectEqualStrings("good-code", accepted.?.callback.code);
+    try testing.expect(std.mem.startsWith(u8, sender.first_status_line[0..sender.first_status_len], "HTTP/1.1 404 "));
+}
+
+test "Google revoke treats HTTP 400 invalid_token as revoked and forgets kept sign-out" {
+    const alloc = testing.allocator;
+    var home = try TestHome.init(alloc, &.{.{ e2e_revoke_url_env, "http://127.0.0.1:1/revoke" }});
+    defer home.deinit();
+
+    const StatusBodyTransport = struct {
+        status: u16,
+        body: []const u8,
+        fn provider(self: *@This()) oauth_transport.Provider {
+            return .{ .context = self, .execute_fn = execute };
+        }
+        fn execute(raw: ?*anyopaque, a: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{
+                .disposition = if (self.status >= 200 and self.status < 300) .accepted else .rejected,
+                .status = self.status,
+                .body = try a.dupe(u8, self.body),
+            };
+        }
+    };
+
+    try saveTestAccount(alloc, "sub-invalid-tok", "ya29.tok", nowSeconds() + 3600, nowSeconds() + 86400, null);
+    var invalid_token_transport = StatusBodyTransport{ .status = 400, .body = "{\"error\":\"invalid_token\"}" };
+    const disconnect_res = try disconnectAccount(alloc, invalid_token_transport.provider(), null);
+    try testing.expect(disconnect_res.local_deleted);
+    try testing.expect(disconnect_res.remote_revoked);
+    try testing.expect(!disconnect_res.retry_kept);
+    try pending_revocation.expectKept(pending_revocation.Place.of(.google), &.{});
+
+    var fx_dir = try home.tmp.dir.openDir(io_mod.getIo(), ".fx", .{});
+    defer fx_dir.close(io_mod.getIo());
+    const record_json = try alloc.print(
+        "{{\"version\":1,\"entries\":[{{\"saved_at_ms\":{d},\"refresh_token\":\"1//stale-refresh\"}}]}}\n",
+        .{io_mod.milliTimestamp()},
+    );
+    defer alloc.free(record_json);
+    var rec_file = try fx_dir.createFile(io_mod.getIo(), "google-revocations.json", .{
+        .truncate = true,
+        .permissions = .fromMode(0o600),
+    });
+    defer rec_file.close(io_mod.getIo());
+    try rec_file.writeStreamingAll(io_mod.getIo(), record_json);
+
+    var other_err_transport = StatusBodyTransport{ .status = 400, .body = "{\"error\":\"invalid_request\"}" };
+    const retry_fail = retryKeptSignOuts(alloc, other_err_transport.provider(), null);
+    try testing.expectEqual(@as(usize, 0), retry_fail.revoked);
+    try testing.expect(retry_fail.failed);
+    try pending_revocation.expectKept(pending_revocation.Place.of(.google), &.{"1//stale-refresh"});
+
+    // Clear the in-process lease on disk to simulate the next retry pass in a new process.
+    var rec_file2 = try fx_dir.createFile(io_mod.getIo(), "google-revocations.json", .{
+        .truncate = true,
+        .permissions = .fromMode(0o600),
+    });
+    defer rec_file2.close(io_mod.getIo());
+    try rec_file2.writeStreamingAll(io_mod.getIo(), record_json);
+
+    const retry_ok = retryKeptSignOuts(alloc, invalid_token_transport.provider(), null);
+    try testing.expectEqual(@as(usize, 1), retry_ok.revoked);
+    try testing.expect(!retry_ok.failed);
     try pending_revocation.expectKept(pending_revocation.Place.of(.google), &.{});
 }

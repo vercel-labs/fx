@@ -359,13 +359,10 @@ pub fn Runtime(comptime App: type) type {
                 };
                 var revocation: ?auth_runtime.RemoteRevocation = if (local.refresh_token) |token| .{ .google = token } else null;
                 defer if (revocation) |pending| releaseRemoteRevocation(pending);
-                const key_deleted = gemini_api_key.delete(app.alloc) catch {
-                    try writeAuthNotice(app, .{
-                        .topic = "auth",
-                        .tone = .@"error",
-                        .body = "Could not durably remove saved Gemini API key. The current source is unchanged.",
-                    });
-                    return;
+                var key_delete_failed = false;
+                const key_deleted = gemini_api_key.delete(app.alloc) catch blk: {
+                    key_delete_failed = true;
+                    break :blk false;
                 };
                 const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterGoogleLogout"))
                     try app.auth.reconcileAfterGoogleLogout(app.alloc)
@@ -381,7 +378,7 @@ pub fn Runtime(comptime App: type) type {
                         .tone = .neutral,
                         .body = "Signed out on this device. Disconnecting your Google Account...",
                     });
-                } else if (!key_deleted) {
+                } else if (!key_deleted and !key_delete_failed) {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .neutral,
@@ -390,6 +387,16 @@ pub fn Runtime(comptime App: type) type {
                 }
                 try reconcileSubscriptionLogout(app, agent, .google);
                 try startRemoteRevocation(app, &revocation, local.kept);
+                if (key_delete_failed) {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = if (local.local_deleted or changed)
+                            "Could not durably remove saved Gemini API key."
+                        else
+                            "Could not durably remove saved Gemini API key. The current source is unchanged.",
+                    });
+                }
                 return;
             }
 
@@ -401,13 +408,10 @@ pub fn Runtime(comptime App: type) type {
                 });
                 return;
             };
-            const key_deleted = gemini_api_key.delete(app.alloc) catch {
-                try writeAuthNotice(app, .{
-                    .topic = "auth",
-                    .tone = .@"error",
-                    .body = "Could not durably remove saved Gemini API key. The current source is unchanged.",
-                });
-                return;
+            var key_delete_failed = false;
+            const key_deleted = gemini_api_key.delete(app.alloc) catch blk: {
+                key_delete_failed = true;
+                break :blk false;
             };
             const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterGoogleLogout"))
                 try app.auth.reconcileAfterGoogleLogout(app.alloc)
@@ -428,7 +432,7 @@ pub fn Runtime(comptime App: type) type {
                     .body = "Signed out of Google.",
                 });
             }
-            if (!plan_deleted and !key_deleted) {
+            if (!plan_deleted and !key_deleted and !key_delete_failed) {
                 try writeAuthNotice(app, .{
                     .topic = "auth",
                     .tone = .neutral,
@@ -436,6 +440,16 @@ pub fn Runtime(comptime App: type) type {
                 });
             }
             try reconcileSubscriptionLogout(app, agent, .google);
+            if (key_delete_failed) {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = if (plan_deleted or changed)
+                        "Could not durably remove saved Gemini API key."
+                    else
+                        "Could not durably remove saved Gemini API key. The current source is unchanged.",
+                });
+            }
         }
 
         /// Signs out of Codex locally, then revokes its refresh token at
@@ -936,6 +950,15 @@ pub fn Runtime(comptime App: type) type {
                                         .topic = "auth",
                                         .tone = .warning,
                                         .body = "Paste the full callback URL from your browser (http://127.0.0.1:.../oauth2callback?...).",
+                                    });
+                                    app.shell.render_requests.request(.footer);
+                                    return true;
+                                },
+                                error.GoogleOAuthStateMismatch => {
+                                    try writeAuthNotice(app, .{
+                                        .topic = "auth",
+                                        .tone = .warning,
+                                        .body = "That callback URL is for a different sign-in attempt. Paste the current callback URL or finish in the browser.",
                                     });
                                     app.shell.render_requests.request(.footer);
                                     return true;
@@ -3211,6 +3234,9 @@ const TestAuth = struct {
     sign_in_code_toggle_succeeds: bool = true,
     sign_in_code_submit_count: usize = 0,
     sign_in_code_submit_succeeds: bool = true,
+    sign_in_code_submit_error: ?anyerror = null,
+    google_logout_reconcile_count: usize = 0,
+    remote_revocation_count: usize = 0,
     inventory_refresh_action: ?auth_runtime.InventoryRefreshAction = null,
     inventory_refresh_fails: bool = false,
     prompt_refresh_start: auth_runtime.PromptCredentialRefreshStart = .not_needed,
@@ -3313,6 +3339,7 @@ const TestAuth = struct {
 
     fn submitSignInCode(self: *TestAuth, _: std.mem.Allocator) !bool {
         self.sign_in_code_submit_count += 1;
+        if (self.sign_in_code_submit_error) |err| return err;
         return self.sign_in_code_submit_succeeds;
     }
 
@@ -3401,6 +3428,18 @@ const TestAuth = struct {
     fn reconcileAfterFxLoginLogout(self: *TestAuth, _: std.mem.Allocator) !bool {
         self.logout_reconcile_count += 1;
         return self.logout_changed;
+    }
+
+    pub fn reconcileAfterGoogleLogout(self: *TestAuth, _: std.mem.Allocator) !bool {
+        self.google_logout_reconcile_count += 1;
+        return self.logout_changed;
+    }
+
+    pub fn beginRemoteRevocation(self: *TestAuth, target: auth_runtime.RemoteRevocation, _: bool) bool {
+        var owned = target;
+        owned.deinit();
+        self.remote_revocation_count += 1;
+        return true;
     }
 
     fn refreshSourceInventory(self: *TestAuth, _: std.mem.Allocator) !void {
@@ -4772,4 +4811,89 @@ test "parseLogoutCommandArgs parses google --disconnect and rejects invalid flag
 
     try std.testing.expectError(error.DisconnectNeedsGoogle, parseLogoutCommandArgs(alloc, "codex --disconnect"));
     try std.testing.expectError(error.InvalidLogoutArgs, parseLogoutCommandArgs(alloc, "google --bogus"));
+}
+
+test "Google sign-in code entry warns on state mismatch and keeps entry open" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.sign_in_entry_active = true;
+    app.auth.sign_in_code_entry_active = true;
+    app.auth.sign_in_code_submit_error = error.GoogleOAuthStateMismatch;
+
+    try std.testing.expect(try Runtime(TestApp).routeAuthPickerByte(&app, (&app).agent(), '\r'));
+    try std.testing.expect(app.auth.sign_in_entry_active);
+    try std.testing.expect(app.auth.sign_in_code_entry_active);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "different sign-in attempt") != null);
+}
+
+test "logout google reconciles auth and starts remote revocation when Gemini key delete fails" {
+    const dpop = @import("../auth/dpop.zig");
+    const google_session = @import("../auth/google_session.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var env = try StartupCredentialTestEnv.install(alloc, &.{
+        .{ "HOME", home },
+        .{ "FX_DISABLE_KEYCHAIN", "1" },
+    });
+    defer env.deinit(alloc);
+
+    const saveAccount = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const seed: [dpop.seed_bytes]u8 = @splat(0x42);
+            const kp = try dpop.keyPairFromSeed(seed);
+            const encoded_key = try dpop.encodeSecretKeyAlloc(a, kp);
+            defer a.free(encoded_key);
+
+            var mutation = try google_session.beginMutation(a);
+            defer mutation.deinit(a);
+            var record = google_session.Record{};
+            defer record.deinit(a);
+            try record.upsertAccount(a, .{
+                .subject = "sub-1",
+                .email = "u@example.com",
+                .client_id = "cid",
+                .refresh_token = "1//refresh-secret",
+                .refresh_token_expires_at_s = 1_900_000_000,
+                .access_token = "ya29.access",
+                .access_token_expires_at_s = 1_900_000_000,
+                .dpop_private_key = encoded_key,
+                .dpop_nonce = null,
+                .granted_scopes = &.{"openid"},
+            }, true);
+            try mutation.save(a, record);
+        }
+    }.run;
+
+    // 1. --disconnect: removes Google session, reconciles auth, starts remote revoke, reports failure accurately.
+    try saveAccount(alloc);
+    // Make deleting gemini-api-key fail even under root by placing a directory at its path
+    // after saveAccount creates .fx with private 0o700 permissions.
+    try tmp.dir.createDirPath(std.testing.io, ".fx/gemini-api-key");
+    var disconnect_app: TestApp = .{};
+    defer disconnect_app.deinit();
+    disconnect_app.auth.active_source = .google_subscription;
+    disconnect_app.auth.logout_changed = true;
+
+    try Runtime(TestApp).logoutGoogleWithOptions(&disconnect_app, (&disconnect_app).agent(), true);
+    try std.testing.expect((try google_session.loadActiveAccount(alloc)) == null);
+    try std.testing.expectEqual(@as(usize, 1), disconnect_app.auth.google_logout_reconcile_count);
+    try std.testing.expectEqual(@as(usize, 1), disconnect_app.auth.remote_revocation_count);
+    try std.testing.expect(std.mem.find(u8, disconnect_app.transcript.items, "Could not durably remove saved Gemini API key.") != null);
+    try std.testing.expect(std.mem.find(u8, disconnect_app.transcript.items, "The current source is unchanged.") == null);
+
+    // 2. Local /logout google: removes Google session, reconciles auth, reports failure accurately.
+    try saveAccount(alloc);
+    var local_app: TestApp = .{};
+    defer local_app.deinit();
+    local_app.auth.active_source = .google_subscription;
+    local_app.auth.logout_changed = true;
+
+    try Runtime(TestApp).logoutGoogleWithOptions(&local_app, (&local_app).agent(), false);
+    try std.testing.expect((try google_session.loadActiveAccount(alloc)) == null);
+    try std.testing.expectEqual(@as(usize, 1), local_app.auth.google_logout_reconcile_count);
+    try std.testing.expect(std.mem.find(u8, local_app.transcript.items, "Could not durably remove saved Gemini API key.") != null);
+    try std.testing.expect(std.mem.find(u8, local_app.transcript.items, "The current source is unchanged.") == null);
 }

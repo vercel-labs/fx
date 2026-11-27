@@ -411,7 +411,7 @@ test("fx login google refuses a callback with a mismatched state", async () => {
   badCallback.searchParams.set("state", "wrong-state-value");
 
   const badResponse = await fetch(badCallback.toString());
-  expect(badResponse.status).toBe(400);
+  expect(badResponse.status).toBe(404);
 
   proc.kill("SIGINT");
   const result = await closePromise;
