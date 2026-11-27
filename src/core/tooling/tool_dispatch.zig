@@ -295,6 +295,9 @@ pub const DispatchContext = struct {
     ask_question_ctx: ?*anyopaque = null,
     observer: ?*observation.Observer = null,
     ask_question_batch: ?AskQuestionBatchFn = null,
+    /// A subagent's context: its questions go to its parent, so
+    /// `ask_user_question` refuses and says how to ask the parent.
+    questions_go_to_parent: bool = false,
     tool_capabilities: ToolCapabilities = .{},
     web_fetch_runtime: ?*web_fetch_runtime.Runtime = null,
     web_fetch_artifact_store: ?*web_fetch_artifacts.Store = null,

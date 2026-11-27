@@ -344,19 +344,19 @@ function expectReportCarriesFirstTurn(body: string, answer: string, toolCalls: s
   expect(body).toContain(answer);
 }
 
-// Main starts a writer and a helper that finishes. The writer's prompt (an
-// approval or a question) is open when main's first turn ends, so the helper's
+// Main starts a writer and a helper that finishes. The writer's approval, or
+// its out-of-credits picker, is open when main's first turn ends, so the helper's
 // report waits for that turn's commit, and the prompt is answered while it
 // waits. The report's request has to carry the first turn, which the loop
 // committed after the report was posted.
-async function reportBehindAnsweredPrompt(prompt: "approval" | "question") {
+async function reportBehindAnsweredPrompt(prompt: "approval" | "out_of_credits") {
   const promptShown = held();
   const mainTurnEnded = held();
   const reports: string[] = [];
   let writerCalls = 0;
   let tracePath = "";
   const env: Record<string, string> = {};
-  const promptText = prompt === "approval" ? "Subagent writer needs permission" : "SWITCH_QUESTION pick one";
+  const promptText = prompt === "approval" ? "Subagent writer needs permission" : "Out of credits. What should fx do?";
   await withFx((body) => {
     const latest = latestUserText(body);
     if (latest.startsWith(REPORT_HEADER)) {
@@ -368,9 +368,7 @@ async function reportBehindAnsweredPrompt(prompt: "approval" | "question") {
       if (writerCalls > 1) return text("child_done", "SWITCH_WRITER_DONE");
       return prompt === "approval"
         ? toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" })
-        : toolCall("child_ask", "ask_user_question", {
-          questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_A" }, { label: "SWITCH_B" }] }],
-        });
+        : outOfCredits();
     }
     if (latest.includes("SWITCH_HELPER_TASK")) return mainTurnEnded.promise.then(() => text("helper_done", "SWITCH_HELPER_DONE"));
     if (!body.includes('"main_w"')) {
@@ -388,7 +386,8 @@ async function reportBehindAnsweredPrompt(prompt: "approval" | "question") {
     mainTurnEnded.release();
     // The report is posted and waits for the first turn's commit, which the open
     // prompt keeps back. Answer the prompt once the worker holds the report, or
-    // the report started anyway.
+    // the report started anyway. The approval's first option and the picker's
+    // retry are both "1".
     await until("the report to wait for the first turn", () => traceHas(tracePath, "event=commit_gate_held") || reports.length >= 1);
     await session.sendKeys("1");
     await until("main's request for the helper's report", () => reports.length >= 1);
@@ -493,8 +492,8 @@ async function withFx(
   }
 }
 
-// Main starts a writer and a helper that finishes. The writer's prompt (an
-// approval or a question) stays open on main's screen. The gateway holds main's
+// Main starts a writer and a helper that finishes. The writer's approval, or
+// its out-of-credits picker, stays open on main's screen. The gateway holds main's
 // reply that ends its first turn until the prompt is on the screen, and the
 // helper's reply until main's worker has ended that turn, so the helper's
 // report waits for main's next turn while the pacer still holds the first turn
@@ -509,16 +508,17 @@ async function withFx(
 // once the writer's request arrived. Whichever the case, the report's request
 // has to carry the turns main finished before it: the report was posted before
 // the loop committed them.
-async function reportWhilePromptStaysOpen(prompt: "approval" | "question" | "none", reportDelayMs = 0, secondReport = false) {
+async function reportWhilePromptStaysOpen(prompt: "approval" | "out_of_credits" | "none", reportDelayMs = 0, secondReport = false) {
   const promptShown = held();
   const writerReleased = held();
   const mainTurnEnded = held();
   const reportTurnEnded = held();
   const reports: string[] = [];
   let writerCalls = 0;
+  let mainTurns = 0;
   let tracePath = "";
   const env: Record<string, string> = {};
-  const promptText = prompt === "approval" ? "Subagent writer needs permission" : "SWITCH_QUESTION pick one";
+  const promptText = prompt === "out_of_credits" ? "Out of credits. What should fx do?" : "Subagent writer needs permission";
   await withFx((body) => {
     const latest = latestUserText(body);
     if (latest.startsWith(REPORT_HEADER)) {
@@ -531,9 +531,7 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "question" | "non
       if (prompt === "none") return writerReleased.promise.then(() => text("child_done", "SWITCH_WRITER_DONE"));
       return prompt === "approval"
         ? toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" })
-        : toolCall("child_ask", "ask_user_question", {
-          questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_A" }, { label: "SWITCH_B" }] }],
-        });
+        : outOfCredits();
     }
     if (latest.includes("SWITCH_HELPER_TASK")) {
       return mainTurnEnded.promise.then(() => Bun.sleep(reportDelayMs)).then(() => text("helper_done", "SWITCH_HELPER_DONE"));
@@ -548,6 +546,10 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "question" | "non
         ...(secondReport ? [{ id: "main_s", agent: "scout", message: "SWITCH_SCOUT_TASK" }] : []),
       ]);
     }
+    // A lent out-of-credits picker tells main that the writer waits, and that
+    // turn answers with its own text so the first turn stays shown once.
+    mainTurns += 1;
+    if (prompt === "out_of_credits" && mainTurns > 1) return text("main_recovery", "SWITCH_MAIN_RECOVERY");
     return promptShown.promise.then(() => text("main_one", "SWITCH_MAIN_ONE"));
   }, async (session, { home }) => {
     const trace = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
@@ -574,7 +576,9 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "question" | "non
       const open = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_ONE") && pane.includes(promptText), 15_000);
 
       // The first turn shows above the open prompt, once, and the prompt stays.
-      // The report turn's answer waits behind the prompt.
+      // The report turn's answer waits behind the prompt. A lent out-of-credits
+      // picker also tells main that the writer waits ("Message from writer"),
+      // and that turn answers SWITCH_MAIN_RECOVERY, never the first turn again.
       expect(open).not.toContain("SWITCH_MAIN_REPORT_1");
       expect((await session.captureFullScrollback()).split("SWITCH_MAIN_ONE").length - 1).toBe(1);
     }
@@ -611,7 +615,11 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "question" | "non
 
     // Nothing of a turn is shown twice.
     const after = await session.captureFullScrollback();
-    const markers = ["SWITCH_MAIN_ONE", ...Array.from({ length: reportTurns }, (_, i) => `SWITCH_MAIN_REPORT_${i + 1}`)];
+    const markers = [
+      "SWITCH_MAIN_ONE",
+      ...(prompt === "out_of_credits" ? ["SWITCH_MAIN_RECOVERY"] : []),
+      ...Array.from({ length: reportTurns }, (_, i) => `SWITCH_MAIN_REPORT_${i + 1}`),
+    ];
     for (const marker of markers) {
       expect(after.split(marker).length - 1).toBe(1);
     }
@@ -640,7 +648,7 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "question" | "non
 
 describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
 
-  for (const prompt of ["approval", "question"] as const) {
+  for (const prompt of ["approval", "out_of_credits"] as const) {
     test(
       `a report that waited for main's turn while a subagent's ${prompt} was open carries that turn once the prompt is answered`,
       async () => {
@@ -2182,11 +2190,12 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "a subagent's question shows on main's screen, named for it, and is answered there",
+    "a subagent's question never reaches the user, and the subagent reads how to ask its parent",
     async () => {
       let mainCalls = 0;
       let childCalls = 0;
       let answer = "";
+      let mainReport = "";
       await withFx((body) => {
         if (!isMainRequest(body)) {
           childCalls += 1;
@@ -2196,7 +2205,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
             });
           }
           answer = body;
-          return text("child_done", "SWITCH_ASKER_DONE");
+          return text("child_done", "CHILD_ASKED_PARENT");
         }
         mainCalls += 1;
         if (mainCalls === 1) {
@@ -2204,18 +2213,30 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
             request: { action: "message", agent: "asker", message: "SWITCH_ASK_TASK" },
           });
         }
-        return text("main_done", "SWITCH_MAIN_DONE");
+        if (mainCalls === 2) return text("main_done", "SWITCH_MAIN_DONE");
+        mainReport = body;
+        return text("main_report", "SWITCH_MAIN_REPORT_SEEN");
       }, async (session) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForPane((pane) => pane.includes("SWITCH_QUESTION pick one") && pane.includes("asker asks"), 30_000);
-        await session.sendKeys("1");
-        const main = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_DONE"), 30_000);
-        expect(main).not.toContain("SWITCH_QUESTION");
-        expect(answer).toContain("SWITCH_ALPHA");
+        await until("the child's second request", () => childCalls === 2, 30_000);
+        expect(answer).toContain("Subagents never ask the user");
 
-        // The question and its answer belong to the subagent's conversation.
+        // No prompt waited for the user: neither the question nor its header
+        // is on main's screen, now or once the child has reported.
+        const pane = await session.capturePane();
+        expect(pane).not.toContain("SWITCH_QUESTION pick one");
+        expect(pane).not.toContain("asker asks");
+        await until("main's report from the child", () => mainCalls === 3, 30_000);
+        const main = await session.waitForPane((shown) => shown.includes("SWITCH_MAIN_REPORT_SEEN"), 30_000);
+        expect(main).not.toContain("SWITCH_QUESTION pick one");
+        expect(main).not.toContain("asker asks");
+
+        // Main receives the child's report, which read how to ask its parent.
+        expect(mainReport).toContain("CHILD_ASKED_PARENT");
+
+        // The refusal belongs to the subagent's conversation.
         await showAgent(session, "asker");
-        await session.waitForPane((pane) => pane.includes("SWITCH_ASKER_DONE"), 15_000);
+        await session.waitForPane((shown) => shown.includes("CHILD_ASKED_PARENT"), 15_000);
       });
     },
     TIMEOUT,
@@ -2297,30 +2318,6 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       expect(waiting).toContain("writer: waiting for an approval");
       expect(waiting).not.toContain("writer: working");
       expect(answered).toContain("writer: idle");
-      expect(answered).not.toContain("waiting for");
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "main's status says a subagent waits for the user's answer, and not once it is answered",
-    async () => {
-      const [waiting, answered] = await mainReadsStatus(
-        toolCall("child_ask", "ask_user_question", {
-          questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_ALPHA" }, { label: "SWITCH_BETA" }] }],
-        }),
-        "asker",
-        "SWITCH_ASK_TASK",
-        async (session) => {
-          await session.waitForPane((pane) => pane.includes("SWITCH_QUESTION pick one") && pane.includes("asker asks"), 30_000);
-        },
-        async (session) => {
-          await session.sendKeys("1");
-        },
-      );
-      expect(waiting).toContain("asker: waiting for the user's answer");
-      expect(waiting).not.toContain("asker: working");
-      expect(answered).toContain("asker: idle");
       expect(answered).not.toContain("waiting for");
     },
     TIMEOUT,
@@ -2478,31 +2475,28 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "main's stop ends a subagent's open question and the turn that asked it",
+    "main's stop ends a subagent's open out-of-credits prompt and the turn that asked it",
     async () => {
       let stopResult = "";
       let statusAfter = "";
       let childCalls = 0;
       let stage = 0;
       const promptShows = held();
+      let promptPane = "";
       await withFx(async (body) => {
         if (!isMainRequest(body)) {
           childCalls += 1;
-          if (childCalls === 1) {
-            return toolCall("child_ask", "ask_user_question", {
-              questions: [{ question: "SWITCH_QUESTION pick one", options: [{ label: "SWITCH_ALPHA" }, { label: "SWITCH_BETA" }] }],
-            });
-          }
-          return text("child_after", "SWITCH_ASKER_STOPPED");
+          if (childCalls === 1) return outOfCredits();
+          return text("child_after", "SWITCH_PAYER_STOPPED");
         }
         stage += 1;
         if (stage === 1) {
-          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "asker", message: "SWITCH_ASK_TASK" } });
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "payer", message: "SWITCH_PAY_TASK" } });
         }
         if (stage === 2) {
-          // Main's next step waits for the question on its screen.
+          // Main's next step waits for the picker on its screen.
           await promptShows.promise;
-          return toolCall("main_stop", "subagent", { request: { action: "stop", agent: "asker" } });
+          return toolCall("main_stop", "subagent", { request: { action: "stop", agent: "payer" } });
         }
         if (stage === 3) stopResult = toolResultText(body, "main_stop");
         else statusAfter = toolResultText(body, `main_status_${stage - 1}`);
@@ -2515,14 +2509,17 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_done", "SWITCH_MAIN_DONE");
       }, async (session) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForPane((pane) => pane.includes("SWITCH_QUESTION pick one") && pane.includes("asker asks"), 30_000);
+        promptPane = await session.waitForPane((pane) =>
+          pane.includes("Out of credits. What should fx do?") && pane.includes("I added credits, retry"), 30_000);
+        expect(promptPane).toContain("payer asks");
         promptShows.release();
-        // The question leaves main's screen with the subagent's turn.
-        const main = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_DONE") && !pane.includes("SWITCH_QUESTION pick one"), 30_000);
-        expect(main).not.toContain("asker asks");
+        // The picker leaves main's screen with the subagent's turn.
+        const main = await session.waitForPane((pane) =>
+          pane.includes("SWITCH_MAIN_DONE") && !pane.includes("Out of credits. What should fx do?"), 30_000);
+        expect(main).not.toContain("payer asks");
       });
-      expect(stopResult).toContain("Stopped asker: its turn ended");
-      expect(statusAfter).toContain("asker: idle");
+      expect(stopResult).toContain("Stopped payer: its turn ended");
+      expect(statusAfter).toContain("payer: idle");
       expect(statusAfter).not.toContain("working");
     },
     TIMEOUT,
@@ -5073,7 +5070,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
-  for (const prompt of ["approval", "question"] as const) {
+  for (const prompt of ["approval", "out_of_credits"] as const) {
     test(
       `a report for main starts its next turn while a subagent's ${prompt} stays open`,
       async () => {
@@ -5085,7 +5082,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
 
   // A person leaves a prompt open for longer than the gate's limit, and the
   // subagent reports after that.
-  for (const [prompt, seconds] of [["approval", 6], ["approval", 10], ["question", 6]] as const) {
+  for (const [prompt, seconds] of [["approval", 6], ["approval", 10], ["out_of_credits", 6]] as const) {
     test(
       `a report ${seconds} s late for main starts its next turn while a subagent's ${prompt} stays open`,
       async () => {

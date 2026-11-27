@@ -251,11 +251,11 @@ pub fn Runtime(comptime App: type) type {
                 .disabled;
             // A child's `subagent` calls go to its own host, which the tool
             // context already holds, as main's go to main's.
-            // A child's approvals and questions go to its own worker, as
-            // main's do, for main's runs and the user's alike; main's screen
-            // borrows them while the child is hidden.
+            // A child's approvals go to its own worker, as main's do; main's
+            // screen borrows them while the child is hidden. Its questions go
+            // to its parent, never the user.
             ctx.interactive = false;
-            ctx.ask_user_questions = true;
+            ctx.questions_go_to_parent = true;
             ctx.provider = run.admission.provider;
             ctx.model = run.admission.model;
             if (comptime @hasDecl(App, "providerSet")) {

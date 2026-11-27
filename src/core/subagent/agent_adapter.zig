@@ -115,6 +115,7 @@ const Context = struct {
         result.subagent_caller_id = self.turn.child_id;
         result.session_child_capability = self.turn.childCapability() catch null;
         result.interactive = false;
+        result.questions_go_to_parent = true;
         result.output_chunk_ctx = self;
         result.on_output_chunk = pushLiveOutputChunk;
         // A child's tool calls are no rows of the parent's, so neither are
@@ -423,8 +424,9 @@ pub fn childSystemPrompt(
         "{s}\n\n<subagent_role>\nYou are the subagent \"{s}\", started by \"{s}\". When work it gives you " ++
             "ends, your output reaches it on its own as your report. To message it sooner, for example when the " ++
             "user asks you to tell {s} something, call the subagent tool with action \"message\" and agent " ++
-            "\"parent\", if you have that tool.\n</subagent_role>",
-        .{ base_prompt, role.name, role.parent, role.parent },
+            "\"parent\", if you have that tool. Never ask the user anything. When a question or a decision blocks you, ask {s}: " ++
+            "message \"parent\" if you have that tool, or else end your turn with the question as your report.\n</subagent_role>",
+        .{ base_prompt, role.name, role.parent, role.parent, role.parent },
     );
     if (overlay.len == 0) return with_role;
     return alloc.print(
@@ -448,6 +450,8 @@ pub const Shown = union(enum) {
 };
 
 fn childSees(registry: tool_dispatch.Registry, shown: Shown, name: []const u8) bool {
+    // A subagent asks its parent, never the user.
+    if (std.mem.eql(u8, name, "ask_user_question")) return false;
     const subagent = std.mem.eql(u8, name, "subagent");
     switch (shown) {
         .profile => |profile| {
@@ -1166,7 +1170,8 @@ test "a child's system prompt names it and who started it, then wraps the run's 
     const expected_role = "<subagent_role>\nYou are the subagent \"reviewer\", started by \"main\". When work it " ++
         "gives you ends, your output reaches it on its own as your report. To message it sooner, for example when " ++
         "the user asks you to tell main something, call the subagent tool with action \"message\" and agent " ++
-        "\"parent\", if you have that tool.\n</subagent_role>";
+        "\"parent\", if you have that tool. Never ask the user anything. When a question or a decision blocks you, ask main: " ++
+        "message \"parent\" if you have that tool, or else end your turn with the question as your report.\n</subagent_role>";
     try std.testing.expectEqualStrings(
         "base prompt\n\n" ++ expected_role,
         try childSystemPrompt(arena.allocator(), null, "base prompt", role, ""),
@@ -1185,4 +1190,22 @@ test "a profile that replaces the system prompt still leaves a child its role" {
     try std.testing.expect(std.mem.startsWith(u8, prompt, "Review only.\n\n<subagent_role>\n"));
     try std.testing.expect(std.mem.find(u8, prompt, "You are the subagent \"helper\", started by \"lead\".") != null);
     try std.testing.expect(std.mem.find(u8, prompt, "base prompt") == null);
+}
+
+test "a subagent never sees ask_user_question, whatever its profile or its parent's tools allow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const names = [_][]const u8{ "ask_user_question", "read_file" };
+    // A null profile allows every tool, so only the tool itself can hide it.
+    const by_profile = try childToolNames(alloc, &names, .{}, .{ .profile = .{ .value = null, .behind = &.{} } });
+    try std.testing.expectEqual(@as(usize, 1), by_profile.len);
+    try std.testing.expectEqualStrings("read_file", by_profile[0]);
+    // The parent may allow it, and the child still never sees it.
+    const admitted = try childToolNames(alloc, &names, .{}, .{ .admitted = .{
+        .tools = &.{"ask_user_question"},
+        .starts_subagents = true,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), admitted.len);
+    try std.testing.expectEqualStrings("read_file", admitted[0]);
 }

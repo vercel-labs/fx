@@ -17,6 +17,8 @@ const legacy_permission_request_sentinel =
 
 pub const cancel_sentinel = "(user cancelled the question)";
 pub const not_available_sentinel = "(ask_user_question is only available in the interactive shell; ask the user freeform instead)";
+/// What a subagent reads when it calls the tool: it asks its parent instead.
+pub const ask_parent_sentinel = "(Subagents never ask the user. Ask your parent: message \"parent\" with the subagent tool if you have it, or end your turn with the question as your report.)";
 
 const invalid_args_sentinel = "(ask_user_question: invalid arguments; provide {questions})";
 const question_count_sentinel = std.fmt.comptimePrint(
@@ -106,6 +108,7 @@ fn hasLegacyPermissionRequestId(
 }
 
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    if (ctx.questions_go_to_parent) return .{ .success = try ctx.allocator.dupe(u8, ask_parent_sentinel) };
     const request = ctx.ask_question_batch orelse {
         return .{ .success = try ctx.allocator.dupe(u8, not_available_sentinel) };
     };
@@ -1075,6 +1078,44 @@ test "ask_user_question noninteractive returns sentinel before parsing" {
     switch (result) {
         .rich => return error.TestUnexpectedRichResult,
         .success => |body| try std.testing.expectEqualStrings(not_available_sentinel, body),
+        .failure => return error.TestExpectedEqual,
+    }
+}
+
+test "a subagent's call is refused with how to ask its parent" {
+    const Fixture = struct {
+        called: bool = false,
+
+        fn request(raw_ctx: ?*anyopaque, _: Allocator, _: []const core_types.QuestionBatchEntry) anyerror!?[][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            self.called = true;
+            return error.TestUnexpectedQuestionBatch;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const decoded = try decode(.{ .allocator = alloc }, "{\"questions\":[{\"question\":\"Proceed?\",\"options\":[{\"label\":\"Yes\"},{\"label\":\"No\"}]}]}");
+    const input = switch (decoded) {
+        .failure => |body| {
+            defer alloc.free(body);
+            return error.TestExpectedEqual;
+        },
+        .input => |owned| owned,
+    };
+    defer input.deinit(alloc);
+
+    var fixture = Fixture{};
+    const result = try call(.{
+        .allocator = alloc,
+        .ask_question_ctx = &fixture,
+        .ask_question_batch = Fixture.request,
+        .questions_go_to_parent = true,
+    }, input);
+    defer result.deinit(alloc);
+
+    try std.testing.expect(!fixture.called);
+    switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
+        .success => |body| try std.testing.expectEqualStrings(ask_parent_sentinel, body),
         .failure => return error.TestExpectedEqual,
     }
 }
