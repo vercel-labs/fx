@@ -17335,3 +17335,52 @@ test("a subagent started with its own model names that child model in its turn c
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 45_000);
+
+test("fx ask --json reports unsupported tty shell as a failed tool result and continues", async () => {
+  const root = createFixtureRoot("unsupported-shell-tool-result");
+  const tracePath = join(root.root, "trace.log");
+  writeFileSync(
+    join(root.home, ".fx", "settings.json"),
+    JSON.stringify({ permission_mode: "full-access" }),
+  );
+  const responses = [
+    fakeGatewayToolCall("bad_shell_1", "shell", {
+      request: {
+        action: "run",
+        command: "echo hi",
+        tty: true,
+        shell: { kind: "executable", path: "/nonexistent_eb47_shell" },
+      },
+    }),
+    fakeGatewayFinalText("Saw unsupported shell error."),
+  ];
+  const gateway = startGateway(() =>
+    responses.shift() ?? new Response("unexpected request", { status: 500 })
+  );
+  try {
+    const result = await runFx(
+      ["ask", "--json", "Run echo hi with the unsupported shell."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 15_000,
+      },
+    );
+    expect(result.code, `stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(0);
+    const json = parseAskJson(result.stdout);
+    expect(json.exit_code).toBe(0);
+    expect(json.output).toBe("Saw unsupported shell error.");
+    expect(gateway.requestCount()).toBe(2);
+    const toolOutput = toolResultOutput(gateway.requests[1]!.body, "bad_shell_1");
+    expect(toolOutput).toContain("Unsupported shell");
+    expect(toolOutput).toContain("/nonexistent_eb47_shell");
+    expect(toolOutput).toContain("bash");
+    expect(toolOutput).toContain("zsh");
+    expect(json.tool_calls).toContainEqual(
+      expect.objectContaining({ name: "shell", status: "error" }),
+    );
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+});

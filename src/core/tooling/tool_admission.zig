@@ -2656,11 +2656,52 @@ fn noninteractivePermissionRequired(call: ToolCall, reason: []const u8) ToolPerm
     return .permission_required;
 }
 
+const supported_shells_text = blk: {
+    const names = @typeInfo(shell_resolver.ShellKind).@"enum".field_names;
+    var text: []const u8 = "";
+    for (names, 0..) |name, index| {
+        if (index > 0) text = text ++ ", ";
+        text = text ++ name;
+    }
+    break :blk text;
+};
+
 pub fn permissionTargetResolutionFailureMessage(
     arena: Allocator,
     call: ToolCall,
     err: anyerror,
 ) !?[]const u8 {
+    switch (err) {
+        error.UnsupportedShell => {
+            if (try shellPathForFailureMessage(arena, call)) |shell_path| {
+                return try arena.print(
+                    "Unsupported shell \"{s}\"; supported shells: {s}",
+                    .{ shell_path, supported_shells_text },
+                );
+            }
+            return try arena.print(
+                "Unsupported shell; supported shells: {s}",
+                .{supported_shells_text},
+            );
+        },
+        error.RelativeShellPath => {
+            if (try shellPathForFailureMessage(arena, call)) |shell_path| {
+                return try arena.print(
+                    "Shell path must be absolute \"{s}\"; supported shells: {s}",
+                    .{ shell_path, supported_shells_text },
+                );
+            }
+            return try arena.print(
+                "Shell path must be absolute; supported shells: {s}",
+                .{supported_shells_text},
+            );
+        },
+        error.MissingLoginShell => return try arena.print(
+            "Missing login shell; supported shells: {s}",
+            .{supported_shells_text},
+        ),
+        else => {},
+    }
     const reason: ?[]const u8 = switch (err) {
         error.FileNotFound => "Path not found",
         error.NotDir => "Path is not a directory",
@@ -2687,6 +2728,22 @@ pub fn permissionTargetResolutionFailureMessage(
         try arena.print("Cannot resolve path \"{s}\": {s}", .{ path, @errorName(err) })
     else
         try arena.print("Cannot resolve tool target path: {s}", .{@errorName(err)});
+}
+
+fn shellPathForFailureMessage(arena: Allocator, call: ToolCall) !?[]const u8 {
+    const raw = tool_args.parseToolArgsObject(arena, call.arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const args = (try tool_args.unwrapRequest(arena, raw)) orelse raw;
+    const shell = explicitTtyShell(arena, args) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    } orelse return null;
+    return switch (shell) {
+        .executable => |value| if (value.path.len > 0) value.path else null,
+        .user_login => null,
+    };
 }
 
 /// Best-effort extraction of the path the caller asked for, so the failure
@@ -2920,6 +2977,47 @@ test "permission target failures name the unresolved path without hiding runtime
 
     for ([_]anyerror{ error.OutOfMemory, error.Cancelled, error.HostAuthorityUnavailable }) |err| {
         try std.testing.expectEqual(null, try permissionTargetResolutionFailureMessage(arena, call, err));
+    }
+}
+
+test "permission target resolution and outcome report unsupported tty shell to the model" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const unsupported_call: ToolCall = .{
+        .id = "unsupported_shell",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\",\"tty\":true,\"shell\":{\"kind\":\"executable\",\"path\":\"/nonexistent_eb47_shell\"}}",
+    };
+    const with_path = (try permissionTargetResolutionFailureMessage(arena, unsupported_call, error.UnsupportedShell)).?;
+    try std.testing.expectEqualStrings(
+        "Unsupported shell \"/nonexistent_eb47_shell\"; supported shells: bash, zsh",
+        with_path,
+    );
+
+    const bare_shell_call: ToolCall = .{
+        .id = "unsupported_shell_bare",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\",\"tty\":true}",
+    };
+    const bare_msg = (try permissionTargetResolutionFailureMessage(arena, bare_shell_call, error.UnsupportedShell)).?;
+    try std.testing.expectEqualStrings(
+        "Unsupported shell; supported shells: bash, zsh",
+        bare_msg,
+    );
+
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    const input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    for ([_]PermissionMode{ .yolo, .auto, .ask }) |mode| {
+        const outcome = try requestPermissionOutcome(input, arena, unsupported_call, mode, &.{});
+        const failure = outcome.tool_failure orelse return error.TestExpectedToolFailure;
+        try std.testing.expectEqualStrings(
+            "Unsupported shell \"/nonexistent_eb47_shell\"; supported shells: bash, zsh",
+            failure,
+        );
     }
 }
 
