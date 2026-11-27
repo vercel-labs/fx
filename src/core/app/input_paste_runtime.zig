@@ -14,6 +14,7 @@ const paste_blocks = @import("../input/pasted_blocks.zig");
 const paste_framing = @import("../input/paste_framing.zig");
 const text_scalar = @import("../input/text_scalar.zig");
 const render_request = @import("../../ui/render_request.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 
@@ -104,12 +105,20 @@ pub fn PasteEditRuntime(comptime App: type) type {
             return app.auth.signInCodeEntryActive();
         }
 
+        fn forkMenuAsking(agent: *const AppAgent) bool {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            return agent.session_persistence.fork_menu.asking();
+        }
+
         pub fn beginPaste(app: *App, agent: *AppAgent, max_input_len: usize) void {
             const owner: paste_framing.Owner = if (agent.question_prompt.isActive())
                 if (agent.question_prompt.isFreeformSelected()) .question_freeform else .decision_prompt
             else if (agent.approval_prompt.isAmending())
                 .approval_amendment
             else if (agent.approval_prompt.isActive())
+                .decision_prompt
+            else if (forkMenuAsking(agent))
                 .decision_prompt
             else if (authCodeEntryActive(app))
                 .auth_code

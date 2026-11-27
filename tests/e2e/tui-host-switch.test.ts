@@ -5080,7 +5080,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("/fork");
         await session.waitForPane((pane) => pane.includes("enter fork"), 15_000);
         await session.sendKeys("Enter");
-        await session.waitForPane((pane) => !pane.includes("enter fork"), 15_000);
+        await session.waitForPane((pane) => pane.includes("Bring 3 subagents into the fork?"), 15_000);
+        await session.sendKeys("Enter");
+        await session.waitForPane((pane) => pane.includes("session forked"), 30_000);
         await session.waitForComposer(30_000);
         await session.sendKeys("C-x");
         const list = await session.waitForPane((pane) => pane.includes(LIST_HINT) && subagentRow("broken").test(pane)

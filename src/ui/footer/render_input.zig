@@ -570,7 +570,25 @@ fn steering_unit_width(raw: []const u8) usize {
     return width + display_width.visibleWidth(raw[safe_start..]);
 }
 
-/// Borrows at most two visible row slices; measurement and painting share this layout.
+/// The offset past the lines of only spaces and tabs that begin at `start`.
+fn skipBlankLines(message: []const u8, start: usize) usize {
+    var offset = start;
+    while (true) {
+        var end = offset;
+        while (end < message.len and (message[end] == ' ' or message[end] == '\t')) end += 1;
+        if (end == message.len) return end;
+        if (message[end] != '\n' and message[end] != '\r') return offset;
+        const cr = message[end] == '\r';
+        end += 1;
+        if (cr and end < message.len and message[end] == '\n') end += 1;
+        offset = end;
+    }
+}
+
+/// Borrows at most `max_message_layout_rows` visible row slices; measurement and
+/// painting share this layout. Blank lines around text take no row, so a preview
+/// never shows an empty row or a lone `…` for them. A message with no text, such
+/// as a queued image-only one, keeps its single row so its marker still shows.
 pub fn steering_message_layout(
     message: []const u8,
     width: u16,
@@ -581,7 +599,8 @@ pub fn steering_message_layout(
         .content_width = if (waits_for_boundary) width -| 2 else width,
     };
     const limit = @min(row_limit, max_message_layout_rows);
-    var offset: usize = 0;
+    const first_text = skipBlankLines(message, 0);
+    var offset: usize = if (first_text == message.len) 0 else first_text;
     while (layout.row_count < limit) {
         const start = offset;
         var cells: usize = 0;
@@ -612,6 +631,7 @@ pub fn steering_message_layout(
             const cr = message[offset] == '\r';
             offset += 1;
             if (cr and offset < message.len and message[offset] == '\n') offset += 1;
+            offset = skipBlankLines(message, offset);
         } else if (!soft_separator and offset < message.len) {
             if (last_space) |space| {
                 if (space > start) {
@@ -679,7 +699,8 @@ test "steering preview layout retains prefix slices at row boundaries" {
         .{ .text = "one two three", .width = 7, .first = "one two", .second = "three", .truncated = false },
         .{ .text = "abc \ndef", .width = 3, .first = "abc", .second = "def", .truncated = false },
         .{ .text = "界海語", .width = 3, .first = "界", .second = "海", .truncated = true },
-        .{ .text = "first\n\nthird", .width = 20, .first = "first", .second = "", .truncated = true },
+        .{ .text = "first\n\nthird", .width = 20, .first = "first", .second = "third", .truncated = false },
+        .{ .text = "\n \t\nfirst\r\n\r\n  \nsecond\nthird", .width = 20, .first = "first", .second = "second", .truncated = true },
     };
     for (cases) |case| {
         const layout = steering_message_layout(case.text, case.width, false, 2);
@@ -688,6 +709,24 @@ test "steering preview layout retains prefix slices at row boundaries" {
         try std.testing.expectEqualStrings(case.second, layout.rows[1]);
         try std.testing.expectEqual(case.truncated, layout.truncated);
     }
+}
+
+test "steering preview layout skips blank lines, so they draw no empty row or lone ellipsis" {
+    const trailing = steering_message_layout("only line\n  \n\n", 20, false, 2);
+    try std.testing.expectEqual(@as(u16, 1), trailing.row_count);
+    try std.testing.expectEqualStrings("only line", trailing.rows[0]);
+    try std.testing.expect(!trailing.truncated);
+
+    // A message with no text keeps one row, as a queued image-only message needs.
+    for ([_][]const u8{ "", " \n\t\n" }) |no_text| {
+        const blank = steering_message_layout(no_text, 20, false, 2);
+        try std.testing.expectEqual(@as(u16, 1), blank.row_count);
+        try std.testing.expect(!blank.truncated);
+    }
+    try std.testing.expectEqual(@as(u16, 2), steeringBannerRowsForMessages(&.{" \n "}, true, 80));
+
+    // A queued steering message with a blank line reserves its two real rows.
+    try std.testing.expectEqual(@as(u16, 3), steeringBannerRowsForMessages(&.{"first\n\nthird"}, true, 80));
 }
 
 pub fn transientActivityGapRows(shell: *const TranscriptRuntime, tool_before_activity: bool) u16 {
