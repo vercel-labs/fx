@@ -2904,6 +2904,7 @@ fn executeToolCallAuthorized(
     request: agent_runtime.ToolExecutionRequest,
 ) !ToolExecutionResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    try markQuestionBreak(ctx, request.call_allocator, request.call);
     var tool_ctx = ctx.toolContext();
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
     tool_ctx.root_user_messages = request.root_user_messages;
@@ -2920,6 +2921,20 @@ fn executeToolCallAuthorized(
     };
     captureToolExecutionResult(ctx, request, result);
     return result;
+}
+
+/// Breaks the raw and JSON text after a question, direct or through toolbox,
+/// as a tool start does in `pushToolLifecycle`: a question starts no visible
+/// tool (`startToolVisibleLifecycle`), and `fx ask` never shows one, so the
+/// reply after it is a new paragraph. A question never runs in a parallel
+/// batch, so only this thread writes the break; other calls touch no state.
+fn markQuestionBreak(ctx: *AskContext, call_allocator: Allocator, call: ToolCall) !void {
+    var scratch_state = std.heap.ArenaAllocator.init(call_allocator);
+    defer scratch_state.deinit();
+    const carried = try toolbox.carriedCall(scratch_state.allocator(), call.name, call.arguments_json);
+    const ran_name = if (carried) |carried_call| carried_call.name else call.name;
+    if (!std.mem.eql(u8, ran_name, types.user_question_tool_name)) return;
+    if (ctx.raw_has_output) ctx.raw_boundary_pending = true;
 }
 
 fn captureToolExecutionError(
@@ -3314,6 +3329,7 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     v2.appendProgressWithRecord(
         progress.user,
         progress.execution,
+        progress.saved_execution,
         .{ .calls = progress.running_calls, .assistant = progress.running_assistant },
         progress.recovery_record,
     ) catch |err| {
@@ -9551,6 +9567,50 @@ test "CLI tagged stream routes source output rendering and diagnostics by mode" 
     defer parsed.deinit();
     try std.testing.expectEqualStrings(source_output, parsed.value.object.get("output").?.string);
     try std.testing.expectEqualStrings("final answer", parsed.value.object.get("final_output").?.string);
+}
+
+test "a question starts a new paragraph in raw and JSON output, as a tool does" {
+    const alloc = std.testing.allocator;
+    const question = "{\"questions\":[{\"question\":\"Choose next step?\",\"options\":[{\"label\":\"Run tests\"},{\"label\":\"Stop\"}]}]}";
+    const calls = [_]ToolCall{
+        .{ .id = "ask_1", .name = "ask_user_question", .arguments_json = question },
+        .{ .id = "ask_1", .name = "toolbox", .arguments_json = "{\"run\":\"ask_user_question\",\"arguments\":" ++ question ++ "}" },
+    };
+    for ([_]OutputMode{ .raw, .json }) |mode| {
+        for (calls) |call| {
+            var stdout_capture: TestCapture = .{};
+            defer stdout_capture.deinit(alloc);
+            var stderr_capture: TestCapture = .{};
+            defer stderr_capture.deinit(alloc);
+            var ctx = AskContext.init(
+                alloc,
+                testConfig(),
+                testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+                "/tmp/workspace",
+            );
+            defer ctx.deinit();
+            ctx.output_mode = mode;
+            const deps = agentRuntimeDeps(&ctx);
+            var arena_state = std.heap.ArenaAllocator.init(alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            try deps.push_text(deps.ctx, .{ .assistant_source = "One question first." });
+            _ = try executeToolCallAuthorized(@ptrCast(&ctx), .{
+                .call_allocator = arena,
+                .result_allocator = arena,
+                .call = call,
+                .authority = .ordinary,
+                .session_grants = &.{},
+                .advertised_dynamic_tool_names = &.{},
+                .max_tool_result_bytes = 4096,
+            });
+            try deps.push_text(deps.ctx, .{ .assistant_source = "Done after the question." });
+
+            const written = if (mode == .json) ctx.assistant_output.items else stdout_capture.bytes.items;
+            try std.testing.expectEqualStrings("One question first.\n\nDone after the question.", written);
+        }
+    }
 }
 
 test "CLI response restart preserves completed output and removes only the failed JSON preview" {

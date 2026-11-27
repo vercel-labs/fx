@@ -18,7 +18,7 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { traceReportNames, waitForNewTraceReport, type TraceReport } from "./trace-report";
 import { spawnSync } from "node:child_process";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
 import { startIdleDropProxy } from "./fixtures/idle-drop-proxy";
 import { startLegacyStreamableHttpFixture } from "./fixtures/mcp-legacy-remote";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
@@ -1896,7 +1896,7 @@ describe("MCP login", () => {
     const root = createRoot(auth, true, "http", auth.url, false);
     const child = Bun.spawn([FX_BIN, "mcp", "login", "--no-browser", "fixture"], {
       cwd: root.workspace,
-      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      env: Object.fromEntries(Object.entries(fxChildEnv(v2Env(root))).filter(([, v]) => v !== undefined)) as Record<string, string>,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
@@ -1930,7 +1930,7 @@ describe("MCP login", () => {
     const root = createRoot(auth, true, "http", auth.url, false);
     const child = Bun.spawn([FX_BIN, "mcp", "login", "--no-browser", "fixture"], {
       cwd: root.workspace,
-      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      env: Object.fromEntries(Object.entries(fxChildEnv(v2Env(root))).filter(([, v]) => v !== undefined)) as Record<string, string>,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
@@ -1978,7 +1978,7 @@ describe("MCP login", () => {
     writeFileSync(profile, JSON.stringify(config));
     const child = Bun.spawn([FX_BIN, "mcp", "login", "--no-browser", "fixture"], {
       cwd: root.workspace,
-      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      env: Object.fromEntries(Object.entries(fxChildEnv(v2Env(root))).filter(([, v]) => v !== undefined)) as Record<string, string>,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
@@ -2087,7 +2087,7 @@ describe("MCP login", () => {
     const root = createRoot(auth, true, "http", auth.url, false);
     const child = Bun.spawn([FX_BIN, "mcp", "login", "--no-browser", "fixture"], {
       cwd: root.workspace,
-      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      env: Object.fromEntries(Object.entries(fxChildEnv(v2Env(root))).filter(([, v]) => v !== undefined)) as Record<string, string>,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
@@ -2121,7 +2121,7 @@ describe("MCP login", () => {
     // A server that isn't configured: fx says so on stderr and exits 1, with nothing on stdout.
     const child = Bun.spawn([FX_BIN, "mcp", "login", "--no-browser", "nosuchserver"], {
       cwd: root.workspace,
-      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      env: Object.fromEntries(Object.entries(fxChildEnv(v2Env(root))).filter(([, v]) => v !== undefined)) as Record<string, string>,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
