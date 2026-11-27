@@ -86,8 +86,14 @@ pub fn Commands(comptime App: type) type {
             }, true);
         }
 
+        fn loadClipboardImage(app: *App) !image_attachments.ClipboardImageAttachment {
+            // Test apps supply a fake reader so tests never read the real clipboard.
+            if (comptime @hasDecl(App, "loadClipboardImageAttachment")) return app.loadClipboardImageAttachment();
+            return image_attachments.loadClipboardImageAttachment(app.alloc);
+        }
+
         pub fn attachClipboard(app: *App) !void {
-            var loaded = image_attachments.loadClipboardImageAttachment(app.alloc) catch |err| {
+            var loaded = loadClipboardImage(app) catch |err| {
                 if (err == error.NoClipboardImage) {
                     try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "no image found on clipboard" }, true);
                 } else if (err != error.Unsupported) {

@@ -3988,6 +3988,7 @@ const RoutingFakeApp = struct {
     upgrade_denied_count: usize = 0,
     suspend_count: usize = 0,
     workspace_access: app_workspace_runtime.Access = .{},
+    clipboard_image_reads: usize = 0,
 
     pub fn slashRegistry(_: *const RoutingFakeApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
@@ -3995,6 +3996,11 @@ const RoutingFakeApp = struct {
 
     pub fn urlOpener(_: *const RoutingFakeApp) host.UrlOpener {
         return .{ .open_fn = routingOpenUrl };
+    }
+
+    pub fn loadClipboardImageAttachment(self: *RoutingFakeApp) !image_attachments.ClipboardImageAttachment {
+        self.clipboard_image_reads += 1;
+        return error.NoClipboardImage;
     }
 
     fn init(alloc: std.mem.Allocator) !RoutingFakeApp {
@@ -10213,7 +10219,9 @@ test "app_input_runtime rejects same-epoch paste suffix without submitting it" {
 
     try std.testing.expectEqualStrings("keep", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
-    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+    // One notice for the clipboard check the empty paste starts, one for the ignored suffix.
+    try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
+    try std.testing.expectEqual(@as(usize, 2), app.notice_write_count);
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
 
     try feedRoutingBytes(&app, "\r");
@@ -10411,6 +10419,82 @@ test "app_input_runtime zero-content decision paste logs once" {
     const trace = try readTraceFileForTest(alloc, trace_path);
     defer alloc.free(trace);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "decision prompt paste dropped bytes=0 reason=decision_prompt_active"));
+}
+
+test "app_input_runtime empty composer paste checks the clipboard for an image" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "empty-composer-paste.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    const notices_before = app.notice_write_count;
+    // xterm.js terminals (VS Code, VSCodium, Cursor) send this for Cmd+V
+    // when the clipboard holds only an image.
+    try feedRoutingBytes(&app, "\x1b[200~\x1b[201~");
+    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
+    try std.testing.expectEqual(notices_before + 1, app.notice_write_count);
+    debug_trace.shutdown();
+
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "composer paste empty action=clipboard_image"));
+}
+
+test "app_input_runtime empty composer paste skips the clipboard while the model picker borrows the composer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "empty-paste-model-picker.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try enterRoutingShortcutEffortStage(&app, "draft", "draft".len);
+
+    try feedRoutingBytes(&app, "\x1b[200~\x1b[201~");
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_image_reads);
+    debug_trace.shutdown();
+
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "composer paste empty action=none reason=model_picker_borrows_composer"));
+}
+
+test "app_input_runtime text composer paste does not read the clipboard" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    try feedRoutingBytes(&app, "\x1b[200~hello\x1b[201~");
+    try std.testing.expectEqualStrings("hello", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_image_reads);
+}
+
+test "app_input_runtime ctrl+v reads the clipboard through the app's reader" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+    try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
 }
 
 test "app_input_runtime decision paste start clears pending ctrl-c and esc gestures" {
