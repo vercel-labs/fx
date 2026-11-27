@@ -4,6 +4,7 @@ const list_window = @import("../../core/shared/list_window.zig");
 const picker_presentation = @import("picker_presentation.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
 const session_store = @import("../../core/session/session_store.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const ui_render = @import("../render.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
@@ -239,7 +240,7 @@ pub fn composeSessionMenuRow(
     const summary = projection.itemAt(display_index) orelse return row;
 
     // item_stride is 1: every session is a single row.
-    const columns = matchingColumns(projection);
+    const columns = try matchingColumns(alloc, projection);
     if (layout.feedback_inline) {
         return composeCompactFailureTitleRow(
             alloc,
@@ -328,7 +329,7 @@ fn sessionTurnsText(buf: []u8, history_len: usize) []const u8 {
     ) catch "";
 }
 
-fn matchingColumns(projection: SessionMenuProjection) MetadataColumns {
+fn matchingColumns(alloc: Allocator, projection: SessionMenuProjection) !MetadataColumns {
     var cols: MetadataColumns = .{};
     var display_index: usize = 0;
     while (projection.itemAt(display_index)) |summary_ptr| : (display_index += 1) {
@@ -337,12 +338,95 @@ fn matchingColumns(projection: SessionMenuProjection) MetadataColumns {
         const age = session_catalog.relativeActivityAgeCompact(&age_buf, summary.updated_at_ms, projection.now_ms);
         var turns_buf: [32]u8 = undefined;
         const turns = sessionTurnsText(&turns_buf, summary.history_len);
-        cols.title = @max(cols.title, display_width.visibleWidth(session_catalog.displayTitle(summary)));
-        cols.workspace = @max(cols.workspace, display_width.visibleWidth(sessionWorkspaceLabel(summary)));
+        const title = try encodedTitle(alloc, summary);
+        defer alloc.free(title);
+        cols.title = @max(cols.title, display_width.visibleWidth(title));
+        const workspace = try encodedWorkspace(alloc, summary);
+        defer alloc.free(workspace);
+        cols.workspace = @max(cols.workspace, display_width.visibleWidth(workspace));
         cols.age = @max(cols.age, display_width.visibleWidth(age));
         cols.turns = @max(cols.turns, display_width.visibleWidth(turns));
     }
     return cols;
+}
+
+/// The code points this row draws as text instead of letting them act: the
+/// bidi embeddings, overrides and isolates, which could reorder the workspace,
+/// age and turns after them in a terminal that honors them.
+const bidi_controls = [_]struct { bytes: [3]u8, codepoint: u21 }{
+    .{ .bytes = .{ 0xe2, 0x80, 0xaa }, .codepoint = 0x202a },
+    .{ .bytes = .{ 0xe2, 0x80, 0xab }, .codepoint = 0x202b },
+    .{ .bytes = .{ 0xe2, 0x80, 0xac }, .codepoint = 0x202c },
+    .{ .bytes = .{ 0xe2, 0x80, 0xad }, .codepoint = 0x202d },
+    .{ .bytes = .{ 0xe2, 0x80, 0xae }, .codepoint = 0x202e },
+    .{ .bytes = .{ 0xe2, 0x81, 0xa6 }, .codepoint = 0x2066 },
+    .{ .bytes = .{ 0xe2, 0x81, 0xa7 }, .codepoint = 0x2067 },
+    .{ .bytes = .{ 0xe2, 0x81, 0xa8 }, .codepoint = 0x2068 },
+    .{ .bytes = .{ 0xe2, 0x81, 0xa9 }, .codepoint = 0x2069 },
+};
+
+/// The escape `encodeTerminalSafe` writes for a code point, such as `\u{202e}`.
+fn appendCodepointEscape(alloc: Allocator, out: *std.ArrayList(u8), codepoint: u21) !void {
+    var buf: [12]u8 = undefined;
+    buf[0] = '\\';
+    buf[1] = 'u';
+    buf[2] = '{';
+    const digit_end = 3 + std.fmt.printInt(buf[3 .. buf.len - 1], codepoint, 16, .lower, .{ .width = 4, .fill = '0' });
+    buf[digit_end] = '}';
+    try out.appendSlice(alloc, buf[0 .. digit_end + 1]);
+}
+
+/// Appends outside text as this row draws it. TAB, LF and a lone CR become one
+/// space each, because the row measures them as no cells while a terminal acts
+/// on them, and the bidi controls show as `\u{XXXX}` text so they cannot
+/// reorder the columns after them. Everything else takes the escapes
+/// `appendTerminalSafeText` writes, which keep the joiners and direction marks
+/// an emoji or a script needs.
+fn appendRowText(alloc: Allocator, out: *std.ArrayList(u8), raw: []const u8) !void {
+    var piece: std.ArrayList(u8) = .empty;
+    defer piece.deinit(alloc);
+    var index: usize = 0;
+    while (index < raw.len) {
+        var escaped = false;
+        for (bidi_controls) |control| {
+            if (!std.mem.startsWith(u8, raw[index..], &control.bytes)) continue;
+            try text_utils.appendTerminalSafeText(alloc, out, piece.items);
+            piece.clearRetainingCapacity();
+            try appendCodepointEscape(alloc, out, control.codepoint);
+            index += control.bytes.len;
+            escaped = true;
+            break;
+        }
+        if (escaped) continue;
+        const byte = raw[index];
+        if (byte == '\r' and index + 1 < raw.len and raw[index + 1] == '\n') {
+            try piece.append(alloc, ' ');
+            index += 2;
+            continue;
+        }
+        try piece.append(alloc, if (byte == '\t' or byte == '\n' or byte == '\r') ' ' else byte);
+        index += 1;
+    }
+    try text_utils.appendTerminalSafeText(alloc, out, piece.items);
+}
+
+/// The session title as the row draws it. A stored title is outside text, so
+/// its escapes show as text. Both the column width and the drawn row use these
+/// bytes. Caller frees it.
+fn encodedTitle(alloc: Allocator, summary: session_store.SessionSummary) ![]u8 {
+    var title: std.ArrayList(u8) = .empty;
+    errdefer title.deinit(alloc);
+    try appendRowText(alloc, &title, session_catalog.displayTitle(summary));
+    return title.toOwnedSlice(alloc);
+}
+
+/// The workspace basename as the row draws it; it is outside text too, so the
+/// same encoder sizes and draws it. Caller frees it.
+fn encodedWorkspace(alloc: Allocator, summary: session_store.SessionSummary) ![]u8 {
+    var workspace: std.ArrayList(u8) = .empty;
+    errdefer workspace.deinit(alloc);
+    try appendRowText(alloc, &workspace, sessionWorkspaceLabel(summary));
+    return workspace.toOwnedSlice(alloc);
 }
 
 fn composeTitleRow(
@@ -356,6 +440,9 @@ fn composeTitleRow(
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
 
+    const title = try encodedTitle(alloc, summary);
+    defer alloc.free(title);
+
     const indent_width: usize = if (width <= 4) 0 else 2;
     if (indent_width > 0) try row.appendSlice(alloc, "  ");
 
@@ -364,7 +451,8 @@ fn composeTitleRow(
     // no shared columns are supplied.
     var age_buf: [32]u8 = undefined;
     const age = session_catalog.relativeActivityAgeCompact(&age_buf, summary.updated_at_ms, now_ms);
-    const workspace = sessionWorkspaceLabel(summary);
+    const workspace = try encodedWorkspace(alloc, summary);
+    defer alloc.free(workspace);
     var turns_buf: [32]u8 = undefined;
     const turns = sessionTurnsText(&turns_buf, summary.history_len);
     const workspace_col = @max(columns.workspace, display_width.visibleWidth(workspace));
@@ -377,7 +465,7 @@ fn composeTitleRow(
     const metadata_overhead = prefix_width + picker_presentation.inline_picker_column_gap_width + metadata_width;
     const available_title_width = content_width -| metadata_overhead;
     const show_metadata = metadata_width > 0 and available_title_width >= minimum_title_column_width;
-    const measured_title_width = @max(columns.title, display_width.visibleWidth(session_catalog.displayTitle(summary)));
+    const measured_title_width = @max(columns.title, display_width.visibleWidth(title));
     const title_col = if (show_metadata)
         @min(measured_title_width, available_title_width)
     else
@@ -391,7 +479,7 @@ fn composeTitleRow(
     // Selection is signaled by brightness: bold bright white when selected,
     // dim gray otherwise, so the two are clearly distinct. No marker glyph.
     try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
-    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, session_catalog.displayTitle(summary), title_budget);
+    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, title, title_budget);
     try row.appendSlice(alloc, ui_render.reset_style);
 
     if (show_metadata) {
@@ -510,6 +598,22 @@ fn cloneClippedRow(alloc: Allocator, bytes: []const u8, width: u16) !std.ArrayLi
     return row;
 }
 
+/// The row as a terminal shows it: SGR sequences removed. Caller owns it.
+fn visibleRowText(alloc: Allocator, row: []const u8) ![]u8 {
+    var visible: std.ArrayList(u8) = .empty;
+    errdefer visible.deinit(alloc);
+    var at: usize = 0;
+    while (at < row.len) {
+        if (row[at] == 0x1b) {
+            at = display_width.ansiSequenceEnd(row, at);
+            continue;
+        }
+        try visible.append(alloc, row[at]);
+        at += 1;
+    }
+    return visible.toOwnedSlice(alloc);
+}
+
 test "resume menu starts every turn count in the same column" {
     const alloc = std.testing.allocator;
     const summaries = [_]session_store.SessionSummary{
@@ -586,6 +690,170 @@ test "resume menu renders each session on one line with a right metadata cluster
     try std.testing.expect(std.mem.find(u8, title.items, "resume-catalog · 8m · 24 turns") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "●") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "○") == null);
+}
+
+/// Every escape in `row` is one fx wrote: a CSI sequence. A stored title's own
+/// OSC, a BEL, or any other escape would be something else.
+fn expectOnlyFxSequences(row: []const u8) !void {
+    var at: usize = 0;
+    while (at < row.len) {
+        if (row[at] == 0x07) return error.InjectedBel;
+        if (row[at] == 0x1b) {
+            if (at + 1 >= row.len or row[at + 1] != '[') return error.InjectedEscape;
+            at = display_width.ansiSequenceEnd(row, at);
+            continue;
+        }
+        at += 1;
+    }
+}
+
+test "a session row shows a stored title's escapes as text and sizes its column to them" {
+    const alloc = std.testing.allocator;
+    const attack_title = "fix\x1b]2;owned\x07 the \u{202e} parser\u{0085} now";
+    // The row as it draws the attack title: ESC and BEL as \xNN, the bidi
+    // override and the C1 control as \u{XXXX}, and the rest as written.
+    const drawn_title = "fix\\x1b]2;owned\\x07 the \\u{202e} parser\\u{0085} now";
+    const summaries = [_]session_store.SessionSummary{
+        .{
+            .id = @constCast("attack"),
+            .workspace_root = @constCast("/tmp/resume-catalog"),
+            .title = @constCast(attack_title),
+            .created_at_ms = 1,
+            .updated_at_ms = 1_000,
+            .conversation_language = .literal("en"),
+            .history_len = 1,
+        },
+        .{
+            .id = @constCast("plain"),
+            .workspace_root = @constCast("/tmp/resume-catalog"),
+            .title = @constCast("plain title"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1_000,
+            .conversation_language = .literal("en"),
+            .history_len = 1,
+        },
+        .{
+            .id = @constCast("joined"),
+            .workspace_root = @constCast("/tmp/resume-catalog"),
+            .title = @constCast("team \u{1f469}\u{200d}\u{1f4bb} parser"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1_000,
+            .conversation_language = .literal("en"),
+            .history_len = 1,
+        },
+        .{
+            .id = @constCast("spacing"),
+            .workspace_root = @constCast("/tmp/resume-catalog"),
+            .title = @constCast("tab\there\nnow"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1_000,
+            .conversation_language = .literal("en"),
+            .history_len = 1,
+        },
+        .{
+            .id = @constCast("bidi"),
+            .workspace_root = @constCast("/tmp/resume-catalog"),
+            .title = @constCast("before \u{202e} after"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1_000,
+            .conversation_language = .literal("en"),
+            .history_len = 1,
+        },
+        .{
+            .id = @constCast("invalid"),
+            .workspace_root = @constCast("/tmp/resume-catalog"),
+            .title = @constCast("bad\xffbyte"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1_000,
+            .conversation_language = .literal("en"),
+            .history_len = 1,
+        },
+        .{
+            .id = @constCast("evil-workspace"),
+            .workspace_root = @constCast("/tmp/evil\x1b]2;x\u{0085}dir"),
+            .title = @constCast("hostile workspace"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1_000,
+            .conversation_language = .literal("en"),
+            .history_len = 1,
+        },
+    };
+    const projection: SessionMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .summaries = &summaries,
+        .scope = .current_workspace,
+        .now_ms = 1_000 + 8 * std.time.ms_per_min,
+    };
+
+    var plain_row = try composeSessionMenuRow(alloc, projection, 3, 200, 12);
+    defer plain_row.deinit(alloc);
+    const plain_visible = try visibleRowText(alloc, plain_row.items);
+    defer alloc.free(plain_visible);
+    const plain_meta = std.mem.find(u8, plain_visible, "resume-catalog") orelse return error.TestMissingWorkspace;
+    const plain_column = display_width.visibleWidth(plain_visible[0..plain_meta]);
+
+    // A stored title is outside text: its escapes show as text and no escape
+    // sequence of its own reaches the screen.
+    var attack_row = try composeSessionMenuRow(alloc, projection, 2, 200, 12);
+    defer attack_row.deinit(alloc);
+    try expectOnlyFxSequences(attack_row.items);
+    const attack_visible = try visibleRowText(alloc, attack_row.items);
+    defer alloc.free(attack_visible);
+    try std.testing.expect(std.mem.find(u8, attack_visible, drawn_title) != null);
+    try std.testing.expect(text_utils.isTerminalSafeText(attack_visible));
+    const attack_meta = std.mem.find(u8, attack_visible, "resume-catalog") orelse return error.TestMissingWorkspace;
+    try std.testing.expectEqual(plain_column, display_width.visibleWidth(attack_visible[0..attack_meta]));
+    try std.testing.expectEqual(
+        2 + display_width.visibleWidth(drawn_title) + picker_presentation.inline_picker_column_gap_width,
+        display_width.visibleWidth(attack_visible[0..attack_meta]),
+    );
+
+    // An emoji keeps its joiner as the transcript draws it, not as \u{200d} text.
+    var joined_row = try composeSessionMenuRow(alloc, projection, 4, 200, 12);
+    defer joined_row.deinit(alloc);
+    const joined_visible = try visibleRowText(alloc, joined_row.items);
+    defer alloc.free(joined_visible);
+    try std.testing.expect(std.mem.find(u8, joined_visible, "\u{1f469}\u{200d}\u{1f4bb}") != null);
+    try std.testing.expect(std.mem.find(u8, joined_visible, "\\u{200d}") == null);
+
+    // TAB and LF take one cell each, as the row measures them.
+    var spacing_row = try composeSessionMenuRow(alloc, projection, 5, 200, 12);
+    defer spacing_row.deinit(alloc);
+    try expectOnlyFxSequences(spacing_row.items);
+    const spacing_visible = try visibleRowText(alloc, spacing_row.items);
+    defer alloc.free(spacing_visible);
+    try std.testing.expect(std.mem.find(u8, spacing_visible, "tab here now") != null);
+    const spacing_meta = std.mem.find(u8, spacing_visible, "resume-catalog") orelse return error.TestMissingWorkspace;
+    try std.testing.expectEqual(plain_column, display_width.visibleWidth(spacing_visible[0..spacing_meta]));
+
+    // A bidi override shows as text, so it cannot reorder the columns after it.
+    var bidi_row = try composeSessionMenuRow(alloc, projection, 6, 200, 12);
+    defer bidi_row.deinit(alloc);
+    try expectOnlyFxSequences(bidi_row.items);
+    const bidi_visible = try visibleRowText(alloc, bidi_row.items);
+    defer alloc.free(bidi_visible);
+    try std.testing.expect(std.mem.find(u8, bidi_visible, "\\u{202e}") != null);
+    try std.testing.expect(std.mem.find(u8, bidi_visible, "\u{202e}") == null);
+    const bidi_meta = std.mem.find(u8, bidi_visible, "resume-catalog") orelse return error.TestMissingWorkspace;
+    try std.testing.expectEqual(plain_column, display_width.visibleWidth(bidi_visible[0..bidi_meta]));
+
+    // Invalid UTF-8 shows as its escape.
+    var invalid_row = try composeSessionMenuRow(alloc, projection, 7, 200, 12);
+    defer invalid_row.deinit(alloc);
+    try expectOnlyFxSequences(invalid_row.items);
+    const invalid_visible = try visibleRowText(alloc, invalid_row.items);
+    defer alloc.free(invalid_visible);
+    try std.testing.expect(std.mem.find(u8, invalid_visible, "bad\\xffbyte") != null);
+
+    // The workspace basename is outside text too.
+    var workspace_row = try composeSessionMenuRow(alloc, projection, 8, 200, 12);
+    defer workspace_row.deinit(alloc);
+    try expectOnlyFxSequences(workspace_row.items);
+    const workspace_visible = try visibleRowText(alloc, workspace_row.items);
+    defer alloc.free(workspace_visible);
+    try std.testing.expect(std.mem.find(u8, workspace_visible, "evil\\x1b]2;x\\u{0085}dir") != null);
+    try std.testing.expect(text_utils.isTerminalSafeText(workspace_visible));
 }
 
 test "resume menu renders loading empty and failure states" {
