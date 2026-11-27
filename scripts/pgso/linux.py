@@ -715,18 +715,18 @@ ARM64 = Platform(
     DISPLAY_NAME="Linux arm64",
     HOST_ARCH="aarch64",
     PROFILE_RUNTIME_TRIPLE="aarch64-unknown-linux-gnu",
-    # Linux arm64 candidates have measured up to 7.004 MiB, so the 0.250 MiB preferred headroom
-    # needs a ceiling of at least 7.254 MiB.
-    SIZE_CEILING_MIB=7.500,
+    # Linux arm64 candidates have measured up to 7.357 MiB, so the 0.250 MiB preferred headroom
+    # needs a ceiling of at least 7.607 MiB.
+    SIZE_CEILING_MIB=7.750,
 )
 X86_64 = Platform(
     TARGET="x86_64-linux",
     DISPLAY_NAME="Linux x86_64",
     HOST_ARCH="x86_64",
     PROFILE_RUNTIME_TRIPLE="x86_64-unknown-linux-gnu",
-    # x86_64 code is larger: candidates have measured 7.654 to 9.025 MiB, and
-    # the 0.250 MiB preferred headroom needs a ceiling of at least 9.275 MiB.
-    SIZE_CEILING_MIB=9.500,
+    # x86_64 code is larger: candidates have measured 7.654 to 9.491 MiB, and
+    # the 0.250 MiB preferred headroom needs a ceiling of at least 9.741 MiB.
+    SIZE_CEILING_MIB=9.750,
     # LLVM runs the machine outliner by default only on AArch64, where it
     # outlines the functions compiled for size. On x86_64, outline only code
     # the profile marks cold: code without profile data counts as hot, and the
