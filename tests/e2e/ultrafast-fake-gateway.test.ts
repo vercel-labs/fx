@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
 import { LineQueue } from "./line-queue";
 import {
   fakeGatewayFinalText,
@@ -220,7 +220,7 @@ class AcpClient {
     args: string[] = [],
   ) {
     const processEnv = Object.fromEntries(
-      Object.entries({ ...process.env, NO_COLOR: "1", ...env }).filter(
+      Object.entries(fxChildEnv({ NO_COLOR: "1", ...env })).filter(
         (entry): entry is [string, string] => entry[1] !== undefined,
       ),
     );
