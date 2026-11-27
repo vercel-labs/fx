@@ -77,13 +77,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn beginWithHome(app: *App, home: ?[]const u8) !void {
-            app.trust.deinit(app.alloc);
             // libfx's wasm terminal never shows the screen; the embedding host owns its files.
+            if (comptime host_target.is_wasm) return;
+            app.trust.deinit(app.alloc);
             app.trust = try Gate.open(
                 app.alloc,
                 app.workspace_root,
                 home,
-                module.screenDisabled() or host_target.is_wasm,
+                module.screenDisabled(),
             );
             if (!app.trust.asking()) return;
             if (comptime @hasField(App, "mcp")) {
@@ -96,6 +97,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn refreshFacts(app: *App) !void {
+            if (comptime host_target.is_wasm) return;
             if (!app.trust.asking()) return;
             const root = if (comptime @hasField(App, "workspace_root")) app.workspace_root else "";
             const agents_md = isEntryOfKind(statKindNoFollow(app.alloc, root, "AGENTS.md"), .file);
@@ -144,6 +146,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn routeIngress(app: *App, ingress: input_action.TerminalInputIngress) !bool {
+            if (comptime host_target.is_wasm) return false;
             if (!app.trust.asking()) return false;
             if (ingress.replay_byte_after_routing != null) traceDroppedReplayByte();
             const event = ingress.event orelse return true;

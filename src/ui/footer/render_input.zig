@@ -20,6 +20,7 @@ const text_utils = @import("../../core/shared/text_utils.zig");
 const types = @import("../../core/shared/types.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
 const workspace_trust = @import("../../core/workspace_trust/workspace_trust.zig");
+const host_target = @import("../../core/hosts/target.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
 const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
@@ -518,6 +519,13 @@ pub const RenderContext = struct {
     transcript_depth: transcript_presentation.Depth = .inline_mode,
     input: *const InputRuntime,
 };
+
+/// The Folder access prompt to draw. libfx's wasm terminal never shows it, so
+/// its drawing code stays out of that build.
+pub inline fn shownTrustPrompt(ctx: anytype) ?*const workspace_trust.prompt.Prompt {
+    if (comptime host_target.is_wasm) return null;
+    return ctx.trust_prompt;
+}
 
 pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjection {
     if (ctx.statusline_menu.active) return .{ .statusline = ctx.statusline_menu };

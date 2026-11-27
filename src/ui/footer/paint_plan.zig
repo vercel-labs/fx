@@ -643,7 +643,7 @@ pub fn composeFooterFrame(
 ) !footer_viewport.ComposedFooterFrame {
     const rows = plan.footer;
     const ctx = input.ctx;
-    const trust_prompt = ctx.trust_prompt;
+    const trust_prompt = render_input.shownTrustPrompt(ctx);
     const trust_active = trust_prompt != null;
     const approval_active = !trust_active and input.approval != null;
     const question_projection = if (!trust_active and !approval_active) ctx.question else null;

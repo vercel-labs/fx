@@ -383,7 +383,7 @@ fn buildFooterSurfaceProjection(
     const viewer_active = ctx.transcript_depth.active();
     const activity_projection: ActivityProjection = if (viewer_active) .none else activity.projection;
     const active_label = if (viewer_active) null else activity.active_label;
-    const trust_active = ctx.trust_prompt != null;
+    const trust_active = render_input.shownTrustPrompt(ctx) != null;
     const approval_active = !trust_active and approval != null;
     const question_projection = switch (mode) {
         .reservation => null,
@@ -608,7 +608,7 @@ fn buildFooterSurfaceProjection(
         banner_rows,
         agents_menu_presentation.max_inline_rows,
     );
-    const picker_rows: u16 = if (ctx.trust_prompt) |prompt|
+    const picker_rows: u16 = if (render_input.shownTrustPrompt(ctx)) |prompt|
         try trust_prompt_ui.panelRowCount(
             alloc,
             prompt,
@@ -1321,7 +1321,7 @@ pub noinline fn resolveSurfaceFooterReservation(
 
     var bottom_reservation = BottomReservationState{};
     const input_visible_for_transient =
-        ctx.composer_visible and approval == null and ctx.trust_prompt == null;
+        ctx.composer_visible and approval == null and render_input.shownTrustPrompt(ctx) == null;
     const composer_top_chrome_rows_for_transient = footer_paint_plan.composerTopChromeRows();
     const banner_rows_for_transient = steeringBannerRowsForLayout(
         ctx,
@@ -1331,7 +1331,7 @@ pub noinline fn resolveSurfaceFooterReservation(
         composer_top_chrome_rows_for_transient,
         0,
     );
-    const banner_active_for_transient = approval != null or ctx.trust_prompt != null or banner_rows_for_transient > 0;
+    const banner_active_for_transient = approval != null or render_input.shownTrustPrompt(ctx) != null or banner_rows_for_transient > 0;
     var frame_plan = footer_paint_plan.planFooterPaint(shell, .{
         .active_label = active_label,
         .activity_projection = activity_projection,
@@ -1421,7 +1421,7 @@ fn prepareSurfaceFooterFrameInternal(
 
     if (!reservation.precomputed) {
         const input_visible_for_transient =
-            ctx.composer_visible and approval == null and ctx.trust_prompt == null;
+            ctx.composer_visible and approval == null and render_input.shownTrustPrompt(ctx) == null;
         const composer_top_chrome_rows_for_transient = footer_paint_plan.composerTopChromeRows();
         const banner_rows_for_transient = steeringBannerRowsForLayout(
             ctx,
@@ -1431,7 +1431,7 @@ fn prepareSurfaceFooterFrameInternal(
             composer_top_chrome_rows_for_transient,
             0,
         );
-        const banner_active_for_transient = approval != null or ctx.trust_prompt != null or banner_rows_for_transient > 0;
+        const banner_active_for_transient = approval != null or render_input.shownTrustPrompt(ctx) != null or banner_rows_for_transient > 0;
         const visible_banner_active_for_transient = banner_rows_for_transient > 0;
         frame_plan = footer_paint_plan.planFooterPaint(shell, .{
             .active_label = active_label,
