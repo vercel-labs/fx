@@ -155,7 +155,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const tapePath = join(root, "render.fxtape");
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspace, { recursive: true });
-      const shortcuts = mode === "unbound" ? {} : { "ctrl+c": { action: "command", command: "/version" } };
+      const shortcuts = mode === "unbound" ? {} : { "ctrl+c": "/version" };
       writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ shortcuts }));
 
       const held: HoldState = { started: false, cancelled: false, cancelCount: 0, released: false };
