@@ -196,7 +196,10 @@ pub const TerminalState = struct {
         if (!supports_resize_signal) return;
 
         if (self.resize_wake_pipe[0] < 0) {
-            self.resize_wake_pipe = std.Io.Threaded.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true }) catch .{ -1, -1 };
+            self.resize_wake_pipe = std.Io.Threaded.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true }) catch |err| blk: {
+                debug_trace.logf("resize", "resize_wake_pipe_failed err={s} fallback=poll_timeout", .{@errorName(err)});
+                break :blk .{ -1, -1 };
+            };
         }
         if (self.resize_wake_pipe[1] >= 0) {
             resize_wake_write_fd.store(self.resize_wake_pipe[1], .release);
@@ -244,10 +247,12 @@ pub const TerminalState = struct {
         }
         var stdout_file = std.Io.File.stdout();
         try stdout_file.writeStreamingAll(io_mod.getIo(), "\x1b[6n");
+        return self.readCursorPositionUntilDeadline(io_mod.milliTimestamp() + 100);
+    }
 
+    fn readCursorPositionUntilDeadline(self: TerminalState, deadline_ms: i64) !CursorPosition {
         var buf: [64]u8 = undefined;
         var len: usize = 0;
-        const deadline_ms = io_mod.milliTimestamp() + 100;
 
         while (len < buf.len) {
             const now_ms = io_mod.milliTimestamp();
@@ -255,7 +260,8 @@ pub const TerminalState = struct {
 
             const remaining_ms: i32 = @intCast(deadline_ms - now_ms);
             const poll = try self.pollInput(remaining_ms);
-            if (poll.closed() or !poll.readable) break;
+            if (poll.closed()) break;
+            if (!poll.readable) continue;
 
             const n = try self.read(buf[len .. len + 1]);
             if (n == 0) break;
@@ -864,6 +870,38 @@ test "pollInput wakes promptly on SIGWINCH during a long timeout" {
     try std.testing.expect(terminal.resize_wake_pipe[0] >= 0 and terminal.resize_wake_pipe[1] >= 0);
     notifyResizeWakePipe();
     closeWakePipe(&terminal.resize_wake_pipe);
+}
+
+test "queryCursorPosition keeps waiting across SIGWINCH until reply arrives" {
+    if (comptime !supports_resize_signal) return error.SkipZigTest;
+
+    const stdin_pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer closeTestFd(stdin_pipe[0]);
+    defer closeTestFd(stdin_pipe[1]);
+
+    var terminal = TerminalState{ .stdin_fd = stdin_pipe[0] };
+    terminal.installResizeSignal(testSigWinchWake);
+    defer {
+        terminal.uninstallResizeSignal();
+        closeWakePipe(&terminal.resize_wake_pipe);
+    }
+
+    const Peer = struct {
+        fn run(pid: std.c.pid_t, write_fd: std.posix.fd_t) void {
+            io_mod.sleep(5 * std.time.ns_per_ms);
+            _ = std.c.kill(pid, std.posix.SIG.WINCH);
+            io_mod.sleep(20 * std.time.ns_per_ms);
+            const reply = "\x1b[12;34R";
+            _ = std.c.write(write_fd, reply.ptr, reply.len);
+        }
+    };
+    const pid = std.c.getpid();
+    var thread = try std.Thread.spawn(.{}, Peer.run, .{ pid, stdin_pipe[1] });
+    defer thread.join();
+
+    const pos = try terminal.readCursorPositionUntilDeadline(io_mod.milliTimestamp() + 200);
+    try std.testing.expectEqual(@as(u16, 12), pos.row);
+    try std.testing.expectEqual(@as(u16, 34), pos.col);
 }
 
 test "TerminalState.read returns 0 when the terminal hangs up" {
