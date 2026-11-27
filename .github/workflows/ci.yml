@@ -1128,6 +1128,7 @@ jobs:
             scripts/check-recovery-boundary.sh
             scripts/detect-ci-need.sh
             scripts/detect-macos-need.sh
+            scripts/dev-channel-forward.sh
             scripts/smoke-binary.sh
             tests/e2e/ci-run-files.sh
           )

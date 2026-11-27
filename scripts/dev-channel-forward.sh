@@ -13,7 +13,8 @@
 # - The channel's commit is in the build's history, or is the build: the
 #   channel moves. A rerun for the same commit writes the channel again.
 # - The channel's commit is empty or outside this history: only main's
-#   newest commit may replace it.
+#   newest commit may replace it. <main-commit> is "" when it could not be
+#   read; the script fails only when it needs it.
 #
 # Writes move=true or move=false to $GITHUB_OUTPUT when it is set, and prints
 # why. Dev Release (dev.json) and Publish libfx (the npm dev tag) use it.
@@ -49,10 +50,14 @@ fi
 if [ "$channel_known" = true ] && git merge-base --is-ancestor "$channel_sha" "$build_sha"; then
   decide true "the channel names ${channel_sha}; moving it to ${build_sha}"
 fi
+if [ -z "$main_sha" ]; then
+  echo "::error::main's newest commit is needed to decide, and it could not be read" >&2
+  exit 1
+fi
 if [ "$main_sha" = "$build_sha" ]; then
   decide true "the channel names no commit in the history of ${build_sha}, which is main's newest commit; moving it"
 fi
 if [ -z "$channel_sha" ]; then
-  decide false "the channel could not be read, and main advanced to ${main_sha}; leaving it unchanged"
+  decide false "::warning::the channel could not be read, and main advanced to ${main_sha}; leaving it unchanged"
 fi
-decide false "the channel's commit ${channel_sha} is not in the history of ${build_sha}, and main advanced to ${main_sha}; leaving it unchanged"
+decide false "::warning::the channel's commit ${channel_sha} is not in the history of ${build_sha}, and main advanced to ${main_sha}; leaving it unchanged"

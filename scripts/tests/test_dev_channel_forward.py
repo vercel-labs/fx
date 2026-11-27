@@ -92,6 +92,17 @@ class DevChannelForwardTests(unittest.TestCase):
         self.assert_move(False, self.side, self.newer, self.head, "is not in the history")
         self.assert_move(True, self.side, self.head, self.head, "main's newest commit")
 
+    def test_a_fallback_skip_is_a_warning(self) -> None:
+        self.assert_move(False, UNKNOWN, self.newer, self.head, "::warning::")
+
+    def test_an_unread_main_matters_only_when_the_rule_needs_it(self) -> None:
+        self.assert_move(True, self.older, self.newer, "", "moving it to")
+        self.assert_move(False, self.newer, self.older, "", "already includes")
+        code, output, text = self.decide(UNKNOWN, self.newer, "")
+        self.assertEqual(1, code, text)
+        self.assertEqual("", output)
+        self.assertIn("could not be read", text)
+
     def test_without_github_output_it_still_prints_the_decision(self) -> None:
         result = subprocess.run(
             ["bash", str(SCRIPT_PATH), self.older, self.newer, self.head],
