@@ -1493,9 +1493,11 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.phase_fn = Owner.phaseTransition;
     turn.begin_context = slot;
     turn.begin_fn = hostedTurnBegins;
-    // Only a run fx ask or ACP opens gets the note. A hosted child (the app's)
-    // keeps its approval on its own screen until Part 2 routes it.
-    if (!hosted) {
+    // A run main started is noted, whether this host runs the turn in a session
+    // of its own (fx ask, ACP) or on the child's agent (the app). A turn the
+    // person typed on the child's screen is not: its approval stays with the
+    // person (`tests/tla/subagent/TuiParentApproval.tla` TypedStaysWithPerson).
+    if (snapshot.active.started_by == .parent) {
         if (owner.approval_note) |hook| {
             turn.approval_note_context = hook.context;
             turn.approval_note_fn = hook.note_fn;

@@ -449,6 +449,66 @@ pub const Registry = struct {
         return counts;
     }
 
+    /// Refuses every pending request of `child_id` with `feedback`: what a stop
+    /// or a close of that subagent does before it ends the turn, so the
+    /// subagent's call is refused with the reason and nothing runs
+    /// (`tests/tla/subagent/ParentApproval.tla` Stop, which drops the request).
+    /// Takes only the registry's mutex, and releases it before answering a
+    /// worker (`resolveIndexLocked`), so a caller that holds no other lock
+    /// cannot deadlock with the note path (worker mutex, then registry) or with
+    /// a stopper (admission, then owner, then worker). Logs the ids and counts,
+    /// never the content (RULES.md R3.8).
+    pub fn refuseChild(self: *Registry, child_id: []const u8, feedback: []const u8) RefusedCounts {
+        var counts: RefusedCounts = .{};
+        var ids: [192]u8 = undefined;
+        var ids_len: usize = 0;
+        while (true) {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            if (self.closed) {
+                self.mutex.unlock(io_mod.getIo());
+                break;
+            }
+            const index = self.firstIndexForChildLocked(child_id) orelse {
+                self.mutex.unlock(io_mod.getIo());
+                break;
+            };
+            const id = self.bindings.items[index].request_id;
+            if (ids_len + 1 + id.len <= ids.len) {
+                if (ids_len > 0) {
+                    ids[ids_len] = ',';
+                    ids_len += 1;
+                }
+                @memcpy(ids[ids_len..][0..id.len], id);
+                ids_len += id.len;
+            }
+            const owned_feedback = self.alloc.dupe(u8, feedback) catch |err| {
+                self.mutex.unlock(io_mod.getIo());
+                debug_trace.logf("subagent", "approval refusals stopped child={s} refused={d} gone={d} err={s}", .{ child_id, counts.accepted, counts.gone, @errorName(err) });
+                break;
+            };
+            var feedback_owned = true;
+            const outcome = self.resolveIndexLocked(index, .deny, owned_feedback, &feedback_owned) catch |err| {
+                debug_trace.logf("subagent", "approval refusals stopped child={s} refused={d} gone={d} err={s}", .{ child_id, counts.accepted, counts.gone, @errorName(err) });
+                break;
+            };
+            switch (outcome) {
+                .accepted => counts.accepted += 1,
+                .rejected => counts.gone += 1,
+            }
+        }
+        if (counts.accepted > 0 or counts.gone > 0) {
+            debug_trace.logf("subagent", "approval requests refused child={s} refused={d} gone={d} ids={s}", .{ child_id, counts.accepted, counts.gone, ids[0..ids_len] });
+        }
+        return counts;
+    }
+
+    fn firstIndexForChildLocked(self: *Registry, child_id: []const u8) ?usize {
+        for (self.bindings.items, 0..) |binding, index| {
+            if (std.mem.eql(u8, binding.child_id, child_id)) return index;
+        }
+        return null;
+    }
+
     fn firstNotedIndexLocked(self: *Registry, root_id: []const u8) ?usize {
         for (self.bindings.items, 0..) |binding, index| {
             if (!binding.noted) continue;
@@ -456,6 +516,32 @@ pub const Registry = struct {
             return index;
         }
         return null;
+    }
+
+    /// Drops every binding of `child_id` without answering its worker: the
+    /// person already answered it on the child's own screen, so the worker has
+    /// its decision and the binding must not outlive it. Main's later answer
+    /// then finds nothing and says the request is no longer waiting. Takes the
+    /// registry's mutex and no other lock, so a listener's worker never waits
+    /// behind it.
+    pub fn withdrawChild(self: *Registry, child_id: []const u8) usize {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        var removed: usize = 0;
+        var index = self.bindings.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (!std.mem.eql(u8, self.bindings.items[index].child_id, child_id)) continue;
+            var binding = self.bindings.items[index];
+            _ = self.bindings.orderedRemove(index);
+            binding.deinit(self.alloc);
+            removed += 1;
+        }
+        if (removed > 0) {
+            self.pending_revision +|= 1;
+            debug_trace.logf("subagent", "approval requests withdrawn child={s} count={d} reason=answered_on_screen", .{ child_id, removed });
+        }
+        self.mutex.unlock(io_mod.getIo());
+        return removed;
     }
 
     pub fn invalidateChild(

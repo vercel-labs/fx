@@ -302,10 +302,10 @@ function command(fixture: Fixture, gateway: any, args: string[], cwd = fixture.w
   return runFx(args, { cwd, env: env(fixture, gateway), timeoutMs: TIMEOUT });
 }
 
-async function ask(fixture: Fixture, gateway: any, args: string[]) {
+async function ask(fixture: Fixture, gateway: any, args: string[], extraEnv: Record<string, string | undefined> = {}) {
   const result = await runFx(["ask", "--json", "--auto", ...args], {
     cwd: fixture.workspace,
-    env: env(fixture, gateway),
+    env: { ...env(fixture, gateway), ...extraEnv },
     timeoutMs: TIMEOUT,
   });
   return result;
@@ -3967,6 +3967,50 @@ test("fx ask: main's deny refuses a subagent's approval request with its reason"
     const lines = childLines(fixture.home, output.session_id);
     const childLog = logLines(fixture.home, lines[0].child) as any[];
     expect(JSON.stringify(childLog)).toContain("CHILD_SAW_DENY");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("fx ask: main's stop refuses a subagent's approval request, and nothing runs", async () => {
+  const fixture = createFixture("fx-v2-subagent-approval-stop-");
+  const profileDir = join(fixture.home, ".fx", "agents", "asker");
+  mkdirSync(profileDir, { recursive: true });
+  writeFileSync(join(profileDir, "profile.json"), JSON.stringify({ description: "Runs one command", tools: ["shell"], permission_mode: "ask" }));
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body) && !body.includes("call_child_shell")) {
+      await waitForRootTurnCommitted(fixture.home);
+      return fakeGatewayToolCall("call_child_shell", "shell", { request: { action: "run", command: "touch stopped.txt" } });
+    }
+    if (isChildRequest(body)) {
+      return fakeGatewayFinalText(body.includes("Your parent stopped you before answering this request") ? "CHILD_SAW_STOP" : "CHILD_NO_REASON");
+    }
+    if (body.includes("I wait for your approval to run") && !body.includes("call_main_stop")) {
+      return fakeGatewayToolCall("call_main_stop", "subagent", { action: "stop", agent: "asker" });
+    }
+    if (body.includes("call_main_stop") && !isReportTurn(body)) return fakeGatewayFinalText("MAIN_STOPPED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("PARENT_DONE");
+    if (body.includes("delegate-asker")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-asker", "subagent", { request: { action: "message", agent: "asker", profile: "asker", message: "Touch stopped.txt." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const trace = join(fixture.root, "fx-trace.log");
+    const result = await ask(fixture, gateway, ["Delegate the command."], { FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "subagent,mailbox" });
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    const output = JSON.parse(result.stdout);
+    expect(existsSync(join(fixture.workspace, "stopped.txt"))).toBe(false);
+    expect(output.output).toContain("MAIN_STOPPED");
+    // The stop refused the waiting request before it ended the turn: the trace
+    // names the request it refused, and the unit test proves the worker read
+    // the reason. The call never returned a result, so nothing ran.
+    expect(readFileSync(trace, "utf8")).toMatch(/approval requests refused child=\S+ refused=1 gone=0 ids=\S+/);
+    const lines = childLines(fixture.home, output.session_id);
+    const childLog = JSON.stringify(logLines(fixture.home, lines[0].child));
+    expect(childLog).toContain("call_child_shell");
+    expect(childLog).toContain("turn_interrupted");
+    expect(childLog).not.toContain("tool_result");
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });

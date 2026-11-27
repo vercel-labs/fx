@@ -3788,6 +3788,13 @@ const App = struct {
         AgentsAppRuntime.notePromptAsked(self, agent, kind);
     }
 
+    /// The person answered a subagent's request on its own screen, so its
+    /// registry binding goes with it and main's later answer reads that it no
+    /// longer waits.
+    pub fn withdrawAnsweredApproval(self: *App, agent: *agents.Agent) void {
+        AgentsAppRuntime.withdrawAnsweredApproval(self, agent);
+    }
+
     /// Whether `agent` keeps its approval prompt this pass,
     /// because an approval is lent between main and a subagent.
     pub fn keepLentApproval(self: *App, agent: *agents.Agent, pending: ?permission_request.PermissionRequest) bool {

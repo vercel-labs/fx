@@ -434,6 +434,10 @@ pub const StateSnapshot = struct {
     }
 };
 
+/// The file review a pending request shows. `review` is an identity, not a
+/// lifetime: the tool call that built it frees it as soon as the request is
+/// answered, and the answer can come from another thread, so only
+/// `copyPendingReview`, which copies under the worker's lock, may read it.
 pub const PendingPermissionReview = struct {
     request_id: u64,
     review: *const diff_mod.FileReview,
@@ -3111,6 +3115,26 @@ pub const WorkerRuntime = struct {
             else
                 null,
         };
+    }
+
+    /// Returns a copy of the file review the pending request `request_id` waits
+    /// on, which the caller owns and frees with `OwnedReview.deinit`, or null
+    /// when no request with that id still waits for a decision or it has no
+    /// review. The copy is made under `worker_mutex`: the tool call that owns
+    /// the review waits on this worker, so it cannot end and free the review
+    /// while the lock is held (`tests/tla/subagent/TuiParentApproval.tla`
+    /// NoStalePrompt).
+    pub fn copyPendingReview(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        request_id: u64,
+    ) std.mem.Allocator.Error!?diff_mod.OwnedReview {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.permissionRequestAwaitingDecisionLocked()) return null;
+        if (self.pending_permission_request_shared.?.id != request_id) return null;
+        const review = self.pending_permission_review orelse return null;
+        return try diff_mod.OwnedReview.init(alloc, review);
     }
 
     pub fn activeTurnId(self: *WorkerRuntime) u64 {
@@ -8270,6 +8294,71 @@ test "permission snapshot keeps the full file review borrowed and request-bound"
     try std.testing.expectEqual(@as(u64, 44), snapshot.pending_permission_review.?.request_id);
     try std.testing.expect(snapshot.pending_permission_review.?.review == &review);
     try std.testing.expectEqual(@as(usize, 7), snapshot.pending_permission_review.?.review.rowCount());
+}
+
+test "worker copies a pending review under its lock" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var review = try diff_mod.FileReview.init(alloc, "one\ntwo\n", "one\nTWO\n");
+    var review_freed = false;
+    defer if (!review_freed) review.deinit(alloc);
+
+    runtime.worker_processing = true;
+    runtime.pending_permission_waiting = true;
+    runtime.pending_permission_request_shared = try permission_request.OwnedPermissionRequest.dupe(
+        alloc,
+        .{
+            .id = 44,
+            .label = "file_mutation",
+            .file = .{
+                .kind = .write,
+                .intent = .mutation,
+                .preview = .{
+                    .path = "note.txt",
+                    .lines = &.{
+                        .{ .op = .deletion, .old_line = 2, .text = "two" },
+                        .{ .op = .addition, .new_line = 2, .text = "TWO" },
+                    },
+                    .additions = 1,
+                    .deletions = 1,
+                    .truncated = false,
+                },
+                .scope = .workspace_files,
+            },
+        },
+    );
+    runtime.pending_permission_review = &review;
+
+    // A request with another id, waiting or not, has no copy to give.
+    try std.testing.expect(try runtime.copyPendingReview(alloc, 45) == null);
+
+    var copied = (try runtime.copyPendingReview(alloc, 44)).?;
+    defer copied.deinit(alloc);
+    try std.testing.expect(copied.view() != &review);
+    const rows = review.rowCount();
+    try std.testing.expectEqual(rows, copied.view().rowCount());
+    const before = try review.viewport(alloc, 0, rows);
+    defer alloc.free(before.lines);
+    const first_row = try alloc.dupe(u8, before.lines[0].text);
+    defer alloc.free(first_row);
+
+    // The copy keeps the rows after the tool call that built the review frees it.
+    review.deinit(alloc);
+    review_freed = true;
+    const after = try copied.view().viewport(alloc, 0, rows);
+    defer alloc.free(after.lines);
+    try std.testing.expectEqualStrings(first_row, after.lines[0].text);
+
+    // Once the request is answered, it waits on nothing, so it has no copy.
+    try std.testing.expectEqual(
+        PermissionSubmissionResult.accepted,
+        runtime.submitPermissionResponse(
+            44,
+            permission_request.OwnedPermissionResponse.init(alloc, .once, null),
+        ),
+    );
+    try std.testing.expect(try runtime.copyPendingReview(alloc, 44) == null);
 }
 
 test "held turn propagation refreshes queued prompt trusted reviewer context" {

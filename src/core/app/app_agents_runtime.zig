@@ -1221,7 +1221,7 @@ pub fn Runtime(comptime App: type) type {
             for (app.child_agents.items) |child| {
                 if (!lendsTo(app, child, borrower)) continue;
                 const approval = &child.agent.approval_prompt;
-                if (approval.isActive() and approval.rule_management == null) {
+                if (approval.isActive() and approval.rule_management == null and !parentRoutedApproval(child)) {
                     if (oldest == null or child.approval_asked < oldest.?.asked) oldest = .{ .child = child, .kind = .approval, .asked = child.approval_asked };
                 }
                 if (child.agent.question_prompt.isActive()) {
@@ -1285,8 +1285,10 @@ pub fn Runtime(comptime App: type) type {
         /// Lends `child`'s approval to `borrower`'s prompt. Its request comes
         /// from the subagent's own worker and stays labeled with its name.
         /// It goes back when the subagent is shown, the instance gets its
-        /// own, or the subagent stops waiting (`keepLentApproval`).
+        /// own, or the subagent stops waiting (`keepLentApproval`). A request
+        /// main answers is never lent: main's screen does not show it.
         fn lendApproval(app: *App, borrower: *AppAgent, child: *ChildAgent) void {
+            if (parentRoutedApproval(child)) return;
             std.mem.swap(@TypeOf(child.agent.approval_prompt), &borrower.approval_prompt, &child.agent.approval_prompt);
             app.approval_lender = child;
             debug_trace.eventf("host", "approval_lent", .{}, "agent={s}", .{child.id});
@@ -1609,7 +1611,9 @@ pub fn Runtime(comptime App: type) type {
             }
             for (app.child_agents.items) |child| {
                 if (child == app.agent_on_screen) continue;
-                const approval = child.agent.approval_prompt.isActive();
+                // A request main answers is not a wait for the person: the
+                // screen shows no prompt for it and the footer stays quiet.
+                const approval = child.agent.approval_prompt.isActive() and !parentRoutedApproval(child);
                 const asks = child.agent.question_prompt.isActive();
                 if (!approval and !asks and !requestWaitsForUser(app, child)) continue;
                 if (!found) {
@@ -2587,9 +2591,27 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
+        /// The person answered a subagent's request on its own screen, so the
+        /// registry binding goes with it. An agent that is not a hosted child
+        /// does nothing.
+        pub fn withdrawAnsweredApproval(app: *App, agent: *AppAgent) void {
+            const child = hostedOf(app, agent) orelse return;
+            const host = hostOf(app, child) orelse return;
+            _ = host.withdrawAnsweredApproval(child.id);
+        }
+
         fn hostedOf(app: *App, agent: *const AppAgent) ?*ChildAgent {
             for (app.child_agents.items) |child| if (&child.agent == agent) return child;
             return null;
+        }
+
+        /// Whether `child`'s waiting approval came from a run main started. Main
+        /// answers those, so no instance's screen lends one and the footer and
+        /// the agent list never say the child needs the person
+        /// (`tests/tla/subagent/TuiParentApproval.tla` NoPersonPromptForParentRouted).
+        fn parentRoutedApproval(child: *const ChildAgent) bool {
+            const run = if (child.agent.child_run) |*value| value else return false;
+            return run.turn != null and run.startedByParent();
         }
 
         /// A subagent's approval or question is lent to an instance's screen
@@ -2792,6 +2814,9 @@ pub fn Runtime(comptime App: type) type {
             if (target) |child| {
                 if (app.approval_lender == child) return .needs_approval;
                 if (app.question_lender == child) return .has_question;
+                // A request main answers is main's work, not a wait for the
+                // person, so the list says working, not "needs approval".
+                if (parentRoutedApproval(child) and child.agent.approval_prompt.isActive()) return .working;
             }
             const last_end: LastEnd = if (target) |child| (if (child.agent.role == .subagent) child.last_end else .done) else .done;
             const state = instanceState(targetAgent(app, target), requestWaitsForUser(app, target), last_end);

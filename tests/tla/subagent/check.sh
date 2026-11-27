@@ -259,4 +259,27 @@ ParentApproval parent-approval-mutation-early-stall FallbackOnlyAfterSeen
 ParentApproval parent-approval-mutation-no-fallback deadlock
 ParentApproval parent-approval-mutation-note-lost deadlock
 ParentApproval parent-approval-mutation-no-nudge deadlock
+# The TuiParentApproval configs:
+# The trial (step 3b) and a must break: the trial breaks NoStaleLent (a lent
+# copy outliving its wait), a breaks NoStalePrompt (the call frees its review).
+# a2, b and c must pass; c is the code in this change (the prompt owns its
+# copy, so NoStalePrompt holds by construction).
+# lend_routed, free_anyway and note_typed each break the rule named on its row.
+# Two defects have no config because they cannot fail: no_withdraw (one request
+# per kid) and b_note_keeps_prompt (b's free guard waits on the prompt).
+# The simulate pair runs under ideal and non-ideal conditions.
+#
+TuiParentApproval tui-approval-current-trial NoStaleLent
+TuiParentApproval tui-approval-design-a NoStalePrompt
+TuiParentApproval tui-approval-design-a-person NoStalePrompt
+TuiParentApproval tui-approval-design-a2 -
+TuiParentApproval tui-approval-design-a2-person -
+TuiParentApproval tui-approval-design-b -
+TuiParentApproval tui-approval-design-c -
+TuiParentApproval tui-approval-design-b-person -
+TuiParentApproval tui-approval-mutant-lend-routed NoPersonPromptForParentRouted
+TuiParentApproval tui-approval-mutant-free-anyway NoStalePrompt
+TuiParentApproval tui-approval-mutant-note-typed TypedStaysWithPerson
+TuiParentApproval tui-approval-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
+TuiParentApproval tui-approval-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
 VERDICTS

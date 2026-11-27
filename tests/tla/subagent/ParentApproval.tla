@@ -261,8 +261,9 @@ Resume(k) ==
   /\ wake' = TRUE
   /\ UNCHANGED <<policy, mail, seen, main, authorized, fallbackRefused, lost, posted, blocked>>
 
-\* Main's stop of a waiting subagent, a tool call in its turn: it drops the
-\* registered request and any note still waiting.
+\* Main's stop of a waiting subagent, a tool call in its turn: it first refuses
+\* the request the subagent waits on (the call is refused, nothing runs), then
+\* drops it and any note still waiting.
 Stop(k) ==
   /\ main = "turn"
   /\ kid[k] = "waiting"
