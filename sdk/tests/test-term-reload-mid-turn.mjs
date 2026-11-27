@@ -109,7 +109,7 @@ function expectCount(actual, want, what) {
   if (actual !== want) throw new Error(`${what}: ${actual}, want ${want}`);
 }
 
-async function start(store, args, fetch) {
+async function start(store, args, fetch, options = {}) {
   const capture = createTerminalCapture();
   const runtime = await createFxTerminal({
     backend: "wasm",
@@ -119,6 +119,7 @@ async function start(store, args, fetch) {
     env: { AI_GATEWAY_API_KEY: "reload-mid-turn-test-key", FX_THEME: "dark" },
     fetch,
     sessionStore: store,
+    ...options,
   });
   runtimes.push(runtime);
   await waitFor(
@@ -259,10 +260,132 @@ async function doneScenario() {
   return { barrier1, barrier2 };
 }
 
+const CUT_MODEL = "test/cut-model";
+const CUT_PROMPT = "CUT_PROMPT_MARKER read the notes";
+// The first step's output, which the compaction inside the turn summarizes.
+const FOLDED = "FOLDED_OUTPUT_5c1e";
+const HANDOFF = "Facts:\nF1: CUT_HANDOFF_3e7a: the user asked to read the notes.";
+
+function cutCatalog() {
+  return Response.json({
+    object: "list",
+    data: [{ id: CUT_MODEL, type: "language", released: 1, tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }],
+  });
+}
+
+function shellCall(id, command) {
+  const events = [
+    { type: "tool-call", toolCallId: id, toolName: "shell", input: { action: "run", command } },
+    { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+  ];
+  return new Response(`${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`, {
+    headers: { "content-type": "text/event-stream" },
+  });
+}
+
+// A summary request has no tools, or keeps them for the cache with fx's note
+// that the request is its own.
+function isSummaryRequest(text, body) {
+  return (body.toolChoice?.type === "none" && body.tools?.length === 0) ||
+    text.includes("This request comes from fx, not from the user") ||
+    text.includes("Write the compaction notes");
+}
+
+function cutOptions() {
+  const config = new Map([["model", CUT_MODEL], ["mode", "auto"]]);
+  return {
+    configStore: { get(id) { return config.get(id) ?? null; }, set(id, value) { config.set(id, value); } },
+    workspace: {
+      info: { version: 1, root: "/workspace", cwd: "/workspace", home: "/home/visitor", gitAvailable: false, ephemeral: true },
+      permission: "allow-sandboxed",
+      exec({ command }) {
+        if (command !== "print-notes") throw new Error(`unexpected workspace command: ${command}`);
+        // Large enough that the compaction keeps none of it.
+        return { stdout: `${FOLDED}\n${"a b c d e f g h i j k l m n o p\n".repeat(600)}`, stderr: "", exitCode: 0 };
+      },
+    },
+  };
+}
+
+// A compaction inside the turn folds its first step into a summary, and the
+// page reloads while the request after the compaction is in flight. The
+// reload sends that request again from the saved checkpoint, which must hold
+// what fx kept after the cut: the folded step must not reach the model again.
+async function cutScenario() {
+  const store1 = createStore("cut-1");
+  const turnRequests = [];
+  let summaries = 0;
+  let refused = false;
+  let commitsAtHeld = -1;
+  const firstFetch = (_input, init = {}) => {
+    if ((init.method ?? "GET") === "GET") return cutCatalog();
+    const text = requestText(init.body);
+    const body = JSON.parse(text);
+    if (isSummaryRequest(text, body)) {
+      summaries += 1;
+      return sseReply(HANDOFF);
+    }
+    if (!text.includes("CUT_PROMPT_MARKER")) return sseReply("SEED_DONE_REPLY");
+    turnRequests.push(text);
+    if (turnRequests.length === 1) return shellCall("fold-a", "print-notes");
+    if (!refused) {
+      refused = true;
+      return Response.json({ error: {
+        type: "invalid_request_error",
+        code: "context_length_exceeded",
+        message: "This model's maximum context length is 128000 tokens. The request exceeds the context window.",
+      } }, { status: 400 });
+    }
+    commitsAtHeld = store1.commits;
+    return new Promise((_, reject) => {
+      init.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+    });
+  };
+  const first = await start(store1, [], firstFetch, cutOptions());
+  first.runtime.write("Seed one turn.\r");
+  await waitFor(() => first.capture.text().includes("SEED_DONE_REPLY"), "the seed reply");
+  first.runtime.write(`${CUT_PROMPT}\r`);
+  const output = () => JSON.stringify(first.capture.text().slice(-1500));
+  await waitFor(() => turnRequests.length === 3, "the request after the compaction", () => `requests=${turnRequests.length}, summaries=${summaries}, output=${output()}`);
+  expectCount(summaries, 1, "summary requests");
+  const live = turnRequests[2];
+  if (live.includes(FOLDED) || !turnRequests[1].includes(FOLDED)) {
+    throw new Error("the compaction did not fold the first step out of the live request");
+  }
+  const snapshot = store1.snapshot();
+  reload(first.runtime);
+
+  const store2 = createStore("cut-2", snapshot);
+  const resent = [];
+  const secondFetch = (_input, init = {}) => {
+    if ((init.method ?? "GET") === "GET") return cutCatalog();
+    const text = requestText(init.body);
+    resent.push(text);
+    return sseReply("CUT_RESUMED_REPLY");
+  };
+  const second = await start(store2, ["-c"], secondFetch, cutOptions());
+  await waitFor(
+    () => second.capture.text().includes("CUT_RESUMED_REPLY"),
+    "the resent request's reply",
+    () => `requests=${resent.length}, output=${JSON.stringify(second.capture.text().slice(-1500))}`,
+  );
+  const request = resent[0];
+  if (!request.includes("CUT_PROMPT_MARKER")) throw new Error("the resent request lacks the prompt");
+  if (request.includes(FOLDED) || request.includes('"fold-a"')) {
+    throw new Error("the resent request holds the step the compaction folded into its summary");
+  }
+  if (request.includes("CUT_HANDOFF_3e7a") !== live.includes("CUT_HANDOFF_3e7a")) {
+    throw new Error(`the resent request and the live one disagree on the summary: live=${live.includes("CUT_HANDOFF_3e7a")}`);
+  }
+  reload(second.runtime);
+  return { commitsAtHeld, summary: request.includes("CUT_HANDOFF_3e7a") };
+}
+
 try {
   const held = await heldScenario();
   const done = await doneScenario();
-  console.log(`term reload mid-turn passed: held_commits_at_fetch=1, held_resumed_requests_before_barrier=${held.barrier2.before}, held_barrier_commits=${held.barrier2.commits}, held_last_reload_requests_before_barrier=${held.barrier3.before}, done_requests_before_barrier=${done.barrier1.before}, done_barrier_commits=${done.barrier1.commits}, reload_after_finished_turn_requests_before_barrier=${done.barrier2.before}`);
+  const cut = await cutScenario();
+  console.log(`term reload mid-turn passed: held_commits_at_fetch=1, held_resumed_requests_before_barrier=${held.barrier2.before}, held_barrier_commits=${held.barrier2.commits}, held_last_reload_requests_before_barrier=${held.barrier3.before}, done_requests_before_barrier=${done.barrier1.before}, done_barrier_commits=${done.barrier1.commits}, reload_after_finished_turn_requests_before_barrier=${done.barrier2.before}, cut_reload_resends_folded_step=false, cut_reload_keeps_summary=${cut.summary}`);
 } finally {
   for (const runtime of runtimes) {
     try {
