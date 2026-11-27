@@ -453,12 +453,16 @@ fn normalizeCanonicalStatus(
         index += 1;
     }
     const owned = try out.toOwnedSlice();
-    var phrase = std.mem.trim(u8, owned, " \t");
+    var phrase = std.mem.trim(u8, owned, status_blank_bytes);
     if (std.mem.endsWith(u8, phrase, cancellation_follow_up)) {
-        phrase = std.mem.trimEnd(u8, phrase[0 .. phrase.len - cancellation_follow_up.len], " \t");
+        phrase = std.mem.trimEnd(u8, phrase[0 .. phrase.len - cancellation_follow_up.len], status_blank_bytes);
     }
     return if (phrase.len == 0) null else phrase;
 }
+
+/// What a status phrase drops from its ends. A command's display keeps them,
+/// so a row matches its command without them (rowCommandDisplay).
+const status_blank_bytes = " \t";
 
 /// The cancellation notice of a cancelled call's status line `raw`, such as
 /// `▪ Cancelled touch .ready && sleep 60 · What can fx do differently?`,
@@ -2355,11 +2359,28 @@ fn rowListsNames(row: *const StoryRow) bool {
 fn commandRowLabel(scratch: std.mem.Allocator, entry: TranscriptEntry, detail: ?*const ToolDetailRecord) !?[]const u8 {
     const record = detail orelse return null;
     if (record.activity_kind != .command) return null;
-    const display = record.command_display orelse return null;
+    const command = rowCommandDisplay(record) orelse return null;
     const status = try entryStatus(scratch, entry) orelse return null;
     const phrase = try reprojectTruncatedCommandPhrase(scratch, status, record) orelse status;
-    if (display.len == 0 or phrase.len <= display.len or !std.mem.endsWith(u8, phrase, display)) return null;
-    const label = phrase[0 .. phrase.len - display.len];
+    return commandPhraseLabel(phrase, command);
+}
+
+/// A command record's display as its row's status line shows it: without
+/// the blanks after it, which the status line drops, as for a command the
+/// model sent with a space after it. Null when the record has none.
+fn rowCommandDisplay(record: *const ToolDetailRecord) ?[]const u8 {
+    const display = std.mem.trimEnd(u8, record.command_display orelse return null, status_blank_bytes);
+    return if (display.len == 0) null else display;
+}
+
+/// The label `phrase` puts before `command`, from rowCommandDisplay, such as
+/// "Ran " or "Exited 1 ". Null when the phrase does not end with the command.
+fn commandPhraseLabel(phrase: []const u8, command: []const u8) ?[]const u8 {
+    // A phrase reprojectTruncatedCommandPhrase rebuilt ends with the whole
+    // display, blanks included.
+    const body = std.mem.trimEnd(u8, phrase, status_blank_bytes);
+    if (body.len <= command.len or !std.mem.endsWith(u8, body, command)) return null;
+    const label = body[0 .. body.len - command.len];
     return if (label[label.len - 1] == ' ') label else null;
 }
 
@@ -7344,10 +7365,8 @@ fn shortPhraseParts(
 ) !?ShortPhrase {
     const record = detail orelse return null;
     if (record.activity_kind != .command) return null;
-    const display = record.command_display orelse return null;
-    if (display.len == 0 or phrase.len <= display.len or !std.mem.endsWith(u8, phrase, display)) return null;
-    const label = phrase[0 .. phrase.len - display.len];
-    if (label[label.len - 1] != ' ') return null;
+    const display = rowCommandDisplay(record) orelse return null;
+    const label = commandPhraseLabel(phrase, display) orelse return null;
     // Lex the command as the model sent it. The display folds its lines into
     // one, which would turn a comment line into a comment over the whole
     // command.
@@ -7447,6 +7466,66 @@ test "a command the safety review held says it was held, then why" {
     defer alloc.free(cut_text);
     errdefer std.debug.print("cut:\n{s}\n", .{cut_text});
     try std.testing.expectEqualStrings("● Held python3 · safety caution", std.mem.trim(u8, cut_text, "\n"));
+}
+
+/// A real call's command. Core keeps the space after it in the command's
+/// display, and the row's status line drops it.
+const spaced_command_for_test = "cd ~/.fx/sessions/v2; grep -l -i \"Chief Of Staff\" */log.jsonl 2>/dev/null | head; ";
+
+/// A shell call's record that ran `command` and passed. The caller frees its
+/// `arguments_json` with `alloc`.
+fn spacedCommandDetailForTest(alloc: std.mem.Allocator, entry_id: u32, command: []const u8) !ToolDetailRecord {
+    const arguments = try alloc.print("{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})});
+    var detail = storyCommandDetail(entry_id, arguments, 0, null);
+    detail.command_display = @constCast(command);
+    return detail;
+}
+
+test "a command sent with a space after it shows its short form while it runs and after it ends" {
+    const alloc = std.testing.allocator;
+    const detail = try spacedCommandDetailForTest(alloc, 1, spaced_command_for_test);
+    defer alloc.free(detail.arguments_json.?);
+    const ran = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Ran " ++ spaced_command_for_test ++ "\n", .class = .tool_status } }};
+    try expectLiveAndResumedRowsForTest(alloc, &ran, &.{detail}, "● Ran grep ✓");
+
+    const running = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Running " ++ spaced_command_for_test ++ "\n", .class = .tool_status } }};
+    var running_detail = detail;
+    running_detail.outcome = null;
+    running_detail.command_process_presentation = null;
+    try expectLiveAndResumedRowsForTest(alloc, &running, &.{running_detail}, "● Running grep");
+}
+
+test "a command sent with a space after it joins the command row before it" {
+    const alloc = std.testing.allocator;
+    const detail = try spacedCommandDetailForTest(alloc, 2, spaced_command_for_test);
+    defer alloc.free(detail.arguments_json.?);
+    var listed = storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"ls\"}", 0, null);
+    listed.command_display = @constCast("ls");
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran ls\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran " ++ spaced_command_for_test ++ "\n", .class = .tool_status } },
+    };
+    try expectLiveAndResumedRowsForTest(alloc, &entries, &.{ listed, detail }, "● Ran ls, grep · 2 calls ✓");
+}
+
+test "a long command sent with a space after it shows its short form when core cut its status short" {
+    const alloc = std.testing.allocator;
+    const command = spaced_command_for_test ++ "find . -maxdepth 2 -name log.jsonl -mtime -2 | wc -l; ";
+    const detail = try spacedCommandDetailForTest(alloc, 1, command);
+    defer alloc.free(detail.arguments_json.?);
+    // Core keeps 117 bytes of the command and marks the cut.
+    const cut = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Ran " ++ command[0..117] ++ "...\n", .class = .tool_status } }};
+    try expectLiveAndResumedRowsForTest(alloc, &cut, &.{detail}, "● Ran grep, find ✓");
+}
+
+test "a space after a one-step command does not count toward the length that keeps its text" {
+    const alloc = std.testing.allocator;
+    const command = "grep -rn createWindow desktop/src/main.ts desktop/src/win.ts";
+    try std.testing.expectEqual(short_command_max_len, command.len);
+    const detail = try spacedCommandDetailForTest(alloc, 1, command ++ " ");
+    defer alloc.free(detail.arguments_json.?);
+    const ran = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Ran " ++ command ++ " \n", .class = .tool_status } }};
+    try expectLiveAndResumedRowsForTest(alloc, &ran, &.{detail}, "● Ran " ++ command ++ " ✓");
 }
 
 fn knownLabelPrefix(phrase: []const u8) ?usize {
