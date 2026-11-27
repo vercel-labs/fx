@@ -3,6 +3,7 @@ const agents = @import("../agents/agents.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const builtin = @import("builtin");
+const child_wait = @import("../shared/child_wait.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const display_width = @import("../shared/display_width.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
@@ -2102,6 +2103,30 @@ pub fn clipboardImageAttachmentFromBytes(alloc: std.mem.Allocator, bytes: []cons
     };
 }
 
+const clipboard_image_read_timeout_seconds = 5;
+
+/// Runs a clipboard helper with its output ignored and returns its status.
+/// The defer kills and reaps a child that is still alive on any exit path.
+fn runClipboardScript(
+    argv: []const []const u8,
+    deadline: std.Io.Clock.Timestamp,
+) !std.process.Child.Term {
+    const io = io_mod.getIo();
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+
+    const term = child_wait.waitWithDeadline(&child, deadline) catch |err| switch (err) {
+        error.Timeout => return error.ClipboardReadTimedOut,
+        else => return err,
+    };
+    return term;
+}
+
 pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
     if (builtin.target.os.tag != .macos) return error.Unsupported;
 
@@ -2125,15 +2150,13 @@ pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAtt
     defer alloc.free(write_script);
 
     const argv = [_][]const u8{ "osascript", "-e", write_script };
-    const result = try std.process.run(alloc, io_mod.getIo(), .{
-        .argv = &argv,
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(4096),
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromSeconds(clipboard_image_read_timeout_seconds),
     });
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
+    const term = try runClipboardScript(&argv, deadline);
 
-    switch (result.term) {
+    switch (term) {
         .exited => |code| if (code == 0) {
             const attachment = try loadImageAttachment(alloc, temp_path);
             return .{

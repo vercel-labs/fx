@@ -242,9 +242,25 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
-        /// Ctrl+V found no image: paste the clipboard text, or say there is none.
+        /// The notice for a clipboard read that failed. A failed read is not an empty clipboard.
+        fn clipboardReadFailureBody(err: anyerror) []const u8 {
+            return switch (err) {
+                error.ReadTimedOut => "couldn't read the clipboard: it took too long",
+                error.ReadTooLarge => "clipboard text is larger than fx can paste",
+                else => "couldn't read the clipboard text",
+            };
+        }
+
+        /// Ctrl+V found no image: paste the clipboard text, or say why it could not.
         fn pasteClipboardTextOrNotice(app: *App, agent: *AppAgent, max_input_len: usize) !void {
-            const maybe_text = try readClipboardText(app);
+            const maybe_text = readClipboardText(app) catch |err| {
+                debug_trace.logf("input", "ctrl+v clipboard read failed err={s}", .{@errorName(err)});
+                return app.writeDomainNotice(.{
+                    .topic = "images",
+                    .tone = .@"error",
+                    .body = clipboardReadFailureBody(err),
+                }, true);
+            };
             defer if (maybe_text) |owned| app.alloc.free(owned);
             const text: []const u8 = maybe_text orelse "";
             if (text.len == 0) {
@@ -4015,6 +4031,7 @@ const RoutingFakeApp = struct {
     clipboard_image_reads: usize = 0,
     clipboard_text: ?[]const u8 = null,
     clipboard_text_reads: usize = 0,
+    clipboard_text_error: ?anyerror = null,
 
     pub fn slashRegistry(_: *const RoutingFakeApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
@@ -4031,6 +4048,7 @@ const RoutingFakeApp = struct {
 
     pub fn readClipboardText(self: *RoutingFakeApp, alloc: std.mem.Allocator) !?[]u8 {
         self.clipboard_text_reads += 1;
+        if (self.clipboard_text_error) |err| return err;
         const text = self.clipboard_text orelse return null;
         return try alloc.dupe(u8, text);
     }
@@ -10240,6 +10258,17 @@ test "app_input_runtime decision prompt owns and discards bracketed paste" {
 
 test "app_input_runtime rejects same-epoch paste suffix without submitting it" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "same-epoch-paste-suffix.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "keep");
@@ -10255,6 +10284,12 @@ test "app_input_runtime rejects same-epoch paste suffix without submitting it" {
     try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
     try std.testing.expectEqual(@as(usize, 2), app.notice_write_count);
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
+
+    debug_trace.shutdown();
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "paste suffix dropped owner=composer bytes=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "reason=same_delivery_as_end_marker") != null);
 
     try feedRoutingBytes(&app, "\r");
     try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
@@ -10477,6 +10512,7 @@ test "app_input_runtime empty composer paste checks the clipboard for an image" 
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 1), app.clipboard_image_reads);
     try std.testing.expectEqual(notices_before + 1, app.notice_write_count);
+    try std.testing.expectEqualStrings("no image found on clipboard", app.notice_body.items);
     debug_trace.shutdown();
 
     const trace = try readTraceFileForTest(alloc, trace_path);
@@ -10615,6 +10651,54 @@ test "app_input_runtime ctrl+v keeps the clipboard untouched while the model pic
 
     try std.testing.expectEqual(@as(usize, 0), app.clipboard_image_reads);
     try std.testing.expectEqual(@as(usize, 0), app.clipboard_text_reads);
+}
+
+test "app_input_runtime ctrl+v reports a failed clipboard read, not an empty clipboard" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const cases = [_]struct { err: anyerror, body: []const u8 }{
+        .{ .err = error.ReadTimedOut, .body = "couldn't read the clipboard: it took too long" },
+        .{ .err = error.ReadTooLarge, .body = "clipboard text is larger than fx can paste" },
+        .{ .err = error.ReadFailed, .body = "couldn't read the clipboard text" },
+    };
+    for (cases) |case| {
+        app.clipboard_text_error = case.err;
+        const notices_before = app.notice_write_count;
+
+        try Runtime(RoutingFakeApp).handleByte(&app, 22, 4096, 100);
+
+        try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+        try std.testing.expectEqual(notices_before + 1, app.notice_write_count);
+        try std.testing.expectEqualStrings(case.body, app.notice_body.items);
+    }
+}
+
+test "app_input_runtime clipboard text traces an allocation failure while copying" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "clipboard-alloc-failed.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+
+    const paste = input_paste_runtime.PasteEditRuntime(RoutingFakeApp);
+    try std.testing.expectError(error.OutOfMemory, paste.insertClipboardText(&app, (&app).agent(), "hello", 4096));
+    debug_trace.shutdown();
+
+    const trace = try readTraceFileForTest(alloc, trace_path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "composer paste dropped bytes=5 reason=alloc_failed") != null);
 }
 
 test "app_input_runtime decision paste start clears pending ctrl-c and esc gestures" {

@@ -269,6 +269,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
 
             openPasteCapture(app, capture);
             app.input_runtime.paste.ingestDecodedSlice(app.alloc, text) catch |err| {
+                debug_trace.logf("input", "{s} paste dropped bytes={d} reason=alloc_failed", .{ @tagName(capture.owner), text.len });
                 if (capture.owner == .auth_code) {
                     app.input_runtime.paste.resetSecretWithTrace(.{ .finalize_failed = .{
                         .owner = .auth_code,
@@ -522,17 +523,18 @@ pub fn PasteEditRuntime(comptime App: type) type {
             return app.model_cache.menu.active;
         }
 
-        pub fn finalizePastedBlock(app: *App, agent: *AppAgent, max_input_len: usize) !void {
-            if (app.input_runtime.paste.buffer.items.len == 0) {
-                // xterm.js terminals send an empty paste for Cmd+V when the clipboard holds only an image.
-                if (modelPickerBorrowsComposer(app)) {
-                    debug_trace.logf("input", "composer paste empty action=none reason=model_picker_borrows_composer", .{});
-                    return;
-                }
-                debug_trace.logf("input", "composer paste empty action=clipboard_image", .{});
-                try image_commands.Commands(App).attachClipboardForEmptyPaste(app);
+        /// xterm.js terminals send an empty paste for Cmd+V when the clipboard holds only an image.
+        fn checkClipboardOnEmptyPaste(app: *App) !void {
+            if (modelPickerBorrowsComposer(app)) {
+                debug_trace.logf("input", "composer paste empty action=none reason=model_picker_borrows_composer", .{});
                 return;
             }
+            debug_trace.logf("input", "composer paste empty action=clipboard_image", .{});
+            try image_commands.Commands(App).attachClipboardForEmptyPaste(app);
+        }
+
+        pub fn finalizePastedBlock(app: *App, agent: *AppAgent, max_input_len: usize) !void {
+            if (app.input_runtime.paste.buffer.items.len == 0) return checkClipboardOnEmptyPaste(app);
 
             // Inline image paths create pending attachments, not pasted-text blocks.
             if (image_attachments.hasImagePathToken(app.input_runtime.paste.buffer.items)) {
@@ -611,9 +613,11 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         /// Pastes clipboard text the way a composer paste lands, for Ctrl+V with no
-        /// clipboard image. A bracketed paste that is still open owns the buffer,
-        /// so the text is dropped instead.
+        /// clipboard image.
         pub fn insertClipboardText(app: *App, agent: *AppAgent, text: []const u8, max_input_len: usize) !void {
+            // Cannot happen from key input: routeActivePasteByte hands every byte to
+            // an open paste before handleByte runs, so Ctrl+V never arrives while one
+            // is open. Kept so a future caller cannot reset a live capture.
             if (app.input_runtime.paste.owner != .none) {
                 debug_trace.logf("input", "clipboard text dropped bytes={d} reason=paste_in_progress", .{text.len});
                 return;

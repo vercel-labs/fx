@@ -321,6 +321,12 @@ const FakeApp = struct {
     snapshot_dir: ?[]const u8 = null,
     terminal_clipboard_requests: usize = 0,
     clipboard_text_reads: usize = 0,
+    clipboard_unsupported: bool = false,
+
+    pub fn loadClipboardImageAttachment(self: *FakeApp) !image_attachments.ClipboardImageAttachment {
+        if (self.clipboard_unsupported) return error.Unsupported;
+        return error.NoClipboardImage;
+    }
 
     pub fn requestTerminalClipboardImage(self: *FakeApp) !void {
         self.terminal_clipboard_requests += 1;
@@ -1129,6 +1135,19 @@ test "attachClipboard asks the terminal where fx cannot read the clipboard" {
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
 }
 
+test "attachClipboard is silent on unsupported platforms" {
+    if (!image_attachments.nativeClipboardImageReadable()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var app = FakeApp{ .alloc = alloc, .clipboard_unsupported = true };
+    defer app.deinit();
+
+    try Commands(FakeApp).attachClipboard(&app);
+
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+}
+
 test "an empty paste never asks the terminal for the clipboard" {
     if (image_attachments.nativeClipboardImageReadable()) return error.SkipZigTest;
 
@@ -1208,8 +1227,6 @@ test "a terminal clipboard reply that is not an image is reported" {
 }
 
 test "attachClipboard never reads clipboard text" {
-    if (@import("builtin").target.os.tag == .macos) return;
-
     const alloc = std.testing.allocator;
     var app = FakeApp{ .alloc = alloc };
     defer app.deinit();

@@ -190,7 +190,15 @@ fn unavailableSecretStoreInteractiveWrite(
     return false;
 }
 
-pub const ClipboardError = error{CopyFailed};
+/// A failed read is an error, never an empty clipboard: `readText` returns null
+/// only when the host has no reader or the read gave no text.
+pub const ClipboardError = error{
+    CopyFailed,
+    ReadFailed,
+    ReadTimedOut,
+    ReadTooLarge,
+    OutOfMemory,
+};
 
 pub const unavailable_clipboard = Clipboard{
     .copy_fn = copyUnavailable,
