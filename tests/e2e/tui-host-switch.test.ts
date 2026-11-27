@@ -64,10 +64,11 @@ function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean
 }
 
 // Shows `agent`, "main" or a subagent's name, through the agent list: Ctrl+X
-// opens it whatever the composer holds, each arrow shows the next row's agent,
-// and Enter keeps it. Main's row comes first, then its working subagents, then
-// the rest by their latest reply. Those rows can move while the list is
-// open, so each step reads the rows again instead of counting them.
+// opens it whatever the composer holds, once fx has another agent to switch to
+// (`openAgentList`), each arrow shows the next row's agent, and Enter keeps it.
+// Main's row comes first, then its working subagents, then the rest by their
+// latest reply. Those rows can move while the list is open, so each step reads
+// the rows again instead of counting them.
 async function showAgent(session: TmuxSession, agent: string) {
   await selectAgent(session, agent);
   await session.sendKeys("Enter");
@@ -87,10 +88,53 @@ async function waitForSelectedRow(session: TmuxSession, agent: string, timeoutMs
   }
 }
 
+// The trace file of the fx that `withFx` started last, which names why fx
+// refused a Ctrl+X. Empty when a test runs fx another way, which leaves
+// `openAgentList` no evidence to act on.
+let switchTrace = "";
+
+// That trace file's text, "" when fx has written none yet.
+function traceText(): string {
+  return switchTrace.length > 0 && existsSync(switchTrace) ? readFileSync(switchTrace, "utf8") : "";
+}
+
+// The refusal fx's trace holds after `mark`, the trace's length before a send,
+// such as "open_agent_list refused reason=no_other_agent", or "" when it holds
+// none.
+function refusedSince(mark: number): string {
+  const seen = traceText().slice(mark);
+  const line = seen.split("\n").find((value) => value.includes("open_agent_list refused"));
+  return line === undefined ? "" : line.slice(line.indexOf("open_agent_list refused"));
+}
+
+// Opens the agent list, which shows `LIST_HINT` while it is open. Ctrl+X opens
+// it whatever the composer holds, but fx drops the key when it has no other
+// agent to switch to: a subagent's "Started" row reaches the screen a moment
+// before the list can switch to it, so a send in that gap is lost. One more
+// send follows only fx's own trace line that says it refused the first one, so
+// a key fx handles late opens the list within the wait and nothing is sent to
+// close it. A test that runs fx without a trace file leaves no such evidence,
+// and its one send waits as long as this always did.
+async function openAgentList(session: TmuxSession): Promise<string> {
+  const mark = traceText().length;
+  await session.sendKeys("C-x");
+  try {
+    return await session.waitForPane((pane) => pane.includes(LIST_HINT), 10_000);
+  } catch (error) {
+    // No refusal of that send in the trace: fx has not handled the key yet, or
+    // it is not tracing. A second Ctrl+X could then close the list the first
+    // one opens.
+    if (refusedSince(mark).length === 0) throw error;
+  }
+  // fx refused the key, so no list is open to close: one more send, and the
+  // list it opens stays.
+  await session.sendKeys("C-x");
+  return session.waitForText(LIST_HINT, 10_000);
+}
+
 // Opens the agent list and moves its highlight to `agent`'s row.
 async function selectAgent(session: TmuxSession, agent: string) {
-  await session.sendKeys("C-x");
-  await session.waitForText(LIST_HINT, 10_000);
+  await openAgentList(session);
   const deadline = Date.now() + 15_000;
   let rows = agentRows(await session.capturePaneEscapes());
   for (;;) {
@@ -455,6 +499,9 @@ async function withFx(
   setupHome(home);
   const sessions: TmuxSession[] = [];
   const tape = join(workspace, "fx.fxtape");
+  // Every fx here traces the input scope, so a test can see why a switch key
+  // opened no list. A test that reads its own trace passes its path in `env`.
+  switchTrace = env.FX_TRACE_LOG ?? join(home, "fx-trace.log");
   const launch = async (args = "") => {
     const session = await TmuxSession.create({
       cmd: args ? `${JSON.stringify(FX_BIN)} ${args}` : FX_BIN,
@@ -469,6 +516,10 @@ async function withFx(
         FX_PERMISSION_MODE: "auto",
         FX_AUTO_UPGRADE: "0",
         FX_SOUND: "0",
+        FX_TRACE_LOG: switchTrace,
+        // A test that reads its own trace decides what it records; every other
+        // fx here records the input scope, which holds the refusal lines.
+        ...(env.FX_TRACE_LOG === undefined && env.FX_TRACE_SCOPES === undefined ? { FX_TRACE_SCOPES: "input" } : {}),
         ...(record && sessions.length === 0 ? { FX_RECORD: tape } : {}),
         ...env,
       },
@@ -2771,6 +2822,23 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // The person's ruling on a Ctrl+X that lands before fx can switch is "trace
+  // only": fx keeps dropping the key, and the trace says why. This case pins
+  // both halves of that, so it fails on a build whose refusal is silent.
+  test(
+    "Ctrl+X with one agent open opens no list, and the trace says why",
+    async () => {
+      await withFx(() => text("unused", "unused"), async (session) => {
+        await session.sendKeys("C-x");
+        await until("fx to trace the switch key it refused", () =>
+          traceText().includes("open_agent_list refused reason=no_other_agent"));
+        const pane = await session.capturePane();
+        expect(pane).not.toContain(LIST_HINT);
+      });
+    },
+    TIMEOUT,
+  );
+
   test(
     "with no subagent, Option+Right jumps by word",
     async () => {
@@ -4160,8 +4228,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER start them, then close tester");
         await until("main's turn that closes tester", () => mainCalls >= 3);
         await session.waitForPane((pane) => pane.includes("Started tester"), 15_000);
-        await session.sendKeys("C-x");
-        await session.waitForText(LIST_HINT, 10_000);
+        // "Started tester" comes before the list can switch to it, so open the
+        // list the way every other test does.
+        await openAgentList(session);
         const rows = agentRows(await session.capturePaneEscapes()).map((row) => row.name);
         expect([...rows].sort()).toEqual(["main", "reviewer", "tester"]);
         target = rows.at(-1)!;

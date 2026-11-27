@@ -7714,6 +7714,43 @@ test "the footer indicator names the agent on screen and the key that opens the 
     try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
 }
 
+test "an open_agent_list key that opens no list says why in the trace" {
+    const alloc = std.testing.allocator;
+    const agent_test_support = @import("core/agent/runtime/tests/support.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "open-agent-list.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
+
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+
+    // One agent open, so the list has nothing to switch to.
+    try sendTerminalBytes(&app, "\x18");
+    try std.testing.expect(!App.AgentsAppRuntime.menuActive(&app));
+    // The full transcript holds the screen, which the list would cover.
+    _ = try app.shell.setTranscriptPresentationDepth(alloc, .full);
+    try sendTerminalBytes(&app, "\x18");
+    debug_trace.shutdown();
+
+    const trace = try agent_test_support.readTraceFile(alloc, trace_path, 8192);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "open_agent_list refused reason=no_other_agent") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "open_agent_list refused reason=full_transcript") != null);
+}
+
 /// What the tests of a subagent's end build: an app that writes its tab title
 /// to /dev/null, and the cleanup its parts need, in the order they need it.
 /// Its children point at its `app`, so it stays where `init` built it.
