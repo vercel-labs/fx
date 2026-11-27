@@ -21,8 +21,8 @@ import { join, sep } from "node:path";
 import {
   cleanupIsolatedTestHome,
   createIsolatedTestHome,
-  envWithoutFxHome,
   FX_BIN,
+  fxChildEnv,
   HAS_API_KEY,
   REPO_ROOT,
   runFx,
@@ -4466,10 +4466,7 @@ describe("cli: models", () => {
       });
       const proc = Bun.spawn([FX_BIN, "models", "--json"], {
         cwd: REPO_ROOT,
-        env: {
-          ...envWithoutFxHome(),
-          ...modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
-        },
+        env: fxChildEnv(modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`)),
         stdout: "pipe",
         stderr: "pipe",
       });
@@ -5003,6 +5000,65 @@ describe("cli: replay failures", () => {
         expect(JSON.parse(malformed.stdout.trim())).toMatchObject({
           kind: "replay",
         });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
+/// A tape, as `FX_RECORD` writes one, whose frames are the given stdout reads.
+function stdoutTape(cols: number, rows: number, reads: string[]): Buffer {
+  const version = Buffer.from("test");
+  const header = Buffer.alloc(18);
+  header.write("FXTP\x01", 0, "binary");
+  header.writeUInt16LE(cols, 5);
+  header.writeUInt16LE(rows, 7);
+  header.writeBigInt64LE(0n, 9);
+  header.writeUInt8(version.length, 17);
+  const parts = [header, version];
+  for (const read of reads) {
+    const payload = Buffer.from(read, "binary");
+    const frame = Buffer.alloc(9);
+    frame.writeInt32LE(0, 0);
+    frame.writeUInt8(1, 4);
+    frame.writeUInt32LE(payload.length, 5);
+    parts.push(frame, payload);
+  }
+  return Buffer.concat(parts);
+}
+
+describe("cli: replay", () => {
+  test(
+    "fx replay drops charset designations, also when a read splits one",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-replay-charset-"));
+      try {
+        const tapePath = join(root, "charset.fxtape");
+        writeFileSync(tapePath, stdoutTape(40, 6, [
+          // What `tput sgr0` sends on xterm terminfo.
+          "1 sgr0: A\x1b(B\x1b[mC\r\n",
+          "2 split: A\x1b(",
+          "BC\r\n",
+          // ncurses line drawing; the designation is ignored, not applied.
+          "3 lines: \x1b(0lqqk\x1b(B end\r\n",
+          "4 ESC SP F: A\x1b F C\r\n",
+        ]));
+        const goldenPath = join(root, "golden.txt");
+        const replay = await runFx(["replay", tapePath, "--golden", goldenPath]);
+        expect(replay.code).toBe(0);
+        expect(replay.stderr).toBe("");
+        const rows = readFileSync(goldenPath, "utf8")
+          .split("\n")
+          .slice(0, 4)
+          .map((line) => line.slice(1, -1).trimEnd());
+        expect(rows).toEqual([
+          "1 sgr0: AC",
+          "2 split: AC",
+          "3 lines: lqqk end",
+          "4 ESC SP F: A C",
+        ]);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }

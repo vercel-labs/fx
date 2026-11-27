@@ -19,7 +19,7 @@ import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { traceReportNames, waitForNewTraceReport } from "./trace-report";
-import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, REPO_ROOT } from "../evals/eval-helpers";
 import { closePanel, waitForPanel } from "./info-panel";
 import {
   AUTO_EXA_SERIALIZED_TOOL_NAMES,
@@ -4864,7 +4864,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const readSavedSession = () =>
         execFileSync(FX_BIN, ["session", "--id", sessionId, "--json"], {
           cwd: workspace,
-          env: { ...process.env, HOME: home },
+          env: fxChildEnv({ HOME: home }),
           encoding: "utf8",
         });
       await waitForCondition(

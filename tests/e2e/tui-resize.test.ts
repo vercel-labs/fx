@@ -16,7 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -2822,7 +2822,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       const replay = Bun.spawnSync([FX_BIN, "replay", tapePath, "--json"], {
         cwd: workspace,
-        env: { ...process.env, HOME: home, FX_SOUND: "0", FX_AUTO_UPGRADE: "0" },
+        env: fxChildEnv({ HOME: home, FX_SOUND: "0", FX_AUTO_UPGRADE: "0" }),
       });
       expect(replay.exitCode).toBe(0);
       expect(replay.stderr.toString()).toBe("");

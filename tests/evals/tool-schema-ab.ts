@@ -19,6 +19,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fxChildEnv } from "./eval-helpers";
 
 const UPSTREAM = "https://ai-gateway.vercel.sh";
 
@@ -1282,8 +1283,7 @@ export async function runOne(arm: Arm, model: string, task: Task, trial: number,
   const prompt = task.prompt({ port });
   const timeoutSec = task.timeoutSec ?? 300;
   const started = Date.now();
-  const env: Record<string, string | undefined> = {
-    ...process.env,
+  const env: Record<string, string | undefined> = fxChildEnv({
     HOME: home,
     NO_COLOR: "1",
     FX_SOUND: "0",
@@ -1294,7 +1294,7 @@ export async function runOne(arm: Arm, model: string, task: Task, trial: number,
     FX_MAX_AGENT_STEPS: "30",
     FX_GATEWAY_BASE_URL: proxy.url,
     FX_GATEWAY_CHAT_URL: `${proxy.url}/v4/ai/language-model`,
-  };
+  }, { keepCredentials: true });
   const askArgs = ["ask", "--full-access", "--json", ...(noSave ? ["--no-save"] : []), "--timeout", String(timeoutSec), "--", prompt];
   const child = spawn(arm.bin, askArgs, {
     cwd: repo,
