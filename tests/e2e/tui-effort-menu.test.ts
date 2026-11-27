@@ -385,6 +385,27 @@ test.skipIf(!tmuxAvailable())("typing over the open /effort menu filters its lev
   expect(highlightsAfter(current, /^\x7f$/).at(-1)).toBe("xhigh");
 }, TIMEOUT);
 
+test.skipIf(!tmuxAvailable())("Ctrl+P over the open /effort menu closes it with its query, and the /model menu it opens takes the typing and Enter", async () => {
+  const current = await launch();
+  const { session } = current;
+  await session.sendText("/effort");
+  await waitForEffortMenu(current);
+  await session.sendLiteral("h");
+  await session.waitForPane((pane) => pane.includes("Effort 2") && /^┃ h$/m.test(pane), 5_000);
+  await session.sendKeys("C-p");
+  await session.waitForPane((pane) => pane.includes("Models 2") && !pane.includes("Effort 2") && /^┃ *$/m.test(pane), 5_000);
+  await session.sendLiteral("plain");
+  await session.waitForPane((pane) => pane.includes("Models 1"), 5_000);
+  await session.sendKeys("Enter");
+  await session.waitForText(`* Switched to ${PLAIN_MODEL}`, 5_000);
+  // The effort query is not given back as a draft when the /model menu closes.
+  await session.waitForPane((pane) => /^┃ *$/m.test(pane) && !pane.includes("Models "), 5_000);
+  expect(savedEffort(current)).toBeUndefined();
+  expect(readFileSync(current.stderrPath, "utf8")).toBe("");
+  await quit(current);
+  expect(readFileSync(current.trace, "utf8")).toContain("effort menu closed and its query cleared reason=model_menu_opened query_bytes=1");
+}, TIMEOUT);
+
 test.skipIf(!tmuxAvailable())("a level the model does not offer, or a malformed one, changes nothing and names the levels", async () => {
   const current = await launch();
   const { session } = current;

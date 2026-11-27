@@ -544,7 +544,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
                 .insert_newline => {
-                    if (commandSkillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(agent)) return;
+                    if (commandSkillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(agent) or app.input_runtime.effort_menu.active) return;
                     dismissActiveMenusThenRedraw(app, agent);
                     switch (try insertComposerSliceBounded(app, agent, "\n", max_input_len, false)) {
                         .inserted => app.shell.render_requests.request(.footer),
@@ -996,6 +996,7 @@ pub fn Runtime(comptime App: type) type {
                         debug_trace.logf("input", "open_agent_list refused reason={s}", .{reason});
                         return .done;
                     }
+                    _ = cancelEffortMenu(app, "agent_list_opened");
                     dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
                     // The list sets the draft aside itself, so the model
                     // picker's goes back to the composer first.
@@ -1162,6 +1163,7 @@ pub fn Runtime(comptime App: type) type {
                         runtime_profile.allows(App, .durable_sessions))
                     {
                         if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app)) return .done;
+                        _ = cancelEffortMenu(app, "session_picker_opened");
                         if (try refuseSessionActionWithDraft(app, agents.screenAgentOf(app), "submit or clear the draft before switching sessions")) return .done;
                         dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
                         try app_session_runtime.Runtime(App).openAllSessionPicker(app, agents.screenAgentOf(app));
@@ -1179,6 +1181,9 @@ pub fn Runtime(comptime App: type) type {
                             return .done;
                         }
                         if (modelPickerShortcutBlocked(app, agents.screenAgentOf(app))) return .done;
+                        // Before the draft is set aside: the query is the
+                        // menu's, not a draft to give back.
+                        _ = cancelEffortMenu(app, "model_menu_opened");
                         try openModelPickerShortcut(app);
                     }
                 },
@@ -1188,10 +1193,9 @@ pub fn Runtime(comptime App: type) type {
                     const agent = agents.screenAgentOf(app);
                     if (effortCycleShortcutBlocked(app, agent)) return .done;
                     // The `/effort` menu marks the level that was in use
-                    // when it opened.
-                    if (cancelEffortMenu(app)) {
-                        debug_trace.logf("input", "effort menu closed without applying its highlight reason=ctrl_t_cycle", .{});
-                    }
+                    // when it opened, so Ctrl+T closes it without applying
+                    // its highlight.
+                    _ = cancelEffortMenu(app, "ctrl_t_cycle");
                     try session_commands.Commands(App).cycleEffort(app, agent);
                     app.shell.render_requests.request(.footer);
                 },
@@ -2318,6 +2322,7 @@ pub fn Runtime(comptime App: type) type {
         fn openModelBrowseCatalog(app: *App) !void {
             if (comptime !@hasField(App, "model_cache")) return;
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+            _ = cancelEffortMenu(app, "model_menu_opened");
             try openModelMenu(app);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
@@ -3213,7 +3218,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "approval_prompt");
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
+                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app, "escape")) {
                     _ = disarmEscapeClear(app);
                     _ = disarmEscapeInterrupt(app, "menu");
                     app.shell.render_requests.request(.footer);
@@ -3267,7 +3272,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 return;
             }
-            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
+            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app, "escape")) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -3383,9 +3388,16 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Closes the `/effort` menu and clears its query from the
-        /// composer, as Esc on the `/model` menu does.
-        fn cancelEffortMenu(app: *App) bool {
+        /// composer, as Esc on the `/model` menu does. Another surface that
+        /// takes the footer closes it too, as an edit did before the menu
+        /// filtered, so Enter never reaches a menu that is not on screen.
+        fn cancelEffortMenu(app: *App, reason: []const u8) bool {
             if (!app.input_runtime.effort_menu.active) return false;
+            debug_trace.logf("input", "effort menu closed and its query cleared reason={s} query_bytes={d} pasted_blocks={d}", .{
+                reason,
+                app.input_runtime.edit_state.input.items.len,
+                app.input_runtime.entities.pasted_blocks.items.len,
+            });
             app.input_runtime.effort_menu.close(app.alloc);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
@@ -3403,7 +3415,7 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return true;
             };
-            _ = cancelEffortMenu(app);
+            _ = cancelEffortMenu(app, "applied");
             try session_commands.Commands(App).selectEffort(app, agent, effort);
             app.shell.render_requests.request(.footer);
             return true;
