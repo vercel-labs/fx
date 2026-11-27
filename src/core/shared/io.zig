@@ -1192,20 +1192,55 @@ pub fn sleep(ns: u64) void {
 /// `request_recovery.closeActive`).
 pub const close_wait_ms: u64 = 1_000;
 
-/// Tries `mutex` for up to `ms` milliseconds, polling every 5 ms, and reports
-/// whether it got the lock. The poll counts its own 5 ms steps rather than
-/// reading the clock, so a sleep that fails and returns early only makes the
-/// loop spin faster; it still ends after `ms / 5` tries.
+/// Tries `mutex` until `ms` milliseconds have passed on the awake clock, polling
+/// about every 5 ms, and reports whether it got the lock. The bound is that
+/// clock, not a count of polls: a sleep that runs long only makes the next
+/// check come later, and a sleep that fails only makes the next try come sooner.
 pub fn lockWithin(mutex: *std.Io.Mutex, ms: u64) bool {
-    var waited_ms: u64 = 0;
+    const started_ms = awakeMilliTimestamp();
+    const budget_ms: i64 = @intCast(ms);
     while (!mutex.tryLock()) {
-        if (waited_ms >= ms) return false;
-        // Dropped on purpose: the bound is the poll's own count, not the clock,
-        // so a failed sleep cannot stretch the wait (RULES R3.1).
+        if (awakeMilliTimestamp() - started_ms >= budget_ms) return false;
+        // Dropped on purpose: the clock check above ends the wait, so a failed
+        // sleep cannot stretch it (RULES R3.1).
         getIo().sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
-        waited_ms += 5;
     }
     return true;
+}
+
+test "lockWithin takes a free mutex at once" {
+    var mutex: std.Io.Mutex = .init;
+    try std.testing.expect(lockWithin(&mutex, 1000));
+    mutex.unlock(getIo());
+}
+
+const HeldByOtherThread = struct {
+    mutex: *std.Io.Mutex,
+    locked_ready: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+
+    fn hold(self: *@This()) void {
+        self.mutex.lockUncancelable(getIo());
+        self.locked_ready.set(getIo());
+        self.release.waitUncancelable(getIo());
+        self.mutex.unlock(getIo());
+    }
+};
+
+test "lockWithin gives up on a mutex another thread holds once ms has passed on the awake clock" {
+    var mutex: std.Io.Mutex = .init;
+    var holder = HeldByOtherThread{ .mutex = &mutex };
+    const thread = try std.Thread.spawn(.{}, HeldByOtherThread.hold, .{&holder});
+    holder.locked_ready.waitUncancelable(getIo());
+    const budget_ms: u64 = 100;
+    const started_ms = awakeMilliTimestamp();
+    const got = lockWithin(&mutex, budget_ms);
+    const elapsed_ms = awakeMilliTimestamp() - started_ms;
+    holder.release.set(getIo());
+    thread.join();
+    try std.testing.expect(!got);
+    try std.testing.expect(elapsed_ms >= budget_ms);
+    try std.testing.expect(elapsed_ms < budget_ms + 2000);
 }
 
 /// Reads terminal attributes. Every errno is an error, including the EBADF

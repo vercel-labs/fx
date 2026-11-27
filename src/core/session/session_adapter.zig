@@ -9030,12 +9030,28 @@ test "closing skips a session whose write lock is held, within the close bound" 
     defer s.close();
     try s.appendProgress(.{ .text = @constCast("work") }, .{}, .{});
     const io = io_mod.getIo();
-    // Held by this thread: a closer that waited without a bound would never return.
-    s.host.write_lock.lockUncancelable(io);
+    // A writer on its own thread holds the lock, as it does while the closer
+    // runs. The closer's own thread never takes a lock it already holds.
+    const Holder = struct {
+        lock: *std.Io.Mutex,
+        locked_ready: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+
+        fn hold(self: *@This()) void {
+            self.lock.lockUncancelable(io_mod.getIo());
+            self.locked_ready.set(io_mod.getIo());
+            self.release.waitUncancelable(io_mod.getIo());
+            self.lock.unlock(io_mod.getIo());
+        }
+    };
+    var holder = Holder{ .lock = &s.host.write_lock };
+    const thread = try std.Thread.spawn(.{}, Holder.hold, .{&holder});
+    holder.locked_ready.waitUncancelable(io);
     const started_ms = io_mod.awakeMilliTimestamp();
     const marked = s.markClosing();
     const waited_ms = io_mod.awakeMilliTimestamp() - started_ms;
-    s.host.write_lock.unlock(io);
+    holder.release.set(io);
+    thread.join();
     try testing.expect(!marked);
     try testing.expect(waited_ms < 5 * @as(i64, @intCast(io_mod.close_wait_ms)));
     try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, s.id(), closing_type));
