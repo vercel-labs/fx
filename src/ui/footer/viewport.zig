@@ -27,6 +27,9 @@ pub const Geometry = struct {
     bottom_divider: u16,
     hint: u16,
     activity_row: ?u16 = null,
+    /// Rows of the question panel in the committed frame; null when the
+    /// frame drew no question panel.
+    question_panel: ?PanelRows = null,
 
     pub fn inputPointerPosition(
         self: Geometry,
@@ -53,6 +56,18 @@ pub const InputPointerPosition = struct {
     content_column: usize,
 };
 
+/// A run of physical footer rows that one panel draws.
+pub const PanelRows = struct {
+    first: u16,
+    count: u16,
+
+    /// The panel row, from 0, at physical `row`, or null outside the panel.
+    pub fn rowAt(self: PanelRows, row: u16) ?u16 {
+        if (row < self.first or row - self.first >= self.count) return null;
+        return row - self.first;
+    }
+};
+
 pub const Cursor = struct {
     row: u16,
     col: u16,
@@ -72,6 +87,9 @@ pub const ComposedFooterFrame = struct {
     cursor: Cursor = .{ .row = 1, .col = 1 },
     cursor_visible: bool = true,
     danger_status_visible: bool = false,
+    /// Rows of the question panel, drawn from the plan's `picker_start`;
+    /// zero when the frame draws none.
+    question_panel_rows: u16 = 0,
 
     pub fn deinit(self: *ComposedFooterFrame, alloc: Allocator) void {
         for (self.rows.items) |*row| row.deinit(alloc);
@@ -310,6 +328,14 @@ test "committed footer geometry maps pointer cells into its input window" {
     try std.testing.expect(geometry.inputPointerPosition(4, 3, 2) == null);
     try std.testing.expect(geometry.inputPointerPosition(8, 3, 2) == null);
     try std.testing.expect(geometry.inputPointerPosition(5, 0, 2) == null);
+}
+
+test "panel rows map physical rows inside the panel only" {
+    const panel = PanelRows{ .first = 10, .count = 3 };
+    try std.testing.expect(panel.rowAt(9) == null);
+    try std.testing.expectEqual(@as(?u16, 0), panel.rowAt(10));
+    try std.testing.expectEqual(@as(?u16, 2), panel.rowAt(12));
+    try std.testing.expect(panel.rowAt(13) == null);
 }
 
 const FrameSink = struct {

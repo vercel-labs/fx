@@ -215,8 +215,34 @@ pub fn QuestionRuntime(comptime App: type) type {
                 .cursor_right, .word_right => {
                     // Enter advances; right arrow remains inert to avoid skipping answers.
                 },
+                .mouse_pointer => |pointer| try routeQuestionPointer(app, agent, pointer),
                 else => {},
             }
+        }
+
+        /// A click or tap on an option row picks that option, as its number
+        /// key does: it answers with a listed option and selects the
+        /// freeform slot for typing.
+        fn routeQuestionPointer(
+            app: *App,
+            agent: *AppAgent,
+            pointer: input_action.MousePointer,
+        ) !void {
+            if (pointer.kind != .press or pointer.shift or pointer.alt or pointer.ctrl) return;
+            const viewport = &app.shell.footer_viewport;
+            if (!viewport.has_frame) return;
+            const panel = viewport.geometry.question_panel orelse return;
+            const panel_row = panel.rowAt(pointer.row) orelse return;
+            const projection = agent.question_prompt.projection() orelse return;
+            const option = try question_ui.optionAtPanelRow(
+                app.alloc,
+                projection,
+                app.shell.layout.cols,
+                panel.count,
+                panel_row,
+            ) orelse return;
+            const ordinal = std.math.cast(u8, option) orelse return;
+            _ = try handleQuestionAction(app, agent, .{ .select_ordinal = ordinal });
         }
 
         fn moveFreeformCursorVertical(
