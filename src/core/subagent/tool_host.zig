@@ -3602,7 +3602,7 @@ pub const Runtime = struct {
                     // Closing, it takes nothing; once gone, the name starts a new one.
                     if (self.closingIndexLocked(child.id) != null) return managedAdmissionRejected(alloc, child.id, .child_closing);
                     const override = request.override();
-                    if (override.present() and !try self.overrideMatchesChild(alloc, child.*, override, resolved_model)) {
+                    if (override.present() and !try self.overrideMatchesChild(child.*, override, resolved_model)) {
                         debug_trace.logf(
                             "subagent",
                             "admission rejected operation={s} child_id={s} agent={s} code=override_after_create",
@@ -3741,22 +3741,10 @@ pub const Runtime = struct {
         return @as(?[]u8, try alloc.dupe(u8, text));
     }
 
-    /// A child's saved preferences, read without opening it. Caller owns.
-    fn childPreferences(self: *Runtime, alloc: Allocator, child_id: []const u8) !session_codec.DurableSessionPreferences {
-        return self.children.parent.store.childPreferences(alloc, child_id) catch |err| switch (err) {
-            error.NotFound => if (try self.children.seedFor(alloc, child_id)) |seed|
-                seed.preferences
-            else
-                self.children.parent.currentPreferences(alloc),
-            else => return err,
-        };
-    }
-
     /// True when every override field set on `override` matches the existing
     /// child's current profile, model, and effort.
     fn overrideMatchesChild(
         self: *Runtime,
-        alloc: Allocator,
         child: child_state.Child,
         override: model_contract.Override,
         resolved_model: ?[]const u8,
@@ -3766,8 +3754,8 @@ pub const Runtime = struct {
             if (!std.mem.eql(u8, requested_profile, current_profile)) return false;
         }
         if (override.model == null and override.effort == null) return true;
-        var current = try self.childPreferences(alloc, child.id);
-        defer current.deinit(alloc);
+        var current = try managed_owner.readChildPreferences(&self.managed, child.id);
+        defer current.deinit(self.managed.alloc);
         if (override.model) |requested_model| {
             const effective_model = resolved_model orelse requested_model;
             if (!std.mem.eql(u8, effective_model, current.model)) return false;
@@ -9354,8 +9342,8 @@ test "queuing a message after the parent changes model keeps the child's startup
     defer seed.preferences.deinit(alloc);
     try std.testing.expectEqualStrings("model-a", seed.preferences.model);
 
-    var prefs = try runtime.childPreferences(alloc, child_id);
-    defer prefs.deinit(alloc);
+    var prefs = try managed_owner.readChildPreferences(&runtime.managed, child_id);
+    defer prefs.deinit(runtime.managed.alloc);
     try std.testing.expectEqualStrings("model-a", prefs.model);
 
     var req3 = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "third", .model = "model-a" } });
