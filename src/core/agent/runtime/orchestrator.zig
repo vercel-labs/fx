@@ -8681,6 +8681,7 @@ fn processQueuedPromptLoop(
         length_resend_effort = null;
         const step_effort = resend_effort orelse config.effort;
         if (deps.observer) |observer| observer.beginStep(current_step_index);
+        if (deps.report_model_step) |report| report(deps.ctx, current_step_index);
         defer if (deps.observer) |observer| observer.endStep();
         const step_ctx: TraceContext = .{ .turn_id = turn_id, .step_id = debug_trace.nextStepId(), .subagent_id = config.subagent_id };
         const presentation_group_id = runtime_tool_presentation.presentationGroupForStep(

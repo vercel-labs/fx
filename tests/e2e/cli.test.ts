@@ -31,6 +31,8 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySse,
+  fakeGatewayToolCall,
+  fakeShellRun,
   startDynamicFakeGateway,
   startFakeGateway,
   tokenPassCatalog,
@@ -448,6 +450,7 @@ TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw
 Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
 JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Subagent usage and dollar spend are excluded.
 JSON subagents appears only when a subagent did work in this request. It lists each one in the order it first ran, with its name, id, and usage in the same shape, counted for this request alone. fx session <session_id>/<name> reads one and prints the same id.
+JSON \`steps\` counts the tool calls the agent started. JSON \`model_steps\` sums the loop steps of every turn in the request, while \`max_agent_steps\` limits each turn.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
@@ -6267,7 +6270,7 @@ describe("cli: ask success", () => {
         expect(jsonResult.code).toBe(1);
         expect(jsonResult.stderr).toBe("");
         expect(jsonResult.stdout).toBe(
-          '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
+          '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"model_steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
         );
       } finally {
         cleanupIsolatedTestHome(home);
@@ -7067,6 +7070,212 @@ describe("cli: ask success", () => {
       } finally {
         cleanupIsolatedTestHome(home);
       }
+    },
+    60_000,
+  );
+});
+
+describe("cli: ask model_steps", () => {
+  const READ_FILES = ["a.txt", "b.txt", "c.txt"];
+
+  function parallelReads(prefix: string, paths: string[]) {
+    return fakeGatewaySse([
+      ...paths.map((path, index) => ({
+        type: "tool-call",
+        toolCallId: `${prefix}_${index}`,
+        toolName: "read_file",
+        input: { path },
+      })),
+      { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+    ]);
+  }
+
+  function unavailableReply() {
+    return new Response(JSON.stringify({ error: { message: "provider temporarily unavailable" } }), {
+      status: 503,
+      headers: { "content-type": "application/json", "retry-after": "0" },
+    });
+  }
+
+  // Cut off by the output limit before any text: fx resends it with a higher limit.
+  function lengthStopReply() {
+    return fakeGatewaySse([
+      {
+        type: "finish",
+        finishReason: { unified: "length", raw: "length" },
+        usage: { inputTokens: { total: 3 }, outputTokens: { total: 4096 } },
+      },
+    ]);
+  }
+
+  type AskOptions = {
+    args?: string[];
+    env?: Record<string, string>;
+    model?: Record<string, unknown>;
+    settings?: Record<string, unknown>;
+  };
+
+  async function askJson(
+    reply: (completion: number, body: string) => Response | Promise<Response>,
+    options: AskOptions = {},
+  ) {
+    const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-model-steps-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    if (options.settings) {
+      mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify(options.settings));
+    }
+    for (const file of READ_FILES) writeFileSync(join(workspace, file), `${file} body\n`);
+    let completions = 0;
+    const gateway = startDynamicFakeGateway((body) => reply(++completions, body), {
+      models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], ...options.model }],
+    });
+    try {
+      const result = await runFx(options.args ?? ["ask", "--json", "--no-save", "Read the files."], {
+        cwd: realpathSync(workspace),
+        timeoutMs: 60_000,
+        env: {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "ask-model-steps-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_TEST_SKIP_ONBOARDING: "1",
+          FX_E2E_DISABLE_DOTENV: "1",
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_PERMISSION_MODE: "full-access",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          ...options.env,
+        },
+      });
+      return { code: result.code, json: JSON.parse(result.stdout), requests: gateway.requestCount() };
+    } finally {
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  test(
+    "steps counts tool starts and model_steps counts the agent's loop steps",
+    async () => {
+      const run = await askJson((completion) =>
+        completion === 1 ? parallelReads("read", READ_FILES) : fakeGatewayFinalText("DONE"),
+      );
+      expect(run.code).toBe(0);
+      expect(run.requests).toBe(2);
+      expect(run.json.steps).toBe(3);
+      expect(run.json.model_steps).toBe(2);
+    },
+    60_000,
+  );
+
+  test(
+    "model_steps counts the loop steps that FX_MAX_AGENT_STEPS limits in each turn, while steps counts tool starts",
+    async () => {
+      const run = await askJson(
+        (completion) => parallelReads(`round${completion}`, READ_FILES.slice(0, 2)),
+        { env: { FX_MAX_AGENT_STEPS: "3" } },
+      );
+      expect(run.requests).toBe(3);
+      expect(run.json.steps).toBe(6);
+      expect(run.json.model_steps).toBe(3);
+    },
+    60_000,
+  );
+
+  test(
+    "model_steps is 1 for a plain answer with no tool call",
+    async () => {
+      const run = await askJson(() => fakeGatewayFinalText("hello"));
+      expect(run.code).toBe(0);
+      expect(run.json.steps).toBe(0);
+      expect(run.json.model_steps).toBe(1);
+    },
+    60_000,
+  );
+
+  test(
+    "model_steps keeps the step that stopped for a permission a headless ask cannot grant",
+    async () => {
+      const run = await askJson(
+        () => fakeShellRun("perm_1", "touch must-not-run.txt"),
+        {
+          env: { FX_PERMISSION_MODE: "ask" },
+          settings: { permission_mode: "ask", sandbox: "none" },
+        },
+      );
+      expect(run.code).toBe(1);
+      expect(run.json.error).toBe("NonInteractivePermissionRequired");
+      expect(run.requests).toBe(1);
+      expect(run.json.model_steps).toBe(1);
+    },
+    60_000,
+  );
+
+  test(
+    "model_steps counts a loop step once when its model request is resent after a 503",
+    async () => {
+      const run = await askJson((completion) =>
+        completion === 1 ? unavailableReply() : fakeGatewayFinalText("DONE"),
+      );
+      expect(run.code).toBe(0);
+      expect(run.requests).toBe(2);
+      expect(run.json.model_steps).toBe(1);
+    },
+    60_000,
+  );
+
+  test(
+    "model_steps counts a length resend as its own loop step, as max_agent_steps does",
+    async () => {
+      const run = await askJson(
+        (completion) => (completion === 1 ? lengthStopReply() : fakeGatewayFinalText("answered after the limit retry")),
+        { model: { context_window: 1_000_000 } },
+      );
+      expect(run.code).toBe(0);
+      expect(run.requests).toBe(2);
+      expect(run.json.model_steps).toBe(2);
+    },
+    60_000,
+  );
+
+  test(
+    "model_steps sums the loop steps of both turns when a subagent report starts a follow-up turn",
+    async () => {
+      let releaseChild = () => {};
+      const parentWaiting = new Promise<void>((resolve) => {
+        releaseChild = resolve;
+      });
+      const run = await askJson(
+        async (_completion, body) => {
+          // The child answers only after the parent's waiting reply, so its
+          // report comes after the first turn has ended.
+          if (!body.includes('"name":"subagent"')) {
+            await parentWaiting;
+            return fakeGatewayFinalText("CHILD_DONE");
+          }
+          if (body.includes("Subagent report")) return fakeGatewayFinalText("PARENT_DONE");
+          if (body.includes("usage_child")) {
+            releaseChild();
+            return fakeGatewayFinalText("PARENT_WAITING");
+          }
+          return fakeGatewayToolCall("usage_child", "subagent", {
+            request: { action: "message", agent: "usage", message: "Reply CHILD_DONE." },
+          });
+        },
+        { args: ["ask", "--json", "--yolo", "--", "Delegate the usage task."] },
+      );
+      expect(run.code).toBe(0);
+      expect(run.json.final_output).toBe("PARENT_DONE");
+      // Three parent requests and the child's one; only the parent's steps count.
+      expect(run.requests).toBe(4);
+      expect(run.json.model_steps).toBe(3);
     },
     60_000,
   );
