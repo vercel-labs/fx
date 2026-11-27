@@ -297,7 +297,7 @@ const Harness = struct {
 
     fn invocation(self: *Harness, label: []const u8) ![]const u8 {
         self.serial += 1;
-        return std.fmt.allocPrint(self.alloc, "{s}-{d}", .{ label, self.serial });
+        return self.alloc.print("{s}-{d}", .{ label, self.serial });
     }
 
     /// The bash call as the model names it: idle, the first call running, the
@@ -339,7 +339,7 @@ const Harness = struct {
     }
 
     fn refuse(self: *Harness, event: []const u8) !void {
-        try self.notes.append(self.alloc, try std.fmt.allocPrint(self.alloc, "refused: {s}", .{event}));
+        try self.notes.append(self.alloc, try self.alloc.print("refused: {s}", .{event}));
     }
 
     fn note(self: *Harness, text: []const u8) !void {
@@ -368,7 +368,7 @@ const Harness = struct {
             return self.refuse("run");
         }
         self.serial += 1;
-        const id = try std.fmt.allocPrint(self.alloc, "agent-program-{d}", .{self.serial});
+        const id = try self.alloc.print("agent-program-{d}", .{self.serial});
         const run = try self.alloc.create(Run);
         run.* = .{};
         self.first = run;
@@ -409,14 +409,14 @@ const Harness = struct {
         _ = waitDone(&active.done, window);
         self.steer.store(false, .seq_cst);
         if (self.hold_dropped_ms != 0) {
-            try self.note(try std.fmt.allocPrint(self.alloc, "yield {d} ms after the hold dropped", .{io_mod.milliTimestamp() - self.hold_dropped_ms}));
+            try self.note(try self.alloc.print("yield {d} ms after the hold dropped", .{io_mod.milliTimestamp() - self.hold_dropped_ms}));
             self.hold_dropped_ms = 0;
         }
         if (active.done.load(.seq_cst)) {
             if (active.prepared) |prepared| {
                 if (prepared.snapshot.state == .running) {
                     self.managed.commitDelivery(self.execution_id, prepared.reservation_id) catch |err| {
-                        try self.note(try std.fmt.allocPrint(self.alloc, "commit failed: {s}", .{@errorName(err)}));
+                        try self.note(try self.alloc.print("commit failed: {s}", .{@errorName(err)}));
                     };
                 }
             }
@@ -453,7 +453,7 @@ const Harness = struct {
             }
         }
         const stopped = self.managed.stop(self.alloc, self.execution_id, true) catch |err| {
-            return self.note(try std.fmt.allocPrint(self.alloc, "stop failed: {s}", .{@errorName(err)}));
+            return self.note(try self.alloc.print("stop failed: {s}", .{@errorName(err)}));
         };
         if (stopped.snapshot.state == .running) return self.note("the program still runs after stop");
         self.prog = .gone;
@@ -511,7 +511,7 @@ const Harness = struct {
             .timestamp_ms = 1,
             .caller_worker = null,
         }) catch |err| {
-            return self.note(try std.fmt.allocPrint(self.alloc, "post failed: {s}", .{@errorName(err)}));
+            return self.note(try self.alloc.print("post failed: {s}", .{@errorName(err)}));
         };
         if (std.mem.find(u8, result.body, "Sent to your parent") == null) try self.note("post was not sent");
         self.settleOpenWait();
@@ -566,7 +566,7 @@ const Harness = struct {
         if (std.mem.eql(u8, event, "child_ends")) return self.doChildEnds();
         if (std.mem.eql(u8, event, "cancel")) return self.doCancel();
         if (std.mem.eql(u8, event, "join")) return self.doJoin();
-        try self.note(try std.fmt.allocPrint(self.alloc, "unknown event: {s}", .{event}));
+        try self.note(try self.alloc.print("unknown event: {s}", .{event}));
     }
 
     fn writeState(self: *Harness, out: *std.Io.Writer) !void {
