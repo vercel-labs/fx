@@ -94,6 +94,7 @@ pub fn Runtime(comptime App: type) type {
                 .when_idle => if (!idleForRestart(app)) return,
             }
             if (app.anyTurnRunning() or draftPending(app)) return;
+            if (app.upgrader.restart == .when_idle and !handOffForIdleRestart(app)) return;
             app.upgrader.restart = .none;
             if (comptime @hasDecl(App, "logHeldWorkForRestart")) app.logHeldWorkForRestart();
             debug_trace.logf("upgrade", "event=restart_after_yield", .{});
@@ -132,6 +133,32 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "queuedWorkElsewhere")) {
                 if (app.queuedWorkElsewhere(&name_buf) != null) return false;
             }
+            return true;
+        }
+
+        /// Asks the agent on screen for the resume handoff again, as Ctrl+G
+        /// does, since what ran while the restart waited for idle can have
+        /// switched or closed the session Ctrl+G asked (`/new`, `/resume`).
+        /// When the session cannot hand off, the restart is cancelled with a
+        /// notice rather than relaunching without it.
+        fn handOffForIdleRestart(app: *App) bool {
+            const agent = agents.screenAgentOf(app);
+            cancelUpgradeHandoffs(app);
+            app.prepareResumeHandoffForUpgrade(agent) catch |err| {
+                app.upgrader.cancelRestart();
+                debug_trace.logf("upgrade", "event=restart_cancelled reason=handoff_unavailable err={s}", .{@errorName(err)});
+                const notice = app.alloc.print(
+                    "restart for the upgrade cancelled because this conversation is not safely resumable: {s}; press Ctrl+G to try again",
+                    .{@errorName(err)},
+                ) catch return false;
+                defer app.alloc.free(notice);
+                // The notice only explains the cancel; the restart is already off.
+                writeUpgradeNotice(app, .@"error", notice) catch |notice_err| {
+                    debug_trace.logf("upgrade", "event=notice_unavailable err={s}", .{@errorName(notice_err)});
+                };
+                return false;
+            };
+            app.requestResumeHandoffForUpgrade(agent);
             return true;
         }
 
@@ -187,8 +214,9 @@ pub fn Runtime(comptime App: type) type {
                 try writeUpgradeNotice(app, .neutral, "auto-upgrade is disabled");
                 return .not_ready;
             }
-            // A second Ctrl+G while the restart waits cancels it. Once the
-            // held turns are let go, the restart is under way.
+            // A second Ctrl+G while the restart waits, for its turns or for
+            // idle, cancels it. Once the held turns are let go, the restart
+            // is under way.
             if (comptime supportsYield(App)) {
                 switch (app.upgrader.restart) {
                     .none => {},
@@ -1128,6 +1156,10 @@ test "app_upgrade_runtime lets a prompt sent while the restart waits go on, and 
     try std.testing.expect(!app.should_exit);
     try std.testing.expectEqual(@as(usize, 0), app.release_count);
     app.turn_running = false;
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "typed");
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    app.input_runtime.edit_state.input.clearRetainingCapacity();
     app.agent().submission.pending = 1;
     Runtime(TestApp).collectUpgradeFacts(&app);
     try std.testing.expect(!app.should_exit);
@@ -1145,10 +1177,35 @@ test "app_upgrade_runtime lets a prompt sent while the restart waits go on, and 
     try std.testing.expect(!app.should_exit);
     app.needs_user_elsewhere = null;
 
-    // Idle: fx exits for the relaunch.
+    // Idle: the agent on screen is asked for the handoff again, and fx
+    // exits for the relaunch.
     Runtime(TestApp).collectUpgradeFacts(&app);
     try std.testing.expect(app.should_exit);
     try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
+    try std.testing.expectEqual(@as(usize, 2), app.prepare_count);
+    try std.testing.expectEqual(@as(usize, 2), app.request_handoff_count);
+    try std.testing.expect(app.agent().upgrade_handoff);
+}
+
+test "app_upgrade_runtime cancels a restart put off until idle when the session on screen cannot hand off" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    var deps_state = TestDepsState{};
+    _ = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expect(Runtime(TestApp).restartWhenIdleForPrompt(&app));
+
+    // A session switch while it waited, such as `/new`, closed the session
+    // Ctrl+G asked; the one on screen now cannot hand off.
+    app.turn_running = false;
+    app.prepare_error = error.SessionPersistenceUnavailable;
+    Runtime(TestApp).collectUpgradeFacts(&app);
+    try std.testing.expect(!app.should_exit);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.none, app.upgrader.restart);
+    try std.testing.expectEqual(@as(usize, 1), app.upgrader.cancel_count);
+    try std.testing.expect(!app.agent().upgrade_handoff);
+    try std.testing.expect(std.mem.find(u8, app.notices.items, "restart for the upgrade cancelled because this conversation is not safely resumable") != null);
 }
 
 test "app_upgrade_runtime cancels a restart put off until idle on Ctrl+G, and keeps a prompt only once the held turns were let go" {

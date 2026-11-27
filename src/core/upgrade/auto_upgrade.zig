@@ -728,7 +728,7 @@ test "statusLabel waiting returns empty" {
     try std.testing.expectEqual(@as(usize, 0), label.len);
 }
 
-test "a restart a prompt put off until idle says so, and a quit then drops its relaunch" {
+test "a restart a prompt put off until idle says so, and an exit before it drops its relaunch" {
     var au = AutoUpgrade{};
     var buf: [64]u8 = undefined;
     try au.requestRelaunch("/tmp/fx-upgraded");

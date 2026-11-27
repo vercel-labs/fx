@@ -13491,10 +13491,25 @@ test "app_input_runtime submit sends a prompt at once while the upgrade restart 
 
     app.upgrader.restart = .waiting;
     try Runtime(FakeSubmitApp).submit(&app, 100);
-    try std.testing.expect(app.last_prompt != null or app.agent().submission.pending != null);
+    const sent = app.last_prompt orelse app.agent().submission.pending.?.draft.prompt;
+    try std.testing.expectEqualStrings("send me now", sent);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expectEqual(auto_upgrade.RestartWait.when_idle, app.upgrader.restart);
     try std.testing.expectEqual(@as(usize, 0), app.notice_count);
+}
+
+test "app_input_runtime submit leaves a waiting upgrade restart alone when Enter sends nothing" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "  ");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    app.upgrader.restart = .waiting;
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+    try std.testing.expectEqual(auto_upgrade.RestartWait.waiting, app.upgrader.restart);
+    try std.testing.expect(app.last_prompt == null);
+    try std.testing.expect(app.agent().submission.pending == null);
 }
 
 test "app_input_runtime submit keeps a prompt in the composer only once the held turns were let go for the restart" {
@@ -13509,7 +13524,7 @@ test "app_input_runtime submit keeps a prompt in the composer only once the held
     try std.testing.expect(app.last_prompt == null);
     try std.testing.expect(app.agent().submission.pending == null);
     try std.testing.expectEqualStrings("after the restart", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqualStrings("fx is restarting for the upgrade now; send this after the restart", app.notice_body.items);
+    try std.testing.expectEqualStrings("fx restarts for the upgrade once the prompt is empty; clear it, or send it after the restart", app.notice_body.items);
     try std.testing.expectEqual(auto_upgrade.RestartWait.releasing, app.upgrader.restart);
 }
 

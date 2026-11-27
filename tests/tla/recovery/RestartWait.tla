@@ -198,6 +198,13 @@ IdleExit ==
     /\ wait' = "exited"
     /\ UNCHANGED <<st, asked, released>>
 
+\* Planted defect: fx exits while a turn still runs. A config plants it
+\* with IdleExit <- IdleExitEarly.
+IdleExitEarly ==
+    /\ wait = "when_idle"
+    /\ wait' = "exited"
+    /\ UNCHANGED <<st, asked, released>>
+
 \* Ctrl+G while the restart waits for idle cancels it.
 CancelWhenIdle ==
     /\ wait = "when_idle"

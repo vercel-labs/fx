@@ -74,8 +74,8 @@ fn buildPendingPromptDraft(
 
 /// What a prompt sent in the moment after the held turns were let go for an
 /// upgrade's restart gets: they stopped for the relaunch, which comes once the
-/// composer is empty.
-const restart_held_submit_notice = "fx is restarting for the upgrade now; send this after the restart";
+/// composer is empty (`app_upgrade_runtime.zig` `finishWaitingRestart`).
+const restart_held_submit_notice = "fx restarts for the upgrade once the prompt is empty; clear it, or send it after the restart";
 
 pub fn SubmitRuntime(comptime App: type) type {
     return struct {
@@ -639,7 +639,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             // does the text stay in the composer. `/quit` still quits.
             // A host that never upgrades itself has no restart to wait for.
             if (comptime runtime_profile.allows(App, .auto_upgrade) and @hasField(App, "upgrader") and @hasField(@FieldType(App, "upgrader"), "restart")) {
-                if (!submitsQuit(app) and !app_upgrade_runtime.Runtime(App).restartWhenIdleForPrompt(app)) {
+                if (!submitsQuit(app) and !submitsNothing(app) and !app_upgrade_runtime.Runtime(App).restartWhenIdleForPrompt(app)) {
                     debug_trace.logf("input", "submit held reason=upgrade_restart_releasing input_bytes={d}", .{app.input_runtime.edit_state.input.items.len});
                     try app.writeDomainNotice(.{
                         .topic = "upgrade",
@@ -1026,6 +1026,13 @@ pub fn SubmitRuntime(comptime App: type) type {
         fn submitsQuit(app: *App) bool {
             const text = std.mem.trim(u8, app.input_runtime.edit_state.input.items, " \t\r\n");
             return command_specs.matchesSlashExact(app.slashRegistry(), text, .quit);
+        }
+
+        /// Whether Enter sends nothing: an empty composer with no images, so
+        /// a waiting upgrade restart stays as it is.
+        fn submitsNothing(app: *App) bool {
+            if (std.mem.trim(u8, app.input_runtime.edit_state.input.items, " \t\r\n").len > 0) return false;
+            return agents.screenAgentOf(app).pending_images.items.len == 0;
         }
 
         fn shouldRouteUnknownSlashCommand(app: *App, text: []const u8) bool {
