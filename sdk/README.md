@@ -130,6 +130,8 @@ createFxAgent({ durability: memory() }); // nothing outlives the process
 
 On `local()`, `vercel()` and `world()`, a session id is a Workflow run id, `wrun_` followed by letters and digits. Take it from `turn.accepted` or `await agent.newSessionId()` instead of making one up. On `memory()`, any 1 to 128 letters, digits, `.`, `_` or `-` work.
 
+The `maxDurationMs`, `pollMs` and `leaseMs` options take at most 2147483647 milliseconds, the longest a JavaScript timer waits, which is about 24.8 days. Earlier versions accepted a longer value, which now throws a `TypeError`. To run without a time limit, leave `maxDurationMs` out.
+
 A session stores the conversation, and with each prompt and steer the caller's `context` and the session object's settings. Every process passes its own model, credentials, tools, MCP clients and skills when it creates the agent.
 
 libfx doesn't know who is calling. Anyone with a session's id can prompt, steer, cancel, stream or checkpoint it, so your app must check that the caller may use a session before it opens it. A queue message only names an input libfx already stored: a delivery that names one the session's log doesn't hold runs nothing, and the agent's `onEvent` gets a `session.refused` event. If a session's saved checkpoint came from a different libfx version, tool set or model, the session still loads, and `onEvent` gets a `checkpoint.mismatch` event naming what changed.

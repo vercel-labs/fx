@@ -211,10 +211,15 @@ export function memory({ maxDurationMs, reserveMs } = {}) {
   return { [durabilityTag]: true, name: "memory", create: () => (backend ??= createMemoryBackend({ maxDurationMs, reserveMs })) };
 }
 
+// setTimeout runs a longer delay at once, which would cut off each step as it starts.
+// The other copy is maxTimerDelayMs in sdk/durable/world.mjs; change both together.
+const maxTimerDelayMs = 2 ** 31 - 1;
+
 function checkDurations(name, { maxDurationMs, reserveMs }) {
   for (const [key, value] of Object.entries({ maxDurationMs, reserveMs })) {
     if (value !== undefined && !(Number.isSafeInteger(value) && value >= 0)) throw new TypeError(`${name}() ${key} must be a non-negative integer`);
   }
+  if (maxDurationMs > maxTimerDelayMs) throw new TypeError(`${name}() maxDurationMs must be at most ${maxTimerDelayMs}`);
 }
 
 // A durability is `memory()`, or a World one from `libfx/durable-world` (and
@@ -2146,8 +2151,10 @@ class SessionWorker {
     // A turn that started under a claim that then failed stops at once and
     // stores nothing.
     void ready.then((landed) => { if (!landed) turnNow?.cancel({ reason: "handoff" }); });
+    // A World's deadline can lie further off than a timer waits; stopping
+    // sooner is safe, since the next delivery continues the turn.
     const hardStop = stopMargin > 0 && deadline - stopMargin > Date.now()
-      ? setTimeout(this.stopNow, deadline - stopMargin - Date.now())
+      ? setTimeout(this.stopNow, Math.min(maxTimerDelayMs, deadline - stopMargin - Date.now()))
       : null;
     // A host handing this process off (agent.handOff()) stops the turn at its
     // next safe point and starts no other; at `cutAt`, in ms since the epoch,

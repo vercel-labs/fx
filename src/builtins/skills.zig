@@ -40,6 +40,13 @@ pub const root_policy: skill_contract.RootPolicy = .{
     .global_roots = &global_roots,
 };
 
+pub fn workspaceRootPath(source: skill_contract.SkillSource) ?[]const u8 {
+    for (workspace_roots) |root| {
+        if (root.source == source) return root.path;
+    }
+    return null;
+}
+
 pub fn loadVisibleSkillsForTool(
     alloc: Allocator,
     workspace_root: []const u8,

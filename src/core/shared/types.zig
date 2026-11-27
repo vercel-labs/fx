@@ -46,17 +46,17 @@ pub const SemanticNotice = struct {
     /// An optional dim line under the body, indented like a wrapped body row
     /// and without its own glyph.
     detail: []const u8 = "",
+    /// Where the detail row shows; `.full_only` keeps it to the full transcript.
+    detail_visibility: NoticeVisibility = .compact_and_full,
 };
 
-/// Status glyph leading every semantic notice, keyed by tone. Tool activity
-/// owns "●"; notices deliberately use distinct git-style status glyphs so the
-/// two channels never read as the same raw marker. The neutral marker "*"
-/// avoids the middot, which the footer already uses as a separator.
+/// Status glyph leading every semantic notice, keyed by tone. Tool activity owns "●",
+/// so notices use other marks; "⚠" matches the status line's warning sign, and "*" avoids the footer's middot.
 pub fn noticeGlyph(tone: NoticeTone) []const u8 {
     return switch (tone) {
         .information => "i",
         .success => "✓",
-        .warning => "!",
+        .warning => "⚠",
         .@"error" => "✗",
         .cancelled => "⊘",
         .neutral => "*",
@@ -76,6 +76,7 @@ pub fn dupeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) std.
         .body = body,
         .visibility = notice.visibility,
         .detail = try alloc.dupe(u8, notice.detail),
+        .detail_visibility = notice.detail_visibility,
     };
 }
 
@@ -226,7 +227,35 @@ pub const TurnErrorKind = enum {
 pub const TurnFinished = struct {
     turn_id: u64,
     outcome: TurnPresentationOutcome,
+    /// How the turn's last model reply ended, when one did. A subagent's
+    /// parent reads it to say why a failed turn failed.
+    disposition: ?ProviderCompletionDisposition = null,
 };
+
+/// Why a turn failed when its reply was cut off at the output limit, in the
+/// failure a subagent's parent sees in place of `agent_turn_failed`.
+const output_limit_failure = "output_limit: the reply was cut off at its output-token limit";
+
+/// The failure a turn that ended this way reports, when its own reason says
+/// more than that it failed.
+pub fn turnFailureFor(finished: TurnFinished) ?ModelFailureDiagnostic {
+    if (finished.outcome != .failed) return null;
+    const disposition = finished.disposition orelse return null;
+    return switch (disposition) {
+        .length_limited => ModelFailureDiagnostic.init(output_limit_failure),
+        else => null,
+    };
+}
+
+test "a turn that a cut reply failed reports the output limit" {
+    try std.testing.expectEqualStrings(
+        "output_limit: the reply was cut off at its output-token limit",
+        turnFailureFor(.{ .turn_id = 1, .outcome = .failed, .disposition = .length_limited }).?.view(),
+    );
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .completed, .disposition = .length_limited }) == null);
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .failed }) == null);
+    try std.testing.expect(turnFailureFor(.{ .turn_id = 1, .outcome = .failed, .disposition = .completed }) == null);
+}
 
 pub const ToolLifecycleId = struct {
     turn_id: u64,
