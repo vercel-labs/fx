@@ -4536,7 +4536,7 @@ fn runConfig(alloc: Allocator, cfg: Config, deps: RunDeps, opts: cli_config.Opti
         loaded.entries.items;
 
     const matches: ?[]settings_entries.Entry = if (opts.key) |key|
-        try settings_entries.lookup(alloc, shown, key)
+        try cli_config.lookupEntries(alloc, shown, key)
     else
         null;
     defer if (matches) |found| alloc.free(found);
@@ -4546,7 +4546,7 @@ fn runConfig(alloc: Allocator, cfg: Config, deps: RunDeps, opts: cli_config.Opti
         .unknown = if (opts.key == null) loaded.unknown else &.{},
         .workspace_root = workspace_root,
         .show_origin = opts.show_origin,
-        .value_only = opts.key != null and entries.len == 1 and std.mem.eql(u8, entries[0].key, opts.key.?),
+        .value_only = opts.key != null and entries.len == 1 and cli_config.sameEntryKey(entries[0].key, opts.key.?),
     };
     if (opts.format == .text) {
         for (snapshot.unknown) |unknown| {

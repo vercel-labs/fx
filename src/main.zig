@@ -31,6 +31,7 @@ const js_host_clipboard = @import("core/hosts/js_host_clipboard.zig");
 const credentials = @import("core/auth/credentials.zig");
 const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
+const personal_shortcut_runtime = @import("core/app/personal_shortcut_runtime.zig");
 const usage = @import("usage/usage.zig");
 const usage_host = @import("core/app/usage_host.zig");
 const credits_lookup = @import("core/app/credits_lookup.zig");
@@ -616,6 +617,8 @@ const App = struct {
     trust: workspace_trust.gate.Gate = .{},
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
+    /// Personal keyboard shortcuts from the profile, reloaded at turn ends.
+    personal_shortcuts: personal_shortcut_runtime.State = .{},
     /// Replaced in `init` with the real home directory.
     usage_dashboard: usage.Dashboard = usage.Dashboard.init(std.heap.c_allocator, usage_host.unset),
     /// The `/credits` lookup in flight, if any.
@@ -3286,7 +3289,7 @@ const App = struct {
             );
             const replay = replay_byte orelse return;
             const context = try InputAppRuntime.prepareTerminalDecode(self, self.screenAgent()) orelse return;
-            ingress = self.terminal_input_runtime.decodeTerminalByte(replay, context);
+            ingress = self.terminal_input_runtime.decodeReplayedTerminalByte(replay, context);
         }
     }
 
@@ -5710,11 +5713,13 @@ test {
     _ = @import("core/recovery/recovery.zig");
     _ = @import("core/workspace_trust/workspace_trust.zig");
     _ = @import("core/app/app_trust_runtime.zig");
+    _ = @import("core/app/personal_shortcut_runtime.zig");
     _ = @import("ui/footer/trust_prompt_ui.zig");
     _ = @import("core/quiesce/quiesce.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
+    _ = @import("core/shortcuts/shortcuts.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/function_tools.zig");
     _ = @import("core/shared/json_depth.zig");
