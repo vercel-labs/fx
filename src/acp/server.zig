@@ -2934,7 +2934,7 @@ fn startLeader(state: *ServerState) void {
         leader.stop(io);
         return;
     };
-    store.manager.setLockWon(takeover_mod.takeOverDeadLeader);
+    store.manager.setLockWon(takeover_mod.takeOverDeadLeader, takeover_mod.max_record_bytes);
     host.leader = leader;
 }
 

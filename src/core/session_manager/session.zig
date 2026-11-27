@@ -32,12 +32,9 @@ pub const default_snapshot_every_bytes: u64 = 64 << 10;
 
 /// Runs right after this process wins a session's lock, with the bytes the
 /// previous holder left in it (empty when none). It runs before this process
-/// writes its own record. A longer lock reaches it with one byte past
-/// `max_lock_line_bytes`, so the hook can refuse the line.
+/// writes its own record. The hook gets at most one byte more than the limit its
+/// owner registered, so a longer lock reaches it past that limit and it can refuse it.
 pub const LockWon = *const fn (io: std.Io, old_line: []const u8) void;
-
-/// The most bytes of a lock's line that a `LockWon` hook takes as a record.
-pub const max_lock_line_bytes: usize = 1024;
 
 pub const Options = struct {
     /// How long `openResume` retries a held flock before Busy.
@@ -56,6 +53,8 @@ pub const Options = struct {
     /// Runs once for each lock this process wins, see `LockWon`. Null when the
     /// process keeps no leader.
     lock_won: ?LockWon = null,
+    /// The limit the hook was registered with, in bytes of a lock's line.
+    lock_won_limit_bytes: usize = 0,
 };
 
 /// What every Session of one manager shares. Owned by L4; outlives them.
@@ -1435,12 +1434,16 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
 /// not called, so the previous holder's folder stays where it is.
 fn notifyLockWon(env: *const Env, lock: storage.File, id: []const u8) void {
     const won = env.options.lock_won orelse return;
-    var old_line: [max_lock_line_bytes + 1]u8 = undefined;
-    const read = env.s.readAt(lock, &old_line, 0) catch {
+    const buffer = env.gpa.alloc(u8, env.options.lock_won_limit_bytes + 1) catch {
         diag.report(env.diagnostics, .{ .kind = .leader_lock_not_read, .session_id = id });
         return;
     };
-    won(env.s.io, old_line[0..read]);
+    defer env.gpa.free(buffer);
+    const read = env.s.readAt(lock, buffer, 0) catch {
+        diag.report(env.diagnostics, .{ .kind = .leader_lock_not_read, .session_id = id });
+        return;
+    };
+    won(env.s.io, buffer[0..read]);
 }
 
 fn acquireLock(env: *const Env, lock: storage.File, wait_ms: u64) OpenError!void {

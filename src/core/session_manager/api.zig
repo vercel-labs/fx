@@ -39,7 +39,6 @@ pub const Child = fold.Child;
 pub const Diagnostic = diag.Event;
 pub const DiagnosticKind = diag.Kind;
 pub const Diagnostics = diag.Sink;
-pub const max_lock_line_bytes = session_mod.max_lock_line_bytes;
 pub const Page = session_mod.Page;
 pub const Entry = session_mod.Entry;
 pub const Cursor = session_mod.Cursor;
@@ -229,8 +228,9 @@ pub const Manager = struct {
     /// Sets the hook that each lock this manager wins calls, with the bytes the
     /// previous holder left (see `session_mod.LockWon`). Call it before any
     /// session opens.
-    pub fn setLockWon(m: *Manager, hook: session_mod.LockWon) void {
+    pub fn setLockWon(m: *Manager, hook: session_mod.LockWon, limit_bytes: usize) void {
         m.env.options.lock_won = hook;
+        m.env.options.lock_won_limit_bytes = limit_bytes;
     }
 
     /// The ids of the sessions this manager leads, copied under the lock. The
@@ -1242,6 +1242,7 @@ const api_tests = struct {
         try testing.expectEqual(@as(usize, 0), f.recorder.count(.leader_record_not_written));
     }
 
+    const lock_line_limit_test: usize = 1024;
     var lock_hook_calls: usize = 0;
     var lock_hook_len: usize = 0;
 
@@ -1262,7 +1263,7 @@ const api_tests = struct {
         defer gpa.free(id);
         s.release();
 
-        const line = try gpa.alloc(u8, api.max_lock_line_bytes + 1);
+        const line = try gpa.alloc(u8, lock_line_limit_test + 1);
         defer gpa.free(line);
         @memset(line, ' ');
         @memcpy(line[0..dead_holder_record.len], dead_holder_record);
@@ -1270,11 +1271,11 @@ const api_tests = struct {
 
         lock_hook_calls = 0;
         lock_hook_len = 0;
-        m.setLockWon(countLockWon);
+        m.setLockWon(countLockWon, lock_line_limit_test);
         const resumed = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .ask });
         resumed.release();
         try testing.expectEqual(@as(usize, 1), lock_hook_calls);
-        try testing.expectEqual(api.max_lock_line_bytes + 1, lock_hook_len);
+        try testing.expectEqual(lock_line_limit_test + 1, lock_hook_len);
     }
 
     test "a lock the next holder cannot read is traced as leader_lock_not_read, and the lock hook is not called" {
@@ -1294,7 +1295,7 @@ const api_tests = struct {
 
         try writeLock(m, id, dead_holder_record);
         lock_hook_calls = 0;
-        m.setLockWon(countLockWon);
+        m.setLockWon(countLockWon, lock_line_limit_test);
         fault.fail_next_read = true;
         const resumed = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .ask });
         resumed.release();

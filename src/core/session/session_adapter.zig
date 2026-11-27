@@ -43,7 +43,6 @@ pub const LogCursor = sm.Cursor;
 /// The session manager's rule for a session id, for code that may not
 /// import the session manager itself.
 pub const validSessionId = sm.validId;
-pub const lock_line_limit_bytes = sm.max_lock_line_bytes;
 const debug_trace = @import("../shared/debug_trace.zig");
 const write_test_controls = @import("write_test_controls.zig");
 const io_mod = @import("../shared/io.zig");
