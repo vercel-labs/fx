@@ -11,7 +11,6 @@ const execution = @import("execution.zig");
 const live_metrics = @import("live_metrics.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const host_target = @import("../hosts/target.zig");
 const end_test_controls = @import("end_test_controls.zig");
 const start_test_controls = @import("start_test_controls.zig");
 const publish_test_controls = @import("publish_test_controls.zig");
@@ -130,13 +129,6 @@ pub const FeedbackResult = union(enum) {
     conflict,
     capacity,
 };
-
-/// Whether a child's turn is asked to stop for fx's upgrade restart. A wasm
-/// host never restarts itself, so its turns never are.
-fn stopsForRestart(worker: *const worker_runtime.WorkerRuntime) bool {
-    if (comptime host_target.is_wasm) return false;
-    return worker.yield_requested.load(.seq_cst);
-}
 
 const Feedback = struct {
     child_id: []u8,
@@ -356,7 +348,7 @@ pub const Owner = struct {
         const attached = slot.work_id orelse return .starting;
         if (!std.mem.eql(u8, attached, work_id)) return .waiting;
         const worker = slot.worker orelse return .waiting;
-        if (stopsForRestart(worker)) {
+        if (worker.stopsForRestart()) {
             debug_trace.logf("subagent", "event=steer_refused reason=upgrade_restart child_id={s} work_id={s}", .{ child_id, work_id });
             return .restarting;
         }

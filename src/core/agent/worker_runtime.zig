@@ -22,6 +22,7 @@ const types = @import("../shared/types.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
 const model_provider = @import("../config/model_provider.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
+const host_target = @import("../hosts/target.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -2394,6 +2395,14 @@ pub const WorkerRuntime = struct {
         }
         self.worker_cond.broadcast(io_mod.getIo());
         debug_trace.logf("worker", "event=yield_requested processing={} queued={d}", .{ self.worker_processing, self.queuedWorkCountLocked() });
+    }
+
+    /// Whether this agent's turn is asked to stop for an upgrade's restart
+    /// (`requestYield`). A wasm host never restarts itself, so its turns
+    /// never are.
+    pub fn stopsForRestart(self: *const WorkerRuntime) bool {
+        if (comptime host_target.is_wasm) return false;
+        return self.yield_requested.load(.seq_cst);
     }
 
     /// Lets a turn held for the restart return, so fx can exit for it.

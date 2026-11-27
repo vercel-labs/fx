@@ -2041,7 +2041,7 @@ pub fn Runtime(comptime App: type) type {
             app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
             defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
             const child = findChild(app, child_id) orelse return false;
-            return child.agent.worker.yield_requested.load(.seq_cst);
+            return child.agent.worker.stopsForRestart();
         }
 
         /// Asks the running turns of main, the other instances, and the

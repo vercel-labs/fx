@@ -150,7 +150,8 @@ pub const ActiveWork = struct {
 };
 
 /// The admission a child's last work ran under, as its spawn line saved it.
-/// A continuation of that work copies it. Owned.
+/// A continuation of that work copies it. Only these fields: a saved
+/// admission has no work id, message, or start time of its own. Owned.
 pub const Admission = struct {
     started_by: reports.StartedBy = .parent,
     permission_mode: types.PermissionMode,
@@ -881,13 +882,38 @@ fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, prof
 /// that is null or empty is left off, so a work without them adds nothing.
 fn workMembers(arena: Allocator, work: ?ActiveWork) ![]const u8 {
     const saved = work orelse return "{}";
+    const root_messages = savedRootMessages(saved.root_user_messages);
+    const cut = root_messages.len < saved.root_user_messages.len;
+    if (cut) debug_trace.logf("subagent", "root requests cut from a spawn line work_id={s} kept={d} of={d}", .{ saved.id, root_messages.len, saved.root_user_messages.len });
     return stringifyOmittingNulls(arena, .{
         .replaces = nonEmptyText(saved.replaces),
         .permission_mode = @tagName(saved.permission_mode),
         .root_user_intent_context = nonEmptyText(saved.root_user_intent_context),
-        .root_user_messages = if (saved.root_user_messages.len == 0) null else saved.root_user_messages,
-        .root_user_evidence_complete = saved.root_user_evidence_complete,
+        .root_user_messages = if (root_messages.len == 0) null else root_messages,
+        .root_user_evidence_complete = saved.root_user_evidence_complete and !cut,
     });
+}
+
+/// The most root requests, and their bytes in all, that one spawn line
+/// saves for a continuation. The session log keeps each spawn line, and a
+/// long conversation has many requests.
+const max_saved_root_messages: usize = 32;
+const max_saved_root_bytes: usize = 32 * 1024;
+
+/// Pure: the newest of `messages` that a spawn line saves, at most
+/// `max_saved_root_messages` of them and `max_saved_root_bytes` in all,
+/// oldest first. A list cut here is saved as incomplete evidence
+/// (`workMembers`), as a compacted conversation's is.
+fn savedRootMessages(messages: []const []u8) []const []u8 {
+    var start = messages.len;
+    var bytes: usize = 0;
+    while (start > 0 and messages.len - start < max_saved_root_messages) {
+        const with_next = bytes + messages[start - 1].len;
+        if (with_next > max_saved_root_bytes) break;
+        bytes = with_next;
+        start -= 1;
+    }
+    return messages[start..];
 }
 
 fn nonEmptyText(text: ?[]const u8) ?[]const u8 {
@@ -897,7 +923,7 @@ fn nonEmptyText(text: ?[]const u8) ?[]const u8 {
 
 /// `json` with the members of the JSON object `members` added after its own.
 fn withMembers(arena: Allocator, json: []const u8, members: []const u8) ![]const u8 {
-    if (members.len <= 2) return json;
+    if (std.mem.eql(u8, members, "{}")) return json;
     return std.mem.concat(arena, u8, &.{ json[0 .. json.len - 1], ",", members[1 .. members.len - 1], "}" });
 }
 
@@ -1408,6 +1434,67 @@ test "a spawn line with a permission mode this fx does not know parses and folds
     try std.testing.expect(child.last_admission == null);
 }
 
+test "a spawn line saves only the newest root requests that fit, as incomplete evidence" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var many: [max_saved_root_messages + 8][]u8 = undefined;
+    for (&many, 0..) |*message, index| message.* = try arena.print("request {d}", .{index});
+    var work: ActiveWork = .{ .id = @constCast("work-1"), .message = @constCast("m"), .root_user_messages = &many, .root_user_evidence_complete = true, .permission_mode = .ask, .created_at_ms = 1 };
+    const line = try spawnData(arena, "reviewer", "ab", null, .final, .parent, null, null, work);
+    const spawn = try std.json.parseFromSliceLeaky(SpawnData, arena, line, .{});
+    const saved = spawn.root_user_messages.?;
+    try std.testing.expectEqual(max_saved_root_messages, saved.len);
+    try std.testing.expectEqualStrings(many[8], saved[0]);
+    try std.testing.expectEqualStrings(many[many.len - 1], saved[saved.len - 1]);
+    try std.testing.expect(!spawn.root_user_evidence_complete.?);
+
+    // A request past the byte limit is left out, with every older one.
+    const big = try arena.alloc(u8, max_saved_root_bytes + 1);
+    @memset(big, 'x');
+    var two = [_][]u8{ big, try arena.dupe(u8, "latest") };
+    work.root_user_messages = &two;
+    const capped = try std.json.parseFromSliceLeaky(SpawnData, arena, try spawnData(arena, "reviewer", "ab", null, .final, .parent, null, null, work), .{});
+    try std.testing.expectEqual(@as(usize, 1), capped.root_user_messages.?.len);
+    try std.testing.expectEqualStrings("latest", capped.root_user_messages.?[0]);
+    try std.testing.expect(!capped.root_user_evidence_complete.?);
+
+    // A list that fits is saved whole, and stays complete.
+    work.root_user_messages = many[0..2];
+    const whole = try std.json.parseFromSliceLeaky(SpawnData, arena, try spawnData(arena, "reviewer", "ab", null, .final, .parent, null, null, work), .{});
+    try std.testing.expectEqual(@as(usize, 2), whole.root_user_messages.?.len);
+    try std.testing.expect(whole.root_user_evidence_complete.?);
+}
+
+test "a spawn line with more root requests than fx admits folds with no admission" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const requests: [domain.max_admission_items + 1][]const u8 = @splat("again");
+    const line = try stringifyOmittingNulls(arena, .{
+        .agent = "reviewer",
+        .fingerprint = text_utils.repeat("ab", 32),
+        .report = "final",
+        .permission_mode = "ask",
+        .root_user_messages = &requests,
+    });
+    const folded: session_adapter.Child = .{
+        .id = @constCast("01J00000000000000000000001"),
+        .work_id = @constCast("work-1"),
+        .open = false,
+        .outcome = .cancelled,
+        .spawn_data = @constCast(line),
+        .finish_data = null,
+        .seq = 1,
+    };
+    // The child still loads, so the registry does; only a continuation is off.
+    var child = try childFromFolded(alloc, folded);
+    defer child.deinit(alloc);
+    try std.testing.expectEqualStrings("reviewer", child.agentName().?);
+    try std.testing.expect(child.last_admission == null);
+}
+
 test "a spawn line names the work it replaces, and only that work" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1559,10 +1646,13 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
     };
 }
 
-/// The admission a spawn line saved for its work, copied into `alloc`, or
-/// null when the line names no permission mode, or one this fx does not
-/// know: a later fx wrote it, and a continuation never runs under a guessed
-/// mode (see `Child.last_admission`).
+/// The admission a spawn line saved for its work, copied into `alloc` (see
+/// `Child.last_admission`). Null when the line names no
+/// permission mode, or one this fx does not know: a later fx wrote it, and
+/// a continuation never runs under a guessed mode. Null too when it lists
+/// more root requests than fx admits: no fx writes that many
+/// (`savedRootMessages`), and a continuation never runs on evidence fx did
+/// not read whole.
 fn savedAdmission(alloc: Allocator, child_id: []const u8, spawn: SpawnData) !?Admission {
     const mode_name = spawn.permission_mode orelse return null;
     const permission_mode = std.meta.stringToEnum(types.PermissionMode, mode_name) orelse {
@@ -1570,7 +1660,10 @@ fn savedAdmission(alloc: Allocator, child_id: []const u8, spawn: SpawnData) !?Ad
         return null;
     };
     const messages = spawn.root_user_messages orelse &.{};
-    if (messages.len > domain.max_admission_items) return error.InvalidState;
+    if (messages.len > domain.max_admission_items) {
+        debug_trace.logf("subagent", "saved admission left out child={s} root_requests={d} limit={d}", .{ child_id, messages.len, domain.max_admission_items });
+        return null;
+    }
     const context = try alloc.dupe(u8, spawn.root_user_intent_context orelse "");
     errdefer alloc.free(context);
     const copies = try alloc.alloc([]u8, messages.len);

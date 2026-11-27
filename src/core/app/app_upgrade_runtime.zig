@@ -115,16 +115,17 @@ pub fn Runtime(comptime App: type) type {
             return draftNotice(app, agents.screenAgentOf(app)) != null;
         }
 
-        /// A prompt sent but not yet started by its agent's worker, on main
-        /// or another instance (`submission.pending`, every phase): it waits
-        /// for a frame, for sign-in, or for the worker to take it, and lives
-        /// only in memory until then.
+        /// A prompt sent but not yet started by its agent's worker, on main,
+        /// another instance, or a subagent whose screen took it
+        /// (`submission.pending`, every phase): it waits for a frame, for
+        /// sign-in, or for the worker to take it, and lives only in memory
+        /// until then.
         fn submissionPending(app: *App) bool {
             if (comptime !agents.hasAgentField(App, "submission")) return false;
             if (app.main_agent.submission.pending != null) return true;
             if (comptime @hasField(App, "child_agents")) {
                 for (app.child_agents.items) |child| {
-                    if (child.agent.role == .instance and child.agent.submission.pending != null) return true;
+                    if (child.agent.submission.pending != null) return true;
                 }
             }
             return false;
@@ -925,6 +926,27 @@ test "app_upgrade_runtime refuses while a sent prompt waits to go out" {
     try std.testing.expectEqual(ApplyOutcome.relaunch_requested, again);
     try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
     try std.testing.expect(app.should_exit);
+}
+
+test "app_upgrade_runtime refuses while a prompt sent on a subagent's screen waits to go out" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    var subagent = TestChild{ .agent = .{ .role = .subagent } };
+    try app.child_agents.append(app.alloc, &subagent);
+    app.upgrader.state = .ready;
+    subagent.agent.submission.pending = 1;
+    var deps_state = TestDepsState{};
+
+    // The prompt lives only in memory until the subagent's worker takes it,
+    // so a restart now would lose it.
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
+    try std.testing.expect(std.mem.find(u8, app.notices.items, "while a sent prompt waits to go out") != null);
+    try std.testing.expect(!app.should_exit);
+
+    subagent.agent.submission.pending = null;
+    const again = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.relaunch_requested, again);
 }
 
 test "app_upgrade_runtime says the restart notice while a turn runs" {

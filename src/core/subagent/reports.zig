@@ -122,6 +122,7 @@ pub const PendingFold = struct {
         while (index < self.pending.items.len) {
             const item = self.pending.items[index];
             if (std.mem.eql(u8, item.child_id, child_id) and child_state.spawnReplaces(data, item.work_id)) {
+                debug_trace.logf("subagent", "report dropped child={s} work_id={s} reason=replaced_by_continuation", .{ child_id, item.work_id });
                 _ = self.pending.orderedRemove(index);
             } else {
                 index += 1;
@@ -740,7 +741,8 @@ test "a spawn that replaces nothing leaves the owed reports as they are" {
 
 /// Pending reports by another route: per work, counters instead of the
 /// fold's lists. A work is pending when its last owed finish came after its
-/// last take, and it is listed in the order that finish came.
+/// last take and after the last spawn that replaces it, and it is listed in
+/// the order that finish came.
 fn pendingOracle(alloc: Allocator, lines: []const session_adapter.ReportLine) ![]Pending {
     const State = struct { child_id: []const u8, work_id: []const u8, marked: usize = 0, used: usize = 0, since: ?usize = null, outcome: child_state.Outcome = .completed };
     var works: std.ArrayList(State) = .empty;
@@ -756,7 +758,13 @@ fn pendingOracle(alloc: Allocator, lines: []const session_adapter.ReportLine) ![
             break :blk &works.items[works.items.len - 1];
         };
         switch (line) {
-            .spawned => |spawned| state.marked += @intFromBool(child_state.spawnNamesRule(spawned.data)),
+            .spawned => |spawned| {
+                state.marked += @intFromBool(child_state.spawnNamesRule(spawned.data));
+                // A continuation's spawn forgets the owed reports of the works it replaces.
+                for (works.items) |*other| {
+                    if (std.mem.eql(u8, other.child_id, child_id) and child_state.spawnReplaces(spawned.data, other.work_id)) other.since = null;
+                }
+            },
             .finished => |finished| {
                 const started = state.marked > state.used;
                 if (started) state.used += 1;
@@ -793,7 +801,7 @@ fn fuzzPendingReports(_: void, smith: *std.testing.Smith) !void {
     const alloc = std.testing.allocator;
     const children = [_][]const u8{ "c0", "c1" };
     const works = [_][]const u8{ "w0", "w1", "w2" };
-    const spawns = [_]?[]const u8{ null, older_spawn, marked_spawn, "not json" };
+    const spawns = [_]?[]const u8{ null, older_spawn, marked_spawn, spawn_replacing_w1, spawn_replacing_w2, "not json" };
     const finishes = [_]?[]const u8{ null, "{\"report\":true}", "{\"failure\":\"x\"}", "{\"failure\":\"x\",\"report\":true}", "{\"report\":false}", "not json" };
     const outcomes = [_]session_adapter.ChildOutcome{ .ok, .failed, .cancelled, .interrupted, .lost };
     var lines: [48]session_adapter.ReportLine = undefined;

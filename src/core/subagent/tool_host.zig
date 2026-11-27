@@ -3652,7 +3652,6 @@ pub const Runtime = struct {
     /// Whether the child's worker is asked to stop for an upgrade's restart,
     /// so it takes no message. A wasm host never restarts itself.
     fn childRestarting(self: *const Runtime, child_id: []const u8) bool {
-        if (comptime host_target.is_wasm) return false;
         const ask = self.child_runner.restarting_fn orelse return false;
         return ask(self.child_runner.context, child_id);
     }
