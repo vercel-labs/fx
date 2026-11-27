@@ -4,8 +4,9 @@ import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, rea
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
+import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
 import { logLines, onlySessionId } from "./saved-sessions";
-import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable, turnSettled } from "./tmux-helpers";
 
 // `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
@@ -239,6 +240,167 @@ describe("fx mcp", () => {
     expect(unknown.stderr).toBe("No MCP server named nope. fx mcp list shows them.\n");
   });
 
+  // What fx refuses in a server's answer to tools/list, and the words it gives for each. The reply is raw text after the
+  // request id, so a repeated key reaches fx as written.
+  const refusedLists: [string, string, string][] = [
+    ["`tools` is no list", '"result":{"resultType":"complete","tools":7}', '"tools" is not a list'],
+    ["`tools` is written twice", '"result":{"resultType":"complete","tools":[],"tools":[]}', "a field is written twice"],
+    ["`tools` is written twice, once with an escape", '"result":{"resultType":"complete","tools":[],"t\\u006fols":[]}', "a field is written twice"],
+    ["the server answers with an error", '"error":{"code":-32603,"message":"Internal error"}', "the server answered the list with an error"],
+    ["the answer is no finished list", '"result":{"resultType":"input_required","inputRequests":{}}', "the server's answer was not a finished list"],
+    // The reply is matched to the list by its id, which comes first, and then fx cannot read the rest. It says so, not that the server
+    // answered with an error, and it does not wait 30 seconds for the list.
+    ["the reply goes wrong after its id: not JSON", '"result":{"resultType":"complete","tools":[]},"extra":nope', "the answer is not a readable tool list"],
+    [
+      "the reply goes wrong after its id: nested past the engine's limit",
+      `"result":{"resultType":"complete","tools":[]},"extra":${"[".repeat(3000)}${"]".repeat(3000)}`,
+      "the answer is not a readable tool list",
+    ],
+    ["the reply goes wrong after its id: `result` is written twice", '"result":{"resultType":"complete","tools":[]},"result":{"resultType":"complete","tools":[]}', "a field is written twice"],
+  ];
+
+  for (const [what, reply, why] of refusedLists) {
+    test(`show says when fx refused the tool list, as the server's answer: ${what}`, async () => {
+      const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: reply } }) } });
+      const text = await mcp(root, "show", "fixture");
+      expect(text.stderr).toBe("");
+      // The server works, so the exit stays 0.
+      expect(text.code).toBe(0);
+      expect(text.stdout).toStartWith(`fixture\n  status     ready, tool list refused\n  tool list  refused: ${why}\n  version    2026-07-28\n  transport  stdio\n`);
+      expect(text.stdout).not.toContain("0 tools");
+
+      const json = await mcp(root, "show", "fixture", "--json");
+      expect(json.code).toBe(0);
+      const shown = JSON.parse(json.stdout);
+      // `error` is what says a server is down, and this one is not; `status` and `tools` keep their meaning.
+      expect(shown).toMatchObject({ name: "fixture", status: "ready", error: null, tools_error: why, tools: [] });
+    }, 30_000);
+  }
+
+  // The reply's id comes after what fx cannot read, so the line names no request. Nothing tells which list it answers: the
+  // list waits out the 30-second grace, as every request in flight does, and then fx says it could not read the list.
+  const unnamedLists: [string, string, "text" | "json"][] = [
+    ["not JSON before the id", '{"jsonrpc":"2.0","result":{"resultType":"complete","tools":[]},"extra":nope,"id":{id}}', "text"],
+    ["nested past the engine's limit before the id", `{"jsonrpc":"2.0","result":{"resultType":"complete","tools":[]},"extra":${"[".repeat(3000)}${"]".repeat(3000)},"id":{id}}`, "json"],
+  ];
+  const UNREADABLE = "the answer is not a readable tool list";
+
+  for (const [what, line, form] of unnamedLists) {
+    test(`show says the list was unreadable when no id could be read, after the grace: ${what}`, async () => {
+      const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_LINE: line } }) } });
+      const started = Date.now();
+      const shown = await runFx(["mcp", "show", "fixture", ...(form === "json" ? ["--json"] : [])], { cwd: root.workspace, env: root.env, timeoutMs: 60_000 });
+      const seconds = (Date.now() - started) / 1000;
+      expect(shown.stderr).toBe("");
+      expect(shown.code).toBe(0);
+      if (form === "json") {
+        expect(JSON.parse(shown.stdout)).toMatchObject({ name: "fixture", status: "ready", error: null, tools_error: UNREADABLE, tools: [] });
+      } else {
+        expect(shown.stdout).toStartWith(`fixture\n  status     ready, tool list refused\n  tool list  refused: ${UNREADABLE}\n`);
+        expect(shown.stdout).not.toContain("0 tools");
+      }
+      // The wait is the grace: not at once, as a line with an id would, and far short of the 5 minutes an operation waits.
+      expect({ late: seconds > 28, early: seconds < 55 }).toEqual({ late: true, early: true });
+    }, 90_000);
+  }
+
+  test("show gives no refusal for a tool list it accepted, or for a tool it could not read", async () => {
+    const good = createRoot({ mcpServers: { fixture: fixtureServer() } });
+    const text = await mcp(good, "show", "fixture");
+    expect(text.stdout).toMatch(/^fixture\n  status     ready, 1 tool\n  version/);
+    expect(text.stdout).not.toContain("tool list");
+    expect(JSON.parse((await mcp(good, "show", "fixture", "--json")).stdout)).toMatchObject({ status: "ready", error: null, tools_error: null });
+
+    // A tool whose `name` is written twice is dropped and the list is still the server's answer: nothing is refused.
+    const dropped = createRoot({
+      mcpServers: {
+        fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: '"result":{"resultType":"complete","tools":[{"name":"a","name":"b","inputSchema":{"type":"object"}}]}' } }),
+      },
+    });
+    const shown = JSON.parse((await mcp(dropped, "show", "fixture", "--json")).stdout);
+    expect(shown).toMatchObject({ status: "ready", tools_error: null, tools: [] });
+  }, 30_000);
+
+  // What fx leaves out of a list is told beside the status, not only traced: how many, and the one reason they share.
+  test("show says how many tools fx left out of a list and why, in text and in --json", async () => {
+    let deepSchema: unknown = { type: "string" };
+    for (let level = 0; level < 70; level += 1) deepSchema = { type: "object", properties: { a: deepSchema } };
+    const good = '{"name":"good","inputSchema":{"type":"object"}}';
+    const twice = '{"name":"twice","name":"again","inputSchema":{"type":"object"}}';
+    const sameName = '{"name":"good","description":"the second","inputSchema":{"type":"object"}}';
+    const tooDeep = JSON.stringify({ name: "deep", inputSchema: deepSchema });
+    // `odd` has a `description` that is no text: the engine keeps it, and the host's reading refuses it. The others the engine
+    // skips itself.
+    const odd = '{"name":"odd","description":7,"inputSchema":{"type":"object"}}';
+    const cases: { tools: string[]; listed: number; text: string | null; json: { count: number; reason: string } | null }[] = [
+      { tools: [good], listed: 1, text: null, json: null },
+      { tools: [good, twice], listed: 1, text: "1 tool: a field is written twice", json: { count: 1, reason: "a field is written twice" } },
+      { tools: [good, sameName], listed: 1, text: "1 tool: a name is used by two tools", json: { count: 1, reason: "a name is used by two tools" } },
+      { tools: [good, tooDeep], listed: 1, text: "1 tool: a limit on size or nesting is passed", json: { count: 1, reason: "a limit on size or nesting is passed" } },
+      { tools: [good, odd], listed: 2, text: "1 tool: a definition can't be used", json: { count: 1, reason: "a definition can't be used" } },
+      { tools: [good, twice, sameName, tooDeep, odd], listed: 2, text: "4 tools: more than one reason", json: { count: 4, reason: "more than one reason" } },
+    ];
+    for (const one of cases) {
+      const reply = `"result":{"resultType":"complete","tools":[${one.tools.join(",")}]}`;
+      const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: reply } }) } });
+      const text = await mcp(root, "show", "fixture");
+      expect(text.stderr).toBe("");
+      expect(text.code).toBe(0);
+      expect(text.stdout).toContain(`  status     ready, ${one.listed} tool${one.listed === 1 ? "" : "s"}\n`);
+      if (one.text === null) expect(text.stdout).not.toContain("left out");
+      else expect(text.stdout).toContain(`  left out   ${one.text}\n`);
+      const shown = JSON.parse((await mcp(root, "show", "fixture", "--json")).stdout);
+      expect(shown).toMatchObject({ status: "ready", tools_error: null, tools_left_out: one.json });
+      expect(JSON.parse((await mcp(root, "list", "--json")).stdout).servers[0]).toHaveProperty("tools_left_out");
+    }
+  }, 120_000);
+
+  test("show says when fx refused the tool list of an HTTP server too", async () => {
+    const upstream = startModernMcpHttpFixture("list_refused");
+    try {
+      const root = createRoot({ mcpServers: { web: { type: "http", url: upstream.url } } });
+      const text = await mcp(root, "show", "web");
+      expect(text.stderr).toBe("");
+      expect(text.code).toBe(0);
+      expect(text.stdout).toStartWith("web\n  status     ready, tool list refused\n  tool list  refused: a field is written twice\n");
+      const shown = JSON.parse((await mcp(root, "show", "web", "--json")).stdout);
+      expect(shown).toMatchObject({ status: "ready", error: null, tools_error: "a field is written twice", tools: [] });
+    } finally {
+      upstream.stop();
+    }
+  }, 30_000);
+
+  // The server answered `tools/list`, but not with a JSON-RPC message: a status that no other flow reads, or a page
+  // that is no JSON. That is an answer fx refuses, not a server that gave none.
+  const httpAnswers = [
+    ["list_http_500", "the server answered the list with HTTP 500"],
+    ["list_http_429", "the server answered the list with HTTP 429"],
+    ["list_html_200", "the list is not valid JSON"],
+  ] as const;
+  for (const [mode, why] of httpAnswers) {
+    test(`show says when an HTTP server answered the tool list with ${mode.replace("list_", "").replaceAll("_", " ")}`, async () => {
+      const upstream = startModernMcpHttpFixture(mode);
+      try {
+        const root = createRoot({ mcpServers: { web: { type: "http", url: upstream.url } } });
+        const text = await mcp(root, "show", "web");
+        expect(text.stderr).toBe("");
+        expect(text.code).toBe(0);
+        expect(text.stdout).toStartWith(`web\n  status     ready, tool list refused\n  tool list  refused: ${why}\n`);
+        const shown = JSON.parse((await mcp(root, "show", "web", "--json")).stdout);
+        expect(shown).toMatchObject({ status: "ready", error: null, tools_error: why, tools: [] });
+      } finally {
+        upstream.stop();
+      }
+    }, 30_000);
+  }
+
+  test("list --json carries tools_error, null for a server fx has not asked for its tools", async () => {
+    const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: refusedLists[0][1] } }), off: { command: "never-run", enabled: false } } });
+    const listed = await mcp(root, "list", "--json");
+    expect(listed.code).toBe(0);
+    for (const server of JSON.parse(listed.stdout).servers) expect(server).toHaveProperty("tools_error", null);
+  });
+
   test("a variable a header can't carry holds its server back instead of aborting fx", async () => {
     // Nothing listens on port 1, and nothing should be sent there.
     const root = createRoot({
@@ -291,16 +453,14 @@ describe("fx mcp", () => {
     expect(gone.code).toBe(1);
     expect(gone.stderr).toBe("No MCP server named solo in ~/.fx/mcp.json or .mcp.json.\n");
 
-    // `--global` names ~/.fx/mcp.json; the older `--profile` still works.
+    // `--global` names ~/.fx/mcp.json.
     const global = await mcp(root, "remove", "--global", "twin");
     expect(global.code).toBe(0);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8"))).toEqual({ mcpServers: {}, other: 1 });
     const profile = await mcp(root, "remove", "--profile", "twin");
-    expect(profile.code).toBe(1);
-    // The older --profile still names the profile file, with a warning.
-    expect(profile.stderr).toBe(
-      "fx mcp remove: --profile is deprecated and stops working in fx 0.0.18; use --global\nNo MCP server named twin in ~/.fx/mcp.json.\n",
-    );
+    expect(profile.code).toBe(2);
+    expect(profile.stdout).toBe("");
+    expect(profile.stderr).toBe("fx mcp remove: --profile was removed; use --global\nusage: fx mcp remove [--global | --project] NAME\n");
   });
 
   test("approve and reject say exactly what they trust", async () => {
@@ -398,6 +558,29 @@ describe("fx mcp", () => {
 });
 
 describe("/mcp in the shell", () => {
+  test.skipIf(!tmuxAvailable())("/mcp list and /mcp show say when fx refused a server's tool list", async () => {
+    // The shell can ask questions, so it says so to servers, and the fixture expects that.
+    const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_LIST_REPLY: '"result":{"resultType":"complete","tools":7}' } }) } });
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    // Servers start on their own once the first frame is up; ask until the status says what happened to the list.
+    const listed = "fixture  ~/.fx/mcp.json  stdio      ready, tool list refused";
+    for (let i = 0; i < 20 && !(await tui.capturePane()).includes(listed); i++) {
+      await tui.sendText("/mcp list");
+      await tui.waitForText(listed, 500).catch(() => {});
+    }
+    await tui.waitForText(listed, 1_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText('tool list  refused: "tools" is not a list', 15_000);
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("/mcp runs the same verbs and prints the same text", async () => {
     // The shell can ask questions, so it says so to servers.
     const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both" } }) } });
@@ -621,7 +804,7 @@ describe("/mcp in the shell", () => {
     expect((await mcp(root, "add", "outside", "--", process.execPath, MODERN_FIXTURE)).code).toBe(0);
     // The next prompt loads it first, so its own request tells the model.
     await tui.sendText("first prompt");
-    await tui.waitForText("first done", 15_000);
+    await tui.waitForPane((pane) => pane.includes("first done") && turnSettled(pane), 15_000);
     expect(gateway.requests).toHaveLength(1);
     const firstMenu = menu(gateway.requests[0]!.body);
     expect(firstMenu).toContain("- fixture");
@@ -732,7 +915,7 @@ describe("/mcp in the shell", () => {
       env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
     });
     await tui.waitForComposer(15_000);
-    const pidPath = join(root.workspace, "slow.pid");
+    const pidPath = join(root.home, "slow.pid");
     for (let i = 0; i < 200 && !existsSync(pidPath); i++) await Bun.sleep(25);
     const pid = Number(readFileSync(pidPath, "utf8").trim());
     try {
@@ -750,7 +933,7 @@ describe("/mcp in the shell", () => {
         await Bun.sleep(50);
       }
       held.release("first done");
-      await tui.waitForText("second done", 15_000);
+      await tui.waitForPane((pane) => pane.includes("second done") && turnSettled(pane), 15_000);
       // The next prompt, sent with no turn running, loads the change.
       await tui.sendText("third prompt");
       await tui.waitForText("third done", 15_000);
@@ -834,7 +1017,7 @@ describe("/mcp in the shell", () => {
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("/mcp show slow");
-    const pidPath = join(root.workspace, "slow.pid");
+    const pidPath = join(root.home, "slow.pid");
     for (let i = 0; i < 200 && !existsSync(pidPath); i++) await Bun.sleep(25);
     const pid = Number(readFileSync(pidPath, "utf8").trim());
     try {
@@ -846,7 +1029,10 @@ describe("/mcp in the shell", () => {
       while (tui.isAlive() && Date.now() - start < 5_000) await Bun.sleep(20);
       // A graceful stop would wait 1.5 s on the closed stdin before SIGTERM.
       expect(Date.now() - start).toBeLessThan(1_000);
-      for (let i = 0; i < 50 && isRunning(pid); i++) await Bun.sleep(20);
+      // The owner stops the server, which ignores its closed stdin, with
+      // SIGTERM within its grace; the session itself does not wait for it.
+      // Polls that process's exit, bounded at 5 s.
+      for (let i = 0; i < 250 && isRunning(pid); i++) await Bun.sleep(20);
       expect(isRunning(pid)).toBe(false);
     } finally {
       if (isRunning(pid)) process.kill(pid, "SIGKILL");
@@ -1215,18 +1401,96 @@ describe("fx mcp add and remove refuse what fx would skip", () => {
     await refused(withMcp, ["a"], fixFor("mcp_servers", "mcp"), "~/.fx/mcp.json", "remove", "a");
   }, 120_000);
 
-  test("guard: remove of a name that is only under the misspelled key, or in .mcp.json, behaves as before", async () => {
+  // The line after "No MCP server named ...": the profile does list the name, under a key that fx doesn't read.
+  const listedUnder = (name: string, why: string) => `${name} is in ~/.fx/mcp.json, but ${why}.\n`;
+
+  test("remove of a name that only the misspelled key holds says so, names the key and the fix, and leaves the file as it was", async () => {
     const root = fresh({ mcpServers: { a: { command: "x" } }, servers: { b: { command: "y" } } }, { mcpServers: { p: { command: "z" } } });
     const before = readFileSync(root.profilePath, "utf8");
+    const fix = fixFor("servers", "mcpServers");
     const missing = await mcp(root, "remove", "b");
     expect(missing.code).toBe(1);
-    expect(missing.stderr).toBe("No MCP server named b in ~/.fx/mcp.json or .mcp.json.\n");
+    expect(missing.stdout).toBe("");
+    expect(missing.stderr).toBe(`No MCP server named b in ~/.fx/mcp.json or .mcp.json.\n${listedUnder("b", fix)}`);
     expect(readFileSync(root.profilePath, "utf8")).toBe(before);
-    // A project server has no misspelled-key check: .mcp.json is not scanned.
+    // --global looks only in the profile, and says so as before; --project looks only in .mcp.json, which has no misspelled-key check.
+    const global = await mcp(root, "remove", "--global", "b");
+    expect(global.code).toBe(1);
+    expect(global.stderr).toBe(`No MCP server named b in ~/.fx/mcp.json.\n${listedUnder("b", fix)}`);
+    const project = await mcp(root, "remove", "--project", "b");
+    expect(project.code).toBe(1);
+    expect(project.stderr).toBe("No MCP server named b in .mcp.json.\n");
+    expect(readFileSync(root.profilePath, "utf8")).toBe(before);
+    // The real key is "mcp" when the profile has it.
+    const withMcp = fresh({ mcp: { a: { command: "x" } }, mcp_servers: { b: { command: "y" } } });
+    const withMcpBefore = readFileSync(withMcp.profilePath, "utf8");
+    const named = await mcp(withMcp, "remove", "b");
+    expect(named.code).toBe(1);
+    expect(named.stderr).toBe(`No MCP server named b in ~/.fx/mcp.json or .mcp.json.\n${listedUnder("b", fixFor("mcp_servers", "mcp"))}`);
+    expect(readFileSync(withMcp.profilePath, "utf8")).toBe(withMcpBefore);
+    // Once the servers are moved and the key is gone, the name is where fx reads it, and the same command removes it.
+    writeFileSync(withMcp.profilePath, JSON.stringify({ mcp: { a: { command: "x" }, b: { command: "y" } } }));
+    const fixed = await mcp(withMcp, "remove", "b");
+    expect(fixed.code).toBe(0);
+    expect(fixed.stdout).toBe("Removed b from ~/.fx/mcp.json.\n");
+  }, 120_000);
+
+  test("guard: remove of a project server leaves the profile as it was, and a name in neither file gets no hint", async () => {
+    const root = fresh({ mcpServers: { a: { command: "x" } }, servers: { b: { command: "y" } } }, { mcpServers: { p: { command: "z" } } });
+    const before = readFileSync(root.profilePath, "utf8");
     const project = await mcp(root, "remove", "p");
     expect(project.code).toBe(0);
     expect(project.stdout).toBe("Removed p from .mcp.json.\n");
     expect(readFileSync(root.profilePath, "utf8")).toBe(before);
+    const none = await mcp(root, "remove", "nope");
+    expect(none.code).toBe(1);
+    expect(none.stderr).toBe("No MCP server named nope in ~/.fx/mcp.json or .mcp.json.\n");
+    expect(readFileSync(root.profilePath, "utf8")).toBe(before);
+  }, 120_000);
+
+  test("the hint finds the name as the reader does: under a key or name written with an escape, under a key too long to show whole, and only when the name is a server there", async () => {
+    // "mcp\u005fservers" is the key mcp_servers, and "b\u0062" the name bb, as JSON reads them.
+    const escaped = fresh('{"mcpServers":{"a":{"command":"x"}},"mcp\\u005fservers":{"b\\u0062":{"command":"y"}}}');
+    const escapedBefore = bytesOf(escaped.profilePath);
+    const found = await mcp(escaped, "remove", "bb");
+    expect(found.code).toBe(1);
+    expect(found.stderr).toBe(`No MCP server named bb in ~/.fx/mcp.json or .mcp.json.\n${listedUnder("bb", fixFor("mcp_servers", "mcpServers"))}`);
+    expect(bytesOf(escaped.profilePath)).toBe(escapedBefore);
+
+    // 11 + 140 bytes: a cut at 128 bytes lands inside a character, so the key is named by how it starts.
+    const wide = "mcp_servers" + "\u00e9".repeat(70);
+    const long = fresh({ mcpServers: { a: { command: "x" } }, [wide]: { b: { command: "y" } } });
+    const longBefore = bytesOf(long.profilePath);
+    const cut = await mcp(long, "remove", "b");
+    expect(cut.code).toBe(1);
+    expect(cut.stdout).toBe("");
+    const lines = cut.stderr.split("\n");
+    expect(lines[0]).toBe("No MCP server named b in ~/.fx/mcp.json or .mcp.json.");
+    expect(cut.stderr).not.toContain("\ufffd");
+    expect(cut.stderr).not.toContain("\\xc3");
+    expect(lines[1]).toContain('b is in ~/.fx/mcp.json, but the key that starts with "mcp_servers\u00e9');
+    expect(lines[1]).not.toContain('the key "mcp_servers');
+    expect(lines[1]).toContain(`" looks like a misspelling of "mcpServers", so fx doesn't read it. Move its servers into "mcpServers", then delete that key, and run the command again.`);
+    const quoted = lines[1].slice(lines[1].indexOf('starts with "') + 'starts with "'.length, lines[1].indexOf('" looks like'));
+    expect(wide.startsWith(quoted)).toBe(true);
+    expect(bytesOf(long.profilePath)).toBe(longBefore);
+
+    // No hint where the name is not a server of a misspelled key: not in it, in a key that is not a misspelling,
+    // or in it as something that is not a server. The first line is the one it always was.
+    const plain = "No MCP server named b in ~/.fx/mcp.json or .mcp.json.\n";
+    for (const profile of [
+      { mcpServers: { a: { command: "x" } }, servers: { c: { command: "y" } } },
+      { mcpServers: { a: { command: "x" } }, notes: { b: { command: "y" } } },
+      { mcpServers: { a: { command: "x" } }, servers: { b: 1, c: { command: "y" } } },
+      { mcpServers: { a: { command: "x" } }, servers: { b: 1 } },
+    ]) {
+      const root = fresh(profile);
+      const before = bytesOf(root.profilePath);
+      const ran = await mcp(root, "remove", "b");
+      expect(ran.code).toBe(1);
+      expect(ran.stderr).toBe(plain);
+      expect(bytesOf(root.profilePath)).toBe(before);
+    }
   }, 120_000);
 
   test("the edit check reads every key: a misspelled key after 64 others, or after 64 entries that aren't servers, is found", async () => {
@@ -1378,6 +1642,62 @@ describe("fx mcp add and remove refuse what fx would skip", () => {
     // The shell still answers.
     await tui.sendText("/mcp list");
     await tui.waitForText("~/.fx/mcp.json", 10_000);
+    await tui.sendText("/mcp add --no-login --project web https://x.example/mcp");
+    await tui.waitForText("Added web to .mcp.json.", 10_000);
+  }, 90_000);
+
+  // A file nested past the limit (src/core/shared/json_depth.zig) is not rewritten: the writer aborts the whole
+  // process from 257 levels. The reader still loads such a file.
+  const nested = (levels: number, server = "old") => `{"mcpServers":{"${server}":{"command":"true"}},"notes":${"[".repeat(levels)}${"]".repeat(levels)}}`;
+  const TOO_DEEP = "the file is nested more than 64 levels deep; flatten it by hand first";
+
+  test("add and remove refuse a file nested past the limit, however deep, and leave it as it was", async () => {
+    for (const levels of [64, 256, 300, 400_000]) {
+      const root = fresh(nested(levels));
+      writeFileSync(root.projectPath, nested(levels, "proj"));
+      for (const [flag, file, path, server] of [["--global", "~/.fx/mcp.json", root.profilePath, "old"], ["--project", ".mcp.json", root.projectPath, "proj"]] as const) {
+        await refused(root, ["--no-login", flag, "web", "https://mcp.example/mcp"], TOO_DEEP, file, "add", "web", path);
+        await refused(root, [flag, server], TOO_DEEP, file, "remove", server, path);
+      }
+      expect((await loaded(root)).sort()).toEqual(["old", "proj"]);
+    }
+  }, 120_000);
+
+  test("guard: a file at the limit is edited, and a deep file beside the one being edited does not stop it", async () => {
+    const root = fresh(nested(63));
+    const added = await mcp(root, "add", "--no-login", "web", "https://mcp.example/mcp");
+    expect(added.stderr).toBe("");
+    expect(added.stdout).toBe("Added web to ~/.fx/mcp.json.\n");
+    expect(Object.keys(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers)).toEqual(["old", "web"]);
+    const removed = await mcp(root, "remove", "--global", "old");
+    expect(removed.stdout).toBe("Removed old from ~/.fx/mcp.json.\n");
+
+    writeFileSync(root.profilePath, nested(400_000));
+    const profile = bytesOf(root.profilePath);
+    const project = await mcp(root, "add", "--no-login", "--project", "web", "https://mcp.example/mcp");
+    expect(project.stderr).toBe("");
+    expect(project.code).toBe(0);
+    expect(project.stdout).toStartWith("Added web to .mcp.json.\n");
+    expect(bytesOf(root.profilePath)).toBe(profile);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp add and /mcp remove refuse a file nested past the limit and the shell keeps running", async () => {
+    const root = fresh(nested(300));
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 220,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    const before = readFileSync(root.profilePath, "utf8");
+    await tui.sendText("/mcp add web https://x.example/mcp");
+    await tui.waitForText(`Couldn't add web to ~/.fx/mcp.json: ${TOO_DEEP}.`, 10_000);
+    await tui.sendText("/mcp remove old");
+    await tui.waitForText(`Couldn't remove old from ~/.fx/mcp.json: ${TOO_DEEP}.`, 10_000);
+    expect(readFileSync(root.profilePath, "utf8")).toBe(before);
     await tui.sendText("/mcp add --no-login --project web https://x.example/mcp");
     await tui.waitForText("Added web to .mcp.json.", 10_000);
   }, 90_000);

@@ -130,11 +130,95 @@ const provider_slug = "token-pass";
 /// Where a team buys Token Pass.
 pub const purchase_url = "https://vercel.com/get/token-pass";
 
-/// The dim line under the Vercel team notice for a team that fx does not know
-/// has an active Token Pass.
+/// The dim line under the Vercel team notice for a team that AI Gateway says
+/// has no active Token Pass.
 /// "Vercel Token Pass" is an OSC 8 link to `purchase_url`, so the terminal
 /// shows the name and not the address.
 pub const offer_line = "Get $150 of tokens for $30 with \x1b]8;;" ++ purchase_url ++ "\x1b\\Vercel Token Pass\x1b]8;;\x1b\\.";
+
+/// Plain-text form of `offer_line` for CLI output where OSC 8 escapes are not
+/// rendered.
+pub const plain_offer_line = "Get $150 of tokens for $30 with Vercel Token Pass (" ++ purchase_url ++ ").";
+
+/// Confirmation line when a team has an active Token Pass and no balance was
+/// returned.
+pub const active_line = "Vercel Token Pass is active.";
+
+/// How a Token Pass login or team notice formats links.
+pub const LinkStyle = enum { osc8, plain };
+
+/// What fx shows under a Vercel login or team selection notice.
+pub const TeamNotice = union(enum) {
+    /// The team has an active Token Pass, with its raw remaining credit when
+    /// AI Gateway returned one.
+    active: ?[]const u8,
+    /// AI Gateway explicitly said the team has no active Token Pass.
+    offer,
+    /// Neither `/credits` nor the model catalog proved Token Pass status.
+    none,
+};
+
+/// Decides what Token Pass notice to show at login or team selection.
+/// A credits reply from this run wins over catalog marks; a catalog without
+/// marks proves nothing when `/credits` did not answer.
+pub fn resolveTeamNotice(
+    credits_answer: ?Answer,
+    remaining: ?[]const u8,
+    catalog_has_marks: bool,
+) TeamNotice {
+    if (credits_answer) |answer| return switch (answer) {
+        .has_pass => .{ .active = remaining },
+        .no_pass => .offer,
+    };
+    if (catalog_has_marks) return .{ .active = null };
+    return .none;
+}
+
+/// Formats a non-negative decimal credit string as `$X.XX` into `buf`, or
+/// returns null when `raw` is not a plain finite dollar amount.
+pub fn formatCreditAmount(buf: []u8, raw: []const u8) ?[]const u8 {
+    if (raw.len == 0 or raw.len > 32) return null;
+    var dots: usize = 0;
+    var digits: usize = 0;
+    for (raw) |byte| {
+        if (std.ascii.isDigit(byte)) {
+            digits += 1;
+        } else if (byte == '.' and dots == 0) {
+            dots += 1;
+        } else {
+            return null;
+        }
+    }
+    if (digits == 0) return null;
+    const amount = std.fmt.parseFloat(f64, raw) catch return null;
+    if (!std.math.isFinite(amount) or amount < 0 or amount >= 1e12) return null;
+    return std.mem.print(buf, "${d:.2}", .{amount}) catch null;
+}
+
+/// Formats `notice` for display, or returns null when nothing should be shown.
+/// Caller owns the returned slice when non-null.
+pub fn formatTeamNotice(
+    alloc: std.mem.Allocator,
+    notice: TeamNotice,
+    link_style: LinkStyle,
+) std.mem.Allocator.Error!?[]u8 {
+    return switch (notice) {
+        .active => |remaining| blk: {
+            if (remaining) |raw| {
+                var amount_buf: [32]u8 = undefined;
+                if (formatCreditAmount(&amount_buf, raw)) |formatted| {
+                    break :blk try alloc.print("Vercel Token Pass is active ({s} remaining).", .{formatted});
+                }
+            }
+            break :blk try alloc.dupe(u8, active_line);
+        },
+        .offer => try alloc.dupe(u8, switch (link_style) {
+            .osc8 => offer_line,
+            .plain => plain_offer_line,
+        }),
+        .none => null,
+    };
+}
 
 /// The dashboard's Token Pass tab, which shows the remaining credit and the
 /// reset date. Vercel fills in the signed-in team for `[team]`.
@@ -426,4 +510,48 @@ test "token pass: denied causes come from the documented messages" {
 test "token pass: the hints point at the picker and the dashboard" {
     try std.testing.expect(std.mem.find(u8, deniedHint(.scoped_key_model), "Token Pass in /models") != null);
     try std.testing.expect(std.mem.find(u8, deniedHint(.no_active_pass), dashboard_url) != null);
+}
+
+test "token pass: team notice resolves credits, catalog marks, and unknown safely" {
+    const active_with_credit = resolveTeamNotice(.has_pass, "79.92906", false);
+    try std.testing.expectEqualStrings("79.92906", active_with_credit.active.?);
+
+    const active_from_marks = resolveTeamNotice(null, null, true);
+    try std.testing.expect(active_from_marks == .active);
+    try std.testing.expect(active_from_marks.active == null);
+
+    // Explicit no_pass from credits outranks stale catalog marks.
+    try std.testing.expectEqual(TeamNotice.offer, resolveTeamNotice(.no_pass, null, true));
+    // Failed credits with no marks must not falsely offer to buy Token Pass.
+    try std.testing.expectEqual(TeamNotice.none, resolveTeamNotice(null, null, false));
+}
+
+test "token pass: team notice formats active credit, active fallback, and offers" {
+    const alloc = std.testing.allocator;
+
+    const with_credit = (try formatTeamNotice(alloc, .{ .active = "79.92906" }, .osc8)).?;
+    defer alloc.free(with_credit);
+    try std.testing.expectEqualStrings("Vercel Token Pass is active ($79.93 remaining).", with_credit);
+
+    const zero_credit = (try formatTeamNotice(alloc, .{ .active = "0" }, .plain)).?;
+    defer alloc.free(zero_credit);
+    try std.testing.expectEqualStrings("Vercel Token Pass is active ($0.00 remaining).", zero_credit);
+
+    const no_balance = (try formatTeamNotice(alloc, .{ .active = null }, .osc8)).?;
+    defer alloc.free(no_balance);
+    try std.testing.expectEqualStrings(active_line, no_balance);
+
+    const bad_balance = (try formatTeamNotice(alloc, .{ .active = "\x1b[31m99" }, .osc8)).?;
+    defer alloc.free(bad_balance);
+    try std.testing.expectEqualStrings(active_line, bad_balance);
+
+    const osc8_offer = (try formatTeamNotice(alloc, .offer, .osc8)).?;
+    defer alloc.free(osc8_offer);
+    try std.testing.expectEqualStrings(offer_line, osc8_offer);
+
+    const plain_offer = (try formatTeamNotice(alloc, .offer, .plain)).?;
+    defer alloc.free(plain_offer);
+    try std.testing.expectEqualStrings(plain_offer_line, plain_offer);
+
+    try std.testing.expect((try formatTeamNotice(alloc, .none, .osc8)) == null);
 }

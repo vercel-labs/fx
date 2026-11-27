@@ -263,7 +263,7 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) anyerror!void {
     // one, and what it reads writes back to the same override.
     if (parseOverride(flag.written())) |override| {
         var text: [64]u8 = undefined;
-        const again = try std.fmt.bufPrint(&text, "{s}={s}", .{ @tagName(override.tool), @tagName(override.placement) });
+        const again = try std.mem.print(&text, "{s}={s}", .{ @tagName(override.tool), @tagName(override.placement) });
         try std.testing.expectEqual(override, try parseOverride(again));
     } else |_| {}
 

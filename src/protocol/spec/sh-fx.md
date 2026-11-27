@@ -10,7 +10,7 @@ When ACP has a proposal for a feature, the extension takes the proposal's shape 
 
 ### Names
 
-Every name that `sh.fx` adds starts with `sh.fx`, the fx.sh domain in reverse-DNS order, as ACP's [extension rules](https://agentclientprotocol.com/protocol/v1/extensibility) require:
+Every name that `sh.fx` adds starts with `sh.fx`, or with `_sh.fx` for a method or notification. Both prefixes are the fx.sh domain in reverse-DNS order, as ACP's [extension rules](https://agentclientprotocol.com/protocol/v1/extensibility) require:
 
 | Name | Form |
 | --- | --- |

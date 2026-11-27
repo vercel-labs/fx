@@ -16,5 +16,23 @@
     "old": "    /\\ t[1] \\in loaded\n    /\\ (t",
     "new": "    /\\ (t",
     "invariant": "ChildWithinParent"
+  },
+  {
+    "description": "a bridge call also needs its list loaded when the command began",
+    "old": "    /\\ InView(v, t)\n    /\\ t \\notin DeniedFor(v)",
+    "new": "    /\\ InView(v, t)\n    /\\ t[1] \\in loaded\n    /\\ t \\notin DeniedFor(v)",
+    "invariant": "BridgeRunsWhatIsAllowed"
+  },
+  {
+    "description": "a bridge call skips the deny rules of the child's mode",
+    "old": "    /\\ InView(v, t)\n    /\\ t \\notin DeniedFor(v)",
+    "new": "    /\\ InView(v, t)",
+    "invariant": "BridgeHoldsViewAndRules"
+  },
+  {
+    "description": "a bridge call skips the child's view",
+    "old": "    /\\ InView(v, t)\n    /\\ t \\notin DeniedFor(v)",
+    "new": "    /\\ t \\notin DeniedFor(v)",
+    "invariant": "BridgeHoldsViewAndRules"
   }
 ]

@@ -112,6 +112,7 @@ pub const EntryProblem = enum {
     env,
     bearer_token_env,
     enabled,
+    shared,
     required,
     startup_timeout_ms,
     operation_timeout_ms,
@@ -167,6 +168,7 @@ fn entryProblem(err: anyerror) EntryProblem {
         error.McpConfigInvalidEnvironment => .env,
         error.McpConfigInvalidBearerEnvironment => .bearer_token_env,
         error.McpConfigInvalidEnabled => .enabled,
+        error.McpConfigInvalidShared => .shared,
         error.McpConfigInvalidRequired => .required,
         error.McpConfigInvalidStartupTimeout => .startup_timeout_ms,
         error.McpConfigInvalidOperationTimeout => .operation_timeout_ms,
@@ -313,7 +315,6 @@ pub const ProfileDiagnostic = mcp_contract.ProfileConfigWarning;
 pub const ProfileParseResult = struct {
     configs: std.ArrayList(McpServerConfig) = .empty,
     diagnostic: ?ProfileDiagnostic = null,
-    mutation_allowed: bool = true,
 
     pub fn deinit(self: *ProfileParseResult, alloc: Allocator) void {
         deinitConfigs(alloc, &self.configs);
@@ -399,7 +400,7 @@ pub fn parseProfileJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(
 /// The profile's servers. With `skipped`, an entry fx can't read is left out
 /// and noted there instead of failing the file.
 pub fn parseProfileServers(alloc: Allocator, json_text: []const u8, skipped: ?*std.ArrayList(WorkspaceDiagnostic)) !std.ArrayList(McpServerConfig) {
-    var result = try parseProfileDocumentInto(alloc, json_text, skipped);
+    var result = try parseProfileDocument(alloc, json_text, skipped);
     defer result.deinit(alloc);
     const configs = result.configs;
     result.configs = .empty;
@@ -414,11 +415,10 @@ noinline fn failProfileParseDynamic(err: anyerror) anyerror!ProfileParseResult {
     return err;
 }
 
-pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfileParseResult {
-    return parseProfileDocumentInto(alloc, json_text, null);
-}
-
-fn parseProfileDocumentInto(alloc: Allocator, json_text: []const u8, skipped: ?*std.ArrayList(WorkspaceDiagnostic)) !ProfileParseResult {
+/// The profile's document. With `skipped`, an entry fx can't read is left out and noted there, with the notes about
+/// a misspelled or ignored key, as the runtime reads it (`parseProfileServers`); `diagnostic` holds the warning either
+/// way. Without it, the first entry fx can't read fails the file.
+pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8, skipped: ?*std.ArrayList(WorkspaceDiagnostic)) !ProfileParseResult {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| switch (err) {
         error.OutOfMemory => return failProfileParse(error.OutOfMemory),
         else => return failProfileParse(error.McpConfigInvalidJson),
@@ -450,7 +450,6 @@ fn parseProfileDocumentInto(alloc: Allocator, json_text: []const u8, skipped: ?*
                     found.key,
                     found.additional_matches,
                 );
-                result.mutation_allowed = false;
                 if (skipped) |notes| try noteMisspelledKey(alloc, notes, found.key, real_is_mcp);
             },
             .indeterminate => {
@@ -459,7 +458,6 @@ fn parseProfileDocumentInto(alloc: Allocator, json_text: []const u8, skipped: ?*
                     null,
                     0,
                 );
-                result.mutation_allowed = false;
             },
         }
         return result;
@@ -475,7 +473,6 @@ fn parseProfileDocumentInto(alloc: Allocator, json_text: []const u8, skipped: ?*
                     found.key,
                     found.additional_matches,
                 ),
-                .mutation_allowed = false,
             };
         },
         .indeterminate => .{
@@ -484,7 +481,6 @@ fn parseProfileDocumentInto(alloc: Allocator, json_text: []const u8, skipped: ?*
                 null,
                 0,
             ),
-            .mutation_allowed = false,
         },
     };
 }
@@ -652,12 +648,27 @@ fn holdsServers(value: std.json.Value) bool {
     return false;
 }
 
+/// Whether a server map has an entry named `name` with a server's shape.
+fn holdsServerNamed(value: std.json.Value, name: []const u8) bool {
+    if (value != .object) return false;
+    const entry = value.object.get(name) orelse return false;
+    return serverEntryShape(entry);
+}
+
 /// The first top-level key of the profile `text` that looks like a misspelling
 /// of its servers key, or null. It reads every key and every entry, unlike the
 /// scan fx runs as it loads the file (`scanSuspiciousProfileKeys`), which gives
 /// up on a big file: an edit must not miss a key because the file is big.
 /// Null for text that isn't a JSON object.
 pub fn misspelledKey(alloc: Allocator, text: []const u8) Allocator.Error!?MisspelledKey {
+    return misspelledKeyHolding(alloc, text, null);
+}
+
+/// `misspelledKey`, for the first such key that holds a server named `name` (a
+/// server's shape, as the scan reads it), when there is a `name`. The scan, the key
+/// limit and the cut are `misspelledKey`'s. `fx mcp remove` uses it to say where a
+/// name it can't find is, and it writes nothing.
+pub fn misspelledKeyHolding(alloc: Allocator, text: []const u8, name: ?[]const u8) Allocator.Error!?MisspelledKey {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -670,6 +681,7 @@ pub fn misspelledKey(alloc: Allocator, text: []const u8) Allocator.Error!?Misspe
         const key = entry.key_ptr.*;
         if (std.mem.eql(u8, key, "mcp") or std.mem.eql(u8, key, "mcpServers")) continue;
         if (!isSuspiciousNormalizedKey(key) or !holdsServers(entry.value_ptr.*)) continue;
+        if (name) |wanted| if (!holdsServerNamed(entry.value_ptr.*, wanted)) continue;
         return MisspelledKey.init(key, object.contains("mcp"));
     }
     return null;
@@ -1261,6 +1273,40 @@ test "entryProblemIn names why the reader skips an entry, and holds back none fo
     try std.testing.expectEqual(EntryProblem.other, (try entryProblemIn(alloc, true, text, "nope")).?);
 }
 
+test "misspelledKeyHolding finds the misspelled key that holds a server by that name, and no other" {
+    const alloc = std.testing.allocator;
+    const text =
+        \\{"mcpServers":{"a":{"command":"x"}},"servers":{"note":1,"c":{"command":"z"}},"mcp_servers":{"b":{"url":"https://b.example/mcp"},"d":7}}
+    ;
+    // Each name is found under the key that holds it; the first key that holds none of them is not the answer.
+    try std.testing.expectEqualStrings("mcp_servers", (try misspelledKeyHolding(alloc, text, "b")).?.key());
+    try std.testing.expectEqualStrings("servers", (try misspelledKeyHolding(alloc, text, "c")).?.key());
+    // A name that is in the real key, in no key, or under a misspelled key as something that is not a server, is not.
+    try std.testing.expect(try misspelledKeyHolding(alloc, text, "a") == null);
+    try std.testing.expect(try misspelledKeyHolding(alloc, text, "nope") == null);
+    try std.testing.expect(try misspelledKeyHolding(alloc, text, "d") == null);
+    try std.testing.expect(try misspelledKeyHolding(alloc, text, "note") == null);
+    // Without a name it is `misspelledKey`.
+    try std.testing.expectEqualStrings((try misspelledKey(alloc, text)).?.key(), (try misspelledKeyHolding(alloc, text, null)).?.key());
+    // Keys and names are read as `std.json` decodes them, so an escape does not hide either.
+    const escaped =
+        \\{"mcp\u005fservers":{"b\u0062":{"command":"y"}}}
+    ;
+    try std.testing.expectEqualStrings("mcp_servers", (try misspelledKeyHolding(alloc, escaped, "bb")).?.key());
+    // The key's bound and its cut are the scan's: a key longer than the bound is named by how it starts.
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(alloc);
+    try long.appendSlice(alloc, "{\"mcp_servers");
+    for (0..70) |_| try long.appendSlice(alloc, "\u{e9}");
+    try long.appendSlice(alloc, "\":{\"b\":{\"command\":\"y\"}}}");
+    const found = (try misspelledKeyHolding(alloc, long.items, "b")).?;
+    try std.testing.expect(found.cut);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(found.key()));
+    // Text that is not an object, or not JSON, holds nothing.
+    try std.testing.expect(try misspelledKeyHolding(alloc, "[1]", "b") == null);
+    try std.testing.expect(try misspelledKeyHolding(alloc, "{ nope", "b") == null);
+}
+
 test "misspelledKey reads every key and entry, and the load scan gives the same key a note" {
     const alloc = std.testing.allocator;
     // The key's own text is longer than the buffer the load scan normalizes into.
@@ -1280,7 +1326,7 @@ test "misspelledKey reads every key and entry, and the load scan gives the same 
     for (0..64) |i| try wide.print(alloc, "\"n{d}\":{d},", .{ i, i });
     try wide.appendSlice(alloc, "\"real\":{\"command\":\"y\"}}}");
     try std.testing.expectEqualStrings("servers", (try foundKey(alloc, wide.items)).key());
-    var scanned = try parseProfileDocument(alloc, wide.items);
+    var scanned = try parseProfileDocument(alloc, wide.items, null);
     defer scanned.deinit(alloc);
     try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_key_scan_indeterminate, scanned.diagnostic.?.cause);
 
@@ -1310,9 +1356,12 @@ test "misspelledKey reads every key and entry, and the load scan gives the same 
         "~/.fx/mcp.json: the key \"mcp_servers\" looks like a misspelling of \"mcpServers\", so fx doesn't read it. Move its servers into \"mcpServers\", then delete \"mcp_servers\".",
         said,
     );
-    var strict = try parseProfileDocument(alloc, typo);
+    // Without notes the load still flags the key, and the edit check finds the same one.
+    var strict = try parseProfileDocument(alloc, typo, null);
     defer strict.deinit(alloc);
-    try std.testing.expect(!strict.mutation_allowed);
+    try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_server_key, strict.diagnostic.?.cause);
+    try std.testing.expectEqualStrings("mcp_servers", strict.diagnostic.?.key().?);
+    try std.testing.expectEqualStrings("mcp_servers", (try foundKey(alloc, typo)).key());
 }
 
 /// The misspelled key of `text`, or a failed test when the scan finds none, so a scan
@@ -1431,6 +1480,12 @@ fn parseServerEntry(
         if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidEnabled)
     else
         true;
+    // One copy of a stdio server for every session whose config matches;
+    // a server that keeps state per client says false.
+    const shared = if (object.get("shared")) |field|
+        if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidShared)
+    else
+        true;
     const configured_required = if (object.get("required")) |field|
         if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidRequired)
     else
@@ -1477,6 +1532,7 @@ fn parseServerEntry(
             .auth = auth,
             .allow_stored_credentials = policy.allow_stored_credentials,
             .enabled = enabled,
+            .shared = shared,
             .workspace_admission = policy.workspace_admission,
             .startup_timeout_ms = timeouts.startup_ms,
             .operation_timeout_ms = timeouts.operation_ms,
@@ -1510,6 +1566,7 @@ fn parseServerEntry(
         .args = command.args,
         .env = env,
         .enabled = enabled,
+        .shared = shared,
         .workspace_admission = policy.workspace_admission,
         .startup_timeout_ms = timeouts.startup_ms,
         .operation_timeout_ms = timeouts.operation_ms,
@@ -1794,7 +1851,9 @@ fn containsName(values: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-fn configNamePresent(configs: []const McpServerConfig, name: []const u8) bool {
+/// Whether a server of `configs` has this name: the one rule for which of two servers keeps a name, in `mergeNative`,
+/// `appendWorkspaceAfterAcpPrimary`, and the host's compose (`builtins/mcp.zig`).
+pub fn configNamePresent(configs: []const McpServerConfig, name: []const u8) bool {
     for (configs) |config| if (std.mem.eql(u8, config.name, name)) return true;
     return false;
 }
@@ -1872,31 +1931,29 @@ test "a server that sets required or a non-default restart_limit gets a note nam
 
 test "profile document accepts mcpServers alias and preserves strict entry parsing" {
     const alloc = std.testing.allocator;
-    var result = try parseProfileDocument(
-        alloc,
-        "{\"mcpServers\":{\"local\":{\"command\":\"node\",\"args\":[\"server.js\"]}}}",
-    );
+    const text = "{\"mcpServers\":{\"local\":{\"command\":\"node\",\"args\":[\"server.js\"]}}}";
+    var result = try parseProfileDocument(alloc, text, null);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
     try std.testing.expectEqualStrings("local", result.configs.items[0].name);
     try std.testing.expectEqualStrings("node", result.configs.items[0].command.?);
     try std.testing.expect(result.diagnostic == null);
-    try std.testing.expect(result.mutation_allowed);
+    // The edit check flags nothing in a document that has only the real keys.
+    try std.testing.expect(try misspelledKey(alloc, text) == null);
 }
 
 test "profile document keeps canonical mcp and reports ignored nonempty alias" {
     const alloc = std.testing.allocator;
-    var result = try parseProfileDocument(
-        alloc,
-        "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"mcpServers\":{\"ignored\":{\"command\":\"two\"}}}",
-    );
+    const text = "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"mcpServers\":{\"ignored\":{\"command\":\"two\"}}}";
+    var result = try parseProfileDocument(alloc, text, null);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
     try std.testing.expectEqualStrings("canonical", result.configs.items[0].name);
     try std.testing.expectEqual(ProfileDiagnosticCause.ignored_mcp_servers_alias, result.diagnostic.?.cause);
-    try std.testing.expect(result.mutation_allowed);
+    // Both keys are real ones, so the edit check flags neither.
+    try std.testing.expect(try misspelledKey(alloc, text) == null);
 }
 
 test "profile servers note each one ignored under mcpServers beside mcp" {
@@ -1928,10 +1985,8 @@ test "profile servers note each one ignored under mcpServers beside mcp" {
 
 test "profile document blocks suspicious sibling keys beside canonical mcp" {
     const alloc = std.testing.allocator;
-    var result = try parseProfileDocument(
-        alloc,
-        "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"MCP-Servers\":{\"shadow\":{\"command\":\"two\"}},\"metadata\":{\"owner\":\"team\"}}",
-    );
+    const text = "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"MCP-Servers\":{\"shadow\":{\"command\":\"two\"}},\"metadata\":{\"owner\":\"team\"}}";
+    var result = try parseProfileDocument(alloc, text, null);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
@@ -1939,22 +1994,22 @@ test "profile document blocks suspicious sibling keys beside canonical mcp" {
     try std.testing.expect(result.diagnostic != null);
     try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_server_key, result.diagnostic.?.cause);
     try std.testing.expectEqualStrings("MCP-Servers", result.diagnostic.?.key().?);
-    try std.testing.expect(!result.mutation_allowed);
+    // The edit check finds the same key, so a write is refused.
+    try std.testing.expectEqualStrings("MCP-Servers", (try foundKey(alloc, text)).key());
 }
 
 test "profile document reports the first exact server-like unsupported key" {
     const alloc = std.testing.allocator;
-    var result = try parseProfileDocument(
-        alloc,
-        "{\"metadata\":{\"entry\":{\"command\":\"ignored\"}},\"MCP-Servers\":{\"one\":{\"command\":\"node\"}},\"servers\":{\"two\":{\"url\":\"https://example.test/mcp\"}}}",
-    );
+    const text = "{\"metadata\":{\"entry\":{\"command\":\"ignored\"}},\"MCP-Servers\":{\"one\":{\"command\":\"node\"}},\"servers\":{\"two\":{\"url\":\"https://example.test/mcp\"}}}";
+    var result = try parseProfileDocument(alloc, text, null);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 0), result.configs.items.len);
     try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_server_key, result.diagnostic.?.cause);
     try std.testing.expectEqualStrings("MCP-Servers", result.diagnostic.?.key().?);
     try std.testing.expectEqual(@as(usize, 1), result.diagnostic.?.additional_matches);
-    try std.testing.expect(!result.mutation_allowed);
+    // The edit check names the same first key.
+    try std.testing.expectEqualStrings("MCP-Servers", (try foundKey(alloc, text)).key());
 }
 
 test "profile document bounds suspicious-key scans" {
@@ -1970,10 +2025,11 @@ test "profile document bounds suspicious-key scans" {
     const json = try out.toOwnedSlice();
     defer alloc.free(json);
 
-    var result = try parseProfileDocument(alloc, json);
+    var result = try parseProfileDocument(alloc, json, null);
     defer result.deinit(alloc);
     try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_key_scan_indeterminate, result.diagnostic.?.cause);
-    try std.testing.expect(!result.mutation_allowed);
+    // The load scan gives up on a big file, but the edit check reads every key, so it decides: none here is a misspelling.
+    try std.testing.expect(try misspelledKey(alloc, json) == null);
 }
 
 test "profile parser preserves validation precedence for multiply invalid entries" {
@@ -2115,6 +2171,7 @@ test "workspace environment diagnostics isolate entries and profile values stay 
     var profile = try parseProfileDocument(
         alloc,
         "{\"mcp\":{\"literal\":{\"command\":\"${COMMAND}\"}}}",
+        null,
     );
     defer profile.deinit(alloc);
     try std.testing.expectEqualStrings("${COMMAND}", profile.configs.items[0].command.?);
@@ -2488,4 +2545,32 @@ test "a project entry fx can't read says why in words" {
         defer alloc.free(said);
         try std.testing.expectEqualStrings(words, said);
     }
+}
+
+test "a server reads \"shared\": false, and a value that isn't a bool says so" {
+    const alloc = std.testing.allocator;
+    var result = try parseWorkspaceJson(alloc,
+        \\{"mcpServers":{"own":{"command":"node","shared":false},"odd":{"command":"node","shared":"no"}}}
+    , .workspace, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
+    try std.testing.expect(!result.configs.items[0].shared);
+    try std.testing.expectEqual(@as(usize, 1), result.diagnostics.items.len);
+    const said = try renderWorkspaceDiagnostic(alloc, result.diagnostics.items[0]);
+    defer alloc.free(said);
+    try std.testing.expectEqualStrings(".mcp.json server 'odd' was skipped: its \"shared\" isn't valid.", said);
+    // A profile server with the same value fails outright, as its other fields do.
+    try std.testing.expectError(
+        error.McpConfigInvalidShared,
+        parseProfileJson(alloc, "{\"mcp\":{\"odd\":{\"command\":[\"node\"],\"shared\":\"no\"}}}"),
+    );
+}
+
+test "a profile server defaults to shared" {
+    const alloc = std.testing.allocator;
+    var result = try parseProfileDocument(alloc, "{\"mcp\":{\"default\":{\"command\":[\"node\"]},\"own\":{\"command\":[\"node\"],\"shared\":false}}}", null);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), result.configs.items.len);
+    try std.testing.expect(result.configs.items[0].shared);
+    try std.testing.expect(!result.configs.items[1].shared);
 }

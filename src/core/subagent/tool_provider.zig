@@ -13,6 +13,9 @@ pub const Status = enum {
 pub const Result = struct {
     status: Status,
     body: []u8,
+    /// The message made a new subagent, for its row (D101). The model's
+    /// `body` does not change with it.
+    started: bool = false,
 };
 
 pub const ExecuteError = Allocator.Error || error{Cancelled};

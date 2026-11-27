@@ -13,9 +13,11 @@ const tool_specs = @import("../../tooling/tool_specs.zig");
 const tooling_presentation = @import("../../tooling/tool_presentation.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const mcp_tool_result = @import("../../mcp/tool_result.zig");
+const result_store = @import("../../session/result_store.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
+const tool_result_display = @import("../../tooling/tool_result_display.zig");
 const read_result_presentation = @import("../../tooling/read_tool_result_presentation.zig");
 const command_result_mapping = if (@import("builtin").is_test)
     @import("../../tooling/command_result_mapping.zig")
@@ -57,6 +59,16 @@ pub fn providerToolOnlyReads(
     if (isProviderSearchAlias(tool_name)) return true;
     const spec = registry.lookup(tool_name) orelse return false;
     return spec.provider_executed and spec.activity_kind == .read;
+}
+
+/// `arguments_json` when it is one complete JSON object. A streaming call's
+/// arguments are that only once the provider has sent all of them, since no
+/// valid text can follow a complete object. Null otherwise.
+fn wholeArguments(scratch: Allocator, arguments_json: ?[]const u8) Allocator.Error!?[]const u8 {
+    const json = arguments_json orelse return null;
+    const start = std.mem.trimStart(u8, json, " \t\r\n");
+    if (start.len == 0 or start[0] != '{') return null;
+    return if (try std.json.validate(scratch, json)) json else null;
 }
 
 fn fallbackToolDisplay(
@@ -231,6 +243,7 @@ pub const ProvisionalToolStatuses = struct {
                 .presentation_group_id = self.presentation_group_id,
                 .tool_name = shown_tool_name,
                 .activity_kind = observed_kind,
+                .arguments_json = try wholeArguments(scratch.allocator(), arguments_json),
             },
         }) catch |err| {
             if (recorded) self.forget(alloc, tool_id);
@@ -764,6 +777,9 @@ pub const ToolPresentationGroupObservation = struct {
     has_visible_text: bool,
     saw_tool_start: bool,
     saw_visible_text_after_tool_start: bool,
+    /// The step called `ask_user_question`. Its answered question draws
+    /// below the open group, so calls after the answer start a new group.
+    asked_question: bool,
 };
 
 pub const ToolPresentationGroupTransition = struct {
@@ -804,7 +820,8 @@ pub fn transitionPresentationGroup(
     if (observation.has_visible_tool_calls) {
         next_active_group_id = resolved_tool_group_id;
     }
-    if (observation.saw_visible_text_after_tool_start or
+    if (observation.asked_question or
+        observation.saw_visible_text_after_tool_start or
         (observation.has_visible_text and !observation.has_visible_tool_calls))
     {
         next_active_group_id = null;
@@ -820,13 +837,44 @@ pub fn activityKind(registry: tool_dispatch.Registry, tool_name: []const u8) typ
     return tool_dispatch.toolActivityKind(registry, tool_name);
 }
 
+/// What a call does, as its rows show it. A toolbox run of a built-in tool
+/// does what the call fx runs for it does (`toolbox.shownBuiltinRun`), so a
+/// question asked through toolbox is a question, as a direct one is.
 pub fn activityKindForCall(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
     call: ToolCall,
 ) types.ToolActivityKind {
     if (tooling_presentation.isProviderSearchAlias(call.name)) return .read;
-    return tool_dispatch.toolActivityKindForCall(alloc, registry, call);
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const shown = toolbox.shownBuiltinRun(scratch_state.allocator(), registry, call) catch |err| blk: {
+        // Out of memory keeps the toolbox call's own kind, as a call whose
+        // arguments don't parse keeps its tool's static kind.
+        debug_trace.logf("tool", "toolbox run kind not resolved call={s} err={s}", .{ call.id, @errorName(err) });
+        break :blk null;
+    };
+    return tool_dispatch.toolActivityKindForCall(alloc, registry, shown orelse call);
+}
+
+test "a toolbox run of a built-in tool does what that tool does" {
+    const registry = test_builtin_tools.advertisement_set.registry;
+    const cases = [_]struct { arguments: []const u8, kind: types.ToolActivityKind }{
+        .{ .arguments = "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}", .kind = .ask },
+        .{ .arguments = "{\"run\":\"ask_user_question\",\"arguments\":\"{\\\"questions\\\":[]}\"}", .kind = .ask },
+        .{ .arguments = "{\"run\":\"read_file\",\"arguments\":{\"path\":\"a\"}}", .kind = .read },
+        // Toolbox's own kinds: a run of an MCP tool, a search, and a run that
+        // also opens, which toolbox refuses.
+        .{ .arguments = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .kind = .mcp },
+        .{ .arguments = "{\"search\":\"files\"}", .kind = .read },
+        .{ .arguments = "{\"run\":\"ask_user_question\",\"open\":\"skill\"}", .kind = .write },
+    };
+    for (cases) |case| {
+        const call: ToolCall = .{ .id = "t", .name = toolbox.tool_name, .arguments_json = case.arguments };
+        try std.testing.expectEqual(case.kind, activityKindForCall(std.testing.allocator, registry, call));
+    }
+    const carried: ToolCall = .{ .id = "t", .name = "ask_user_question", .arguments_json = "{\"questions\":[]}", .carried_by = toolbox.tool_name };
+    try std.testing.expectEqual(types.ToolActivityKind.ask, activityKindForCall(std.testing.allocator, registry, carried));
 }
 
 /// How a streaming toolbox call's row reads when it runs a built-in tool.
@@ -1499,8 +1547,40 @@ pub fn finishExecutedToolStatus(
             .result = presentation_result,
             .result_memory = presentation_memory,
             .command_artifact_handle = command_artifact_handle,
+            .check_found_command_ended = shell_command and try checkFoundCommandEnded(arena, call, result.model_output),
+            .resolved_path = readFileResolvedPath(call, result.status == .success, safe_result),
         },
     });
+}
+
+/// The file a completed read_file call read, as core resolved it with
+/// symlinks followed: the path its result names (`readPathOfResult`), in
+/// the text the session saves, so a resumed row finds the same path. Null
+/// for any other call, and for one that failed, whose path core never
+/// resolved to a file.
+fn readFileResolvedPath(call: ToolCall, succeeded: bool, saved_result: []const u8) ?[]const u8 {
+    if (!succeeded or !std.mem.eql(u8, call.name, "read_file")) return null;
+    return tool_result_display.readPathOfResult(saved_result);
+}
+
+test "a finished read tells the transcript the file core read" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    // The call named a symlink; core read the file it points to.
+    const call = ToolCall{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" };
+    const output = "<path>real/real.md</path>\n<content>\n1\tok\n</content>";
+    try finishExecutedToolStatus(&hooks, arena_state.allocator(), 4, call, true, null, .{ .status = .success, .model_output = output }, output, .{}, null, &.{});
+    try std.testing.expectEqualStrings("real/real.md", capture.events.items[0].terminal.resolved_path.?);
+    // A failed read, and a call of another tool, resolved no file.
+    try finishExecutedToolStatus(&hooks, arena_state.allocator(), 4, call, true, null, .{ .status = .failure, .model_output = output }, output, .{}, null, &.{});
+    try std.testing.expect(capture.events.items[1].terminal.resolved_path == null);
+    const search = ToolCall{ .id = "search", .name = "grep_files", .arguments_json = "{\"pattern\":\"a\"}" };
+    try finishExecutedToolStatus(&hooks, arena_state.allocator(), 4, search, true, null, .{ .status = .success, .model_output = output }, output, .{}, null, &.{});
+    try std.testing.expect(capture.events.items[2].terminal.resolved_path == null);
 }
 
 fn presentedToolResult(
@@ -1635,6 +1715,90 @@ test "a shell run that returns its command running reads Still running" {
     try std.testing.expect((try runningCommandDecision(arena, run, "not json \"running\"")) == null);
 }
 
+/// Whether a shell check, an `interact` call that sends no input, found its
+/// session's command ended, from the check's result `output`. A check that
+/// found it passed reads `Observed`, as one does while the command runs on,
+/// since the shell gives a check an exit status only when the command failed
+/// (publishSnapshotMetadata in src/tools/shell/shell.zig).
+pub fn checkFoundCommandEnded(arena: Allocator, call: ToolCall, output: []const u8) !bool {
+    if (!std.mem.eql(u8, call.name, "shell")) return false;
+    if (std.mem.find(u8, output, "\"completed\"") == null) return false;
+    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    const action = tool_args.optionalStringArg(args, "action") orelse return false;
+    if (!std.mem.eql(u8, action, "interact")) return false;
+    if (tool_args.optionalStringArg(args, "chars")) |chars| if (chars.len > 0) return false;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, output, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    if (parsed != .object) return false;
+    const state = parsed.object.get("state") orelse return false;
+    return state == .string and std.mem.eql(u8, state.string, "completed");
+}
+
+test "a shell check finds its command ended only from a completed result" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const check = ToolCall{ .id = "c", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}" };
+    const passed = "{\"state\":\"completed\",\"exit_code\":0,\"duration_ms\":2004,\"output_delta\":\"CAPTURED_DONE\"}";
+    try std.testing.expect(try checkFoundCommandEnded(arena, check, passed));
+    const empty_chars = ToolCall{ .id = "c", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"chars\":\"\"}" };
+    try std.testing.expect(try checkFoundCommandEnded(arena, empty_chars, passed));
+    const failed = "{\"state\":\"completed\",\"exit_code\":1,\"output_delta\":\"\"}";
+    try std.testing.expect(try checkFoundCommandEnded(arena, check, failed));
+
+    const running = "{\"session_id\":\"shell-1\",\"state\":\"running\",\"running_ms\":30008,\"output_delta\":\"completed\"}";
+    try std.testing.expect(!try checkFoundCommandEnded(arena, check, running));
+    const stopped = "{\"state\":\"stopped\",\"signal\":15,\"output_delta\":\"completed\"}";
+    try std.testing.expect(!try checkFoundCommandEnded(arena, check, stopped));
+    const send = ToolCall{ .id = "s", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"chars\":\"y\\n\"}" };
+    try std.testing.expect(!try checkFoundCommandEnded(arena, send, passed));
+    const run = ToolCall{ .id = "r", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"true\"}" };
+    try std.testing.expect(!try checkFoundCommandEnded(arena, run, passed));
+    const read = ToolCall{ .id = "f", .name = "read_file", .arguments_json = "{\"action\":\"interact\"}" };
+    try std.testing.expect(!try checkFoundCommandEnded(arena, read, passed));
+    try std.testing.expect(!try checkFoundCommandEnded(arena, check, "not json \"completed\""));
+}
+
+test "a check tells the transcript it found its command ended and keeps its own status" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const check = ToolCall{ .id = "check", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}" };
+    const cases = [_]struct { output: []const u8, ended: bool }{
+        .{ .output = "{\"state\":\"completed\",\"exit_code\":0,\"output_delta\":\"done\"}", .ended = true },
+        .{ .output = "{\"session_id\":\"shell-1\",\"state\":\"running\",\"output_delta\":\"\"}", .ended = false },
+    };
+    for (cases) |case| {
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        try finishExecutedToolStatus(
+            &hooks,
+            arena,
+            3,
+            check,
+            true,
+            null,
+            .{ .status = .success, .model_output = case.output },
+            case.output,
+            .{ .output_bytes = case.output.len, .stored_output_bytes = case.output.len },
+            null,
+            &.{},
+        );
+        const terminal = capture.events.items[0].terminal;
+        try std.testing.expectEqual(case.ended, terminal.check_found_command_ended);
+        // The status line Ctrl+O, ACP, and `fx ask` show is the same either way.
+        try std.testing.expectEqual(types.ToolOutcomeKind.completed, terminal.outcome.kind);
+        try std.testing.expectEqualStrings("started shell", terminal.outcome.summary);
+    }
+}
+
 fn checkRunningCommandDecisionAllocationFailures(alloc: Allocator) !void {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -1727,11 +1891,24 @@ fn failureStatusDetail(
     // An MCP call shows why it failed, made directly or through toolbox.
     const mcp_call = containsName(advertised_dynamic_tool_names, call.name) or
         if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| types.isMcpToolName(run.name) else false;
-    if (safe_result.len == 0 or !mcp_call) return null;
-    const server_text = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
+    if (!mcp_call) return null;
+    return mcpFailureCause(arena, safe_result);
+}
+
+/// Why an MCP call failed, from the result the model got, for its status
+/// line: terminal-safe, and null when the result says nothing. A resume
+/// writes a saved call's line with it too, so the line reads as it did live.
+pub fn mcpFailureCause(arena: Allocator, safe_result: []const u8) !?[]const u8 {
+    if (safe_result.len == 0) return null;
+    // A result over the cap is stored, and the model's copy is the head of the text in a preview block.
+    // The cause comes from that head, as it does in the trace.
+    const model_text = result_store.storedPreview(safe_result) orelse safe_result;
+    const server_text = try mcpFailureEnvelopeText(arena, model_text) orelse model_text;
     // A refused call's parameters read as which fields and types, not as the
     // start of a protocol dump; the model still gets the server's own words.
-    const detail = try mcp_tool_result.invalidParamsCause(arena, server_text) orelse server_text;
+    // The line shows what the server said, and no error's data, which only the model gets.
+    const detail = try mcp_tool_result.invalidParamsCause(arena, server_text) orelse
+        try mcp_tool_result.protocolErrorWithoutData(arena, server_text);
     const masked_detail = try text_utils.maskSecrets(arena, detail);
     const encoded = try text_utils.encodeTerminalSafeInline(arena, masked_detail, 256);
     return if (encoded.bytes.len == 0) null else encoded.bytes;
@@ -1824,6 +2001,9 @@ pub fn finishCommittedFileStatus(
     status_started: bool,
     display_target: ?[]const u8,
     preview: diff.FileChangePreview,
+    /// The file the change wrote, resolved: `CommittedFileHandoff`'s
+    /// tracker path.
+    resolved_path: []const u8,
     advertised_dynamic_tool_names: []const []const u8,
 ) !void {
     if (!status_started) return;
@@ -1848,8 +2028,31 @@ pub fn finishCommittedFileStatus(
                 .kind = .completed,
                 .summary = line,
             },
+            .resolved_path = resolved_path,
         },
     });
+}
+
+test "a committed file change tells the transcript the file core resolved" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const call = ToolCall{ .id = "edit", .name = "edit_file", .arguments_json = "{\"path\":\"./tsec/x.tse\"}" };
+    try finishCommittedFileStatus(&hooks, arena_state.allocator(), 4, call, true, null, .{
+        .path = "./tsec/x.tse",
+        .lines = &.{},
+        .additions = 1,
+        .deletions = 2,
+        .truncated = false,
+    }, "/w/tsec/x.tse", &.{});
+    const terminal = capture.events.items[0].terminal;
+    try std.testing.expectEqualStrings("/w/tsec/x.tse", terminal.resolved_path.?);
+    // What Ctrl+O, ACP, and `fx ask` show of the call does not change.
+    try std.testing.expect(terminal.result == null);
+    try std.testing.expect(std.mem.startsWith(u8, terminal.outcome.summary, "started edit_file"));
 }
 
 fn renderedSubagentSummary(
@@ -2172,6 +2375,7 @@ test "presentation grouping spans silent tool steps and splits on visible prose"
             .has_visible_text = false,
             .saw_tool_start = false,
             .saw_visible_text_after_tool_start = false,
+            .asked_question = false,
         },
     );
     const inherited = presentationGroupForStep(first_transition.active_group_id, 7, 12);
@@ -2187,6 +2391,7 @@ test "presentation grouping spans silent tool steps and splits on visible prose"
             .has_visible_text = true,
             .saw_tool_start = false,
             .saw_visible_text_after_tool_start = false,
+            .asked_question = false,
         },
     );
     try std.testing.expectEqual(
@@ -2214,10 +2419,54 @@ test "visible prose after streamed tools closes the group for the next step" {
             .has_visible_text = true,
             .saw_tool_start = true,
             .saw_visible_text_after_tool_start = true,
+            .asked_question = false,
         },
     );
 
     try std.testing.expectEqual(current, transition.tool_group_id.?);
+    try std.testing.expect(transition.active_group_id == null);
+}
+
+test "a step that only asks a question closes the group for the calls after the answer" {
+    const open = types.ToolPresentationGroupId{ .turn_id = 7, .anchor_step_id = 11 };
+    const asked = transitionPresentationGroup(
+        open,
+        open,
+        7,
+        12,
+        .{
+            .has_visible_tool_calls = false,
+            .has_visible_text = false,
+            .saw_tool_start = true,
+            .saw_visible_text_after_tool_start = false,
+            .asked_question = true,
+        },
+    );
+    try std.testing.expect(asked.active_group_id == null);
+
+    const after_answer = presentationGroupForStep(asked.active_group_id, 7, 13);
+    try std.testing.expectEqual(
+        types.ToolPresentationGroupId{ .turn_id = 7, .anchor_step_id = 13 },
+        after_answer,
+    );
+}
+
+test "calls in the step that asks keep the open group, and the group closes after it" {
+    const open = types.ToolPresentationGroupId{ .turn_id = 7, .anchor_step_id = 11 };
+    const transition = transitionPresentationGroup(
+        open,
+        open,
+        7,
+        12,
+        .{
+            .has_visible_tool_calls = true,
+            .has_visible_text = false,
+            .saw_tool_start = false,
+            .saw_visible_text_after_tool_start = false,
+            .asked_question = true,
+        },
+    );
+    try std.testing.expectEqual(open, transition.tool_group_id.?);
     try std.testing.expect(transition.active_group_id == null);
 }
 
@@ -2257,6 +2506,26 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
         .progress => |event| try std.testing.expectEqualStrings("● Matching\x1b[0m", event.text),
         else => return error.TestExpectedEqual,
     }
+}
+
+test "a provisional row carries its call's arguments once all of them have arrived" {
+    const alloc = std.testing.allocator;
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    var statuses = ProvisionalToolStatuses{};
+    defer statuses.deinit(alloc);
+    const kind = activityKind(hooks.tool_registry, "read_file");
+    const whole = "{\"path\":\"a.md\",\"start_line\":3}";
+
+    // While they stream in, the row has none.
+    try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", kind, eligibleActionLabel("read_file"), null, "{\"path\":\"a.md\",\"start_li");
+    // The provider's finished call has them all.
+    try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", kind, eligibleActionLabel("read_file"), "a.md", whole);
+
+    try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
+    try std.testing.expect(capture.events.items[0].provisional.arguments_json == null);
+    try std.testing.expectEqualStrings(whole, capture.events.items[2].provisional.arguments_json.?);
 }
 
 test "provisional toolbox labels read as what the call opens, runs, or searches" {
@@ -3743,6 +4012,106 @@ test "cancelled shell wait names the observation instead of the process" {
         terminal.outcome.summary,
         "Stopped waiting for",
     ) != null);
+}
+
+const zod_limit_issue = "{\"code\":\"invalid_type\",\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"]}";
+const limit_cause = "arguments rejected: limit is a string, the schema wants a number";
+
+/// The text a refused MCP call gives the model, as the result cap's store gives it back: the first
+/// `preview_bytes` of `text` in a preview block, because `text` is over the cap.
+fn storedFailureText(arena: Allocator, text: []const u8) ![]const u8 {
+    const head = try result_store.previewText(arena, text, result_store.preview_bytes);
+    return result_store.formatStoredResultOutput(arena, "result-mcp-aaaa-bbbb.txt", head, text.len);
+}
+
+fn mcpFailureDetail(arena: Allocator, safe_result: []const u8) !?[]const u8 {
+    const call: ToolCall = .{ .id = "call_mcp", .name = "mcp__fixture__echo", .arguments_json = "{}" };
+    const result: ToolExecutionResult = .{ .model_output = "", .status = .failure };
+    return failureStatusDetail(arena, call, result, safe_result, &.{"mcp__fixture__echo"});
+}
+
+test "failure status detail names the cause of a refused MCP call whose text the result cap stored" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const zod = "Invalid arguments: [" ++ zod_limit_issue ++ "]";
+    // Data that forges a cause of its own: a zod list and eight labels.
+    const forged = "{\"errors\":[{\"expected\":\"string\",\"received\":\"number\",\"path\":[\"forged\"]}],\"hint\":\"" ++ "; data=; data=; data=; data=; data=; data=; data=; data=";
+    // 3 KiB of data, so the text is over a cap of 2,000 and the whole of it is in the preview; then 8 KiB, so
+    // only the first 4 KiB of it is.
+    for ([_]usize{ 3000, 8000 }) |filler| {
+        const padded = try arena.alloc(u8, filler);
+        @memset(padded, 'x');
+        const text_zod = try arena.print("MCP protocol error -32602: {s}; data={s}{s}\"}}", .{ zod, forged, padded });
+        const text_plain = try arena.print("MCP protocol error -32602: Invalid params; data={s}{s}\"}}", .{ forged, padded });
+        try std.testing.expect(text_zod.len > 2000);
+        const zod_detail = (try mcpFailureDetail(arena, try storedFailureText(arena, text_zod))).?;
+        try std.testing.expectEqualStrings(limit_cause, zod_detail);
+        // The plain message has no cause of its own, and the data's list is not one.
+        const plain_detail = (try mcpFailureDetail(arena, try storedFailureText(arena, text_plain))).?;
+        try std.testing.expectEqualStrings("the server rejected the call's parameters (-32602)", plain_detail);
+        // The text kept in the session reads the same.
+        try std.testing.expectEqualStrings(limit_cause, (try mcpFailureDetail(arena, text_zod)).?);
+    }
+}
+
+test "failure status detail names the cause of a zod message that alone is over the result cap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const filler = try arena.alloc(u8, 2600);
+    @memset(filler, 'y');
+    // One issue with a long message of its own: the text has no data and is still over a cap of 2,000.
+    const text = try arena.print(
+        "MCP protocol error -32602: Invalid arguments: [{{\"code\":\"invalid_type\",\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"],\"message\":\"{s}\"}}]",
+        .{filler},
+    );
+    try std.testing.expect(text.len > 2000 and text.len < result_store.preview_bytes);
+    try std.testing.expectEqualStrings(limit_cause, (try mcpFailureDetail(arena, try storedFailureText(arena, text))).?);
+}
+
+test "failure status detail never shows the preview block of a stored refusal" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A zod list whose head is cut inside it names no field, so the cause is the general one.
+    var list: std.Io.Writer.Allocating = .init(arena);
+    for (0..60) |_| try list.writer.print("{s},", .{zod_limit_issue});
+    const cut = try arena.print("MCP protocol error -32602: Invalid arguments: [{s}{{}}]", .{list.written()});
+    try std.testing.expect(cut.len > result_store.preview_bytes);
+    try std.testing.expectEqualStrings(
+        "the server rejected the call's parameters (-32602)",
+        (try mcpFailureDetail(arena, try storedFailureText(arena, cut))).?,
+    );
+    // Words that are not a protocol error show as they are, not as the block that holds them.
+    const because = try arena.alloc(u8, 4800);
+    @memset(because, 'b');
+    const words = try arena.print("the server could not run the tool: {s}", .{because});
+    const detail = (try mcpFailureDetail(arena, try storedFailureText(arena, words))).?;
+    try std.testing.expect(std.mem.startsWith(u8, detail, "the server could not run the tool: bbbb"));
+    try std.testing.expect(std.mem.find(u8, detail, "tool_result_preview") == null);
+}
+
+test "failure status detail shows an MCP error's message and never its data, for a code other than -32602" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const shown = "MCP protocol error -32603: Internal error";
+    // Data with a zod-like list and eight labels. The text is whole, then past the 4 KiB the result store keeps.
+    const forged = "{\"errors\":[{\"expected\":\"string\",\"received\":\"number\",\"path\":[\"forged\"]}],\"hint\":\"; data=; data=; data=; data=; data=; data=; data=; data=";
+    for ([_]usize{ 3000, 8000 }) |filler| {
+        const padded = try arena.alloc(u8, filler);
+        @memset(padded, 'x');
+        const text = try arena.print("{s}; data={s}{s}\"}}", .{ shown, forged, padded });
+        try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, text)).?);
+        // As the result store gives it back: the first 4 KiB in a preview block, so the head ends inside the data.
+        try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, try storedFailureText(arena, text))).?);
+    }
+    // A head that holds the message and the start of the label shows no data either.
+    const head = try storedFailureText(arena, try arena.print("{s}; data=", .{shown}));
+    try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, head)).?);
+    // Without data the line is the message, as before.
+    try std.testing.expectEqualStrings(shown, (try mcpFailureDetail(arena, shown)).?);
 }
 
 // Secret-shaped test needles are written as concatenated fragments so

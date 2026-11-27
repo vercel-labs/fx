@@ -274,12 +274,39 @@ fn outputNoun(handle: []const u8, command: []const u8, other: []const u8) []cons
     return if (command_replay_store.isReplayHandle(handle)) command else other;
 }
 
+/// The word a row puts before "output" for an output whose source no call
+/// names: "command" for a command's saved output, "saved" for any other.
+pub fn savedOutputNoun(handle: []const u8) []const u8 {
+    return outputNoun(handle, "command", "saved");
+}
+
 fn recordNoun(kind: u8) []const u8 {
     return switch (std.ascii.toUpper(kind)) {
         'M' => "turn",
         'T' => "tool call",
         else => "compaction",
     };
+}
+
+/// A saved record by its kind and ID, such as "tool call T5". `requestView`
+/// admits only a record ID: one letter, then digits. The caller owns the
+/// result.
+fn recordName(alloc: Allocator, handle: []const u8) Allocator.Error![]u8 {
+    return alloc.print("{s} {c}{s}", .{ recordNoun(handle[0]), std.ascii.toUpper(handle[0]), handle[1..] });
+}
+
+/// `query` as a row repeats it: terminal-safe, cut short past
+/// `max_query_label_bytes`, and in double quotes. The caller owns the result.
+fn quotedQuery(alloc: Allocator, query: []const u8) Allocator.Error![]u8 {
+    var encoded = try text_utils.encodeTerminalSafe(alloc, query, max_query_label_bytes);
+    defer encoded.deinit(alloc);
+    return alloc.print("\"{s}\"", .{encoded.bytes});
+}
+
+/// `handle` as `validate` opens it. The caller owns the result.
+fn restoredHandle(alloc: Allocator, handle: []const u8) Allocator.Error![]u8 {
+    const normalization = classifyHandleNormalization(handle);
+    return std.mem.concat(alloc, u8, &.{ normalization.trimmed, normalization.suffix });
 }
 
 fn readPresentation(
@@ -323,8 +350,55 @@ pub fn requestedHandle(alloc: Allocator, arguments_json: []const u8) Allocator.E
         .record, .history_search => return null,
         .range, .query, .images => {},
     }
-    const normalization = classifyHandleNormalization(view.handle);
-    return try std.mem.concat(alloc, u8, &.{ normalization.trimmed, normalization.suffix });
+    return try restoredHandle(alloc, view.handle);
+}
+
+/// The saved output a call reads more of, by a byte range or from its start,
+/// with the suffix `validate` restores. Null for a search of an output or of
+/// the conversation, a saved record, saved images, or arguments `decode`
+/// rejects. The caller owns the returned handle.
+pub fn rangeReadHandle(alloc: Allocator, arguments_json: []const u8) Allocator.Error!?[]u8 {
+    var parsed = (try parseArguments(alloc, arguments_json)) orelse return null;
+    defer parsed.deinit();
+    const view = (try requestView(parsed.arena.allocator(), parsed.value.object)) orelse return null;
+    if (view.kind != .range) return null;
+    return try restoredHandle(alloc, view.handle);
+}
+
+/// A search of a saved output, as a row names it: the output's handle, with
+/// the suffix `validate` restores, and the text it looks for, as the row
+/// repeats it. Free it with `deinit`.
+pub const OutputSearch = struct {
+    handle: []u8,
+    quoted_query: []u8,
+
+    pub fn deinit(self: OutputSearch, alloc: Allocator) void {
+        alloc.free(self.handle);
+        alloc.free(self.quoted_query);
+    }
+};
+
+/// What a search of a saved output looks for. Null for any other request and
+/// for arguments `decode` rejects.
+pub fn outputSearch(alloc: Allocator, arguments_json: []const u8) Allocator.Error!?OutputSearch {
+    var parsed = (try parseArguments(alloc, arguments_json)) orelse return null;
+    defer parsed.deinit();
+    const view = (try requestView(parsed.arena.allocator(), parsed.value.object)) orelse return null;
+    if (view.kind != .query) return null;
+    const handle = try restoredHandle(alloc, view.handle);
+    errdefer alloc.free(handle);
+    return .{ .handle = handle, .quoted_query = try quotedQuery(alloc, view.query) };
+}
+
+/// The saved record a call opens, such as "tool call T5", without the
+/// "earlier" that `displayTarget` puts first. Null for any other request and
+/// for arguments `decode` rejects. The caller owns the result.
+pub fn openedRecordName(alloc: Allocator, arguments_json: []const u8) Allocator.Error!?[]u8 {
+    var parsed = (try parseArguments(alloc, arguments_json)) orelse return null;
+    defer parsed.deinit();
+    const view = (try requestView(parsed.arena.allocator(), parsed.value.object)) orelse return null;
+    if (view.kind != .record) return null;
+    return try recordName(alloc, view.handle);
 }
 
 /// The row text for what a call reads: the output of the earlier call that
@@ -345,20 +419,15 @@ pub fn displayTarget(
             return try alloc.print("more output from {s}", .{name});
         },
         .query => {
-            var query = try text_utils.encodeTerminalSafe(alloc, view.query, max_query_label_bytes);
-            defer query.deinit(alloc);
-            if (source) |name| return try alloc.print("{s} output for \"{s}\"", .{ name, query.bytes });
-            return try alloc.print("{s} for \"{s}\"", .{
-                outputNoun(view.handle, "command output", "saved output"),
-                query.bytes,
-            });
+            const query = try quotedQuery(alloc, view.query);
+            defer alloc.free(query);
+            return try alloc.print("{s} output for {s}", .{ source orelse savedOutputNoun(view.handle), query });
         },
-        // `requestView` admits only a record ID: one letter, then digits.
-        .record => return try alloc.print("earlier {s} {c}{s}", .{
-            recordNoun(view.handle[0]),
-            std.ascii.toUpper(view.handle[0]),
-            view.handle[1..],
-        }),
+        .record => {
+            const name = try recordName(alloc, view.handle);
+            defer alloc.free(name);
+            return try alloc.print("earlier {s}", .{name});
+        },
         .images, .history_search => return null,
     }
 }
@@ -418,6 +487,28 @@ test "read_tool_result display targets name the source, query, and record" {
     try expectDisplayTarget("{\"request\":{\"handle\":\"image-result-abc\"}}", "vision", null);
     try expectDisplayTarget("{\"request\":{\"search\":\"retry\"}}", null, null);
     try expectDisplayTarget("not json", "zig build test", null);
+}
+
+test "read_tool_result searches and record opens give the parts a short row names" {
+    const alloc = std.testing.allocator;
+    const search = (try outputSearch(alloc, "{\"request\":{\"handle\":\" result-x \",\"query\":\"npx\"}}")).?;
+    defer search.deinit(alloc);
+    try std.testing.expectEqualStrings("result-x.txt", search.handle);
+    try std.testing.expectEqualStrings("\"npx\"", search.quoted_query);
+    // The query is quoted as the full row quotes it.
+    const target = (try displayTarget(alloc, "{\"handle\":\"result-x\",\"query\":\"npx\"}", "github.com")).?;
+    defer alloc.free(target);
+    try std.testing.expect(std.mem.endsWith(u8, target, search.quoted_query));
+    try std.testing.expect(try outputSearch(alloc, "{\"handle\":\"result-x\",\"start_byte\":9}") == null);
+    try std.testing.expect(try outputSearch(alloc, "{\"handle\":\"T5\",\"query\":\"x\"}") == null);
+    try std.testing.expectEqualStrings("command", savedOutputNoun("fx-command-replay-0123.bin"));
+    try std.testing.expectEqualStrings("saved", savedOutputNoun("result-x.txt"));
+
+    const record = (try openedRecordName(alloc, "{\"request\":{\"handle\":\"t5\"}}")).?;
+    defer alloc.free(record);
+    try std.testing.expectEqualStrings("tool call T5", record);
+    try std.testing.expect(try openedRecordName(alloc, "{\"handle\":\"result-x\"}") == null);
+    try std.testing.expect(try openedRecordName(alloc, "not json") == null);
 }
 
 test "read_tool_result rows read a request sent as JSON text as they read an object" {

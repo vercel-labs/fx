@@ -7,6 +7,7 @@ const render_engine = @import("render_engine.zig");
 const render_request = @import("render_request.zig");
 const shared_theme = @import("../core/shared/theme.zig");
 const shell_runtime = @import("shell_runtime.zig");
+const shimmer_runtime = @import("transcript/shimmer_runtime.zig");
 const transcript_painter = @import("transcript/painter.zig");
 const transcript_runtime = @import("transcript/runtime.zig");
 const ui_render = @import("render.zig");
@@ -18,19 +19,21 @@ const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 
 const restore_terminal_sequence = "\x1b[0m\x1b]8;;\x1b\\\x1b[?25h\x1b[?7h\n";
 const prepare_terminal_sequence = "\x1b[0m\x1b]8;;\x1b\\\x1b[?7l";
+const thinking_activity_label = "• Thinking";
 
 pub const Runtime = struct {
     alloc: Allocator,
     shell: TranscriptRuntime,
     metrics: Metrics = .{},
     no_color: bool,
+    thinking: bool = true,
     terminal_prepared: bool = false,
     finished: bool = false,
     pending_error: ?anyerror = null,
 
     pub fn init(
         alloc: Allocator,
-        user: types.UserTurn,
+        header: ui_render.AskHeader,
         no_color: bool,
     ) !Runtime {
         const layout = zeroFooterLayout(try ui_terminal.queryLayout(std.posix.STDOUT_FILENO, 0));
@@ -38,7 +41,7 @@ pub const Runtime = struct {
         const cursor = probeTerminal(&terminal, layout, no_color);
         return initConfigured(
             alloc,
-            user,
+            header,
             no_color,
             std.Io.File.stdout(),
             layout,
@@ -49,7 +52,7 @@ pub const Runtime = struct {
 
     fn initConfigured(
         alloc: Allocator,
-        user: types.UserTurn,
+        header: ui_render.AskHeader,
         no_color: bool,
         stdout_file: std.Io.File,
         layout: types.Layout,
@@ -84,23 +87,29 @@ pub const Runtime = struct {
         try self.writeTerminalBytes(prepare_terminal_sequence);
         try self.shell.initViewport(&self.metrics, start.row);
 
-        const welcome = try ui_render.welcomeMessage(alloc);
-        defer alloc.free(welcome);
+        const banner = try ui_render.askHeaderMessage(alloc, header);
+        defer alloc.free(banner);
         try self.shell.writeTranscriptClassified(
             alloc,
             &self.metrics,
-            welcome,
+            banner,
             true,
             .welcome,
         );
-        const owned_user = try types.dupeUserTurn(alloc, user);
-        _ = try self.shell.appendUserTurnOwned(alloc, owned_user);
         try self.render();
         return self;
     }
 
     pub fn deinit(self: *Runtime) void {
-        if (!self.finished) self.restoreTerminal() catch {};
+        if (!self.finished) {
+            if (self.thinking and self.pending_error == null) {
+                self.thinking = false;
+                // Best-effort clear on teardown; stdout may already be closed.
+                self.render() catch {};
+            }
+            // Best-effort restore on teardown; stdout may already be closed.
+            self.restoreTerminal() catch {};
+        }
         self.shell.deinit(self.alloc);
         self.finished = true;
     }
@@ -111,17 +120,40 @@ pub const Runtime = struct {
             .table = pushTable,
             .code_block = pushCodeBlock,
             .thematic_rule = pushThematicRule,
+            .assistant_tail = pushAssistantTail,
         };
+    }
+
+    pub fn setThinking(self: *Runtime, active: bool) !void {
+        try self.checkPendingError();
+        if (self.finished) return;
+        if (self.thinking == active) return;
+        self.thinking = active;
+        self.render() catch |err| return self.failWith(err);
+    }
+
+    /// The open tail is applied at once: `fx ask` writes committed text without a pacer.
+    fn pushAssistantTail(raw: *anyopaque, alloc: std.mem.Allocator, events: []assistant_presentation.Event) !void {
+        const self: *Runtime = @ptrCast(@alignCast(raw));
+        self.checkPendingError() catch |err| {
+            assistant_presentation.freeEventSlice(alloc, events);
+            return err;
+        };
+        const id = self.shell.stageAssistantTail(alloc, events);
+        self.shell.applyStagedAssistantTail(self.alloc, id);
+        self.render() catch |err| self.rememberFailure(err);
     }
 
     pub fn pushText(self: *Runtime, text: []const u8) !void {
         try self.checkPendingError();
+        if (text.len > 0) self.thinking = false;
         _ = self.shell.streamAssistantChunk(self.alloc, &self.metrics, text) catch |err| return self.failWith(err);
         self.render() catch |err| return self.failWith(err);
     }
 
     pub fn pushToolLifecycle(self: *Runtime, event: types.ToolLifecycleEvent) !void {
         try self.checkPendingError();
+        self.thinking = false;
         _ = self.shell.applyToolLifecycle(self.alloc, event) catch |err| return self.failWith(err);
         self.render() catch |err| return self.failWith(err);
         switch (event) {
@@ -133,6 +165,7 @@ pub const Runtime = struct {
     pub fn pushDiffBlock(self: *Runtime, payload: diff_mod.DiffEntryPayload) !void {
         defer diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
         try self.checkPendingError();
+        self.thinking = false;
         _ = self.shell.appendRawTranscriptEntryClassified(
             self.alloc,
             payload.preview,
@@ -143,6 +176,7 @@ pub const Runtime = struct {
 
     pub fn pushNotice(self: *Runtime, notice: types.SemanticNotice) !void {
         try self.checkPendingError();
+        if (notice.visibility != .full_only) self.thinking = false;
         _ = self.shell.appendSemanticNotice(self.alloc, notice) catch |err| return self.failWith(err);
         self.render() catch |err| return self.failWith(err);
     }
@@ -150,7 +184,12 @@ pub const Runtime = struct {
     pub fn finish(self: *Runtime) !void {
         try self.checkPendingError();
         if (self.finished) return;
-        if (self.shell.render_requests.hasPending()) try self.render();
+        if (self.thinking) {
+            self.thinking = false;
+            try self.render();
+        } else if (self.shell.render_requests.hasPending()) {
+            try self.render();
+        }
         try self.restoreTerminal();
         self.finished = true;
     }
@@ -158,6 +197,7 @@ pub const Runtime = struct {
     fn pushTable(raw: *anyopaque, table: assistant_presentation.TablePayload) !void {
         const self: *Runtime = @ptrCast(@alignCast(raw));
         try self.checkPendingError();
+        self.thinking = false;
         _ = self.shell.appendAssistantTableOwned(self.alloc, table) catch |err| return self.failWith(err);
         self.render() catch |err| {
             self.rememberFailure(err);
@@ -167,6 +207,7 @@ pub const Runtime = struct {
     fn pushCodeBlock(raw: *anyopaque, block: assistant_presentation.CodeBlockPayload) !void {
         const self: *Runtime = @ptrCast(@alignCast(raw));
         try self.checkPendingError();
+        self.thinking = false;
         _ = self.shell.appendAssistantCodeBlockOwned(self.alloc, block) catch |err| return self.failWith(err);
         self.render() catch |err| {
             self.rememberFailure(err);
@@ -176,6 +217,7 @@ pub const Runtime = struct {
     fn pushThematicRule(raw: *anyopaque) !void {
         const self: *Runtime = @ptrCast(@alignCast(raw));
         try self.checkPendingError();
+        self.thinking = false;
         _ = self.shell.appendAssistantThematicRule(self.alloc) catch |err| return self.failWith(err);
         self.render() catch |err| return self.failWith(err);
     }
@@ -194,15 +236,7 @@ pub const Runtime = struct {
         return err;
     }
 
-    fn refreshGeometry(self: *Runtime) !void {
-        const queried = ui_terminal.queryLayout(std.posix.STDOUT_FILENO, 0) catch return;
-        const layout = zeroFooterLayout(queried);
-        if (layout.rows == self.shell.layout.rows and layout.cols == self.shell.layout.cols) return;
-        try shell_runtime.applyResizeWithLayout(&self.shell, &self.metrics, layout, true);
-    }
-
     fn render(self: *Runtime) !void {
-        try self.refreshGeometry();
         if (!self.shell.render_requests.hasPending()) self.shell.render_requests.request(.transcript);
         var attempt = (try self.shell.render_requests.beginAttempt()) orelse return;
         defer attempt.deinit();
@@ -214,6 +248,13 @@ pub const Runtime = struct {
         var resolved_target: ?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget = null;
         var invalidations = attempt.snapshot.invalidations;
         self.shell.normalizeFrameInvalidations(&invalidations);
+
+        const activity_state: render_engine.frame_layout.ActivityState = if (self.thinking)
+            .{ .thinking = .{
+                .gap_above_activity = self.shell.transientAssistantGapRows(),
+            } }
+        else
+            .none;
 
         var solve_context = SolveContext{
             .runtime = self,
@@ -230,6 +271,7 @@ pub const Runtime = struct {
                 .owned_top = self.shell.owned_top_row,
                 .footer = .{ .natural_rows = 0, .min_rows = 0, .max_rows = 0 },
                 .transcript = source.preview,
+                .activity = activity_state,
                 .prior = self.shell.committed_frame_layout,
             },
             SolveContext.prepareCandidate,
@@ -238,18 +280,31 @@ pub const Runtime = struct {
         const paint = if (prepared) |*value| value else return error.MissingTranscriptPaint;
         const target = resolved_target orelse return error.MissingResolvedTranscriptTarget;
 
+        const activity_placement: render_engine.activity_overlay.ActivityPlacement = if (self.thinking)
+            if (fixed.layout.activity_row) |row|
+                .{ .transient_row = .{
+                    .row = row,
+                    .row_count = @max(fixed.layout.activity_rows, 1),
+                    .gap_above_rows = activity_state.thinking.gap_above_activity,
+                } }
+            else
+                .none
+        else
+            .none;
+
         var plan = fixed.layout.toPaintPlan(.{
             .footer_rows = zeroFooterRows(self.shell.layout.rows),
             .viewport = target.selection(),
+            .activity = activity_placement,
             .invalidation = invalidations,
             .synchronized_update = self.shell.sync_updates_enabled,
             .cursor_target = .{
-                .row = target.cursorRow(),
-                .col = target.cursorCol(),
-                .visible = true,
+                .row = activity_placement.row() orelse target.cursorRow(),
+                .col = if (activity_placement.row() != null) 1 else target.cursorCol(),
+                .visible = !self.thinking,
             },
             .preserve_scrollback = !self.shell.pending_scroll_compact,
-            .reset_terminal = self.shell.terminal_reset_pending,
+            .reset_terminal = false,
         });
         var transition = try self.shell.sealTranscriptTransition(
             self.alloc,
@@ -274,6 +329,10 @@ pub const Runtime = struct {
                 .scroll_plan = fixed.scroll_plan,
                 .document_append = transition.document_append,
                 .body_painter = .{ .ctx = &paint_context, .paint = PaintContext.paint },
+                .activity_painter = if (activity_placement != .none)
+                    .{ .ctx = &paint_context, .paint = PaintContext.paintActivity }
+                else
+                    null,
                 .presentation = if (self.no_color) .neutral else .styled,
             },
         );
@@ -390,6 +449,16 @@ const PaintContext = struct {
             self.prepared,
         );
     }
+
+    fn paintActivity(_: *anyopaque, surface: *render_engine.frame_surface.FrameSurface) !void {
+        if (surface.plan.activity_band.isEmpty()) return;
+        _ = try shimmer_runtime.paintActivityIntoSurface(surface, .{
+            .label = thinking_activity_label,
+            .shimmer_pos = 0,
+            .style = .live,
+            .thinking_blink = true,
+        });
+    }
 };
 
 fn probeTerminal(
@@ -463,22 +532,21 @@ fn normalizeStartCursor(
     return .{ .row = row, .col = 1 };
 }
 
-test "ask presentation paints Minimal prompt and assistant into a footerless frame" {
+test "ask presentation paints ask header and assistant into a footerless frame without prompt echo" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var output = try tmp.dir.createFile(std.testing.io, "ask-frame.log", .{ .read = true });
     defer output.close(io_mod.getIo());
 
-    const prompt = types.UserTurn{ .text = @constCast("show **markdown**") };
     var runtime = try Runtime.initConfigured(
         alloc,
-        prompt,
+        .{ .model = "openai/gpt-5", .effort = "high" },
         false,
         output,
         zeroFooterLayout(.{
             .rows = 12,
-            .cols = 48,
+            .cols = 64,
             .content_bottom = 12,
             .divider_top_row = 12,
             .input_row = 12,
@@ -493,13 +561,15 @@ test "ask presentation paints Minimal prompt and assistant into a footerless fra
     try runtime.pushText("\x1b[1manswer\x1b[22m\n");
     try runtime.finish();
 
-    try std.testing.expect(runtime.shell.notebook.entries.items.len >= 3);
+    try std.testing.expect(runtime.shell.notebook.entries.items.len >= 2);
     try std.testing.expect(runtime.shell.notebook.entries.items[0] == .raw_bytes);
     try std.testing.expectEqual(
         transcript_runtime.RawEntryClass.welcome,
         runtime.shell.notebook.entries.items[0].raw_bytes.class,
     );
-    try std.testing.expect(runtime.shell.notebook.entries.items[1] == .user_turn);
+    for (runtime.shell.notebook.entries.items) |entry| {
+        try std.testing.expect(entry != .user_turn);
+    }
     try std.testing.expect(runtime.shell.committed_frame_layout.footer_area.isEmpty());
     try std.testing.expectEqual(
         transcript_runtime.TranscriptCommitDiagnosticState.stable,
@@ -512,7 +582,13 @@ test "ask presentation paints Minimal prompt and assistant into a footerless fra
         committed.selection.last_visible_row <=
             runtime.shell.committed_frame_layout.transcript_area.bottom,
     );
-    try std.testing.expect(runtime.shell.shadow_vt.?.cellAt(1, 1) != null);
+    const shadow = runtime.shell.shadow_vt orelse return error.TestExpectedShadowVt;
+    var row1: std.ArrayList(u8) = .empty;
+    defer row1.deinit(alloc);
+    try shadow.rowTextTrimmed(1, &row1);
+    try std.testing.expect(std.mem.find(u8, row1.items, "𝒇x v") != null);
+    try std.testing.expect(std.mem.find(u8, row1.items, "openai/gpt-5 · high · fx ask --help") != null);
+    try std.testing.expect(std.mem.find(u8, row1.items, "Run /help for commands") == null);
     const length = try output.length(io_mod.getIo());
     try std.testing.expect(length > restore_terminal_sequence.len);
 }
@@ -529,7 +605,7 @@ test "ask presentation carries the light theme into semantic code blocks" {
 
     var runtime = try Runtime.initConfigured(
         alloc,
-        .{ .text = @constCast("show code") },
+        .{ .model = "openai/gpt-5" },
         false,
         output,
         zeroFooterLayout(.{
@@ -549,6 +625,57 @@ test "ask presentation carries the light theme into semantic code blocks" {
     try std.testing.expect(runtime.shell.retainedTranscriptStyles().code_highlight_theme == .light);
 }
 
+fn askGridRowsContaining(runtime: *Runtime, needle: []const u8) !usize {
+    var count: usize = 0;
+    var row: u16 = 1;
+    while (row <= runtime.shell.layout.rows) : (row += 1) {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(std.testing.allocator);
+        try runtime.shell.shadow_vt.?.rowText(row, &buf);
+        if (std.mem.find(u8, buf.items, needle) != null) count += 1;
+    }
+    return count;
+}
+
+test "ask presentation draws a provisional tail and drops it when committed text arrives" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output = try tmp.dir.createFile(std.testing.io, "ask-tail.log", .{ .read = true });
+    defer output.close(io_mod.getIo());
+
+    var runtime = try Runtime.initConfigured(
+        alloc,
+        .{ .model = "openai/gpt-5" },
+        false,
+        output,
+        zeroFooterLayout(.{
+            .rows = 12,
+            .cols = 48,
+            .content_bottom = 12,
+            .divider_top_row = 12,
+            .input_row = 12,
+            .divider_bottom_row = 12,
+            .hint_row = 12,
+        }),
+        .{ .row = 1, .col = 1 },
+        true,
+    );
+    defer runtime.deinit();
+
+    const events = try alloc.alloc(assistant_presentation.Event, 1);
+    events[0] = .{ .text = try alloc.dupe(u8, "Streaming bold") };
+    const sink = runtime.semanticSink();
+    try sink.assistant_tail.?(sink.ctx, alloc, events);
+    try std.testing.expectEqual(@as(usize, 1), runtime.shell.assistant_tail.items.len);
+    try std.testing.expectEqual(@as(usize, 1), try askGridRowsContaining(&runtime, "Streaming bold"));
+
+    try runtime.pushText("Streaming bold\n");
+    try std.testing.expectEqual(@as(usize, 0), runtime.shell.assistant_tail.items.len);
+    try std.testing.expectEqual(@as(usize, 1), try askGridRowsContaining(&runtime, "Streaming bold"));
+    try runtime.finish();
+}
+
 test "ask presentation retains a streaming write failure until finish" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -566,7 +693,7 @@ test "ask presentation retains a streaming write failure until finish" {
     });
     var runtime = try Runtime.initConfigured(
         alloc,
-        .{ .text = @constCast("show output") },
+        .{ .model = "openai/gpt-5" },
         false,
         output,
         layout,
@@ -582,4 +709,161 @@ test "ask presentation retains a streaming write failure until finish" {
     };
     const write_err = observed orelse return error.TestExpectedError;
     try std.testing.expectError(write_err, runtime.finish());
+}
+
+fn testShadowContains(alloc: Allocator, runtime: *const Runtime, needle: []const u8) !bool {
+    const shadow = runtime.shell.shadow_vt orelse return error.TestExpectedShadowVt;
+    var row_buf: std.ArrayList(u8) = .empty;
+    defer row_buf.deinit(alloc);
+    var row: u16 = 1;
+    while (row <= shadow.rows) : (row += 1) {
+        row_buf.clearRetainingCapacity();
+        try shadow.rowTextTrimmed(row, &row_buf);
+        if (std.mem.find(u8, row_buf.items, needle) != null) return true;
+    }
+    return false;
+}
+
+fn readTmpFile(alloc: Allocator, dir: std.Io.Dir, name: []const u8) ![]u8 {
+    var file = try dir.openFile(std.testing.io, name, .{});
+    defer file.close(std.testing.io);
+    return io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+}
+
+test "ask presentation shows transient thinking row on init and clears it on text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output = try tmp.dir.createFile(std.testing.io, "ask-thinking.log", .{ .read = true });
+    defer output.close(io_mod.getIo());
+
+    var runtime = try Runtime.initConfigured(
+        alloc,
+        .{ .model = "openai/gpt-5", .effort = "high" },
+        false,
+        output,
+        zeroFooterLayout(.{
+            .rows = 12,
+            .cols = 64,
+            .content_bottom = 12,
+            .divider_top_row = 12,
+            .input_row = 12,
+            .divider_bottom_row = 12,
+            .hint_row = 12,
+        }),
+        .{ .row = 1, .col = 1 },
+        true,
+    );
+    defer runtime.deinit();
+
+    // First frame shows transient thinking below the header.
+    try std.testing.expect(try testShadowContains(alloc, &runtime, "𝒇x v"));
+    try std.testing.expect(try testShadowContains(alloc, &runtime, thinking_activity_label));
+
+    // Streaming text clears the transient thinking row completely.
+    try runtime.pushText("Final answer.\n");
+    try std.testing.expect(!try testShadowContains(alloc, &runtime, thinking_activity_label));
+    try std.testing.expect(!try testShadowContains(alloc, &runtime, "•"));
+    try std.testing.expect(try testShadowContains(alloc, &runtime, "Final answer."));
+
+    try runtime.finish();
+    try std.testing.expect(!try testShadowContains(alloc, &runtime, thinking_activity_label));
+}
+
+test "ask presentation restores thinking after tool lifecycle and clears on setThinking(false) and finish without screen clears" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output = try tmp.dir.createFile(std.testing.io, "ask-tool-thinking.log", .{ .read = true });
+    defer output.close(io_mod.getIo());
+
+    var runtime = try Runtime.initConfigured(
+        alloc,
+        .{ .model = "openai/gpt-5" },
+        false,
+        output,
+        zeroFooterLayout(.{
+            .rows = 12,
+            .cols = 64,
+            .content_bottom = 12,
+            .divider_top_row = 12,
+            .input_row = 12,
+            .divider_bottom_row = 12,
+            .hint_row = 12,
+        }),
+        .{ .row = 1, .col = 1 },
+        true,
+    );
+    defer runtime.deinit();
+
+    try std.testing.expect(try testShadowContains(alloc, &runtime, thinking_activity_label));
+
+    const call_id: types.ToolLifecycleId = .{ .turn_id = 1, .call_id = "call_1" };
+    try runtime.pushToolLifecycle(.{ .authoritative_started = .{
+        .id = call_id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    try std.testing.expect(!try testShadowContains(alloc, &runtime, thinking_activity_label));
+
+    try runtime.pushToolLifecycle(.{ .terminal = .{
+        .id = call_id,
+        .outcome = .{ .kind = .completed, .summary = "Reading README.md" },
+    } });
+    try runtime.setThinking(true);
+    try std.testing.expect(try testShadowContains(alloc, &runtime, thinking_activity_label));
+
+    try runtime.setThinking(false);
+    try std.testing.expect(!try testShadowContains(alloc, &runtime, thinking_activity_label));
+
+    try runtime.setThinking(true);
+    try std.testing.expect(try testShadowContains(alloc, &runtime, thinking_activity_label));
+    try runtime.finish();
+    try std.testing.expect(!try testShadowContains(alloc, &runtime, thinking_activity_label));
+
+    const bytes = try readTmpFile(alloc, tmp.dir, "ask-tool-thinking.log");
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[2J") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[3J") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1bc") == null);
+}
+
+test "ask presentation neutralizes thinking row styling under no_color" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output = try tmp.dir.createFile(std.testing.io, "ask-nocolor-thinking.log", .{ .read = true });
+    defer output.close(io_mod.getIo());
+
+    var runtime = try Runtime.initConfigured(
+        alloc,
+        .{ .model = "openai/gpt-5" },
+        true,
+        output,
+        zeroFooterLayout(.{
+            .rows = 12,
+            .cols = 64,
+            .content_bottom = 12,
+            .divider_top_row = 12,
+            .input_row = 12,
+            .divider_bottom_row = 12,
+            .hint_row = 12,
+        }),
+        .{ .row = 1, .col = 1 },
+        true,
+    );
+    defer runtime.deinit();
+
+    try std.testing.expect(try testShadowContains(alloc, &runtime, thinking_activity_label));
+    try runtime.finish();
+
+    const bytes = try readTmpFile(alloc, tmp.dir, "ask-nocolor-thinking.log");
+    defer alloc.free(bytes);
+    // Neutral presentation emits no color SGR codes (38;/48;) for header or thinking row.
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[38;") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[48;") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[2J") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[3J") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\x1bc") == null);
 }

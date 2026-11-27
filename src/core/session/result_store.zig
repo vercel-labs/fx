@@ -66,86 +66,43 @@ pub const ResultReader = struct {
 
 pub fn prepare(
     alloc: Allocator,
-    result_dir: ?[]const u8,
+    result_dir: []const u8,
     tool_call_id: []const u8,
     tool_name: []const u8,
     output_bytes: usize,
     durable_output: []const u8,
     inline_cap: usize,
 ) !PreparedResult {
-    if (result_dir) |dir| {
-        if (output_bytes > large_result_threshold_bytes or
-            durable_output.len > inline_cap)
-        {
-            return prepareStoredResult(
-                alloc,
-                .{ .legacy_dir = dir },
-                tool_call_id,
-                tool_name,
-                output_bytes,
-                durable_output,
-            );
-        }
-        return prepareExternallyBackedInlineResult(
-            alloc,
-            .{ .legacy_dir = dir },
-            tool_call_id,
-            tool_name,
-            output_bytes,
-            durable_output,
-        );
-    }
-    const capped = try cappedInlineOutput(alloc, tool_name, durable_output, inline_cap);
-    return .{
-        .model_output = capped,
-        .memory = .{
-            .output_bytes = output_bytes,
-            .stored_output_bytes = durable_output.len,
-            .truncated = capped.len < durable_output.len,
-        },
-    };
+    return prepareAt(alloc, .{ .legacy_dir = result_dir }, tool_call_id, tool_name, output_bytes, durable_output, inline_cap);
 }
 
 pub fn prepareManaged(
     alloc: Allocator,
-    capability: ?*session_child_store.SessionChildCapability,
+    capability: *session_child_store.SessionChildCapability,
     tool_call_id: []const u8,
     tool_name: []const u8,
     output_bytes: usize,
     durable_output: []const u8,
     inline_cap: usize,
 ) !PreparedResult {
-    if (capability) |managed| {
-        if (output_bytes > large_result_threshold_bytes or
-            durable_output.len > inline_cap)
-        {
-            return prepareStoredResult(
-                alloc,
-                .{ .managed = managed },
-                tool_call_id,
-                tool_name,
-                output_bytes,
-                durable_output,
-            );
-        }
-        return prepareExternallyBackedInlineResult(
-            alloc,
-            .{ .managed = managed },
-            tool_call_id,
-            tool_name,
-            output_bytes,
-            durable_output,
-        );
+    return prepareAt(alloc, .{ .managed = capability }, tool_call_id, tool_name, output_bytes, durable_output, inline_cap);
+}
+
+/// A large result is stored and the model gets its preview and handle; a small one is kept inline, with the same
+/// handle beside it.
+fn prepareAt(
+    alloc: Allocator,
+    target: StorageTarget,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    output_bytes: usize,
+    durable_output: []const u8,
+    inline_cap: usize,
+) !PreparedResult {
+    if (output_bytes > large_result_threshold_bytes or durable_output.len > inline_cap) {
+        return prepareStoredResult(alloc, target, tool_call_id, tool_name, output_bytes, durable_output);
     }
-    const capped = try cappedInlineOutput(alloc, tool_name, durable_output, inline_cap);
-    return .{
-        .model_output = capped,
-        .memory = .{
-            .output_bytes = output_bytes,
-            .stored_output_bytes = durable_output.len,
-            .truncated = capped.len < durable_output.len,
-        },
-    };
+    return prepareExternallyBackedInlineResult(alloc, target, tool_call_id, tool_name, output_bytes, durable_output);
 }
 
 fn prepareExternallyBackedInlineResult(
@@ -456,13 +413,30 @@ fn storeLargeResultAtHandleManaged(
     entry.deinit(alloc);
 }
 
+/// What follows the preview in `formatStoredResultOutput`'s block. The handle and the notice after it are
+/// fx's own words, so the last occurrence of this is the one that ends the preview, whatever the preview holds.
+const preview_end = "\n</tool_result_preview>\n<tool_result_handle>";
+
 pub fn formatStoredResultOutput(alloc: Allocator, handle: []const u8, preview: []const u8, stored_bytes: usize) ![]u8 {
     return alloc.print(
-        "<tool_result_preview handle=\"{s}\" stored_bytes=\"{d}\">\n{s}\n</tool_result_preview>\n" ++
-            "<tool_result_handle>{s}</tool_result_handle>\n" ++
+        "<tool_result_preview handle=\"{s}\" stored_bytes=\"{d}\">\n{s}" ++ preview_end ++ "{s}</tool_result_handle>\n" ++
             "Full result is stored outside session JSON. Use read_tool_result with this handle to inspect a byte range or literal query.",
         .{ handle, stored_bytes, preview, handle },
     );
+}
+
+/// The preview that `formatStoredResultOutput` put in `output`: the first `preview_bytes` of the stored
+/// result. Null when `output` is not that block, such as a result kept in the session.
+/// (`tests/e2e/mcp-stdio.test.ts` "a project that sets max_tool_result_bytes below a refused call's error
+/// text still sees the cause")
+pub fn storedPreview(output: []const u8) ?[]const u8 {
+    const start_tag = "<tool_result_preview handle=\"";
+    if (!std.mem.startsWith(u8, output, start_tag)) return null;
+    const tag_end = std.mem.find(u8, output, "\">\n") orelse return null;
+    const start = tag_end + "\">\n".len;
+    const end = std.mem.findLast(u8, output, preview_end) orelse return null;
+    if (end < start) return null;
+    return output[start..end];
 }
 
 pub fn readByRange(alloc: Allocator, result_dir: []const u8, handle: []const u8, start_byte: usize, byte_count: usize) ![]u8 {
@@ -619,19 +593,6 @@ pub fn deleteManaged(
         error.FileNotFound => return error.ResultHandleNotFound,
         else => return err,
     };
-}
-
-fn cappedInlineOutput(alloc: Allocator, tool_name: []const u8, text: []const u8, max_bytes: usize) ![]u8 {
-    const marker = try alloc.print(
-        "\n... [tool result truncated for {s}: original {d} bytes; cap is {d} bytes]\n",
-        .{ tool_name, text.len, max_bytes },
-    );
-    defer alloc.free(marker);
-    if (text.len <= max_bytes) return try alloc.dupe(u8, text);
-    const prefix_cap = if (max_bytes > marker.len) max_bytes - marker.len else 0;
-    const prefix_len = text_utils.utf8BackwardBoundary(text, prefix_cap);
-    if (prefix_len == 0) return try alloc.dupe(u8, marker);
-    return try std.mem.concat(alloc, u8, &.{ text[0..prefix_len], marker });
 }
 
 pub fn previewText(alloc: Allocator, text: []const u8, max_bytes: usize) ![]u8 {
@@ -826,6 +787,25 @@ fn validateHandle(handle: []const u8) !void {
         const ok = std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-' or byte == '.';
         if (!ok) return error.InvalidHandle;
     }
+}
+
+test "storedPreview reads back the preview that formatStoredResultOutput wrote" {
+    const alloc = std.testing.allocator;
+    const previews = [_][]const u8{
+        "MCP protocol error -32602: Invalid arguments: [{\"path\":[\"limit\"]}]; data={\"a\":1}",
+        "",
+        "first\nsecond\n",
+        // A server's text can hold the tags and the tag end itself.
+        "x\">\ny\n</tool_result_preview>\n<tool_result_handle>fake</tool_result_handle>\nz",
+    };
+    for (previews) |preview| {
+        const block = try formatStoredResultOutput(alloc, "result-t-aaaa-bbbb.txt", preview, 99999);
+        defer alloc.free(block);
+        try std.testing.expectEqualStrings(preview, storedPreview(block) orelse "(not a preview block)");
+    }
+    try std.testing.expect(storedPreview("MCP protocol error -32602: not a block") == null);
+    try std.testing.expect(storedPreview("") == null);
+    try std.testing.expect(storedPreview("<tool_result_preview handle=\"h\" stored_bytes=\"1\">\ncut") == null);
 }
 
 test "large result storage creates stable handle and bounded preview" {
@@ -1027,19 +1007,8 @@ test "saved preparation externalizes small results" {
     try std.testing.expect(std.mem.find(u8, stored, "\ndone\n") != null);
 }
 
-test "inline cap and stored preview keep complete codepoints" {
+test "a stored preview keeps complete codepoints" {
     const alloc = std.testing.allocator;
-
-    const inline_text = "x" ++ text_utils.repeat("\xc3\xa9", 300);
-    for ([_]usize{ 128, 129 }) |cap| {
-        const prepared = try prepare(alloc, null, "call/2", "grep_files", inline_text.len, inline_text, cap);
-        defer alloc.free(prepared.model_output);
-        const marker_start = std.mem.find(u8, prepared.model_output, "\n... [tool result truncated").?;
-        const prefix = prepared.model_output[0..marker_start];
-        try std.testing.expect(std.unicode.utf8ValidateSlice(prefix));
-        try std.testing.expect(std.mem.endsWith(u8, prefix, "\xc3\xa9"));
-    }
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");

@@ -78,10 +78,10 @@ fn hasStringValue(values: std.json.Value, want: []const u8) bool {
 
 /// The regular expressions that `sh-fx.schema.json` gives for sh.fx names. Zig has no regular
 /// expression engine, so `isMethodName` and `isKeyName` check the same forms by hand.
-const method_name_pattern = "^_sh\\.fx/[a-z][a-z0-9_]*(/[a-z][a-z0-9_]*)+$";
+const method_name_pattern = "^_sh\\.fx/[a-z][a-z0-9_]*/[a-z][a-z0-9_]*$";
 const key_name_pattern = "^sh\\.fx/[a-z][A-Za-z0-9]*$";
 
-/// Reports whether `name` is `_sh.fx/` followed by two or more snake_case segments.
+/// Reports whether `name` is `_sh.fx/` followed by an `<area>/<action>` pair of snake_case segments.
 fn isMethodName(name: []const u8) bool {
     const rest = std.mem.cutPrefix(u8, name, "_sh.fx/") orelse return false;
     var segments = std.mem.splitScalar(u8, rest, '/');
@@ -92,7 +92,7 @@ fn isMethodName(name: []const u8) bool {
             if (!std.ascii.isLower(c) and !std.ascii.isDigit(c) and c != '_') return false;
         }
     }
-    return count >= 2;
+    return count == 2;
 }
 
 /// Reports whether `name` is `sh.fx/` followed by one camelCase segment, the form of capability
@@ -195,7 +195,7 @@ test "sh-fx.schema.json uses the JSON Schema draft of ACP's schema" {
     try std.testing.expect(fx_defs == .object);
 }
 
-test "the sh.fx name checks accept the documented forms and reject others" {
+test "isMethodName accepts the documented method names and rejects others" {
     for ([_][]const u8{
         "_sh.fx/session/steer",
         "_sh.fx/session/follow_up",
@@ -211,8 +211,11 @@ test "the sh.fx name checks accept the documented forms and reject others" {
         "_sh.fx//steer",
         "_sh.fx/session/steer/",
         "_sh.fx/session/2steer",
+        "_sh.fx/a/b/c",
     }) |name| try std.testing.expect(!isMethodName(name));
+}
 
+test "isKeyName accepts the documented key names and rejects others" {
     for ([_][]const u8{ "sh.fx/steering", "sh.fx/journalSeq", "sh.fx/steering2" }) |name| {
         try std.testing.expect(isKeyName(name));
     }
@@ -227,7 +230,7 @@ test "the sh.fx name checks accept the documented forms and reject others" {
     }) |name| try std.testing.expect(!isKeyName(name));
 }
 
-test "sh-fx.schema.json gives the name patterns that the name checks implement" {
+test "the name patterns in sh-fx.schema.json equal this file's pattern constants" {
     const parsed = try parseSpecFile(fx_schema);
     defer parsed.deinit();
     const defs = field(parsed.value, "$defs") orelse return error.TestUnexpectedResult;
@@ -246,7 +249,13 @@ test "sh-fx.schema.json gives the name patterns that the name checks implement" 
     }
 }
 
-test "every capability in sh-fx.schema.json has an sh.fx name and an object value" {
+/// Checks one entry of a capability map: a `$ref` to the `Capability` type.
+fn expectCapabilityValue(value: std.json.Value) !void {
+    try std.testing.expect(value == .object);
+    try std.testing.expectEqualStrings("#/$defs/Capability", stringField(value, "$ref") orelse "");
+}
+
+test "the capability maps in sh-fx.schema.json check sh.fx keys and leave other keys open" {
     const parsed = try parseSpecFile(fx_schema);
     defer parsed.deinit();
     const defs = field(parsed.value, "$defs") orelse return error.TestUnexpectedResult;
@@ -261,14 +270,52 @@ test "every capability in sh-fx.schema.json has an sh.fx name and an object valu
                 std.debug.print("{s} lists {s}, which is not an sh.fx capability name\n", .{ type_name, name });
                 return error.TestUnexpectedResult;
             }
-            try std.testing.expectEqualStrings("#/$defs/Capability", stringField(value, "$ref") orelse "");
+            try expectCapabilityValue(value);
         }
+
+        const property_names = field(def, "propertyNames") orelse return error.TestUnexpectedResult;
+        const if_pattern = stringField(field(property_names, "if") orelse .null, "pattern") orelse "";
+        const then_pattern = stringField(field(property_names, "then") orelse .null, "pattern") orelse "";
+        try std.testing.expectEqualStrings("^sh\\.fx/", if_pattern);
+        try std.testing.expectEqualStrings(key_name_pattern, then_pattern);
+
+        const pattern_properties = field(def, "patternProperties") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(pattern_properties == .object and pattern_properties.object.count() == 1);
+        try std.testing.expectEqualStrings("^sh\\.fx/", pattern_properties.object.keys()[0]);
+        try expectCapabilityValue(pattern_properties.object.values()[0]);
     }
     const capability = field(defs, "Capability") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("object", stringField(capability, "type") orelse "");
 }
 
-test "every JSON example in sh-fx.md parses as a JSON object" {
+/// Fails on the first key of a `_meta` object under `value` that is not an sh.fx key name.
+fn expectMetaKeyNames(value: std.json.Value) !void {
+    switch (value) {
+        .object => |object| {
+            for (object.keys(), object.values()) |key, child| {
+                if (std.mem.eql(u8, key, "_meta")) try expectMetaObjectKeys(child);
+                try expectMetaKeyNames(child);
+            }
+        },
+        .array => |array| for (array.items) |child| try expectMetaKeyNames(child),
+        else => {},
+    }
+}
+
+fn expectMetaObjectKeys(meta: std.json.Value) !void {
+    if (meta != .object) {
+        std.debug.print("sh-fx.md has a _meta value that is not a JSON object\n", .{});
+        return error.TestUnexpectedResult;
+    }
+    for (meta.object.keys()) |key| {
+        if (!isKeyName(key)) {
+            std.debug.print("sh-fx.md has the _meta key {s}, which is not an sh.fx key name\n", .{key});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "every JSON example in sh-fx.md parses as a JSON object with sh.fx _meta keys" {
     const fence = "```json\n";
     var examples: usize = 0;
     var rest = fx_spec.bytes;
@@ -285,6 +332,7 @@ test "every JSON example in sh-fx.md parses as a JSON object" {
         };
         defer parsed.deinit();
         try std.testing.expect(parsed.value == .object);
+        try expectMetaKeyNames(parsed.value);
         rest = body[end..];
     }
     try std.testing.expect(examples > 0);
