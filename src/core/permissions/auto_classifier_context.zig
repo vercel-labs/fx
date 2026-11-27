@@ -125,14 +125,19 @@ fn buildFromHistory(
                     entry.permission_feedback,
                 );
             },
-            // A turn a subagent's report opened holds no request of the
-            // user's; the user's answers in it are still the user's.
+            // A turn a subagent's report opened, or a deferred steer with no
+            // work id from main, holds no root request; user answers in it
+            // are still the user's.
             .assistant => |entry| {
-                if (entry.user.author != .child) try turns.append(alloc, entry.user.text);
+                if (entry.user.author == .user or (entry.user.author == .parent and entry.user.work_id != null)) {
+                    try turns.append(alloc, entry.user.text);
+                }
                 try appendExecutionPermissionFeedback(alloc, &permission_feedback, entry.execution);
             },
             .interrupted => |entry| {
-                if (entry.user.author != .child) try turns.append(alloc, entry.user.text);
+                if (entry.user.author == .user or (entry.user.author == .parent and entry.user.work_id != null)) {
+                    try turns.append(alloc, entry.user.text);
+                }
                 try appendExecutionPermissionFeedback(alloc, &permission_feedback, entry.execution);
             },
         }
@@ -190,8 +195,8 @@ pub fn refreshQueuedRootUserContext(
         execution: types.ExecutionMemory,
     };
     const finished: Finished = switch (finished_turn) {
-        .assistant => |entry| .{ .user = if (entry.user.author != .child) entry.user.text else null, .execution = entry.execution },
-        .interrupted => |entry| .{ .user = if (entry.user.author != .child) entry.user.text else null, .execution = entry.execution },
+        .assistant => |entry| .{ .user = if (entry.user.author == .user or (entry.user.author == .parent and entry.user.work_id != null)) entry.user.text else null, .execution = entry.execution },
+        .interrupted => |entry| .{ .user = if (entry.user.author == .user or (entry.user.author == .parent and entry.user.work_id != null)) entry.user.text else null, .execution = entry.execution },
         .compacted_summary => return alloc.dupe(u8, existing_context),
     };
     const finished_user = finished.user;
@@ -844,15 +849,15 @@ test "a turn a subagent's report opened never becomes a request of the user's" {
     try std.testing.expect(std.mem.find(u8, bare, "every file deleted") == null);
 }
 
-test "a subagent's parent-authored turns count the same as main's user turns for the reviewer" {
+test "a subagent's parent-authored turns with a work id count the same as main's user turns for the reviewer" {
     const alloc = std.testing.allocator;
     const parent_history = [_]types.HistoryTurn{
         .{ .assistant = .{
-            .user = .{ .text = @constCast("main first task"), .author = .parent },
+            .user = .{ .text = @constCast("main first task"), .work_id = @constCast("work-1"), .author = .parent },
             .assistant = @constCast("started"),
         } },
         .{ .interrupted = .{
-            .user = .{ .text = @constCast("main follow-up task"), .author = .parent },
+            .user = .{ .text = @constCast("main follow-up task"), .work_id = @constCast("work-2"), .author = .parent },
         } },
     };
     const user_history = [_]types.HistoryTurn{
@@ -888,6 +893,66 @@ test "a subagent's parent-authored turns count the same as main's user turns for
     const user_refreshed_int = try refreshQueuedRootUserContext(alloc, "next task", "current_request: next task\n", user_history[1]);
     defer alloc.free(user_refreshed_int);
     try std.testing.expectEqualStrings(user_refreshed_int, parent_refreshed_int);
+}
+
+test "a deferred parent steer with no work id is excluded from reviewer context like main" {
+    const alloc = std.testing.allocator;
+    const deferred_steer_history = [_]types.HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("post with work id"), .work_id = @constCast("work-1"), .author = .parent },
+            .assistant = @constCast("started"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("deferred steer without work id"), .work_id = null, .author = .parent },
+            .assistant = @constCast("steered"),
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("interrupted steer without work id"), .work_id = null, .author = .parent },
+        } },
+    };
+    const user_only_history = [_]types.HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("post with work id"), .author = .user },
+            .assistant = @constCast("started"),
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("deferred steer without work id"), .author = .child },
+            .assistant = @constCast("steered"),
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("interrupted steer without work id"), .author = .child },
+        } },
+    };
+
+    const got_ctx = try buildCanonicalRootUserContext(alloc, "current task", &deferred_steer_history);
+    defer alloc.free(got_ctx);
+    const want_ctx = try buildCanonicalRootUserContext(alloc, "current task", &user_only_history);
+    defer alloc.free(want_ctx);
+    try std.testing.expectEqualStrings(want_ctx, got_ctx);
+
+    const got_woken = try buildAgentTurnRootUserContext(alloc, &deferred_steer_history);
+    defer alloc.free(got_woken);
+    const want_woken = try buildAgentTurnRootUserContext(alloc, &user_only_history);
+    defer alloc.free(want_woken);
+    try std.testing.expectEqualStrings(want_woken, got_woken);
+
+    const got_refreshed = try refreshQueuedRootUserContext(
+        alloc,
+        "next task",
+        "current_request: next task\n",
+        deferred_steer_history[1],
+    );
+    defer alloc.free(got_refreshed);
+    try std.testing.expectEqualStrings("current_request: next task\n", got_refreshed);
+
+    const got_refreshed_int = try refreshQueuedRootUserContext(
+        alloc,
+        "next task",
+        "current_request: next task\n",
+        deferred_steer_history[2],
+    );
+    defer alloc.free(got_refreshed_int);
+    try std.testing.expectEqualStrings("current_request: next task\n", got_refreshed_int);
 }
 
 test "persisted root user context accepts only the bounded canonical format" {
