@@ -1178,6 +1178,8 @@ pub fn Runtime(comptime App: type) type {
                         debug_trace.logf("input", "shift+tab ignored reason=fork_menu_active", .{});
                     } else if (app.input_runtime.effort_menu.active) {
                         debug_trace.logf("input", "shift+tab ignored reason=effort_menu_active", .{});
+                    } else if (mcpHostMenuActive(app)) {
+                        debug_trace.logf("input", "shift+tab ignored reason=mcp_menu_active", .{});
                     } else {
                         try app_permission_runtime.Runtime(App).toggleMode(app, screen_agent);
                     }

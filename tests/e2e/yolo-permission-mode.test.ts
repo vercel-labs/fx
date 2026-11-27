@@ -370,6 +370,49 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
   );
 
   test(
+    "Shift+Tab leaves the permission mode alone while the /mcp menu is open",
+    async () => {
+      const fixture = createFixture("fx-mcp-menu-shift-tab-");
+      const stderrPath = join(fixture.root, "stderr.log");
+      writeFileSync(
+        fixture.settingsPath,
+        JSON.stringify({
+          permission_mode: "auto",
+          sandbox: CONFIGURED_SANDBOX,
+          yolo_acknowledged: true,
+        }) + "\n",
+      );
+      writeFileSync(stderrPath, "");
+
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: undefined,
+        },
+      });
+
+      await session.waitForText("auto ·", TIMEOUT);
+      await session.sendText("/mcp");
+      await session.waitForText("MCP servers", TIMEOUT);
+      await session.sendKeys("BTab");
+      await session.sendKeys("Escape");
+      const closed = await session.waitForPane((pane) => !pane.includes("MCP servers"), TIMEOUT);
+      expect(closed).toContain("auto ·");
+      expect(closed).not.toContain("full access ·");
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).permission_mode).toBe("auto");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    30_000,
+  );
+
+  test(
     "Shift+Tab applies auto to a later tool call in the active turn",
     async () => {
       const fixture = createFixture("fx-live-permission-auto-");
