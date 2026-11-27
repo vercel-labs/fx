@@ -748,6 +748,57 @@ test "paste_framing ingest decoded slice keeps embedded end marker bytes except 
     for (secret.buffer.allocatedSlice()) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
+const fuzz_input_bytes = 4096;
+const fuzz_composer_limit_bytes = 8;
+const fuzz_prompt_limit_bytes = 64;
+
+fn expectKeptBytesAccepted(owner: Owner, state: *const State) !void {
+    try std.testing.expect(state.buffer.items.len <= state.buffer_limit);
+    for (state.buffer.items) |byte| {
+        try std.testing.expect(acceptsPastedByte(owner, byte));
+    }
+}
+
+// Each path gets its own State: ingestDecodedSlice asserts that no byte of a
+// paste is still waiting on an end marker.
+fn expectOwnerLawsOnInput(owner: Owner, buffer_limit: usize, input: []const u8) !void {
+    const alloc = std.testing.allocator;
+
+    var consumed: State = .{};
+    defer consumed.deinit(alloc);
+    consumed.begin(owner, buffer_limit);
+    for (input) |byte| {
+        try consumed.consumeByte(alloc, byte);
+        try expectKeptBytesAccepted(owner, &consumed);
+    }
+
+    var ingested: State = .{};
+    defer ingested.deinit(alloc);
+    ingested.begin(owner, buffer_limit);
+    try ingested.ingestDecodedSlice(alloc, input);
+    try expectKeptBytesAccepted(owner, &ingested);
+}
+
+fn fuzzPasteFraming(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [fuzz_input_bytes]u8 = undefined;
+    const input = input_buffer[0..@intCast(smith.slice(&input_buffer))];
+    try expectOwnerLawsOnInput(.composer, fuzz_composer_limit_bytes, input);
+    try expectOwnerLawsOnInput(.question_freeform, fuzz_prompt_limit_bytes, input);
+    try expectOwnerLawsOnInput(.approval_amendment, fuzz_prompt_limit_bytes, input);
+    try expectOwnerLawsOnInput(.auth_code, fuzz_prompt_limit_bytes, input);
+    try expectOwnerLawsOnInput(.decision_prompt, fuzz_prompt_limit_bytes, input);
+}
+
+test "paste_framing keeps its laws on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzPasteFraming, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "plain text\n",
+            "before\x1b[201~after",
+            "one\r\ntwo\r\n",
+        }) ++ @import("fuzz_corpus").paste_framing.*),
+    });
+}
+
 fn readTraceFileForTest(alloc: Allocator, path: []const u8) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
     defer file.close(io_mod.getIo());

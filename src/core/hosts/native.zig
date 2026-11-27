@@ -93,19 +93,6 @@ fn close_clipboard_process_streams(child: *std.process.Child) void {
     child.stderr = null;
 }
 
-/// Kills a child that is still running, then reaps it. A child that already
-/// exited has no id left, so it is left alone. Failures are traced under `label`.
-fn killAndReapClipboardChild(child: *std.process.Child, label: []const u8) void {
-    const pid = child.id orelse return;
-    std.posix.kill(pid, .KILL) catch |err| switch (err) {
-        error.ProcessNotFound => {},
-        else => debug_trace.logf("host", "{s} cleanup failed err={s}", .{ label, @errorName(err) }),
-    };
-    _ = child.wait(io_mod.getIo()) catch |err| {
-        debug_trace.logf("host", "{s} cleanup failed err={s}", .{ label, @errorName(err) });
-    };
-}
-
 fn run_clipboard_process(
     alloc: std.mem.Allocator,
     argv: []const []const u8,
@@ -117,13 +104,10 @@ fn run_clipboard_process(
         .stdout = .pipe,
         .stderr = .pipe,
     });
-    defer child.kill(io_mod.getIo());
+    defer child_wait.killAndReap(&child, "clipboard file copy");
     defer close_clipboard_process_streams(&child);
 
-    const term = child_wait.waitWithDeadline(&child, deadline) catch |err| {
-        killAndReapClipboardChild(&child, "clipboard file copy");
-        return err;
-    };
+    const term = try child_wait.waitWithDeadline(&child, deadline);
     const stderr = try collect_clipboard_process_output(alloc, &child, deadline);
     return .{
         .term = term,
@@ -189,76 +173,100 @@ fn copy_file_to_clipboard(_: ?*anyopaque, alloc: std.mem.Allocator, path: []cons
 }
 
 const max_clipboard_text_bytes: usize = 16 * 1024 * 1024;
+/// stderr is read only to recognize xclip's "no text" message, which is short.
+const max_clipboard_read_stderr_bytes: usize = 1024;
 const clipboard_read_timeout_seconds = 2;
-/// Bytes the stdout reader asks for per wait, in bytes.
-const clipboard_stdout_fill_min_bytes: usize = 64;
+/// Free buffer bytes the reader keeps for each read, in bytes.
+const clipboard_read_spare_capacity_bytes: usize = 64;
+/// Exit status xclip uses when the selection has no text target.
+const no_text_exit_code: u8 = 1;
 
-// Stdout is drained before the child is waited on: a child that fills the pipe
-// cannot exit until it is read, so waiting first would time out large text.
-fn collect_clipboard_stdout(
+const ClipboardReadOutput = struct {
+    text: []u8,
+    stderr: []u8,
+};
+
+const ClipboardReadResult = struct {
+    term: std.process.Child.Term,
+    text: []u8,
+    stderr: []u8,
+};
+
+// Both pipes are drained before the child is waited on: a child that fills a
+// pipe cannot exit until it is read, so waiting first would time out large text.
+fn collect_clipboard_read_output(
     alloc: std.mem.Allocator,
     child: *std.process.Child,
     deadline: std.Io.Clock.Timestamp,
-    max_bytes: usize,
-) ![]u8 {
-    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(1) = undefined;
+    max_stdout_bytes: usize,
+) !ClipboardReadOutput {
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
-    multi_reader.init(alloc, io_mod.getIo(), multi_reader_buffer.toStreams(), &.{child.stdout.?});
+    multi_reader.init(alloc, io_mod.getIo(), multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer multi_reader.deinit();
 
     const stdout_reader = multi_reader.reader(0);
-    while (multi_reader.fill(clipboard_stdout_fill_min_bytes, .{ .deadline = deadline })) |_| {
-        if (stdout_reader.buffered().len > max_bytes) return error.StreamTooLong;
+    const stderr_reader = multi_reader.reader(1);
+    while (multi_reader.fill(clipboard_read_spare_capacity_bytes, .{ .deadline = deadline })) |_| {
+        if (stdout_reader.buffered().len > max_stdout_bytes) return error.StreamTooLong;
+        if (stderr_reader.buffered().len > max_clipboard_read_stderr_bytes) return error.StderrTooLong;
     } else |err| switch (err) {
         error.EndOfStream => {},
         else => |fill_err| return fill_err,
     }
     try multi_reader.checkAnyError();
 
-    return multi_reader.toOwnedSlice(0);
+    const text = try multi_reader.toOwnedSlice(0);
+    errdefer alloc.free(text);
+    return .{ .text = text, .stderr = try multi_reader.toOwnedSlice(1) };
 }
-
-const ClipboardReadResult = struct {
-    term: std.process.Child.Term,
-    text: []u8,
-};
 
 fn run_clipboard_read(
     alloc: std.mem.Allocator,
     argv: []const []const u8,
     deadline: std.Io.Clock.Timestamp,
-    max_bytes: usize,
+    max_stdout_bytes: usize,
 ) !ClipboardReadResult {
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .pipe,
-        .stderr = .ignore,
+        .stderr = .pipe,
     });
-    defer child.kill(io_mod.getIo());
+    defer child_wait.killAndReap(&child, "clipboard text read");
     defer close_clipboard_process_streams(&child);
 
-    const text = collect_clipboard_stdout(alloc, &child, deadline, max_bytes) catch |err| {
-        killAndReapClipboardChild(&child, "clipboard text read");
-        return err;
-    };
-    errdefer alloc.free(text);
-    const term = child_wait.waitWithDeadline(&child, deadline) catch |err| {
-        killAndReapClipboardChild(&child, "clipboard text read");
-        return err;
-    };
-    return .{ .term = term, .text = text };
+    const output = try collect_clipboard_read_output(alloc, &child, deadline, max_stdout_bytes);
+    errdefer {
+        alloc.free(output.text);
+        alloc.free(output.stderr);
+    }
+    const term = try child_wait.waitWithDeadline(&child, deadline);
+    return .{ .term = term, .text = output.text, .stderr = output.stderr };
 }
 
-/// Runs a read command and returns its stdout, owned by the caller. Each
-/// failure maps to one host error, so a failed read is never an empty clipboard.
+/// True when the read failed only because the selection has no text target.
+/// xclip reports that as `Error: target STRING not available` with exit 1.
+fn noTextTarget(term: std.process.Child.Term, stderr: []const u8) bool {
+    const code = switch (term) {
+        .exited => |exit_code| exit_code,
+        else => return false,
+    };
+    if (code != no_text_exit_code) return false;
+    const message = std.mem.trim(u8, stderr, " \r\n\t");
+    return std.mem.startsWith(u8, message, "Error: target ") and
+        std.mem.endsWith(u8, message, " not available");
+}
+
+/// Runs a read command. Returns the stdout bytes, owned by the caller, or null
+/// when the read worked but found no text. Every failed read is an error.
 fn runClipboardTextRead(
     alloc: std.mem.Allocator,
     argv: []const []const u8,
     deadline: std.Io.Clock.Timestamp,
-    max_bytes: usize,
-) host.ClipboardError![]u8 {
-    const result = run_clipboard_read(alloc, argv, deadline, max_bytes) catch |err| {
+    max_stdout_bytes: usize,
+) host.ClipboardError!?[]u8 {
+    const result = run_clipboard_read(alloc, argv, deadline, max_stdout_bytes) catch |err| {
         debug_trace.logf("host", "clipboard text read failed err={s}", .{@errorName(err)});
         return switch (err) {
             error.Timeout => error.ReadTimedOut,
@@ -267,28 +275,30 @@ fn runClipboardTextRead(
             else => error.ReadFailed,
         };
     };
+    defer alloc.free(result.stderr);
+    if (noTextTarget(result.term, result.stderr)) {
+        alloc.free(result.text);
+        return null;
+    }
     if (!copySucceeded(result.term)) {
         alloc.free(result.text);
         logUnsuccessfulTerm("text read", result.term);
         return error.ReadFailed;
     }
+    if (result.text.len == 0) {
+        alloc.free(result.text);
+        return null;
+    }
     return result.text;
 }
 
-// A clipboard that holds no text is a successful read, so it returns null, as a
-// host without a clipboard reader does.
 fn read_clipboard_text(_: ?*anyopaque, alloc: std.mem.Allocator) host.ClipboardError!?[]u8 {
     const argv = clipboardReadCommand(builtin.target.os.tag) orelse return null;
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromSeconds(clipboard_read_timeout_seconds),
     });
-    const text = try runClipboardTextRead(alloc, argv, deadline, max_clipboard_text_bytes);
-    if (text.len == 0) {
-        alloc.free(text);
-        return null;
-    }
-    return text;
+    return runClipboardTextRead(alloc, argv, deadline, max_clipboard_text_bytes);
 }
 
 fn clipboardCommand(os_tag: std.Target.Os.Tag) ?[]const []const u8 {
@@ -369,14 +379,32 @@ test "native clipboard read reports output over the byte cap" {
 }
 
 test "native clipboard read returns stdout bytes unchanged" {
-    const text = try runClipboardTextRead(
+    const text = (try runClipboardTextRead(
         std.testing.allocator,
         &.{ "sh", "-c", "printf 'a\\r\\nb'" },
         testReadDeadline(5000),
         max_clipboard_text_bytes,
-    );
+    )).?;
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("a\r\nb", text);
+}
+
+test "native clipboard read treats xclip's no-text message as an empty clipboard" {
+    try std.testing.expect((try runClipboardTextRead(
+        std.testing.allocator,
+        &.{ "sh", "-c", "echo 'Error: target STRING not available' >&2; exit 1" },
+        testReadDeadline(5000),
+        max_clipboard_text_bytes,
+    )) == null);
+}
+
+test "native clipboard read keeps other stderr messages as failures" {
+    try std.testing.expectError(error.ReadFailed, runClipboardTextRead(
+        std.testing.allocator,
+        &.{ "sh", "-c", "echo \"Error: Can't open display: :99\" >&2; exit 1" },
+        testReadDeadline(5000),
+        max_clipboard_text_bytes,
+    ));
 }
 
 test "native clipboard read reports a program that cannot start" {

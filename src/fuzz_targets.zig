@@ -90,4 +90,5 @@ test {
     _ = @import("ui/transcript/frozen_prefix_tests.zig");
     _ = @import("ui/transcript/tool_group_projection.zig");
     _ = @import("ui/transcript/transcript_window_fuzz.zig");
+    _ = @import("core/input/paste_framing.zig");
 }

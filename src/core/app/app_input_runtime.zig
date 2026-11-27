@@ -270,6 +270,8 @@ pub fn Runtime(comptime App: type) type {
             }
             debug_trace.logf("input", "ctrl+v clipboard text bytes={d}", .{text.len});
             try paste_rt.insertClipboardText(app, agent, text, max_input_len);
+            syncCatalogMenus(app, agent);
+            settleModelPickerDraft(app);
         }
 
         fn insertComposerSliceBounded(
@@ -16721,11 +16723,10 @@ fn pendingManualCodeDecodedTestPoll(
     _: @import("../auth/oauth.zig").Metadata,
     _: []const u8,
     _: []const u8,
-    cancel_flag: *std.atomic.Value(bool),
+    _: *std.atomic.Value(bool),
     _: std.Io.Clock.Timestamp,
 ) !@import("../auth/oauth.zig").PollResult {
-    while (!cancel_flag.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
-    return error.Cancelled;
+    return .pending;
 }
 
 fn acceptManualCodeDecodedTest(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) !void {}
@@ -16772,7 +16773,7 @@ test "app_input_runtime decoded paste matches bracketed paste in composer for sh
         defer alloc.free(framed);
         try feedRoutingBytes(&bracketed, framed);
 
-        const target = paste_rt.resolvePasteTarget(&decoded, (&decoded).agent(), RoutingFakeApp.input_byte_limit);
+        const target = paste_rt.pasteCaptureTarget(&decoded, (&decoded).agent(), RoutingFakeApp.input_byte_limit);
         try paste_rt.pasteDecodedText(&decoded, (&decoded).agent(), target, short_text, RoutingFakeApp.input_byte_limit);
 
         try std.testing.expectEqualStrings(bracketed.input_runtime.edit_state.input.items, decoded.input_runtime.edit_state.input.items);
@@ -16795,7 +16796,7 @@ test "app_input_runtime decoded paste matches bracketed paste in composer for sh
         defer alloc.free(framed);
         try feedRoutingBytes(&bracketed, framed);
 
-        const target = paste_rt.resolvePasteTarget(&decoded, (&decoded).agent(), RoutingFakeApp.input_byte_limit);
+        const target = paste_rt.pasteCaptureTarget(&decoded, (&decoded).agent(), RoutingFakeApp.input_byte_limit);
         try paste_rt.pasteDecodedText(&decoded, (&decoded).agent(), target, long_text, RoutingFakeApp.input_byte_limit);
 
         try std.testing.expectEqualStrings(bracketed.input_runtime.edit_state.input.items, decoded.input_runtime.edit_state.input.items);
@@ -16822,7 +16823,7 @@ test "app_input_runtime decoded paste keeps embedded end marker except esc unlik
 
     var decoded = try RoutingFakeApp.init(alloc);
     defer decoded.deinit();
-    const target = paste_rt.resolvePasteTarget(&decoded, (&decoded).agent(), RoutingFakeApp.input_byte_limit);
+    const target = paste_rt.pasteCaptureTarget(&decoded, (&decoded).agent(), RoutingFakeApp.input_byte_limit);
     try paste_rt.pasteDecodedText(&decoded, (&decoded).agent(), target, payload, RoutingFakeApp.input_byte_limit);
 
     try std.testing.expectEqualStrings("before[201~after", decoded.input_runtime.edit_state.input.items);
@@ -16848,8 +16849,8 @@ test "app_input_runtime decoded paste routes to question freeform and approval a
         try app.agent().question_prompt.syncFrom(alloc, &entries);
         app.agent().question_prompt.moveChoice(-1);
 
-        const target = paste_rt.resolvePasteTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
-        try std.testing.expectEqual(paste_framing.Owner.question_freeform, target.capture.owner);
+        const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
+        try std.testing.expectEqual(paste_framing.Owner.question_freeform, target.owner);
         try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "first\rsecond\tvalue\x03", RoutingFakeApp.input_byte_limit);
 
         try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
@@ -16866,8 +16867,8 @@ test "app_input_runtime decoded paste routes to question freeform and approval a
         try feedRoutingBytes(&app, "\t");
         try std.testing.expect(app.agent().approval_prompt.isAmending());
 
-        const target = paste_rt.resolvePasteTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
-        try std.testing.expectEqual(paste_framing.Owner.approval_amendment, target.capture.owner);
+        const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
+        try std.testing.expectEqual(paste_framing.Owner.approval_amendment, target.owner);
         try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "line1\r\nline2\t\x1b[201~tail\x03", RoutingFakeApp.input_byte_limit);
 
         try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
@@ -16896,8 +16897,8 @@ test "app_input_runtime decoded paste with decision prompt open drops with trace
     try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     const payload = "typing\t\r\n\x03";
-    const target = paste_rt.resolvePasteTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
-    try std.testing.expectEqual(paste_framing.Owner.decision_prompt, target.capture.owner);
+    const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
+    try std.testing.expectEqual(paste_framing.Owner.decision_prompt, target.owner);
     try paste_rt.pasteDecodedText(&app, (&app).agent(), target, payload, RoutingFakeApp.input_byte_limit);
 
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
@@ -16920,9 +16921,9 @@ test "app_input_runtime decoded paste over composer limit shows limit notice and
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "keep");
 
-    const target = paste_rt.resolvePasteTarget(&app, (&app).agent(), 6);
-    try std.testing.expectEqual(paste_framing.Owner.composer, target.capture.owner);
-    try std.testing.expectEqual(@as(usize, 2), target.capture.buffer_limit);
+    const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), 6);
+    try std.testing.expectEqual(paste_framing.Owner.composer, target.owner);
+    try std.testing.expectEqual(@as(usize, 2), target.buffer_limit);
     try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "xyz", 6);
 
     try std.testing.expectEqualStrings("keep", app.input_runtime.edit_state.input.items);
@@ -16945,8 +16946,8 @@ test "app_input_runtime decoded paste reaches auth code input and zeroes paste b
     try std.testing.expect(app.auth.toggleSignInCodeEntry());
     try std.testing.expect(app.auth.signInCodeEntryActive());
 
-    const target = paste_rt.resolvePasteTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
-    try std.testing.expectEqual(paste_framing.Owner.auth_code, target.capture.owner);
+    const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
+    try std.testing.expectEqual(paste_framing.Owner.auth_code, target.owner);
     try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "secret-auth-code", RoutingFakeApp.input_byte_limit);
 
     try std.testing.expectEqualStrings("secret-auth-code", app.auth.sign_in_code_input.items);
@@ -16975,7 +16976,7 @@ test "app_input_runtime decoded paste empty traces without opening paste or read
 
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    const target = paste_rt.resolvePasteTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
+    const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
     try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "", RoutingFakeApp.input_byte_limit);
 
     try std.testing.expectEqual(@as(usize, 0), app.clipboard_image_reads);
@@ -16987,45 +16988,13 @@ test "app_input_runtime decoded paste empty traces without opening paste or read
     try std.testing.expect(std.mem.find(u8, trace, "decoded paste empty") != null);
 }
 
-test "app_input_runtime resolvePasteTarget drops auth screens before composer" {
-    const alloc = std.testing.allocator;
-    const paste_rt = input_paste_runtime.PasteEditRuntime(RoutingFakeApp);
-
-    // Hidden manual code on sign-in screen without input event to toggle
-    {
-        var app = try RoutingFakeApp.init(alloc);
-        defer app.deinit();
-        try enterPendingDecodedTestSignIn(&app, alloc);
-        try std.testing.expect(!app.auth.signInCodeEntryActive());
-
-        const target = paste_rt.resolvePasteTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
-        try std.testing.expectEqual(input_paste_runtime.PasteTarget{ .drop = .sign_in_screen }, target);
-        try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "ignored", RoutingFakeApp.input_byte_limit);
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
-        try std.testing.expectEqual(@as(usize, 0), app.auth.sign_in_code_input.items.len);
-    }
-
-    // API key entry active
-    {
-        var app = try RoutingFakeApp.init(alloc);
-        defer app.deinit();
-        app.auth.openApiKeyPicker(alloc);
-
-        const target = paste_rt.resolvePasteTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
-        try std.testing.expectEqual(input_paste_runtime.PasteTarget{ .drop = .api_key_entry }, target);
-        try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "ignored", RoutingFakeApp.input_byte_limit);
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
-        try std.testing.expectEqual(@as(usize, 0), app.auth.pickerView().api_key_mask_count);
-    }
-}
-
 test "app_input_runtime decoded paste with only control bytes skips clipboard check and shows notice" {
     const alloc = std.testing.allocator;
     const paste_rt = input_paste_runtime.PasteEditRuntime(RoutingFakeApp);
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
 
-    const target = paste_rt.resolvePasteTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
+    const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
     try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "\x01\x1b", RoutingFakeApp.input_byte_limit);
 
     try std.testing.expectEqual(@as(usize, 0), app.clipboard_image_reads);
@@ -17045,7 +17014,7 @@ test "app_input_runtime decoded paste zeroes auth code paste buffer on invalid i
     try enterPendingDecodedTestSignIn(&app, alloc);
     try std.testing.expect(app.auth.toggleSignInCodeEntry());
 
-    const target = paste_rt.resolvePasteTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
+    const target = paste_rt.pasteCaptureTarget(&app, (&app).agent(), RoutingFakeApp.input_byte_limit);
     try paste_rt.pasteDecodedText(&app, (&app).agent(), target, "bad code", RoutingFakeApp.input_byte_limit);
 
     try std.testing.expectEqual(@as(usize, 0), app.auth.sign_in_code_input.items.len);

@@ -251,8 +251,10 @@ pub const Clipboard = struct {
         return self.copy_file_fn(self.context, alloc, path);
     }
 
-    /// Returns clipboard text owned by the caller, or null when the host has no
-    /// clipboard reader or the read fails.
+    /// Returns the clipboard text, owned by the caller. Returns null when the host
+    /// has no clipboard reader, or when the read worked and found no text (the
+    /// native host maps xclip's "target STRING not available" to this). A failed
+    /// read returns an error instead, so it is never taken for an empty clipboard.
     pub fn readText(
         self: Clipboard,
         alloc: std.mem.Allocator,

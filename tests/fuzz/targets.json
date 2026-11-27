@@ -107,6 +107,7 @@
     {"name": "compaction_progress", "module": "fx", "test": "the notes count keeps its laws on fuzzed replies", "iterations": 2000000},
     {"name": "secret_pieces", "module": "fx", "test": "maskSecretPieces masks every piece of a wrapped value and keeps other bytes on fuzzed rows", "iterations": 400000},
     {"name": "gateway_json_decode", "module": "fx", "test": "gateway JSON body decode stays bounded and round-trips gzip on fuzzed bytes", "iterations": 20000},
-    {"name": "terminal_clipboard_reply", "module": "fx", "test": "the clipboard reader stays bounded and gives one outcome per request on fuzzed terminal input", "iterations": 700000}
+    {"name": "terminal_clipboard_reply", "module": "fx", "test": "the clipboard reader stays bounded and gives one outcome per request on fuzzed terminal input", "iterations": 700000},
+    {"name": "paste_framing", "module": "fx", "test": "paste_framing keeps its laws on fuzzed bytes", "iterations": 15000}
   ]
 }
