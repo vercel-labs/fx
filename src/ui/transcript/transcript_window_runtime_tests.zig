@@ -383,7 +383,7 @@ test "a compaction inside a turn leaves the turn summary's recap counting every 
     try expectWindowMatchesEntries(&runtime);
 }
 
-test "a resize after a compaction inside a turn keeps the turn whole for its summary" {
+test "a resize after a compaction inside a turn keeps the summary's recap after the turn's entries drop" {
     const alloc = std.testing.allocator;
     var runtime = testRuntime(alloc);
     defer runtime.deinit(alloc);
@@ -451,7 +451,7 @@ test "a resize after a compaction inside a turn keeps the turn whole for its sum
     try expectWindowMatchesEntries(&runtime);
 }
 
-test "a turn that ends before its frame commits keeps the turn whole for its summary" {
+test "a turn that ends before its frame commits keeps its summary's recap after the turn's entries drop" {
     const alloc = std.testing.allocator;
     var runtime = testRuntime(alloc);
     defer runtime.deinit(alloc);
