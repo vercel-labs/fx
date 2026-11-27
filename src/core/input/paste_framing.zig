@@ -107,6 +107,18 @@ pub const State = struct {
         self.buffer_limit = max_buffer_len;
     }
 
+    pub fn ingestDecodedSlice(
+        self: *State,
+        alloc: Allocator,
+        bytes: []const u8,
+    ) Allocator.Error!void {
+        std.debug.assert(self.boundary == .capturing);
+        if (self.owner == .none) return;
+        for (bytes) |byte| {
+            try self.captureByte(alloc, byte);
+        }
+    }
+
     pub fn consumeByte(
         self: *State,
         alloc: Allocator,
@@ -122,25 +134,15 @@ pub const State = struct {
 
         switch (self.owner) {
             .none => return,
-            .decision_prompt => self.decision_bytes +|= 1,
+            .decision_prompt => {},
             .composer, .question_freeform, .approval_amendment, .auth_code => {
                 if (byte == 0x1b) {
                     self.end_candidate_buffer_len = self.buffer.items.len;
                     self.end_candidate_overflow_bytes = self.overflow_bytes;
                 }
-                const captured_byte: u8 = if (self.owner == .question_freeform and byte == '\t')
-                    ' '
-                else
-                    byte;
-                if (acceptsPastedByte(self.owner, captured_byte)) {
-                    if (self.buffer.items.len < self.buffer_limit) {
-                        try self.buffer.append(alloc, captured_byte);
-                    } else {
-                        self.overflow_bytes +|= 1;
-                    }
-                }
             },
         }
+        try self.captureByte(alloc, byte);
 
         if (!self.advanceEndMatcher(byte)) return;
 
@@ -299,6 +301,30 @@ pub const State = struct {
         self.buffer_limit = std.math.maxInt(usize);
         self.decision_bytes = 0;
         self.buffer.clearRetainingCapacity();
+    }
+
+    fn captureByte(
+        self: *State,
+        alloc: Allocator,
+        byte: u8,
+    ) Allocator.Error!void {
+        switch (self.owner) {
+            .none => return,
+            .decision_prompt => self.decision_bytes +|= 1,
+            .composer, .question_freeform, .approval_amendment, .auth_code => {
+                const captured_byte: u8 = if (self.owner == .question_freeform and byte == '\t')
+                    ' '
+                else
+                    byte;
+                if (acceptsPastedByte(self.owner, captured_byte)) {
+                    if (self.buffer.items.len < self.buffer_limit) {
+                        try self.buffer.append(alloc, captured_byte);
+                    } else {
+                        self.overflow_bytes +|= 1;
+                    }
+                }
+            },
+        }
     }
 
     fn advanceEndMatcher(self: *State, byte: u8) bool {
@@ -671,6 +697,55 @@ test "deinit traces an active capture once" {
     defer alloc.free(trace);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "decision prompt paste dropped bytes=0 reason=shutdown"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "composer paste dropped bytes=7 reason=shutdown"));
+}
+
+test "paste_framing ingest decoded slice keeps embedded end marker bytes except esc and shares owner rules" {
+    const alloc = std.testing.allocator;
+
+    var composer: State = .{};
+    defer composer.deinit(alloc);
+    composer.begin(.composer, 64);
+    try composer.ingestDecodedSlice(alloc, "before\x1b[201~after\t\r\n\x01");
+    try std.testing.expectEqualStrings("before[201~after\t\r\n", composer.buffer.items);
+    try std.testing.expectEqual(BoundaryState.capturing, composer.boundary);
+    try std.testing.expectEqual(@as(usize, 0), composer.overflow_bytes);
+
+    var question: State = .{};
+    defer question.deinit(alloc);
+    question.begin(.question_freeform, 64);
+    try question.ingestDecodedSlice(alloc, "one\t\x1b[201~two\r\x03");
+    try std.testing.expectEqualStrings("one [201~two\r", question.buffer.items);
+
+    var amendment: State = .{};
+    defer amendment.deinit(alloc);
+    amendment.begin(.approval_amendment, 64);
+    try amendment.ingestDecodedSlice(alloc, "a\t\r\n\x1b[201~b\x03");
+    try std.testing.expectEqualStrings("a\t\r\n[201~b", amendment.buffer.items);
+
+    var decision: State = .{};
+    defer decision.deinit(alloc);
+    decision.begin(.decision_prompt, std.math.maxInt(usize));
+    const decision_payload = "abc" ++ paste_end_marker ++ "xyz";
+    try decision.ingestDecodedSlice(alloc, decision_payload);
+    try std.testing.expectEqual(decision_payload.len, decision.decision_bytes);
+    try std.testing.expectEqual(BoundaryState.capturing, decision.boundary);
+
+    var limited: State = .{};
+    defer limited.deinit(alloc);
+    limited.begin(.composer, 3);
+    try limited.ingestDecodedSlice(alloc, "abcd\x01");
+    try std.testing.expectEqualStrings("abc", limited.buffer.items);
+    try std.testing.expectEqual(@as(usize, 1), limited.overflow_bytes);
+    try std.testing.expectEqual(@as(usize, 4), limited.attemptedBytes());
+
+    var secret: State = .{};
+    defer secret.deinit(alloc);
+    secret.begin(.auth_code, 64);
+    try secret.ingestDecodedSlice(alloc, "code\t\r\n-1\x1b[201~");
+    try std.testing.expectEqualStrings("code-1[201~", secret.buffer.items);
+    secret.beginHandling();
+    secret.finishSecretHandled();
+    for (secret.buffer.allocatedSlice()) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
 fn readTraceFileForTest(alloc: Allocator, path: []const u8) ![]u8 {
