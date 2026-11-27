@@ -68,11 +68,25 @@ pub const Lookup = struct {
     /// when none started. The caller owns the result.
     pub fn take(self: *Lookup) ?Result {
         const task = self.task orelse return null;
-        if (!task.done.load(.acquire)) return null;
+        if (!task.done.isSet()) return null;
         self.task = null;
         var result = task.finish();
         result.epoch = self.epoch;
         return result;
+    }
+
+    /// Waits at most `wait_ms` for the running lookup to finish, and returns
+    /// at once when none runs. A wait can end early, so the caller checks
+    /// the lookup and the time again.
+    pub fn awaitFinish(self: *Lookup, wait_ms: i64) std.Io.Cancelable!void {
+        const task = self.task orelse return;
+        task.done.waitTimeout(io_mod.getIo(), .{ .duration = .{
+            .raw = .fromMilliseconds(wait_ms),
+            .clock = .awake,
+        } }) catch |err| switch (err) {
+            error.Timeout => {},
+            error.Canceled => return error.Canceled,
+        };
     }
 
     /// `deinit` for process exit, which never waits. A lookup still running,
@@ -81,7 +95,7 @@ pub const Lookup = struct {
     /// end with the process. It holds only its own copies and static providers.
     pub fn leaveForExit(self: *Lookup) void {
         const task = self.task orelse return;
-        if (task.done.load(.acquire)) return self.deinit();
+        if (task.done.isSet()) return self.deinit();
         self.task = null;
         task.cancel.store(true, .seq_cst);
         debug_trace.logf("credits", "lookup left running reason=process_exit", .{});
@@ -91,7 +105,7 @@ pub const Lookup = struct {
     pub fn deinit(self: *Lookup) void {
         const task = self.task orelse return;
         self.task = null;
-        if (!task.done.load(.acquire)) {
+        if (!task.done.isSet()) {
             debug_trace.logf("credits", "lookup dropped reason=shutdown", .{});
         }
         task.cancel.store(true, .seq_cst);
@@ -108,7 +122,8 @@ const Task = struct {
     renewal: ?Renewal,
     renewal_account_id: ?[]u8,
     cancel: std.atomic.Value(bool) = .init(false),
-    done: std.atomic.Value(bool) = .init(false),
+    /// Set once `result` is final; a waiter wakes on it (`Lookup.awaitFinish`).
+    done: std.Io.Event = .unset,
     result: Result = .{ .snapshot = .{} },
     future: std.Io.Future(void) = undefined,
 
@@ -158,7 +173,7 @@ const Task = struct {
                 else
                     renewal_failed_message;
                 self.result.snapshot = .{ .err_message = alloc.dupe(u8, message) catch null };
-                self.done.store(true, .release);
+                self.done.set(io_mod.getIo());
                 return;
             };
             if (renewed) |value| {
@@ -173,7 +188,7 @@ const Task = struct {
             .tenant = tenant,
             .cancel_flag = &self.cancel,
         });
-        self.done.store(true, .release);
+        self.done.set(io_mod.getIo());
     }
 
     /// Awaits the task, frees it, and returns its result.
@@ -272,6 +287,37 @@ test "credits lookup reports busy while one runs" {
     try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 0));
 }
 
+/// Releases `fake` once a waiter parks on the lookup, or after `give_up_ms`.
+fn releaseOnceWaiting(fake: *TestProvider, done: *const std.Io.Event, give_up_ms: i64) void {
+    const deadline_ms = io_mod.awakeMilliTimestamp() + give_up_ms;
+    // A failed yield only spins once more.
+    while (@atomicLoad(std.Io.Event, done, .acquire) != .waiting and io_mod.awakeMilliTimestamp() < deadline_ms) std.Thread.yield() catch {};
+    fake.release.store(true, .seq_cst);
+}
+
+test "credits lookup wakes a waiter when it finishes, and a wait with none running returns at once" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const wait_ms: i64 = 5_000;
+    var fake: TestProvider = .{};
+    var lookup: Lookup = .{};
+    defer lookup.deinit();
+
+    var started_ms = io_mod.awakeMilliTimestamp();
+    try lookup.awaitFinish(wait_ms);
+    try std.testing.expect(io_mod.awakeMilliTimestamp() - started_ms < @divTrunc(wait_ms, 2));
+
+    _ = try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 0);
+    const releaser = try std.Thread.spawn(.{}, releaseOnceWaiting, .{ &fake, &lookup.task.?.done, 2 * wait_ms });
+    started_ms = io_mod.awakeMilliTimestamp();
+    try lookup.awaitFinish(wait_ms);
+    const waited_ms = io_mod.awakeMilliTimestamp() - started_ms;
+    releaser.join();
+
+    var result = lookup.take() orelse return error.TestExpectedFinished;
+    result.deinit();
+    try std.testing.expect(waited_ms < @divTrunc(wait_ms, 2));
+}
+
 test "credits lookup at exit is cancelled and left running instead of waited for" {
     if (builtin.single_threaded) return error.SkipZigTest;
     var fake: TestProvider = .{ .ignores_cancel = true };
@@ -283,7 +329,7 @@ test "credits lookup at exit is cancelled and left running instead of waited for
     lookup.leaveForExit();
     try std.testing.expect(lookup.task == null);
     try std.testing.expect(task.cancel.load(.seq_cst));
-    try std.testing.expect(!task.done.load(.acquire));
+    try std.testing.expect(!task.done.isSet());
 
     // The process would end here; the test lets the task finish and frees it.
     fake.release.store(true, .seq_cst);

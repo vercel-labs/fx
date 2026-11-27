@@ -3268,25 +3268,42 @@ fn applyTokenPassStartModel(state: *ServerState) void {
 }
 
 /// The awake clock for the Token Pass tests: it starts at zero, and a sleep
-/// moves it on at once, so a test reads how long fx would have waited.
+/// or a timed futex wait on it moves it on at once, so a test reads how long
+/// fx would have waited. `deliverAt` makes the held credits reply arrive at
+/// a set time inside such a wait.
 const FakeAwakeClock = struct {
     previous: ?std.Io,
 
     var vtable: std.Io.VTable = undefined;
-    var base_now: *const fn (?*anyopaque, std.Io.Clock) std.Io.Timestamp = undefined;
+    var base: std.Io = undefined;
     var awake_ns: std.atomic.Value(i64) = .init(0);
+    var delivery: ?Delivery = null;
+    /// The lookup event of the last delivery, and the wakes fx sent it.
+    var watched: std.atomic.Value(usize) = .init(0);
+    var wakes: std.atomic.Value(u32) = .init(0);
+
+    const Delivery = struct { at_ms: i64, credits: *HeldCredits, done: *std.Io.Event };
+
+    /// How long a wait that a delivery reached waits, for real, for the
+    /// lookup to finish or to wake it. Past it, the wake counts as lost.
+    const real_wake_limit_ms: i64 = 1_000;
 
     fn install() FakeAwakeClock {
-        const base = io_mod.getIo();
+        base = io_mod.getIo();
         vtable = base.vtable.*;
-        base_now = base.vtable.now;
         vtable.now = now;
         vtable.sleep = sleep;
+        vtable.futexWait = futexWait;
+        vtable.futexWake = futexWake;
         awake_ns.store(0, .seq_cst);
+        delivery = null;
+        watched.store(0, .seq_cst);
+        wakes.store(0, .seq_cst);
         return .{ .previous = io_mod.replaceIoForTest(.{ .userdata = base.userdata, .vtable = &vtable }) };
     }
 
     fn deinit(self: *FakeAwakeClock) void {
+        delivery = null;
         io_mod.restoreIoForTest(self.previous);
     }
 
@@ -3294,19 +3311,86 @@ const FakeAwakeClock = struct {
         return @divTrunc(awake_ns.load(.seq_cst), std.time.ns_per_ms);
     }
 
-    fn now(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
-        if (clock == .awake) return .fromNanoseconds(awake_ns.load(.seq_cst));
-        return base_now(userdata, clock);
+    /// The credits reply goes out when the clock reaches `at_ms`.
+    fn deliverAt(at_ms: i64, credits: *HeldCredits, done: *std.Io.Event) void {
+        delivery = .{ .at_ms = at_ms, .credits = credits, .done = done };
+        watched.store(@intFromPtr(done), .seq_cst);
     }
 
+    /// The delivery due by `end_ns`, released, or null.
+    fn releaseDue(end_ns: i64) ?Delivery {
+        const due = delivery orelse return null;
+        if (due.at_ms * std.time.ns_per_ms > end_ns) return null;
+        delivery = null;
+        due.credits.released.store(true, .seq_cst);
+        return due;
+    }
+
+    fn realMs() i64 {
+        const timestamp = base.vtable.now(base.userdata, .awake);
+        return @intCast(@divTrunc(timestamp.nanoseconds, std.time.ns_per_ms));
+    }
+
+    fn now(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+        if (clock == .awake) return .fromNanoseconds(awake_ns.load(.seq_cst));
+        return base.vtable.now(userdata, clock);
+    }
+
+    /// A sleep a delivery falls in still lasts its whole time, and its end
+    /// sees the lookup finished, as a poll after it would.
     fn sleep(_: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
-        switch (timeout) {
-            .duration => |duration| _ = awake_ns.fetchAdd(@intCast(duration.raw.nanoseconds), .seq_cst),
+        const ns: i64 = switch (timeout) {
+            .duration => |duration| @intCast(duration.raw.nanoseconds),
             // The Token Pass waits sleep only for a duration.
             .none, .deadline => return error.Canceled,
+        };
+        const end_ns = awake_ns.load(.seq_cst) + ns;
+        if (releaseDue(end_ns)) |due| {
+            const give_up_ms = realMs() + real_wake_limit_ms;
+            // A failed yield only spins once more.
+            while (!due.done.isSet() and realMs() < give_up_ms) std.Thread.yield() catch {};
         }
+        awake_ns.store(end_ns, .seq_cst);
+    }
+
+    /// A timed wait on the awake clock that a delivery falls in ends at the
+    /// delivery only if the lookup wakes it; otherwise it lasts its whole
+    /// time, as a lost wake would make it. Every other wait is real.
+    fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+        const ns: i64 = switch (timeout) {
+            .duration => |duration| if (duration.clock == .awake)
+                @intCast(duration.raw.nanoseconds)
+            else
+                return base.vtable.futexWait(userdata, ptr, expected, timeout),
+            .none, .deadline => return base.vtable.futexWait(userdata, ptr, expected, timeout),
+        };
+        if (@atomicLoad(u32, ptr, .acquire) != expected) return;
+        const end_ns = awake_ns.load(.seq_cst) + ns;
+        const wakes_before = wakes.load(.seq_cst);
+        if (releaseDue(end_ns)) |due| {
+            awake_ns.store(due.at_ms * std.time.ns_per_ms, .seq_cst);
+            const give_up_ms = realMs() + real_wake_limit_ms;
+            // A failed yield only spins once more.
+            while (wakes.load(.seq_cst) == wakes_before and realMs() < give_up_ms) std.Thread.yield() catch {};
+            if (wakes.load(.seq_cst) != wakes_before) return;
+        }
+        awake_ns.store(end_ns, .seq_cst);
+    }
+
+    fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
+        if (@intFromPtr(ptr) == watched.load(.seq_cst)) _ = wakes.fetchAdd(1, .seq_cst);
+        base.vtable.futexWake(userdata, ptr, max_waiters);
     }
 };
+
+/// Releases the held credits reply once a waiter parks on the lookup's
+/// event, or after `give_up_ms` when none does.
+fn releaseOnceWaiting(credits: *HeldCredits, done: *const std.Io.Event, give_up_ms: i64) void {
+    const deadline_ms = io_mod.awakeMilliTimestamp() + give_up_ms;
+    // A failed yield only spins once more.
+    while (@atomicLoad(std.Io.Event, done, .acquire) != .waiting and io_mod.awakeMilliTimestamp() < deadline_ms) std.Thread.yield() catch {};
+    credits.released.store(true, .seq_cst);
+}
 
 /// A credits endpoint that answers only once the test releases it: then it
 /// says the team has Token Pass.
@@ -3457,7 +3541,7 @@ test "ACP session/new takes a Token Pass answer that arrived after initialize an
     credits.released.store(true, .seq_cst);
     const task = state.token_pass_run.?.lookup.task.?;
     // A failed yield only spins once more.
-    while (!task.done.load(.acquire)) std.Thread.yield() catch {};
+    while (!task.done.isSet()) std.Thread.yield() catch {};
     takeTokenPassAnswer(&state, .session_new);
 
     try std.testing.expectEqual(@as(i64, 0), FakeAwakeClock.elapsedMs());
@@ -3465,6 +3549,58 @@ test "ACP session/new takes a Token Pass answer that arrived after initialize an
     // Token Pass credit pays only for standard speed.
     try std.testing.expect(!state.fast_mode);
     try std.testing.expectEqual(token_pass.Answer.has_pass, @import("../core/gateway/token_pass_memory.zig").load(alloc, home_path, &state.token_pass_run.?.named.saved_as.?).?);
+}
+
+test "ACP session/new wakes as soon as the Token Pass answer arrives, not at its next poll" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var home = std.testing.tmpDir(.{});
+    defer home.cleanup();
+    const home_path = try io_mod.dirRealpathAlloc(alloc, home.dir, ".");
+    defer alloc.free(home_path);
+    var api_key = "vck_example".*;
+    var credits: HeldCredits = .{};
+    var clock = FakeAwakeClock.install();
+    defer clock.deinit();
+    var state = try tokenPassTestState(alloc, home_path, &credits, &api_key);
+    defer freeTokenPassTestState(&state, &credits);
+    startTokenPassCheck(&state, alloc, .compiled_default);
+
+    // The credits reply comes 3 ms into the new session's wait.
+    FakeAwakeClock.deliverAt(3, &credits, &state.token_pass_run.?.lookup.task.?.done);
+    takeTokenPassAnswer(&state, .session_new);
+
+    try std.testing.expectEqual(@as(i64, 3), FakeAwakeClock.elapsedMs());
+    try std.testing.expectEqualStrings(token_pass.default_model, state.selected_model);
+}
+
+test "ACP session/new wakes on the Token Pass answer with the real clock" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var home = std.testing.tmpDir(.{});
+    defer home.cleanup();
+    const home_path = try io_mod.dirRealpathAlloc(alloc, home.dir, ".");
+    defer alloc.free(home_path);
+    var api_key = "vck_example".*;
+    var credits: HeldCredits = .{};
+    var state = try tokenPassTestState(alloc, home_path, &credits, &api_key);
+    defer freeTokenPassTestState(&state, &credits);
+    startTokenPassCheck(&state, alloc, .compiled_default);
+
+    const done = &state.token_pass_run.?.lookup.task.?.done;
+    const releaser = try std.Thread.spawn(.{}, releaseOnceWaiting, .{ &credits, done, 2 * token_pass_check.first_prompt_wait_ms });
+    const started_ms = io_mod.awakeMilliTimestamp();
+    takeTokenPassAnswer(&state, .session_new);
+    const waited_ms = io_mod.awakeMilliTimestamp() - started_ms;
+    releaser.join();
+
+    // The reply goes out once the new session waits on the lookup, which
+    // then wakes it long before the 2 s limit.
+    if (waited_ms >= @divTrunc(token_pass_check.first_prompt_wait_ms, 2)) {
+        std.debug.print("session/new waited {d} ms for an answer sent once it waited\n", .{waited_ms});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqualStrings(token_pass.default_model, state.selected_model);
 }
 
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
