@@ -16,5 +16,17 @@
     "old": "    /\\ IF phase = \"ready\" /\\ Quiet\n",
     "new": "    /\\ IF phase = \"ready\" /\\ QuietFor(armed)\n",
     "invariant": "IdleEndsNothing"
+  },
+  {
+    "description": "The owner sends ready before it listens, so a client connects before any owner serves (ReadyMeansServing)",
+    "old": "    /\\ wait' = [wait EXCEPT ![x] = \"waiting\"]\n",
+    "new": "    /\\ wait' = [wait EXCEPT ![x] = \"ready\"]\n",
+    "invariant": "ReadyMeansServing"
+  },
+  {
+    "description": "The session ignores EOF on its ready pipe and keeps waiting (WaitEnds)",
+    "old": "WaitEof(x) ==\n    /\\ alive[x] /\\ wait[x] = \"eof\"\n",
+    "new": "WaitEof(x) ==\n    /\\ alive[x] /\\ wait[x] = \"eof\" /\\ FALSE\n",
+    "property": "WaitEnds"
   }
 ]
