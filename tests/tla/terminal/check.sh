@@ -9,6 +9,10 @@
 # steps of the exit close (record the tree, hang up, kill, bounded drain) and
 # what holds the PTY meanwhile, and a start whose caller has not indexed the
 # terminal yet, which the other calls of its process must not see.
+# CI runs only the design config TerminalLifecycle.cfg, which has one terminal
+# (about 8,000 states, a few seconds). TerminalLifecycle-full.cfg has two
+# (about 486,000 states, a few minutes) and runs here, with the planted
+# mutants, which keep two terminals and are rejected with one as well.
 #
 # Each design config must pass every invariant and liveness property with
 # deadlock checking on. Each <Model>-<mutation>.cfg enables one broken rule,
@@ -24,6 +28,7 @@ cd "$(dirname "$0")"
 tlc_verdicts "$@" <<'EOF'
 ShellSnapshot ShellSnapshot -
 TerminalLifecycle TerminalLifecycle -
+TerminalLifecycle TerminalLifecycle-full -
 ShellSnapshot ShellSnapshot-reload_per_command DotfilesPaidOnce -deadlock
 ShellSnapshot ShellSnapshot-no_single_flight SingleFlight -deadlock
 ShellSnapshot ShellSnapshot-free_while_leased NoUseAfterFree -deadlock
