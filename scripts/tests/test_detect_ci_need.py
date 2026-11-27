@@ -165,9 +165,14 @@ class DetectCiNeedTests(unittest.TestCase):
             "tests/e2e/render-lab/tape.ts",
         ), libfx=False, mcp=True)
 
-    def test_helpers_both_driver_sets_load_need_both_checks(self) -> None:
+    def test_the_eval_helpers_need_each_check_that_loads_them(self) -> None:
         self.commit_each(
-            ("tests/evals/eval-helpers.ts",), libfx=False, mcp=True, subagent=True, managed_execution=True,
+            ("tests/evals/eval-helpers.ts",),
+            libfx=False,
+            mcp=True,
+            subagent=True,
+            managed_execution=True,
+            acp=True,
         )
 
     def test_the_fake_gateway_needs_each_check_that_loads_it(self) -> None:

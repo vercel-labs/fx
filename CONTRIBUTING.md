@@ -267,7 +267,7 @@ The `TLA+ ACP models and drivers` job takes about 5 minutes and runs its checks 
 
 - `src/acp/`
 - The models in `tests/tla/acp/` or their drivers in `tests/tla/drivers/acp/`
-- The code those drivers share: `tests/tla/drivers/lib/` and `tests/tla/lib/`, or the fake Gateway they load from `tests/e2e/tmux-helpers.ts`
+- The code those drivers share: `tests/tla/drivers/lib/` and `tests/tla/lib/`, or the helpers they load: the fake Gateway in `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`
 
 All six run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
 

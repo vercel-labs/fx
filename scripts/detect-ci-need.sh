@@ -56,8 +56,9 @@
 # acp: the TLA+ ACP models and drivers job model-checks tests/tla/acp/ and
 # drives the built fx acp along those models. A pull request runs it only when
 # it touches src/acp/, those models, their drivers in tests/tla/drivers/acp/,
-# the code they share: tests/tla/drivers/lib/ and tests/tla/lib/, or the fake
-# Gateway the drivers load from tests/e2e/tmux-helpers.ts.
+# the code they share: tests/tla/drivers/lib/ and tests/tla/lib/, or the
+# helpers the drivers load: the fake Gateway in tests/e2e/tmux-helpers.ts and
+# tests/evals/eval-helpers.ts.
 #
 # All six run when the change touches build.zig, build.zig.zon,
 # .github/workflows/ci.yml, or this script. A change to shared code the checks
@@ -216,15 +217,11 @@ while IFS= read -r -d '' path; do
       require_subagent "$path: shared model-check code changed"
       require_managed_execution "$path: shared model-check code changed"
       require_acp "$path: shared TLC script changed" ;;
-    tests/e2e/tmux-helpers.ts)
+    tests/e2e/tmux-helpers.ts | tests/evals/eval-helpers.ts)
       require_mcp "$path: a file the MCP drivers load changed"
       require_subagent "$path: a file the subagent and session drivers load changed"
       require_managed_execution "$path: a file the shell quiet notice driver loads changed"
       require_acp "$path: a file the ACP drivers load changed" ;;
-    tests/evals/eval-helpers.ts)
-      require_mcp "$path: a file the MCP drivers load changed"
-      require_subagent "$path: a file the subagent and session drivers load changed"
-      require_managed_execution "$path: a file the shell quiet notice driver loads changed" ;;
     tests/e2e/saved-sessions.ts)
       require_subagent "$path: a file the accepted-input driver loads changed" ;;
     tests/e2e/fixtures/mcp-* | tests/e2e/render-lab/tape.ts)
