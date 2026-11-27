@@ -47,13 +47,26 @@ fn isSubagentCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
 
 /// The subagent a subagent call goes to: `none` for a call that names none,
 /// such as a wait, and `unknown` when its arguments can't be read.
-const SubagentTarget = union(enum) { none, named: []const u8, unknown };
+const SubagentTarget = union(enum) { none, named: []const u8, many: []const []const u8, unknown };
 
 fn subagentTarget(arena: Allocator, call: ToolCall) SubagentTarget {
     if (call.argument_integrity != .valid) return .unknown;
-    const Arguments = struct { request: ?struct { agent: ?[]const u8 = null } = null };
+    const Arguments = struct {
+        request: ?struct {
+            agent: ?[]const u8 = null,
+            agents: ?[]const []const u8 = null,
+        } = null,
+    };
     const parsed = json_decode.parseFromSliceLeaky(Arguments, arena, call.arguments_json, .{ .ignore_unknown_fields = true }) catch return .unknown;
     const request = parsed.request orelse return .unknown;
+    if (request.agent != null and request.agents != null) return .unknown;
+    if (request.agents) |agents| {
+        if (agents.len == 0) return .unknown;
+        for (agents) |name| {
+            if (name.len == 0) return .unknown;
+        }
+        return .{ .many = agents };
+    }
     // An empty name is no name. A status or a wait reads an empty `agent` as
     // none, and any other call with one is refused before it acts.
     const agent = request.agent orelse return .none;
@@ -78,6 +91,17 @@ fn parallelSubagentPrefixLen(alloc: Allocator, registry: tool_dispatch.Registry,
             .named => |name| {
                 for (named.items) |seen| if (std.mem.eql(u8, seen, name)) return len;
                 named.append(arena, name) catch return if (len == 0) 1 else len;
+            },
+            .many => |names| {
+                for (names) |name| {
+                    for (named.items) |seen| if (std.mem.eql(u8, seen, name)) return len;
+                }
+                for (names) |name| {
+                    const already = for (named.items) |seen| {
+                        if (std.mem.eql(u8, seen, name)) break true;
+                    } else false;
+                    if (!already) named.append(arena, name) catch return if (len == 0) 1 else len;
+                }
             },
         }
     }
@@ -1175,4 +1199,29 @@ fn fuzzSubagentGroups(_: void, smith: *std.testing.Smith) anyerror!void {
     const group = leadingParallelGroup(std.testing.allocator, registry, calls.items);
     try std.testing.expectEqual(GroupKind.subagent, group.kind);
     try std.testing.expectEqual(expected, group.len);
+}
+
+test "a batch close prevents parallel execution with any call naming one of its agents" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{ builtin_tools.subagent, builtin_tools.read_file };
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+
+    const close_ab = toolCall("c1", "subagent", "{\"request\":{\"action\":\"close\",\"agents\":[\"alpha\",\"beta\"]}}");
+    const msg_beta = toolCall("c2", "subagent", "{\"request\":{\"action\":\"message\",\"agent\":\"beta\",\"message\":\"hi\"}}");
+    const msg_gamma = toolCall("c3", "subagent", "{\"request\":{\"action\":\"message\",\"agent\":\"gamma\",\"message\":\"hi\"}}");
+
+    const overlap_after = [_]ToolCall{ close_ab, msg_beta };
+    const g1 = leadingParallelGroup(std.testing.allocator, registry, &overlap_after);
+    try std.testing.expectEqual(GroupKind.subagent, g1.kind);
+    try std.testing.expectEqual(@as(usize, 1), g1.len);
+
+    const overlap_before = [_]ToolCall{ msg_beta, close_ab };
+    const g2 = leadingParallelGroup(std.testing.allocator, registry, &overlap_before);
+    try std.testing.expectEqual(GroupKind.subagent, g2.kind);
+    try std.testing.expectEqual(@as(usize, 1), g2.len);
+
+    const disjoint = [_]ToolCall{ close_ab, msg_gamma };
+    const g3 = leadingParallelGroup(std.testing.allocator, registry, &disjoint);
+    try std.testing.expectEqual(GroupKind.subagent, g3.kind);
+    try std.testing.expectEqual(@as(usize, 2), g3.len);
 }

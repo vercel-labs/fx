@@ -69,13 +69,13 @@ pub fn subagentAction(
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
     // Every other action says what it does to whom, with nothing to preview.
     if (action_words.get(action)) |words| {
-        const named = namedAgent(args, action);
+        const named = try namedTarget(scratch, args, action);
         // A call that concerns every subagent, a wait or a status that names
         // none, names them when its host listed them in the call's
         // `resolved_display_target`; without the list it says "subagents".
-        const roster = if (words.target != null or named == null) call.resolved_display_target else null;
-        const raw_target = roster orelse words.target orelse named orelse words.no_agent orelse return null;
-        const target = try text_utils.encodeTerminalSafe(scratch, raw_target, if (roster != null) 96 else 64);
+        const roster = if (words.target != null or named.name == null) call.resolved_display_target else null;
+        const raw_target = roster orelse words.target orelse named.name orelse words.no_agent orelse return null;
+        const target = try text_utils.encodeTerminalSafe(scratch, raw_target, if (roster != null or named.many) 96 else 64);
         const label = switch (state) {
             .active, .pending => try alloc.print("{s} {s}", .{ words.doing, target.bytes }),
             .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
@@ -160,6 +160,25 @@ pub fn subagentRoster(alloc: Allocator, call: ToolCall) Allocator.Error!?Subagen
     if (std.mem.eql(u8, action, "wait")) return .working;
     if (std.mem.eql(u8, action, "status") and namedAgent(args, action) == null) return .open;
     return null;
+}
+
+const NamedTarget = struct {
+    name: ?[]const u8 = null,
+    many: bool = false,
+};
+
+fn namedTarget(scratch: Allocator, args: std.json.ObjectMap, action: []const u8) Allocator.Error!NamedTarget {
+    if (namedAgent(args, action)) |agent| return .{ .name = agent, .many = false };
+    if (!std.mem.eql(u8, action, "close")) return .{};
+    const raw_agents = args.get("agents") orelse return .{};
+    if (raw_agents != .array or raw_agents.array.items.len == 0) return .{};
+    var joined: std.ArrayList(u8) = .empty;
+    for (raw_agents.array.items) |item| {
+        if (item != .string or item.string.len == 0) return .{};
+        if (joined.items.len > 0) try joined.appendSlice(scratch, ", ");
+        try joined.appendSlice(scratch, item.string);
+    }
+    return .{ .name = joined.items, .many = true };
 }
 
 /// The `agent` a `subagent` call of `action` names, or null. The decoder reads
@@ -2113,4 +2132,16 @@ test "saved output sources name commands, paths, URLs, and MCP tools" {
             try std.testing.expect(label == null);
         }
     }
+}
+
+test "batch close rows name every agent in order for active and completed states" {
+    const alloc = std.testing.allocator;
+    const args = "{\"action\":\"close\",\"agents\":[\"a\",\"b\"]}";
+    const active = (try subagentAction(alloc, .{ .id = "c1", .name = "subagent", .arguments_json = args }, .active)).?;
+    defer active.deinit(alloc);
+    try std.testing.expectEqualStrings("closing a, b", active.label);
+
+    const completed = (try subagentAction(alloc, .{ .id = "c2", .name = "subagent", .arguments_json = args }, .completed)).?;
+    defer completed.deinit(alloc);
+    try std.testing.expectEqualStrings("closed a, b", completed.label);
 }

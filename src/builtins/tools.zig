@@ -198,6 +198,7 @@ const subagent_description =
 const subagent_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "message", "wait", "status", "stop", "close", "approve", "deny" } }, .description = "wait blocks you, and the user cannot talk to you meanwhile. When nothing is left to do but wait, end your turn with a short status instead: each report starts your next turn. A subagent may still wait, since the end of its turn sends its report. approve allows the approval request a subagent waits on, once; deny refuses it, with message as the reason. Ask the user first only when the action is risky or you cannot judge it." },
     .{ .name = "agent", .json_type = .string, .description = "For message, stop, close, approve, and deny, optional for status: a lowercase name. As a subagent, \"parent\" is the agent that started you." },
+    .{ .name = "agents", .json_type = .array, .shape = &.{ .array_values = .{ .json_type = .string } }, .description = "For close: several names to close at once." },
     .{ .name = "message", .json_type = .string, .description = "For message: its task, or a message for its turn. For deny: why." },
     .{ .name = "instructions", .json_type = .string, .description = "For message: system instructions for this child." },
     .{ .name = "report", .json_type = .string, .shape = &.{ .enum_values = &.{ "final", "every_turn", "never" } }, .description = "For message: when it reports back. final, the default, when your work ends; every_turn after each turn; never only on failure." },
@@ -850,9 +851,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "c78ae877fb42327d4ed1ab58d95a32b492858a08cd1442600c5a9f8997a5114a"
+            "2cc93b5d222ed3a8d5b1002f210487f7c027346a4fd188b58a3e8a97450ea462"
         else
-            "1c1204ee8981d61a12a5e85135ed2eb2617e972115a8c9196b4855ae5028a771",
+            "ed81cf0dfc10ca1f4723cdff7cd078b49cad7ced046c468a8f2736413b96ac2d",
         &actual_hex,
     );
 }
@@ -1283,6 +1284,7 @@ test "built-in subagent owns product metadata schema and callbacks" {
     try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"message\",\"wait\",\"status\",\"stop\",\"close\",\"approve\",\"deny\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"final\",\"every_turn\",\"never\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"task\":") == null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"agents\":") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"instructions\":") != null);
     // Creation-time routing overrides are advertised on both actions.
     try std.testing.expect(std.mem.find(u8, schema_json, "\"model\":") != null);

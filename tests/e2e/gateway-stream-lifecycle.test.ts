@@ -17335,3 +17335,71 @@ test("a subagent started with its own model names that child model in its turn c
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 45_000);
+
+test("subagent close with agents closes two subagents in one call and a later message starts a new one", async () => {
+  const root = createFixtureRoot("subagent-batch-close");
+  let alphaRuns = 0;
+  let waitCount = 0;
+  const gateway = startDynamicFakeGateway((body) => {
+    const latest = latestUserText(body);
+    if (latest.includes("RUN_ALPHA_ONE") && !latest.includes("Start alpha and beta")) {
+      alphaRuns += 1;
+      return fakeGatewayFinalText("ALPHA_ONE_DONE");
+    }
+    if (latest.includes("RUN_BETA_ONE") && !latest.includes("Start alpha and beta")) {
+      return fakeGatewayFinalText("BETA_ONE_DONE");
+    }
+    if (latest.includes("RUN_ALPHA_TWO") && !latest.includes("Start alpha and beta")) {
+      alphaRuns += 1;
+      const promptText = gatewayRequest(body).prompt.map((m) => contentText(m.content)).join("\n");
+      expect(promptText).not.toContain("RUN_ALPHA_ONE");
+      expect(promptText).not.toContain("ALPHA_ONE_DONE");
+      return fakeGatewayFinalText("ALPHA_TWO_DONE");
+    }
+    if (body.includes("ALPHA_TWO_DONE")) {
+      return fakeGatewayFinalText("BATCH_CLOSE_AND_REOPEN_OK");
+    }
+    if (hasToolResultAnywhere(body, "reopen-alpha")) {
+      return fakeGatewayToolCall(`wait-${++waitCount}`, "subagent", { action: "wait" });
+    }
+    if (hasToolResultAnywhere(body, "batch-close")) {
+      const closeOut = toolResultOutput(body, "batch-close");
+      expect(closeOut).toContain("Closed alpha.");
+      expect(closeOut).toContain("Closed beta.");
+      expect(closeOut).toContain("A later message to a closed name starts a new one.");
+      return fakeGatewayToolCall("reopen-alpha", "subagent", {
+        action: "message",
+        agent: "alpha",
+        message: "RUN_ALPHA_TWO",
+      });
+    }
+    if (body.includes("ALPHA_ONE_DONE") && body.includes("BETA_ONE_DONE")) {
+      return fakeGatewayToolCall("batch-close", "subagent", {
+        action: "close",
+        agents: ["alpha", "beta"],
+      });
+    }
+    if (hasToolResultAnywhere(body, "open-alpha") && hasToolResultAnywhere(body, "open-beta")) {
+      return fakeGatewayToolCall(`wait-${++waitCount}`, "subagent", { action: "wait" });
+    }
+    return fakeGatewaySse([
+      { type: "tool-call", toolCallId: "open-alpha", toolName: "subagent", input: { action: "message", agent: "alpha", message: "RUN_ALPHA_ONE" } },
+      { type: "tool-call", toolCallId: "open-beta", toolName: "subagent", input: { action: "message", agent: "beta", message: "RUN_BETA_ONE" } },
+      { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_use" } },
+    ]);
+  });
+
+  try {
+    const result = await runFx(["ask", "--json", "--full-access", "Start alpha and beta, close both, then reopen alpha."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+      timeoutMs: 30_000,
+    });
+    expect(result.code, result.stderr).toBe(0);
+    expect(parseAskJson(result.stdout).output).toContain("BATCH_CLOSE_AND_REOPEN_OK");
+    expect(alphaRuns).toBe(2);
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45_000);

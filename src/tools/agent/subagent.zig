@@ -22,6 +22,7 @@ const DecodeError = error{
     InvalidFieldType,
     MissingField,
     UnknownField,
+    ConflictingFields,
     InvalidEnum,
 };
 
@@ -34,7 +35,7 @@ pub const message_fields = [_][]const u8{ "action", "agent", "instructions", "me
 pub const wait_fields = [_][]const u8{ "action", "agent" };
 pub const status_fields = [_][]const u8{ "action", "agent" };
 pub const stop_fields = [_][]const u8{ "action", "agent" };
-pub const close_fields = [_][]const u8{ "action", "agent" };
+pub const close_fields = [_][]const u8{ "action", "agent", "agents" };
 pub const approve_fields = [_][]const u8{ "action", "agent" };
 pub const deny_fields = [_][]const u8{ "action", "agent", "message" };
 
@@ -58,7 +59,7 @@ pub fn decode(
     defer parsed.deinit();
 
     var problem: Problem = .{};
-    const request_input = parseRoot(parsed.value, &problem) catch |err| {
+    const request_input = parseRoot(arena, parsed.value, &problem) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("subagent", "request decode rejected code={s} field={s}", .{ decodeErrorCode(err), problem.field });
         const correction = try problemText(arena, err, problem);
@@ -103,7 +104,7 @@ fn refused(ctx: tool_dispatch.DispatchContext, why: refusal.Refusal) tool_dispat
 
 /// Pure: the correction a model sees for a call that failed to decode.
 fn problemText(arena: Allocator, err: DecodeError, problem: Problem) Allocator.Error![]const u8 {
-    const fields = "message takes agent, message, instructions, report, model, effort, and profile; wait and status take an optional agent; stop, close, and approve take agent; deny takes agent and an optional message.";
+    const fields = "message takes agent, message, instructions, report, model, effort, and profile; wait and status take an optional agent; stop and approve take agent; close takes agent or agents; deny takes agent and an optional message.";
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.InvalidEnum => "action must be \"message\", \"wait\", \"status\", \"stop\", \"close\", \"approve\", or \"deny\".",
@@ -112,7 +113,7 @@ fn problemText(arena: Allocator, err: DecodeError, problem: Problem) Allocator.E
         else if (std.mem.eql(u8, problem.action, "stop"))
             "stop needs agent."
         else if (std.mem.eql(u8, problem.action, "close"))
-            "close needs agent."
+            "close needs agent or agents."
         else if (std.mem.eql(u8, problem.action, "approve"))
             "approve needs agent."
         else if (std.mem.eql(u8, problem.action, "deny"))
@@ -123,10 +124,13 @@ fn problemText(arena: Allocator, err: DecodeError, problem: Problem) Allocator.E
             try arena.print("{s} cannot sit beside request. Put every field at the top level without request.", .{problem.field})
         else
             try arena.print("{s} does not apply to {s}. " ++ fields, .{ problem.field, problem.action }),
+        error.ConflictingFields => "close takes either agent or agents, not both.",
         error.InvalidFieldType => if (problem.field.len == 0)
             "subagent arguments must be a JSON object."
         else if (std.mem.eql(u8, problem.field, "request"))
             "request must be an object. Put the fields at the top level instead."
+        else if (std.mem.eql(u8, problem.field, "agents"))
+            "agents must be a list of strings."
         else
             try arena.print("{s} must be a string.", .{problem.field}),
     };
@@ -138,11 +142,12 @@ fn decodeErrorCode(err: DecodeError) []const u8 {
         error.InvalidFieldType => "invalid_field_type",
         error.MissingField => "missing_field",
         error.UnknownField => "unknown_field",
+        error.ConflictingFields => "conflicting_fields",
         error.InvalidEnum => "invalid_enum",
     };
 }
 
-fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contract.RequestInput {
+fn parseRoot(arena: Allocator, value: std.json.Value, problem: *Problem) DecodeError!model_contract.RequestInput {
     const root = try objectValue(value);
     const request = if (root.get("request")) |request_value| blk: {
         try rejectUnknown(root, &.{"request"}, problem);
@@ -191,6 +196,23 @@ fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contrac
     if (std.mem.eql(u8, action, "close")) {
         problem.action = "close";
         try rejectOutsideAction(request, &close_fields, problem);
+        const has_agent = request.get("agent") != null;
+        const has_agents = request.get("agents") != null;
+        if (has_agent and has_agents) {
+            problem.field = "agents";
+            return error.ConflictingFields;
+        }
+        if (has_agents) {
+            problem.field = "agents";
+            const raw_agents = request.get("agents").?;
+            if (raw_agents != .array) return error.InvalidFieldType;
+            const items = raw_agents.array.items;
+            const names = try arena.alloc([]const u8, items.len);
+            for (items, names) |item, *out| {
+                out.* = try stringValue(item);
+            }
+            return .{ .close = .{ .agents = names } };
+        }
         return .{ .close = .{ .agent = try requiredString(request, "agent", problem) } };
     }
     if (std.mem.eql(u8, action, "approve")) {
@@ -524,7 +546,7 @@ test "decode accepts flat calls and names what a rejected call got wrong" {
     try expectCorrection("{\"action\":\"wait\",\"agent\":7}", "invalid_field_type", "agent must be a string.");
     try expectCorrection("{\"action\":\"wait\",\"message\":\"x\"}", "unknown_field", "message does not apply to wait.");
     try expectCorrection("{\"action\":\"stop\"}", "missing_field", "stop needs agent.");
-    try expectCorrection("{\"action\":\"close\"}", "missing_field", "close needs agent.");
+    try expectCorrection("{\"action\":\"close\"}", "missing_field", "close needs agent or agents.");
     try expectCorrection("{\"action\":\"message\",\"agent\":\"reviewer\"}", "missing_field", "message needs agent and message.");
     try expectCorrection("{\"task\":\"x\"}", "missing_field", "action is required");
     try expectCorrection("{\"request\":{\"action\":\"wait\"},\"task\":\"y\"}", "unknown_field", "task cannot sit beside request");
@@ -741,6 +763,11 @@ test "every call the decoder refuses tells the model what is wrong and what to d
         .{ .args = "{\"action\":\"stop\",\"agent\":\"Ghost\"}", .code = "invalid_agent" },
         .{ .args = "{\"action\":\"stop\",\"agent\":\"parent\"}", .code = "invalid_agent" },
         .{ .args = "{\"action\":\"close\",\"agent\":\"parent\"}", .code = "invalid_agent" },
+        .{ .args = "{\"action\":\"close\",\"agent\":\"a\",\"agents\":[\"b\"]}", .code = "conflicting_fields" },
+        .{ .args = "{\"action\":\"close\",\"agents\":[]}", .code = "invalid_agent" },
+        .{ .args = "{\"action\":\"close\",\"agents\":[\"a\",7]}", .code = "invalid_field_type" },
+        .{ .args = "{\"action\":\"close\",\"agents\":[\"parent\"]}", .code = "invalid_agent" },
+        .{ .args = "{\"action\":\"wait\",\"agents\":[\"a\"]}", .code = "unknown_field" },
         .{ .args = "{\"action\":\"approve\",\"agent\":\"parent\"}", .code = "invalid_agent" },
         .{ .args = "{\"action\":\"deny\",\"agent\":\"parent\"}", .code = "invalid_agent" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"\"}", .code = "invalid_message" },
@@ -786,6 +813,49 @@ test "call reports compact host unavailability" {
                     "\"error_code\":\"host_unavailable\"",
                 ) != null),
             }
+        },
+    }
+}
+
+test "decode accepts batch close, folds duplicates, and refuses invalid agents shapes" {
+    try expectRequestTag("{\"action\":\"close\",\"agents\":[\"alpha\",\"beta\"]}", .close);
+    try expectRequestTag("{\"action\":\"close\",\"agents\":[\"alpha\",\"beta\",\"alpha\"]}", .close);
+    try expectDecodeFailure("{\"action\":\"close\",\"agent\":\"alpha\",\"agents\":[\"beta\"]}", "conflicting_fields");
+    try expectDecodeFailure("{\"action\":\"close\"}", "missing_field");
+    try expectDecodeFailure("{\"action\":\"close\",\"agents\":[]}", "invalid_agent");
+    try expectDecodeFailure("{\"action\":\"close\",\"agents\":\"alpha\"}", "invalid_field_type");
+    try expectDecodeFailure("{\"action\":\"close\",\"agents\":[\"alpha\",7]}", "invalid_field_type");
+    try expectDecodeFailure("{\"action\":\"close\",\"agents\":[\"alpha\",\"Bad Name\"]}", "invalid_agent");
+    try expectDecodeFailure("{\"action\":\"close\",\"agents\":[\"parent\"]}", "invalid_agent");
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"alpha\",\"message\":\"hi\",\"agents\":[\"beta\"]}", "unknown_field");
+    try expectDecodeFailure("{\"action\":\"wait\",\"agents\":[\"beta\"]}", "unknown_field");
+    try expectDecodeFailure("{\"action\":\"wait\",\"agents\":[]}", "unknown_field");
+
+    const alloc = std.testing.allocator;
+    var too_many: std.ArrayList(u8) = .empty;
+    defer too_many.deinit(alloc);
+    try too_many.appendSlice(alloc, "{\"action\":\"close\",\"agents\":[");
+    for (0..257) |i| {
+        if (i > 0) try too_many.append(alloc, ',');
+        try too_many.print(alloc, "\"a{d}\"", .{i});
+    }
+    try too_many.appendSlice(alloc, "]}");
+    try expectDecodeFailure(too_many.items, "invalid_agent");
+
+    // Verify duplicate folding preserves first-seen order in the validated request.
+    const alloc2 = std.testing.allocator;
+    const deduped = try decode(.{ .allocator = alloc2 }, "{\"action\":\"close\",\"agents\":[\"alpha\",\"beta\",\"alpha\"]}");
+    switch (deduped) {
+        .failure => |msg| {
+            defer alloc2.free(msg);
+            return error.TestUnexpectedResult;
+        },
+        .input => |input| {
+            defer input.deinit(alloc2);
+            const names = input.as(Input).request.close.many;
+            try std.testing.expectEqual(@as(usize, 2), names.len);
+            try std.testing.expectEqualStrings("alpha", names[0]);
+            try std.testing.expectEqualStrings("beta", names[1]);
         },
     }
 }

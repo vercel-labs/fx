@@ -71,6 +71,8 @@ pub const Refusal = union(enum) {
             .invalid_agent => |fault| try writer.writeAll(switch (fault) {
                 .name => agent_name_rule,
                 .parent_target => "stop, close, approve, and deny take the name of a subagent you started. \"parent\" is the agent that started you and works only with message.",
+                .empty_list => "close with agents needs at least one subagent name.",
+                .too_many => too_many_agents_rule,
             }),
             .invalid_message => try writer.writeAll(message_rule),
             .invalid_instructions => try writer.writeAll(instructions_rule),
@@ -132,6 +134,10 @@ const AgentFault = enum {
     name,
     /// `stop` or `close` named "parent", which is no subagent of the caller's.
     parent_target,
+    /// `close` received `agents: []` or omitted both `agent` and `agents`.
+    empty_list,
+    /// `close` received more than `child_state.max_children` items in `agents`.
+    too_many,
 };
 
 const CallerFault = enum {
@@ -181,6 +187,10 @@ const agent_name_rule = std.fmt.comptimePrint(
     "agent must be a name of 1 to {d} characters: lowercase letters, digits, \"_\" or \"-\", starting with a letter or digit.",
     .{domain.max_agent_name_bytes},
 );
+const too_many_agents_rule = std.fmt.comptimePrint(
+    "close takes at most {d} subagent names at once. Split the list and try again.",
+    .{child_state.max_children},
+);
 const message_rule = std.fmt.comptimePrint(
     "message must be 1 to {d} bytes of valid text with no NUL character. Send it again within that limit.",
     .{domain.max_message_bytes},
@@ -217,9 +227,15 @@ const parent_queue_full = std.fmt.comptimePrint(
 /// "No open subagent is named X.", then the open ones up to `max_named_open`
 /// and a count of the rest. `agent` passed the name rule, so it is quotable.
 fn writeNotOpen(writer: *std.Io.Writer, agent: []const u8, open: []const []const u8) std.Io.Writer.Error!void {
-    try writer.print("No open subagent is named \"{s}\".", .{agent});
-    if (open.len == 0) return writer.writeAll(" You have no open subagents.");
-    try writer.writeAll(" Open subagents: ");
+    try writer.print("No open subagent is named \"{s}\". ", .{agent});
+    try writeOpenRoster(writer, open);
+}
+
+/// Writes the open subagents summary up to `max_named_open` and a count of the
+/// rest, or says none are open.
+pub fn writeOpenRoster(writer: *std.Io.Writer, open: []const []const u8) std.Io.Writer.Error!void {
+    if (open.len == 0) return writer.writeAll("You have no open subagents.");
+    try writer.writeAll("Open subagents: ");
     const named = @min(open.len, max_named_open);
     for (open[0..named], 0..) |name, index| {
         if (index > 0) try writer.writeAll(", ");
@@ -235,6 +251,8 @@ pub fn fromValidation(err: model_contract.ValidationError) Allocator.Error!Refus
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.InvalidAgent => .{ .invalid_agent = .name },
+        error.EmptyAgentList => .{ .invalid_agent = .empty_list },
+        error.TooManyAgents => .{ .invalid_agent = .too_many },
         error.InvalidParentTarget => .{ .invalid_agent = .parent_target },
         error.InvalidReport => .invalid_report,
         error.InvalidParentMessage => .invalid_parent_message,
@@ -260,6 +278,8 @@ const samples = [_]Refusal{
     .invalid_json,
     .{ .invalid_agent = .name },
     .{ .invalid_agent = .parent_target },
+    .{ .invalid_agent = .empty_list },
+    .{ .invalid_agent = .too_many },
     .invalid_message,
     .invalid_instructions,
     .invalid_report,
