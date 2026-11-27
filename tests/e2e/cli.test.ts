@@ -413,7 +413,7 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--] <prompt>
+  fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--stream-events] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--] <prompt>
 
 Options:
   --permission-mode <mode>    Set the permission mode for this request: ask, auto, or full-access
@@ -434,6 +434,7 @@ Options:
   --image PATH                Attach an image file; repeat for multiple images
   --system TEXT               Replace the built-in system prompt for this request
   --json                      Emit machine-readable JSON instead of text
+  --stream-events             Stream JSON Lines lifecycle events on stdout as they happen
   --quiet                     Suppress assistant output
   --prompt-permissions        Prompt for Y/N permission approval when stdin is a TTY
   --timeout <seconds>         Time limit for each shell command the agent runs
@@ -7243,7 +7244,7 @@ describe("cli: error handling", () => {
             "fx ask: --no-save cannot be used with --resume",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save]",
+            "usage: fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--stream-events] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);
@@ -8216,6 +8217,201 @@ describe("fx login Token Pass status", () => {
         expect(reqB.prompt.slice(0, turnIdxB).map((m) => m.content)).toEqual(reqA.prompt.slice(0, turnIdxA).map((m) => m.content));
         expect(JSON.stringify(reqC.prompt.slice(0, turnIdxC))).toBe(JSON.stringify(reqB.prompt.slice(0, turnIdxB)));
       } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --stream-events emits turn_start, tool_start, tool_end, result in order and leaves --json byte-identical",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(workspace, "hello.txt"), "hello from disk\n", "utf8");
+
+      let step = 0;
+      const gateway = startDynamicFakeGateway(async () => {
+        step += 1;
+        if (step % 2 === 1) {
+          return fakeGatewaySse([
+            {
+              type: "tool-call",
+              toolCallId: `call_read_${step}`,
+              toolName: "read_file",
+              input: { path: "hello.txt" },
+            },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]);
+        }
+        return fakeGatewayFinalText("DONE_STREAM_EVENTS");
+      });
+
+      try {
+        const env = {
+          AI_GATEWAY_API_KEY: "fake-ask-stream-events-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          HOME: home,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+
+        const streamed = await runFx(
+          ["ask", "--stream-events", "--full-access", "--model", FAKE_GATEWAY_MODEL, "Read hello.txt"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(streamed.code, streamed.stderr).toBe(0);
+        const rawLines = streamed.stdout.trimEnd().split("\n");
+        expect(rawLines).toHaveLength(4);
+        const events = rawLines.map((line) => JSON.parse(line));
+
+        expect(events[0].type).toBe("turn_start");
+        expect(typeof events[0].session_id).toBe("string");
+        expect(events[0].session_id.length).toBeGreaterThan(0);
+        expect(events[0].model).toBe(FAKE_GATEWAY_MODEL);
+        expect(events[0].provider).toBe("gateway");
+
+        expect(events[1]).toEqual({
+          type: "tool_start",
+          call_id: "call_read_1",
+          name: "read_file",
+          target: "hello.txt",
+        });
+
+        expect(events[2]).toEqual({
+          type: "tool_end",
+          call_id: "call_read_1",
+          name: "read_file",
+          status: "completed",
+        });
+
+        expect(events[3].type).toBe("result");
+        expect(events[3].exit_code).toBe(0);
+        expect(events[3].final_output).toBe("DONE_STREAM_EVENTS");
+        expect(events[3].session_id).toBe(events[0].session_id);
+        expect(events[3].tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+
+        // --json output with --no-save must remain byte-identical across runs.
+        step = 0;
+        const jsonRunA = await runFx(
+          ["ask", "--json", "--no-save", "--full-access", "--model", FAKE_GATEWAY_MODEL, "Read hello.txt"],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(jsonRunA.code, jsonRunA.stderr).toBe(0);
+        const parsedJsonA = JSON.parse(jsonRunA.stdout);
+        const { type: resultType, ...resultWithoutType } = events[3];
+        expect(resultType).toBe("result");
+        expect({ ...resultWithoutType, session_id: "" }).toEqual(parsedJsonA);
+        // Exact canonical shape check for --json stdout.
+        expect(jsonRunA.stdout).toBe(
+          JSON.stringify({
+            output: "DONE_STREAM_EVENTS",
+            final_output: "DONE_STREAM_EVENTS",
+            exit_code: 0,
+            model: FAKE_GATEWAY_MODEL,
+            resolved_provider: null,
+            session_id: "",
+            steps: 1,
+            tool_calls: [{ name: "read_file", status: "success" }],
+            usage: { input_tokens: 3, output_tokens: 5 },
+          }) + "\n",
+        );
+
+        // Conflicting output flags exit 2.
+        for (const conflictArgs of [
+          ["ask", "--stream-events", "--json", "hi"],
+          ["ask", "--stream-events", "--quiet", "hi"],
+          ["ask", "--stream-events", "--raw", "hi"],
+        ]) {
+          const bad = await runFx(conflictArgs, { cwd: workspace, env, timeoutMs: TIMEOUT });
+          expect(bad.code).toBe(2);
+        }
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask --stream-events keeps turn_start and tool_start on stdout and exits 143 on SIGTERM during a slow tool",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = join(home, "workspace");
+      mkdirSync(workspace, { recursive: true });
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          {
+            type: "tool-call",
+            toolCallId: "call_slow_shell",
+            toolName: "shell",
+            input: { action: "run", command: "sleep 10", yield_time_ms: 10000 },
+          },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]),
+      ]);
+      const proc = Bun.spawn(
+        [FX_BIN, "ask", "--stream-events", "--full-access", "--model", FAKE_GATEWAY_MODEL, "Run sleep 10"],
+        {
+          cwd: workspace,
+          env: fxChildEnv({
+            AI_GATEWAY_API_KEY: "fake-ask-sigterm-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            HOME: home,
+            FX_MODEL: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          }),
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+
+      try {
+        const reader = proc.stdout.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        const lines: string[] = [];
+        const deadline = AbortSignal.timeout(TIMEOUT);
+        while (lines.length < 2) {
+          if (deadline.aborted) throw new Error(`Timed out waiting for turn_start and tool_start; got: ${buffer}`);
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let nl = buffer.indexOf("\n");
+          while (nl !== -1) {
+            const line = buffer.slice(0, nl);
+            if (line.length > 0) lines.push(line);
+            buffer = buffer.slice(nl + 1);
+            nl = buffer.indexOf("\n");
+          }
+        }
+        expect(lines.length).toBeGreaterThanOrEqual(2);
+        const turnStart = JSON.parse(lines[0]!);
+        const toolStart = JSON.parse(lines[1]!);
+        expect(turnStart.type).toBe("turn_start");
+        expect(turnStart.session_id.length).toBeGreaterThan(0);
+        expect(toolStart).toEqual({
+          type: "tool_start",
+          call_id: "call_slow_shell",
+          name: "shell",
+          target: "sleep 10",
+        });
+
+        proc.kill("SIGTERM");
+        const exitCode = await proc.exited;
+        expect(exitCode).toBe(143);
+        expect(proc.signalCode).toBe("SIGTERM");
+      } finally {
+        proc.kill("SIGKILL");
         gateway.stop();
         cleanupIsolatedTestHome(home);
       }

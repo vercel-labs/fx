@@ -235,6 +235,7 @@ pub const ask_options = agentRunOptions("this request", .with_provider_order) ++
     .{ .flag = "--image PATH", .description = "Attach an image file; repeat for multiple images" },
     .{ .flag = "--system TEXT", .description = "Replace the built-in system prompt for this request" },
     json_option,
+    .{ .flag = "--stream-events", .description = "Stream JSON Lines lifecycle events on stdout as they happen" },
     .{ .flag = "--quiet", .description = "Suppress assistant output" },
     .{ .flag = "--prompt-permissions", .description = "Prompt for Y/N permission approval when stdin is a TTY" },
     .{ .flag = "--timeout <seconds>", .description = "Time limit for each shell command the agent runs" },
@@ -257,7 +258,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask " ++ agent_run_usage ++ " [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--] <prompt>",
+        .usage = "ask " ++ agent_run_usage ++ " [--image PATH] [--system TEXT] [--json] [--stream-events] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &ask_options,
         .details = &.{
