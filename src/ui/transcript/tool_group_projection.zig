@@ -7528,6 +7528,28 @@ test "a space after a one-step command does not count toward the length that kee
     try expectLiveAndResumedRowsForTest(alloc, &ran, &.{detail}, "● Ran " ++ command ++ " ✓");
 }
 
+test "a failed command sent with a space after it colors the command, not its exit label" {
+    const alloc = std.testing.allocator;
+    // Short enough that its row keeps its text and colors it in place.
+    const command = "ls missing-file";
+    var detail = try spacedCommandDetailForTest(alloc, 1, command ++ " ");
+    defer alloc.free(detail.arguments_json.?);
+    detail.command_action_label = @constCast("Ran");
+    detail.command_process_presentation = .{ .exit_code = 1 };
+    const exited = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 " ++ command ++ " \n", .class = .tool_status } }};
+    var group = try build(alloc, &exited, &.{detail}, 120);
+    defer group.deinit(alloc);
+
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const variant: code_highlight.Theme = if (shared_theme.current().light) .light else .dark;
+    const colored = try code_highlight.highlight(scratch_state.allocator(), command, code_highlight_languages.resolve("sh").?, variant, null);
+    try std.testing.expect(!std.mem.eql(u8, colored, command));
+    const row = group.entry_actions.items[0].override.bytes;
+    const label_at = std.mem.find(u8, row, "Exited 1") orelse return error.TestExpectedExitLabel;
+    try std.testing.expectStringStartsWith(row[label_at..], try std.mem.concat(scratch_state.allocator(), u8, &.{ "Exited 1 ", colored }));
+}
+
 fn knownLabelPrefix(phrase: []const u8) ?usize {
     for (known_multiword_labels) |label| {
         if (std.mem.startsWith(u8, phrase, label) and phrase.len > label.len and phrase[label.len] == ' ')
@@ -7555,12 +7577,10 @@ fn highlightCommandPhrase(
             null
     else
         null;
-    const display_end = if (record.command_display) |display| blk: {
-        if (display.len == 0 or phrase.len <= display.len + 1) break :blk null;
-        if (!std.mem.endsWith(u8, phrase, display)) break :blk null;
-        const split_at = phrase.len - display.len - 1;
-        break :blk if (phrase[split_at] == ' ') split_at else null;
-    } else null;
+    const display_end = if (rowCommandDisplay(record)) |display|
+        if (commandPhraseLabel(phrase, display)) |label| label.len - 1 else null
+    else
+        null;
     const split = label_end orelse display_end orelse knownLabelPrefix(phrase) orelse findByte(phrase, ' ') orelse return null;
     const command = phrase[split + 1 ..];
     if (command.len == 0) return null;
