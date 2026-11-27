@@ -297,13 +297,17 @@ pub const Catalog = struct {
         var matched: std.ArrayList(usize) = .empty;
         defer matched.deinit(alloc);
         var result = try tool_search.rank(alloc, candidates.items, request, limits, if (open) &matched else null);
-        if (open and matched.items.len == 0) result.model_output = try c.withUnavailableLocked(alloc, result.model_output);
+        if (open and matched.items.len == 0) result.model_output = try c.withUnavailableLocked(
+            alloc,
+            result.model_output,
+            limits.mcp_search_result_bytes.effectiveBytes(),
+        );
         return result;
     }
 
     /// `page` saying why each searched server whose list failed, needs a
-    /// login, or is held was skipped.
-    fn withUnavailableLocked(c: *Catalog, alloc: Allocator, page: []u8) ![]u8 {
+    /// login, or is held was skipped, bounded by `max_bytes`.
+    fn withUnavailableLocked(c: *Catalog, alloc: Allocator, page: []u8, max_bytes: usize) ![]u8 {
         var reasons: std.ArrayList([]const u8) = .empty;
         defer {
             for (reasons.items) |reason| alloc.free(reason);
@@ -314,7 +318,7 @@ pub const Catalog = struct {
             reasons.appendAssumeCapacity(try c.unavailableText(alloc, s, l) orelse continue);
         }
         if (reasons.items.len == 0) return page;
-        return tool_search.withUnavailable(alloc, page, reasons.items);
+        return tool_search.withUnavailable(alloc, page, reasons.items, max_bytes);
     }
 
     pub fn toolSchema(
@@ -1926,4 +1930,34 @@ test "a call the server answers with a 401 tells the model it refused the login,
     // A call that gets the 401 with no words from the server still says only that it needs a login.
     const bare = try ended(a, "linear", "mcp_linear_list", .{ .outcome = .needs_auth, .maybe_ran = false, .timed_out = false }, 4096, .terminal, null);
     try testing.expect(std.mem.find(u8, bare.model_output, "MCP server 'linear' needs a login. Ask the user to run fx mcp login linear in a terminal") != null);
+}
+
+test "open search with unavailable servers stays within mcp_search_result_bytes" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{
+        .{ .name = "keyed_a", .transport = .http, .url = "https://example.invalid/a", .bearer_token_env = @constCast("FX_MCP_HOST_TEST_UNSET") },
+        .{ .name = "keyed_b", .transport = .http, .url = "https://example.invalid/b", .bearer_token_env = @constCast("FX_MCP_HOST_TEST_UNSET") },
+        .{ .name = "keyed_c", .transport = .http, .url = "https://example.invalid/c", .bearer_token_env = @constCast("FX_MCP_HOST_TEST_UNSET") },
+    };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var c: Catalog = undefined;
+    try c.init(testing.allocator, testing.io, &r, .{});
+    defer c.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var limits: context_limits.Values = .{};
+    limits.mcp_search_result_bytes.value = .{ .bytes = 220 };
+    const query = try lexical_relevance.prepare("issues");
+    const open = try c.searchTools(a, .{ .query = &query, .kind = .mcp }, .{}, limits, .unrestricted, null);
+    try testing.expect(open.model_output.len <= 220);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, open.model_output, .{});
+    defer parsed.deinit();
+    const unavailable = parsed.value.object.get("unavailable").?.array.items;
+    try testing.expectEqual(@as(usize, 1), unavailable.len);
 }

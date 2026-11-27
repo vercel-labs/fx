@@ -23,18 +23,32 @@ pub fn renderServerNotFound(alloc: Allocator) ![]u8 {
 }
 
 /// `page`, a search's JSON object, with why each server it couldn't look in
-/// was skipped, so a model that found nothing hears why. Takes `page`.
-pub fn withUnavailable(alloc: Allocator, page: []u8, reasons: []const []const u8) ![]u8 {
-    if (page.len == 0 or page[page.len - 1] != '}') return page;
+/// was skipped, so a model that found nothing hears why, bounded by `max_bytes`.
+/// Takes `page`.
+pub fn withUnavailable(alloc: Allocator, page: []u8, reasons: []const []const u8, max_bytes: usize) ![]u8 {
+    if (reasons.len == 0 or page.len == 0 or page[page.len - 1] != '}') return page;
+    const prefix_len = page.len - 1;
+    const header = ",\"unavailable\":[";
+    const trailer = "]}";
+    if (prefix_len + header.len + trailer.len > max_bytes) return page;
+
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.writeAll(page[0 .. page.len - 1]);
-    try out.writer.writeAll(",\"unavailable\":[");
-    for (reasons, 0..) |reason, i| {
-        if (i > 0) try out.writer.writeByte(',');
-        try writeEncodedJsonScalar(alloc, &out.writer, reason);
+    try out.writer.writeAll(page[0..prefix_len]);
+    try out.writer.writeAll(header);
+
+    var added: usize = 0;
+    for (reasons) |reason| {
+        var item: std.Io.Writer.Allocating = .init(alloc);
+        defer item.deinit();
+        if (added > 0) try item.writer.writeByte(',');
+        try writeEncodedJsonScalar(alloc, &item.writer, reason);
+        if (out.written().len + item.written().len + trailer.len > max_bytes) break;
+        try out.writer.writeAll(item.written());
+        added += 1;
     }
-    try out.writer.writeAll("]}");
+    if (added == 0) return page;
+    try out.writer.writeAll(trailer);
     const result = try out.toOwnedSlice();
     alloc.free(page);
     return result;
@@ -44,7 +58,7 @@ test "a page that matched nothing names the servers the search couldn't look in"
     const alloc = std.testing.allocator;
     const page = try alloc.dupe(u8, "{\"tools\":[],\"count\":0}");
     // Text for the model is encoded as everywhere else on the page.
-    const out = try withUnavailable(alloc, page, &.{ "MCP server 'linear' needs a login.", "MCP server 'say \"hi\"' is unavailable: it did not start" });
+    const out = try withUnavailable(alloc, page, &.{ "MCP server 'linear' needs a login.", "MCP server 'say \"hi\"' is unavailable: it did not start" }, 4096);
     defer alloc.free(out);
     try std.testing.expectEqualStrings(
         "{\"tools\":[],\"count\":0,\"unavailable\":[\"MCP server 'linear' needs a login.\",\"MCP server 'say &quot;hi&quot;' is unavailable: it did not start\"]}",

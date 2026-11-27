@@ -8,6 +8,11 @@ const tool_result_limits = @import("../../core/tooling/tool_result_limits.zig");
 const skill_search = @import("../skills/skill_search.zig");
 
 const Allocator = std.mem.Allocator;
+/// Bytes reserved for `renderCombined`'s wrapper fields and counts so a
+/// domain-bounded page still fits inside `output_cap` once wrapped.
+const combined_wrapper_reserve_bytes: usize = 512;
+const min_wrapper_reserve_bytes: usize = 128;
+
 /// Searches skills and MCP tools for `request`, as toolbox search answers.
 /// A request that loads schemas reports the MCP tools it loaded as selected
 /// for the next step.
@@ -21,10 +26,17 @@ pub fn search(
     );
     const searches_skills = request.includes(.skill);
     const searches_mcp = request.includes(.mcp);
-    const domain_cap = if (searches_skills and searches_mcp and output_cap > 512)
-        (output_cap - 512) / 2
+    const wrapper_reserve = if (output_cap > combined_wrapper_reserve_bytes)
+        combined_wrapper_reserve_bytes
+    else if (output_cap > min_wrapper_reserve_bytes)
+        min_wrapper_reserve_bytes
     else
-        output_cap;
+        0;
+    const available_cap = output_cap - wrapper_reserve;
+    const domain_cap = if (searches_skills and searches_mcp)
+        available_cap / 2
+    else
+        available_cap;
     var skill_result: ?skill_search.SearchResult = null;
     if (searches_skills) {
         skill_result = skill_search.searchRequest(ctx, request, domain_cap) catch |err| switch (err) {
@@ -302,4 +314,158 @@ fn testSkillResult(output: []const u8, count: usize, total_matches: usize) skill
         .count = count,
         .total_matches = total_matches,
     };
+}
+
+test "MCP-only search reserves combined wrapper overhead so a page near output_cap still fits" {
+    const alloc = std.testing.allocator;
+    const mcp_catalog = @import("../../core/mcp/catalog_state.zig");
+    const tool_search = @import("../../core/mcp/tool_search.zig");
+    const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
+    const context_limits = @import("../../core/config/context_limits.zig");
+    const types = @import("../../core/shared/types.zig");
+
+    const FakeMcp = struct {
+        candidates: []const tool_search.Candidate,
+
+        fn searchTools(
+            raw: *anyopaque,
+            gpa: Allocator,
+            request: tool_mcp_runtime.SearchRequest,
+            _: types.PermissionRuleSet,
+            limits: context_limits.Values,
+            _: tool_mcp_runtime.Access,
+            _: ?*std.atomic.Value(bool),
+        ) anyerror!tool_mcp_runtime.SearchResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return tool_search.rank(gpa, self.candidates, request, limits, null);
+        }
+    };
+
+    const tool_count = 14;
+    var names: [tool_count][18]u8 = undefined;
+    var desc_buf: [1520]u8 = @splat('d');
+    const schema_pad: [422]u8 = @splat('s');
+    var schema_buf: [600]u8 = undefined;
+    const schema = try std.mem.print(
+        &schema_buf,
+        "{{\"type\":\"object\",\"properties\":{{\"text\":{{\"type\":\"string\",\"description\":\"{s}\"}}}},\"required\":[\"text\"]}}",
+        .{&schema_pad},
+    );
+    var tools: [tool_count]mcp_catalog.McpTool = undefined;
+    var candidates: [tool_count]tool_search.Candidate = undefined;
+    for (0..tool_count) |i| {
+        const name = try std.mem.print(&names[i], "mcp_srv_tool_{d:0>2}", .{i});
+        tools[i] = .{
+            .original_name = name[8..],
+            .prefixed_name = name,
+            .description = desc_buf[0..1024],
+            .input_schema_json = schema,
+            .tags = &.{},
+        };
+        candidates[i] = .{
+            .server_name = "srv",
+            .instructions = null,
+            .tool = &tools[i],
+            .binding = .{ .runtime_generation = 1, .connection_generation = 1, .catalog_generation = 1, .auth_generation = 1 },
+        };
+    }
+    var fake: FakeMcp = .{ .candidates = &candidates };
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = alloc,
+        .max_tool_result_bytes = result_store.large_result_threshold_bytes,
+        .mcp_ctx = &fake,
+        .mcp_search_tools = FakeMcp.searchTools,
+    };
+    const query = try lexical_relevance.prepare("");
+    const result = try search(ctx, .{
+        .query = &query,
+        .kind = .all,
+        .server = "srv",
+        .limit = 10,
+        .load_schemas = false,
+        .schemas_in_result = true,
+    });
+    defer result.deinit(alloc);
+
+    switch (result) {
+        .success => |text| {
+            try std.testing.expect(text.len <= result_store.large_result_threshold_bytes);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, text, .{});
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value.object.get("mcp_tools").?.array.items.len > 0);
+        },
+        .failure => |text| {
+            std.debug.print("unexpected failure: {s}\n", .{text});
+            return error.TestUnexpectedResult;
+        },
+        .rich => return error.TestUnexpectedResult,
+    }
+}
+
+test "unavailable servers in an MCP search keep combined output within output_cap" {
+    const alloc = std.testing.allocator;
+    const tool_search = @import("../../core/mcp/tool_search.zig");
+    const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
+    const context_limits = @import("../../core/config/context_limits.zig");
+    const types = @import("../../core/shared/types.zig");
+
+    const FakeMcp = struct {
+        fn searchTools(
+            _: *anyopaque,
+            gpa: Allocator,
+            request: tool_mcp_runtime.SearchRequest,
+            _: types.PermissionRuleSet,
+            limits: context_limits.Values,
+            _: tool_mcp_runtime.Access,
+            _: ?*std.atomic.Value(bool),
+        ) anyerror!tool_mcp_runtime.SearchResult {
+            var res = try tool_search.rank(gpa, &.{}, request, limits, null);
+            errdefer res.deinit(gpa);
+            const pad: [60]u8 = @splat('r');
+            var buf_a: [128]u8 = undefined;
+            var buf_b: [128]u8 = undefined;
+            const reason_a = try std.mem.print(&buf_a, "MCP server 'alpha' is unavailable: {s}", .{&pad});
+            const reason_b = try std.mem.print(&buf_b, "MCP server 'beta' is unavailable: {s}", .{&pad});
+            res.model_output = try tool_search.withUnavailable(
+                gpa,
+                res.model_output,
+                &.{ reason_a, reason_b },
+                limits.mcp_search_result_bytes.effectiveBytes(),
+            );
+            return res;
+        }
+    };
+
+    var dummy: u8 = 0;
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = alloc,
+        .max_tool_result_bytes = 340,
+        .mcp_ctx = &dummy,
+        .mcp_search_tools = FakeMcp.searchTools,
+    };
+    const query = try lexical_relevance.prepare("anything");
+    const result = try search(ctx, .{
+        .query = &query,
+        .kind = .mcp,
+        .limit = 10,
+        .load_schemas = false,
+        .schemas_in_result = true,
+    });
+    defer result.deinit(alloc);
+
+    switch (result) {
+        .success => |text| {
+            try std.testing.expect(text.len <= 340);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, text, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("no_match", parsed.value.object.get("state").?.string);
+            const unavailable = parsed.value.object.get("mcp_unavailable") orelse return error.MissingUnavailable;
+            try std.testing.expectEqual(@as(usize, 1), unavailable.array.items.len);
+        },
+        .failure => |text| {
+            std.debug.print("unexpected failure: {s}\n", .{text});
+            return error.TestUnexpectedResult;
+        },
+        .rich => return error.TestUnexpectedResult,
+    }
 }
