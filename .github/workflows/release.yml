@@ -34,6 +34,8 @@ jobs:
         id: check
         env:
           VALIDATE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.validate_only }}
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
           VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
           if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
@@ -42,6 +44,13 @@ jobs:
           fi
           TAG="v${VERSION}"
           echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+          # Only the push that changes the version, the release PR's merge,
+          # starts a release. Later pushes would build newer code under the
+          # same version; run this workflow by hand to retry a release.
+          PREVIOUS=""
+          if [[ "$EVENT_NAME" == push ]]; then
+            PREVIOUS=$(git show "${BEFORE_SHA}:src/main.zig" 2>/dev/null | grep 'pub const version' | head -1 | sed 's/.*"\(.*\)".*/\1/' || true)
+          fi
           if [[ "$VALIDATE_ONLY" == true ]]; then
             echo "needed=true" >> "$GITHUB_OUTPUT"
             echo "publish=false" >> "$GITHUB_OUTPUT"
@@ -50,6 +59,10 @@ jobs:
             echo "needed=false" >> "$GITHUB_OUTPUT"
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "Tag ${TAG} exists, no release needed"
+          elif [[ -n "$PREVIOUS" && "$PREVIOUS" == "$VERSION" ]]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Version ${TAG} did not change in this push, no release needed"
           else
             echo "needed=true" >> "$GITHUB_OUTPUT"
             echo "publish=true" >> "$GITHUB_OUTPUT"

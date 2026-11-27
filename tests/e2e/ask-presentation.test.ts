@@ -25,11 +25,13 @@ import {
   fakeGatewaySerializedToolCall,
   fakeGatewayToolCall,
   fakeShellRun,
+  heldFakeGatewayFinalText,
   startDynamicFakeGateway,
   startFakeGateway,
   terminalFixtureShell,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -564,6 +566,235 @@ describe("fx ask presentation", () => {
       expect(pane).not.toContain("# Ask presentation");
       expect(pane).not.toContain("**bold**");
       expect(escaped).toContain("\x1b[");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "ask in a terminal stream error after a partial line keeps the committed text once",
+    async () => {
+      const root = createRoot();
+      const finalText = "A complete replacement response.";
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          { type: "text-delta", id: "answer_1", delta: "Streaming **bold" },
+          { type: "finish", finishReason: { unified: "error", raw: "provider_error" } },
+        ]),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateways.push(gateway);
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--auto", "--no-save", "Fail mid line."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+
+      expect(scrollback.split(finalText).length - 1).toBe(1);
+      expect(scrollback.split("Streaming **bold").length - 1).toBe(1);
+      expect(scrollback).not.toContain("Streaming bold");
+    },
+    TIMEOUT * 2,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "ask in a terminal Ctrl+C on a partial line commits the held text once and leaves no tail",
+    async () => {
+      const root = createRoot();
+      const held = heldFakeGatewayFinalText();
+      const gateway = startFakeGateway([() => held.response]);
+      gateways.push(gateway);
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--auto", "--no-save", "Cancel mid line."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+      held.send("Streaming **bold");
+      await session.waitForText("Streaming bold", TIMEOUT);
+      await session.sendKeys("C-c");
+      await session.waitForText("Streaming **bold", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      held.dispose();
+
+      expect(scrollback.split("Streaming **bold").length - 1).toBe(1);
+      expect(scrollback).not.toContain("Streaming bold");
+    },
+    TIMEOUT * 2,
+  );
+
+  // tmux's "Pane is dead" row is not fx's output. tmux draws it only once
+  // it has the command's exit status, which can come after it marks the
+  // pane dead, and on CI it can still be missing when the capture runs.
+  // So the rows leave it out, with the blank rows after fx's output. Only
+  // the exact row goes, so another row that starts with the same words stays.
+  const tmuxDeadPaneRow = /^Pane is dead \(status \d+, [^)]*\)$/;
+  // tmux's default `remain-on-exit-format`, the same in tmux 3.4, 3.6 and
+  // 3.6a. It draws the rows that `tmuxDeadPaneRow` matches.
+  const tmuxDeadPaneFormat =
+    "Pane is dead (#{?#{!=:#{pane_dead_status},},status #{pane_dead_status},}" +
+    "#{?#{!=:#{pane_dead_signal},},signal #{pane_dead_signal},}, #{t:pane_dead_time})";
+  const rowsOf = (text: string) => {
+    const rows = text
+      .replace(/\b\d+(?:h\d+m\d+s|m\d+s|s)\b/g, "Ns")
+      .replace(/↑\d+(?:\.\d+)?k? ↓\d+(?:\.\d+)?k?/g, "↑N ↓N")
+      .split("\n")
+      .map((row) => row.trimEnd())
+      .filter((row) => !tmuxDeadPaneRow.test(row));
+    while (rows.length > 0 && rows[rows.length - 1] === "") rows.pop();
+    return rows;
+  };
+  // A run is over once the shell prints its exit marker and tmux marks
+  // the pane dead, which it does after it reads the last output. A
+  // session that is gone can show no marker, so the wait fails at once
+  // then, and it gives up well before the test's own timeout, so a
+  // failure shows the pane.
+  const waitForExit = async (target: TmuxSession) => {
+    await target.waitForPane((pane) => {
+      if (pane.includes("__FX_EXIT_0__")) return true;
+      if (!target.isAlive()) throw new Error(`${target.name} ended before it showed its exit marker`);
+      return false;
+    }, 10_000);
+    await target.waitForPane(() => target.paneStatus().dead, 10_000);
+  };
+
+  test("screen rows leave out only tmux's own Pane is dead row", () => {
+    const ownRow = "Pane is dead is a row at column 0 that tmux did not draw.";
+    // The rows tmux 3.4 and 3.6a draw when the pane's command exits.
+    expect(rowsOf(`${ownRow}\n__FX_EXIT_0__\n\nPane is dead (status 0, Wed Nov 25 21:27:52 2026)\n\n`))
+      .toEqual([ownRow, "__FX_EXIT_0__"]);
+    expect(rowsOf(`${ownRow}\n__FX_EXIT_3__\n\nPane is dead (status 3, Thu Nov  5 09:07:02 2026)\n`))
+      .toEqual([ownRow, "__FX_EXIT_3__"]);
+    expect(rowsOf("")).toEqual([]);
+    // A row for a pane that a signal ended stays. Each run in these tests
+    // exits with status 0 after its exit marker, so a signal row means the run
+    // did not end cleanly, and the comparison shows it instead of hiding it.
+    const signalRow = "Pane is dead (signal 15, Wed Nov 25 21:27:52 2026)";
+    expect(rowsOf(`${ownRow}\n\n${signalRow}\n`)).toEqual([ownRow, "", signalRow]);
+  });
+
+  test.skipIf(!tmuxAvailable())(
+    "ask in a terminal keeps its own Pane is dead row and drops tmux's in the screen rows",
+    async () => {
+      const root = createRoot();
+      const reply = "Pane is dead is a row fx wrote.";
+      const gateway = startFakeGateway([fakeGatewayFinalText(`First row.\n\n${reply}\n`)]);
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--auto", "--no-save", "Write the row."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+      await waitForExit(session);
+      const rows = rowsOf(await session.captureFullScrollback());
+
+      // fx indents its reply rows by two columns.
+      expect(rows).toContain(`  ${reply}`);
+      // tmux may not have drawn its row yet, so the format is checked as text.
+      // Its expansion would not help: tmux fills in the status and time at the
+      // same moment it draws the row.
+      expect(session.remainOnExitFormat()).toBe(tmuxDeadPaneFormat);
+      // A row tmux did draw matches the pattern, so it is not left.
+      expect(rows.filter((row) => row.startsWith("Pane is dead ("))).toEqual([]);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "ask in a terminal shows streamed words formatted before their line ends",
+    async () => {
+      const root = createRoot();
+      const prompt = "Stream the formatted reply.";
+      const calibration = "Calibration **bold** line.\n\n";
+      const streamedLine = "Streaming **bold";
+      const streamedRest = " words** and `code` here.\n\n| a | b |";
+      const ending = "\n|---|---|\n| 1 | 2 |\n\nDone.\n";
+      const fullReply = `${calibration}${streamedLine}${streamedRest}${ending}`;
+      const boldSgr = /\x1b\[(?:[0-9;]*;)?1(?:;[0-9;]*)?m/;
+      const sgrBeforeBold = (row: string) =>
+        row.slice(0, row.indexOf("bold")).match(/(?:\x1b\[[0-9;]*m)+$/)?.[0] ?? "";
+      const startAsk = async (
+        gateway: ReturnType<typeof startFakeGateway>,
+        label: string,
+      ) => {
+        const stderrPath = join(root.root, `${label}-stderr.log`);
+        writeFileSync(stderrPath, "");
+        const session = await TmuxSession.create({
+          isolated: true,
+          cmd: terminalCommand(["ask", "--auto", "--no-save", prompt]),
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+          width: 120,
+          height: 40,
+          remainOnExit: true,
+          stderrPath,
+        });
+        sessions.push(session);
+        return { session, stderrPath };
+      };
+
+      const held = heldFakeGatewayFinalText();
+      const heldGateway = startFakeGateway([() => held.response]);
+      gateways.push(heldGateway);
+      const { session, stderrPath } = await startAsk(heldGateway, "streamed");
+      held.send(calibration);
+      await session.waitForText("Calibration bold line.", TIMEOUT);
+      held.send(streamedLine);
+      await session.waitForText("Streaming bold", 5_000);
+
+      const escapedMid = await session.captureFullScrollbackEscapes();
+      const plainMid = await session.captureFullScrollback();
+      expect(plainMid).not.toContain("**");
+      const calibrationRow =
+        escapedMid.split("\n").find((row) => row.includes("Calibration")) ?? "";
+      const streamedRow =
+        escapedMid.split("\n").find((row) => row.includes("Streaming")) ?? "";
+      expect(sgrBeforeBold(calibrationRow)).toMatch(boldSgr);
+      expect(sgrBeforeBold(streamedRow)).toBe(sgrBeforeBold(calibrationRow));
+
+      held.send(streamedRest);
+      await session.waitForText("words", TIMEOUT);
+      await session.waitForText("code", TIMEOUT);
+      const plainPartial = await session.captureFullScrollback();
+      expect(plainPartial).not.toContain("**");
+      expect(plainPartial).not.toContain("`");
+      expect(
+        plainPartial.split("\n").some((row) => row.trimStart().startsWith("| a")),
+      ).toBe(false);
+
+      held.send(ending);
+      held.release("");
+      await waitForExit(session);
+      const streamed = await session.captureFullScrollback();
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      const onePieceGateway = startFakeGateway([fakeGatewayFinalText(fullReply)]);
+      gateways.push(onePieceGateway);
+      const onePiece = await startAsk(onePieceGateway, "one-piece");
+      await waitForExit(onePiece.session);
+      expect(rowsOf(streamed)).toEqual(
+        rowsOf(await onePiece.session.captureFullScrollback()),
+      );
     },
     TIMEOUT,
   );
@@ -1242,6 +1473,50 @@ describe("fx ask presentation", () => {
     },
     TIMEOUT,
   );
+
+  // `fx ask` shows no question, so the prose before one ends its line as it
+  // does before any other tool.
+  const ASK_QUESTION = { questions: [{ question: "Choose next step?", options: [{ label: "Run tests" }, { label: "Stop" }] }] };
+  for (const [placement, settings, call] of [
+    ["direct", {}, { name: "ask_user_question", input: ASK_QUESTION }],
+    ["toolbox", { tool_placement: { ask_user_question: "toolbox" } }, { name: "toolbox", input: { run: "ask_user_question", arguments: ASK_QUESTION } }],
+  ] as const) {
+    test.skipIf(!tmuxAvailable())(
+      `ask in a terminal ends the prose line before a ${placement} question`,
+      async () => {
+        const root = createShortRoot();
+        mkdirSync(join(root.home, ".fx"), { recursive: true });
+        writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify(settings));
+        const gateway = startFakeGateway([
+          fakeGatewaySse([
+            { type: "text-delta", id: "prose_1", delta: "One question first." },
+            { type: "tool-call", toolCallId: "ask_1", toolName: call.name, input: call.input },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]),
+          fakeGatewayFinalText("Done after the question."),
+        ]);
+        gateways.push(gateway);
+
+        const session = await TmuxSession.create({
+          isolated: true,
+          cmd: terminalCommand(["ask", "--no-save", "Ask me, then finish."]),
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root.home, gateway), NO_COLOR: "1" },
+          width: 100,
+          height: 30,
+          remainOnExit: true,
+        });
+        sessions.push(session);
+
+        await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+        const rows = (await session.captureFullScrollback()).split("\n").map((row) => row.trimEnd());
+        const prose = rows.indexOf("  One question first.");
+        expect(prose, rows.join("\n")).toBeGreaterThan(0);
+        expect(rows[prose + 1]).toBe("  Done after the question.");
+      },
+      TIMEOUT,
+    );
+  }
 });
 
 // Both login shells read these files, so the tests hold for zsh and bash.
@@ -1456,7 +1731,7 @@ describe("fx ask shell startup files", () => {
       try {
         await session.waitForComposer(TIMEOUT);
         await session.sendText("Check the secret.");
-        await session.waitForText("SECRET_CHECK_DONE", TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("SECRET_CHECK_DONE") && turnSettled(pane), TIMEOUT);
         await session.sendText("/trace");
         await session.waitForText("Trace saved at", TIMEOUT);
       } finally {
