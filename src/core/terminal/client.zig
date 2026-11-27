@@ -668,27 +668,19 @@ pub const Runtime = struct {
 
 fn ignoreLiveWork(_: ?*anyopaque, _: bool) void {}
 
+/// Test builds only: runs with the lock free, after a worker registers a request and before its thread starts. Set by "a cancel that lands right after the worker takes a request is not lost".
+var test_after_take: if (builtin.is_test) ?*const fn (runtime: *Runtime, correlation_id: contracts.CorrelationId) void else void = if (builtin.is_test) null else {};
+
 fn workerMain(runtime: *Runtime) void {
     const alloc = runtime.alloc.?;
     while (true) {
-        const intent = takeIntent(runtime) orelse return;
-        const worker = alloc.create(RequestWorker) catch {
-            finishUnstarted(runtime, alloc, intent);
-            continue;
+        const spare = alloc.create(RequestWorker) catch null;
+        const worker = switch (takeAndRegister(runtime, spare)) {
+            .stopped => return,
+            .unstarted => continue,
+            .started => |started| started,
         };
-        worker.* = .{ .runtime = runtime, .intent = intent };
-
-        const zio = io_mod.getIo();
-        runtime.mutex.lockUncancelable(zio);
-        const slot = runtime.registerWorkerLocked(worker);
-        if (slot) |index| worker.slot = index;
-        runtime.mutex.unlock(zio);
-        if (slot == null) {
-            const unstarted = worker.intent;
-            alloc.destroy(worker);
-            finishUnstarted(runtime, alloc, unstarted);
-            continue;
-        }
+        if (builtin.is_test) if (test_after_take) |hook| hook(runtime, worker.intent.correlation_id);
         // Tickets are issued here, in admission order, before any worker of
         // a later request can run.
         if (operation.requiresOrderedMutation(worker.intent.request.value)) {
@@ -857,32 +849,55 @@ fn persistCancellation(backend: *Backend, request: contracts.ActionRequest) void
     };
 }
 
-fn finishUnstarted(
-    runtime: *Runtime,
-    alloc: Allocator,
-    intent_value: Intent,
-) void {
-    var intent = intent_value;
-    const correlation_id = intent.correlation_id;
-    intent.deinit(alloc);
-    const zio = io_mod.getIo();
-    runtime.mutex.lockUncancelable(zio);
-    defer runtime.mutex.unlock(zio);
-    runtime.completions.push(.{
-        .kind = .disconnected,
-        .correlation_id = correlation_id,
-    });
-}
+const Taken = union(enum) {
+    stopped,
+    unstarted,
+    started: *RequestWorker,
+};
 
-fn takeIntent(runtime: *Runtime) ?Intent {
+/// Waits for work, then takes the next request and registers its worker in
+/// one hold of `runtime.mutex`. `cancel` therefore finds the request in the
+/// queue or the active table at every moment the lock is free. `spare` is the
+/// worker allocated before the hold, or null if that allocation failed. It
+/// is freed when it is not registered.
+fn takeAndRegister(runtime: *Runtime, spare: ?*RequestWorker) Taken {
+    const alloc = runtime.alloc.?;
     const zio = io_mod.getIo();
     runtime.mutex.lockUncancelable(zio);
     defer runtime.mutex.unlock(zio);
     while (runtime.queue.len == 0 and !runtime.stopping) {
         runtime.wake.waitUncancelable(zio, &runtime.mutex);
     }
-    if (runtime.stopping) return null;
-    return runtime.queue.take();
+    const intent = (if (runtime.stopping) null else runtime.queue.take()) orelse {
+        if (spare) |worker| alloc.destroy(worker);
+        return .stopped;
+    };
+    const worker = spare orelse return finishUnstartedLocked(runtime, intent, "allocation failed");
+    worker.* = .{ .runtime = runtime, .intent = intent };
+    if (runtime.registerWorkerLocked(worker)) |index| {
+        worker.slot = index;
+        return .{ .started = worker };
+    }
+    alloc.destroy(worker);
+    return finishUnstartedLocked(runtime, intent, "no free worker slot");
+}
+
+/// Ends a request that got no worker. It runs under `runtime.mutex`, so the
+/// request never leaves the queue without a completion while the lock is free.
+fn finishUnstartedLocked(runtime: *Runtime, intent_value: Intent, reason: []const u8) Taken {
+    var intent = intent_value;
+    const correlation_id = intent.correlation_id;
+    debug_trace.logf(
+        "terminal_client",
+        "request dropped unstarted correlation={d} reason={s}",
+        .{ correlation_id.value, reason },
+    );
+    intent.deinit(runtime.alloc.?);
+    runtime.completions.push(.{
+        .kind = .disconnected,
+        .correlation_id = correlation_id,
+    });
+    return .unstarted;
 }
 
 var file_descriptor_budget_checked: std.atomic.Value(bool) = .init(false);
@@ -1050,14 +1065,10 @@ test "runtime correlation stays reserved until its completion is taken" {
     // Finishing frees the worker and its intent; the testing allocator
     // reports a leak or a double free if it doesn't free them exactly once.
     const worker = try std.testing.allocator.create(RequestWorker);
-    worker.* = .{
-        .runtime = &runtime,
-        .intent = takeIntent(&runtime).?,
-    };
-    const zio = io_mod.getIo();
-    runtime.mutex.lockUncancelable(zio);
-    worker.slot = runtime.registerWorkerLocked(worker).?;
-    runtime.mutex.unlock(zio);
+    try std.testing.expectEqual(
+        Taken{ .started = worker },
+        takeAndRegister(&runtime, worker),
+    );
     try std.testing.expectError(
         error.DuplicateCorrelation,
         admitTestIntent(&runtime, 23),
@@ -1615,6 +1626,34 @@ test "cancelling a start after its terminal launched closes that terminal" {
         contracts.Lifecycle.closed,
         try fixture.recordedLifecycle(session_id),
     );
+}
+
+test "a cancel that lands right after the worker takes a request is not lost" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    const CancelOnTake = struct {
+        var cancel_returned = false;
+
+        fn cancelOnTake(runtime: *Runtime, correlation_id: contracts.CorrelationId) void {
+            cancel_returned = runtime.cancel(correlation_id);
+        }
+    };
+    test_after_take = &CancelOnTake.cancelOnTake;
+    defer test_after_take = null;
+
+    // A screen read starts no terminal, so the test depends only on the cancel
+    // and the completion.
+    const correlation_id = fixture.runtime.nextCorrelationId();
+    try fixture.runtime.admit(std.testing.allocator, correlation_id, .{ .screen = .{
+        .session_id = "terminal-1",
+    } });
+    var completion = try fixture.awaitCompletion(correlation_id, 15_000);
+    defer completion.deinit();
+
+    try std.testing.expectEqual(true, CancelOnTake.cancel_returned);
+    try std.testing.expectEqual(CompletionKind.cancelled, completion.kind);
 }
 
 /// The command of a terminal that stays idle until the fixture ends it. It

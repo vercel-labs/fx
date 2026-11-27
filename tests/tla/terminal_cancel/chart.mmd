@@ -1,0 +1,23 @@
+stateDiagram-v2
+    [*] --> Queued : you send a command (admit)
+    Queued --> Taken : current, mutant_a: worker takes the request (lock released)
+    Taken --> Running : current, mutant_a: worker allocates and registers it
+    Taken --> Disconnected : current, mutant_a: no free slot, or allocation fails
+    Taken --> LostCancel : current, mutant_a: you cancel while it is taken (cancel returns false) [breaks CancelIsSeen]
+    LostCancel --> Responded : the request runs to its end, ignoring your cancel
+    Queued --> Running : design_a: worker takes and registers in one hold
+    Queued --> Disconnected : design_a: no free slot, or allocation fails, in that same hold
+    Queued --> Cancelled : you cancel while queued (cancel returns true)
+    Running --> Cancelled : you cancel while running (flag set)
+    Running --> Responded : the run ends before a cancel
+    Responded --> [*]
+    Cancelled --> [*]
+    Disconnected --> [*]
+    note right of LostCancel
+        Shortest path (current, and mutant_a, which splits the hold again):
+        Queued -> Taken -> LostCancel -> Responded
+    end note
+    %% Left out of this chart, as in the model:
+    %%   - a request still queued at shutdown
+    %%   - ordered-mutation tickets and spawn failure
+    %%   - admit refused after shutdown (caller reports cancelled at once)
