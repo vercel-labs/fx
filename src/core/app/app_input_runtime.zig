@@ -993,6 +993,11 @@ pub fn Runtime(comptime App: type) type {
             // first, as Esc, in `routeAgentsMenuInput`.
             if (resolved == .open_agent_list) {
                 if (comptime @hasDecl(App, "openAgentsMenu")) {
+                    const screen_agent = agents.screenAgentOf(app);
+                    if (forkMenuAsking(screen_agent)) {
+                        debug_trace.logf("input", "open_agent_list refused reason=fork_question", .{});
+                        return .done;
+                    }
                     if (agentsMenuRefusal(app)) |reason| {
                         // The key is gone, and the trace is the only record:
                         // the footer shows the switch key itself only once
@@ -1000,7 +1005,7 @@ pub fn Runtime(comptime App: type) type {
                         debug_trace.logf("input", "open_agent_list refused reason={s}", .{reason});
                         return .done;
                     }
-                    dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
+                    dismissActiveMenusThenRedraw(app, screen_agent);
                     // The list sets the draft aside itself, so the model
                     // picker's goes back to the composer first.
                     restoreModelPickerDraft(app);
@@ -9574,6 +9579,10 @@ test "app_input_runtime blocks shift+tab, ctrl+r, and stray edits while fork men
     _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(&app, .paste_end, null, null, null, false, 4096);
     try std.testing.expect(app.agent().session_persistence.fork_menu.asking());
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+
+    // Ctrl+X must not open the agent list behind the fork question.
+    _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(&app, .open_agent_list, null, null, null, false, 4096);
+    try std.testing.expect(app.agent().session_persistence.fork_menu.asking());
 }
 
 test "app_input_runtime ctrl+c while the picker borrows the composer keeps the stashed draft and its image" {
