@@ -1595,6 +1595,24 @@ fn createSkillSymlinkOrSkip(
     };
 }
 
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+fn createSkillFifoOrSkip(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []const u8) !void {
+    if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| {
+        try tmp.dir.createDirPath(io_mod.getIo(), parent);
+    }
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, sub_path });
+    defer alloc.free(path);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_z = try std.mem.printSentinel(&path_buf, "{s}", .{path}, 0);
+    if (mkfifo(path_z, 0o600) != 0) return error.SkipZigTest;
+}
+
 test "skill resource loading rejects symlink components and candidate rebinding" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1646,6 +1664,162 @@ test "skill resource loading rejects symlink components and candidate rebinding"
     try tmp.dir.rename("root/workflow", tmp.dir, "root/original-workflow", io_mod.getIo());
     try createSkillSymlinkOrSkip(tmp.dir, "../outside", "root/workflow", true);
     try expectSkillResourceRejected(alloc, root, "SKILL.md");
+}
+
+test "skill resource read refuses FIFO resource and FIFO SKILL.md without blocking" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "skills/demo/nested");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "skills/demo/SKILL.md", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "---\nname: demo\ndescription: demo\n---\n\nDEMO_BODY\n");
+    }
+    try createSkillFifoOrSkip(alloc, &tmp, "skills/demo/pipe");
+    try createSkillFifoOrSkip(alloc, &tmp, "skills/demo/nested/pipe");
+    try createSkillFifoOrSkip(alloc, &tmp, "skills/fifo-main/SKILL.md");
+
+    const demo_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "skills/demo");
+    defer alloc.free(demo_path);
+    const demo_skills = [_]skill_runtime.Skill{.{
+        .name = "demo",
+        .description = "demo",
+        .path = demo_path,
+        .source = .workspace_shared,
+    }};
+    const demo_catalog: Catalog = .{ .skills = &demo_skills };
+
+    try std.testing.expectError(
+        error.SkillResourceNotRegularFile,
+        loadWholeRawByLocation(alloc, demo_catalog, demo_path, "pipe", .{}, null),
+    );
+    try std.testing.expectError(
+        error.SkillResourceNotRegularFile,
+        loadWholeByLocation(alloc, demo_catalog, demo_path, "pipe", .{}, null, null),
+    );
+    try std.testing.expectError(
+        error.SkillResourceNotRegularFile,
+        loadByIdentity(alloc, demo_catalog, "demo", demo_path, "pipe", 0, .{}, null),
+    );
+    try std.testing.expectError(
+        error.SkillResourceNotRegularFile,
+        loadWholeRawByLocation(alloc, demo_catalog, demo_path, "nested/pipe", .{}, null),
+    );
+    try std.testing.expectError(
+        error.SkillResourceNotRegularFile,
+        loadWholeByLocation(alloc, demo_catalog, demo_path, "nested/pipe", .{}, null, null),
+    );
+
+    const fifo_main_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "skills/fifo-main");
+    defer alloc.free(fifo_main_path);
+    const fifo_skills = [_]skill_runtime.Skill{.{
+        .name = "fifo-main",
+        .description = "fifo",
+        .path = fifo_main_path,
+        .source = .workspace_shared,
+    }};
+    const fifo_catalog: Catalog = .{ .skills = &fifo_skills };
+
+    const raw_main = try loadWholeRawByLocation(alloc, fifo_catalog, fifo_main_path, "SKILL.md", .{}, null);
+    defer freeExecuteResult(alloc, raw_main);
+    try std.testing.expect(raw_main == .failure);
+
+    const whole_main = try loadWholeByLocation(alloc, fifo_catalog, fifo_main_path, null, .{}, null, null);
+    defer freeExecuteResult(alloc, whole_main);
+    try std.testing.expect(whole_main == .failure);
+
+    const id_main = try loadByIdentity(alloc, fifo_catalog, "fifo-main", fifo_main_path, null, 0, .{}, null);
+    defer freeExecuteResult(alloc, id_main);
+    try std.testing.expect(id_main == .failure);
+
+    // Intermediate FIFO segment in resource path fails with NotDir without blocking.
+    try std.testing.expectError(
+        error.NotDir,
+        loadWholeRawByLocation(alloc, demo_catalog, demo_path, "pipe/child", .{}, null),
+    );
+    // Directory resource is refused as a non-regular file.
+    try std.testing.expectError(
+        error.SkillResourceNotRegularFile,
+        loadWholeRawByLocation(alloc, demo_catalog, demo_path, "nested", .{}, null),
+    );
+    // Replacing SKILL.md with a FIFO after candidate validation still refuses openResource("SKILL.md").
+    var opened = try openTestSkillCandidate(alloc, demo_path);
+    defer opened.deinit();
+    try tmp.dir.deleteFile(io_mod.getIo(), "skills/demo/SKILL.md");
+    try createSkillFifoOrSkip(alloc, &tmp, "skills/demo/SKILL.md");
+    try std.testing.expectError(error.SkillResourceNotRegularFile, opened.openResource("SKILL.md"));
+}
+
+test "skill resource read preserves regular files and symlink rejection" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "skills/demo/nested/real-dir");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "skills/demo/SKILL.md", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "---\nname: demo\ndescription: demo\n---\n\nDEMO_BODY\n");
+    }
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "skills/demo/nested/notes.md", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "NOTES_LINE_1\nNOTES_LINE_2\n");
+    }
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "skills/demo/nested/real-dir/item.txt", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "ITEM_BODY\n");
+    }
+    try createSkillSymlinkOrSkip(tmp.dir, "nested/notes.md", "skills/demo/alias.md", false);
+    try createSkillSymlinkOrSkip(tmp.dir, "real-dir", "skills/demo/nested/link-dir", true);
+
+    const demo_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "skills/demo");
+    defer alloc.free(demo_path);
+    const demo_skills = [_]skill_runtime.Skill{.{
+        .name = "demo",
+        .description = "demo",
+        .path = demo_path,
+        .source = .workspace_shared,
+    }};
+    const catalog: Catalog = .{ .skills = &demo_skills };
+
+    const raw_main = try loadWholeRawByLocation(alloc, catalog, demo_path, null, .{}, null);
+    defer freeExecuteResult(alloc, raw_main);
+    try std.testing.expect(raw_main == .loaded and raw_main.loaded.complete);
+    try std.testing.expectEqualStrings("---\nname: demo\ndescription: demo\n---\n\nDEMO_BODY\n", raw_main.modelOutput());
+
+    const raw_res = try loadWholeRawByLocation(alloc, catalog, demo_path, "nested/notes.md", .{}, null);
+    defer freeExecuteResult(alloc, raw_res);
+    try std.testing.expect(raw_res == .loaded and raw_res.loaded.complete);
+    try std.testing.expectEqualStrings("NOTES_LINE_1\nNOTES_LINE_2\n", raw_res.modelOutput());
+
+    const whole_res = try loadWholeByLocation(alloc, catalog, demo_path, "nested/notes.md", .{}, null, null);
+    defer freeExecuteResult(alloc, whole_res);
+    try std.testing.expect(whole_res == .loaded and whole_res.loaded.complete);
+    try expectContains(whole_res.modelOutput(), "NOTES_LINE_1\nNOTES_LINE_2\n");
+
+    const id_res = try loadByIdentity(alloc, catalog, "demo", demo_path, "nested/notes.md", 0, .{}, null);
+    defer freeExecuteResult(alloc, id_res);
+    try std.testing.expect(id_res == .loaded);
+    try expectContains(id_res.modelOutput(), "NOTES_LINE_1\nNOTES_LINE_2\n");
+
+    var opened = try openTestSkillCandidate(alloc, demo_path);
+    defer opened.deinit();
+    var regular_file = try opened.openResource("nested/notes.md");
+    defer regular_file.close(io_mod.getIo());
+    try std.testing.expect(!regular_file.flags.nonblocking);
+
+    try std.testing.expectError(error.SkillResourceNotRegularFile, loadWholeRawByLocation(alloc, catalog, demo_path, "alias.md", .{}, null));
+    if (loadWholeRawByLocation(alloc, catalog, demo_path, "nested/link-dir/item.txt", .{}, null)) |loaded| {
+        freeExecuteResult(alloc, loaded);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expect(err == error.SymLinkLoop or err == error.NotDir);
+    }
+    try std.testing.expectError(error.FileNotFound, loadWholeRawByLocation(alloc, catalog, demo_path, "missing.md", .{}, null));
 }
 
 fn checkSkillErrorFormattingAllocationFailures(alloc: Allocator) !void {

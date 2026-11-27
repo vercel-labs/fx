@@ -3830,6 +3830,42 @@ describe("slice 6 break-it", () => {
     expect(out2).toContain("x=1");
     expect(out2).toContain("NO_AGENT_FN");
   }, TIMEOUT);
+
+  test("attack 11 (fifo): skill open demo pipe refuses a FIFO resource without blocking", async () => {
+    const root = createRoot();
+    const skillDir = join(root.workspace, ".fx", "skills", "demo");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(
+      join(skillDir, "SKILL.md"),
+      "---\nname: demo\ndescription: Demo skill\n---\n\nBODY\n",
+    );
+    expect(Bun.spawnSync(["mkfifo", join(skillDir, "pipe")]).exitCode).toBe(0);
+
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("fifo_bash", "bash", {
+        command: [
+          'out_pipe=$(skill open demo pipe 2>&1); rc_pipe=$?',
+          'printf "rc=%d\\nout=%s\\n" "$rc_pipe" "$out_pipe"',
+        ].join("\n"),
+      }),
+      fakeGatewayFinalText("FIFO check done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const startedAt = Date.now();
+    const result = await runFx(
+      ["ask", "--json", "--quiet", "--yolo", ...BASH_SETTING, "Open fifo skill resource."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: 10_000 },
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(elapsedMs).toBeLessThan(10_000);
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic:");
+    const out = (JSON.parse(toolResultText(gateway.requests[1]!.body, "fifo_bash")) as { value: string }).value;
+    expect(out).toContain("rc=6");
+    expect(out).toContain("SkillResourceNotRegularFile");
+  }, 15_000);
 });
 
 
