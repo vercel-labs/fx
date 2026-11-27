@@ -1980,9 +1980,23 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     // The ask ends once its whole tree is quiet: mail that waits when a turn
     // ends runs as the ask's next turn, as one wakes an idle main.
     while (ctx.subagent_host) |tree| {
-        switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag())) {
+        switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag(), true)) {
             .quiet, .stopped => break,
             .mail => {},
+            // fx ask cannot show an approval, and main had its turn: refuse
+            // what it left unanswered, so the subagents resume, report, and
+            // their reports wake main again (`ParentApproval.tla` `Fallback`).
+            .approvals_unanswered => {
+                const refused = tree.refuseUnansweredApprovals();
+                if (refused == 0) {
+                    // Nothing could be refused, so the next check would see the
+                    // same state at once: wait one poll first (RULES.md R3.8).
+                    debug_trace.eventf("mailbox", "approvals_refusal_empty", .{}, "reason=nothing_refused", .{});
+                    if (ctx.cancelFlag().load(.seq_cst)) break;
+                    _ = ctx.worker.waitForPostOrNudgeTimeout(subagent_tool_host.Runtime.cancel_poll);
+                }
+                continue;
+            },
         }
         // The take marks the turn, so mail posted from then on joins it.
         const turn_id = debug_trace.nextTurnId();
@@ -2440,13 +2454,14 @@ fn takeSteeringBoundary(
     return ctx.worker.takeSteeringBoundaryInto(std.heap.c_allocator, arena, turn_id, kind);
 }
 
-fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, model: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     try ctx.deps.context_registry.appendDefaultTransient(.{
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .interactive = false,
         .permission_mode = ctx.permission_mode,
+        .model = model,
         .subagents = if (ctx.subagent_host) |team_host| try team_host.teamNote(arena, ctx.active_turn_id) else null,
     }, arena, messages);
 }
@@ -3572,7 +3587,7 @@ fn onWebFetchProgress(raw_ctx: *anyopaque, _: []const u8, progress: types.WebFet
 fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.presenter) |presenter| return presenter.pushNotice(.{
-        .topic = "system",
+        .topic = "",
         .tone = .neutral,
         .body = text,
     });
@@ -5092,7 +5107,7 @@ const TestContextRegistryFixture = struct {
 
         const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
         try append_static(deps.ctx, arena, &messages);
-        try deps.append_runtime_context(deps.ctx, arena, &messages);
+        try deps.append_runtime_context(deps.ctx, arena, ctx.model, &messages);
         try std.testing.expectEqual(
             ctx.permission_mode,
             transient_permission_mode orelse return error.TestExpectedEqual,
@@ -5288,7 +5303,7 @@ test "CLI prompt projection configures web search then blocks native execution" 
     const deps = agentRuntimeDeps(&ctx);
     const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
     try append_static(deps.ctx, arena, &messages);
-    try deps.append_runtime_context(deps.ctx, arena, &messages);
+    try deps.append_runtime_context(deps.ctx, arena, ctx.model, &messages);
 
     try std.testing.expectEqualStrings("stale-key", ctx.web_search_runtime.api_key);
 
