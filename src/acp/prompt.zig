@@ -3737,6 +3737,7 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
     var yields = false;
+    const stop_requested = hostAskedToYield(session);
     const barrier = barrier: {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -3750,7 +3751,7 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
             .compaction
         else
             .request;
-        if (journal.yieldsAt(io_mod.milliTimestamp(), kind)) {
+        if (journal.yieldsAt(io_mod.milliTimestamp(), kind, stop_requested)) {
             try journal.appendMarked(ctx.alloc, session.session_id, .turn_yielded, true);
             yields = true;
         }
@@ -3770,8 +3771,16 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
         try journal.keepYielded(ctx.state.alloc, checkpoint);
     }
-    debug_trace.logf("session", "event=libfx_journal_turn_yielded session={s}", .{session.session_id});
+    debug_trace.logf("session", "event=libfx_journal_turn_yielded session={s} requested={s}", .{ session.session_id, if (stop_requested) "host" else "deadline" });
     return error.TurnYielded;
+}
+
+/// Whether the host asked the running turn to stop at its next safe point: a
+/// web host through its import, since the web core reads no ACP message while a
+/// prompt runs, and a native host through `libfx/yield`.
+fn hostAskedToYield(session: *const server.ActiveSessionState) bool {
+    if (comptime host_target.is_wasm) return js_host_steering.yieldRequested();
+    return session.yield_requested.load(.seq_cst);
 }
 
 fn keepCancelledProgress(session_alloc: Allocator, session: *server.ActiveSessionState, checkpoint: session_codec.RecoveryCheckpoint) !void {
