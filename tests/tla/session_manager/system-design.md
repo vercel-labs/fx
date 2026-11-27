@@ -1445,8 +1445,9 @@ Settled while removing v1 (2026-10-17):
   call and its result, and the turn as interrupted, but not the text
   streamed by the attempt being retried, which v1 kept. An fx session's
   `_meta.fx.continueRecovery` over ACP continues the turn a crash or a
-  closed window stopped, as the same turn, as `fx -c` does; a libfx
-  session continues the turn its journal left open. **Why:** text from an attempt
+  closed window stopped, or an upgrade restart yielded, as the same turn,
+  as `fx -c` does; a libfx session continues the turn its journal left
+  open. **Why:** text from an attempt
   being retried is not a result, and the next turn never sends it.
   **Alternative:** save it in the open turn.
 - **D81 Decision:** when fx relaunches itself after an update and the

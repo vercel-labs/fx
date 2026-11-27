@@ -1326,7 +1326,7 @@ test "a stopped continuation sends the user's prompt, its steps, and the resume 
     var fixture = PromptFixture{};
     var job = fixture.job();
     job.recovery_resume = .{};
-    job.continuation = .stopped;
+    job.continuation = .interrupted;
     var calls = [_]types.ToolCall{.{ .id = "call_1", .name = "read_file", .arguments_json = "{}" }};
     var results = [_]types.PersistedToolResult{.{
         .tool_call_id = @constCast("call_1"),

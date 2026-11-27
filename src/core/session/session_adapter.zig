@@ -6626,9 +6626,10 @@ fn joinHeld(alloc: Allocator, held: *?HeldTurn, continues_held: *bool, turn: typ
 
 /// Drops the open builder of a continuation that never ended. Its held turn
 /// stays, and is sunk as it is.
-fn abandonContinuation(alloc: Allocator, builder: *session_log.ConversationTurnBuilder, continues_held: *bool) void {
+fn abandonContinuation(alloc: Allocator, session_id: []const u8, reason: []const u8, builder: *session_log.ConversationTurnBuilder, continues_held: *bool) void {
     if (!continues_held.*) return;
     continues_held.* = false;
+    if (!builder.isIdle()) debug_trace.logf("session", "event=sessions_v2_replay_continuation_abandoned session={s} dropped=continuation_pieces reason={s}", .{ session_id, reason });
     builder.deinit();
     builder.* = session_log.ConversationTurnBuilder.init(alloc);
 }
@@ -6999,7 +7000,7 @@ noinline fn replay(
                     }
                 },
                 .compacted => |line| {
-                    abandonContinuation(alloc, &builder, &continues_held);
+                    abandonContinuation(alloc, src.id, "compacted", &builder, &continues_held);
                     try sinkHeld(sink, &held);
                     try sink.summary(line.data);
                 },
@@ -7014,7 +7015,7 @@ noinline fn replay(
         }
         from = .{ .at = page.next orelse break };
     }
-    abandonContinuation(alloc, &builder, &continues_held);
+    abandonContinuation(alloc, src.id, "end_of_log", &builder, &continues_held);
     try sinkHeld(sink, &held);
     if (!builder.isIdle()) debug_trace.logf("session", "event=sessions_v2_replay_open_turn session={s} dropped=unfinished_pieces", .{src.id});
 }
@@ -7135,14 +7136,7 @@ fn answerRunning(
     for (running) |call| {
         if (containsId(represented, call.call_id)) continue;
         try calls.append(a, historyToolCall(call));
-        try results.append(a, .{
-            .tool_call_id = @constCast(call.call_id),
-            .tool_name = @constCast(call.tool_name),
-            .status = .failure,
-            .output = @constCast(unfinished_tool_output),
-            .output_bytes = unfinished_tool_output.len,
-            .stored_output_bytes = unfinished_tool_output.len,
-        });
+        try results.append(a, session_codec.answeredResult(call.call_id, call.tool_name, null));
     }
     if (calls.items.len == 0) return 0;
     const owned_calls = try types.dupeToolCallSlice(alloc, calls.items);

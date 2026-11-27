@@ -3135,6 +3135,113 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP continueRecovery on an fx session drops rerun ids and continues the stopped turn",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-continue-rerun-dropped-");
+      const prompt = "ACP rerun-dropped prompt";
+      const notice = "Resuming from unexpected session interruption.";
+      const tracePath = join(root.root, "trace.log");
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (body.includes(notice)) return finalText("ACP_RERUN_DROPPED_OK");
+        if (body.includes(prompt)) return new Promise<Response>(() => {});
+        return finalText("UNRELATED");
+      });
+      let client: AcpClient | null = null;
+      try {
+        const proc = nodeSpawn(FX_BIN, ["acp"], {
+          cwd: root.workspace,
+          env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        client = new AcpClient(proc);
+        const sessionId = await startAutoSession(client);
+        sendPrompt(client, 40, prompt);
+        await waitForCondition("the first request", () => gateway.requests.length === 1, TIMEOUT);
+        const exited = client.waitForExit();
+        proc.kill("SIGKILL");
+        await exited;
+        expect(proc.signalCode).toBe("SIGKILL");
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "session",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        const loaded = await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 11) as any;
+        expect(loaded.error).toBeUndefined();
+        client.send({
+          jsonrpc: "2.0",
+          id: 12,
+          method: "session/prompt",
+          params: { prompt: [], _meta: { fx: { continueRecovery: true, rerun: ["call_read_1"] } } },
+        });
+        const resumed = await readResponse(client, 12, TIMEOUT) as any;
+        expect(resumed.error).toBeUndefined();
+        expect(resumed.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(2);
+        const body = gateway.requests[1]!.body;
+        expect(occurrenceCount(body, prompt)).toBe(1);
+        expect(occurrenceCount(body, notice)).toBe(1);
+        const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+        expect(trace).toContain("event=acp_resume_rerun_ignored count=1 reason=native_log_has_no_journal");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "ACP continueRecovery after a cancelled turn answers that there is no interrupted turn",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-continue-cancelled-");
+      const prompt = "ACP cancelled-turn prompt";
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (body.includes(prompt)) return new Promise<Response>(() => {});
+        return finalText("UNRELATED");
+      });
+      let client: AcpClient | null = null;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        sendPrompt(client, 40, prompt);
+        await waitForCondition("the first request", () => gateway.requests.length === 1, TIMEOUT);
+        client.send({ jsonrpc: "2.0", id: 41, method: "session/cancel", params: {} });
+        const responses = new Map<number, any>();
+        while (responses.size < 2) {
+          const message = await client.readLine() as any;
+          if (message.id === 40 || message.id === 41) responses.set(message.id, message);
+        }
+        expect(responses.get(40)?.result?.stopReason).toBe("cancelled");
+
+        client.send({
+          jsonrpc: "2.0",
+          id: 42,
+          method: "session/prompt",
+          params: { prompt: [], _meta: { fx: { continueRecovery: true } } },
+        });
+        const refused = await readResponse(client, 42, TIMEOUT) as any;
+        expect(refused.error.code).toBe(-32602);
+        expect(refused.error.message).toBe("No interrupted turn to resume");
+        expect(gateway.requests).toHaveLength(1);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP reload after a crash during a retry shows the finished tool result once and a new prompt goes on",
     async () => {
       const root = createIsolatedRoot("fx-acp-reload-model-recovery-");
