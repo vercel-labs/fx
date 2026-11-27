@@ -1957,7 +1957,15 @@ describe("effect-aware command permissions", () => {
     await activeSession.sendText(rootPrompt);
     if (shipFails) {
       await activeSession.waitForPane((pane) => pane.includes("report noted 1") && turnSettled(pane), TIMEOUT * 2);
-      await activeSession.waitForText("ship needs you", TIMEOUT);
+      // Ship's request failed while main's turn was still taking in reports,
+      // so the view shows the card for it instead of the footer's note.
+      const card = await activeSession.waitForText("Open ship's screen", TIMEOUT);
+      expect(card).toContain("ship: The provider rejected this request");
+      expect(card).not.toContain("ship needs you");
+      // The card holds the keys, so the person opens ship's screen to go on
+      // from there; ship's wait and its running turn stay as they were.
+      await activeSession.sendKeys("4");
+      await activeSession.waitForPane((pane) => !pane.includes("Open ship's screen"), TIMEOUT);
     } else {
       await activeSession.waitForPane((pane) => pane.includes("report noted 2") && turnSettled(pane), TIMEOUT * 2);
     }

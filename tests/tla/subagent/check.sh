@@ -282,4 +282,62 @@ TuiParentApproval tui-approval-mutant-free-anyway NoStalePrompt
 TuiParentApproval tui-approval-mutant-note-typed TypedStaysWithPerson
 TuiParentApproval tui-approval-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
 TuiParentApproval tui-approval-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
+# The ViewWaits configs:
+# ViewWaits models what a view shows for the person-only items in its tree
+# (lendPrompt, settleLentQuestion and waitingNote in app_agents_runtime.zig;
+# attach and stopSet; a child's question prompt and status row). It models
+# approvals only as far as the one-item order needs them; their routing and
+# their review memory stay in TuiParentApproval.tla.
+#   design-a and design-b are the two designs and must pass every rule. A
+#   copies the item into the view and settles a pass later; b projects it
+#   from the child's live state and stores nothing.
+#   current-e, current-b and current-model are today: kind E shows nothing,
+#   kind B says "needs you" while its picker is shown, and its "Switch to
+#   another model" reaches the screen's agent.
+#   Each mutant plants one defect, and the rule named for it must catch it:
+#     footer-blind      the footer counts every wait, shown or not
+#                                                    FooterQuietForShown
+#     route-screen      an action from a view goes to the screen's agent
+#                                                    ActionReachesOwner
+#     a-no-settle       design A never discards a stale copy  NoStaleShown
+#     lend-under-alt    a lend while the alternate screen is owned
+#                                                    HeldUnderAltScreen
+#     two-shown         a view adds a second item instead of replacing
+#                                                    OneAtATime
+#     cross-tree        a view shows another tree's item   InstanceScope
+#     note-content      the note carries the question text  NoSecretToModel
+#     main-answers      main answers the item           MainOnlyTellsOrStops
+#     view-only         the child's own screen cannot act  OwnScreenActable
+#     row-as-wait       the view shows a status row that outlived its wait
+#                                                   ShownOnlyWhileWaiting
+#     lend-under-picker a view lends the card under the picker it opened
+#                                                    CardYieldsToPicker
+#     stale-pick        a continue keeps its pick       OnceForTheWait
+#     own-model-keeps-pick  the own-screen model does not beat an older pick
+#                                                    LatestChoiceWins
+#   The simulate pair runs under ideal and non-ideal conditions.
+#
+#   view-waits-chart is the same design with one child in each tree, small enough
+#   to draw every state as a chart.
+ViewWaits view-waits-chart -
+ViewWaits view-waits-design-a -
+ViewWaits view-waits-design-b -
+ViewWaits view-waits-current-e ShownWhenFree
+ViewWaits view-waits-current-b FooterQuietForShown
+ViewWaits view-waits-current-model ActionReachesOwner
+ViewWaits view-waits-mutant-footer-blind FooterQuietForShown
+ViewWaits view-waits-mutant-route-screen ActionReachesOwner
+ViewWaits view-waits-mutant-a-no-settle NoStaleShown
+ViewWaits view-waits-mutant-lend-under-alt HeldUnderAltScreen
+ViewWaits view-waits-mutant-two-shown OneAtATime
+ViewWaits view-waits-mutant-cross-tree InstanceScope
+ViewWaits view-waits-mutant-note-content NoSecretToModel
+ViewWaits view-waits-mutant-main-answers MainOnlyTellsOrStops
+ViewWaits view-waits-mutant-view-only OwnScreenActable
+ViewWaits view-waits-mutant-row-as-wait ShownOnlyWhileWaiting
+ViewWaits view-waits-mutant-lend-under-picker CardYieldsToPicker
+ViewWaits view-waits-mutant-stale-pick OnceForTheWait
+ViewWaits view-waits-mutant-own-model-keeps-pick LatestChoiceWins
+ViewWaits view-waits-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
+ViewWaits view-waits-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
 VERDICTS
