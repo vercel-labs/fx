@@ -1734,7 +1734,7 @@ function noticeWrongLanguageReply() {
 
 const PROVIDER_ERROR_TEXT = "invalid_request_error: ACP_TURN_ENDING_PROVIDER_ERROR";
 const LANGUAGE_FAILURE_TEXT =
-  "The model response used a different language than your request, and fx could not accept it. Retry or name the response language explicitly.";
+  "The model answered in a different language.\n└ Retry, or name the language in your message.";
 
 async function runMcpToolPrompt(
   client: AcpClient,
@@ -4023,6 +4023,7 @@ describe("acp: model-independent", () => {
           { type: "text-delta", id: "cut", delta: "ACP length reply" },
           { type: "finish", finishReason: { unified: "length", raw: "length" } },
         ]),
+        finalText("ACP continued reply"),
         noticePartialReply("ACP partial reply"),
         finalText("ACP restarted reply"),
       ]);
@@ -4039,8 +4040,11 @@ describe("acp: model-independent", () => {
         expect(nudged.messages.map((message) => message.text).join("")).toBe("ACP notices reply");
 
         const cut = await noticeTurn(client, "Answer past the output limit.");
-        expect(cut.notices).toEqual([{ severity: "warning", title: "response hit provider length limit; output may be incomplete" }]);
-        expect(cut.messages.map((message) => message.text).join("")).toBe("ACP length reply");
+        expect(cut.notices).toEqual([{
+          severity: "info",
+          title: "The reply reached its output limit and was cut off. Asking the model to continue from where it stopped. The next requests allow 32000 output tokens.",
+        }]);
+        expect(cut.messages.map((message) => message.text).join("")).toBe("ACP length replyACP continued reply");
 
         const restarted = await noticeTurn(client, "Answer after a dropped stream.");
         expect(restarted.stopReason).toBe("end_turn");
@@ -4050,7 +4054,7 @@ describe("acp: model-independent", () => {
         // line sat between them.
         expect(restarted.messages[1]!.messageId).not.toBe(restarted.messages[0]!.messageId);
 
-        expect(gateway.requests).toHaveLength(5);
+        expect(gateway.requests).toHaveLength(6);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -4120,6 +4124,7 @@ describe("acp: model-independent", () => {
           { type: "text-delta", id: "cut", delta: "ACP plain length reply" },
           { type: "finish", finishReason: { unified: "length", raw: "length" } },
         ]),
+        finalText("ACP plain continued reply"),
       ]);
       try {
         client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
@@ -4137,10 +4142,13 @@ describe("acp: model-independent", () => {
         expect(cut.notices).toEqual([]);
         expect(cut.messages.map((message) => message.text)).toEqual([
           "ACP plain length reply",
-          "response hit provider length limit; output may be incomplete",
+          "\n",
+          "The reply reached its output limit and was cut off. Asking the model to continue from where it stopped. The next requests allow 32000 output tokens.",
+          "\n",
+          "ACP plain continued reply",
         ]);
 
-        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests).toHaveLength(4);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
