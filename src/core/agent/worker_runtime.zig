@@ -5936,7 +5936,7 @@ fn dupeToolResultMemory(
         null;
     errdefer if (command_output_replay) |replay| types.freeCommandOutputReplay(alloc, replay);
     const quiet_crossing: ?types.QuietCrossing = if (memory.quiet_crossing) |crossing|
-        .{ .command = try alloc.dupe(u8, crossing.command), .quiet_ms = crossing.quiet_ms }
+        .{ .command = try alloc.dupe(u8, crossing.command), .quiet_ms = crossing.quiet_ms, .activity = crossing.activity }
     else
         null;
     return .{

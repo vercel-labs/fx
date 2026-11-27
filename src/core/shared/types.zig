@@ -3,6 +3,7 @@ const testing_allocator = @import("testing_allocator.zig");
 const text_utils = @import("text_utils.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const recovery = @import("../recovery/recovery.zig");
+const quiet_notice = @import("../execution/quiet_notice.zig");
 const json_decode = @import("json_decode.zig");
 
 pub const Layout = struct {
@@ -1498,6 +1499,7 @@ pub const ToolResultMemory = struct {
 pub const QuietCrossing = struct {
     command: []const u8,
     quiet_ms: u64,
+    activity: quiet_notice.Activity = .{},
 };
 
 pub const ToolExecutionStep = struct {
@@ -1830,7 +1832,7 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
         null;
     errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
     const quiet_crossing: ?QuietCrossing = if (memory.quiet_crossing) |crossing|
-        .{ .command = try alloc.dupe(u8, crossing.command), .quiet_ms = crossing.quiet_ms }
+        .{ .command = try alloc.dupe(u8, crossing.command), .quiet_ms = crossing.quiet_ms, .activity = crossing.activity }
     else
         null;
     return .{

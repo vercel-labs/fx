@@ -14,6 +14,7 @@ const session_adapter = @import("../session/session_adapter.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
 const live_metrics = @import("live_metrics.zig");
 const activity_status = @import("../output/activity_status.zig");
+const quiet_notice = @import("../execution/quiet_notice.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const model_contract = @import("model_contract.zig");
 const refusal = @import("refusal.zig");
@@ -309,18 +310,51 @@ fn unavailableChildRun(
 
 /// fx's note from a subagent whose command crossed the quiet limit, as its
 /// parent reads it. `command` is already one terminal-safe line.
-fn quietNoteText(writer: *std.Io.Writer, command: []const u8, quiet_ms: u64) std.Io.Writer.Error!void {
+fn quietNoteText(
+    writer: *std.Io.Writer,
+    command: []const u8,
+    quiet_ms: u64,
+    activity: quiet_notice.Activity,
+) std.Io.Writer.Error!void {
     try writer.print("fx: my command `{s}` has had no output for ", .{command});
     try activity_status.writeElapsed(writer, @intCast(quiet_ms / std.time.ms_per_s));
-    try writer.writeAll(". It may still be working, or it may be hung. Message me to check on it, or stop me.");
+    if (quiet_notice.activityDetail(activity)) |detail| {
+        try writer.print(", {s}. Message me to check on it, or stop me.", .{detail});
+    } else {
+        try writer.writeAll(". It may still be working, or it may be hung. Message me to check on it, or stop me.");
+    }
 }
 
 test "the quiet note names the command and how long it has been quiet" {
     var buffer: [512]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try quietNoteText(&writer, "node verify.mjs --mock", 125_000);
+    try quietNoteText(&writer, "node verify.mjs --mock", 125_000, .{});
     try std.testing.expectEqualStrings(
         "fx: my command `node verify.mjs --mock` has had no output for 2m5s. It may still be working, or it may be hung. Message me to check on it, or stop me.",
+        writer.buffered(),
+    );
+}
+
+test "quietNoteText reports active CPU, writes, or both, and leaves inactive text unchanged" {
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try quietNoteText(&writer, "cc main.c", 125_000, .{ .cpu = true });
+    try std.testing.expectEqualStrings(
+        "fx: my command `cc main.c` has had no output for 2m5s, still active (using CPU). Message me to check on it, or stop me.",
+        writer.buffered(),
+    );
+
+    writer = std.Io.Writer.fixed(&buffer);
+    try quietNoteText(&writer, "tar -cf out.tar .", 125_000, .{ .writes = true });
+    try std.testing.expectEqualStrings(
+        "fx: my command `tar -cf out.tar .` has had no output for 2m5s, still active (writing files). Message me to check on it, or stop me.",
+        writer.buffered(),
+    );
+
+    writer = std.Io.Writer.fixed(&buffer);
+    try quietNoteText(&writer, "ld -o app", 125_000, .{ .cpu = true, .writes = true });
+    try std.testing.expectEqualStrings(
+        "fx: my command `ld -o app` has had no output for 2m5s, still active (using CPU and writing files). Message me to check on it, or stop me.",
         writer.buffered(),
     );
 }
@@ -3267,7 +3301,7 @@ pub const Runtime = struct {
         const command = label[0..live_metrics.storeLabel(&label, crossing.command)];
         var buffer: [live_metrics.max_label_bytes + 256]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
-        quietNoteText(&writer, command, crossing.quiet_ms) catch
+        quietNoteText(&writer, command, crossing.quiet_ms, crossing.activity) catch
             return debug_trace.eventf("mailbox", "quiet_note_dropped", .{}, "child={s} reason=too_long quiet_ms={d}", .{ child_id, crossing.quiet_ms });
         sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = writer.buffered() } }) catch |err|
             return debug_trace.eventf("mailbox", "quiet_note_dropped", .{}, "child={s} reason={s} quiet_ms={d}", .{ child_id, @errorName(err), crossing.quiet_ms });

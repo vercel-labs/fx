@@ -7,6 +7,7 @@ const command_environment = @import("../../core/execution/command_environment.zi
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
+const quiet_notice = @import("../../core/execution/quiet_notice.zig");
 const mcp_call_bridge = @import("../../core/mcp_host/mcp_call_bridge.zig");
 const mcp_call_capability = @import("../../core/tooling/mcp_call_capability.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -2415,10 +2416,11 @@ fn publishQuietCrossing(
 ) !void {
     if (!snapshot.quiet_crossed or ctx.tool_result_memory_sink == null) return;
     const command = try ctx.allocator.dupe(u8, snapshot.command);
-    debug_trace.eventf("shell", "quiet_crossing", .{}, "session={s} quiet_ms={d}", .{ snapshot.execution_id, snapshot.quiet_ms orelse 0 });
+    debug_trace.eventf("shell", "quiet_crossing", .{}, "session={s} quiet_ms={d} cpu={} writes={}", .{ snapshot.execution_id, snapshot.quiet_ms orelse 0, snapshot.quiet_activity.cpu, snapshot.quiet_activity.writes });
     tool_dispatch.reportToolResultMemory(ctx, .{ .quiet_crossing = .{
         .command = command,
         .quiet_ms = snapshot.quiet_ms orelse 0,
+        .activity = snapshot.quiet_activity,
     } });
 }
 
@@ -2712,7 +2714,7 @@ fn formatSnapshotRaw(
     };
     var notice_buffer: [quiet_notice_max_bytes]u8 = undefined;
     const notice: ?[]const u8 = if (snapshot.quiet_notice)
-        quietNoticeText(&notice_buffer, snapshot.quiet_ms orelse 0)
+        quietNoticeText(&notice_buffer, snapshot.quiet_ms orelse 0, snapshot.quiet_activity)
     else
         null;
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -2748,14 +2750,25 @@ const quiet_notice_max_bytes = 192;
 comptime {
     // The longest notice, for the largest quiet time, fits the buffer.
     std.debug.assert(quiet_notice_max_bytes >= "No output for 18446744073709551615 min. ".len + quiet_notice_check.len);
+    std.debug.assert(quiet_notice_max_bytes >= "No output for 18446744073709551615 min, still active (using CPU and writing files).".len);
 }
 
 /// The check a running command's result asks for once it has printed nothing
-/// for the quiet limit. fx never stops the command: it may have hung, or it
-/// may be a server or watcher at rest.
-fn quietNoticeText(buffer: *[quiet_notice_max_bytes]u8, quiet_ms: u64) []const u8 {
+/// for the quiet limit. fx never stops the command: when CPU or write activity
+/// grew, it says the command is still active; otherwise it warns that it may
+/// have hung or be a server or watcher at rest.
+fn quietNoticeText(
+    buffer: *[quiet_notice_max_bytes]u8,
+    quiet_ms: u64,
+    activity: quiet_notice.Activity,
+) []const u8 {
     const minutes = quiet_ms / std.time.ms_per_min;
-    const text = if (minutes > 0)
+    const text = if (quiet_notice.activityDetail(activity)) |detail|
+        if (minutes > 0)
+            std.mem.print(buffer, "No output for {d} min, {s}.", .{ minutes, detail })
+        else
+            std.mem.print(buffer, "No output for {d} s, {s}.", .{ quiet_ms / std.time.ms_per_s, detail })
+    else if (minutes > 0)
         std.mem.print(buffer, "No output for {d} min. " ++ quiet_notice_check, .{minutes})
     else
         std.mem.print(buffer, "No output for {d} s. " ++ quiet_notice_check, .{quiet_ms / std.time.ms_per_s});
@@ -3716,10 +3729,50 @@ test "a running command says how long it has run and been quiet, and asks for a 
 
 test "the quiet notice names seconds under a minute and fits its buffer for any quiet time" {
     var buffer: [quiet_notice_max_bytes]u8 = undefined;
-    try std.testing.expect(std.mem.startsWith(u8, quietNoticeText(&buffer, 1_500), "No output for 1 s. "));
-    try std.testing.expect(std.mem.startsWith(u8, quietNoticeText(&buffer, 59_999), "No output for 59 s. "));
-    try std.testing.expect(std.mem.startsWith(u8, quietNoticeText(&buffer, 60_000), "No output for 1 min. "));
-    try std.testing.expect(std.mem.endsWith(u8, quietNoticeText(&buffer, std.math.maxInt(u64)), quiet_notice_check));
+    try std.testing.expect(std.mem.startsWith(u8, quietNoticeText(&buffer, 1_500, .{}), "No output for 1 s. "));
+    try std.testing.expect(std.mem.startsWith(u8, quietNoticeText(&buffer, 59_999, .{}), "No output for 59 s. "));
+    try std.testing.expect(std.mem.startsWith(u8, quietNoticeText(&buffer, 60_000, .{}), "No output for 1 min. "));
+    try std.testing.expect(std.mem.endsWith(u8, quietNoticeText(&buffer, std.math.maxInt(u64), .{}), quiet_notice_check));
+}
+
+test "quietNoticeText reports active CPU, writes, or both, and leaves inactive text unchanged" {
+    var buffer: [quiet_notice_max_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "No output for 2 min. Check whether this command is still working or has hung; a server or watcher can stay quiet while it works.",
+        quietNoticeText(&buffer, 125_000, .{}),
+    );
+    try std.testing.expectEqualStrings(
+        "No output for 2 min, still active (using CPU).",
+        quietNoticeText(&buffer, 125_000, .{ .cpu = true }),
+    );
+    try std.testing.expectEqualStrings(
+        "No output for 2 s, still active (writing files).",
+        quietNoticeText(&buffer, 2_000, .{ .writes = true }),
+    );
+    try std.testing.expectEqualStrings(
+        "No output for 2 min, still active (using CPU and writing files).",
+        quietNoticeText(&buffer, 125_000, .{ .cpu = true, .writes = true }),
+    );
+
+    const alloc = std.testing.allocator;
+    const active_json = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-active"),
+        .command = @constCast("clang -c foo.c"),
+        .cwd = @constCast("/tmp"),
+        .retained = true,
+        .state = .running,
+        .output_delta = @constCast(""),
+        .output_truncated = false,
+        .running_ms = 185_000,
+        .quiet_ms = 150_000,
+        .quiet_notice = true,
+        .quiet_activity = .{ .cpu = true },
+    }, null);
+    defer alloc.free(active_json);
+    try std.testing.expectEqualStrings(
+        "{\"session_id\":\"shell-active\",\"state\":\"running\",\"backend\":\"captured\",\"persistence\":\"process\",\"running_ms\":185000,\"quiet_ms\":150000,\"quiet_notice\":\"No output for 2 min, still active (using CPU).\",\"output_delta\":\"\"}",
+        active_json,
+    );
 }
 
 test "completed shell snapshot reports incomplete output without losing status" {

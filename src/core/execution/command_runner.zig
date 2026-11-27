@@ -43,6 +43,11 @@ pub const Config = struct {
     /// Variables added to the command's environment after `AI_AGENT`,
     /// such as the `fx mcp call` bridge's address. Borrowed for the run.
     extra_environment: []const EnvironmentVariable = &.{},
+    /// Optional lifecycle hooks for the spawned command process (`pid` is valid
+    /// between `on_process_started` and `on_process_exited`).
+    process_observer_ctx: ?*anyopaque = null,
+    on_process_started: ?*const fn (ctx: ?*anyopaque, pid: std.posix.pid_t, include_root: bool) void = null,
+    on_process_exited: ?*const fn (ctx: ?*anyopaque) void = null,
 };
 
 pub const EnvironmentVariable = struct {
@@ -3880,6 +3885,15 @@ fn collectSpawnedProcess(
     var wait_pending = true;
     defer if (wait_pending) observer.abort(process_group_id);
 
+    var process_notified = false;
+    if (comptime builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
+        if (cfg.on_process_started) |cb| {
+            cb(cfg.process_observer_ctx, observer.process_id, termination_protocol != .foreground_supervisor);
+            process_notified = true;
+        }
+    }
+    defer if (process_notified) if (cfg.on_process_exited) |cb| cb(cfg.process_observer_ctx);
+
     var leader_status: ?command_contract.CommandStatus = null;
     const collected_output = try collectOutputForProcess(
         arena,
@@ -3897,6 +3911,10 @@ fn collectSpawnedProcess(
             "command output drain failed before process status; aborting command",
             .{},
         );
+        if (process_notified) {
+            if (cfg.on_process_exited) |cb| cb(cfg.process_observer_ctx);
+            process_notified = false;
+        }
         observer.abort(process_group_id);
         wait_pending = false;
         return .{
@@ -3904,6 +3922,10 @@ fn collectSpawnedProcess(
             .status = .indeterminate,
             .output_incomplete = true,
         };
+    }
+    if (process_notified) {
+        if (cfg.on_process_exited) |cb| cb(cfg.process_observer_ctx);
+        process_notified = false;
     }
     const status = try waitForCollectedProcess(
         &observer,

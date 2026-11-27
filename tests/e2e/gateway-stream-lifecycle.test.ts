@@ -7256,6 +7256,31 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     );
   }, 60_000);
 
+  test("a silent CPU-busy shell command reports still active in quiet_notice", async () => {
+    let sessionId = "";
+    await runQuietFixture(
+      "shell-quiet-still-active",
+      ["ask", "--json", "--yolo", "--no-save", "Run the silent CPU-busy command fixture."],
+      [
+        () => fakeShellRun("shell_cpu_busy_run", "while :; do :; done", { profile: "clean", yield_time_ms: 2_000 }),
+        (body) => {
+          const result = shellResult(body, "shell_cpu_busy_run");
+          sessionId = result.session_id ?? "";
+          expect(result.state).toBe("running");
+          expect(result.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS);
+          expect(result.quiet_notice).toContain("still active");
+          expect(result.quiet_notice).toContain("using CPU");
+          return shellStop("shell_cpu_busy_stop", sessionId);
+        },
+        (body) => {
+          expect(shellResult(body, "shell_cpu_busy_stop").state).toBe("stopped");
+          return fakeGatewayFinalText("Active quiet command checked.");
+        },
+      ],
+      "Active quiet command checked.",
+    );
+  }, 60_000);
+
   test("shell keeps a detached daemon across calls and stops same-session jobs", async () => {
     const root = createFixtureRoot("shell-detached-daemon");
     const tracePath = join(root.root, "trace.log");

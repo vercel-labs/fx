@@ -90,7 +90,29 @@ const ProcessSnapshot = struct {
     parent_unique_id: ?u64 = null,
     started_at_us: ?u64 = null,
     zombie: bool = false,
+    cpu_time: u64 = 0,
 };
+
+pub const ActivitySample = struct {
+    cpu_time: u64 = 0,
+    write_bytes: u64 = 0,
+};
+
+pub const ActivityGrowth = struct {
+    cpu: bool = false,
+    writes: bool = false,
+
+    pub fn any(self: ActivityGrowth) bool {
+        return self.cpu or self.writes;
+    }
+};
+
+pub fn compareActivity(previous: ActivitySample, current: ActivitySample) ActivityGrowth {
+    return .{
+        .cpu = current.cpu_time > previous.cpu_time,
+        .writes = current.write_bytes > previous.write_bytes,
+    };
+}
 
 pub const DeliverySummary = struct {
     delivered: usize = 0,
@@ -741,6 +763,39 @@ pub const Tracker = struct {
             .identity = snapshot.identity,
         });
         return true;
+    }
+
+    /// Samples total CPU time and write bytes across `root_pid` (when
+    /// `include_root` is true) and all tracked descendants. Read errors for a
+    /// process count as zero activity and never fail the caller.
+    pub fn sampleActivity(
+        self: *Tracker,
+        root_pid: std.posix.pid_t,
+        include_root: bool,
+    ) ActivitySample {
+        if (comptime builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return .{};
+        // Read errors mean a process vanished or denied access; partial tree samples stay valid.
+        self.refresh(root_pid) catch {};
+        if (comptime builtin.target.os.tag == .macos) {
+            // Best-effort witness scan; missing processes count as zero activity.
+            self.refreshLineageProcesses() catch {};
+        }
+        var total: ActivitySample = .{};
+        if (include_root) {
+            if (self.root) |root| {
+                if (root.pid == root_pid) {
+                    const sample = sampleProcessActivity(self.alloc, root.pid, root.identity);
+                    total.cpu_time +|= sample.cpu_time;
+                    total.write_bytes +|= sample.write_bytes;
+                }
+            }
+        }
+        for (self.processes.items) |process| {
+            const sample = sampleProcessActivity(self.alloc, process.pid, process.identity);
+            total.cpu_time +|= sample.cpu_time;
+            total.write_bytes +|= sample.write_bytes;
+        }
+        return total;
     }
 
     fn processHasBoundWitness(self: *Tracker, pid: std.posix.pid_t) !bool {
@@ -1453,11 +1508,19 @@ fn captureLinuxSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot
     var field_number: usize = 3;
     var parent_pid: ?std.posix.pid_t = null;
     var zombie = false;
+    var utime: u64 = 0;
+    var stime: u64 = 0;
     while (fields.next()) |field| : (field_number += 1) {
         if (field_number == 3) zombie = field.len == 1 and field[0] == 'Z';
         if (field_number == 4) {
             parent_pid = std.fmt.parseInt(std.posix.pid_t, field, 10) catch
                 return error.ProcessIdentityUnavailable;
+        }
+        if (field_number == 14) {
+            utime = std.fmt.parseUnsigned(u64, field, 10) catch 0;
+        }
+        if (field_number == 15) {
+            stime = std.fmt.parseUnsigned(u64, field, 10) catch 0;
         }
         if (field_number == 22) {
             const start_ticks = std.fmt.parseUnsigned(u64, field, 10) catch
@@ -1467,10 +1530,89 @@ fn captureLinuxSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot
                 .parent_pid = parent_pid orelse
                     return error.ProcessIdentityUnavailable,
                 .zombie = zombie,
+                .cpu_time = utime +| stime,
             };
         }
     }
     return error.ProcessIdentityUnavailable;
+}
+
+fn sampleProcessActivity(
+    alloc: Allocator,
+    pid: std.posix.pid_t,
+    expected_identity: Identity,
+) ActivitySample {
+    return switch (builtin.target.os.tag) {
+        .linux => sampleLinuxProcessActivity(alloc, pid, expected_identity),
+        .macos => sampleMacOSProcessActivity(pid, expected_identity),
+        else => .{},
+    };
+}
+
+fn sampleLinuxProcessActivity(
+    alloc: Allocator,
+    pid: std.posix.pid_t,
+    expected_identity: Identity,
+) ActivitySample {
+    if (comptime builtin.target.os.tag != .linux) return .{};
+    const snapshot = captureLinuxSnapshot(alloc, pid) catch return .{};
+    if (!snapshot.identity.eql(expected_identity)) return .{};
+    return .{
+        .cpu_time = snapshot.cpu_time,
+        .write_bytes = readLinuxProcIoWriteBytes(alloc, pid),
+    };
+}
+
+fn readLinuxProcIoWriteBytes(alloc: Allocator, pid: std.posix.pid_t) u64 {
+    if (comptime builtin.target.os.tag != .linux) return 0;
+    const path = alloc.print("/proc/{d}/io", .{pid}) catch return 0;
+    defer alloc.free(path);
+    var file = (openLinuxProcFile(path) catch return 0) orelse return 0;
+    defer file.close(io_mod.getIo());
+    var buffer: [1024]u8 = undefined;
+    const read_len = readLinuxProcFile(file, &buffer) catch return 0;
+    return parseLinuxProcIoWriteBytes(buffer[0..read_len]);
+}
+
+fn parseLinuxProcIoWriteBytes(text: []const u8) u64 {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const prefix = "write_bytes:";
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        const trimmed = std.mem.trim(u8, line[prefix.len..], " \t\r");
+        return std.fmt.parseUnsigned(u64, trimmed, 10) catch 0;
+    }
+    return 0;
+}
+
+fn sampleMacOSProcessActivity(
+    pid: std.posix.pid_t,
+    expected_identity: Identity,
+) ActivitySample {
+    if (comptime builtin.target.os.tag != .macos) return .{};
+    const snapshot = captureMacOSSnapshot(pid) catch return .{};
+    if (!snapshot.identity.eql(expected_identity)) return .{};
+    var task_info: Darwin.ProcTaskInfo = undefined;
+    const task_len = Darwin.proc_pidinfo(
+        pid,
+        Darwin.proc_pid_task_info,
+        0,
+        &task_info,
+        @sizeOf(Darwin.ProcTaskInfo),
+    );
+    const cpu_time: u64 = if (task_len == @sizeOf(Darwin.ProcTaskInfo))
+        task_info.pti_total_user +| task_info.pti_total_system
+    else
+        0;
+    var rusage: Darwin.RusageInfoV2 = undefined;
+    const write_bytes: u64 = if (Darwin.proc_pid_rusage(pid, Darwin.rusage_info_v2, &rusage) == 0)
+        rusage.ri_diskio_byteswritten
+    else
+        0;
+    return .{
+        .cpu_time = cpu_time,
+        .write_bytes = write_bytes,
+    };
 }
 
 fn readLinuxProcFile(file: std.Io.File, buffer: []u8) !usize {
@@ -1593,8 +1735,53 @@ const Darwin = struct {
     // its public header, but XNU defines the record as API with a fixed size.
     const proc_pid_unique_identifier_info: c_int = 17;
     const proc_pid_fd_pipe_info: c_int = 6;
+    const proc_pid_task_info: c_int = 4;
+    const rusage_info_v2: c_int = 2;
     const process_status_stopped: u32 = 4;
     const process_status_zombie: u32 = 5;
+
+    const ProcTaskInfo = extern struct {
+        pti_virtual_size: u64,
+        pti_resident_size: u64,
+        pti_total_user: u64,
+        pti_total_system: u64,
+        pti_threads_user: u64,
+        pti_threads_system: u64,
+        pti_policy: i32,
+        pti_faults: i32,
+        pti_pageins: i32,
+        pti_cow_faults: i32,
+        pti_messages_sent: i32,
+        pti_messages_received: i32,
+        pti_syscalls_mach: i32,
+        pti_syscalls_unix: i32,
+        pti_csw: i32,
+        pti_threadnum: i32,
+        pti_numrunning: i32,
+        pti_priority: i32,
+    };
+
+    const RusageInfoV2 = extern struct {
+        ri_uuid: [16]u8,
+        ri_user_time: u64,
+        ri_system_time: u64,
+        ri_pkg_idle_wkups: u64,
+        ri_interrupt_wkups: u64,
+        ri_pageins: u64,
+        ri_wired_size: u64,
+        ri_resident_size: u64,
+        ri_phys_footprint: u64,
+        ri_proc_start_abstime: u64,
+        ri_proc_exit_abstime: u64,
+        ri_child_user_time: u64,
+        ri_child_system_time: u64,
+        ri_child_pkg_idle_wkups: u64,
+        ri_child_interrupt_wkups: u64,
+        ri_child_pageins: u64,
+        ri_child_elapsed_abstime: u64,
+        ri_diskio_bytesread: u64,
+        ri_diskio_byteswritten: u64,
+    };
 
     const ProcFileInfo = extern struct {
         fi_openflags: u32,
@@ -1702,6 +1889,12 @@ const Darwin = struct {
         buffer: *anyopaque,
         buffersize: c_int,
     ) c_int;
+
+    extern "c" fn proc_pid_rusage(
+        pid: c_int,
+        flavor: c_int,
+        buffer: *anyopaque,
+    ) c_int;
 };
 
 test "tracked identity distinguishes process instances" {
@@ -1733,4 +1926,136 @@ test "Darwin witness scan excludes processes older than command root" {
         std.math.maxInt(u64),
         darwinStartTimeUs(std.math.maxInt(u64), 1),
     );
+}
+
+test "compareActivity reports cpu, writes, both, or neither" {
+    try std.testing.expectEqual(
+        ActivityGrowth{},
+        compareActivity(.{ .cpu_time = 10, .write_bytes = 4096 }, .{ .cpu_time = 10, .write_bytes = 4096 }),
+    );
+    try std.testing.expectEqual(
+        ActivityGrowth{},
+        compareActivity(.{ .cpu_time = 10, .write_bytes = 4096 }, .{ .cpu_time = 5, .write_bytes = 0 }),
+    );
+    try std.testing.expectEqual(
+        ActivityGrowth{ .cpu = true, .writes = false },
+        compareActivity(.{ .cpu_time = 10, .write_bytes = 4096 }, .{ .cpu_time = 11, .write_bytes = 4096 }),
+    );
+    try std.testing.expectEqual(
+        ActivityGrowth{ .cpu = false, .writes = true },
+        compareActivity(.{ .cpu_time = 10, .write_bytes = 4096 }, .{ .cpu_time = 10, .write_bytes = 8192 }),
+    );
+    try std.testing.expectEqual(
+        ActivityGrowth{ .cpu = true, .writes = true },
+        compareActivity(.{ .cpu_time = 10, .write_bytes = 4096 }, .{ .cpu_time = 15, .write_bytes = 8192 }),
+    );
+}
+
+test "linux proc io write_bytes parser reads write_bytes and ignores missing or malformed text" {
+    try std.testing.expectEqual(@as(u64, 16384), parseLinuxProcIoWriteBytes("rchar: 100\nwchar: 200\nwrite_bytes: 16384\ncancelled_write_bytes: 0\n"));
+    try std.testing.expectEqual(@as(u64, 0), parseLinuxProcIoWriteBytes("rchar: 100\nwchar: 200\n"));
+    try std.testing.expectEqual(@as(u64, 0), parseLinuxProcIoWriteBytes("write_bytes: not-a-number\n"));
+    try std.testing.expectEqual(@as(u64, 0), parseLinuxProcIoWriteBytes(""));
+}
+
+test "Darwin activity structs match macOS ABI sizes and self sample" {
+    if (comptime builtin.target.os.tag != .macos) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(usize, 96), @sizeOf(Darwin.ProcTaskInfo));
+    try std.testing.expectEqual(@as(usize, 160), @sizeOf(Darwin.RusageInfoV2));
+    var tracker = try Tracker.init(std.testing.allocator);
+    defer tracker.deinit();
+    var busy: u64 = 0;
+    for (0..50_000) |i| busy +%= i;
+    std.mem.doNotOptimizeAway(busy);
+    const sample = tracker.sampleActivity(std.c.getpid(), true);
+    try std.testing.expect(sample.cpu_time > 0);
+}
+
+test "activity sample grows for a busy or writing child and stays flat for a sleeping child" {
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    // Sleeping child: wait for ready byte so shell startup is done, sample
+    // before and after the CPU-busy child runs, with no sleep in the test.
+    var sleepy = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", "printf R; exec sleep 30" },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer {
+        _ = sleepy.kill(io);
+    }
+    var ready: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try sleepy.stdout.?.readStreaming(io, &.{&ready}));
+    var sleepy_tracker = try Tracker.init(std.testing.allocator);
+    defer sleepy_tracker.deinit();
+    const s1 = sleepy_tracker.sampleActivity(sleepy.id.?, true);
+
+    // CPU-busy child: wait until cpu_time grows (bounded).
+    {
+        var busy = try std.process.spawn(io, .{
+            .argv = &.{ "sh", "-c", "while :; do :; done" },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+        defer {
+            _ = busy.kill(io);
+        }
+        var tracker = try Tracker.init(std.testing.allocator);
+        defer tracker.deinit();
+        const baseline = tracker.sampleActivity(busy.id.?, true);
+        var grew = false;
+        const deadline_ms = io_mod.milliTimestamp() + 2_000;
+        while (io_mod.milliTimestamp() < deadline_ms) {
+            const next = tracker.sampleActivity(busy.id.?, true);
+            if (compareActivity(baseline, next).cpu) {
+                grew = true;
+                break;
+            }
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+        try std.testing.expect(grew);
+    }
+
+    const s2 = sleepy_tracker.sampleActivity(sleepy.id.?, true);
+    try std.testing.expectEqual(ActivityGrowth{}, compareActivity(s1, s2));
+
+    // Writing child (Linux /proc/<pid>/io write_bytes): wait on pipe signal before and after synced write.
+    if (comptime builtin.target.os.tag == .linux) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const out_path = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+        defer std.testing.allocator.free(out_path);
+        const target_file = try std.testing.allocator.print("{s}/io_test.bin", .{out_path});
+        defer std.testing.allocator.free(target_file);
+        const script = try std.testing.allocator.print(
+            "import os,sys\nf=open({f},'wb',buffering=0)\nsys.stdout.write('R');sys.stdout.flush()\nsys.stdin.read(1)\nf.write(b'x'*65536)\nos.fsync(f.fileno())\nsys.stdout.write('W');sys.stdout.flush()\nsys.stdin.read(1)\n",
+            .{std.json.fmt(target_file, .{})},
+        );
+        defer std.testing.allocator.free(script);
+        var writer_child = try std.process.spawn(io, .{
+            .argv = &.{ "python3", "-c", script },
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,
+        });
+        defer {
+            if (writer_child.stdin) |in_pipe| {
+                in_pipe.close(io);
+                writer_child.stdin = null;
+            }
+            _ = writer_child.kill(io);
+        }
+        var sig: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try writer_child.stdout.?.readStreaming(io, &.{&sig}));
+        var tracker = try Tracker.init(std.testing.allocator);
+        defer tracker.deinit();
+        const before = tracker.sampleActivity(writer_child.id.?, true);
+        try writer_child.stdin.?.writeStreamingAll(io, "G");
+        try std.testing.expectEqual(@as(usize, 1), try writer_child.stdout.?.readStreaming(io, &.{&sig}));
+        const after = tracker.sampleActivity(writer_child.id.?, true);
+        try std.testing.expect(compareActivity(before, after).writes);
+    }
 }

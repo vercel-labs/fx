@@ -59,6 +59,26 @@ fn noticeDue(quiet_ms: u64, limit_ms: u64) bool {
     return quiet_ms >= limit_ms;
 }
 
+/// Whether a quiet command's process tree showed new CPU or write activity
+/// since the previous check.
+pub const Activity = struct {
+    cpu: bool = false,
+    writes: bool = false,
+
+    pub fn any(self: Activity) bool {
+        return self.cpu or self.writes;
+    }
+};
+
+/// Short description placed after the quiet duration when the command's
+/// process tree is still active; null when no CPU or write growth was seen.
+pub fn activityDetail(activity: Activity) ?[]const u8 {
+    if (activity.cpu and activity.writes) return "still active (using CPU and writing files)";
+    if (activity.cpu) return "still active (using CPU)";
+    if (activity.writes) return "still active (writing files)";
+    return null;
+}
+
 /// What a result for a running command says about its time.
 pub const Times = struct {
     running_ms: u64,

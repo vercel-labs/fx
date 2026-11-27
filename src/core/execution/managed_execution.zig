@@ -9,6 +9,7 @@ const contract = @import("managed_execution_contract.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const execution_router = @import("router.zig");
 const io_mod = @import("../shared/io.zig");
+const process_tree = @import("process_tree.zig");
 const types = @import("../shared/types.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const quiet_notice = @import("quiet_notice.zig");
@@ -175,6 +176,7 @@ pub const Snapshot = struct {
     running_ms: ?u64 = null,
     quiet_ms: ?u64 = null,
     quiet_notice: bool = false,
+    quiet_activity: quiet_notice.Activity = .{},
     /// Set when a wait ends with the command still running past the quiet
     /// limit after seeing it under the limit (`quiet_notice.crossedAt`). A
     /// spell crosses once, so a later wait in it leaves this false
@@ -294,6 +296,13 @@ const Entry = struct {
     /// start until then. Guarded by `mutex`.
     started_ms: i64 = 0,
     last_output_ms: i64 = 0,
+    /// Live child root PID and last sampled process-tree activity for quiet
+    /// checks. Guarded by `mutex`.
+    process_pid: ?std.posix.pid_t = null,
+    process_include_root: bool = true,
+    activity_tracker: ?process_tree.Tracker = null,
+    activity_sample: ?process_tree.ActivitySample = null,
+    activity_sampled_output_ms: ?i64 = null,
     delivery: contract.DeliveryState = .{},
     active_waiter: ?u64 = null,
     preempted_waiter: ?u64 = null,
@@ -471,6 +480,7 @@ const Entry = struct {
         if (self.replay_capture) |capture| {
             capture.releaseRetained(self.arena.allocator());
         }
+        if (self.activity_tracker) |*tracker| tracker.deinit();
         deinitReplayCapability(self.runtime, self.replay_capability);
         self.output.deinit(self.runtime.alloc);
         self.arena.deinit();
@@ -640,6 +650,9 @@ const Entry = struct {
             .timeout_started_ms = started_ms,
             .command_artifact_dir = self.command_artifact_dir,
             .extra_environment = self.extra_environment,
+            .process_observer_ctx = self,
+            .on_process_started = onProcessStarted,
+            .on_process_exited = onProcessExited,
         }, self.arena.allocator(), captured.route) catch |err| {
             const zio = io_mod.getIo();
             self.mutex.lockUncancelable(zio);
@@ -702,6 +715,50 @@ const Entry = struct {
             .unavailable => {},
         }
         capture.releaseRetained(self.arena.allocator());
+    }
+
+    fn onProcessStarted(raw: ?*anyopaque, pid: std.posix.pid_t, include_root: bool) void {
+        const self: *Entry = @ptrCast(@alignCast(raw orelse return));
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        self.process_pid = pid;
+        self.process_include_root = include_root;
+        self.activity_sample = null;
+        self.activity_sampled_output_ms = null;
+    }
+
+    fn onProcessExited(raw: ?*anyopaque) void {
+        const self: *Entry = @ptrCast(@alignCast(raw orelse return));
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        self.process_pid = null;
+    }
+
+    fn sampleProcessActivityLocked(self: *Entry) ?process_tree.ActivitySample {
+        const pid = self.process_pid orelse return null;
+        if (self.isTerminal()) return null;
+        if (self.activity_tracker == null) {
+            self.activity_tracker = process_tree.Tracker.init(self.runtime.alloc) catch return null;
+        }
+        return self.activity_tracker.?.sampleActivity(pid, self.process_include_root);
+    }
+
+    fn refreshActivityBaselineLocked(self: *Entry, output_ms: i64) void {
+        const sample = self.sampleProcessActivityLocked() orelse return;
+        self.activity_sample = sample;
+        self.activity_sampled_output_ms = output_ms;
+    }
+
+    fn sampleQuietActivityLocked(self: *Entry, output_ms: i64) quiet_notice.Activity {
+        const current = self.sampleProcessActivityLocked() orelse return .{};
+        const previous = self.activity_sample;
+        self.activity_sample = current;
+        self.activity_sampled_output_ms = output_ms;
+        const prev = previous orelse return .{};
+        const growth = process_tree.compareActivity(prev, current);
+        return .{ .cpu = growth.cpu, .writes = growth.writes };
     }
 };
 
@@ -807,12 +864,21 @@ pub const Runtime = struct {
         const limit_ms = quietLimitMs();
         entry.mutex.lockUncancelable(zio);
         var quiet_wait = quiet_notice.beginWait(started_ms, entry.last_output_ms, input.yield_time_ms, limit_ms);
+        if (!quiet_wait.armed and entry.activity_sampled_output_ms != entry.last_output_ms) {
+            entry.refreshActivityBaselineLocked(entry.last_output_ms);
+        }
         entry.mutex.unlock(zio);
         var quiet_crossed = false;
         while (true) {
             entry.mutex.lockUncancelable(zio);
             const terminal = entry.isTerminal();
             const last_output_ms = entry.last_output_ms;
+            if (!terminal and entry.process_pid != null and
+                entry.activity_sampled_output_ms != last_output_ms and
+                quiet_notice.quietMs(io_mod.milliTimestamp(), last_output_ms) >= limit_ms / 2)
+            {
+                entry.refreshActivityBaselineLocked(last_output_ms);
+            }
             entry.mutex.unlock(zio);
             if (terminal) break;
             if (input.cancel_flag) |flag| {
@@ -1158,6 +1224,9 @@ pub const Runtime = struct {
         const wait_started_ms = io_mod.milliTimestamp();
         const yield_grace_ms = if (tool_yield_flag != null) steerYieldGraceMs() else 0;
         var quiet_wait = quiet_notice.beginWait(wait_started_ms, entry.last_output_ms, wait_ceiling_ms, limit_ms);
+        if (!quiet_wait.armed and entry.activity_sampled_output_ms != entry.last_output_ms) {
+            entry.refreshActivityBaselineLocked(entry.last_output_ms);
+        }
         entry.mutex.unlock(zio);
         defer self.clearActiveWaiter(entry, waiter_id);
         const poll_ms = capturedWaitPollMs();
@@ -1167,6 +1236,12 @@ pub const Runtime = struct {
             const terminal = entry.isTerminal();
             const preempted = entry.preempted_waiter == waiter_id;
             const last_output_ms = entry.last_output_ms;
+            if (!terminal and !preempted and entry.process_pid != null and
+                entry.activity_sampled_output_ms != last_output_ms and
+                quiet_notice.quietMs(io_mod.milliTimestamp(), last_output_ms) >= limit_ms / 2)
+            {
+                entry.refreshActivityBaselineLocked(last_output_ms);
+            }
             entry.mutex.unlock(zio);
             if (preempted) {
                 traceDroppedCrossing(
@@ -1637,6 +1712,10 @@ pub const Runtime = struct {
             )
         else
             null;
+        const quiet_activity: quiet_notice.Activity = if (times) |value|
+            if (value.notice) entry.sampleQuietActivityLocked(entry.last_output_ms) else .{}
+        else
+            .{};
         return .{
             .reservation_id = reservation_id,
             .snapshot = .{
@@ -1667,6 +1746,7 @@ pub const Runtime = struct {
                 .running_ms = if (times) |value| value.running_ms else null,
                 .quiet_ms = if (times) |value| value.quiet_ms else null,
                 .quiet_notice = if (times) |value| value.notice else false,
+                .quiet_activity = quiet_activity,
             },
         };
     }
