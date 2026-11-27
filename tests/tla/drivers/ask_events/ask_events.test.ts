@@ -240,7 +240,47 @@ test("AskEventsTrace validates real fx runs and rejects tampered controls", asyn
     }
   }
 
-  // 4. Negative controls: model must reject missing cancel on SIGTERM and stdout>0 on SIGTERM
+  // 4. Closed stdout reader (OutputReaderGone -> exit 141)
+  const events4 = join(root, "events4.jsonl");
+  const status4 = join(root, "status4.txt");
+  const gw4 = helpers.startDynamicFakeGateway(() => helpers.fakeGatewayFinalText("TLA_EPIPE"));
+  try {
+    const proc4 = Bun.spawn(
+      [
+        "sh",
+        "-c",
+        '(sleep 0.2; "$0" ask --json --events-file "$FX_EV" --auto --no-save "Hi."; echo $? > "$FX_ST") | true',
+        binary,
+      ],
+      {
+        cwd: ws,
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "pipe",
+        env: { ...makeEnv(home, gw4), FX_EV: events4, FX_ST: status4 },
+      },
+    );
+    await proc4.exited;
+    expect(Number(readFileSync(status4, "utf8").trim())).toBe(141);
+    const rows4 = readFileSync(events4, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    expect(rows4.at(-1)?.event).toBe("run_finished");
+    expect(rows4.at(-1)?.exit_code).toBe(141);
+    expect(
+      await checkTrace("closed-stdout-epipe", {
+        exitKind: "fail",
+        sinkClosed: false,
+        stdoutLen: 0,
+        fileLen: 4,
+        requiredEvents: ["run_started", "step_start", "step_end", "run_finished"],
+        forbiddenEvents: ["cancel"],
+      }),
+    ).toBe("ACCEPTED");
+  } finally {
+    gw4.stop();
+  }
+
+  // 5. Negative controls: model must reject missing cancel on SIGTERM, stdout>0 on SIGTERM,
+  //    and two terminal events in one run.
   expect(
     await checkTrace("control-missing-cancel", {
       exitKind: "sigterm",
@@ -259,6 +299,17 @@ test("AskEventsTrace validates real fx runs and rejects tampered controls", asyn
       stdoutLen: 1,
       fileLen: 2,
       requiredEvents: ["run_started", "cancel"],
+      forbiddenEvents: [],
+    }),
+  ).toBe("REJECTED");
+
+  expect(
+    await checkTrace("control-double-terminal", {
+      exitKind: "ok",
+      sinkClosed: false,
+      stdoutLen: 1,
+      fileLen: 5,
+      requiredEvents: ["run_started", "run_finished", "cancel"],
       forbiddenEvents: [],
     }),
   ).toBe("REJECTED");

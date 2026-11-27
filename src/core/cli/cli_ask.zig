@@ -640,13 +640,21 @@ const AskEventSink = struct {
     seq: u64 = 0,
     turn_id: u64 = 0,
     run_started_emitted: bool = false,
+    terminal_emitted: bool = false,
     disabled: bool = false,
     stderr_ctx: ?*anyopaque = null,
     write_stderr: WriteFn = writeRealStderr,
 
     fn open(path: []const u8, stderr_ctx: ?*anyopaque, write_stderr: WriteFn) !AskEventSink {
         const io = io_mod.getIo();
-        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+        const file_permissions: std.Io.File.Permissions = switch (std_builtin.target.os.tag) {
+            .windows => .default_file,
+            else => std.Io.File.Permissions.fromMode(0o600),
+        };
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{
+            .truncate = false,
+            .permissions = file_permissions,
+        });
         return .{
             .file = file,
             .stderr_ctx = stderr_ctx,
@@ -675,7 +683,11 @@ const AskEventSink = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        self.emitLocked(fields);
+    }
 
+    fn emitLocked(self: *AskEventSink, fields: EventFields) void {
+        const io = io_mod.getIo();
         if (self.disabled) return;
         const file = self.file orelse return;
         self.seq += 1;
@@ -708,17 +720,29 @@ const AskEventSink = struct {
     }
 
     fn emitRunStarted(self: *AskEventSink, model: []const u8, turn_id: u64) void {
-        self.setTurnId(turn_id);
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.turn_id = turn_id;
         self.run_started_emitted = true;
-        self.emit(.{ .event = "run_started", .turn_id = turn_id, .model = model });
+        self.emitLocked(.{ .event = "run_started", .turn_id = turn_id, .model = model });
+    }
+
+    fn emitTerminal(self: *AskEventSink, fields: EventFields) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.terminal_emitted) return;
+        self.terminal_emitted = true;
+        self.emitLocked(fields);
     }
 
     fn emitRunFinished(self: *AskEventSink, status: []const u8, exit_code: u8, message: ?[]const u8) void {
-        self.emit(.{ .event = "run_finished", .status = status, .exit_code = exit_code, .message = message });
+        self.emitTerminal(.{ .event = "run_finished", .status = status, .exit_code = exit_code, .message = message });
     }
 
     fn emitRunCancelled(self: *AskEventSink, exit_code: u8) void {
-        self.emit(.{ .event = "run_cancelled", .exit_code = exit_code });
+        self.emitTerminal(.{ .event = "run_cancelled", .exit_code = exit_code });
     }
 };
 
@@ -884,6 +908,8 @@ const AskContext = struct {
     /// kind or attempt changes, not on every one-second refresh.
     last_recovery_notice_kind: ?types.RouteRecoveryStatus.Kind = null,
     last_recovery_notice_attempt: usize = 0,
+    last_recovery_event_kind: ?types.RouteRecoveryStatus.Kind = null,
+    last_recovery_event_attempt: usize = 0,
     recovery_notice_mutex: std.Io.Mutex = .init,
     event_sink: ?*AskEventSink = null,
     current_model_step: usize = 0,
@@ -1611,20 +1637,47 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         return headless_interrupt.exitCode();
     }
     // The answer is in the saved session, but the reader never got it.
-    if (result.output_reader_gone) return error.OutputReaderGone;
-    if (result.output_write_failed) return error.OutputWriteFailed;
-
-    if (options.json_output) {
-        const json = try renderFinalJsonResult(alloc, result);
-        defer alloc.free(json);
-        if (interrupt_scope.requested()) return headless_interrupt.exitCode();
-        try deps.write_stdout(deps.stdout_ctx, json);
+    if (result.output_reader_gone) {
+        if (event_sink) |*sink| if (sink.run_started_emitted) sink.emitRunFinished("failed", 141, "OutputReaderGone");
+        return error.OutputReaderGone;
+    }
+    if (result.output_write_failed) {
+        if (event_sink) |*sink| if (sink.run_started_emitted) sink.emitRunFinished("failed", 1, "OutputWriteFailed");
+        return error.OutputWriteFailed;
     }
 
-    return if (interrupt_scope.requested())
-        headless_interrupt.exitCode()
-    else
-        result.exit_code;
+    if (options.json_output) {
+        const json = renderFinalJsonResult(alloc, result) catch |err| {
+            if (event_sink) |*sink| if (sink.run_started_emitted) sink.emitRunFinished("failed", 1, @errorName(err));
+            return err;
+        };
+        defer alloc.free(json);
+        if (interrupt_scope.requested()) {
+            if (event_sink) |*sink| if (sink.run_started_emitted) sink.emitRunCancelled(headless_interrupt.exitCode());
+            return headless_interrupt.exitCode();
+        }
+        deps.write_stdout(deps.stdout_ctx, json) catch |err| {
+            if (event_sink) |*sink| {
+                if (sink.run_started_emitted) {
+                    const code: u8 = if (err == error.OutputReaderGone or err == error.BrokenPipe) 141 else 1;
+                    const msg = if (code == 141) "OutputReaderGone" else @errorName(err);
+                    sink.emitRunFinished("failed", code, msg);
+                }
+            }
+            return err;
+        };
+    }
+
+    if (interrupt_scope.requested()) {
+        if (event_sink) |*sink| if (sink.run_started_emitted) sink.emitRunCancelled(headless_interrupt.exitCode());
+        return headless_interrupt.exitCode();
+    }
+    if (event_sink) |*sink| if (sink.run_started_emitted) sink.emitRunFinished(
+        if (result.exit_code != 0) "failed" else "completed",
+        result.exit_code,
+        result.error_code,
+    );
+    return result.exit_code;
 }
 
 fn preflightAskImages(
@@ -2160,9 +2213,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             null,
     };
     if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, job, false)) |early| {
-        if (!early.interrupted) {
-            if (ctx.event_sink) |sink| sink.emitRunFinished("failed", early.exit_code, early.error_code);
-        }
         return early;
     }
     // The ask ends once its whole tree is quiet: mail that waits when a turn
@@ -2196,20 +2246,13 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         // runAskTurn ends the turn the take marked.
         turn_marked = false;
         if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, follow, true)) |early| {
-            if (!early.interrupted) {
-                if (ctx.event_sink) |sink| sink.emitRunFinished("failed", early.exit_code, early.error_code);
-            }
             return early;
         }
     }
     worker_events_drained = true;
     if (ctx.presenter) |value| try value.finish();
 
-    const result = try takePromptRunResult(&ctx, alloc);
-    if (!result.interrupted) {
-        if (ctx.event_sink) |sink| sink.emitRunFinished(if (ctx.failed) "failed" else "completed", result.exit_code, result.error_code);
-    }
-    return result;
+    return try takePromptRunResult(&ctx, alloc);
 }
 
 /// Starts background title generation for a fresh saved session. The task runs
@@ -3858,6 +3901,7 @@ fn beginRouteRecoveryRequest(raw_ctx: *anyopaque) void {
     defer ctx.recovery_notice_mutex.unlock(io_mod.getIo());
     ctx.last_recovery_status = null;
     ctx.last_recovery_notice_kind = null;
+    ctx.last_recovery_event_kind = null;
 }
 
 fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatus) !void {
@@ -3866,12 +3910,28 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
         ctx.recovery_notice_mutex.lockUncancelable(io_mod.getIo());
         defer ctx.recovery_notice_mutex.unlock(io_mod.getIo());
         ctx.last_recovery_status = status;
-        const transition = switch (status.kind) {
-            .waiting, .retrying, .need_user, .recovered, .failed => changed: {
+        const notice_transition = switch (status.kind) {
+            .waiting, .retrying, .need_user => changed: {
                 const diff = ctx.last_recovery_notice_kind != status.kind or
                     ctx.last_recovery_notice_attempt != status.attempt;
                 ctx.last_recovery_notice_kind = status.kind;
                 ctx.last_recovery_notice_attempt = status.attempt;
+                break :changed diff;
+            },
+            .recovered,
+            .failed,
+            .terminal_provider_error,
+            .unsafe_assistant_output,
+            .unsafe_tool_start,
+            .content_filter,
+            => true,
+        };
+        const event_transition = switch (status.kind) {
+            .waiting, .retrying, .need_user, .recovered, .failed => changed: {
+                const diff = ctx.last_recovery_event_kind != status.kind or
+                    ctx.last_recovery_event_attempt != status.attempt;
+                ctx.last_recovery_event_kind = status.kind;
+                ctx.last_recovery_event_attempt = status.attempt;
                 break :changed diff;
             },
             .terminal_provider_error,
@@ -3881,7 +3941,7 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
             => true,
         };
         const notice = switch (status.kind) {
-            .waiting, .retrying, .need_user => transition and ctx.output_mode != .quiet,
+            .waiting, .retrying, .need_user => notice_transition and ctx.output_mode != .quiet,
             // The success or the error itself is the notice; --json reports how
             // the request ended.
             .recovered, .failed => false,
@@ -3891,7 +3951,7 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
             .content_filter,
             => ctx.output_mode != .json and ctx.output_mode != .quiet,
         };
-        break :blk .{ .emit = transition, .notice = notice };
+        break :blk .{ .emit = event_transition, .notice = notice };
     };
     var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
     const label = status.label(&label_buf);
@@ -3931,11 +3991,15 @@ fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u
     else
         try gateway_error_format.formatHttpErrorMessage(ctx.alloc, status, detail);
     defer ctx.alloc.free(message);
-    if (ctx.event_sink) |sink| sink.emit(.{
-        .event = "http_error",
-        .status = @tagName(status),
-        .message = message,
-    });
+    if (ctx.event_sink) |sink| {
+        var status_buf: [16]u8 = undefined;
+        const status_text = std.mem.print(&status_buf, "{d}", .{@backingInt(status)}) catch "";
+        sink.emit(.{
+            .event = "http_error",
+            .status = if (status_text.len > 0) status_text else null,
+            .message = message,
+        });
+    }
     if (ctx.presenter) |presenter| {
         const was_finished = presenter.finished;
         presenter.finish() catch |err| {
@@ -10137,11 +10201,18 @@ test "AskEventSink appends JSONL lines, bounds long text, and latches write erro
         var long_msg: [700]u8 = undefined;
         @memset(&long_msg, 'x');
         sink.emit(.{ .event = "notice", .message = &long_msg });
+        // Terminal events are mutually exclusive per sink instance.
+        sink.emitRunFinished("completed", 0, null);
+        sink.emitRunCancelled(143);
+    }
+    if (std_builtin.target.os.tag != .windows) {
+        const stat = try tmp.dir.statFile(std.testing.io, "events.jsonl", .{});
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
     }
     {
         var sink = try AskEventSink.open(path, &stderr_capture, TestCapture.write);
         defer sink.close();
-        sink.emitRunFinished("completed", 0, null);
+        sink.emit(.{ .event = "notice", .message = "reopened append" });
     }
 
     var read_file = try tmp.dir.openFile(std.testing.io, "events.jsonl", .{});
@@ -10150,17 +10221,24 @@ test "AskEventSink appends JSONL lines, bounds long text, and latches write erro
     defer alloc.free(bytes);
     var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, bytes, "\n"), '\n');
     var count: usize = 0;
+    var terminal_count: usize = 0;
     while (lines.next()) |line| {
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
         defer parsed.deinit();
         const obj = parsed.value.object;
         try std.testing.expectEqualStrings("ask_event", obj.get("kind").?.string);
-        if (std.mem.eql(u8, obj.get("event").?.string, "notice")) {
+        if (std.mem.eql(u8, obj.get("event").?.string, "notice") and obj.get("message").?.string.len > 100) {
             try std.testing.expectEqual(event_text_max_bytes, obj.get("message").?.string.len);
+        }
+        if (std.mem.eql(u8, obj.get("event").?.string, "run_finished") or
+            std.mem.eql(u8, obj.get("event").?.string, "run_cancelled"))
+        {
+            terminal_count += 1;
         }
         count += 1;
     }
-    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expectEqual(@as(usize, 1), terminal_count);
 
     // Latches off on mid-run write failure (read-only fd) and writes a single stderr notice.
     var ro_sink = AskEventSink{

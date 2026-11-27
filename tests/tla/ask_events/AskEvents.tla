@@ -46,6 +46,7 @@ VARIABLES
     tickerReady,      \* TRUE when recovery ticker thread wants to emit recovery status
     sigterm,          \* TRUE once SIGTERM arrives
     sinkClosed,       \* TRUE once stdout (A) or events file (B) fails/closes/fills
+    stdoutClosed,     \* TRUE once Design B stdout fails (OutputReaderGone / BrokenPipe)
     abortedByFile,    \* TRUE if Mutant = "file-abort-on-full" aborted a turn on file ENOSPC
     stepCount,        \* 0..2 bounded model steps
     recoveryCount,    \* 0..1 bounded recovery wait cycles
@@ -53,8 +54,8 @@ VARIABLES
 
 vars == <<phase, stdoutLines, fileLines, buf, producedEvents, sinkEvents,
           eventCorrupt, finalCorrupt, toolAState, toolBState, writerBusy,
-          tickerReady, sigterm, sinkClosed, abortedByFile, stepCount,
-          recoveryCount, exitKind>>
+          tickerReady, sigterm, sinkClosed, stdoutClosed, abortedByFile,
+          stepCount, recoveryCount, exitKind>>
 
 UsesEventSink == Design \in {"design-a", "design-b"}
 
@@ -97,6 +98,7 @@ TypeOK ==
     /\ tickerReady \in BOOLEAN
     /\ sigterm \in BOOLEAN
     /\ sinkClosed \in BOOLEAN
+    /\ stdoutClosed \in BOOLEAN
     /\ abortedByFile \in BOOLEAN
     /\ stepCount \in 0..2
     /\ recoveryCount \in 0..1
@@ -117,6 +119,7 @@ Init ==
     /\ tickerReady = FALSE
     /\ sigterm = FALSE
     /\ sinkClosed = FALSE
+    /\ stdoutClosed = FALSE
     /\ abortedByFile = FALSE
     /\ stepCount = 0
     /\ recoveryCount = 0
@@ -128,7 +131,7 @@ StartRun ==
     /\ phase' = "running"
     /\ EmitEvent("run_started")
     /\ UNCHANGED <<eventCorrupt, finalCorrupt, toolAState, toolBState, writerBusy,
-                   tickerReady, sigterm, sinkClosed, abortedByFile, stepCount,
+                   tickerReady, sigterm, sinkClosed, stdoutClosed, abortedByFile, stepCount,
                    recoveryCount, exitKind>>
 
 \* Run fails before any model step (e.g., missing credentials / image preflight error).
@@ -142,7 +145,7 @@ PreStepFail ==
                       ELSE Append(stdoutLines, "error_result")
     /\ UNCHANGED <<fileLines, buf, producedEvents, sinkEvents, eventCorrupt,
                    finalCorrupt, toolAState, toolBState, writerBusy, tickerReady,
-                   sigterm, sinkClosed, abortedByFile, stepCount, recoveryCount>>
+                   sigterm, sinkClosed, stdoutClosed, abortedByFile, stepCount, recoveryCount>>
 
 \* Model step begins: enter model_streaming and emit step_start.
 BeginModelStep ==
@@ -154,7 +157,7 @@ BeginModelStep ==
     /\ phase' = "model_streaming"
     /\ EmitEvent("step_start")
     /\ UNCHANGED <<eventCorrupt, finalCorrupt, toolAState, toolBState, writerBusy,
-                   tickerReady, sigterm, sinkClosed, abortedByFile, recoveryCount,
+                   tickerReady, sigterm, sinkClosed, stdoutClosed, abortedByFile, recoveryCount,
                    exitKind>>
 
 \* Transient error triggers recovery wait and arms the background ticker thread.
@@ -169,7 +172,7 @@ EnterRecoveryWait ==
     /\ tickerReady' = TRUE
     /\ EmitEvent("recovery")
     /\ UNCHANGED <<eventCorrupt, finalCorrupt, toolAState, toolBState, writerBusy,
-                   sigterm, sinkClosed, abortedByFile, stepCount, exitKind>>
+                   sigterm, sinkClosed, stdoutClosed, abortedByFile, stepCount, exitKind>>
 
 \* Recovery wait finishes and resends the model request.
 RetryAfterRecovery ==
@@ -180,7 +183,7 @@ RetryAfterRecovery ==
     /\ tickerReady' = FALSE
     /\ UNCHANGED <<stdoutLines, fileLines, buf, producedEvents, sinkEvents,
                    eventCorrupt, finalCorrupt, toolAState, toolBState, writerBusy,
-                   sigterm, sinkClosed, abortedByFile, stepCount, recoveryCount,
+                   sigterm, sinkClosed, stdoutClosed, abortedByFile, stepCount, recoveryCount,
                    exitKind>>
 
 \* Model step finishes: start a parallel pair of tools (Step 1) or proceed to finalize (Step 2).
@@ -196,7 +199,7 @@ ModelStepProducesTools ==
     \* Open a write window when Mutant = "unlocked" to let parallel tool or ticker race.
     /\ writerBusy' = "none"
     /\ EmitEvent("step_end")
-    /\ UNCHANGED <<eventCorrupt, finalCorrupt, tickerReady, sigterm, sinkClosed,
+    /\ UNCHANGED <<eventCorrupt, finalCorrupt, tickerReady, sigterm, sinkClosed, stdoutClosed,
                    abortedByFile, stepCount, recoveryCount, exitKind>>
 
 BeginToolAWrite ==
@@ -208,7 +211,7 @@ BeginToolAWrite ==
     /\ writerBusy' = "turn"
     /\ UNCHANGED <<phase, stdoutLines, fileLines, buf, producedEvents, sinkEvents,
                    eventCorrupt, finalCorrupt, toolAState, toolBState, tickerReady,
-                   sigterm, sinkClosed, abortedByFile, stepCount, recoveryCount,
+                   sigterm, sinkClosed, stdoutClosed, abortedByFile, stepCount, recoveryCount,
                    exitKind>>
 
 \* Emit tool_a_start / tool_b_start once tools_parallel begins (simplified atomic pair or individual).
@@ -240,7 +243,7 @@ FinishToolA ==
                                               THEN Append(Append(stdoutLines, "event"), "event")
                                               ELSE stdoutLines
     /\ UNCHANGED <<phase, eventCorrupt, finalCorrupt, toolBState,
-                   tickerReady, sigterm, sinkClosed, abortedByFile, stepCount,
+                   tickerReady, sigterm, sinkClosed, stdoutClosed, abortedByFile, stepCount,
                    recoveryCount, exitKind>>
 
 \* Tool B finishes (may finish BEFORE Tool A: out-of-order parallel completion).
@@ -254,7 +257,7 @@ FinishToolB ==
             /\ toolBState' = "finished"
             /\ UNCHANGED <<phase, stdoutLines, fileLines, buf, producedEvents, sinkEvents,
                            finalCorrupt, toolAState, writerBusy, tickerReady, sigterm,
-                           sinkClosed, abortedByFile, stepCount, recoveryCount, exitKind>>
+                           sinkClosed, stdoutClosed, abortedByFile, stepCount, recoveryCount, exitKind>>
        ELSE /\ writerBusy = "none"
             /\ eventCorrupt' = eventCorrupt
             /\ toolBState' = "finished"
@@ -278,7 +281,7 @@ FinishToolB ==
                                                       THEN Append(Append(stdoutLines, "event"), "event")
                                                       ELSE stdoutLines
             /\ UNCHANGED <<phase, finalCorrupt, toolAState, writerBusy,
-                           tickerReady, sigterm, sinkClosed, abortedByFile, stepCount,
+                           tickerReady, sigterm, sinkClosed, stdoutClosed, abortedByFile, stepCount,
                            recoveryCount, exitKind>>
 
 \* Both parallel tools completed -> return to agent loop.
@@ -291,7 +294,7 @@ ParallelBatchDone ==
     /\ phase' = "running"
     /\ UNCHANGED <<stdoutLines, fileLines, buf, producedEvents, sinkEvents,
                    eventCorrupt, finalCorrupt, toolAState, toolBState, writerBusy,
-                   tickerReady, sigterm, sinkClosed, abortedByFile, stepCount,
+                   tickerReady, sigterm, sinkClosed, stdoutClosed, abortedByFile, stepCount,
                    recoveryCount, exitKind>>
 
 \* Background ticker emits a concurrent recovery/notice event.
@@ -305,12 +308,12 @@ TickerEmit ==
        THEN /\ eventCorrupt' = TRUE
             /\ UNCHANGED <<phase, stdoutLines, fileLines, buf, producedEvents, sinkEvents,
                            finalCorrupt, toolAState, toolBState, writerBusy, sigterm,
-                           sinkClosed, abortedByFile, stepCount, recoveryCount, exitKind>>
+                           sinkClosed, stdoutClosed, abortedByFile, stepCount, recoveryCount, exitKind>>
        ELSE /\ writerBusy = "none"
             /\ eventCorrupt' = eventCorrupt
             /\ EmitEvent("notice")
             /\ UNCHANGED <<phase, finalCorrupt, toolAState, toolBState, writerBusy,
-                           sigterm, sinkClosed, abortedByFile, stepCount, recoveryCount,
+                           sigterm, sinkClosed, stdoutClosed, abortedByFile, stepCount, recoveryCount,
                            exitKind>>
 
 \* Model step produces final answer and enters finalizing.
@@ -321,7 +324,7 @@ ModelStepFinishes ==
     /\ phase' = "finalizing"
     /\ EmitEvent("step_end")
     /\ UNCHANGED <<eventCorrupt, finalCorrupt, toolAState, toolBState, writerBusy,
-                   tickerReady, sigterm, sinkClosed, abortedByFile, stepCount,
+                   tickerReady, sigterm, sinkClosed, stdoutClosed, abortedByFile, stepCount,
                    recoveryCount, exitKind>>
 
 \* Normal finalization: emit final result line on stdout (unless Design A stdout closed).
@@ -355,8 +358,26 @@ FinalizeNormal ==
                               THEN stdoutLines
                               ELSE Append(stdoutLines, "final_result")
     /\ UNCHANGED <<eventCorrupt, finalCorrupt, toolAState, toolBState, writerBusy,
-                   tickerReady, sigterm, sinkClosed, abortedByFile, stepCount,
+                   tickerReady, sigterm, sinkClosed, stdoutClosed, abortedByFile, stepCount,
                    recoveryCount>>
+
+\* Design B stdout reader closes early (EPIPE / OutputReaderGone -> exit 141):
+\* runWithDeps emits run_finished with failed status after stdout fails.
+StdoutFailsFinal ==
+    /\ Class /= "ideal"
+    /\ Design = "design-b"
+    /\ phase = "finalizing"
+    /\ ~sigterm
+    /\ phase' = "exited"
+    /\ exitKind' = "fail"
+    /\ stdoutClosed' = TRUE
+    /\ producedEvents' = producedEvents \cup {"run_finished"}
+    /\ buf' = buf
+    /\ stdoutLines' = stdoutLines
+    /\ sinkEvents' = IF ~sinkClosed THEN sinkEvents \cup {"run_finished"} ELSE sinkEvents
+    /\ fileLines' = IF ~sinkClosed THEN Append(fileLines, "event") ELSE fileLines
+    /\ UNCHANGED <<eventCorrupt, finalCorrupt, toolAState, toolBState, writerBusy,
+                   tickerReady, sigterm, sinkClosed, abortedByFile, stepCount, recoveryCount>>
 
 \* Sink closed / disk full (non-ideal environment).
 SinkFails ==
@@ -374,7 +395,7 @@ SinkFails ==
             /\ exitKind' = exitKind
     /\ UNCHANGED <<stdoutLines, fileLines, buf, producedEvents, sinkEvents,
                    eventCorrupt, finalCorrupt, toolAState, toolBState, writerBusy,
-                   tickerReady, sigterm, stepCount, recoveryCount>>
+                   tickerReady, sigterm, stdoutClosed, stepCount, recoveryCount>>
 
 \* SIGTERM arrives while active.
 SigtermArrives ==
@@ -386,7 +407,7 @@ SigtermArrives ==
     /\ writerBusy' = "none"
     /\ UNCHANGED <<stdoutLines, fileLines, buf, producedEvents, sinkEvents,
                    eventCorrupt, finalCorrupt, toolAState, toolBState, tickerReady,
-                   sinkClosed, abortedByFile, stepCount, recoveryCount, exitKind>>
+                   sinkClosed, stdoutClosed, abortedByFile, stepCount, recoveryCount, exitKind>>
 
 \* Process completes clean SIGTERM shutdown (returns 143).
 SigtermExits ==
@@ -415,7 +436,7 @@ SigtermExits ==
                                                       THEN Append(stdoutLines, "event")
                                                       ELSE stdoutLines
     /\ UNCHANGED <<eventCorrupt, finalCorrupt, toolAState, toolBState, writerBusy,
-                   tickerReady, sigterm, sinkClosed, abortedByFile, stepCount,
+                   tickerReady, sigterm, sinkClosed, stdoutClosed, abortedByFile, stepCount,
                    recoveryCount>>
 
 \* SIGKILL kills the process immediately at any active step, including mid-finalizing.
@@ -427,7 +448,7 @@ SigkillHits ==
     /\ exitKind' = "killed"
     /\ UNCHANGED <<stdoutLines, fileLines, buf, producedEvents, sinkEvents,
                    eventCorrupt, toolAState, toolBState, writerBusy, tickerReady,
-                   sigterm, sinkClosed, abortedByFile, stepCount, recoveryCount>>
+                   sigterm, sinkClosed, stdoutClosed, abortedByFile, stepCount, recoveryCount>>
 
 Terminated ==
     /\ phase \in {"exited", "killed"}
@@ -447,6 +468,7 @@ Next ==
     \/ TickerEmit
     \/ ModelStepFinishes
     \/ FinalizeNormal
+    \/ StdoutFailsFinal
     \/ SinkFails
     \/ SigtermArrives
     \/ SigtermExits
@@ -463,7 +485,7 @@ ValidJsonPerLine == ~eventCorrupt
 
 \* 2. The final result line on normal exit is the same object `--json` prints today.
 FinalResultMatchesJson ==
-    (exitKind \in {"ok", "fail"} /\ ~(Design = "design-a" /\ sinkClosed)) =>
+    (exitKind \in {"ok", "fail"} /\ ~stdoutClosed /\ ~(Design = "design-a" /\ sinkClosed)) =>
         (Len(stdoutLines) >= 1 /\ stdoutLines[Len(stdoutLines)] \in {"final_result", "error_result"})
 
 \* 3. No produced event (nor the cancel marker) is lost before a SIGTERM exit completes.
@@ -475,7 +497,7 @@ NoEventLostOnSigterm ==
 \*    (and in Design B stdout never contains event lines at all).
 IgnoreEventsGetsResult ==
     /\ (Design = "design-b" => \A i \in 1..Len(stdoutLines) : stdoutLines[i] # "event")
-    /\ ((exitKind \in {"ok", "fail"} /\ ~(Design = "design-a" /\ sinkClosed)) =>
+    /\ ((exitKind \in {"ok", "fail"} /\ ~stdoutClosed /\ ~(Design = "design-a" /\ sinkClosed)) =>
             (Len(stdoutLines) >= 1 /\ stdoutLines[Len(stdoutLines)] \in {"final_result", "error_result"}))
 
 \* 5. Design B: a full/closed event file never aborts the main turn.
@@ -485,5 +507,8 @@ FileFullDoesNotAbortTurn == ~abortedByFile
 OutOfOrderToolsCorrelated ==
     (UsesEventSink /\ Mutant = "none" /\ ~sinkClosed /\ toolBState = "finished" /\ toolAState = "started") =>
         ("tool_b_start" \in sinkEvents /\ "tool_b_end" \in sinkEvents)
+
+\* 7. run_finished and run_cancelled are mutually exclusive.
+SingleTerminalEvent == ~("run_finished" \in sinkEvents /\ "cancel" \in sinkEvents)
 
 =============================================================================

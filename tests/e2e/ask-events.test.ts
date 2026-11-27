@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -104,6 +104,7 @@ describe("fx ask --events-file", () => {
 
       const events = parseJsonl(readFileSync(eventsPath, "utf8"));
       expect(events.length).toBeGreaterThanOrEqual(9);
+      expect(statSync(eventsPath).mode & 0o777).toBe(0o600);
       for (let i = 0; i < events.length; i += 1) {
         expect(events[i]!.kind).toBe("ask_event");
         expect(events[i]!.seq).toBe(i + 1);
@@ -291,4 +292,95 @@ describe("fx ask --events-file", () => {
       cleanupIsolatedTestHome(home);
     }
   }, 30_000);
+
+  test("unnamed HTTP 499 error records numeric status without panicking", async () => {
+    const home = createIsolatedTestHome("fx-ask-events-499-");
+    const root = mkdtempSync(join(tmpdir(), "fx-ask-events-499-ws-"));
+    const workspace = join(root, "ws");
+    mkdirSync(workspace);
+    const eventsPath = join(root, "events.jsonl");
+
+    const gateway = startDynamicFakeGateway(
+      () =>
+        new Response(JSON.stringify({ error: { message: "client closed request" } }), {
+          status: 499,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+
+    try {
+      const proc = Bun.spawn(
+        [FX_BIN, "ask", "--json", "--events-file", eventsPath, "--auto", "--no-save", "Trigger 499."],
+        { cwd: workspace, stdin: "ignore", stdout: "pipe", stderr: "pipe", env: makeAskEnv(home, gateway) },
+      );
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      expect(code, stderr).toBe(1);
+      const result = JSON.parse(stdout);
+      expect(result.exit_code).toBe(1);
+
+      const events = parseJsonl(readFileSync(eventsPath, "utf8"));
+      const httpErrors = events.filter((e) => e.event === "http_error");
+      expect(httpErrors).toHaveLength(1);
+      expect(httpErrors[0]!.status).toBe("499");
+      const finals = events.filter((e) => e.event === "run_finished" || e.event === "run_cancelled");
+      expect(finals).toHaveLength(1);
+      expect(finals[0]!.event).toBe("run_finished");
+      expect(finals[0]!.exit_code).toBe(1);
+    } finally {
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+      cleanupIsolatedTestHome(home);
+    }
+  }, 15_000);
+
+  test("closed stdout reader records one failed terminal event matching exit 141", async () => {
+    const home = createIsolatedTestHome("fx-ask-events-epipe-");
+    const root = mkdtempSync(join(tmpdir(), "fx-ask-events-epipe-ws-"));
+    const workspace = join(root, "ws");
+    mkdirSync(workspace);
+
+    for (const [label, flags] of [["raw", []], ["--json", ["--json"]]] as const) {
+      const eventsPath = join(root, `events-${label}.jsonl`);
+      const statusPath = join(root, `status-${label}.txt`);
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("CLOSED_STDOUT_ANSWER"));
+
+      try {
+        const proc = Bun.spawn(
+          [
+            "sh",
+            "-c",
+            '(sleep 0.2; "$0" ask "$@" --events-file "$FX_EV" --auto --no-save "Say hello."; echo $? > "$FX_ST") | true',
+            FX_BIN,
+            ...flags,
+          ],
+          {
+            cwd: workspace,
+            stdin: "ignore",
+            stdout: "ignore",
+            stderr: "pipe",
+            env: { ...makeAskEnv(home, gateway), FX_EV: eventsPath, FX_ST: statusPath },
+          },
+        );
+        const stderr = await new Response(proc.stderr).text();
+        await proc.exited;
+        const status = Number(readFileSync(statusPath, "utf8").trim());
+        expect(status, `${label}: ${stderr}`).toBe(141);
+
+        const events = parseJsonl(readFileSync(eventsPath, "utf8"));
+        const finals = events.filter((e) => e.event === "run_finished" || e.event === "run_cancelled");
+        expect(finals, label).toHaveLength(1);
+        expect(events.at(-1)!.event, label).toBe("run_finished");
+        expect(events.at(-1)!.status, label).toBe("failed");
+        expect(events.at(-1)!.exit_code, label).toBe(141);
+      } finally {
+        gateway.stop();
+      }
+    }
+    rmSync(root, { recursive: true, force: true });
+    cleanupIsolatedTestHome(home);
+  }, 20_000);
 });
