@@ -3,6 +3,7 @@ const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
 const approval_decision = @import("../../core/permissions/approval_decision.zig");
 const paste_blocks = @import("../../core/input/pasted_blocks.zig");
+const paste_framing = @import("../../core/input/paste_framing.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const native_clear_probe_runtime = @import("native_clear_probe.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
@@ -581,6 +582,19 @@ pub const DeferredSessionInput = union(enum) {
     delivery_epoch,
 };
 
+pub const PendingClipboardTextTarget = struct {
+    owner: paste_framing.Owner,
+    buffer_limit: usize,
+    max_input_len: usize,
+};
+
+pub const PendingClipboardRead = union(enum) {
+    none,
+    ctrl_v_image,
+    paste_event_image,
+    paste_event_text: PendingClipboardTextTarget,
+};
+
 pub const Runtime = struct {
     terminal_cursor_probe: cursor_probe.Parser = .{},
     terminal_theme_monitor: theme_monitor.Monitor = .{},
@@ -588,6 +602,11 @@ pub const Runtime = struct {
     /// it, the terminal sends a paste as typed keys, and each line break in
     /// the paste presses Enter.
     bracketed_paste_rearm: mode_rearm.Schedule = .{},
+    /// Session-scoped toggle for kitty paste events (DEC mode 5522). Turned
+    /// off if the terminal denies clipboard access (`EPERM`) for a paste event.
+    paste_events_enabled: bool = true,
+    /// Origin and target of the open OSC 5522 read, owned with the reader.
+    pending_clipboard_read: PendingClipboardRead = .none,
     /// Reads a clipboard image from the terminal when fx cannot read the
     /// clipboard itself, such as over SSH.
     terminal_clipboard_reader: clipboard_protocol.Reader = .{},

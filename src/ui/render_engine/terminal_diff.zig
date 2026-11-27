@@ -57,10 +57,24 @@ pub const FrameReset = enum {
     none,
     clear,
     ris,
+    ris_without_paste_events,
 
     pub fn fromPlan(reset_terminal: bool, history_reset_uses_ris: bool) FrameReset {
+        return fromPlanWithPasteEvents(reset_terminal, history_reset_uses_ris, true);
+    }
+
+    pub fn fromPlanWithPasteEvents(
+        reset_terminal: bool,
+        history_reset_uses_ris: bool,
+        paste_events_enabled: bool,
+    ) FrameReset {
         if (!reset_terminal) return .none;
-        return if (history_reset_uses_ris) .ris else .clear;
+        if (!history_reset_uses_ris) return .clear;
+        return if (paste_events_enabled) .ris else .ris_without_paste_events;
+    }
+
+    fn isRis(self: FrameReset) bool {
+        return self == .ris or self == .ris_without_paste_events;
     }
 };
 
@@ -70,6 +84,7 @@ pub const FrameCommitInput = struct {
     repaint_window: paint_plan.FrameRepaintWindow,
     synchronized_update: bool,
     history_reset_uses_ris: bool = false,
+    paste_events_enabled: bool = true,
     scroll_plan: frame_scroll_plan.FrameScrollPlan,
     document_append: frame_scroll_plan.FrameDocumentAppend = .{},
     terminal_transition: FrameTerminalTransition = .none,
@@ -183,7 +198,7 @@ pub const PreparedTerminalMovement = struct {
             !std.meta.eql(self.scroll_rows, expected_rows) or
             !std.meta.eql(self.terminal_transition, terminal_transition) or
             self.reset != reset or
-            (self.reset == .ris) != (self.sync_prefix_offset > 0) or
+            self.reset.isRis() != (self.sync_prefix_offset > 0) or
             self.sync_prefix_offset > self.bytes.len or
             (self.hasDocumentAppend() and self.sync_prefix_offset > self.document_append_start) or
             self.reset_replay != reset_replay or
@@ -367,7 +382,11 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
     if (input.document_append.reset_replay and !input.surface.plan.reset_terminal) {
         return error.InvalidFrameScrollPlan;
     }
-    const reset = FrameReset.fromPlan(input.surface.plan.reset_terminal, input.history_reset_uses_ris);
+    const reset = FrameReset.fromPlanWithPasteEvents(
+        input.surface.plan.reset_terminal,
+        input.history_reset_uses_ris,
+        input.paste_events_enabled,
+    );
     var local_movement: ?PreparedTerminalMovement = null;
     defer if (local_movement) |*movement| movement.deinit(alloc);
     const movement = if (input.prepared_movement) |prepared|
@@ -1328,9 +1347,12 @@ fn appendFrameReset(
     if (reset == .none) return 0;
     const start = bytes.written().len;
     var sync_prefix_offset: usize = 0;
-    if (reset == .ris) {
+    if (reset.isRis()) {
         try bytes.writer.writeAll("\x1bc");
-        try bytes.writer.writeAll(ui_terminal.interactive_mode_enable_sequence);
+        try bytes.writer.writeAll(ui_terminal.interactiveModeEnableSequenceWithPasteEvents(
+            null,
+            reset == .ris,
+        ));
         sync_prefix_offset = bytes.written().len;
     }
     try bytes.writer.writeAll("\x1b[0m\x1b[2J\x1b[3J\x1b[H");
@@ -2706,6 +2728,39 @@ test "flushFrame uses RIS before a terminal history reset" {
     try std.testing.expect(interactive_modes < sync_begin);
     try std.testing.expect(sync_begin < cursor_hide);
     try std.testing.expect(cursor_hide < clear_scrollback);
+}
+
+test "flushFrame RIS omits paste events when disabled" {
+    var previous = try vt_emulator.Grid.init(std.testing.allocator, 8, 4);
+    defer previous.deinit();
+    try previous.feed("\x1b[1;1Hshell");
+
+    var plan = testPlan();
+    plan.reset_terminal = true;
+    var surface = try makeSurface(std.testing.allocator, previous, plan);
+    defer surface.deinit();
+
+    var sink = TestSink{};
+    defer sink.deinit(std.testing.allocator);
+    var metrics: Metrics = .{};
+    _ = try flushFrame(.{
+        .previous = &previous,
+        .surface = &surface,
+        .repaint_window = paint_plan.FrameRepaintWindow.fromPlan(surface.plan, .{ .include_transcript = true }),
+        .synchronized_update = true,
+        .history_reset_uses_ris = true,
+        .paste_events_enabled = false,
+        .scroll_plan = testScrollPlan(0),
+        .sink = sink.frameSink(),
+        .metrics = &metrics,
+    });
+
+    try std.testing.expect(std.mem.find(
+        u8,
+        sink.bytes.items,
+        ui_terminal.interactiveModeEnableSequenceWithPasteEvents(null, false),
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "\x1b[?5522h") == null);
 }
 
 test "flushFrame emits terminal scroll inside synchronized frame bytes" {

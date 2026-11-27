@@ -138,7 +138,9 @@ fn mimeBase64(mime: PasteMime) []const u8 {
     };
 }
 
-/// Picks the preferred MIME type from an ASCII-whitespace-separated list.
+/// Picks the preferred MIME type from an ASCII-whitespace-separated list:
+/// `text/plain;charset=utf-8`, then `text/plain`, then `image/png` only when
+/// `image_allowed` is true.
 pub fn pickPasteMime(mimes: []const u8, image_allowed: bool) ?PasteMime {
     var has_png = false;
     var has_text_utf8 = false;
@@ -150,17 +152,17 @@ pub fn pickPasteMime(mimes: []const u8, image_allowed: bool) ?PasteMime {
         const start = index;
         while (index < mimes.len and !std.ascii.isWhitespace(mimes[index])) : (index += 1) {}
         const token = mimes[start..index];
-        if (image_allowed and std.mem.eql(u8, token, "image/png")) {
-            has_png = true;
-        } else if (std.mem.eql(u8, token, "text/plain;charset=utf-8")) {
+        if (std.mem.eql(u8, token, "text/plain;charset=utf-8")) {
             has_text_utf8 = true;
         } else if (std.mem.eql(u8, token, "text/plain")) {
             has_text = true;
+        } else if (image_allowed and std.mem.eql(u8, token, "image/png")) {
+            has_png = true;
         }
     }
-    if (has_png) return .png;
     if (has_text_utf8) return .text_utf8;
     if (has_text) return .text;
+    if (has_png) return .png;
     return null;
 }
 
@@ -439,6 +441,17 @@ pub const Reader = struct {
         self.max_payload_bytes = max_image_bytes;
         self.saved_awaiting_phase = null;
         self.phase = .{ .awaiting_mode = io_mod.addMillis(now_ms, mode_report_timeout_ms) };
+    }
+
+    /// Starts an image read request for a paste-event follow-up read, skipping
+    /// the DECRQM mode query because the listing already proved mode 5522 is on.
+    pub fn beginPasteImage(self: *Reader, now_ms: i64, max_image_bytes: usize) error{RequestPending}!void {
+        if (self.pending()) return error.RequestPending;
+        self.request_kind = .image;
+        self.request_mime = .png;
+        self.max_payload_bytes = max_image_bytes;
+        self.saved_awaiting_phase = null;
+        self.phase = .{ .awaiting_reply = io_mod.addMillis(now_ms, reply_timeout_ms) };
     }
 
     /// Starts a text read request (such as a paste-event follow-up read, which
@@ -1781,8 +1794,11 @@ fn expectTextOutcome(reader: *Reader, expected: std.meta.Tag(TextOutcome)) !void
 }
 
 test "pickPasteMime selects by priority with exact ASCII whitespace tokens" {
-    try testing.expectEqual(@as(?PasteMime, .png), pickPasteMime("text/plain image/png text/plain;charset=utf-8", true));
+    try testing.expectEqual(@as(?PasteMime, .text_utf8), pickPasteMime("text/plain image/png text/plain;charset=utf-8", true));
     try testing.expectEqual(@as(?PasteMime, .text_utf8), pickPasteMime("text/plain image/png text/plain;charset=utf-8", false));
+    try testing.expectEqual(@as(?PasteMime, .text), pickPasteMime("image/png text/plain", true));
+    try testing.expectEqual(@as(?PasteMime, .png), pickPasteMime("image/png", true));
+    try testing.expectEqual(@as(?PasteMime, null), pickPasteMime("image/png", false));
     try testing.expectEqual(@as(?PasteMime, .text), pickPasteMime("text/html\ttext/plain\r\n", true));
     try testing.expectEqual(@as(?PasteMime, null), pickPasteMime("", true));
     try testing.expectEqual(@as(?PasteMime, null), pickPasteMime("  \t\n\r ", true));
@@ -1853,7 +1869,19 @@ test "reader decodes spec paste event listings with clipboard, primary, image, a
         try testing.expectEqual(@as(?PasteMime, .text_utf8), pickPasteMime(outcome.paste_event.mimes.items, true));
     }
 
-    // 3. Listing with image/png.
+    // 3. Listing with image/png only, and image/png + text/plain.
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        deliverPacket(&reader, "type=read:status=OK:pw=c2VjcmV0MTIz", "\x1b\\", 0);
+        try deliverMimeData(&reader, "Lg==", "image/png", "", "\x07", 1);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 2);
+
+        var outcome = reader.takePasteEventOutcome().?;
+        defer outcome.deinit(testing.allocator);
+        try testing.expectEqual(@as(?PasteMime, .png), pickPasteMime(outcome.paste_event.mimes.items, true));
+        try testing.expectEqual(@as(?PasteMime, null), pickPasteMime(outcome.paste_event.mimes.items, false));
+    }
     {
         var reader: Reader = .{};
         defer reader.deinit(testing.allocator);
@@ -1863,7 +1891,7 @@ test "reader decodes spec paste event listings with clipboard, primary, image, a
 
         var outcome = reader.takePasteEventOutcome().?;
         defer outcome.deinit(testing.allocator);
-        try testing.expectEqual(@as(?PasteMime, .png), pickPasteMime(outcome.paste_event.mimes.items, true));
+        try testing.expectEqual(@as(?PasteMime, .text), pickPasteMime(outcome.paste_event.mimes.items, true));
         try testing.expectEqual(@as(?PasteMime, .text), pickPasteMime(outcome.paste_event.mimes.items, false));
     }
 
@@ -2199,6 +2227,50 @@ test "reader handles listing stalls, boundary caps, and idle OK without pw or Lg
         var outcome = reader.takeOutcome().?;
         defer outcome.deinit(testing.allocator);
         try testing.expectEqualStrings(test_png, outcome.image.items);
+        try testing.expect(!reader.pending());
+    }
+}
+
+test "reader beginPasteImage skips mode query and reads png or denial" {
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        try reader.beginPasteImage(0, 1024);
+        deliverPacket(&reader, "type=read:status=OK", "\x1b\\", 1);
+        try deliverData(&reader, test_png, 2);
+        deliverPacket(&reader, "type=read:status=DONE", "\x1b\\", 3);
+
+        var outcome = reader.takeOutcome().?;
+        defer outcome.deinit(testing.allocator);
+        try testing.expectEqualStrings(test_png, outcome.image.items);
+        try testing.expect(!reader.pending());
+    }
+
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        try reader.beginPasteImage(0, 1024);
+        deliverPacket(&reader, "type=read:status=EPERM", "\x1b\\", 1);
+        try expectOutcome(&reader, .denied);
+        try testing.expect(!reader.pending());
+    }
+
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        try reader.beginPasteImage(0, 1024);
+        reader.poll(testing.allocator, reply_timeout_ms - 1);
+        try testing.expect(reader.takeOutcome() == null);
+        reader.poll(testing.allocator, reply_timeout_ms);
+        try expectOutcome(&reader, .timed_out);
+        try testing.expect(!reader.pending());
+    }
+
+    {
+        var reader: Reader = .{};
+        defer reader.deinit(testing.allocator);
+        try reader.beginPasteImage(0, 1024);
+        reader.cancel();
         try testing.expect(!reader.pending());
     }
 }

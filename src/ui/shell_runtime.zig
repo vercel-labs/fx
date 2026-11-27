@@ -72,6 +72,7 @@ pub const TerminalState = struct {
     alternate_mouse_tracking_active: bool = false,
     signal_handler_installed: bool = false,
     old_winch_action: ?std.posix.Sigaction = null,
+    test_write_sink: if (builtin.is_test) ?*std.Io.Writer else void = if (builtin.is_test) null else {},
 
     pub fn fileApprovalScreenActive(self: TerminalState) bool {
         return self.alternate_screen_owner == .file_approval;
@@ -223,9 +224,19 @@ pub const TerminalState = struct {
         try stdout_file.writeStreamingAll(io_mod.getIo(), cursor_probe.queryBytes(protocol));
     }
 
-    pub fn enableBracketedPaste(_: TerminalState) !void {
+    pub fn enableBracketedPaste(self: TerminalState, paste_events_enabled: bool) !void {
+        const seq = ui_terminal.bracketedPasteRearmSequence(
+            io_mod.getenv("TMUX"),
+            paste_events_enabled,
+        );
+        if (comptime builtin.is_test) {
+            if (self.test_write_sink) |sink| {
+                try sink.writeAll(seq);
+                return;
+            }
+        }
         var stdout_file = std.Io.File.stdout();
-        try stdout_file.writeStreamingAll(io_mod.getIo(), ui_terminal.bracketed_paste_enable_sequence);
+        try stdout_file.writeStreamingAll(io_mod.getIo(), seq);
     }
 
     pub fn enableThemeNotifications(_: TerminalState) !void {
@@ -249,9 +260,39 @@ pub const TerminalState = struct {
     }
 
     /// Asks the terminal for the clipboard image (`clipboard_protocol`).
-    pub fn requestClipboardImage(_: TerminalState) !void {
+    pub fn requestClipboardImage(self: TerminalState) !void {
+        if (comptime builtin.is_test) {
+            if (self.test_write_sink) |sink| {
+                try sink.writeAll(clipboard_protocol.image_read_request);
+                return;
+            }
+        }
         var stdout_file = std.Io.File.stdout();
         try stdout_file.writeStreamingAll(io_mod.getIo(), clipboard_protocol.image_read_request);
+    }
+
+    /// Writes an encoded OSC 5522 paste-event follow-up read request.
+    pub fn requestClipboardPasteRead(self: TerminalState, request_bytes: []const u8) !void {
+        if (comptime builtin.is_test) {
+            if (self.test_write_sink) |sink| {
+                try sink.writeAll(request_bytes);
+                return;
+            }
+        }
+        var stdout_file = std.Io.File.stdout();
+        try stdout_file.writeStreamingAll(io_mod.getIo(), request_bytes);
+    }
+
+    /// Turns off kitty paste events (DEC mode 5522) for the rest of the session.
+    pub fn disablePasteEvents(self: TerminalState) !void {
+        if (comptime builtin.is_test) {
+            if (self.test_write_sink) |sink| {
+                try sink.writeAll(ui_terminal.paste_events_disable_sequence);
+                return;
+            }
+        }
+        var stdout_file = std.Io.File.stdout();
+        try stdout_file.writeStreamingAll(io_mod.getIo(), ui_terminal.paste_events_disable_sequence);
     }
 
     pub fn read(self: TerminalState, out: []u8) !usize {

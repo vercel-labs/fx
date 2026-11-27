@@ -100,9 +100,12 @@ pub fn terminalInputGone(fd: std.posix.fd_t) bool {
     return terminalGone(fd, error.InputOutput);
 }
 
-pub const interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[>1u\x1b[?2004h\x1b[?7l";
+pub const interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[>1u\x1b[?2004h\x1b[?5522h\x1b[?7l";
+pub const interactive_mode_enable_without_paste_events_sequence = "\x1b[>4;2m\x1b[>1u\x1b[?2004h\x1b[?7l";
 const tmux_interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[?2004h\x1b[?7l";
 pub const bracketed_paste_enable_sequence = "\x1b[?2004h";
+pub const paste_events_disable_sequence = "\x1b[?5522l";
+const bracketed_and_paste_events_enable_sequence = "\x1b[?2004h\x1b[?5522h";
 pub const theme_notification_enable_sequence = "\x1b[?2031h";
 pub const theme_notification_disable_sequence = "\x1b[?2031l";
 pub const theme_color_scheme_query = "\x1b[?996n";
@@ -127,10 +130,20 @@ pub fn alternateScreenFrameRestoreSequence(mouse_tracking_active: bool) []const 
 }
 
 pub fn interactiveModeEnableSequence(tmux: ?[]const u8) []const u8 {
-    return if (tmux == null)
+    return interactiveModeEnableSequenceWithPasteEvents(tmux, true);
+}
+
+pub fn interactiveModeEnableSequenceWithPasteEvents(tmux: ?[]const u8, paste_events_enabled: bool) []const u8 {
+    if (tmux != null) return tmux_interactive_mode_enable_sequence;
+    return if (paste_events_enabled)
         interactive_mode_enable_sequence
     else
-        tmux_interactive_mode_enable_sequence;
+        interactive_mode_enable_without_paste_events_sequence;
+}
+
+pub fn bracketedPasteRearmSequence(tmux: ?[]const u8, paste_events_enabled: bool) []const u8 {
+    if (tmux == null and paste_events_enabled) return bracketed_and_paste_events_enable_sequence;
+    return bracketed_paste_enable_sequence;
 }
 
 pub fn queryLayout(fd: std.posix.fd_t, footer_rows: u16) !types.Layout {
@@ -217,6 +230,10 @@ test "interactive mode preserves direct terminal keyboard protocols" {
         interactive_mode_enable_sequence,
         interactiveModeEnableSequence(null),
     );
+    try std.testing.expect(std.mem.find(u8, interactiveModeEnableSequence(null), "\x1b[?5522h") != null);
+    try std.testing.expect(
+        std.mem.find(u8, interactiveModeEnableSequenceWithPasteEvents(null, false), "\x1b[?5522h") == null,
+    );
 }
 
 test "interactive mode leaves kitty keyboard negotiation to tmux" {
@@ -227,9 +244,16 @@ test "interactive mode leaves kitty keyboard negotiation to tmux" {
         sequence,
     );
     try std.testing.expect(std.mem.find(u8, sequence, "\x1b[>1u") == null);
+    try std.testing.expect(std.mem.find(u8, sequence, "\x1b[?5522h") == null);
     try std.testing.expect(std.mem.find(u8, sequence, "\x1b[>4;2m") != null);
     try std.testing.expect(std.mem.find(u8, sequence, "\x1b[?2004h") != null);
     try std.testing.expect(std.mem.find(u8, sequence, "\x1b[?7l") != null);
+}
+
+test "bracketed paste re-arm includes paste events only outside tmux when enabled" {
+    try std.testing.expectEqualStrings("\x1b[?2004h\x1b[?5522h", bracketedPasteRearmSequence(null, true));
+    try std.testing.expectEqualStrings("\x1b[?2004h", bracketedPasteRearmSequence(null, false));
+    try std.testing.expectEqualStrings("\x1b[?2004h", bracketedPasteRearmSequence("", true));
 }
 
 test "interactive mode leaves native terminal scrollback enabled" {

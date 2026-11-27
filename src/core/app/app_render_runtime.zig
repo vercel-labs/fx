@@ -104,11 +104,13 @@ const SurfaceFrameShell = struct {
     shadow_vt: ?*vt_emulator.Grid,
     committed_frame_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
     history_reset_uses_ris: bool,
+    paste_events_enabled: bool,
 
     fn init(
         output: *transcript_runtime.TranscriptRuntime,
         invalidation_owner: *transcript_runtime.TranscriptRuntime,
         committed_frame_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
+        paste_events_enabled: bool,
     ) SurfaceFrameShell {
         return .{
             .output = output,
@@ -116,6 +118,7 @@ const SurfaceFrameShell = struct {
             .shadow_vt = output.shadow_vt,
             .committed_frame_layout = committed_frame_layout,
             .history_reset_uses_ris = output.history_reset_uses_ris,
+            .paste_events_enabled = paste_events_enabled,
         };
     }
 
@@ -1808,10 +1811,15 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
             }
+            const paste_events_enabled = if (comptime @hasField(App, "terminal_input_runtime"))
+                app.terminal_input_runtime.paste_events_enabled
+            else
+                true;
             var frame_shell = SurfaceFrameShell.init(
                 &app.shell,
                 presentation_shell,
                 active_committed_layout,
+                paste_events_enabled,
             );
             const result = try render_engine.frame_builder.buildAndFlushFrame(
                 app.alloc,

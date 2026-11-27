@@ -43,10 +43,10 @@ pub const default_permission_mode = config_runtime.default_permission_mode;
 /// Resets terminal modes, clears fx's program status, and ends with a newline
 /// before the next shell prompt.
 const abnormal_exit_restore_prefix = "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[?1049l\x1b[?7h\x1b[4l\x1b[?6l\x1b[0m\x1b[?25h\x1b[?2031l\x1b[?2004l" ++ program_status.clear_sequence;
-const abnormal_exit_restore = abnormal_exit_restore_prefix ++ "\x1b[<u\x1b[>4;0m\n";
+const abnormal_exit_restore = abnormal_exit_restore_prefix ++ "\x1b[?5522l\x1b[<u\x1b[>4;0m\n";
 const tmux_abnormal_exit_restore = abnormal_exit_restore_prefix ++ "\x1b[>4;0m\n";
 const normal_exit_restore_prefix = ui_terminal.theme_notification_disable_sequence ++ "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[4l\x1b[?6l\x1b[?2004l" ++ program_status.clear_sequence;
-const normal_exit_restore = normal_exit_restore_prefix ++ "\x1b[<u\x1b[>4;0m";
+const normal_exit_restore = normal_exit_restore_prefix ++ "\x1b[?5522l\x1b[<u\x1b[>4;0m";
 const tmux_normal_exit_restore = normal_exit_restore_prefix ++ "\x1b[>4;0m";
 const alternate_screen_enter = "\x1b[?1049h";
 const alternate_mouse_tracking_enter = "\x1b[?1000h\x1b[?1006h";
@@ -1099,7 +1099,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     );
     // Enable keyboard/paste protocol modes and disable autowrap for the
     // interactive session. Shutdown restores each mode.
-    try enableInteractiveTerminalModes(cfg.shell, cfg.metrics);
+    try enableInteractiveTerminalModes(cfg.shell, cfg.metrics, true);
     try cfg.shell.initViewportWithReservedRows(cfg.metrics, launch_start_row, effective_startup_min_body_rows);
 
     return state;
@@ -1340,12 +1340,13 @@ pub fn suspendToJobControl(
     shell: *TranscriptRuntime,
     metrics: *Metrics,
     footer_rows: u16,
+    paste_events_enabled: bool,
 ) !void {
     if (!shell_runtime.supports_resize_signal) return;
 
     suspendTerminalForJobControl(terminal, shell, metrics);
     _ = std.c.raise(std.posix.SIG.TSTP);
-    try resumeTerminalAfterJobControl(terminal, shell, metrics, footer_rows);
+    try resumeTerminalAfterJobControl(terminal, shell, metrics, footer_rows, paste_events_enabled);
 }
 
 fn leaveAlternateScreens(terminal: *TerminalState, shell: *TranscriptRuntime, metrics: *Metrics) void {
@@ -1370,21 +1371,22 @@ fn resumeTerminalAfterJobControl(
     shell: *TranscriptRuntime,
     metrics: *Metrics,
     footer_rows: u16,
+    paste_events_enabled: bool,
 ) !void {
     shell.layout = terminal.queryLayout(footer_rows) catch shell.layout;
     try terminal.captureOriginalTermios();
     try terminal.enableRawMode();
-    try enableInteractiveTerminalModes(shell, metrics);
+    try enableInteractiveTerminalModes(shell, metrics, paste_events_enabled);
     debug_trace.logf("app", "event=job_control_resume_redraw dropped=terminal_screen_and_scrollback reason=resumed_after_suspend", .{});
     try shell.requestTerminalReset(metrics);
     shell.render_requests.request(.first_frame);
 }
 
-fn enableInteractiveTerminalModes(shell: *TranscriptRuntime, metrics: *Metrics) !void {
+fn enableInteractiveTerminalModes(shell: *TranscriptRuntime, metrics: *Metrics, paste_events_enabled: bool) !void {
     try writeLifecycleTerminalBytes(
         shell,
         metrics,
-        ui_terminal.interactiveModeEnableSequence(io_mod.getenv("TMUX")),
+        ui_terminal.interactiveModeEnableSequenceWithPasteEvents(io_mod.getenv("TMUX"), paste_events_enabled),
     );
 }
 
@@ -2508,10 +2510,14 @@ test "exit and suspend restoration clear the program status record" {
 test "terminal keyboard stack restore stays paired with enable policy" {
     try std.testing.expect(std.mem.find(u8, normalExitRestoreSequence(null), "\x1b[<u") != null);
     try std.testing.expect(std.mem.find(u8, abnormal_exit_restore, "\x1b[<u") != null);
+    try std.testing.expect(std.mem.find(u8, normalExitRestoreSequence(null), "\x1b[?5522l") != null);
+    try std.testing.expect(std.mem.find(u8, abnormal_exit_restore, "\x1b[?5522l") != null);
 
     const tmux_restore = normalExitRestoreSequence("");
     try std.testing.expect(std.mem.find(u8, tmux_restore, "\x1b[<u") == null);
     try std.testing.expect(std.mem.find(u8, tmux_abnormal_exit_restore, "\x1b[<u") == null);
+    try std.testing.expect(std.mem.find(u8, tmux_restore, "\x1b[?5522l") == null);
+    try std.testing.expect(std.mem.find(u8, tmux_abnormal_exit_restore, "\x1b[?5522l") == null);
     try std.testing.expect(std.mem.find(u8, tmux_restore, "\x1b[?2004l") != null);
     try std.testing.expect(std.mem.find(u8, tmux_restore, "\x1b[>4;0m") != null);
 }
