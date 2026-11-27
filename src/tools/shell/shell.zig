@@ -2405,9 +2405,10 @@ fn publishSnapshotMetadata(
     }
 }
 
-/// A running result carries metadata only when its wait ended at the quiet
-/// crossing: the command and its quiet time, for the note fx relays to a
-/// subagent's parent (`noteChildQuiet` in `src/core/subagent/tool_host.zig`).
+/// A running result carries metadata only when its wait ended past the quiet
+/// limit after seeing the command under it: the command and its quiet time, for
+/// the note fx relays to a subagent's parent (`noteChildQuiet` in
+/// `src/core/subagent/tool_host.zig`).
 fn publishQuietCrossing(
     ctx: tool_dispatch.DispatchContext,
     snapshot: managed_execution.Snapshot,
@@ -3563,7 +3564,7 @@ test "stopped execution is a successful shell observation without command failur
     }
 }
 
-test "only a running result that ended its wait at the quiet crossing carries the crossing" {
+test "only a result whose wait ended past the limit after seeing it under carries the crossing" {
     const alloc = std.testing.allocator;
     for ([_]bool{ true, false }) |crossed| {
         var memory: ?types.ToolResultMemory = null;

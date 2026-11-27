@@ -6,7 +6,7 @@ This describes the code on `6bb36a928` (`origin/main` when this workspace was ma
 
 | Entry point | Where | What it does |
 | --- | --- | --- |
-| A model's MCP tool call | `src/core/tooling/tool_mcp_runtime.zig:379-405` (`isAvailableDynamicTool`, `callAdvertisedDynamicTool`) | Runs a dynamic tool only if the model step advertised it, through the runtime's `call_tool` capability |
+| A model's MCP tool call | `src/core/tooling/tool_mcp_runtime.zig:379-405` (`isAvailableDynamicTool`) and `src/core/tooling/tool_mcp_registry.zig` (`resolve`, `call`) | Runs a dynamic tool only if the model step advertised it, through the runtime's `call_tool` capability |
 | The app's MCP call | `src/core/app/app_agent_runtime.zig:466` (`callMcpTool`) → `src/core/app/app_mcp_runtime.zig:920-931` (`State.callTool`) | Leases the MCP host and calls its catalog |
 | The catalog call | `src/core/mcp_host/model.zig:195-235` (`Catalog.callTool`) | Checks access and the runtime generation, finds the server, reports the call to the UI observer (`:219`), and runs it |
 | The engine call | `src/core/mcp_host/runtime.zig:647-667` (`call`, `callObserved`), `:708-735` (`submit`) | Queues the call to the runtime's owner thread, waits, and sends a cancel once when the cancel flag is set, then waits for that too |

@@ -509,6 +509,76 @@ export function envWithoutFxHome(
   return copy;
 }
 
+/// The credentials fx reads from the environment.
+export const CREDENTIAL_ENV_KEYS = [
+  "AI_GATEWAY_API_KEY",
+  "VERCEL_OIDC_TOKEN",
+] as const;
+
+/// Names that a developer's shell, or a long-lived tmux server, can hold and
+/// that must reach a test's fx only when the test sets them itself.
+export const DEFAULT_UNSET_ENV_KEYS = [
+  ...CREDENTIAL_ENV_KEYS,
+  "FX_TEST_GATEWAY_CHAT_URL",
+  "FX_TEST_GATEWAY_MODELS_URL",
+  "FX_TEST_GATEWAY_CREDITS_URL",
+  "FX_TEST_UPGRADE_BASE_URL",
+  "FX_PERMISSION_MODE",
+  "FX_HOME",
+  // A developer's terminal recording would start on every test's fx, and the
+  // bridge of the fx session that started their tmux server would point
+  // `fx mcp call` at that session.
+  "FX_DEBUG_RECORD",
+  "FX_DEBUG_RECORD_SILENT_BANNER",
+  "FX_RECORD",
+  "FX_RECORD_INPUT",
+  "FX_MCP_CALL_SOCKET",
+  "FX_MCP_CALL_TOKEN",
+  // fx reads its test holds in release builds, so a hold left there would
+  // stop every test's fx at it. A test that sets one passes it itself.
+  "FX_TEST_REPORT_DELIVERY_HELD",
+  "FX_TEST_REPORT_DELIVERY_RELEASE",
+  "FX_TEST_SESSION_WRITE_HELD",
+  "FX_TEST_SESSION_WRITE_RELEASE",
+  "FX_TEST_SHELL_YIELD_HELD",
+  "FX_TEST_SHELL_YIELD_RELEASE",
+  "FX_TEST_SUBAGENT_CLOSE_HELD",
+  "FX_TEST_SUBAGENT_CLOSE_RELEASE",
+  "FX_TEST_SUBAGENT_END_HELD",
+  "FX_TEST_SUBAGENT_END_RELEASE",
+  "FX_TEST_SUBAGENT_PUBLISH_HELD",
+  "FX_TEST_SUBAGENT_PUBLISH_RELEASE",
+  "FX_TEST_SUBAGENT_SETTLE_HELD",
+  "FX_TEST_SUBAGENT_SETTLE_RELEASE",
+  "FX_TEST_SUBAGENT_START_HELD",
+  "FX_TEST_SUBAGENT_START_RELEASE",
+  "FX_TEST_WORKSPACE_CAPTURE_START_HELD",
+  "FX_TEST_WORKSPACE_CAPTURE_START_RELEASE",
+  "FX_TEST_WEB_FETCH_DNS_READY",
+  "FX_TEST_WEB_FETCH_DNS_RELEASE",
+  "FX_TEST_GREP_RELEASE",
+  "FX_TEST_ACP_PROMPT_TERMINAL_READY",
+  "FX_TEST_ACP_PROMPT_REAP_READY",
+  "FX_TEST_ACP_PROMPT_RELEASE",
+] as const;
+
+/// The environment a test starts fx with: `inherited` without
+/// `DEFAULT_UNSET_ENV_KEYS`, then `own` on top, so each key the caller sets,
+/// even one on that list, reaches fx as given. With `keepCredentials` the
+/// inherited credentials stay, for runs on the developer's own key, such as
+/// evals and live tests.
+export function fxChildEnv(
+  own: Record<string, string | undefined> = {},
+  options: { keepCredentials?: boolean; inherited?: Record<string, string | undefined> } = {},
+): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...(options.inherited ?? process.env) };
+  const kept = new Set<string>(options.keepCredentials ? CREDENTIAL_ENV_KEYS : []);
+  for (const key of DEFAULT_UNSET_ENV_KEYS) {
+    if (!kept.has(key)) delete env[key];
+  }
+  return { ...env, ...own };
+}
+
 export async function runFx(
   args: string[],
   opts: {
@@ -528,8 +598,8 @@ export async function runFx(
   const { cwd, timeoutMs = 15_000 } = opts;
 
   return new Promise<FxRunResult>((resolvePromise) => {
-    const env: Record<string, string | undefined> = {
-      ...envWithoutFxHome({ ...dotEnvVars, ...process.env }),
+    // Evals and live tests run on the developer's own key, so runFx keeps it.
+    const env: Record<string, string | undefined> = fxChildEnv({
       NO_COLOR: "1",
       HOME: process.env.HOME ?? "",
       PATH: process.env.PATH ?? "",
@@ -537,7 +607,7 @@ export async function runFx(
       // macOS even when stdout and stderr are pipes. A test that exercises
       // sound passes its own FX_SOUND value.
       FX_SOUND: "0",
-    };
+    }, { keepCredentials: true, inherited: { ...dotEnvVars, ...process.env } });
     for (const [key, value] of Object.entries(opts.env ?? {})) {
       if (value === undefined) {
         delete env[key];
