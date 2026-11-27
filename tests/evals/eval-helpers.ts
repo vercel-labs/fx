@@ -524,6 +524,8 @@ export const DEFAULT_UNSET_ENV_KEYS = [
   "FX_TEST_GATEWAY_CREDITS_URL",
   "FX_TEST_UPGRADE_BASE_URL",
   "FX_PERMISSION_MODE",
+  // A developer's provider choice would send a test to a login it did not set up.
+  "FX_PROVIDER",
   "FX_HOME",
   // A developer's terminal recording would start on every test's fx, and the
   // bridge of the fx session that started their tmux server would point
@@ -534,6 +536,9 @@ export const DEFAULT_UNSET_ENV_KEYS = [
   "FX_RECORD_INPUT",
   "FX_MCP_CALL_SOCKET",
   "FX_MCP_CALL_TOKEN",
+  // A terminal that supports program resume, such as Rex, gives each shell a
+  // token, and every test's fx would then send resume reports with it.
+  "OSC7577_TOKEN",
   // fx reads its test holds in release builds, so a hold left there would
   // stop every test's fx at it. A test that sets one passes it itself.
   "FX_TEST_REPORT_DELIVERY_HELD",

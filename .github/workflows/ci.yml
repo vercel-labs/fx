@@ -66,6 +66,9 @@ jobs:
       - name: Check recovery boundary
         run: ./scripts/check-recovery-boundary.sh
 
+      - name: Check workspace trust boundary
+        run: ./scripts/check-workspace-trust-boundary.sh
+
       - name: Model-check request recovery
         run: |
           set -euo pipefail
@@ -90,6 +93,16 @@ jobs:
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/acp_eof/check.sh design-a design-b
       - name: Model-check web_fetch DNS cancellation
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/web_fetch_dns/check.sh design-b design-a
+      - name: Model-check terminal hang-up
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/terminal_hangup/check.sh design-a design-b
+      - name: Model-check how the TUI ends on an outside signal
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/tui_close/check.sh design-a design-b
+
+      - name: Model-check CLI hang-up
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/cli_hangup/check.sh design-a design-b
+
+      - name: Model-check the terminal lifecycle
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/terminal/check.sh TerminalLifecycle
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -109,7 +122,10 @@ jobs:
         run: python3 -m scripts.check_cli_shape
 
       - name: Test CI and release scripts
-        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape scripts.tests.test_check_provider_versions
+        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_dev_channel_forward scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape scripts.tests.test_check_provider_versions
+
+      - name: Test benchmark scripts
+        run: python3 -m unittest benchmarks.shell_command_overhead_test
 
       - name: Test the zig skill's scripts and examples
         run: python3 -m unittest discover -s .fx/skills/zig/scripts
@@ -126,10 +142,26 @@ jobs:
       - name: Walk fx ask turns along the malformed tool call model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/malformed.ts --self-check
 
+      - name: Walk fx ask turns along the output limit model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/output_limit.ts --self-check
+
       - name: Walk fx acp along the ACP EOF model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/acp_eof/
+
       - name: Walk fx along the web_fetch DNS model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/web_fetch_dns/
+      - name: Walk fx along the terminal hang-up model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/terminal_hangup/
+      - name: Install tmux
+        run: |
+          command -v tmux >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y tmux; }
+          tmux -V
+
+      - name: Walk the TUI's close paths along their model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/tui_close/
+
+      - name: Walk fx along the CLI hang-up model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/cli_hangup/
 
       # The zsh user profile tests in src/core/execution/command_runner.zig
       # skip without /bin/zsh. They start interactive zsh with no terminal,
@@ -498,6 +530,7 @@ jobs:
           bun sdk/tests/test-durable.mjs local native
           bun sdk/tests/test-durable-core.mjs memory
           bun sdk/tests/test-durable-core.mjs local
+          node sdk/tests/test-durable-sigterm.mjs
 
       - name: Model-check durable sessions and drive the code along the model
         if: needs.ci-need.outputs.libfx == 'true'
@@ -514,6 +547,7 @@ jobs:
           bun tests/tla/drivers/drive.mjs lookup --walks 20 --seed 9 --durability world
           bun tests/tla/drivers/drive.mjs write --walks 20 --seed 4
           bun tests/tla/drivers/drive.mjs cutoff --walks 20 --seed 5
+          bun tests/tla/drivers/drive.mjs handoff --walks 25 --seed 7
           bun tests/tla/drivers/drive.mjs leased --walks 40 --seed 12
           bun tests/tla/drivers/drive.mjs queue --walks 40 --seed 4
           bun tests/tla/drivers/drive-intake.mjs --walks 60 --seed 1
@@ -918,12 +952,13 @@ jobs:
           curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
           export TLA2TOOLS_JAR="$jar"
-          tests/tla/subagent/check.sh steer-queue steer-queue-deep stop-message stop-message-deep main-mail main-mail-acp main-mail-handoff quiet-relay quiet-relay-deep wait-nudge
+          tests/tla/subagent/check.sh steer-queue steer-queue-deep stop-message stop-message-deep main-mail main-mail-acp main-mail-handoff quiet-relay quiet-relay-deep wait-nudge view-waits-design-a view-waits-chart
           tests/tla/session/check.sh session-write session-write-witness-added-during-write session-write-witness-waits session-write-witness-relisted live-holds live-simulate live-witness-stale live-witness-idle-parent live-witness-open-fails-on-scan accepted-design-a accepted-design-a2 accepted-design-b
           bun tests/tla/drivers/subagent/driver.ts
           bun test ./tests/tla/drivers/subagent/stop-message.test.ts
           bun test ./tests/tla/drivers/subagent/main-mail.test.ts
           bun test ./tests/tla/drivers/subagent/quiet-relay.test.ts
+          bun test ./tests/tla/drivers/subagent/view-waits.test.ts
           bun test ./tests/tla/drivers/session/write.test.ts
           bun test ./tests/tla/drivers/session/live.test.ts
           bun test ./tests/tla/drivers/session/accepted-input.test.ts
@@ -1222,8 +1257,10 @@ jobs:
             scripts/check-indexer-boundary.sh
             scripts/check-public-surface.sh
             scripts/check-recovery-boundary.sh
+            scripts/check-workspace-trust-boundary.sh
             scripts/detect-ci-need.sh
             scripts/detect-macos-need.sh
+            scripts/dev-channel-forward.sh
             scripts/smoke-binary.sh
             tests/e2e/ci-run-files.sh
             tests/tla/acp/check.sh

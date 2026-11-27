@@ -247,16 +247,21 @@ await assert.rejects(createFxEngine({ ...backendOptions }), /apiKey is required/
     return { requests: replyRequests(world.log).map((entry) => JSON.parse(entry.body)), shown: JSON.stringify(seen) };
   };
 
+  // Each reply cut before any text gets a note to take a smaller step, and
+  // the third in a row ends the turn.
   const atLow = await cutOffTurn({ id: "gpt-5.6-luna", effort: "low" });
-  assert.equal(atLow.requests.length, 1, "a request Codex would see unchanged is not sent again");
-  assert.equal(atLow.shown.includes("Retrying"), false, "no retry is announced");
+  assert.equal(atLow.requests.length, 3, "two notes, then the third cut reply ends the turn");
+  assert.ok(JSON.stringify(atLow.requests[1]).includes("before any text or tool call"), "the request after a cut carries the note");
+  assert.ok(atLow.shown.includes("Asking the model to take a smaller step."), "the notice says what fx asks");
+  assert.equal(atLow.shown.includes("at low effort"), false, "an effort already at low is not lowered");
 
   const unset = await cutOffTurn("gpt-5.6-luna");
-  assert.equal(unset.requests.length, 2, "with no effort set, the reply is asked for once more");
+  assert.equal(unset.requests.length, 3, "two notes, then the third cut reply ends the turn");
   assert.equal(unset.requests[0].reasoning?.effort, undefined);
-  assert.equal(unset.requests[1].reasoning?.effort, "low", "the resend asks for low effort");
-  assert.ok(unset.shown.includes("Retrying with low effort."), "the notice names the change the resend makes");
-  assert.equal(unset.shown.includes("higher limit"), false, "the notice does not claim a limit Codex never gets");
+  assert.equal(unset.requests[1].reasoning?.effort, "low", "the step after the first note reasons at low effort");
+  assert.equal(unset.requests[2].reasoning?.effort, undefined, "only that step reasons less");
+  assert.ok(unset.shown.includes("Asking the model to take a smaller step, at low effort."), "the notice names the lower effort");
+  assert.equal(unset.shown.includes("The next requests allow"), false, "the notice does not claim a limit Codex never gets");
 }
 
 console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Codex agent passed`);
