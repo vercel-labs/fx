@@ -375,6 +375,13 @@ function refused(): Response {
   }), { status: 400, headers: { "content-type": "application/json" } });
 }
 
+// A user skill, which fx finds in the profile's skills folder.
+function writeHostSwitchSkill(home: string, name: string) {
+  const dir = join(home, ".fx", "skills", name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: A test skill named ${name}.\n---\n\n# ${name}\n`);
+}
+
 // A reply the test holds back until it calls `release`.
 function held() {
   let release!: () => void;
@@ -774,6 +781,75 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       TIMEOUT,
     );
   }
+
+  test(
+    "a prompt and a subagent's report go on while two other subagents hold older skill catalogs",
+    async () => {
+      // Each turn keeps the skill catalog it started with until it ends. Two
+      // subagents hold two older catalogs when a skill changes and the person
+      // sends a prompt, which waits for its skill refresh. That refresh must
+      // not wait for those subagents: while the prompt waits, no turn starts
+      // on main, a subagent's report included.
+      const slow = held();
+      const quick = held();
+      const asked = new Set<string>();
+      let mainCalls = 0;
+      const bodies = await withFx(async (body) => {
+        const task = userTexts(body)[0] ?? "";
+        for (const name of ["OLDEST_TASK", "OLDER_TASK", "QUICK_TASK"]) {
+          if (!task.includes(name)) continue;
+          asked.add(name);
+          await (name === "QUICK_TASK" ? quick.promise : slow.promise);
+          return text(name, `${name}_DONE`);
+        }
+        mainCalls += 1;
+        const subagent = (agent: string, message: string) =>
+          toolCall(`main_${mainCalls}`, "subagent", { request: { action: "message", agent, message } });
+        if (mainCalls === 1) return subagent("oldest", "OLDEST_TASK wait");
+        if (mainCalls === 2) return text("main_one", "MAIN_ONE");
+        if (mainCalls === 3) return subagent("older", "OLDER_TASK wait");
+        if (mainCalls === 4) return subagent("quick", "QUICK_TASK wait");
+        if (mainCalls === 5) return text("main_two", "MAIN_TWO");
+        return text(`main_${mainCalls}`, `MAIN_REPLY_${mainCalls}`);
+      }, async (session, { home, requests }) => {
+        const mainAsked = (needle: string) =>
+          requests.some((request) => isMainRequest(request.body) && userTexts(request.body).some((text) => text.includes(needle)));
+        const waitFor = async (what: string, done: () => boolean) => {
+          const deadline = Date.now() + 20_000;
+          while (!done()) {
+            if (Date.now() > deadline) throw new Error(`fx never reached: ${what}`);
+            await Bun.sleep(25);
+          }
+        };
+
+        // The oldest subagent's turn holds the launch catalog.
+        await session.sendText("SWITCH_USER start the oldest");
+        await waitFor("the oldest subagent's request", () => asked.has("OLDEST_TASK"));
+        await session.waitForText("MAIN_ONE", 30_000);
+        await session.waitForComposer(15_000);
+
+        // A new skill: this prompt's refresh replaces that catalog, which the
+        // oldest subagent still holds, and the next two subagents hold the new one.
+        writeHostSwitchSkill(home, "beta");
+        await session.sendText("SECOND_PROMPT start two more");
+        await waitFor("the newer subagents' requests", () => asked.has("OLDER_TASK") && asked.has("QUICK_TASK"));
+        await session.waitForText("MAIN_TWO", 30_000);
+        await session.waitForComposer(15_000);
+
+        // Another new skill while both catalogs are held.
+        writeHostSwitchSkill(home, "gamma");
+        await session.sendText("THIRD_PROMPT after the second skill change");
+        quick.release();
+        await waitFor("the third prompt's request", () => mainAsked("THIRD_PROMPT"));
+        await waitFor("the quick subagent's report", () => mainAsked("QUICK_TASK_DONE"));
+        slow.release();
+      }, (home) => writeHostSwitchSkill(home, "alpha"));
+      slow.release();
+      quick.release();
+      expect(bodies.filter(isMainRequest).some((body) => userTexts(body).some((text) => text.includes("THIRD_PROMPT")))).toBe(true);
+    },
+    TIMEOUT,
+  );
 
   test(
     "the agent list shows a subagent's conversation, which takes messages typed there",

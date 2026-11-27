@@ -1627,16 +1627,6 @@ pub const CatalogLease = struct {
     }
 };
 
-const PendingCatalog = struct {
-    generation: u64,
-    catalog: LoadedCatalog,
-
-    fn deinit(self: *PendingCatalog, alloc: Allocator) void {
-        self.catalog.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
 const PendingRefresh = struct {
     alloc: Allocator,
     generation: u64,
@@ -2146,8 +2136,10 @@ pub const Runtime = struct {
     menu_index_ready: bool = false,
     catalog_mutex: std.Io.Mutex = .init,
     active_catalog: ?*CatalogGeneration = null,
-    retired_catalog: ?*CatalogGeneration = null,
-    pending_catalog: ?PendingCatalog = null,
+    /// Replaced generations that running turns still lease. Each one goes
+    /// when its last lease ends, so the list never holds more generations
+    /// than there are running turns.
+    retired_catalogs: std.ArrayList(*CatalogGeneration) = .empty,
     next_refresh_generation: u64 = 0,
     fresh_through_generation: u64 = 0,
     failed_refresh_generation: ?u64 = null,
@@ -2158,15 +2150,13 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
         if (self.refresh_task) |task| task.deinit();
         self.refresh_task = null;
-        if (self.pending_catalog) |*pending| pending.deinit(alloc);
-        self.pending_catalog = null;
         if (self.pending_refresh_action) |*action| action.deinit(alloc);
         self.pending_refresh_action = null;
         if (self.refresh_pending) |*pending| pending.deinit();
         self.refresh_pending = null;
         self.freeLoaded(alloc);
-        if (self.retired_catalog) |catalog| catalog.release();
-        self.retired_catalog = null;
+        for (self.retired_catalogs.items) |catalog| catalog.release();
+        self.retired_catalogs.deinit(alloc);
         self.menu.close();
         self.menu_index.deinit(alloc);
     }
@@ -2186,7 +2176,7 @@ pub const Runtime = struct {
             );
             return generation;
         };
-        if (self.refresh_task != null or self.pending_catalog != null) {
+        if (self.refresh_task != null) {
             if (self.refresh_pending) |pending| return pending.generation;
             const owned_home = try alloc.dupe(u8, configured_home);
             const generation = self.nextGeneration();
@@ -2245,22 +2235,14 @@ pub const Runtime = struct {
         workspace_root: []const u8,
         root_policy: skill_contract.RootPolicy,
     ) !RefreshCompletion {
-        self.reapRetiredCatalog();
-        var completion: RefreshCompletion = .none;
-        if (self.pending_catalog) |*pending| {
-            if (try self.adoptCatalog(alloc, pending.generation, &pending.catalog)) {
-                pending.catalog = .{};
-                self.pending_catalog = null;
-                completion = .adopted;
-            }
-        }
+        self.reapRetiredCatalogs();
         const task = self.refresh_task orelse {
             try self.startPendingRefresh(
                 alloc,
                 workspace_root,
                 root_policy,
             );
-            return completion;
+            return .none;
         };
         if (!task.done.load(.acquire)) return .none;
         if (task.thread) |thread| {
@@ -2269,7 +2251,7 @@ pub const Runtime = struct {
         }
         self.refresh_task = null;
         defer task.deinit();
-        completion = .failed;
+        var completion: RefreshCompletion = .failed;
         if (task.failure == null) {
             if (task.unchanged) {
                 self.fresh_through_generation = @max(
@@ -2287,16 +2269,8 @@ pub const Runtime = struct {
                     );
                     completion = .unchanged;
                 } else {
-                    if (try self.adoptCatalog(alloc, task.generation, &catalog)) {
-                        completion = .adopted;
-                    } else {
-                        self.pending_catalog = .{
-                            .generation = task.generation,
-                            .catalog = catalog,
-                        };
-                        catalog = .{};
-                        completion = .none;
-                    }
+                    try self.adoptCatalog(alloc, task.generation, &catalog);
+                    completion = .adopted;
                 }
             }
         } else {
@@ -2312,7 +2286,7 @@ pub const Runtime = struct {
         workspace_root: []const u8,
         root_policy: skill_contract.RootPolicy,
     ) !void {
-        if (self.refresh_task != null or self.pending_catalog != null) return;
+        if (self.refresh_task != null) return;
         var pending = self.refresh_pending orelse return;
         self.refresh_pending = null;
         defer pending.deinit();
@@ -2340,7 +2314,7 @@ pub const Runtime = struct {
     }
 
     pub fn refreshActive(self: *const Runtime) bool {
-        return self.refresh_task != null or self.pending_catalog != null;
+        return self.refresh_task != null;
     }
 
     pub fn queueRefreshAction(
@@ -2410,11 +2384,20 @@ pub const Runtime = struct {
         };
     }
 
-    fn reapRetiredCatalog(self: *Runtime) void {
-        const retired = self.retired_catalog orelse return;
-        if (retired.referenceCount() != 1) return;
-        self.retired_catalog = null;
-        retired.release();
+    /// Frees each replaced generation that no turn leases any more. A
+    /// replaced generation gains no lease, since `acquireCatalog` leases only
+    /// the active one, so a count of 1, the runtime's own, stays 1.
+    fn reapRetiredCatalogs(self: *Runtime) void {
+        var index: usize = 0;
+        while (index < self.retired_catalogs.items.len) {
+            const retired = self.retired_catalogs.items[index];
+            if (retired.referenceCount() != 1) {
+                index += 1;
+                continue;
+            }
+            _ = self.retired_catalogs.swapRemove(index);
+            retired.release();
+        }
     }
 
     fn freeLoaded(self: *Runtime, alloc: Allocator) void {
@@ -2448,33 +2431,32 @@ pub const Runtime = struct {
             .skills = skills,
             .diagnostics = diagnostics,
         };
-        const adopted = try self.adoptCatalog(alloc, generation, &catalog);
-        std.debug.assert(adopted);
+        try self.adoptCatalog(alloc, generation, &catalog);
     }
 
+    /// Makes `catalog` the active generation and takes it, leaving `catalog`
+    /// empty. It never waits for turns that lease older generations: a
+    /// prompt waits for its refresh, and a turn can run for hours. On
+    /// failure `catalog` and the active generation are unchanged.
     fn adoptCatalog(
         self: *Runtime,
         alloc: Allocator,
         generation: u64,
         catalog: *LoadedCatalog,
-    ) Allocator.Error!bool {
+    ) Allocator.Error!void {
         try self.menu_index.actual_indices.ensureTotalCapacity(
             alloc,
             catalog.skills.len,
         );
-        self.reapRetiredCatalog();
+        self.reapRetiredCatalogs();
+        try self.retired_catalogs.ensureUnusedCapacity(alloc, 1);
         self.catalog_mutex.lockUncancelable(io_mod.getIo());
         defer self.catalog_mutex.unlock(io_mod.getIo());
-        if (self.active_catalog) |active| {
-            if (active.referenceCount() > 1 and self.retired_catalog != null) {
-                return false;
-            }
-        }
         const next = try CatalogGeneration.create(alloc, generation, catalog.*);
         catalog.* = .{};
         if (self.active_catalog) |active| {
             if (active.referenceCount() > 1) {
-                self.retired_catalog = active;
+                self.retired_catalogs.appendAssumeCapacity(active);
             } else {
                 active.release();
             }
@@ -2499,7 +2481,6 @@ pub const Runtime = struct {
         );
         self.menu_index_ready = true;
         self.menu.clampCount(self.menu_index.count());
-        return true;
     }
 
     pub fn prepareMenuIndex(self: *Runtime, alloc: Allocator) Allocator.Error!void {
@@ -3851,11 +3832,11 @@ test "skill catalog lease keeps one retired generation alive until release" {
 
     try std.testing.expectEqualStrings("first", lease.items[0].name);
     try std.testing.expectEqualStrings("second", runtime.items[0].name);
-    try std.testing.expect(runtime.retired_catalog != null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.retired_catalogs.items.len);
     lease.deinit();
     lease_owned = false;
-    runtime.reapRetiredCatalog();
-    try std.testing.expect(runtime.retired_catalog == null);
+    runtime.reapRetiredCatalogs();
+    try std.testing.expectEqual(@as(usize, 0), runtime.retired_catalogs.items.len);
 }
 
 test "skill refresh publishes one generation and coalesces one latest request" {
@@ -3908,6 +3889,44 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     _ = try runtime.requestRefresh(alloc, home, home, policy);
     try std.testing.expectEqual(RefreshCompletion.adopted, try waitForRefreshForTest(&runtime, alloc, home, policy));
     try std.testing.expectEqual(@as(usize, 2), runtime.items.len);
+}
+
+test "a skill refresh takes over while turns still hold two older catalogs" {
+    // Each turn leases the catalog it started with until it ends, and long
+    // subagent turns can hold two older generations at once. A prompt waits
+    // for its refresh, so the refresh must not wait for those turns.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "home/.fx/skills/one/SKILL.md", "---\nname: one\ndescription: first\n---\nbody\n");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const managed = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "skills" });
+    defer alloc.free(managed);
+    var runtime = Runtime{ .dir = try alloc.dupe(u8, managed) };
+    defer runtime.deinit(alloc);
+    const policy: skill_contract.RootPolicy = .{ .managed_root_source = .global_fx };
+
+    _ = try runtime.requestRefresh(alloc, home, home, policy);
+    try std.testing.expect(try waitForAdoptedRefreshForTest(&runtime, alloc, home, policy));
+    var first_turn = runtime.acquireCatalog();
+    defer first_turn.deinit();
+
+    try writeTempFile(&tmp, "home/.fx/skills/two/SKILL.md", "---\nname: two\ndescription: second\n---\nbody\n");
+    _ = try runtime.requestRefresh(alloc, home, home, policy);
+    try std.testing.expectEqual(RefreshCompletion.adopted, try waitForRefreshForTest(&runtime, alloc, home, policy));
+    var second_turn = runtime.acquireCatalog();
+    defer second_turn.deinit();
+
+    try writeTempFile(&tmp, "home/.fx/skills/three/SKILL.md", "---\nname: three\ndescription: third\n---\nbody\n");
+    const prompt_generation = try runtime.requestRefresh(alloc, home, home, policy);
+    try std.testing.expectEqual(RefreshCompletion.adopted, try waitForRefreshForTest(&runtime, alloc, home, policy));
+    try std.testing.expectEqual(Runtime.GenerationStatus.current, runtime.generationStatus(prompt_generation));
+    try std.testing.expectEqual(@as(usize, 3), runtime.items.len);
+
+    // Each turn still reads the catalog it started with.
+    try std.testing.expectEqual(@as(usize, 1), first_turn.items.len);
+    try std.testing.expectEqual(@as(usize, 2), second_turn.items.len);
 }
 
 test "an empty launch catalog fills from a refresh before its startup notice is due" {
