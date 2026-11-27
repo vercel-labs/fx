@@ -14341,7 +14341,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("cyber policy block in a stream ends the turn after one request and reports its cause", async () => {
+  test("cyber policy block in a stream resends three times then ends the turn with its cause", async () => {
     const root = createFixtureRoot("streamed-cyber-policy");
     const tracePath = join(root.root, "trace.log");
     const gateway = startGateway(() =>
@@ -14384,7 +14384,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("cyber policy block in an HTTP error ends the turn after one request and reports its cause", async () => {
+  test("cyber policy block in an HTTP error resends three times then ends the turn with its cause", async () => {
     const root = createFixtureRoot("http-cyber-policy");
     const tracePath = join(root.root, "trace.log");
     const gateway = startGateway(() => cyberPolicyHttpResponse());
@@ -14418,7 +14418,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   });
 
   for (const path of ["HTTP", "stream"] as const) {
-    test(`cyber policy block after a tool result in an ${path} reply sends nothing more`, async () => {
+    test(`cyber policy block after a tool result in an ${path} reply resends three times then ends without prefill repair`, async () => {
       const root = createFixtureRoot(`post-tool-cyber-policy-${path}`);
       const tracePath = join(root.root, "trace.log");
       writeFileSync(join(root.workspace, "notes.txt"), "notes\n");
@@ -14452,7 +14452,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     });
   }
 
-  test("cyber policy HTTP error that also reads like a prefill rejection is not repaired or sent again", async () => {
+  test("cyber policy HTTP error that also reads like a prefill rejection resends three times without prefill repair", async () => {
     const root = createFixtureRoot("post-tool-cyber-policy-prefill-text");
     const tracePath = join(root.root, "trace.log");
     writeFileSync(join(root.workspace, "notes.txt"), "notes\n");

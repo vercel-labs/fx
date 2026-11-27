@@ -3458,7 +3458,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "a streamed cyber policy block shows the provider's message and is not resent",
+    "a streamed cyber policy block resends three times then shows the provider's message",
     async () => {
       const guidance = "PROVIDER_GUIDANCE_TAIL";
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(

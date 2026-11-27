@@ -14700,7 +14700,7 @@ test("ACP keeps an idle Claude session's cache warm until the next session repla
 // warmer arms before the prompt answers, so its trace shows whether a ping
 // could follow; only the request with the tool call may arm it.
 for (const variant of ["post-tool HTTP", "post-tool stream", "first stream"] as const) {
-  test(`ACP sends nothing more after a ${variant} cyber policy block`, async () => {
+  test(`ACP resends a ${variant} cyber policy block three times then ends`, async () => {
     const root = createIsolatedRoot("fx-acp-cyber-policy-");
     const tracePath = join(root.root, "trace.log");
     const message = "This content was flagged for possible cybersecurity risk.";
