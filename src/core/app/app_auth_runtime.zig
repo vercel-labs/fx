@@ -9,6 +9,7 @@ const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const sign_in_trace = @import("../auth/sign_in_trace.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const pending_revocation = @import("../auth/pending_revocation.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
@@ -2309,6 +2310,12 @@ pub fn Runtime(comptime App: type) type {
             return recoverCredentialFailure(app, agent, source, err);
         }
 
+        /// Which screen `agent`'s prompt is on, for a `/trace` record.
+        fn screenLabel(agent: *const AppAgent) []const u8 {
+            if (comptime !@hasField(AppAgent, "role")) return "main";
+            return if (agent.role == .subagent) "subagent" else "main";
+        }
+
         fn recoverCredentialFailure(app: *App, agent: *AppAgent, source: credentials.Source, err: anyerror) !bool {
             debug_trace.logf("auth", "prompt credential refresh failed source={t} err={s}", .{ source, @errorName(err) });
             if (config_runtime.sessionConnectionNotice(err)) |notice| {
@@ -2332,6 +2339,14 @@ pub fn Runtime(comptime App: type) type {
                 app.auth.recordCredentialFailure(failure, .{ .notify = notify })
             else
                 notify;
+            sign_in_trace.record(.prompt, true, "outcome=credential_failed screen={s} source={t} reason={t} retryable={} err={s} notice={s}", .{
+                screenLabel(agent),
+                failure.source,
+                failure.reason,
+                failure.retryable(),
+                @errorName(err),
+                if (should_notify) "shown" else "not_shown",
+            });
             if (!should_notify) return false;
             const recovery = try credentialRecoveryText(app.alloc, failure);
             defer app.alloc.free(recovery);

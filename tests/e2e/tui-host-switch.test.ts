@@ -17,6 +17,7 @@ import {
   hasEmptyComposer,
 } from "./tmux-helpers";
 import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
+import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 
 // Switching between main and its subagents through the agent list, in one fx
 // process: ↓ on an empty composer or Ctrl+X opens it, moving through it shows
@@ -2598,6 +2599,78 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       expect(waiting).not.toContain("payer: working");
       expect(answered).toContain("payer: idle");
       expect(answered).not.toContain("waiting for");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/trace on a subagent's screen shows why its prompt waits for a sign-in: the failed refresh, the issuer step, and the notice it never showed",
+    async () => {
+      // The issuer cannot refresh the saved login. Main's screen shows the
+      // failure; the subagent's prompt then waits with no notice of its own.
+      const issuer = startFakeIssuer({ refresh: () => new Response("unavailable", { status: 500 }) });
+      const traceDir = mkdtempSync(join(tmpdir(), "fx-sign-in-trace-"));
+      let mainCalls = 0;
+      try {
+        await withFx((body) => {
+          if (!isMainRequest(body)) return text("road_1", "SWITCH_ROAD_DONE");
+          mainCalls += 1;
+          if (mainCalls === 1) return toolCall("main_road", "subagent", { request: { action: "message", agent: "roadmap", message: "SWITCH_ROAD_TASK" } });
+          return text(`main_${mainCalls}`, `SWITCH_MAIN_${mainCalls}`);
+        }, async (session, { home }) => {
+          await session.sendText("SWITCH_USER start the roadmap");
+          await session.waitForText("roadmap finished", 30_000);
+          await session.waitForComposer(15_000);
+
+          writeFxLogin(home, issuer.issuerUrl, "seeded-token", { expiresAtMs: Date.now() - 120_000 });
+          await session.sendText("SWITCH_MAIN_AFTER_EXPIRY");
+          await session.waitForText("credential refresh failed", 30_000);
+          await session.sendKeys("C-c");
+          await until("main's prompt dropped", () => traceText().includes("reason=ctrl_c_pending_submission"), 15_000);
+
+          await showAgent(session, "roadmap");
+          await session.waitForPane((pane) => pane.includes("roadmap \u00b7 "), 15_000);
+          const mark = traceText().length;
+          await session.sendText("SWITCH_ROAD_PROMPT after the failure");
+          await until("the roadmap prompt waits", () => traceText().slice(mark).includes("pending_prompt_awaiting_auth"), 30_000);
+          // Ctrl+C drops the waiting prompt, so the composer takes /trace.
+          await session.sendKeys("C-c");
+          await until("the roadmap prompt dropped", () => traceText().slice(mark).includes("reason=ctrl_c_pending_submission"), 15_000);
+
+          const before = new Set(traceReportNames(traceDir));
+          await session.sendText("/trace");
+          const report = await waitForNewTraceReport(traceDir, before);
+          const events = report.all("sign_in_event").map((record) => ({
+            event: String(record.event),
+            failed: record.failed === true,
+            detail: String(record.detail ?? ""),
+          }));
+          const has = (event: string, failed: boolean, ...parts: string[]) =>
+            events.some((e) => e.event === event && e.failed === failed && parts.every((part) => e.detail.includes(part)));
+
+          expect(has("lock_wait", false, "outcome=taken")).toBe(true);
+          expect(has("issuer", true, "outcome=failed", "step=token", "login_deleted=false")).toBe(true);
+          expect(has("refresh", true, "mode=if_needed", "outcome=failed", "step=issuer")).toBe(true);
+          expect(has("prompt", true, "outcome=credential_failed", "screen=main", "notice=shown")).toBe(true);
+          expect(has("prompt", true, "outcome=credential_failed", "screen=subagent", "notice=not_shown")).toBe(true);
+          expect(has("prompt", true, "outcome=waits_for_sign_in", "screen=subagent")).toBe(true);
+
+          const summary = report.one("sign_in");
+          expect(Number(summary.kept_failures)).toBeGreaterThanOrEqual(5);
+          expect(report.all("failed_sign_in_event").length).toBe(Number(summary.kept_failures));
+          expect(report.problems("sign_in").length).toBe(3);
+          expect(report.text).not.toContain("seeded-token");
+          expect(report.text).not.toContain("seeded-refresh-token");
+        }, (home) => writeFxLogin(home, issuer.issuerUrl, "seeded-token"), false, {
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          AI_GATEWAY_API_KEY: undefined as unknown as string,
+          TMPDIR: traceDir,
+        });
+      } finally {
+        issuer.stop();
+        rmSync(traceDir, { recursive: true, force: true });
+      }
     },
     TIMEOUT,
   );

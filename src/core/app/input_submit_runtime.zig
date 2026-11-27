@@ -8,6 +8,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const sign_in_trace = @import("../auth/sign_in_trace.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -185,7 +186,27 @@ pub fn SubmitRuntime(comptime App: type) type {
                 "trigger={s}",
                 .{trigger},
             );
+            sign_in_trace.record(.prompt, false, "outcome=resumed screen={s} turn_id={d} trigger={s}", .{
+                screenLabel(agent),
+                pending.draft.turn_id,
+                trigger,
+            });
             return true;
+        }
+
+        /// A held prompt now waits for a sign-in: only Enter, a sign-in, or a
+        /// change of source or team sends it on.
+        fn recordPromptWaitsForSignIn(agent: *const AppAgent, turn_id: anytype) void {
+            sign_in_trace.record(.prompt, true, "outcome=waits_for_sign_in screen={s} turn_id={d}", .{
+                screenLabel(agent),
+                turn_id,
+            });
+        }
+
+        /// Which screen `agent`'s prompt is on, for a `/trace` record.
+        fn screenLabel(agent: *const AppAgent) []const u8 {
+            if (comptime !@hasField(AppAgent, "role")) return "main";
+            return if (agent.role == .subagent) "subagent" else "main";
         }
 
         pub fn resumePromptAfterAuth(app: *App, agent: *AppAgent, max_prompt_history: usize) !void {
@@ -338,6 +359,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                                 "",
                                 .{},
                             );
+                            recordPromptWaitsForSignIn(agent, pending.draft.turn_id);
                             return;
                         },
                     }
@@ -357,6 +379,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                             "",
                             .{},
                         );
+                        recordPromptWaitsForSignIn(agent, pending.draft.turn_id);
                         return;
                     }
                 }

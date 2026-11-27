@@ -12,6 +12,7 @@ const auto_review_metrics = @import("auto_review_metrics.zig");
 const compactor = @import("../compactor/compactor.zig");
 const model_catalog_metrics = @import("model_catalog_metrics.zig");
 const output_limit_metrics = @import("output_limit_metrics.zig");
+const sign_in_trace = @import("../auth/sign_in_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const os_errors = @import("../shared/os_errors.zig");
 
@@ -37,6 +38,9 @@ pub const subagent_turn_capacity = subagent_turn_metrics.ring_capacity;
 pub const CompactionEvent = compactor.TraceEvent;
 pub const compaction_ring_capacity = compactor.trace_ring_capacity;
 pub const ModelCatalogEvent = model_catalog_metrics.Event;
+pub const SignInEvent = sign_in_trace.Event;
+pub const sign_in_ring_capacity = sign_in_trace.ring_capacity;
+pub const failed_sign_in_event_capacity = sign_in_trace.failure_ring_capacity;
 pub const model_catalog_ring_capacity = model_catalog_metrics.ring_capacity;
 pub const AutoReview = auto_review_metrics.Review;
 pub const AutoReviewRecord = auto_review_metrics.Record;
@@ -177,6 +181,28 @@ pub fn modelCatalogFailureCount() u64 {
     return model_catalog_metrics.failureCount();
 }
 
+/// Copies the newest sign-in events, oldest first: `auth.lock` waits, login
+/// refreshes, issuer requests, and prompts that stopped for a credential.
+pub fn snapshotSignInEvents(out: []SignInEvent) usize {
+    return sign_in_trace.snapshot(out);
+}
+
+/// Copies the kept failed sign-in events, oldest first. Later events never
+/// remove them; only newer failures and a session reset do.
+pub fn snapshotFailedSignInEvents(out: []SignInEvent) usize {
+    return sign_in_trace.snapshotFailures(out);
+}
+
+/// Sign-in events this session, including any no longer kept.
+pub fn signInEventCount() u64 {
+    return sign_in_trace.total();
+}
+
+/// Failed sign-in events this session, including any no longer kept.
+pub fn signInFailureCount() u64 {
+    return sign_in_trace.failureCount();
+}
+
 pub fn recordToolCallResult(input: ToolCallRecord) void {
     tool_call_metrics.recordResult(input);
 }
@@ -223,6 +249,7 @@ pub fn resetSession() void {
     render_metrics.reset();
     compactor.resetTrace();
     model_catalog_metrics.reset();
+    sign_in_trace.reset();
     auto_review_metrics.reset();
     os_errors.reset(io_mod.getIo());
     output_limit_metrics.reset();
