@@ -7648,9 +7648,8 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
         expect(detail.code).toBe(0);
         const history = JSON.parse(detail.stdout).history;
         expect(history).toHaveLength(1);
-        // The saved turn keeps a cut part as the turn sent it, so its last
-        // message is the reply that finished the answer.
-        expect(history[0].assistant).toBe("RECOVERED_OK");
+        // `fx session` shows the whole answer, while the saved execution keeps the cut part.
+        expect(history[0].assistant).toBe(answer);
         if (limited) expect(JSON.stringify(history[0].execution)).toContain("LIMITED_ANSWER");
         expect(history[0].execution.tool_steps).toEqual([]);
         if (mode === "partial") expect(direct!.bodies[1]).not.toContain("DISCARDED_PREVIEW");

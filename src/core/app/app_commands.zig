@@ -1239,7 +1239,7 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandCopyLast(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const last_reply = agents.screenAgentOf(app).session.lastAssistantReply() orelse {
+            const last_reply = (try agents.screenAgentOf(app).session.lastAssistantAnswer(app.alloc)) orelse {
                 try app.writeDomainNotice(.{
                     .topic = "clipboard",
                     .tone = .neutral,
@@ -1247,6 +1247,7 @@ pub fn Handlers(comptime App: type) type {
                 }, true);
                 return;
             };
+            defer app.alloc.free(last_reply);
             const copied = app.clipboard().copy(last_reply) catch false;
             if (!copied) {
                 try app.writeDomainNotice(.{
@@ -2236,16 +2237,19 @@ const ClipboardCommandFakeApp = struct {
     const Session = struct {
         reply: ?[]const u8 = null,
 
-        fn lastAssistantReply(self: *const Session) ?[]const u8 {
-            return self.reply;
+        fn lastAssistantAnswer(self: *const Session, alloc: std.mem.Allocator) !?[]u8 {
+            const reply = self.reply orelse return null;
+            return try alloc.dupe(u8, reply);
         }
     };
 
+    alloc: std.mem.Allocator,
     main_agent: struct {
         session: Session = .{},
     } = .{},
     copy_outcome: CopyOutcome = .copied,
     copy_calls: usize = 0,
+    copied_bytes: [64]u8 = undefined,
     copied_text: ?[]const u8 = null,
     last_topic: ?[]const u8 = null,
     last_tone: ?types.NoticeTone = null,
@@ -2261,7 +2265,8 @@ const ClipboardCommandFakeApp = struct {
     fn copy(raw_context: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
         const self: *ClipboardCommandFakeApp = @ptrCast(@alignCast(raw_context.?));
         self.copy_calls += 1;
-        self.copied_text = text;
+        self.copied_text = self.copied_bytes[0..text.len];
+        @memcpy(self.copied_bytes[0..text.len], text);
         return switch (self.copy_outcome) {
             .copied => true,
             .unavailable => false,
@@ -2567,6 +2572,7 @@ test "app_commands routes clear through carry-forward session reset" {
 
 test "copy command routes exact reply bytes through the host clipboard" {
     var app = ClipboardCommandFakeApp{
+        .alloc = std.testing.allocator,
         .main_agent = .{ .session = .{ .reply = "reply\nwith exact bytes" } },
     };
 
@@ -2580,7 +2586,7 @@ test "copy command routes exact reply bytes through the host clipboard" {
 }
 
 test "copy command reports missing replies and host failures" {
-    var app = ClipboardCommandFakeApp{};
+    var app = ClipboardCommandFakeApp{ .alloc = std.testing.allocator };
 
     try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app));
     try std.testing.expectEqual(@as(usize, 0), app.copy_calls);

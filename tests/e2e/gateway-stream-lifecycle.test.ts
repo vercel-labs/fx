@@ -13136,7 +13136,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
     },
   ]);
 
-  test("an answer cut at its output limit goes on from where it stopped and is saved whole", async () => {
+  test("an answer cut at its output limit goes on from where it stopped and is shown whole", async () => {
     const { result, json, bodies, trace } = await askWithReplies("cut-text-continue", [
       cutTextReply("The first half of the answer"),
       () => fakeGatewayFinalText(", and the second half."),

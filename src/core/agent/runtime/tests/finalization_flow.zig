@@ -825,7 +825,6 @@ test "common Stop sees a cut answer joined with the reply that finished it" {
         deps.history_turns.items[0].assistant.execution.tool_steps[0].assistant.?,
     );
     try std.testing.expectEqualStrings("candidate and the rest", deps.finish_presentation_text orelse "");
-    try std.testing.expectEqualStrings("candidate and the rest", deps.finish_continued_answer orelse "");
     // A finished turn carries no provider disposition to finalization.
     try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, null), deps.finalized_disposition);
 }

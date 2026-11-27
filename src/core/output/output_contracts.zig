@@ -13,6 +13,7 @@ const mode_contract = @import("../modes/mode_contract.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_codec = @import("../session/session_codec.zig");
+const session_runtime = @import("../session/session.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_json = @import("../session/session_json.zig");
 const compactor = @import("../compactor/compactor.zig");
@@ -1651,7 +1652,7 @@ pub const SessionDetailSnapshot = struct {
 
         for (state.history[first..], 0..) |turn, i| {
             if (i > 0) try out.writer.writeByte(',');
-            try writeSessionHistoryTurnJson(&out.writer, turn);
+            try writeSessionHistoryTurnJson(&out.writer, alloc, turn);
         }
 
         try out.writer.writeAll("]}");
@@ -2835,7 +2836,9 @@ fn writeSessionHistoryTurnText(writer: *std.Io.Writer, alloc: Allocator, turn: t
             try writeSessionUserTurnText(writer, alloc, entry.user);
             try writeSessionExecutionText(writer, alloc, entry.execution);
             try writer.writeAll("[assistant]\n");
-            try writeTextBlock(writer, alloc, entry.assistant);
+            const answer = try session_runtime.SessionRuntime.wholeAnswer(alloc, entry);
+            defer alloc.free(answer);
+            try writeTextBlock(writer, alloc, answer);
         },
         .interrupted => |entry| {
             try writeSessionUserTurnText(writer, alloc, entry.user);
@@ -2921,7 +2924,7 @@ fn writeTextBlock(writer: *std.Io.Writer, alloc: Allocator, text: []const u8) !v
     if (safe.items.len == 0 or safe.items[safe.items.len - 1] != '\n') try writer.writeByte('\n');
 }
 
-fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) !void {
+fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, alloc: Allocator, turn: types.HistoryTurn) !void {
     switch (turn) {
         .compacted_summary => |entry| {
             try writer.writeAll("{\"kind\":\"compacted_summary\",\"summary\":");
@@ -2933,7 +2936,9 @@ fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) 
             try writer.writeAll("{\"kind\":\"assistant\",\"user\":");
             try writeSessionUserTurnJson(writer, entry.user);
             try writer.writeAll(",\"assistant\":");
-            try std.json.Stringify.value(entry.assistant, .{}, writer);
+            const answer = try session_runtime.SessionRuntime.wholeAnswer(alloc, entry);
+            defer alloc.free(answer);
+            try std.json.Stringify.value(answer, .{}, writer);
             try writer.writeAll(",\"execution\":");
             try session_json.writeExecutionMemoryJson(writer, entry.execution);
             try writer.writeByte('}');

@@ -228,8 +228,6 @@ test "malformed tool call feedback names the tool, then asks for smaller calls" 
 // EndsAfterThird, NoFalseSuccess).
 const output_limit_smaller_steps =
     "Continue the task in smaller steps: at most one or two edits per reply, and split a large file or change across several calls.";
-const output_limit_continue_text =
-    "Its text is above. Continue exactly where it stopped, without repeating it. If you planned to use tools, call them now, one small step at a time.";
 const output_limit_act_now =
     "Think less and take one small step now: one or two tool calls, or a short answer.";
 
@@ -309,7 +307,7 @@ fn outputLimitTextNote(arena: Allocator, limit: ?u32, text: bool, again: bool) !
     const again_text = if (again) " again" else "";
     if (text) return try arena.print(
         "Your last reply reached {s}{s} and was cut off. {s}",
-        .{ reached, again_text, output_limit_continue_text },
+        .{ reached, again_text, output_limit.continue_text },
     );
     return try arena.print(
         "Your last reply reached {s}{s} before any text or tool call, likely while thinking. {s}",
@@ -11257,13 +11255,12 @@ fn processQueuedPromptLoop(
                 continue :agent_steps_loop;
             }
             if (stop_state.retained_candidate != null) {
-                var persisted_text = try runtime_finalization.shownTerminalText(
+                const persisted_text = try runtime_finalization.shownTerminalText(
                     arena,
                     stop_state.retained_candidate,
                     assistant_text,
                     shown_text orelse assistant_text,
                 );
-                persisted_text.continued_answer = shown_text;
                 stop_state.terminal_materializing = true;
                 try finishCommonAssistantTerminal(
                     deps,
@@ -11295,7 +11292,6 @@ fn processQueuedPromptLoop(
                 .turn = turn,
                 .summary = completed_summary,
                 .presentation_text = shown_text,
-                .continued_answer = shown_text,
             }));
             finish_trace.finish("provider_length");
             return;
@@ -11348,7 +11344,7 @@ fn processQueuedPromptLoop(
             else if (std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0)
                 partial_assistant
             else
-                empty_final;
+                "";
             const history_text = try arena.dupe(u8, saved_final);
             // What fx shows, what `fx ask` prints, and what a subagent reports.
             const shown_text = if (joined != null) raw_final else history_text;
@@ -11406,13 +11402,12 @@ fn processQueuedPromptLoop(
                 }
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
-                var persisted_text = try runtime_finalization.shownTerminalText(
+                const persisted_text = try runtime_finalization.shownTerminalText(
                     arena,
                     stop_state.retained_candidate,
                     history_text,
                     shown_text,
                 );
-                if (joined != null) persisted_text.continued_answer = shown_text;
                 stop_state.terminal_materializing =
                     stop_state.retained_candidate != null;
                 if (has_content and disposition == .completed) try persistFinalReplyCheckpoint(
@@ -11518,7 +11513,7 @@ fn processQueuedPromptLoop(
                         job,
                         within_turn_suffix.items,
                         &summary_accumulator,
-                        .{ .history = "", .presentation = shown_text, .continued_answer = if (joined != null) shown_text else null },
+                        .{ .history = "", .presentation = shown_text },
                         .completed,
                         if (disposition == .length_limited)
                             .length_limited
@@ -14441,7 +14436,6 @@ pub fn finishCommonAssistantTerminal(
         trace_outcome,
         replay,
         presentation_text,
-        assistant_text.continued_answer,
     );
 }
 
@@ -14458,7 +14452,6 @@ fn finishCommonAssistantTerminalWithExecution(
     trace_outcome: []const u8,
     replay: ?types.ProviderReplay,
     presentation_text: ?[]const u8,
-    continued_answer: ?[]const u8,
 ) !void {
     try runtime_finalization.finishAssistantTerminalWithExecution(
         deps,
@@ -14473,7 +14466,6 @@ fn finishCommonAssistantTerminalWithExecution(
         trace_outcome,
         replay,
         presentation_text,
-        continued_answer,
     );
 }
 

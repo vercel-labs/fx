@@ -66,6 +66,8 @@ const permission_gate = @import("../permissions/permission_gate.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_runtime = @import("../session/session.zig");
+const recovery_prompt = @import("../shared/recovery_prompt.zig");
+const output_limit = @import("../agent/runtime/output_limit.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
@@ -3351,7 +3353,9 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
                     const normalized = try presentation.normalizeAssistantTextForDisplay(ctx.alloc, text);
                     defer ctx.alloc.free(normalized);
                     try ctx.final_output.appendSlice(ctx.alloc, presentation.textForCompletedPresentation(text, normalized));
-                    try ctx.final_source.appendSlice(ctx.alloc, turn.assistant);
+                    const whole = try session_runtime.SessionRuntime.wholeAnswer(ctx.alloc, turn);
+                    defer ctx.alloc.free(whole);
+                    try ctx.final_source.appendSlice(ctx.alloc, whole);
                 },
                 .compacted_summary, .interrupted => {},
             };
@@ -9630,6 +9634,42 @@ test "CLI final source keeps only the completed response with its Markdown" {
     try deps.push_event(deps.ctx, .{ .finish_prompt = displayed });
     try std.testing.expectEqualStrings(draft, ctx.final_source.items);
     try std.testing.expect(std.mem.startsWith(u8, ctx.final_output.items, "Earlier candidate."));
+}
+
+test "CLI final source joins the parts of an answer cut at its output limit" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .json;
+    const deps = agentRuntimeDeps(&ctx);
+
+    const note = try recovery_prompt.saved(alloc, "Your last reply reached its output limit and was cut off. " ++ output_limit.continue_text);
+    defer alloc.free(note);
+    var steering = [_]types.PersistedSteering{
+        .{ .text = note, .assistant_prefix = @constCast("First part"), .after_tool_step_count = 0 },
+    };
+    const finished = try types.dupeFinishedPrompt(std.heap.c_allocator, .{
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast(" and the rest."),
+            .execution = .{ .steering = &steering },
+        } },
+        .terminal_outcome = .completed,
+    });
+    try deps.push_event(deps.ctx, .{ .finish_prompt = finished });
+
+    const result = try takePromptRunResult(&ctx, alloc);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("First part and the rest.", result.final_source);
 }
 
 test "CLI command output completion terminates only an open display line" {

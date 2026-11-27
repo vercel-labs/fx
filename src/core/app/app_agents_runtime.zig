@@ -3884,8 +3884,16 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.eventf("host", "child_turn_saved", .{}, "agent={s} work_id={s}", .{ run.child_id, saved_work orelse "none" });
             if (saved_work == null and run.turn_work_id.len > 0) {
                 const host = hostOf(app, hostedOf(app, agent) orelse return) orelse return;
+                const whole: ?[]u8 = switch (finished.turn) {
+                    .assistant => |value| session_mod.SessionRuntime.wholeAnswer(app.alloc, value) catch |err| blk: {
+                        debug_trace.logf("host", "child_reply_whole_failed err={s}", .{@errorName(err)});
+                        break :blk null;
+                    },
+                    .interrupted, .compacted_summary => null,
+                };
+                defer if (whole) |text| app.alloc.free(text);
                 const reply = switch (finished.turn) {
-                    .assistant => |value| finished.continued_answer orelse value.assistant,
+                    .assistant => |value| whole orelse value.assistant,
                     .interrupted => |value| value.assistant orelse "",
                     .compacted_summary => "",
                 };
@@ -3896,11 +3904,6 @@ pub fn Runtime(comptime App: type) type {
             if (!std.mem.eql(u8, saved_work orelse return, run.work_id)) return;
             const outcome = finished.terminal_outcome orelse .completed;
             debug_trace.eventf("host", "child_turn_committed", .{}, "agent={s} work_id={s} outcome={s}", .{ run.child_id, run.work_id, @tagName(outcome) });
-            // The report reads a continued answer whole, since the saved
-            // turn's last message holds only its last part.
-            if (finished.continued_answer) |text| if (run.turn) |turn| turn.setContinuedAnswer(text) catch |err| {
-                debug_trace.logf("host", "continued answer dropped agent={s} work_id={s} bytes={d}: {s}; the report reads the saved last part", .{ run.child_id, run.work_id, text.len, @errorName(err) });
-            };
             endRun(run, outcome);
         }
 

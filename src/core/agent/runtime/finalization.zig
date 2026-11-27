@@ -248,8 +248,6 @@ pub const TurnFinalizationGuard = struct {
 pub const TerminalText = struct {
     history: []const u8,
     presentation: ?[]const u8 = null,
-    /// The whole answer when cut replies began it (`types.FinishedPrompt.continued_answer`).
-    continued_answer: ?[]const u8 = null,
 };
 
 /// The candidate is already retained as an original response. History borrows
@@ -290,7 +288,6 @@ pub fn finishAssistantTerminalWithExecution(
     trace_outcome: []const u8,
     replay: ?types.ProviderReplay,
     presentation_text: ?[]const u8,
-    continued_answer: ?[]const u8,
 ) !void {
     var projection_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer projection_arena.deinit();
@@ -310,7 +307,6 @@ pub fn finishAssistantTerminalWithExecution(
             .turn = turn,
             .summary = completed_summary,
             .presentation_text = presentation_text,
-            .continued_answer = continued_answer,
         },
     );
 
@@ -354,7 +350,6 @@ pub fn finishExecutionOnlyFailureIfNeeded(
         trace_outcome,
         null,
         null,
-        null,
     );
     return true;
 }
@@ -394,7 +389,6 @@ pub fn finalizeRetainedCandidateFailure(
         "error",
         null,
         assistant_text.presentation,
-        null,
     );
 }
 
@@ -462,7 +456,6 @@ test "eb03: finishAssistantTerminalWithExecution carries job.input_id to UserTur
         .completed,
         &trace,
         "completed",
-        null,
         null,
         null,
     );

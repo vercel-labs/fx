@@ -3740,8 +3740,7 @@ pub const Runtime = struct {
     ) !?[]u8 {
         const history = self.children.parent.store.childHistory(alloc, child_id) catch return null;
         defer types.freeHistoryTurnSlice(alloc, history);
-        const text = assistantTextForWork(history, work_id) orelse return null;
-        return @as(?[]u8, try alloc.dupe(u8, text));
+        return try assistantTextForWork(alloc, history, work_id);
     }
 
     /// A child's saved preferences, read without opening it. Caller owns.
@@ -9608,13 +9607,15 @@ fn makeManagedWork(
     };
 }
 
+/// The text a work's report quotes: the whole answer of its saved turn. Caller owns.
 fn assistantTextForWork(
+    alloc: Allocator,
     history: []const types.HistoryTurn,
     work_id: []const u8,
-) ?[]const u8 {
+) !?[]u8 {
     return switch (turnForWork(history, work_id) orelse return null) {
-        .assistant => |value| value.assistant,
-        .interrupted => |value| value.assistant orelse "",
+        .assistant => |value| try session.SessionRuntime.wholeAnswer(alloc, value),
+        .interrupted => |value| try alloc.dupe(u8, value.assistant orelse ""),
         .compacted_summary => null,
     };
 }

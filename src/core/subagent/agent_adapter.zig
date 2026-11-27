@@ -1136,11 +1136,8 @@ fn captureHttpError(
 
 fn pushLiveEvent(raw: *anyopaque, event: worker_runtime.WorkerEvent) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
-    defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
-    // The report reads a continued answer whole, since the saved turn's last
-    // message holds only its last part.
-    if (event == .finish_prompt) if (event.finish_prompt.continued_answer) |text| try context.turn.setContinuedAnswer(text);
     context.turn.appendLiveEvent(event);
+    worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
 }
 
 fn pushLiveOutputChunk(

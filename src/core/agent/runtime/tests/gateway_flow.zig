@@ -11753,7 +11753,9 @@ test "processQueuedPrompt joins an answer cut at its output limit with the reply
     // note as the turn sent them, so the next turn's request starts with this
     // turn's last one (`tests/tla/saved_turn/SavedTurn.tla` NextExtendsLast).
     try std.testing.expectEqualStrings("Partial answer and the rest.", hooks.finish_presentation_text orelse "");
-    try std.testing.expectEqualStrings("Partial answer and the rest.", hooks.finish_continued_answer orelse "");
+    const whole = try session_runtime.SessionRuntime.wholeAnswer(alloc, hooks.history_turns.items[0].assistant);
+    defer alloc.free(whole);
+    try std.testing.expectEqualStrings("Partial answer and the rest.", whole);
     try std.testing.expectEqualStrings(" and the rest.", hooks.finish_assistant_text.?);
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
     const steering = hooks.history_turns.items[0].assistant.execution.steering;
@@ -11789,7 +11791,11 @@ test "processQueuedPrompt ends the turn on the third reply in a row cut before a
     const text = hooks.finish_presentation_text orelse "";
     try std.testing.expect(std.mem.find(u8, text, "Part one. Part two. Part three.") != null);
     try std.testing.expect(std.mem.find(u8, text, "The reply reached the output limit of 32768 tokens 3 times in a row before it was complete, so fx stopped the turn.") != null);
-    try std.testing.expectEqualStrings(text, hooks.finish_continued_answer orelse "");
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const whole = try session_runtime.SessionRuntime.wholeAnswer(alloc, hooks.history_turns.items[0].assistant);
+    defer alloc.free(whole);
+    try std.testing.expect(std.mem.find(u8, whole, "Part one. Part two. Part three.") != null);
+    try std.testing.expect(std.mem.find(u8, whole, "The reply reached the output limit of 32768 tokens 3 times in a row before it was complete, so fx stopped the turn.") != null);
     // The saved turn keeps the earlier parts as the turn sent them; its last
     // message holds only the third part and why the turn stopped.
     const saved = hooks.finish_assistant_text.?;
@@ -11826,8 +11832,12 @@ test "processQueuedPrompt shows a continued answer's text once when the turn end
     // why the turn stopped.
     const shown_text = hooks.finish_presentation_text orelse "";
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, shown_text, "Alpha."));
-    try std.testing.expectEqualStrings(shown_text, hooks.finish_continued_answer orelse "");
     try std.testing.expect(std.mem.find(u8, shown_text, "3 times in a row before it was complete, so fx stopped the turn.") != null);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const whole = try session_runtime.SessionRuntime.wholeAnswer(alloc, hooks.history_turns.items[0].assistant);
+    defer alloc.free(whole);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, whole, "Alpha."));
+    try std.testing.expect(std.mem.find(u8, whole, "3 times in a row before it was complete, so fx stopped the turn.") != null);
     const saved = hooks.finish_assistant_text.?;
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, saved, "Alpha."));
     try std.testing.expect(std.mem.find(u8, saved, "3 times in a row before it was complete, so fx stopped the turn.") != null);
@@ -11895,7 +11905,10 @@ test "processQueuedPrompt keeps a cut reply's text as its own reply once tools r
     // Tool activity ended the answer, so nothing joins: fx shows and saves
     // the last reply alone, as before.
     try std.testing.expect(hooks.finish_presentation_text == null);
-    try std.testing.expect(hooks.finish_continued_answer == null);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const whole = try session_runtime.SessionRuntime.wholeAnswer(alloc, hooks.history_turns.items[0].assistant);
+    defer alloc.free(whole);
+    try std.testing.expectEqualStrings("Read it.", whole);
 }
 
 test "processQueuedPrompt review continuation appends active review prompt after write tool" {
