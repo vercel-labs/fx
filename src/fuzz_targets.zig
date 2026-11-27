@@ -10,6 +10,8 @@ test {
     _ = @import("acp/mcp_servers.zig");
     _ = @import("builtins/context.zig");
     _ = @import("acp/prompt.zig");
+
+    _ = @import("acp/server.zig");
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/agent/presentation/inline_render.zig");
     _ = @import("core/auth/credentials.zig");

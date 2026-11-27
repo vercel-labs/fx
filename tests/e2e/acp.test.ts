@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, jest, test } from "bun:test";
 import { processAlive } from "./process-alive";
 import { createConfiguredProviderFixture, completion as configuredCompletion, toolCompletion as configuredToolCompletion } from "./fixtures/chat-completions";
 import { execFileSync, spawn as nodeSpawn, type ChildProcess } from "node:child_process";
@@ -690,6 +690,15 @@ class AcpReadTimeoutError extends Error {
   }
 }
 
+/// fx ended while a line was awaited, or before one was asked for. The message
+/// says how it ended and what it wrote to stderr, so an abort is not mistaken
+/// for a lost line or a slow reply.
+class AcpProcessEndedError extends Error {
+  constructor(how: string, stderrTail: string) {
+    super(`fx acp ended with ${how} while a line was awaited${stderrTail ? `; stderr ends: ${stderrTail}` : ""}`);
+  }
+}
+
 class AcpClient {
   private proc: ChildProcess;
   private buffer: string = "";
@@ -698,12 +707,14 @@ class AcpClient {
   private decoder = new TextDecoder();
   private _stdoutChunks: Buffer[] = [];
   private _closed = false;
+  private endedWith: string | null = null;
   private _stderrChunks: Buffer[] = [];
   private activeSessionId: string | null = null;
   private pendingSessionTargets = new Map<number | string, string>();
   private pendingNewSessions = new Set<number | string>();
   readonly rawLines: string[] = [];
-  private permissionOptionId: "allow_once" | "allow_always" | "reject_once" = "reject_once";
+  /// How readLine answers a permission request; null leaves it for the test.
+  private permissionOptionId: "allow_once" | "allow_always" | "reject_once" | null = "reject_once";
   private elicitationHandler?: (
     params: Record<string, unknown>,
     id: number | string,
@@ -726,7 +737,15 @@ class AcpClient {
       }
     });
     proc.stderr!.on("data", (chunk: Buffer) => { this._stderrChunks.push(chunk); });
-    proc.on("close", () => { this._closed = true; });
+    proc.on("close", (code: number | null, signal: string | null) => {
+      this._closed = true;
+      this.endedWith = signal ? `signal ${signal}` : `exit code ${code}`;
+      this.queue.end(this.endedError());
+    });
+  }
+
+  private endedError(): AcpProcessEndedError {
+    return new AcpProcessEndedError(this.endedWith ?? "an unknown end", this.stderr.slice(-400).trim());
   }
 
   static async create(opts?: {
@@ -769,7 +788,7 @@ class AcpClient {
     return this._closed;
   }
 
-  setPermissionOption(optionId: "allow_once" | "allow_always" | "reject_once"): void {
+  setPermissionOption(optionId: "allow_once" | "allow_always" | "reject_once" | null): void {
     this.permissionOptionId = optionId;
   }
 
@@ -842,7 +861,7 @@ class AcpClient {
         if (message.error === undefined) this.activeSessionId = sessionId;
       }
     }
-    if (message.method === "session/request_permission" && message.id !== undefined) {
+    if (message.method === "session/request_permission" && message.id !== undefined && this.permissionOptionId !== null) {
       this.send({
         jsonrpc: "2.0",
         id: message.id,
@@ -12789,10 +12808,20 @@ describe("acp: model-independent", () => {
   const reloadChildOutcomes = (home: string, id: string): string[] =>
     (logLines(home, id) as any[]).filter((line) => line.kind === "child_finished").map((line) => line.outcome);
 
-  /** Whether a subagent's approval request is registered and its turn waits for the answer. The hook that
-   * says it asks comes earlier, while the request is still being prepared. */
-  const approvalWaitRegistered = (tracePath: string): boolean =>
-    existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("approval_wait_registered");
+  /** Reads the client's messages into `messages` until `done` holds. */
+  async function readMessagesUntilDone(client: AcpClient, messages: any[], done: () => boolean) {
+    while (!done()) messages.push(await client.readLine(TIMEOUT));
+  }
+  const approvalRequestFor = (messages: any[], name: string) =>
+    messages.find((message) => message.method === "session/request_permission" && message.params?._meta?.fx?.subagent?.name === name);
+  const approvalWithdrawn = (messages: any[], requestId: number) =>
+    messages.some((message) => message.method === "$/cancel_request" && message.params?.requestId === requestId);
+  const approvalResponseTo = (messages: any[], id: number) =>
+    messages.find((message) => message.id === id && (message.result !== undefined || message.error !== undefined));
+  const cardStatuses = (messages: any[], toolCallId: string): string[] =>
+    messages
+      .filter((message) => message.method === "session/update" && message.params?.update?.toolCallId === toolCallId)
+      .map((message) => message.params.update.status);
 
   for (const via of ["session/load", "session/resume"] as const) {
     test(
@@ -12906,26 +12935,26 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
-  // In ACP a subagent's question never goes to the client: it waits for an
-  // approval that only the terminal app's menu gives, and a cancel does not end
-  // that wait. A reload stops such a subagent, as it always did, so the session
-  // is not left with a turn that waits for ever (until #1722 closes a
-  // subagent's requests when its prompt ends).
+  // A subagent that asks for an approval asks the client through its parent
+  // session. A session/cancel or a session/load closes that prompt, which
+  // withdraws the subagent's request: its card ends failed, no action runs,
+  // and a late answer runs nothing.
   test(
-    "ACP session/load stops a subagent that waits for an approval, which session/cancel leaves waiting",
+    "a subagent's wait for an approval ends when session/cancel or session/load closes its prompt",
     async () => {
-      const seen: Record<string, { outcomesBefore: string[]; note: string; stopReason: string; requests: number }> = {};
       for (const via of ["session/cancel", "session/load"] as const) {
         const root = createIsolatedRoot("fx-acp-reload-approval-");
         const target = join(root.external, "child-write.txt");
-        const tracePath = join(root.root, "trace.log");
         writeFileSync(
           join(root.home, ".fx", "settings.json"),
           JSON.stringify({ permission: { edit: { [`${root.external}/**`]: "ask" } } }),
         );
         const gateway = startDynamicFakeGateway((body) => {
-          // The writer's one request: its write waits for an approval.
-          if (!body.includes('"name":"subagent"')) return fileToolCall("child_write", target, "blocked\n");
+          // The writer asks once to write. Once the refusal is in its conversation, it finishes.
+          if (!body.includes('"name":"subagent"')) {
+            if (body.includes("child_write")) return finalText("ACP_WRITER_FINISHED");
+            return fileToolCall("child_write", target, "blocked\n");
+          }
           if (acpLatestUserIsReport(body)) return finalText("ACP_RELOAD_APPROVAL_REPORT_SEEN");
           if (acpLatestPromptText(body).includes("Report the writer's state")) return finalText("ACP_RELOAD_APPROVAL_NOTED");
           if (body.includes("reload_approval_call")) return finalText("ACP_RELOAD_APPROVAL_PARENT_DONE");
@@ -12935,45 +12964,42 @@ describe("acp: model-independent", () => {
         });
         let acp: AcpClient | null = null;
         try {
-          acp = await AcpClient.create({
-            cwd: root.workspace,
-            env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp,subagent" },
-          });
+          acp = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          acp.setPermissionOption(null);
           const sessionId = await startAutoSession(acp, true);
+          const messages: any[] = [];
           sendPrompt(acp, 7501, "Start the writing subagent.");
-          await waitForCondition("the parent's finished turn and the writer's request", () => gateway.requests.length === 3, TIMEOUT);
-          await waitForCondition("the writer's wait for an approval", () => approvalWaitRegistered(tracePath), TIMEOUT);
+          await readMessagesUntilDone(acp, messages, () => approvalRequestFor(messages, "writer") !== undefined);
+          const request = approvalRequestFor(messages, "writer");
+          expect(request.params.sessionId).toBe(sessionId);
+          const cardId = request.params.toolCall.toolCallId;
 
           acp.send(via === "session/cancel"
             ? { jsonrpc: "2.0", id: 7502, method: "session/cancel", params: {} }
             : { jsonrpc: "2.0", id: 7502, method: "session/load", params: { sessionId, mcpServers: [] } });
-          const stopped = await readUntilResponses(acp, [7501, 7502], TIMEOUT);
-          expect(stopped.responses.get(7501).result.stopReason).toBe("cancelled");
-          expect(stopped.responses.get(7502).error).toBeUndefined();
-          expect(stopped.messages.some((message: any) => message.method === "session/request_permission")).toBe(false);
-          const outcomesBefore = reloadChildOutcomes(root.home, sessionId);
+          await readMessagesUntilDone(acp, messages, () =>
+            approvalWithdrawn(messages, request.id) &&
+            approvalResponseTo(messages, 7501) !== undefined &&
+            approvalResponseTo(messages, 7502) !== undefined);
+          expect(approvalResponseTo(messages, 7501).result.stopReason).toBe("cancelled");
+          expect(approvalResponseTo(messages, 7502).error).toBeUndefined();
+          // The card closed as failed before the prompt answered.
+          const closedAt = messages.findIndex((message) =>
+            message.params?.update?.toolCallId === cardId && message.params.update.status === "failed");
+          expect(closedAt).toBeGreaterThanOrEqual(0);
+          expect(closedAt).toBeLessThan(messages.indexOf(approvalResponseTo(messages, 7501)));
 
-          const base = gateway.requests.length;
+          // A late answer runs nothing.
+          acp.send({ jsonrpc: "2.0", id: request.id, result: { outcome: { outcome: "selected", optionId: "allow_once" } } });
           sendPrompt(acp, 7503, "Report the writer's state.");
-          await waitForCondition("the next prompt's first request", () => gateway.requests.length > base, TIMEOUT);
-          // Wherever the request puts the turn's list of subagents, it holds the writer's line.
-          const note = JSON.stringify(acpGatewayRequest(gateway.requests[base]!.body)).match(/- writer: [^\\"]*/)?.[0] ?? "";
-          if (via === "session/cancel") {
-            // The wait goes on, so the prompt does too, until the user cancels it.
-            acp.send({ jsonrpc: "2.0", id: 7504, method: "session/cancel", params: {} });
-          }
-          const ended = await readUntilResponses(acp, via === "session/cancel" ? [7503, 7504] : [7503], TIMEOUT);
+          await readMessagesUntilDone(acp, messages, () => approvalResponseTo(messages, 7503) !== undefined);
+          expect(approvalResponseTo(messages, 7503).result.stopReason).toBe("end_turn");
           expect(existsSync(target)).toBe(false);
-          seen[via] = { outcomesBefore, note, stopReason: ended.responses.get(7503).result.stopReason, requests: gateway.requests.length - base };
-          if (via === "session/load") {
-            // The prompt ended by itself: its own turn, then the writer's report, which says it was stopped.
-            const reportTurn = gateway.requests[base + 1]!.body;
-            expect(acpLatestUserIsReport(reportTurn)).toBe(true);
-            expect(reportTurn).toContain("fx stopped before it finished");
-            const trace = readFileSync(tracePath, "utf8");
-            expect(trace).toContain("event=reload_interrupted_approval_waits");
-            expect(trace).toContain("count=1");
-          }
+          expect(cardStatuses(messages, cardId).at(-1)).toBe("failed");
+          // The writer read that the prompt ended, not that anyone denied it.
+          const refusal = gateway.requests.find((seenRequest) =>
+            !seenRequest.body.includes('"name":"subagent"') && seenRequest.body.includes("child_write"));
+          expect(refusal?.body).toContain("fx could not ask because the prompt it belongs to ended or was cancelled");
           expect(acp.stderr).toBe("");
         } finally {
           await acp?.close();
@@ -12981,22 +13007,12 @@ describe("acp: model-independent", () => {
           rmSync(root.root, { recursive: true, force: true });
         }
       }
-      // A cancel leaves the writer waiting: nothing finished, and the list names it as still going. (The
-      // hook that says it asks comes just before its phase turns to waiting for an approval, so the list
-      // may still say working.)
-      const going = /^- writer: (working|waiting for an approval)\. For: Write the file\.$/;
-      expect(seen["session/cancel"]!.outcomesBefore).toEqual([]);
-      expect(seen["session/cancel"]!.note).toMatch(going);
-      // A reload ends the wait: the work ended interrupted, and the next prompt needs no cancel.
-      expect(seen["session/load"]!.outcomesBefore).toEqual(["interrupted"]);
-      expect(seen["session/load"]!.stopReason).toBe("end_turn");
-      expect(seen["session/load"]!.requests).toBe(2);
     },
     TIMEOUT * 2,
   );
 
   test(
-    "ACP session/load stops only the subagent that waits for an approval, and another one goes on and reports",
+    "ACP session/load withdraws only the request a subagent waits on, and another subagent goes on and reports",
     async () => {
       const root = createIsolatedRoot("fx-acp-reload-approval-other-");
       const target = join(root.external, "child-write.txt");
@@ -13007,8 +13023,11 @@ describe("acp: model-independent", () => {
       const holder = deferred<Response>();
       const gateway = startDynamicFakeGateway((body) => {
         if (!body.includes('"name":"subagent"')) {
-          // The writer's write waits for an approval; the other subagent's one request is held.
-          return acpPromptText(body).includes("Write the file.") ? fileToolCall("child_write", target, "blocked\n") : holder.promise;
+          // The writer asks once to write, and finishes once its refusal is in its conversation.
+          if (body.includes("child_write")) return finalText("ACP_WRITER_FINISHED");
+          return acpPromptText(body).includes("Write the file.")
+            ? fileToolCall("child_write", target, "blocked\n")
+            : holder.promise;
         }
         if (acpLatestUserIsReport(body)) return finalText("ACP_RELOAD_TWO_REPORT_SEEN");
         if (acpLatestPromptText(body).includes("Confirm the reloaded session")) return finalText("ACP_RELOAD_TWO_FOLLOWUP");
@@ -13022,39 +13041,37 @@ describe("acp: model-independent", () => {
           request: { action: "message", agent: "writer", message: "Write the file." },
         });
       });
-      const tracePath = join(root.root, "trace.log");
       let acp: AcpClient | null = null;
       try {
-        acp = await AcpClient.create({
-          cwd: root.workspace,
-          env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp,subagent" },
-        });
+        acp = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        acp.setPermissionOption(null);
         const sessionId = await startAutoSession(acp, true);
+        const messages: any[] = [];
         sendPrompt(acp, 7601, "Start both subagents.");
-        // The parent's two calls and its turn after each, the writer's request, and the held one.
-        await waitForCondition("both subagents' requests", () => gateway.requests.length === 5, TIMEOUT);
-        await waitForCondition("the writer's wait for an approval", () => approvalWaitRegistered(tracePath), TIMEOUT);
+        await readMessagesUntilDone(acp, messages, () => approvalRequestFor(messages, "writer") !== undefined);
+        await waitForCondition("the held subagent's turn", () =>
+          gateway.requests.some((seenRequest) => seenRequest.body.includes("Stay busy.")), TIMEOUT);
+        const request = approvalRequestFor(messages, "writer");
 
         acp.send({ jsonrpc: "2.0", id: 7602, method: "session/load", params: { sessionId, mcpServers: [] } });
-        const reloaded = await readUntilResponses(acp, [7601, 7602], TIMEOUT);
-        expect(reloaded.responses.get(7602).error).toBeUndefined();
-        // The writer's work ended interrupted, and the holder's goes on.
-        expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["interrupted"]);
+        await readMessagesUntilDone(acp, messages, () =>
+          approvalWithdrawn(messages, request.id) &&
+          approvalResponseTo(messages, 7601) !== undefined &&
+          approvalResponseTo(messages, 7602) !== undefined);
+        expect(approvalResponseTo(messages, 7602).error).toBeUndefined();
+        expect(cardStatuses(messages, request.params.toolCall.toolCallId).at(-1)).toBe("failed");
 
-        // The prompt runs the writer's report, then waits for the holder.
-        const base = gateway.requests.length;
+        // The writer reads its refusal. The next prompt waits for the held subagent's report, so the holder is released here.
+        await waitForCondition("the writer's refusal", () =>
+          gateway.requests.some((seenRequest) => !seenRequest.body.includes('"name":"subagent"') && seenRequest.body.includes("child_write")), TIMEOUT);
         sendPrompt(acp, 7603, "Confirm the reloaded session is usable.");
-        await waitForCondition("the prompt's turn and the writer's report", () => gateway.requests.length === base + 2, TIMEOUT);
-        expect(acpLatestUserIsReport(gateway.requests[base + 1]!.body)).toBe(true);
-        expect(gateway.requests[base + 1]!.body).toContain("fx stopped before it finished");
-        expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["interrupted"]);
-
         holder.resolve(finalText("HOLDER_DONE"));
-        const ended = await readUntilResponses(acp, [7603], TIMEOUT);
-        expect(ended.responses.get(7603).result.stopReason).toBe("end_turn");
-        expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["interrupted", "ok"]);
-        expect(gateway.requests.length).toBe(base + 3);
-        expect(gateway.requests[base + 2]!.body).toContain("HOLDER_DONE");
+        await readMessagesUntilDone(acp, messages, () => approvalResponseTo(messages, 7603) !== undefined);
+        expect(approvalResponseTo(messages, 7603).result.stopReason).toBe("end_turn");
+        // The holder's report and the writer's report both reached the parent.
+        const reports = gateway.requests.filter((seenRequest) => acpLatestUserIsReport(seenRequest.body)).map((seenRequest) => seenRequest.body);
+        expect(reports.some((body) => body.includes("HOLDER_DONE"))).toBe(true);
+        expect(reports.some((body) => body.includes("ACP_WRITER_FINISHED"))).toBe(true);
         expect(existsSync(target)).toBe(false);
         expect(acp.stderr).toBe("");
       } finally {
@@ -14675,6 +14692,983 @@ describe("acp: model-independent", () => {
       } finally {
         await client?.close();
         gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
+describe("acp: the test client's reads", () => {
+  /// An AcpClient over a process that is only its three streams, so the
+  /// clock and the process's end are the test's to control.
+  function fakeProcess() {
+    const proc: any = new EventEmitter();
+    proc.stdout = new EventEmitter();
+    proc.stderr = new EventEmitter();
+    proc.stdin = { write() {}, end() {} };
+    return {
+      proc,
+      client: new AcpClient(proc as ChildProcess),
+      say: (line: object) => proc.stdout.emit("data", Buffer.from(`${JSON.stringify(line)}\n`)),
+    };
+  }
+
+  test("a line that arrives after a read timed out is read by the next read", async () => {
+    jest.useFakeTimers();
+    try {
+      const { client, say } = fakeProcess();
+      const timedOut = client.readLine(1_000);
+      const outcome = timedOut.then((message) => message, (error) => error);
+      // Just before the deadline the read still waits; at it, it times out.
+      jest.advanceTimersByTime(999);
+      say({ n: 0 });
+      expect(await outcome).toEqual({ n: 0 });
+      const waiting = client.readLine(1_000).then((message) => message, (error) => error);
+      jest.advanceTimersByTime(1_000);
+      expect(await waiting).toBeInstanceOf(AcpReadTimeoutError);
+      // The timed-out read left no waiter behind to take this line.
+      say({ n: 1 });
+      const next = client.readLine(1_000).then((message) => message, (error) => error);
+      jest.advanceTimersByTime(1_000);
+      expect(await next).toEqual({ n: 1 });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("a read that outlives its process names how fx ended and what it wrote", async () => {
+    const { proc, client } = fakeProcess();
+    proc.stderr.emit("data", Buffer.from("programmer bug caused syscall error: ISCONN\n"));
+    const waiting = client.readLine(60_000).then((message) => message, (error) => error);
+    proc.emit("close", null, "SIGABRT");
+    const error = await waiting;
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain("signal SIGABRT");
+    expect(error.message).toContain("ISCONN");
+    // A read asked for after the end fails at once, the same way.
+    const later = await client.readLine(60_000).then((message) => message, (e) => e);
+    expect(later.message).toContain("signal SIGABRT");
+  });
+});
+
+describe("acp: subagent permission requests", () => {
+  let client: AcpClient | undefined;
+
+  afterEach(async () => {
+    await client?.close();
+    client = undefined;
+  });
+
+  /// A parent that sends each named subagent one write, in one turn, and
+  /// subagents that call write_file and then finish once it is decided. A
+  /// subagent's request never offers the subagent tool, so the requests tell
+  /// apart. `holdFirst` holds that subagent's first request until `release`;
+  /// `noWrite` subagents finish without a write; `afterCalls` answers the
+  /// parent's request after its subagent calls, and `onReport` the parent's
+  /// turns that a report starts. A subagent's phase write waits for a parent
+  /// model reply in flight, so no option holds a parent reply. With
+  /// `childCallId` every subagent numbers its write the same way, as models
+  /// of different conversations do. A `writesTwice` subagent writes
+  /// `<name>.txt` and then `<name>2.txt`, both as call_1, as one run's model
+  /// can repeat an id.
+  function subagentWrites(
+    names: string[],
+    options: {
+      holdFirst?: string;
+      noWrite?: string[];
+      writesTwice?: string[];
+      childCallId?: string;
+      afterCalls?: (body: string) => Response | Promise<Response>;
+      onReport?: (body: string) => Response | Promise<Response>;
+    } = {},
+  ) {
+    const seen: Array<{ who: string; kind: string; body: string }> = [];
+    let release = () => {};
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        const name = names.find((candidate) => body.includes(`Write ${candidate}.txt.`));
+        if (!name) {
+          seen.push({ who: "unknown", kind: "final", body });
+          return finalText("done");
+        }
+        if (options.writesTwice?.includes(name)) {
+          const decided = (JSON.parse(body).prompt ?? []).filter((item: any) => item.role === "tool").length;
+          if (decided >= 2) {
+            seen.push({ who: name, kind: "after-decision", body });
+            return finalText(`${name} done`);
+          }
+          seen.push({ who: name, kind: decided === 0 ? "first" : "second", body });
+          const file = decided === 0 ? `${name}.txt` : `${name}2.txt`;
+          return fileToolCall("call_1", file, `${name} wrote ${file}\n`);
+        }
+        const callId = options.childCallId ?? `w_${name}`;
+        if (body.includes(callId)) {
+          seen.push({ who: name, kind: "after-decision", body });
+          return finalText(`${name} done`);
+        }
+        seen.push({ who: name, kind: "first", body });
+        if (options.holdFirst === name) await held;
+        if (options.noWrite?.includes(name)) return finalText(`${name} done`);
+        return fileToolCall(callId, `${name}.txt`, `${name} wrote this\n`);
+      }
+      if (acpLatestUserIsReport(body)) {
+        if (options.onReport) return options.onReport(body);
+        seen.push({ who: "parent", kind: "report", body });
+        return finalText("SUBAGENT_REPORT_DONE");
+      }
+      if (names.some((name) => body.includes(`call_${name}`))) {
+        if (options.afterCalls) return options.afterCalls(body);
+        seen.push({ who: "parent", kind: "after-calls", body });
+        return finalText("SUBAGENT_PARENT_DONE");
+      }
+      seen.push({ who: "parent", kind: "calls", body });
+      return fakeGatewaySse([
+        ...names.map((name) => ({
+          type: "tool-call",
+          toolCallId: `call_${name}`,
+          toolName: "subagent",
+          input: { request: { action: "message", agent: name, message: `Write ${name}.txt.` } },
+        })),
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]);
+    });
+    const count = (who: string, kind: string) => seen.filter((entry) => entry.who === who && entry.kind === kind).length;
+    return { gateway, seen, count, release };
+  }
+
+  async function startAskSession(
+    root: ReturnType<typeof createIsolatedRoot>,
+    gateway: { baseUrl: string; chatUrl: string },
+    hooks = false,
+    extraEnv: Record<string, string> = {},
+  ) {
+    client = await AcpClient.create({
+      cwd: root.workspace,
+      env: { ...fakeGatewayEnv(root, gateway as any), FX_DISABLE_KEYCHAIN: "1", FX_SOUND: "0", FX_HOME: join(root.home, ".fx"), ...extraEnv },
+    });
+    const sessionId = await startAutoSession(client, hooks);
+    const mode = await client.request("session/set_mode", { modeId: "ask" }, 4) as any;
+    expect(mode.error).toBeUndefined();
+    return sessionId;
+  }
+
+  /// Reads the client's messages into `messages` until `done` holds.
+  async function readMessagesUntil(messages: any[], label: string, done: () => boolean, timeoutMs = TIMEOUT) {
+    const deadline = Date.now() + timeoutMs;
+    while (!done()) {
+      if (Date.now() > deadline) {
+        const seen = messages.map((message) => message.method ?? `response ${message.id}`);
+        throw new Error(`timed out waiting for ${label}; read ${JSON.stringify(seen)}`);
+      }
+      try {
+        messages.push(await client!.readLine(Math.min(200, Math.max(50, deadline - Date.now()))));
+      } catch (err) {
+        if (!(err instanceof AcpReadTimeoutError)) throw err;
+      }
+    }
+  }
+
+  /// What a subagent's model reads when fx needed its approval and could not
+  /// ask, by cause. It is not the noninteractive text fx ask shows, and not a
+  /// person's denial.
+  const COULD_NOT_ASK = "it needs approval, and fx could not ask because";
+  const PROMPT_CLOSED = `${COULD_NOT_ASK} the prompt it belongs to ended or was cancelled`;
+  const REQUESTS_FULL = `${COULD_NOT_ASK} too many approval requests are open`;
+  function expectReadsCause(body: string, cause: string) {
+    expect(body).toContain(cause);
+    expect(body).toContain("permission_required");
+    expect(body).not.toContain("Noninteractive mode");
+    expect(body).not.toContain("user_denied");
+    expect(body).not.toContain("Permission denied by user");
+  }
+
+  const permissionRequests = (messages: any[]) => messages.filter((message) => message.method === "session/request_permission");
+  const requestFor = (messages: any[], name: string) => permissionRequests(messages).find((message) => message.params?._meta?.fx?.subagent?.name === name);
+  const responseTo = (messages: any[], id: number) => messages.find((message) => message.id === id && (message.result !== undefined || message.error !== undefined));
+  const withdrawn = (messages: any[], requestId: number) => messages.some((message) => message.method === "$/cancel_request" && message.params?.requestId === requestId);
+  const answer = (requestId: number, optionId: string) => client!.send({ jsonrpc: "2.0", id: requestId, result: { outcome: { outcome: "selected", optionId } } });
+
+  /// Whether a trace line tells how request `id` ended without an answer: a
+  /// cancel settled it, a stop withdrew it, or its entry was gone. The line
+  /// that says it was withdrawn again after its write is not one of these.
+  const settlesRequest = (line: string, id: number) =>
+    new RegExp(`(outbound request cancelled|subagent permission request withdrawn|(subagent|parent) permission request gone) id=${id}( |$)`).test(line);
+
+  /// What a client shows for one call card: its `session/update`s, in order.
+  const cardUpdates = (messages: any[], toolCallId: string) => messages
+    .filter((message) => message.method === "session/update" && message.params?.update?.toolCallId === toolCallId)
+    .map((message) => message.params.update);
+
+  /// A card is announced pending and then ends once, with the call's status.
+  function expectCardEnds(messages: any[], toolCallId: string, status: "completed" | "failed") {
+    const updates = cardUpdates(messages, toolCallId);
+    expect(updates[0]?.sessionUpdate).toBe("tool_call");
+    expect(updates[0]?.status).toBe("pending");
+    const finals = updates.filter((update) => update.status === "completed" || update.status === "failed");
+    expect(finals).toHaveLength(1);
+    expect(updates.at(-1)).toBe(finals[0]);
+    expect(finals[0].status).toBe(status);
+  }
+
+  function expectNamesSubagent(request: any, sessionId: string, name: string) {
+    expect(request.params.sessionId).toBe(sessionId);
+    const subagent = request.params._meta.fx.subagent;
+    expect(subagent.name).toBe(name);
+    expect(typeof subagent.childId).toBe("string");
+    expect(subagent.childId).not.toBe(sessionId);
+    expect(typeof subagent.workId).toBe("string");
+    expect(request.params.toolCall.rawInput.path).toBe(`${name}.txt`);
+  }
+
+  test(
+    "a subagent's permission request reaches the client on the parent session",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-ask-");
+      const fixture = subagentWrites(["writer"]);
+      try {
+        const sessionId = await startAskSession(root, fixture.gateway, true);
+        client!.setPermissionOption("allow_once");
+        const result = await runPrompt(client!, "Delegate the write.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        const requests = permissionRequests(result.messages);
+        expect(requests).toHaveLength(1);
+        expectNamesSubagent(requests[0], sessionId, "writer");
+        expect(readFileSync(join(root.workspace, "writer.txt"), "utf8")).toBe("writer wrote this\n");
+        // The subagent's own hooks show the wait, named by its write.
+        const wait = client!.hookEvents.find((event) => event.type === "wait.start" && event.data.kind === "approval");
+        expect(wait.data.callId).toBe("w_writer");
+        expect(wait.sessionId).toBe(requests[0].params._meta.fx.subagent.childId);
+        expect(client!.hookEvents.find((event) => event.type === "wait.end" && event.data.requestId === wait.data.requestId).data.outcome).toBe("accepted");
+        expect(fixture.count("parent", "calls")).toBe(1);
+        expect(fixture.count("writer", "first")).toBe(1);
+        expect(fixture.count("writer", "after-decision")).toBe(1);
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's card ends with the call's real status, and its id is unique in the session",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-card-");
+      // Both subagents number their write call_1, as models of different
+      // conversations do.
+      const fixture = subagentWrites(["alpha", "beta"], { childCallId: "call_1" });
+      try {
+        await startAskSession(root, fixture.gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 67, "Delegate both writes.");
+        await readMessagesUntil(messages, "two subagent requests", () => permissionRequests(messages).length === 2);
+        const alpha = requestFor(messages, "alpha"), beta = requestFor(messages, "beta");
+        const alphaCard = alpha.params.toolCall.toolCallId, betaCard = beta.params.toolCall.toolCallId;
+        // Each id leads with the child id and the call's order in its run.
+        expect(alphaCard).toBe(`${alpha.params._meta.fx.subagent.childId}:1:call_1`);
+        expect(betaCard).toBe(`${beta.params._meta.fx.subagent.childId}:1:call_1`);
+        expect(alphaCard).not.toBe(betaCard);
+        answer(alpha.id, "allow_once");
+        answer(beta.id, "reject_once");
+        await readMessagesUntil(messages, "the prompt's response", () => responseTo(messages, 67) !== undefined);
+        expect(responseTo(messages, 67).result.stopReason).toBe("end_turn");
+        // Each card was announced pending and ends once: completed after an
+        // allow, failed after a reject.
+        expectCardEnds(messages, alphaCard, "completed");
+        expectCardEnds(messages, betaCard, "failed");
+        // The parent's own cards keep their call ids, and no two announced
+        // cards share an id.
+        expect(cardUpdates(messages, "call_alpha")).not.toHaveLength(0);
+        const announced = messages
+          .filter((message) => message.method === "session/update" && message.params?.update?.sessionUpdate === "tool_call")
+          .map((message) => message.params.update.toolCallId);
+        expect(new Set(announced).size).toBe(announced.length);
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent run whose model repeats a call id gets a card of its own for each call",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-repeat-");
+      const fixture = subagentWrites(["alpha"], { writesTwice: ["alpha"] });
+      try {
+        await startAskSession(root, fixture.gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 69, "Delegate the writes.");
+        await readMessagesUntil(messages, "alpha's first request", () => permissionRequests(messages).length === 1);
+        const first = permissionRequests(messages)[0];
+        answer(first.id, "allow_once");
+        await readMessagesUntil(messages, "alpha's second request", () => permissionRequests(messages).length === 2);
+        const second = permissionRequests(messages)[1];
+        answer(second.id, "allow_once");
+        await readMessagesUntil(messages, "the prompt's response", () => responseTo(messages, 69) !== undefined);
+        expect(responseTo(messages, 69).result.stopReason).toBe("end_turn");
+        // Both calls are the model's call_1, in one run, so fx gives the
+        // second call its own id, fx_call_1. Each card's id leads with the
+        // child id and the call's order in the run, and stays the same across
+        // the card's updates.
+        const childId = first.params._meta.fx.subagent.childId;
+        const ids = [`${childId}:1:call_1`, `${childId}:2:fx_call_1`];
+        expect(first.params.toolCall.toolCallId).toBe(ids[0]);
+        expect(second.params.toolCall.toolCallId).toBe(ids[1]);
+        expect(first.params.toolCall.rawInput.path).toBe("alpha.txt");
+        expect(second.params.toolCall.rawInput.path).toBe("alpha2.txt");
+        for (const id of ids) {
+          expectCardEnds(messages, id, "completed");
+          expect(cardUpdates(messages, id).map((update) => update.status)).toEqual(["pending", "in_progress", "completed"]);
+        }
+        expect(readFileSync(join(root.workspace, "alpha.txt"), "utf8")).toBe("alpha wrote alpha.txt\n");
+        expect(readFileSync(join(root.workspace, "alpha2.txt"), "utf8")).toBe("alpha wrote alpha2.txt\n");
+        expect(fixture.count("alpha", "first")).toBe(1);
+        expect(fixture.count("alpha", "second")).toBe(1);
+        expect(fixture.count("alpha", "after-decision")).toBe(1);
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's card ids stay unique across its runs",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-runs-");
+      // One named subagent that two prompts send work to. Its model numbers
+      // its write call_1 in both runs, and its history carries over.
+      let childRequests = 0;
+      const delegate = (callId: string, message: string) => fakeGatewaySse([
+        { type: "tool-call", toolCallId: callId, toolName: "subagent", input: { request: { action: "message", agent: "alpha", message } } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]);
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes('"name":"subagent"')) {
+          childRequests += 1;
+          if (childRequests === 1) return fileToolCall("call_1", "a.txt", "a\n");
+          if (childRequests === 3) return fileToolCall("call_1", "b.txt", "b\n");
+          return finalText(`alpha done ${childRequests}`);
+        }
+        if (acpLatestUserIsReport(body)) return finalText("SUBAGENT_REPORT_DONE");
+        if (body.includes("call_alpha_2")) return finalText("SUBAGENT_PARENT_DONE_2");
+        if (body.includes("Delegate two.")) return delegate("call_alpha_2", "Write b.txt.");
+        if (body.includes("call_alpha_1")) return finalText("SUBAGENT_PARENT_DONE_1");
+        return delegate("call_alpha_1", "Write a.txt.");
+      });
+      try {
+        await startAskSession(root, gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 91, "Delegate one.");
+        await readMessagesUntil(messages, "alpha's first request", () => permissionRequests(messages).length === 1);
+        answer(permissionRequests(messages)[0].id, "allow_once");
+        await readMessagesUntil(messages, "the first prompt's response", () => responseTo(messages, 91) !== undefined);
+        expect(responseTo(messages, 91).result.stopReason).toBe("end_turn");
+        sendPrompt(client!, 92, "Delegate two.");
+        await readMessagesUntil(messages, "alpha's second request", () => permissionRequests(messages).length === 2);
+        answer(permissionRequests(messages)[1].id, "allow_once");
+        await readMessagesUntil(messages, "the second prompt's response", () => responseTo(messages, 92) !== undefined);
+        expect(responseTo(messages, 92).result.stopReason).toBe("end_turn");
+        // Both runs are the same child's, and each model call is call_1. The
+        // second run's call repeats that id, so fx gives it its own, fx_call_1,
+        // and the order goes on from the first run's.
+        const [first, second] = permissionRequests(messages);
+        const childId = first.params._meta.fx.subagent.childId;
+        expect(second.params._meta.fx.subagent.childId).toBe(childId);
+        expect(first.params.toolCall.toolCallId).toBe(`${childId}:1:call_1`);
+        expect(second.params.toolCall.toolCallId).toBe(`${childId}:2:fx_call_1`);
+        expect(first.params.toolCall.rawInput.path).toBe("a.txt");
+        expect(second.params.toolCall.rawInput.path).toBe("b.txt");
+        expectCardEnds(messages, first.params.toolCall.toolCallId, "completed");
+        expectCardEnds(messages, second.params.toolCall.toolCallId, "completed");
+        // No two cards the client was shown share an id.
+        const announced = messages
+          .filter((message) => message.method === "session/update" && message.params?.update?.sessionUpdate === "tool_call")
+          .map((message) => message.params.update.toolCallId);
+        expect(new Set(announced).size).toBe(announced.length);
+        expect(readFileSync(join(root.workspace, "a.txt"), "utf8")).toBe("a\n");
+        expect(readFileSync(join(root.workspace, "b.txt"), "utf8")).toBe("b\n");
+        expect(childRequests).toBe(4);
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's approval is one wait, accepted after an allow",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-wait-allow-");
+      const fixture = subagentWrites(["alpha"]);
+      try {
+        await startAskSession(root, fixture.gateway, true);
+        client!.setPermissionOption("allow_once");
+        const result = await runPrompt(client!, "Delegate the write.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(permissionRequests(result.messages)).toHaveLength(1);
+        const starts = client!.hookEvents.filter((event) => event.type === "wait.start");
+        const ends = client!.hookEvents.filter((event) => event.type === "wait.end");
+        expect(starts).toHaveLength(1);
+        expect(ends).toHaveLength(1);
+        expect(starts[0].data.kind).toBe("approval");
+        expect(ends[0].data.requestId).toBe(starts[0].data.requestId);
+        expect(ends[0].data.outcome).toBe("accepted");
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's approval is one wait, cancelled after a cancel",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-wait-cancel-");
+      const fixture = subagentWrites(["alpha"]);
+      try {
+        await startAskSession(root, fixture.gateway, true);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 93, "Delegate the write.");
+        await readMessagesUntil(messages, "alpha's request", () => requestFor(messages, "alpha") !== undefined);
+        client!.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
+        await readMessagesUntil(messages, "the cancelled prompt", () => responseTo(messages, 93) !== undefined);
+        expect(responseTo(messages, 93).result.stopReason).toBe("cancelled");
+        await readMessagesUntil(messages, "the wait's end", () => client!.hookEvents.some((event) => event.type === "wait.end"));
+        // The wait the request opened is the only one, and it ended with the
+        // cancel, as a parent's own approval does.
+        const starts = client!.hookEvents.filter((event) => event.type === "wait.start");
+        const ends = client!.hookEvents.filter((event) => event.type === "wait.end");
+        expect(starts).toHaveLength(1);
+        expect(ends).toHaveLength(1);
+        expect(starts[0].data.kind).toBe("approval");
+        expect(ends[0].data.requestId).toBe(starts[0].data.requestId);
+        expect(ends[0].data.outcome).toBe("cancelled");
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a cancel closes every open subagent card before the prompt's response",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-close-");
+      const fixture = subagentWrites(["alpha", "beta"]);
+      try {
+        await startAskSession(root, fixture.gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 70, "Delegate both writes.");
+        await readMessagesUntil(messages, "two subagent requests", () => permissionRequests(messages).length === 2);
+        const cards = permissionRequests(messages).map((request) => request.params.toolCall.toolCallId);
+        client!.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
+        await readMessagesUntil(messages, "the cancelled prompt", () => responseTo(messages, 70) !== undefined);
+        expect(responseTo(messages, 70).result.stopReason).toBe("cancelled");
+        // ACP's prompt turn: every update comes before the response.
+        const responseAt = messages.indexOf(responseTo(messages, 70));
+        for (const id of cards) {
+          const closedAt = messages.findIndex((message) =>
+            message.method === "session/update" && message.params?.update?.toolCallId === id && message.params.update.status === "failed");
+          expect(closedAt).toBeGreaterThanOrEqual(0);
+          expect(closedAt).toBeLessThan(responseAt);
+        }
+        // The subagents then read the cancel, and their own ends add nothing.
+        await readMessagesUntil(messages, "both subagents' turns after their decision", () =>
+          fixture.count("alpha", "after-decision") === 1 && fixture.count("beta", "after-decision") === 1);
+        const next = await runPrompt(client!, "Continue.", TIMEOUT);
+        expect(next.promptResult.result.stopReason).toBe("end_turn");
+        const all = [...messages, ...next.messages];
+        for (const id of cards) expectCardEnds(all, id, "failed");
+        expect(next.messages.some((message) => cards.includes(message.params?.update?.toolCallId))).toBe(false);
+        expect(existsSync(join(root.workspace, "alpha.txt"))).toBe(false);
+        expect(existsSync(join(root.workspace, "beta.txt"))).toBe(false);
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "two subagents asking at once each get their own request and answer",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-two-");
+      const fixture = subagentWrites(["alpha", "beta"]);
+      try {
+        const sessionId = await startAskSession(root, fixture.gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 60, "Delegate both writes.");
+        await readMessagesUntil(messages, "two subagent requests", () => permissionRequests(messages).length === 2);
+        const alpha = requestFor(messages, "alpha"), beta = requestFor(messages, "beta");
+        expectNamesSubagent(alpha, sessionId, "alpha");
+        expectNamesSubagent(beta, sessionId, "beta");
+        expect(alpha.id).not.toBe(beta.id);
+        expect(alpha.params._meta.fx.subagent.childId).not.toBe(beta.params._meta.fx.subagent.childId);
+        // Answered in the other order: the second request first.
+        answer(beta.id, "reject_once");
+        answer(alpha.id, "allow_once");
+        await readMessagesUntil(messages, "the prompt's response", () => responseTo(messages, 60) !== undefined);
+        expect(responseTo(messages, 60).result.stopReason).toBe("end_turn");
+        expect(permissionRequests(messages)).toHaveLength(2);
+        expect(readFileSync(join(root.workspace, "alpha.txt"), "utf8")).toBe("alpha wrote this\n");
+        expect(existsSync(join(root.workspace, "beta.txt"))).toBe(false);
+        for (const name of ["alpha", "beta"]) {
+          expect(fixture.count(name, "first")).toBe(1);
+          expect(fixture.count(name, "after-decision")).toBe(1);
+        }
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session/cancel withdraws an open subagent request, and a late allow runs nothing",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-cancel-");
+      const fixture = subagentWrites(["alpha"]);
+      const tracePath = join(root.root, "trace.log");
+      try {
+        await startAskSession(root, fixture.gateway, false, { FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp" });
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 61, "Delegate the write.");
+        await readMessagesUntil(messages, "alpha's request", () => requestFor(messages, "alpha") !== undefined);
+        const request = requestFor(messages, "alpha");
+        client!.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
+        await readMessagesUntil(messages, "the cancelled prompt and the withdrawn request", () =>
+          responseTo(messages, 61) !== undefined && withdrawn(messages, request.id));
+        expect(responseTo(messages, 61).result.stopReason).toBe("cancelled");
+        // The card's closing update came before the response, as ACP's prompt
+        // turn requires.
+        const closedAt = messages.findIndex((message) =>
+          message.params?.update?.toolCallId === request.params.toolCall.toolCallId && message.params.update.status === "failed");
+        expect(closedAt).toBeGreaterThanOrEqual(0);
+        expect(closedAt).toBeLessThan(messages.indexOf(responseTo(messages, 61)));
+        // A client that ignores $/cancel_request answers anyway.
+        answer(request.id, "allow_once");
+        await readMessagesUntil(messages, "alpha's turn after its decision", () => fixture.count("alpha", "after-decision") === 1);
+        // And answers again once fx has forgotten the request.
+        answer(request.id, "allow_once");
+        const next = await runPrompt(client!, "Continue.", TIMEOUT);
+        expect(next.promptResult.result.stopReason).toBe("end_turn");
+        expect(existsSync(join(root.workspace, "alpha.txt"))).toBe(false);
+        expect(permissionRequests([...messages, ...next.messages])).toHaveLength(1);
+        expect(fixture.count("alpha", "first")).toBe(1);
+        // A cancel in the wait reads as the prompt's cancel, not as a
+        // person's denial.
+        expectReadsCause(fixture.seen.find((entry) => entry.who === "alpha" && entry.kind === "after-decision")!.body, PROMPT_CLOSED);
+        // The card ends once, failed, though no allow ever ran the write.
+        expectCardEnds([...messages, ...next.messages], request.params.toolCall.toolCallId, "failed");
+        // fx leaves a trace line for the cancel and for each answer it dropped.
+        await readMessagesUntil(messages, "the dropped answers traced", () => {
+          const trace = readFileSync(tracePath, "utf8");
+          return trace.includes(`client answer ignored id=${request.id} reason=no_pending_request`);
+        }, 5_000);
+        const trace = readFileSync(tracePath, "utf8");
+        expect(trace).toContain(`outbound request cancelled id=${request.id} reason=session_cancel`);
+        // The cancel is the request's one settling line: the cleanup after
+        // the failed wait finds no entry and says nothing of one gone.
+        expect(trace.split("\n").filter((line) => settlesRequest(line, request.id))).toHaveLength(1);
+        expect(trace).not.toContain("permission request gone");
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent that asks after its prompt closed is denied at once",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-closed-");
+      const fixture = subagentWrites(["alpha"], { holdFirst: "alpha" });
+      try {
+        await startAskSession(root, fixture.gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 62, "Delegate the write.");
+        await readMessagesUntil(messages, "alpha's first model request", () => fixture.count("alpha", "first") === 1);
+        client!.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
+        await readMessagesUntil(messages, "the cancelled prompt", () => responseTo(messages, 62) !== undefined);
+        expect(responseTo(messages, 62).result.stopReason).toBe("cancelled");
+        // Alpha reaches its write with no prompt open.
+        fixture.release();
+        await readMessagesUntil(messages, "alpha's turn after its decision", () => fixture.count("alpha", "after-decision") === 1);
+        expect(permissionRequests(messages)).toHaveLength(0);
+        const next = await runPrompt(client!, "Continue.", TIMEOUT);
+        expect(next.promptResult.result.stopReason).toBe("end_turn");
+        expect(permissionRequests(next.messages)).toHaveLength(0);
+        expect(existsSync(join(root.workspace, "alpha.txt"))).toBe(false);
+        // No card was announced for a call nobody could be asked about, and the
+        // subagent's model reads that approval was required and could not be
+        // asked, not that a person refused.
+        expect([...messages, ...next.messages].some((message) => String(message.params?.update?.toolCallId ?? "").endsWith(":w_alpha"))).toBe(false);
+        const afterDecision = fixture.seen.find((entry) => entry.who === "alpha" && entry.kind === "after-decision")!.body;
+        expectReadsCause(afterDecision, PROMPT_CLOSED);
+        expect(client!.stderr).toBe("");
+      } finally {
+        fixture.release();
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  for (const [how, reply, traced] of [
+    ["an error", { error: { code: -32601, message: "Method not found" } }, "client_error"],
+    ["garbage", { result: { outcome: { outcome: "selected", optionId: "allow_everything" }, extra: [1, 2] } }, "unknown_outcome"],
+    ["a cancelled outcome", { result: { outcome: { outcome: "cancelled" } } }, null],
+  ] as const) {
+    test(
+      `${how} in answer to a subagent's request denies its write`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-subagent-fault-");
+        const fixture = subagentWrites(["alpha"]);
+        const tracePath = join(root.root, "trace.log");
+        try {
+          await startAskSession(root, fixture.gateway, false, { FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "acp" });
+          client!.setPermissionOption(null);
+          const messages: any[] = [];
+          sendPrompt(client!, 63, "Delegate the write.");
+          await readMessagesUntil(messages, "alpha's request", () => requestFor(messages, "alpha") !== undefined);
+          const request = requestFor(messages, "alpha");
+          client!.send({ jsonrpc: "2.0", id: request.id, ...reply });
+          await readMessagesUntil(messages, "the prompt's response", () => responseTo(messages, 63) !== undefined);
+          expect(responseTo(messages, 63).result.stopReason).toBe("end_turn");
+          expect(existsSync(join(root.workspace, "alpha.txt"))).toBe(false);
+          expect(fixture.count("alpha", "after-decision")).toBe(1);
+          // The card ends once, failed, and a dropped answer leaves its trace.
+          expectCardEnds(messages, request.params.toolCall.toolCallId, "failed");
+          const trace = readFileSync(tracePath, "utf8");
+          if (traced) expect(trace).toContain(`permission answer denied id=${request.id} reason=${traced}`);
+          else expect(trace).not.toContain("permission answer denied");
+          expect(client!.stderr).toBe("");
+        } finally {
+          await client?.close();
+          fixture.gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
+
+  test(
+    "a subagent's request stays open after the parent's own turn fails",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-fail-");
+      const fixture = subagentWrites(["alpha"], {
+        // The parent's turn fails right after it sends alpha.
+        afterCalls: () => new Response(JSON.stringify({ error: { message: "invalid request", type: "invalid_request_error" } }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        }),
+      });
+      try {
+        await startAskSession(root, fixture.gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 65, "Delegate the write.");
+        await readMessagesUntil(messages, "alpha's request and the parent's failure", () =>
+          requestFor(messages, "alpha") !== undefined && JSON.stringify(messages).includes("HTTP 400"));
+        const request = requestFor(messages, "alpha");
+        // The prompt stays open for its subagent.
+        expect(responseTo(messages, 65)).toBeUndefined();
+        expect(withdrawn(messages, request.id)).toBe(false);
+        answer(request.id, "allow_once");
+        await readMessagesUntil(messages, "the prompt's response", () => responseTo(messages, 65) !== undefined);
+        expect(responseTo(messages, 65).result).toBeDefined();
+        expect(readFileSync(join(root.workspace, "alpha.txt"), "utf8")).toBe("alpha wrote this\n");
+        expect(permissionRequests(messages)).toHaveLength(1);
+      } finally {
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "more subagents than the client may be asked at once are refused, and the parent's own request is still sent",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-many-");
+      // One writer more than a subagent may be asked about: the fewest that
+      // show the parent's slot is kept. A thread that opens many connections
+      // at once can abort an fx process (the ISCONN panic on main), and the
+      // test then names the abort, so it stays small.
+      const writers = Array.from({ length: 32 }, (_, n) => `s${String(n + 1).padStart(2, "0")}`);
+      // zz reports without a write once the flood is in, and its report
+      // starts the parent's turn that writes root.txt itself.
+      const names = [...writers, "zz"];
+      let parentWrote = false;
+      const fixture = subagentWrites(names, {
+        holdFirst: "zz",
+        noWrite: ["zz"],
+        onReport: () => {
+          if (parentWrote) return finalText("SUBAGENT_PARENT_DONE");
+          parentWrote = true;
+          return fileToolCall("w_root", "root.txt", "root wrote this\n");
+        },
+      });
+      try {
+        const sessionId = await startAskSession(root, fixture.gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 66, "Delegate thirty-three writes.");
+        // Nothing is answered until each writer has a request open or was
+        // refused. fx keeps the registry's last slot for the parent's own
+        // request (`max_pending_outbound` in src/acp/server.zig), so 31 of the
+        // 32 writers have one open.
+        await readMessagesUntil(messages, "every writer asked or was refused", () =>
+          permissionRequests(messages).length + writers.filter((name) => fixture.count(name, "after-decision") === 1).length === writers.length);
+        const requests = permissionRequests(messages);
+        expect(requests).toHaveLength(31);
+        expect(new Set(requests.map((request) => request.id)).size).toBe(31);
+        for (const request of requests) expectNamesSubagent(request, sessionId, request.params._meta.fx.subagent.name);
+        const asked = new Set(requests.map((request) => request.params._meta.fx.subagent.name));
+        // A refused writer reads that approval was required and could not be
+        // asked, not that a person refused.
+        const refused = writers.filter((name) => !asked.has(name));
+        expect(refused).toHaveLength(1);
+        for (const name of refused) {
+          const body = fixture.seen.find((entry) => entry.who === name && entry.kind === "after-decision")!.body;
+          expectReadsCause(body, REQUESTS_FULL);
+        }
+        // zz reports now, and the parent's own write asks the client, though
+        // 31 requests are open.
+        fixture.release();
+        await readMessagesUntil(messages, "the parent's own request", () =>
+          permissionRequests(messages).some((request) => request.params?._meta === undefined));
+        const own = permissionRequests(messages).find((request) => request.params?._meta === undefined);
+        expect(own.params.toolCall.rawInput.path).toBe("root.txt");
+        expect(own.params.sessionId).toBe(sessionId);
+        expect(responseTo(messages, 66)).toBeUndefined();
+        for (const request of [...requests, own]) answer(request.id, "allow_once");
+        await readMessagesUntil(messages, "the prompt's response", () => responseTo(messages, 66) !== undefined, 60_000);
+        expect(responseTo(messages, 66).result.stopReason).toBe("end_turn");
+        expect(readFileSync(join(root.workspace, "root.txt"), "utf8")).toBe("root wrote this\n");
+        for (const name of writers) expect(existsSync(join(root.workspace, `${name}.txt`))).toBe(asked.has(name));
+        expect(requests.some((request) => withdrawn(messages, request.id))).toBe(false);
+        for (const name of names) expect(fixture.count(name, "first")).toBe(1);
+        for (const name of writers) expect(fixture.count(name, "after-decision")).toBe(1);
+        expect(client!.stderr).toBe("");
+      } finally {
+        fixture.release();
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    90_000,
+  );
+
+  test(
+    "a cancel between a subagent request's insert and its write leaves no request shown",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-gap-");
+      const fixture = subagentWrites(["alpha"]);
+      // fx holds alpha's request after its entry is inserted and before it is
+      // written (src/acp/prompt_test_controls.zig).
+      const inserted = join(root.root, "request-inserted");
+      const release = join(root.root, "request-release");
+      const tracePath = join(root.root, "trace.log");
+      try {
+        await startAskSession(root, fixture.gateway, false, {
+          FX_TEST_ACP_REQUEST_INSERTED: inserted,
+          FX_TEST_ACP_REQUEST_RELEASE: release,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "acp",
+        });
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 68, "Delegate the write.");
+        await readMessagesUntil(messages, "alpha's request held after its insert", () => existsSync(inserted));
+        expect(permissionRequests(messages)).toHaveLength(0);
+        client!.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
+        await readMessagesUntil(messages, "the cancelled prompt", () => responseTo(messages, 68) !== undefined);
+        expect(responseTo(messages, 68).result.stopReason).toBe("cancelled");
+        writeFileSync(release, "");
+        await readMessagesUntil(messages, "alpha's turn after its decision", () => fixture.count("alpha", "after-decision") === 1);
+        // The next prompt's response follows every frame alpha's turn wrote.
+        const next = await runPrompt(client!, "Continue.", TIMEOUT);
+        expect(next.promptResult.result.stopReason).toBe("end_turn");
+        // The request was written after the cancel went out, so a client that
+        // shows it must be told again that it is withdrawn. No request may be
+        // left with no withdrawal after it.
+        const all = [...messages, ...next.messages];
+        expect(permissionRequests(all)).toHaveLength(1);
+        for (const request of permissionRequests(all)) {
+          expect(all.slice(all.indexOf(request) + 1).some((message) =>
+            message.method === "$/cancel_request" && message.params?.requestId === request.id)).toBe(true);
+        }
+        expect(existsSync(join(root.workspace, "alpha.txt"))).toBe(false);
+        // The card closed with the prompt before alpha could report its call's
+        // end, so that report is dropped, and the trace names the card. The
+        // cancel is the request's one settling line.
+        const request = permissionRequests(all)[0];
+        const trace = readFileSync(tracePath, "utf8");
+        const dropped = trace.split("\n").filter((line) => line.includes("subagent card update dropped"));
+        expect(dropped).toHaveLength(1);
+        expect(dropped[0]).toContain(`card_id=${request.params.toolCall.toolCallId} `);
+        expect(trace.split("\n").filter((line) => settlesRequest(line, request.id))).toHaveLength(1);
+        expect(client!.stderr).toBe("");
+      } finally {
+        writeFileSync(release, "");
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a cancel between an elicitation request's insert and its write is withdrawn again after the write",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-elicit-gap-");
+      const pidPath = join(root.root, "mcp-elicit-gap.pid");
+      // fx holds the request after its entry is inserted and before it is
+      // written (src/acp/prompt_test_controls.zig), for every kind of request.
+      const inserted = join(root.root, "request-inserted");
+      const release = join(root.root, "request-release");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_form", "mcp_select_tool", { name: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_form", MCP_TOOL_NAME, { text: "acp-gap" }),
+        finalText("the elicitation never finished"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_TEST_ACP_REQUEST_INSERTED: inserted,
+            FX_TEST_ACP_REQUEST_RELEASE: release,
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { elicitation: { form: {} } } }, 1);
+        const created = await client.request(
+          "session/new",
+          {
+            cwd: root.workspace,
+            mcpServers: [acpStdioServer("unused", pidPath, "mrtr_input_required", { FX_MCP_EXPECT_ELICITATION: "form" })],
+          },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const messages: any[] = [];
+        sendPrompt(client, 71, "Call the supplied MRTR MCP tool and use the form response.");
+        await readMessagesUntil(messages, "the elicitation request held after its insert", () => existsSync(inserted));
+        expect(messages.some((message) => message.method === "elicitation/create")).toBe(false);
+        client.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
+        // The cancel's notice goes out for the request fx has not written yet.
+        await readMessagesUntil(messages, "the cancel's notice", () =>
+          messages.some((message) => message.method === "$/cancel_request"));
+        writeFileSync(release, "");
+        await readMessagesUntil(messages, "the prompt's response", () => responseTo(messages, 71) !== undefined);
+        expect(responseTo(messages, 71).result.stopReason).toBe("cancelled");
+        // The request was written after the cancel went out, so a client that
+        // shows it must be told again that it is withdrawn.
+        const request = messages.find((message) => message.method === "elicitation/create");
+        expect(request).toBeDefined();
+        const written = messages.indexOf(request);
+        const notices = messages.flatMap((message, at) =>
+          message.method === "$/cancel_request" && message.params?.requestId === request.id ? [at] : []);
+        expect(notices.some((at) => at < written)).toBe(true);
+        expect(notices.some((at) => at > written)).toBe(true);
+        expect(client.stderr).toBe("");
+      } finally {
+        writeFileSync(release, "");
+        await client?.close();
+        if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "the parent's stop ends a subagent's wait on the client",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-stop-");
+      let stopped = false;
+      // Beta reports once alpha's request is at the client, and the parent's
+      // turn that beta's report starts stops alpha.
+      const fixture = subagentWrites(["alpha", "beta"], {
+        holdFirst: "beta",
+        noWrite: ["beta"],
+        onReport: () => {
+          if (stopped) return finalText("SUBAGENT_PARENT_STOPPED");
+          stopped = true;
+          return fakeGatewayToolCall("stop_alpha", "subagent", { request: { action: "stop", agent: "alpha" } });
+        },
+      });
+      try {
+        const sessionId = await startAskSession(root, fixture.gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 64, "Delegate the write, then stop it.");
+        await readMessagesUntil(messages, "alpha's request", () => requestFor(messages, "alpha") !== undefined);
+        const request = requestFor(messages, "alpha");
+        expectNamesSubagent(request, sessionId, "alpha");
+        fixture.release();
+        await readMessagesUntil(messages, "the withdrawn request and the prompt's response", () =>
+          withdrawn(messages, request.id) && responseTo(messages, 64) !== undefined);
+        expect(stopped).toBe(true);
+        expect(responseTo(messages, 64).result.stopReason).toBe("end_turn");
+        expect(permissionRequests(messages)).toHaveLength(1);
+        expect(existsSync(join(root.workspace, "alpha.txt"))).toBe(false);
+        expect(fixture.count("alpha", "after-decision")).toBe(0);
+        // The stopped subagent's card ends once, failed.
+        expectCardEnds(messages, request.params.toolCall.toolCallId, "failed");
+        expect(client!.stderr).toBe("");
+      } finally {
+        fixture.release();
+        await client?.close();
+        fixture.gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },

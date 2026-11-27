@@ -74,6 +74,9 @@
     {"name": "trace_record_text", "module": "fx", "test": "trace records stay one valid JSON line for fuzzed text", "iterations": 12000},
     {"name": "mcp_object_fields", "module": "fx", "test": "the engine reads an object's field names as std.json decodes them", "iterations": 1000000},
     {"name": "acp_command_output_utf8", "module": "fx", "test": "command output text is valid UTF-8 and matches the whole output however it is split", "iterations": 20000},
+
+    {"name": "acp_permission_answer", "module": "fx", "test": "a permission answer allows only when it selects an allow option, on fuzzed bytes", "iterations": 400000},
+    {"name": "acp_subagent_cards", "module": "fx", "test": "no two subagent cards share an id, on fuzzed runs, calls, and prompt closes", "iterations": 1500},
     {"name": "mcp_wire", "module": "fx", "test": "MCP wire decoding returns only whole JSON values from valid input", "iterations": 900000},
     {"name": "mcp_elicitation_escapes", "module": "fx", "test": "the engine's equality and length limits of a form's strings and an answer's match std.json's decoded strings", "iterations": 150000},
     {"name": "mcp_challenge", "module": "fx", "test": "a WWW-Authenticate challenge is read within its bounds on fuzzed bytes", "iterations": 1500000},

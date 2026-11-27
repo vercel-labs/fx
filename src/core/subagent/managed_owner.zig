@@ -827,44 +827,12 @@ pub const Owner = struct {
 
     /// The parent drains tool callers before releasing its borrowed context.
     pub fn cancelAndJoin(self: *Owner, child_id: []const u8) void {
-        self.stopAndJoin(child_id, .cancelled);
+        self.stopAndJoin(child_id);
     }
 
-    /// Ends the running turn of each child that waits on an approval, as a
-    /// quit ends every turn: its work ends interrupted and owes its report,
-    /// and the wait ends. The other children keep running. Returns how many
-    /// turns it ended. A host whose approvals reach no one calls it, so a
-    /// turn that waits for one does not wait for ever.
-    pub fn interruptApprovalWaits(self: *Owner) usize {
-        var waiting: std.ArrayList([]u8) = .empty;
-        defer {
-            for (waiting.items) |child_id| self.alloc.free(child_id);
-            waiting.deinit(self.alloc);
-        }
-        {
-            self.mutex.lockUncancelable(io_mod.getIo());
-            defer self.mutex.unlock(io_mod.getIo());
-            for (self.slots.items) |slot| {
-                if (slot.completion != .running) continue;
-                // The worker's own flag, read under its lock: the registry's phase is saved only
-                // after the request is registered, so a turn still registering would read as running.
-                const worker = slot.worker orelse continue;
-                if (!worker.permissionWaiting()) continue;
-                const child_id = self.alloc.dupe(u8, slot.child_id) catch continue;
-                waiting.append(self.alloc, child_id) catch {
-                    self.alloc.free(child_id);
-                    continue;
-                };
-            }
-        }
-        for (waiting.items) |child_id| self.stopAndJoin(child_id, .interrupted);
-        return waiting.items.len;
-    }
-
-    /// Ends the running turn of `child_id` and joins its slot: the wait of
-    /// an approval ends too. `.cancelled` keeps an explicit cancellation as
-    /// one, and `.interrupted` ends the work as a quit would.
-    fn stopAndJoin(self: *Owner, child_id: []const u8, end: enum { cancelled, interrupted }) void {
+    /// Cancels the running turn of `child_id` and joins its slot: the wait of
+    /// an approval ends too.
+    fn stopAndJoin(self: *Owner, child_id: []const u8) void {
         const slot = blk: {
             self.mutex.lockUncancelable(io_mod.getIo());
             defer self.mutex.unlock(io_mod.getIo());
@@ -872,8 +840,6 @@ pub const Owner = struct {
                 if (!std.mem.eql(u8, candidate.child_id, child_id)) continue;
                 if (candidate.completion == .running) {
                     candidate.cancel.store(true, .seq_cst);
-                    if (end == .interrupted) candidate.shutdown.store(true, .seq_cst);
-                    // Stop approval waits without changing explicit cancellation to interruption.
                     stopTurn(candidate, .shutdown);
                 }
                 candidate.waiters += 1;
@@ -2014,22 +1980,16 @@ fn debugFailure(child_id: []const u8, stage: []const u8, err: anyerror) void {
 }
 
 test "managed owner cancellation join wakes pending permission" {
-    try testCancellationJoin(.pending, .cancel);
+    try testCancellationJoin(.pending);
 }
 
 test "managed owner cancellation join stops late permission registration" {
-    try testCancellationJoin(.before_permission, .cancel);
+    try testCancellationJoin(.before_permission);
 }
 
 test "managed owner cancellation join reaches worker attached after cancellation" {
-    try testCancellationJoin(.before_attachment, .cancel);
+    try testCancellationJoin(.before_attachment);
 }
-
-test "managed owner interrupts a turn that waits on an approval, which ends the work interrupted" {
-    try testCancellationJoin(.pending, .interrupt);
-}
-
-const JoinEnd = enum { cancel, interrupt };
 
 const CancellationJoinTest = struct {
     owner: *Owner,
@@ -2043,12 +2003,10 @@ const CancellationJoinTest = struct {
     turn: ?*execution.TurnContext = null,
     request_id: u64 = 0,
     decision: ?types.ToolPermissionDecision = null,
+    /// The wait ended because the worker was stopped.
+    stopped: bool = false,
     effects: usize = 0,
     commits: usize = 0,
-    /// Which call ends the turn: the parent's cancel, or the interruption
-    /// of the turns that wait on an approval.
-    end: JoinEnd = .cancel,
-    interrupted: usize = 0,
 
     fn childMain(self: *@This()) void {
         self.start.waitUncancelable(io_mod.getIo());
@@ -2056,10 +2014,7 @@ const CancellationJoinTest = struct {
     }
 
     fn joinMain(self: *@This()) void {
-        switch (self.end) {
-            .cancel => self.owner.cancelAndJoin("child"),
-            .interrupt => self.interrupted = self.owner.interruptApprovalWaits(),
-        }
+        self.owner.cancelAndJoin("child");
     }
 
     fn capture(_: ?*anyopaque, alloc: Allocator, request: execution.CaptureRequest) execution.ServiceError!domain.AdmissionSnapshot {
@@ -2089,7 +2044,14 @@ const CancellationJoinTest = struct {
             .{ .label = "review child action" },
             null,
             .{ .context = self, .observe_fn = observe },
-        ) catch return error.ProviderFailed;
+        ) catch |err| {
+            // A wait the stop ended is no decision: the person did not refuse.
+            if (err == error.PermissionPromptStopped) {
+                self.stopped = true;
+                return error.Cancelled;
+            }
+            return error.ProviderFailed;
+        };
         defer response.deinit();
         self.decision = response.decision;
         if (cancel.load(.seq_cst) or worker.isCancelRequested()) return error.Cancelled;
@@ -2128,7 +2090,7 @@ const CancellationJoinTest = struct {
     }
 };
 
-fn testCancellationJoin(timing: enum { pending, before_permission, before_attachment }, end: JoinEnd) !void {
+fn testCancellationJoin(timing: enum { pending, before_permission, before_attachment }) !void {
     const alloc = std.testing.allocator;
     var parent: child_state.TestParent = undefined;
     try parent.init(alloc);
@@ -2158,7 +2120,7 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
     const slot = try alloc.create(Slot);
     slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, "child") };
     try owner.slots.append(alloc, slot);
-    var fixture = CancellationJoinTest{ .owner = &owner, .slot = slot, .end = end };
+    var fixture = CancellationJoinTest{ .owner = &owner, .slot = slot };
     owner.services = .{ .context = &fixture, .capture_fn = CancellationJoinTest.capture, .run_fn = CancellationJoinTest.run };
     slot.thread = try std.Thread.spawn(.{}, CancellationJoinTest.childMain, .{&fixture});
     // Release every gate and stop the real worker even when an assertion fails.
@@ -2209,7 +2171,9 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
             try CancellationJoinTest.wait(&fixture.returned);
             break :blk true;
         };
-        try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), fixture.decision);
+        // The stop ends the wait as a refusal that says so, never as a denial.
+        try std.testing.expect(fixture.stopped);
+        try std.testing.expect(fixture.decision == null);
         for ([_]types.ToolPermissionDecision{ .once, .deny }) |decision| {
             try std.testing.expectEqual(worker_runtime.PermissionSubmissionResult.no_pending, try route.submit_fn(
                 route.context,
@@ -2219,7 +2183,7 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
             ));
         }
         try std.testing.expectEqual(@as(usize, 0), fixture.commits);
-        try std.testing.expectEqual(end == .interrupt, slot.shutdown.load(.seq_cst));
+        try std.testing.expectEqual(false, slot.shutdown.load(.seq_cst));
         fixture.finish.set(io_mod.getIo());
         // Detach invalidates the approval, but cannot release the worker while pinned.
         for (0..1000) |_| {
@@ -2235,8 +2199,7 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
     try std.testing.expectEqual(@as(usize, 0), fixture.effects);
     try std.testing.expectEqual(@as(usize, 0), owner.slots.items.len);
     const observation = try owner.observe("child");
-    try std.testing.expectEqual(if (end == .interrupt) child_state.Outcome.interrupted else child_state.Outcome.cancelled, observation.outcome.?);
-    try std.testing.expectEqual(if (end == .interrupt) @as(usize, 1) else 0, fixture.interrupted);
+    try std.testing.expectEqual(child_state.Outcome.cancelled, observation.outcome.?);
     try std.testing.expect(observation.failure == null);
     var pending = try approvals.firstPendingRequest(alloc, "parent");
     defer if (pending) |*request| request.deinit(alloc);
