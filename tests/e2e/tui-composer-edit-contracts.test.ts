@@ -1423,3 +1423,128 @@ test(
   },
   TIMEOUT,
 );
+
+function sendPasteEventListing(passwordBase64: string, mimes: string): void {
+  writeToFx(`\x1b]5522;type=read:status=OK:pw=${passwordBase64}\x1b\\`);
+  writeToFx(`\x1b]5522;type=read:status=DATA:mime=Lg==;${Buffer.from(mimes).toString("base64")}\x1b\\`);
+  writeToFx("\x1b]5522;type=read:status=DONE\x1b\\");
+}
+
+test(
+  "kitty paste event enables mode 5522 on startup and disables it on exit",
+  async () => {
+    await startFxOnPty();
+    expect(ptyOutput).toContain("\x1b[?5522h");
+
+    const beforeExit = ptyOutput.length;
+    writeToFx("\x03");
+    await waitForOutput(
+      () => visibleText(ptyOutput.slice(beforeExit)).includes("press ctrl+c again to exit"),
+      "the ctrl+c exit prompt",
+    );
+    writeToFx("\x03");
+    await ptyFx!.exited;
+
+    expect(ptyFx!.exitCode).toBe(0);
+    expect(ptyOutput.slice(beforeExit)).toContain("\x1b[?5522l");
+  },
+  TIMEOUT,
+);
+
+test(
+  "kitty paste event reads text/plain with password and pastes into composer",
+  async () => {
+    await startFxOnPty();
+    const beforeListing = ptyOutput.length;
+    sendPasteEventListing("c2VjcmV0MTIz", "text/plain");
+
+    const expectedRead = "\x1b]5522;type=read:pw=c2VjcmV0MTIz:name=UGFzdGUgZXZlbnQ=;dGV4dC9wbGFpbg==\x1b\\";
+    await waitForOutput(
+      () => ptyOutput.slice(beforeListing).includes(expectedRead),
+      "the paste event text read request",
+    );
+
+    const beforeReply = ptyOutput.length;
+    writeToFx("\x1b]5522;type=read:status=OK\x1b\\");
+    writeToFx(
+      `\x1b]5522;type=read:status=DATA:mime=dGV4dC9wbGFpbg==;${Buffer.from("hello from a paste event").toString("base64")}\x1b\\`,
+    );
+    writeToFx("\x1b]5522;type=read:status=DONE\x1b\\");
+    await waitForOutput(
+      () => visibleText(ptyOutput.slice(beforeReply)).includes("hello from a paste event"),
+      "the pasted text in the composer",
+    );
+
+    const screen = visibleText(ptyOutput.slice(beforeListing));
+    expect(screen).not.toContain("status=");
+    expect(screen).not.toContain("secret123");
+    expect(screen).not.toContain("c2VjcmV0MTIz");
+    expect(ptyFx!.exitCode).toBeNull();
+  },
+  TIMEOUT,
+);
+
+test(
+  "kitty paste event reads image/png when only image/png is listed",
+  async () => {
+    await startFxOnPty();
+    const beforeListing = ptyOutput.length;
+    sendPasteEventListing("c2VjcmV0MTIz", "image/png");
+
+    const expectedRead = "\x1b]5522;type=read:pw=c2VjcmV0MTIz:name=UGFzdGUgZXZlbnQ=;aW1hZ2UvcG5n\x1b\\";
+    await waitForOutput(
+      () => ptyOutput.slice(beforeListing).includes(expectedRead),
+      "the paste event image read request",
+    );
+
+    const beforeReply = ptyOutput.length;
+    writeToFx("\x1b]5522;type=read:status=OK\x1b\\");
+    writeToFx(`\x1b]5522;type=read:status=DATA:mime=aW1hZ2UvcG5n;${ONE_PIXEL_PNG_BASE64}\x1b\\`);
+    writeToFx("\x1b]5522;type=read:status=DONE\x1b\\");
+    await waitForOutput(
+      () => visibleText(ptyOutput.slice(beforeReply)).includes("[Image 1]"),
+      "the pasted image badge",
+    );
+
+    const screen = visibleText(ptyOutput.slice(beforeListing));
+    expect(screen).not.toContain("status=");
+    expect(screen).not.toContain(ONE_PIXEL_PNG_BASE64.slice(0, 16));
+    expect(ptyFx!.exitCode).toBeNull();
+  },
+  TIMEOUT,
+);
+
+test(
+  "kitty paste event EPERM disables mode 5522, shows notice, and leaves bracketed paste working",
+  async () => {
+    await startFxOnPty();
+    const beforeListing = ptyOutput.length;
+    sendPasteEventListing("c2VjcmV0MTIz", "text/plain");
+
+    const expectedRead = "\x1b]5522;type=read:pw=c2VjcmV0MTIz:name=UGFzdGUgZXZlbnQ=;dGV4dC9wbGFpbg==\x1b\\";
+    await waitForOutput(
+      () => ptyOutput.slice(beforeListing).includes(expectedRead),
+      "the paste event text read request",
+    );
+
+    const beforeDenial = ptyOutput.length;
+    writeToFx("\x1b]5522;type=read:status=EPERM\x1b\\");
+    await waitForOutput(
+      () =>
+        ptyOutput.slice(beforeDenial).includes("\x1b[?5522l") &&
+        visibleText(ptyOutput.slice(beforeDenial)).includes(
+          "The terminal blocked fx from reading the clipboard, so fx turned off paste events. Paste again.",
+        ),
+      "paste events disable and denial notice",
+    );
+
+    const beforeBracketed = ptyOutput.length;
+    writeToFx("\x1b[200~after\x1b[201~");
+    await waitForOutput(
+      () => visibleText(ptyOutput.slice(beforeBracketed)).includes("after"),
+      "bracketed paste after denial",
+    );
+    expect(ptyFx!.exitCode).toBeNull();
+  },
+  TIMEOUT,
+);
