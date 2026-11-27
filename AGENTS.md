@@ -467,7 +467,7 @@ To prepare a release:
 3. Write the changelog entry in `CHANGELOG.md` at the top, under a new `## <version>` heading, wrapped in `<!-- release:start -->` and `<!-- release:end -->` markers. Remove the markers from the previous release entry so only the new release has them.
 4. Open a PR and merge to `main`
 
-When the PR merges, CI compares the version tag to what exists in git. If the tag is missing, it builds all platform binaries, creates the git tag, and publishes a GitHub Release with the binaries attached. The release body is extracted from the content between the `<!-- release:start -->` and `<!-- release:end -->` markers in `CHANGELOG.md`.
+When the PR merges, CI compares the version tag to what exists in git. If the tag is missing, it builds all platform binaries, creates the git tag, and publishes a GitHub Release with the binaries attached. Only the push that changes the version starts a release. To retry a failed release after a fix, run the Release workflow on `main` by hand with `validate_only` off. The release body is extracted from the content between the `<!-- release:start -->` and `<!-- release:end -->` markers in `CHANGELOG.md`.
 
 ### Writing the changelog
 

@@ -328,7 +328,7 @@ For example:
 
 ## Releases
 
-Maintainers prepare each release in a pull request that bumps `pub const version` in `src/main.zig` and adds the new entry to `CHANGELOG.md`. When that pull request merges, the release workflow finds no tag for the new version, builds the binaries for every platform, creates the tag, and publishes the GitHub Release along with the binaries that the install script and `fx upgrade` download. Never create a version tag by hand. The [Releasing](AGENTS.md#releasing) section of AGENTS.md describes the changelog format and release markers.
+Maintainers prepare each release in a pull request that bumps `pub const version` in `src/main.zig` and adds the new entry to `CHANGELOG.md`. When that pull request merges, the release workflow finds no tag for the new version, builds the binaries for every platform, creates the tag, and publishes the GitHub Release along with the binaries that the install script and `fx upgrade` download. Later pushes to `main` under the same version don't start a release. If a release fails and needs a fix, merge the fix, then run **Actions > Release** on `main` with `validate_only` off. Never create a version tag by hand. The [Releasing](AGENTS.md#releasing) section of AGENTS.md describes the changelog format and release markers.
 
 To check release artifacts without publishing anything, run **Actions > Release** on `main` with `validate_only` enabled. The run builds every target, runs the PGSO qualification, and notarizes the macOS binaries. It creates no tag or GitHub Release, uploads nothing to the CDN, and changes no update channel.
 
