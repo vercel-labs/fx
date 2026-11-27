@@ -533,18 +533,7 @@ pub fn composeHintRow(
     else
         null;
     var hint_buf: [max_status_line_len]u8 = undefined;
-    const base_hint_line = ui_render.buildHintLine(
-        approval_active,
-        ctx.has_api_key or (ctx.auth_picker.active and ctx.auth_picker.include_skip),
-        ctx.model,
-        ctx.permission_mode,
-        ctx.fast_indicator_active,
-        ctx.effort,
-        ctx.model_supports_effort,
-        ctx.statusline,
-        width,
-        &hint_buf,
-    );
+    const base_hint_line = buildModelHintLine(approval_active, ctx, width, &hint_buf);
     var hint_line = if (question_hint) |hint|
         hint
     else if (ctx.ctrl_c_pending)
@@ -553,6 +542,7 @@ pub fn composeHintRow(
         hint
     else
         base_hint_line;
+    var hint_is_model_line = question_hint == null and !ctx.ctrl_c_pending and auth_hint == null;
 
     const width_usize: usize = width;
     const danger_text = dangerStatusText(approval_active, ctx, width);
@@ -573,7 +563,10 @@ pub fn composeHintRow(
                 break;
             }
         }
-        if (esc_interrupt_hint.len == 0) hint_line = "esc esc to interrupt";
+        if (esc_interrupt_hint.len == 0) {
+            hint_line = "esc esc to interrupt";
+            hint_is_model_line = false;
+        }
     }
     // The agent indicator, such as "fx 2/3 ↓", follows whatever status
     // shows on the right, as in "fx 3 finished · fx 1/3 ↓".
@@ -596,44 +589,95 @@ pub fn composeHintRow(
     // freeform draft mid-question uses the same double-Esc contract as the
     // composer and needs the same cue. The armed interrupt indicator outranks
     // both: it guards an irreversible cancel of active work.
-    const right_text: []const u8 = if (ctx.esc_interrupt_armed)
-        esc_interrupt_hint
+    const right: HintRowRight = if (ctx.esc_interrupt_armed)
+        .{ .text = esc_interrupt_hint, .kind = .cue }
     else if (ctx.esc_clear_armed)
-        "esc again to clear"
+        .{ .text = "esc again to clear", .kind = .cue }
     else if (question_hint != null)
-        ""
+        .{ .text = "", .kind = .cue }
     else if (danger_text.len > 0)
-        danger_text
+        .{ .text = danger_text, .kind = .warning }
     else
-        indicated_text;
-    const right_width = display_width.visibleWidth(right_text);
-    const danger_visible = danger_text.len > 0 and right_text.ptr == danger_text.ptr;
-    const left_width: u16 = if (!danger_visible and right_width > 0 and width_usize > right_width)
-        @intCast(width_usize - right_width - 1)
-    else
-        width;
+        .{ .text = indicated_text, .kind = .status };
+    const right_width = display_width.visibleWidth(right.text);
+    var right_shown = right_width > 0 and switch (right.kind) {
+        .warning => width_usize >= right_width,
+        .cue, .status => width_usize > right_width,
+    };
+    // The right text keeps one blank column before it, and the left hint gets
+    // the rest. The model line is built again for that space, so the
+    // permission label and the workspace give way before the model name.
+    var left_text = hint_line;
+    var left_width = width;
+    var beside_buf: [max_status_line_len]u8 = undefined;
+    if (right_shown) {
+        const beside_width: u16 = if (width_usize > right_width) @intCast(width_usize - right_width - 1) else 0;
+        const beside_text = if (hint_is_model_line)
+            buildModelHintLine(approval_active, ctx, beside_width, &beside_buf)
+        else
+            hint_line;
+        const cut_short = beside_width < min_hint_columns and
+            display_width.visibleWidthIgnoringAnsi(beside_text) > beside_width;
+        if (right.kind == .status and cut_short) {
+            right_shown = false;
+        } else {
+            left_text = beside_text;
+            left_width = beside_width;
+        }
+    }
 
+    const left_style = if (question_hint != null) ui_render.dim_style else ui_render.statusline_style;
     var row: std.ArrayList(u8) = .empty;
-    try row.appendSlice(alloc, if (question_hint != null) ui_render.dim_style else ui_render.statusline_style);
-    try row_text.appendClipped(alloc, &row, hint_line, left_width);
+    try row.appendSlice(alloc, left_style);
+    try appendHintCut(alloc, &row, left_text, left_width, left_style);
     try row.appendSlice(alloc, ui_render.reset_style);
 
-    const hint_width = @min(
-        display_width.visibleWidthIgnoringAnsi(hint_line),
-        @as(usize, left_width),
-    );
-    if (right_text.len > 0 and right_width > 0 and
-        ((danger_visible and width_usize >= right_width) or
-            (!danger_visible and width_usize > hint_width + right_width)))
-    {
+    if (right_shown) {
         const tag_col: u16 = @intCast(width_usize - right_width + 1);
         try row_text.appendAbsoluteColumn(alloc, &row, tag_col);
-        try row.appendSlice(alloc, if (danger_visible) ui_render.red_style else ui_render.dim_style);
-        try row.appendSlice(alloc, right_text);
+        try row.appendSlice(alloc, if (right.kind == .warning) ui_render.red_style else ui_render.dim_style);
+        try row.appendSlice(alloc, right.text);
         try row.appendSlice(alloc, ui_render.reset_style);
     }
 
     return row;
+}
+
+/// A status on the right of the hint row gives way when it would leave the
+/// left hint fewer columns than this, unless the hint fits whole, so the model
+/// name never shrinks to a letter or two.
+const min_hint_columns: u16 = 8;
+
+/// The text on the right of the hint row, and how it shares the row: a status
+/// gives way to the left hint, and an esc cue or the red warning never does.
+const HintRowRight = struct {
+    text: []const u8,
+    kind: enum { cue, warning, status },
+};
+
+fn buildModelHintLine(approval_active: bool, ctx: RenderContext, width: u16, out: []u8) []const u8 {
+    return ui_render.buildUncutHintLine(
+        approval_active,
+        ctx.has_api_key or (ctx.auth_picker.active and ctx.auth_picker.include_skip),
+        ctx.model,
+        ctx.permission_mode,
+        ctx.fast_indicator_active,
+        ctx.effort,
+        ctx.model_supports_effort,
+        ctx.statusline,
+        width,
+        out,
+    );
+}
+
+/// Appends `text` cut to `width` columns. A cut ends in "…" in `style`, so a
+/// color that the cut text leaves open does not tint it.
+fn appendHintCut(alloc: Allocator, row: *std.ArrayList(u8), text: []const u8, width: u16, style: []const u8) !void {
+    if (display_width.visibleWidthIgnoringAnsi(text) <= width) return row_text.appendClipped(alloc, row, text, width);
+    if (width == 0) return;
+    try row_text.appendClipped(alloc, row, text, width - 1);
+    try row.appendSlice(alloc, style);
+    try row.appendSlice(alloc, "…");
 }
 
 pub fn dangerStatusText(
@@ -1890,6 +1934,135 @@ test "compose hint row right-aligns upgrade status after styled auto mode" {
     try std.testing.expect(std.mem.find(u8, row.items, "update ready: ctrl+g to reload") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "\x1b[27G") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 56);
+}
+
+/// Returns the text a hint row paints before it moves to its right-side
+/// text, without styles, written into `buf`.
+fn hintRowLeftText(row: []const u8, buf: []u8) []const u8 {
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < row.len) {
+        if (row[i] == 0x1b) {
+            const end = display_width.ansiSequenceEnd(row, i);
+            if (row[end - 1] == 'G') break;
+            i = end;
+            continue;
+        }
+        buf[len] = row[i];
+        len += 1;
+        i += 1;
+    }
+    return buf[0..len];
+}
+
+/// Returns the column a hint row moves to for its right-side text, or null
+/// when the row has no right-side text.
+fn hintRowRightColumn(row: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < row.len) {
+        if (row[i] == 0x1b) {
+            const end = display_width.ansiSequenceEnd(row, i);
+            if (row[end - 1] == 'G') return std.fmt.parseInt(usize, row[i + 2 .. end - 1], 10) catch null;
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+test "compose hint row drops the permission label before it cuts the model for a status" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var ctx = testRenderContext(&input);
+    ctx.permission_mode = .auto;
+    ctx.upgrade_status = "update ready: ctrl+g to reload";
+
+    var row = try composeHintRow(std.testing.allocator, false, ctx, 40);
+    defer row.deinit(std.testing.allocator);
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("gpt-5.1", hintRowLeftText(row.items, &buf));
+    try std.testing.expectEqual(@as(?usize, 11), hintRowRightColumn(row.items));
+    try std.testing.expect(std.mem.find(u8, row.items, "update ready: ctrl+g to reload") != null);
+}
+
+test "compose hint row ends a model name cut for a status in an ellipsis" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var ctx = testRenderContext(&input);
+    ctx.model = "openai/gpt-6-astra";
+    ctx.upgrade_status = "update ready: ctrl+g to reload";
+    var buf: [256]u8 = undefined;
+
+    var row = try composeHintRow(std.testing.allocator, false, ctx, 40);
+    defer row.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("gpt-6-as…", hintRowLeftText(row.items, &buf));
+    try std.testing.expectEqual(@as(?usize, 11), hintRowRightColumn(row.items));
+
+    var narrower = try composeHintRow(std.testing.allocator, false, ctx, 39);
+    defer narrower.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("gpt-6-a…", hintRowLeftText(narrower.items, &buf));
+    try std.testing.expectEqual(@as(?usize, 10), hintRowRightColumn(narrower.items));
+}
+
+test "compose hint row hides a status that leaves the model fewer than eight columns" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var ctx = testRenderContext(&input);
+    ctx.upgrade_status = "update ready: ctrl+g to reload";
+    var buf: [256]u8 = undefined;
+
+    // Seven columns hold "gpt-5.1" whole, so the status stays.
+    var whole = try composeHintRow(std.testing.allocator, false, ctx, 38);
+    defer whole.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("gpt-5.1", hintRowLeftText(whole.items, &buf));
+    try std.testing.expectEqual(@as(?usize, 9), hintRowRightColumn(whole.items));
+
+    for ([_]u16{ 37, 32 }) |width| {
+        var row = try composeHintRow(std.testing.allocator, false, ctx, width);
+        defer row.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("ask · gpt-5.1", hintRowLeftText(row.items, &buf));
+        try std.testing.expectEqual(@as(?usize, null), hintRowRightColumn(row.items));
+        try std.testing.expect(std.mem.find(u8, row.items, "update ready") == null);
+    }
+
+    ctx.model = "openai/gpt-6-astra";
+    var long_model = try composeHintRow(std.testing.allocator, false, ctx, 38);
+    defer long_model.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ask · gpt-6-astra", hintRowLeftText(long_model.items, &buf));
+    try std.testing.expect(std.mem.find(u8, long_model.items, "update ready") == null);
+}
+
+test "compose hint row keeps the red warning and the esc cue beside a cut model" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var buf: [256]u8 = undefined;
+
+    var danger_ctx = testRenderContext(&input);
+    danger_ctx.permission_mode = .yolo;
+    danger_ctx.danger_status = "Full access enabled: fx permission checks disabled";
+    danger_ctx.danger_status_compact = "Full access";
+
+    var danger = try composeHintRow(std.testing.allocator, false, danger_ctx, 60);
+    defer danger.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("gpt-5.1", hintRowLeftText(danger.items, &buf));
+    try std.testing.expectEqual(@as(?usize, 11), hintRowRightColumn(danger.items));
+    try std.testing.expect(std.mem.find(u8, danger.items, danger_ctx.danger_status) != null);
+
+    // The warning never gives way, even when it leaves one column.
+    var tight = try composeHintRow(std.testing.allocator, false, danger_ctx, 52);
+    defer tight.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("…", hintRowLeftText(tight.items, &buf));
+    try std.testing.expectEqual(@as(?usize, 3), hintRowRightColumn(tight.items));
+    try std.testing.expect(std.mem.find(u8, tight.items, danger_ctx.danger_status) != null);
+
+    var cue_ctx = testRenderContext(&input);
+    cue_ctx.esc_clear_armed = true;
+    var cue = try composeHintRow(std.testing.allocator, false, cue_ctx, 24);
+    defer cue.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("gpt-…", hintRowLeftText(cue.items, &buf));
+    try std.testing.expectEqual(@as(?usize, 7), hintRowRightColumn(cue.items));
+    try std.testing.expect(std.mem.find(u8, cue.items, "esc again to clear") != null);
 }
 
 test "compose hint row prioritizes red yolo warning with compact fallback" {

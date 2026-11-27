@@ -510,6 +510,36 @@ pub fn buildHintLine(
     width: u16,
     out: []u8,
 ) []const u8 {
+    const line = buildUncutHintLine(
+        awaiting_permission,
+        has_api_key,
+        model,
+        permission_mode,
+        fast_indicator_active,
+        effort,
+        model_supports_effort,
+        statusline,
+        width,
+        out,
+    );
+    if (width == 0) return "";
+    return display_width.prefixByWidthIgnoringAnsi(line, width);
+}
+
+/// Builds the hint line from the segments that suit `width` columns, but does
+/// not cut it to `width`, so a caller that cuts it can mark the cut.
+pub fn buildUncutHintLine(
+    awaiting_permission: bool,
+    has_api_key: bool,
+    model: []const u8,
+    permission_mode: types.PermissionMode,
+    fast_indicator_active: bool,
+    effort: types.ReasoningEffort,
+    model_supports_effort: bool,
+    statusline: StatuslineItems,
+    width: u16,
+    out: []u8,
+) []const u8 {
     var model_buf: [96]u8 = undefined;
     const model_label = compactModelLabel(model, &model_buf);
     var permission_buf: [64]u8 = undefined;
@@ -524,10 +554,7 @@ pub fn buildHintLine(
         appendStatusSegment(out, &end, permission_label);
     }
     appendSessionStatusSegments(out, &end, status_limit, model, effort, model_supports_effort, fast_indicator_active, statusline);
-
-    const width_usize: usize = width;
-    if (width_usize == 0) return "";
-    return display_width.prefixByWidthIgnoringAnsi(out[0..end], width_usize);
+    return out[0..end];
 }
 
 pub fn buildInputLine(input: []const u8, cursor: usize, width: u16, out: []u8) InputLineView {
