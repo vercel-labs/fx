@@ -6,6 +6,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const image_attachments = @import("../images/image_attachments.zig");
+const image_commands = @import("../images/image_commands.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const gesture_state = @import("../input/gesture_state.zig");
 const input_limit_rejection = @import("../input/input_limit_rejection.zig");
@@ -373,7 +374,16 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         pub fn finalizePastedBlock(app: *App, agent: *AppAgent, max_input_len: usize) !void {
-            if (app.input_runtime.paste.buffer.items.len == 0) return;
+            if (app.input_runtime.paste.buffer.items.len == 0) {
+                // xterm.js terminals send an empty paste for Cmd+V when the clipboard holds only an image.
+                if (modelPickerBorrowsComposer(app)) {
+                    debug_trace.logf("input", "composer paste empty action=none reason=model_picker_borrows_composer", .{});
+                    return;
+                }
+                debug_trace.logf("input", "composer paste empty action=clipboard_image", .{});
+                try image_commands.Commands(App).attachClipboard(app);
+                return;
+            }
 
             // Inline image paths create pending attachments, not pasted-text blocks.
             if (image_attachments.hasImagePathToken(app.input_runtime.paste.buffer.items)) {
@@ -449,6 +459,52 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 app.input_runtime.historyBoundary(app.alloc);
             }
             app.input_runtime.paste.buffer.clearRetainingCapacity();
+        }
+
+        /// Pastes clipboard text the way a composer paste lands, for Ctrl+V with no
+        /// clipboard image. A bracketed paste that is still open owns the buffer,
+        /// so the text is dropped instead.
+        pub fn insertClipboardText(app: *App, agent: *AppAgent, text: []const u8, max_input_len: usize) !void {
+            if (app.input_runtime.paste.owner != .none) {
+                debug_trace.logf("input", "clipboard text dropped bytes={d} reason=paste_in_progress", .{text.len});
+                return;
+            }
+            if (text.len == 0) return;
+
+            const buffer = &app.input_runtime.paste.buffer;
+            buffer.clearRetainingCapacity();
+            defer buffer.clearRetainingCapacity();
+            var dropped_bytes: usize = 0;
+            for (text) |byte| {
+                if (paste_framing.acceptsPastedByte(.composer, byte)) {
+                    try buffer.append(app.alloc, byte);
+                } else {
+                    dropped_bytes += 1;
+                }
+            }
+            if (dropped_bytes > 0) {
+                debug_trace.logf("input", "clipboard text filtered dropped_bytes={d}", .{dropped_bytes});
+            }
+            const normalized = text_utils.normalizeLineEndingsInPlace(buffer.items);
+            buffer.items.len = normalized.len;
+
+            // An empty buffer must not reach finalizePastedBlock, which would attach a clipboard image.
+            if (buffer.items.len == 0 or !text_utils.isModelSafeText(buffer.items)) {
+                debug_trace.logf("input", "clipboard text dropped bytes={d} reason=unsafe_bytes", .{buffer.items.len});
+                app.shell.render_requests.request(.footer);
+                try app.writeDomainNotice(.{
+                    .topic = "input",
+                    .tone = .@"error",
+                    .body = "Pasted text contains unsupported bytes and was not added to the draft.",
+                }, true);
+                return;
+            }
+
+            finalizePastedBlock(app, agent, max_input_len) catch |err| {
+                debug_trace.logf("input", "clipboard text dropped bytes={d} reason=finalize_failed error={s}", .{ buffer.items.len, @errorName(err) });
+                return err;
+            };
+            app.shell.render_requests.request(.footer);
         }
 
         pub fn handlePastedBytes(app: *App, agent: *AppAgent, bytes: []const u8, max_input_len: usize) !void {

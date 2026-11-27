@@ -2845,8 +2845,8 @@ const App = struct {
         return app_process_runtime.Runtime(App).formatToolExecutionError(arena, tool_name, err);
     }
 
-    pub fn appendRuntimeContextMessage(self: *App, agent: *agents.Agent, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
-        try AgentAppRuntime.appendTransientRuntimeContextMessage(self, agent, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    pub fn appendRuntimeContextMessage(self: *App, agent: *agents.Agent, arena: Allocator, model: []const u8, messages: *std.ArrayList(ChatMessage)) !void {
+        try AgentAppRuntime.appendTransientRuntimeContextMessage(self, agent, arena, model, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
     pub fn appendStaticContextMessage(self: *App, agent: *agents.Agent, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {

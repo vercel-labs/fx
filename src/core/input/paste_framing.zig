@@ -67,6 +67,19 @@ const Finish = struct {
     dropped_suffix_bytes: usize,
 };
 
+/// Whether a paste owned by `owner` keeps `byte`. Other bytes are dropped
+/// silently, so every paste path shares one rule for control bytes.
+pub fn acceptsPastedByte(owner: Owner, byte: u8) bool {
+    const is_printable = byte >= 32 and byte != 127;
+    return switch (owner) {
+        .composer => byte == '\r' or byte == '\n' or byte == '\t' or is_printable,
+        .question_freeform => byte == '\r' or byte == '\n' or is_printable,
+        .approval_amendment => byte == '\r' or byte == '\n' or byte == '\t' or is_printable,
+        .auth_code => is_printable,
+        .none, .decision_prompt => false,
+    };
+}
+
 pub const State = struct {
     owner: Owner = .none,
     boundary: BoundaryState = .capturing,
@@ -119,15 +132,7 @@ pub const State = struct {
                     ' '
                 else
                     byte;
-                const is_printable = captured_byte >= 32 and captured_byte != 127;
-                const accepts_byte = switch (self.owner) {
-                    .composer => captured_byte == '\r' or captured_byte == '\n' or captured_byte == '\t' or is_printable,
-                    .question_freeform => captured_byte == '\r' or captured_byte == '\n' or is_printable,
-                    .approval_amendment => captured_byte == '\r' or captured_byte == '\n' or captured_byte == '\t' or is_printable,
-                    .auth_code => is_printable,
-                    .none, .decision_prompt => false,
-                };
-                if (accepts_byte) {
+                if (acceptsPastedByte(self.owner, captured_byte)) {
                     if (self.buffer.items.len < self.buffer_limit) {
                         try self.buffer.append(alloc, captured_byte);
                     } else {

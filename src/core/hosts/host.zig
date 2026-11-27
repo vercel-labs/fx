@@ -204,6 +204,10 @@ fn copy_file_unavailable(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) Cl
     return false;
 }
 
+fn read_text_unavailable(_: ?*anyopaque, _: std.mem.Allocator) ClipboardError!?[]u8 {
+    return null;
+}
+
 pub const Clipboard = struct {
     context: ?*anyopaque = null,
     copy_fn: *const fn (
@@ -215,6 +219,10 @@ pub const Clipboard = struct {
         std.mem.Allocator,
         []const u8,
     ) ClipboardError!bool = copy_file_unavailable,
+    read_text_fn: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+    ) ClipboardError!?[]u8 = read_text_unavailable,
 
     /// Borrows `text` for this call. The caller retains ownership. Returns
     /// `false` when the host has no clipboard implementation.
@@ -233,6 +241,15 @@ pub const Clipboard = struct {
         path: []const u8,
     ) ClipboardError!bool {
         return self.copy_file_fn(self.context, alloc, path);
+    }
+
+    /// Returns clipboard text owned by the caller, or null when the host has no
+    /// clipboard reader or the read fails.
+    pub fn readText(
+        self: Clipboard,
+        alloc: std.mem.Allocator,
+    ) ClipboardError!?[]u8 {
+        return self.read_text_fn(self.context, alloc);
     }
 };
 
