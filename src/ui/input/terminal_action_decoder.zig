@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const input_action = @import("../../core/input/input_action.zig");
+const shortcut_rules = @import("../../core/shortcuts/shortcuts.zig");
 const escape_parser = @import("escape_parser.zig");
 const shortcuts = @import("shortcuts.zig");
 
@@ -26,10 +27,32 @@ pub const Decoder = struct {
         return self.stage != 0;
     }
 
+    /// Decodes one byte the terminal sent. The result carries the chord the
+    /// byte names, next to its unchanged event.
     pub fn feed(
         self: *Decoder,
         byte: u8,
         context: input_action.TerminalDecodeContext,
+    ) input_action.TerminalInputIngress {
+        return self.feedWith(byte, context, true);
+    }
+
+    /// Decodes a byte that core replays after routing a `remapped_byte`. The
+    /// original report already named its chord, so the replay names none, and
+    /// a personal shortcut cannot fire twice for one key press.
+    pub fn feedReplay(
+        self: *Decoder,
+        byte: u8,
+        context: input_action.TerminalDecodeContext,
+    ) input_action.TerminalInputIngress {
+        return self.feedWith(byte, context, false);
+    }
+
+    fn feedWith(
+        self: *Decoder,
+        byte: u8,
+        context: input_action.TerminalDecodeContext,
+        names_chord: bool,
     ) input_action.TerminalInputIngress {
         var ingress = input_action.TerminalInputIngress{
             .interrupts_pending_text = byte < 0x80 and !context.paste_active,
@@ -73,13 +96,16 @@ pub const Decoder = struct {
 
         if (self.stage != 0) {
             const prior_stage = self.stage;
-            const action = escape_parser.consumeInputEscapeByteWithMouse(
+            var report_chord: ?shortcut_rules.Chord = null;
+            const action = escape_parser.consumeKeyReport(
                 &self.stage,
                 &self.param,
                 &self.param2,
                 &self.mouse,
                 byte,
+                &report_chord,
             );
+            const chord = if (names_chord) report_chord else null;
 
             if (byte == 0x1b and !escape_parser.isLegacyX10PayloadStage(prior_stage)) {
                 self.started_ms = context.now_ms;
@@ -95,30 +121,31 @@ pub const Decoder = struct {
                 shouldReplayControlAfterBareEscape(byte))
             {
                 const was_cancel_pending = self.takeCancelPending();
-                appendAction(&ingress, .escape, was_cancel_pending);
+                appendAction(&ingress, .escape, was_cancel_pending, null);
                 ingress.replay_byte_after_routing = byte;
                 return ingress;
             }
 
             if (action) |resolved| {
                 const was_cancel_pending = self.takeCancelPending();
-                appendAction(&ingress, resolved, was_cancel_pending);
+                appendAction(&ingress, resolved, was_cancel_pending, chord);
                 return ingress;
             }
 
             if (self.stage != 0 or prior_stage != 0) {
                 if (self.stage == 0) {
                     _ = self.takeCancelPending();
-                    appendAction(&ingress, .ignore, false);
+                    appendAction(&ingress, .ignore, false, null);
                 }
                 return ingress;
             }
         }
 
+        const control_chord = if (names_chord) shortcut_rules.fromControlByte(byte) else null;
         if (escape_parser.controlByteFeatureAction(byte)) |resolved| {
-            appendAction(&ingress, resolved, false);
+            appendAction(&ingress, resolved, false, control_chord);
         } else {
-            appendRaw(&ingress, byte);
+            appendRaw(&ingress, byte, control_chord);
         }
         return ingress;
     }
@@ -179,7 +206,7 @@ pub const Decoder = struct {
 
         const was_cancel_pending = self.cancel_pending;
         self.reset();
-        appendAction(&ingress, .escape, was_cancel_pending);
+        appendAction(&ingress, .escape, was_cancel_pending, null);
         return ingress;
     }
 
@@ -204,23 +231,30 @@ pub const Decoder = struct {
     }
 };
 
-fn appendRaw(ingress: *input_action.TerminalInputIngress, byte: u8) void {
+fn appendRaw(
+    ingress: *input_action.TerminalInputIngress,
+    byte: u8,
+    chord: ?shortcut_rules.Chord,
+) void {
     ingress.setEvent(.{ .raw = .{
         .byte = byte,
         .composer_shortcut = shortcuts.fromControlByte(byte),
     } });
+    ingress.chord = chord;
 }
 
 fn appendAction(
     ingress: *input_action.TerminalInputIngress,
     action: input_action.Action,
     cancel_pending: bool,
+    chord: ?shortcut_rules.Chord,
 ) void {
     ingress.setEvent(.{ .action = .{
         .action = action,
         .composer_shortcut = shortcuts.fromEscapeAction(action),
         .cancel_pending = cancel_pending,
     } });
+    ingress.chord = chord;
 }
 
 fn shouldReplayControlAfterBareEscape(byte: u8) bool {
@@ -229,6 +263,22 @@ fn shouldReplayControlAfterBareEscape(byte: u8) bool {
         3, 7, 12, 15, 16, 20, 22, 24 => true,
         else => false,
     };
+}
+
+fn feedSequence(
+    decoder: *Decoder,
+    bytes: []const u8,
+    context: input_action.TerminalDecodeContext,
+) input_action.TerminalInputIngress {
+    var ingress = input_action.TerminalInputIngress{};
+    for (bytes) |byte| ingress = decoder.feed(byte, context);
+    return ingress;
+}
+
+fn expectChord(text: []const u8, actual: ?shortcut_rules.Chord) !void {
+    const expected = shortcut_rules.Chord.parse(text) orelse return error.TestBadChordText;
+    try std.testing.expect(actual != null);
+    try std.testing.expect(actual.?.eql(expected));
 }
 
 test "plain byte carries composer fallback without consuming product routing" {
@@ -289,6 +339,7 @@ test "active paste bypasses decoding and preserves pending text ownership" {
     try std.testing.expectEqual(@as(u8, 0x1b), ingress.event.?.paste_byte);
     try std.testing.expect(!ingress.interrupts_pending_text);
     try std.testing.expect(!decoder.hasPending());
+    try std.testing.expect(ingress.chord == null);
 }
 
 test "unknown escape resolves to ignore instead of Escape" {
@@ -342,4 +393,121 @@ test "incomplete CSI expires without producing Escape" {
     const ingress = decoder.flush(31, 30, false);
     try std.testing.expect(ingress.event == null);
     try std.testing.expect(!decoder.hasPending());
+}
+
+test "legacy Alt+m is the Alt chord with its unchanged ignored event, and a doubled Escape names none" {
+    var decoder = Decoder{};
+    const context: input_action.TerminalDecodeContext = .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = false,
+    };
+
+    _ = decoder.feed(0x1b, context);
+    const ingress = decoder.feed('m', context);
+    try std.testing.expectEqual(input_action.Action.ignore, ingress.event.?.action.action);
+    try std.testing.expectEqual(@as(?input_action.ShortcutAction, null), ingress.event.?.action.composer_shortcut);
+    try expectChord("alt+m", ingress.chord);
+    try std.testing.expect(!decoder.hasPending());
+
+    _ = decoder.feed(0x1b, context);
+    _ = decoder.feed(0x1b, context);
+    const doubled = decoder.feed('m', context);
+    try std.testing.expectEqual(input_action.Action.ignore, doubled.event.?.action.action);
+    try std.testing.expect(doubled.chord == null);
+}
+
+test "raw Ctrl+F names Ctrl+F and its event stays the cursor motion" {
+    var decoder = Decoder{};
+    const context: input_action.TerminalDecodeContext = .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = false,
+    };
+    const ingress = decoder.feed(6, context);
+    try std.testing.expectEqual(@as(u8, 6), ingress.event.?.raw.byte);
+    try std.testing.expectEqual(input_action.ShortcutAction{ .move = .{ .kind = .character_right } }, ingress.event.?.raw.composer_shortcut.?);
+    try expectChord("ctrl+f", ingress.chord);
+
+    const replayed = decoder.feedReplay(6, context);
+    try std.testing.expectEqual(@as(u8, 6), replayed.event.?.raw.byte);
+    try std.testing.expect(replayed.chord == null);
+}
+
+test "exact CSI u and modifyOtherKeys Ctrl+F name Ctrl+F and keep remapped_byte 6" {
+    var decoder = Decoder{};
+    const context: input_action.TerminalDecodeContext = .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = false,
+    };
+    const csi_u = feedSequence(&decoder, "\x1b[102;5u", context);
+    try std.testing.expectEqual(input_action.Action{ .remapped_byte = 6 }, csi_u.event.?.action.action);
+    try expectChord("ctrl+f", csi_u.chord);
+
+    const modify_other = feedSequence(&decoder, "\x1b[27;5;102~", context);
+    try std.testing.expectEqual(input_action.Action{ .remapped_byte = 6 }, modify_other.event.?.action.action);
+    try expectChord("ctrl+f", modify_other.chord);
+}
+
+test "near misses of Ctrl+F keep their event and name their own chord" {
+    var decoder = Decoder{};
+    const context: input_action.TerminalDecodeContext = .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = false,
+    };
+    const super_ctrl = feedSequence(&decoder, "\x1b[102;13u", context);
+    try std.testing.expectEqual(input_action.Action{ .remapped_byte = 6 }, super_ctrl.event.?.action.action);
+    try expectChord("ctrl+super+f", super_ctrl.chord);
+
+    const shifted = feedSequence(&decoder, "\x1b[102;6u", context);
+    try expectChord("ctrl+shift+f", shifted.chord);
+
+    const meta = feedSequence(&decoder, "\x1b\x1b[102;5u", context);
+    try std.testing.expect(meta.chord == null);
+
+    const release = feedSequence(&decoder, "\x1b[102;5:3u", context);
+    try std.testing.expectEqual(input_action.Action.ignore, release.event.?.action.action);
+    try std.testing.expect(release.chord == null);
+}
+
+test "Ctrl+digit and key reports with arrows, Shift, and function keys name their chords" {
+    var decoder = Decoder{};
+    const context: input_action.TerminalDecodeContext = .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = false,
+    };
+    const ctrl_one = feedSequence(&decoder, "\x1b[49;5u", context);
+    try std.testing.expectEqual(input_action.Action.ignore, ctrl_one.event.?.action.action);
+    try expectChord("ctrl+1", ctrl_one.chord);
+
+    const shift_left = feedSequence(&decoder, "\x1b[1;2D", context);
+    try expectChord("shift+left", shift_left.chord);
+
+    const ctrl_right = feedSequence(&decoder, "\x1b[1;5C", context);
+    try expectChord("ctrl+right", ctrl_right.chord);
+
+    const ctrl_delete = feedSequence(&decoder, "\x1b[3;5~", context);
+    try expectChord("ctrl+delete", ctrl_delete.chord);
+
+    const ss3_f1 = feedSequence(&decoder, "\x1bOP", context);
+    try expectChord("f1", ss3_f1.chord);
+    try std.testing.expectEqual(input_action.Action.ignore, ss3_f1.event.?.action.action);
+
+    const csi_f5 = feedSequence(&decoder, "\x1b[15~", context);
+    try expectChord("f5", csi_f5.chord);
+}
+
+test "plain typing and Enter name no chord" {
+    var decoder = Decoder{};
+    const context: input_action.TerminalDecodeContext = .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = false,
+    };
+    try std.testing.expect(decoder.feed('f', context).chord == null);
+    try std.testing.expect(decoder.feed(13, context).chord == null);
+    try std.testing.expect(decoder.feed(9, context).chord == null);
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
+const host_target = @import("../hosts/target.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const vision_contracts = @import("../agent/runtime/vision_contracts.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -28,6 +29,7 @@ const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_presentation = @import("tool_presentation.zig");
+const sandbox_policy = @import("../runner/runner.zig");
 const test_builtin_tools = if (builtin.is_test)
     @import("../../builtins/tools.zig")
 else
@@ -38,6 +40,8 @@ const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const current_branch = @import("../workspace/current_branch.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
+const result_store = @import("../session/result_store.zig");
+const session_child_store = @import("../session/session_child_store.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -67,6 +71,36 @@ pub const SessionPermissionStateProvider = struct {
     }
 };
 
+/// The stores a review reads a question's stored answers from: the session's
+/// managed result store first, the legacy tool-result folder second. Both are
+/// borrowed for the admission call.
+pub const ReviewResultStore = struct {
+    capability: ?*session_child_store.SessionChildCapability = null,
+    result_dir: ?[]const u8 = null,
+};
+
+/// The classifier's `read_fn` context: reads one stored answer text whole.
+const ReviewResultReader = struct {
+    store: ReviewResultStore,
+
+    fn readWhole(raw: *anyopaque, alloc: Allocator, handle: []const u8) anyerror![]u8 {
+        const self: *const ReviewResultReader = @ptrCast(@alignCast(raw));
+        if (self.store.capability) |capability| return result_store.readWholeManaged(alloc, capability, handle);
+        const dir = self.store.result_dir orelse return error.ResultHandleNotFound;
+        return result_store.readWhole(alloc, dir, handle);
+    }
+};
+
+/// The stored-answers reader for one review, or null when no store exists.
+/// The reader lives in `arena`, which lasts as long as the review request.
+fn storedResultsFor(input: Input, arena: Allocator) !?permission_auto_classifier.StoredResults {
+    const store = input.review_result_store orelse return null;
+    if (store.capability == null and store.result_dir == null) return null;
+    const reader = try arena.create(ReviewResultReader);
+    reader.* = .{ .store = store };
+    return .{ .context = reader, .read_fn = ReviewResultReader.readWhole };
+}
+
 /// Borrowed capabilities required for permission admission. The leaf never
 /// owns, persists, or extends any referenced runtime state.
 pub const Input = struct {
@@ -86,7 +120,13 @@ pub const Input = struct {
     context_limits: context_limits.Values = .{},
     auto_classifier: permission_auto_classifier.Classifier = .disabled(),
     terminal_review_context: ?terminal_managed_observer.Context = null,
+    /// Where a review reads a question's stored answers by handle. Null when
+    /// the session has no result store.
+    review_result_store: ?ReviewResultStore = null,
     host_sandbox_default: HostSandboxDefault = .none,
+    /// The sandbox policy for shell commands. Null when sandbox execution is
+    /// off, and then every command runs here, as before.
+    sandbox_policy: ?*const sandbox_policy.Policy = null,
 };
 
 fn registeredTool(input: Input, name: []const u8) ?*const tool_dispatch.Tool {
@@ -120,6 +160,7 @@ fn registeredTerminalCallReadsOnly(
         .allocator = arena,
         .workspace_root = input.workspace_root,
         .access_scope = input.access_scope,
+        .sandbox_policy = input.sandbox_policy,
     };
     const decoded = try tool.decode(decode_ctx, call.arguments_json);
     return switch (decoded) {
@@ -802,6 +843,7 @@ fn reviewRequestForCall(
         .prior_tool_results = prior_tool_results,
         .targets = targets,
         .action = action,
+        .stored_results = try storedResultsFor(input, arena),
     };
 }
 
@@ -1492,6 +1534,10 @@ fn requestPermissionOutcomeResolved(
     }
     const is_mcp_tool = isAvailableDynamicTool(input, call.name);
     const command_call = try isRunCommandCall(input, arena, call);
+    // A refusal comes before any permission step, so nothing is asked and nothing runs.
+    if (command_call) {
+        if (try commandCallRefusal(input, arena, call)) |text| return .{ .tool_failure = text };
+    }
     if (!toolHasPermissionContract(input, call.name) and
         !is_mcp_tool and
         !command_call)
@@ -2308,6 +2354,20 @@ const unsafe_git_hold_output =
     "names turned off, and plain git could start them. Inspect files with read_file, glob_files or grep_files, " ++
     "or ask the user to run git themselves.";
 
+/// Where a shell run is placed before execution, or null when the call is not
+/// a shell run or cannot be placed now.
+pub fn runCommandPlacement(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+) Allocator.Error!?types.CommandPlacement {
+    const context = runCommandContext(input, arena, call) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    return context.placement;
+}
+
 pub fn runCommandContext(
     input: Input,
     arena: Allocator,
@@ -2333,13 +2393,232 @@ pub fn runCommandContext(
         .workspace_clean => .workspace_clean,
         .native => try nativeCommandEnvironment(arena, args, execution_mode),
     };
+    var refusal: sandbox_policy.Refusal = .{};
+    const placed = try placeShellCommand(
+        input.sandbox_policy,
+        arena,
+        input.workspace_root,
+        command,
+        tool.captured_command_host == .native,
+        runnerRequest(args),
+        &refusal,
+    );
     return .{
         .command = command,
         .resolved_cwd = cwd,
         .target_os = builtin.target.os.tag,
         .environment = environment_value,
         .execution_mode = execution_mode,
+        .placement = placed.placement,
+        .placement_profile = placed.profile,
+        .sandbox = placed.launch,
     };
+}
+
+pub const PlaceError = sandbox_policy.PlaceError;
+
+/// Every refusal fx gives a shell run before it starts begins with this text.
+pub const refusal_prefix = "fx did not run this command: ";
+/// E18: a built-in placement with no launch. It never runs locally.
+pub const runner_not_prepared_text = refusal_prefix ++
+    "remote setup did not prepare the built-in runner for this run. Run it again.";
+
+/// The refusal for a placed run whose approved placement changed before it started.
+pub const placement_changed_refusal = refusal_prefix ++
+    "its sandbox placement changed after it was approved. Request it again.";
+
+const tty_sandbox_reason = "a tty=true command cannot run in a sandbox. Run it without tty, or change the rule in ~/.fx/sandbox/config.json.";
+const invalid_config_suffix = " Fix ~/.fx/sandbox/config.json, or turn off experimental.sandbox_execution.";
+
+/// Where a shell command runs. Without a policy, and for a host that runs its
+/// own commands (`native` false), the command runs here.
+pub fn placeShellCommand(
+    sandbox: ?*const sandbox_policy.Policy,
+    arena: Allocator,
+    workspace_root: []const u8,
+    command: []const u8,
+    native: bool,
+    runner: ?sandbox_policy.Request,
+    refusal: *sandbox_policy.Refusal,
+) sandbox_policy.PlaceError!sandbox_policy.Placed {
+    // WASM hosts never load the policy (A4), so every command stays local. The early return keeps the placement code out of the WASM builds.
+    if (comptime host_target.is_wasm) return .{ .placement = .local };
+    if (!native) {
+        // E11: a host without native tools never sends a command away, so a remote request is refused.
+        const remote = if (runner) |request| request == .remote else false;
+        if (remote and sandbox != null) return error.RemoteRunnerUnavailable;
+        return .{ .placement = .local };
+    }
+    const active = sandbox orelse return .{ .placement = .local };
+    return active.place(arena, workspace_root, command, runner, refusal);
+}
+
+/// The fields of a shell run that decide whether it may start away from this
+/// machine. `runner` is the request the call names, if any.
+pub const RunFields = struct {
+    tty: bool = false,
+    shell: bool = false,
+    reload: bool = false,
+    profile_user: bool = false,
+    runner: ?sandbox_policy.Request = null,
+    cwd: ?[]const u8 = null,
+};
+
+/// The refusal text for a shell run that fx must not start, or null when it may
+/// start. `native` is whether this host runs the command itself. A run placed
+/// away from this machine is refused for a field that applies only here (E3),
+/// then for a terminal (E12), then for a cwd outside the workspace (E13).
+pub fn shellRunRefusal(
+    arena: Allocator,
+    sandbox: ?*const sandbox_policy.Policy,
+    workspace_root: []const u8,
+    command: []const u8,
+    fields: RunFields,
+    native: bool,
+) Allocator.Error!?[]const u8 {
+    if (comptime host_target.is_wasm) return null;
+    const active = sandbox orelse return null;
+    var refusal: sandbox_policy.Refusal = .{};
+    const placed = placeShellCommand(sandbox, arena, workspace_root, command, native, fields.runner, &refusal) catch |err| {
+        return try placeErrorText(arena, active, err, refusal, fields.tty);
+    };
+    if (placed.placement == .local) return null;
+    if (fields.shell) return "shell applies only to local runs";
+    if (fields.reload) return "reload applies only to local runs";
+    if (fields.profile_user) return "profile applies only to local runs";
+    if (fields.tty) return refusal_prefix ++ tty_sandbox_reason;
+    if (!try cwdInsideRoot(arena, workspace_root, fields.cwd)) {
+        return try arena.print("{s}a remote run needs a cwd inside the workspace {s}.", .{ refusal_prefix, workspace_root });
+    }
+    return null;
+}
+
+fn cwdInsideRoot(arena: Allocator, workspace_root: []const u8, cwd_arg: ?[]const u8) Allocator.Error!bool {
+    const resolved = pathing.resolveWorkspaceOrExternalPath(arena, workspace_root, cwd_arg orelse ".") catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    return pathing.pathInside(workspace_root, resolved);
+}
+
+/// The refusal text for a placement error from `sandbox`. A terminal cannot
+/// run in a sandbox, so a tty command that cannot be placed gets that reason.
+pub fn placeErrorText(
+    arena: Allocator,
+    sandbox: *const sandbox_policy.Policy,
+    err: sandbox_policy.PlaceError,
+    refusal: sandbox_policy.Refusal,
+    tty: bool,
+) Allocator.Error![]const u8 {
+    switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SandboxConfigInvalid => return try arena.print(
+            "{s}{s}{s}",
+            .{ refusal_prefix, sandbox.message(), invalid_config_suffix },
+        ),
+        error.SandboxLoginMissing => return sandbox_policy.login_missing_text,
+        error.SandboxRunnerNotPrepared => return runner_not_prepared_text,
+        error.RemoteRunnerUnavailable => return refusal_prefix ++ "remote runners are not available in this host.",
+        error.SandboxWorkspaceUnresolved => return try arena.print(
+            "{s}the workspace folder {f} could not be resolved: {s}",
+            .{ refusal_prefix, text_utils.terminalSafe(refusal.path), refusal.detail },
+        ),
+        error.SandboxStateUnavailable => return try arena.print(
+            "{s}the sandbox state folder {f} could not be created: {s}",
+            .{ refusal_prefix, text_utils.terminalSafe(refusal.path), refusal.detail },
+        ),
+        error.SandboxProviderUnavailable => {
+            if (tty) return refusal_prefix ++ tty_sandbox_reason;
+            return try arena.print(
+                "{s}the sandbox provider cannot be used: {s}",
+                .{ refusal_prefix, if (refusal.reason.len > 0) refusal.reason else sandbox.message() },
+            );
+        },
+    }
+}
+
+/// A placement the policy gives now, with the reason the request did not decide it.
+pub const ApprovedPlacement = struct {
+    ctx: command_admission.CommandContext,
+    reason: ?sandbox_policy.Reason,
+};
+
+/// Whether a placed run is remote with no launch. Nothing can start it: a
+/// built-in remote run gets its launch only after remote setup (spec R1, U10).
+pub fn launchlessRemote(command_ctx: command_admission.CommandContext) bool {
+    return command_ctx.placement == .remote and command_ctx.sandbox == null;
+}
+
+/// The command as admission approved it, with the placement and launch that
+/// the policy gives it now. Null when they differ from the approved fingerprint,
+/// so the caller must refuse the run instead of starting it.
+pub fn placementAsApprovedWithReason(
+    sandbox: ?*const sandbox_policy.Policy,
+    arena: Allocator,
+    workspace_root: []const u8,
+    approved: command_admission.AdmissionFingerprint,
+    command_ctx: command_admission.CommandContext,
+    native: bool,
+    runner: ?sandbox_policy.Request,
+    refusal: *sandbox_policy.Refusal,
+) sandbox_policy.PlaceError!?ApprovedPlacement {
+    const placed = try placeShellCommand(sandbox, arena, workspace_root, command_ctx.command, native, runner, refusal);
+    var placed_ctx = command_ctx;
+    placed_ctx.placement = placed.placement;
+    placed_ctx.placement_profile = placed.profile;
+    placed_ctx.sandbox = placed.launch;
+    if (!command_admission.keepsPlacement(approved, placed.placement, placed.profile)) return null;
+    return .{ .ctx = placed_ctx, .reason = placed.reason };
+}
+
+pub fn placementAsApproved(
+    sandbox: ?*const sandbox_policy.Policy,
+    arena: Allocator,
+    workspace_root: []const u8,
+    approved: command_admission.AdmissionFingerprint,
+    command_ctx: command_admission.CommandContext,
+    native: bool,
+    runner: ?sandbox_policy.Request,
+) sandbox_policy.PlaceError!?command_admission.CommandContext {
+    var refusal: sandbox_policy.Refusal = .{};
+    const placed = (try placementAsApprovedWithReason(sandbox, arena, workspace_root, approved, command_ctx, native, runner, &refusal)) orelse return null;
+    return placed.ctx;
+}
+
+/// LOG-01: one trace line for a refusal that stops a shell run before it starts. It names the site and
+/// the refusal text fx gives the model. The command itself is never traced.
+pub fn traceRefusal(site: []const u8, text: []const u8) void {
+    debug_trace.logf("permission", "event=shell_refused site={s} reason={f}", .{ site, text_utils.terminalSafe(text) });
+}
+
+/// Refuses a shell run that fx must not start, before any prompt: a run the
+/// fields make impossible away from this machine, or any run while the sandbox
+/// config is invalid or its provider cannot run.
+fn commandCallRefusal(input: Input, arena: Allocator, call: ToolCall) !?[]const u8 {
+    if (comptime host_target.is_wasm) return null;
+    const active = input.sandbox_policy orelse return null;
+    const tool = registeredTool(input, call.name) orelse return null;
+    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+    const command = try tool_args.requiredStringArg(args, "command");
+    const fields: RunFields = .{
+        .tty = tool_args.optionalBoolArg(args, "tty") orelse false,
+        .shell = if (args.get("shell")) |value| std.meta.activeTag(value) != .null else false,
+        .reload = tool_args.optionalBoolArg(args, "reload") orelse false,
+        .profile_user = std.mem.eql(u8, tool_args.optionalStringArg(args, "profile") orelse "", "user"),
+        .runner = runnerRequest(args),
+        .cwd = tool_args.nullablePlaceholderStringArg(args, "cwd"),
+    };
+    const refusal = try shellRunRefusal(arena, active, input.workspace_root, command, fields, tool.captured_command_host == .native);
+    if (refusal) |text| traceRefusal("admission", text);
+    return refusal;
+}
+
+/// The request a run's `runner` names. Decode has already refused any other value.
+fn runnerRequest(args: std.json.ObjectMap) ?sandbox_policy.Request {
+    const word = tool_args.optionalStringArg(args, "runner") orelse return null;
+    if (std.mem.eql(u8, word, "local")) return .local;
+    if (std.mem.eql(u8, word, "remote")) return .remote;
+    return null;
 }
 
 fn nativeCommandEnvironment(
@@ -2383,6 +2662,41 @@ fn explicitTtyShell(
     } };
 }
 
+/// The command identity in a session permission key. A local command keeps
+/// the key it had before placements existed, so saved session rules still
+/// match it. The placement is the outermost prefix.
+fn commandStateIdentity(
+    arena: Allocator,
+    command: command_admission.CommandContext,
+) ![]const u8 {
+    const identity = switch (command.execution_mode) {
+        .captured => command.command,
+        .tty => try command_environment.ttyPermissionCommandIdentity(
+            arena,
+            command.environment,
+            command.command,
+        ),
+    };
+    if (command.placement == .local) return identity;
+    return command_environment.placementPermissionCommandIdentity(
+        arena,
+        command.placement,
+        command.placement_profile,
+        placementDestination(command),
+        identity,
+    );
+}
+
+/// The project a placed command's grant names (spec A1). A built-in launch names
+/// its project. No launch yet means remote setup has not run, so the grant names
+/// `setup`. A third-party provider has a launch with no built-in section, so it
+/// names `provider`.
+fn placementDestination(command: command_admission.CommandContext) command_environment.Destination {
+    const placed_launch = command.sandbox orelse return .setup;
+    const built_in = placed_launch.builtin orelse return .provider;
+    return .{ .project = built_in.project_id };
+}
+
 pub fn permissionStateKeyForCall(
     input: Input,
     arena: Allocator,
@@ -2393,14 +2707,7 @@ pub fn permissionStateKeyForCall(
     }
     if (try isRunCommandCall(input, arena, call)) {
         const command = try runCommandContext(input, arena, call);
-        const command_identity = switch (command.execution_mode) {
-            .captured => command.command,
-            .tty => try command_environment.ttyPermissionCommandIdentity(
-                arena,
-                command.environment,
-                command.command,
-            ),
-        };
+        const command_identity = try commandStateIdentity(arena, command);
         return session_permission_state.commandKeyV2(
             arena,
             command_identity,
@@ -2432,18 +2739,28 @@ fn commandPermissionIdentityForContext(
     arena: Allocator,
     command: command_admission.CommandContext,
 ) ![]const u8 {
-    return switch (command.execution_mode) {
-        .captured => command_environment.permissionCommandIdentity(
+    const identity = switch (command.execution_mode) {
+        .captured => try command_environment.permissionCommandIdentity(
             arena,
             command.environment,
             command.command,
         ),
-        .tty => command_environment.ttyPermissionCommandIdentity(
+        .tty => try command_environment.ttyPermissionCommandIdentity(
             arena,
             command.environment,
             command.command,
         ),
     };
+    // The placement is the outermost prefix, so
+    // `commandFromPermissionIdentity` strips it first.
+    if (command.placement == .local) return identity;
+    return command_environment.placementPermissionCommandIdentity(
+        arena,
+        command.placement,
+        command.placement_profile,
+        placementDestination(command),
+        identity,
+    );
 }
 
 pub const PreparedPermissionStateAction = struct {
@@ -2657,11 +2974,48 @@ fn noninteractivePermissionRequired(call: ToolCall, reason: []const u8) ToolPerm
     return .permission_required;
 }
 
+const supported_shells_text = blk: {
+    const names = @typeInfo(shell_resolver.ShellKind).@"enum".field_names;
+    var text: []const u8 = "";
+    for (names, 0..) |name, index| {
+        if (index > 0) text = text ++ ", ";
+        text = text ++ name;
+    }
+    break :blk text;
+};
+
+fn shellResolutionFailureMessage(
+    arena: Allocator,
+    call: ToolCall,
+    err: anyerror,
+) !?[]const u8 {
+    const headline = switch (err) {
+        error.UnsupportedShell => "Unsupported shell",
+        error.RelativeShellPath => "Shell path must be absolute",
+        error.MissingLoginShell => return try arena.print(
+            "Missing login shell; supported shells: {s}",
+            .{supported_shells_text},
+        ),
+        else => return null,
+    };
+    if (try shellPathForFailureMessage(arena, call)) |shell_path| {
+        return try arena.print(
+            "{s} \"{f}\"; supported shells: {s}",
+            .{ headline, model_context_encoding.scalar(shell_path), supported_shells_text },
+        );
+    }
+    return try arena.print(
+        "{s}; supported shells: {s}",
+        .{ headline, supported_shells_text },
+    );
+}
+
 pub fn permissionTargetResolutionFailureMessage(
     arena: Allocator,
     call: ToolCall,
     err: anyerror,
 ) !?[]const u8 {
+    if (try shellResolutionFailureMessage(arena, call, err)) |msg| return msg;
     const reason: ?[]const u8 = switch (err) {
         error.FileNotFound => "Path not found",
         error.NotDir => "Path is not a directory",
@@ -2688,6 +3042,22 @@ pub fn permissionTargetResolutionFailureMessage(
         try arena.print("Cannot resolve path \"{f}\": {s}", .{ model_context_encoding.scalar(path), @errorName(err) })
     else
         try arena.print("Cannot resolve tool target path: {s}", .{@errorName(err)});
+}
+
+fn shellPathForFailureMessage(arena: Allocator, call: ToolCall) !?[]const u8 {
+    const raw = tool_args.parseToolArgsObject(arena, call.arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const args = (try tool_args.unwrapRequest(arena, raw)) orelse raw;
+    const shell = explicitTtyShell(arena, args) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    } orelse return null;
+    return switch (shell) {
+        .executable => |value| if (value.path.len > 0) value.path else null,
+        .user_login => null,
+    };
 }
 
 /// Best-effort extraction of the path the caller asked for, so the failure
@@ -2978,6 +3348,75 @@ test "permission target resolution failures encode ampersand in model paths" {
 
     const sym_loop = (try permissionTargetResolutionFailureMessage(arena, file_call, error.SymLinkLoop)).?;
     try std.testing.expectEqualStrings("Cannot resolve path \"/nonexistent_dir/R&amp;D/x\": SymLinkLoop", sym_loop);
+}
+
+test "permission target resolution and outcome report unsupported tty shell to the model" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const unsupported_call: ToolCall = .{
+        .id = "unsupported_shell",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\",\"tty\":true,\"shell\":{\"kind\":\"executable\",\"path\":\"/nonexistent_eb47_shell\"}}",
+    };
+    const with_path = (try permissionTargetResolutionFailureMessage(arena, unsupported_call, error.UnsupportedShell)).?;
+    try std.testing.expectEqualStrings(
+        "Unsupported shell \"/nonexistent_eb47_shell\"; supported shells: bash, zsh",
+        with_path,
+    );
+
+    const bare_shell_call: ToolCall = .{
+        .id = "unsupported_shell_bare",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\",\"tty\":true}",
+    };
+    const bare_msg = (try permissionTargetResolutionFailureMessage(arena, bare_shell_call, error.UnsupportedShell)).?;
+    try std.testing.expectEqualStrings(
+        "Unsupported shell; supported shells: bash, zsh",
+        bare_msg,
+    );
+
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    const input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    for ([_]PermissionMode{ .yolo, .auto, .ask }) |mode| {
+        const outcome = try requestPermissionOutcome(input, arena, unsupported_call, mode, &.{});
+        const failure = outcome.tool_failure orelse return error.TestExpectedToolFailure;
+        try std.testing.expectEqualStrings(
+            "Unsupported shell \"/nonexistent_eb47_shell\"; supported shells: bash, zsh",
+            failure,
+        );
+    }
+
+    const esc_call: ToolCall = .{
+        .id = "unsupported_shell_esc",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\",\"tty\":true,\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/sh\\u001b]0;owned\\u0007\"}}",
+    };
+    const esc_msg = (try permissionTargetResolutionFailureMessage(arena, esc_call, error.UnsupportedShell)).?;
+    try std.testing.expect(std.mem.findScalar(u8, esc_msg, 0x1b) == null);
+    try std.testing.expectEqualStrings(
+        "Unsupported shell \"/bin/sh&#x1b;]0;owned&#x07;\"; supported shells: bash, zsh",
+        esc_msg,
+    );
+
+    const relative_call: ToolCall = .{
+        .id = "relative_shell",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\",\"tty\":true,\"shell\":{\"kind\":\"executable\",\"path\":\"bin/zsh\"}}",
+    };
+    const relative_msg = (try permissionTargetResolutionFailureMessage(arena, relative_call, error.RelativeShellPath)).?;
+    try std.testing.expectEqualStrings(
+        "Shell path must be absolute \"bin/zsh\"; supported shells: bash, zsh",
+        relative_msg,
+    );
+    const relative_outcome = try requestPermissionOutcome(input, arena, relative_call, .auto, &.{});
+    try std.testing.expectEqualStrings(
+        "Shell path must be absolute \"bin/zsh\"; supported shells: bash, zsh",
+        relative_outcome.tool_failure orelse return error.TestExpectedToolFailure,
+    );
 }
 
 test "interactive terminal exec approval permits command amendments" {
@@ -4638,10 +5077,12 @@ test "missing contextual review authority maps to unavailable without reviewer t
             _: []const u8,
             _: []const types.ChatMessage,
             _: []const types.ChatMessage,
+            follow_up: []const types.ChatMessage,
             _: []const u8,
             _: std.Io.Clock.Timestamp,
             _: *std.atomic.Value(bool),
         ) ![]u8 {
+            if (follow_up.len > 0) return error.ReadTurnsUnsupported;
             return alloc.dupe(u8, "{}");
         }
 
@@ -6932,4 +7373,585 @@ test "automatic trusted-root overwrite preserves configured read disclosure revi
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+}
+
+test "command grant identity wraps the placement outermost" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const local: command_admission.CommandContext = .{ .command = "zig build test", .resolved_cwd = "/repo", .target_os = .linux };
+    try std.testing.expectEqualStrings("zig build test", try commandPermissionIdentityForContext(arena, local));
+
+    var remote = local;
+    remote.placement = .remote;
+    const remote_identity = try commandPermissionIdentityForContext(arena, remote);
+    try std.testing.expectEqualStrings("@fx-placement:remote:setup:zig build test", remote_identity);
+    try std.testing.expectEqualStrings("zig build test", command_environment.commandFromPermissionIdentity(remote_identity));
+
+    var tty_isolated = local;
+    tty_isolated.execution_mode = .tty;
+    tty_isolated.placement = .isolated;
+    tty_isolated.placement_profile = "media";
+    const tty_identity = try commandPermissionIdentityForContext(arena, tty_isolated);
+    try std.testing.expect(std.mem.startsWith(u8, tty_identity, "@fx-placement:isolated/media:setup:@fx-shell-mode:tty:"));
+    try std.testing.expectEqualStrings("zig build test", command_environment.commandFromPermissionIdentity(tty_identity));
+}
+
+test "a placed grant names its project, setup before one exists, and provider for a third-party launch" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const base: command_admission.CommandContext = .{ .command = "make", .resolved_cwd = "/repo", .target_os = .linux, .placement = .remote };
+    const before_setup = try commandStateIdentity(arena, base);
+    try std.testing.expectEqualStrings("@fx-placement:remote:setup:make", before_setup);
+
+    const project_one: sandbox_policy.Launch = .{
+        .provider = &.{},
+        .state_dir = "/fx/state",
+        .workspace_root = "/repo",
+        .grace_ms = 700,
+        .builtin = .{ .team_id = "team_1", .team_slug = "acme", .project_id = "prj_1", .project_name = "repo", .user_id = "usr_1", .token_sha256 = "00" },
+    };
+    var with_project = base;
+    with_project.sandbox = &project_one;
+    const project_identity = try commandStateIdentity(arena, with_project);
+    try std.testing.expectEqualStrings("@fx-placement:remote:prj_1:make", project_identity);
+    try std.testing.expect(!std.mem.eql(u8, before_setup, project_identity));
+
+    const project_two: sandbox_policy.Launch = .{
+        .provider = &.{},
+        .state_dir = "/fx/state",
+        .workspace_root = "/repo",
+        .grace_ms = 700,
+        .builtin = .{ .team_id = "team_1", .team_slug = "acme", .project_id = "prj_2", .project_name = "other", .user_id = "usr_1", .token_sha256 = "00" },
+    };
+    var other_project = base;
+    other_project.sandbox = &project_two;
+    try std.testing.expect(!std.mem.eql(u8, project_identity, try commandStateIdentity(arena, other_project)));
+
+    const third_party: sandbox_policy.Launch = .{ .provider = &.{"/opt/fx/provider"}, .state_dir = "/fx/state", .workspace_root = "/repo", .grace_ms = 700 };
+    var provider_run = base;
+    provider_run.sandbox = &third_party;
+    try std.testing.expectEqualStrings("@fx-placement:remote:provider:make", try commandStateIdentity(arena, provider_run));
+}
+
+test "session command keys keep local keys and bind sandbox placements" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const local: command_admission.CommandContext = .{ .command = "zig build test", .resolved_cwd = "/repo", .target_os = .linux };
+    try std.testing.expectEqualStrings("zig build test", try commandStateIdentity(arena, local));
+
+    var local_tty = local;
+    local_tty.execution_mode = .tty;
+    local_tty.environment = .{ .clean = "/bin/zsh" };
+    try std.testing.expectEqualStrings(
+        try command_environment.ttyPermissionCommandIdentity(arena, local_tty.environment, local_tty.command),
+        try commandStateIdentity(arena, local_tty),
+    );
+
+    var remote = local;
+    remote.placement = .remote;
+    try std.testing.expectEqualStrings("@fx-placement:remote:setup:zig build test", try commandStateIdentity(arena, remote));
+
+    var isolated_tty = local_tty;
+    isolated_tty.placement = .isolated;
+    isolated_tty.placement_profile = "media";
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        try commandStateIdentity(arena, isolated_tty),
+        "@fx-placement:isolated/media:setup:@fx-shell-mode:tty:",
+    ));
+
+    var isolated_captured = local;
+    isolated_captured.placement = .isolated;
+    isolated_captured.placement_profile = "media";
+    try std.testing.expectEqualStrings("@fx-placement:isolated/media:setup:zig build test", try commandStateIdentity(arena, isolated_captured));
+}
+
+/// Creates the test fx home under `dir` and returns its absolute path. With
+/// `provider_ready`, the home holds an executable provider named `fake-cli`.
+fn sandboxTestHome(arena: Allocator, dir: std.Io.Dir, provider_ready: bool) ![]const u8 {
+    try dir.createDirPath(io_mod.getIo(), "fxhome/sandbox");
+    if (provider_ready) {
+        try dir.writeFile(io_mod.getIo(), .{
+            .sub_path = "fxhome/fake-cli",
+            .data = "#!/bin/sh\n",
+            .flags = .{ .permissions = .fromMode(0o700) },
+        });
+    }
+    return io_mod.dirRealpathAlloc(arena, dir, "fxhome");
+}
+
+/// Writes `config_text` as the test home's sandbox config and loads its policy.
+fn loadSandboxTestPolicy(
+    alloc: Allocator,
+    dir: std.Io.Dir,
+    fx_home: []const u8,
+    config_text: []const u8,
+) !*sandbox_policy.Policy {
+    try dir.writeFile(io_mod.getIo(), .{ .sub_path = "fxhome/sandbox/config.json", .data = config_text });
+    return sandbox_policy.load(alloc, fx_home, "/Users/example", null);
+}
+
+test "every placement error gives a refusal text that names its reason" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, false);
+    // placeErrorText has no else branch, so a new placement error needs its text there.
+    const unavailable = try loadSandboxTestPolicy(std.testing.allocator, tmp.dir, fx_home, "{\"provider\":[\"/no/such/fx-provider\"]}");
+    defer unavailable.destroy();
+    const cases = [_]struct { err: sandbox_policy.PlaceError, refusal: sandbox_policy.Refusal = .{}, must_contain: []const u8 }{
+        .{ .err = error.SandboxLoginMissing, .must_contain = "no Vercel login" },
+        .{ .err = error.SandboxProviderUnavailable, .must_contain = "is not an executable file" },
+        .{ .err = error.RemoteRunnerUnavailable, .must_contain = "remote runners are not available in this host." },
+        .{
+            .err = error.SandboxWorkspaceUnresolved,
+            .refusal = .{ .path = "/Users/example/work", .detail = "FileNotFound" },
+            .must_contain = "the workspace folder /Users/example/work could not be resolved: FileNotFound",
+        },
+        .{
+            .err = error.SandboxStateUnavailable,
+            .refusal = .{ .path = "/Users/example/.fx/sandbox/state/0123456789abcdef", .detail = "NotDir" },
+            .must_contain = "the sandbox state folder /Users/example/.fx/sandbox/state/0123456789abcdef could not be created: NotDir",
+        },
+    };
+    inline for (cases) |case| {
+        const text = try placeErrorText(arena, unavailable, case.err, case.refusal, false);
+        try std.testing.expect(text.len > 0);
+        try std.testing.expect(std.mem.find(u8, text, case.must_contain) != null);
+    }
+    const e16 = try placeErrorText(arena, unavailable, error.SandboxWorkspaceUnresolved, .{ .path = "/Users/example/work", .detail = "FileNotFound" }, false);
+    try std.testing.expectEqualStrings("fx did not run this command: the workspace folder /Users/example/work could not be resolved: FileNotFound", e16);
+    const e18 = try placeErrorText(arena, unavailable, error.SandboxRunnerNotPrepared, .{}, false);
+    try std.testing.expectEqualStrings(
+        "fx did not run this command: remote setup did not prepare the built-in runner for this run. Run it again.",
+        e18,
+    );
+    const invalid = try loadSandboxTestPolicy(std.testing.allocator, tmp.dir, fx_home, "{");
+    defer invalid.destroy();
+    const invalid_text = try placeErrorText(arena, invalid, error.SandboxConfigInvalid, .{}, false);
+    try std.testing.expect(std.mem.find(u8, invalid_text, "Fix ~/.fx/sandbox/config.json") != null);
+}
+
+fn shellRunCall(arena: Allocator, command: []const u8, tty: bool) !ToolCall {
+    return .{
+        .id = "shell-run",
+        .name = "shell",
+        .arguments_json = try arena.print("{{\"action\":\"run\",\"command\":\"{s}\",\"tty\":{}}}", .{ command, tty }),
+    };
+}
+
+fn runnerRunCall(arena: Allocator, command: []const u8, extra: []const u8) !ToolCall {
+    return .{
+        .id = "runner-run",
+        .name = "shell",
+        .arguments_json = try arena.print("{{\"action\":\"run\",\"command\":\"{s}\"{s}}}", .{ command, extra }),
+    };
+}
+
+fn expectRunRefusal(input: Input, arena: Allocator, extra: []const u8, expected: ?[]const u8) !void {
+    const refusal = try commandCallRefusal(input, arena, try runnerRunCall(arena, "ls", extra));
+    if (expected) |text| {
+        try std.testing.expectEqualStrings(text, refusal orelse return error.TestExpectedEqual);
+    } else {
+        try std.testing.expectEqual(@as(?[]const u8, null), refusal);
+    }
+}
+
+test "a cwd is inside the workspace by path segments, not by string prefix" {
+    try std.testing.expect(pathing.pathInside("/Users/example/repo", "/Users/example/repo"));
+    try std.testing.expect(pathing.pathInside("/Users/example/repo", "/Users/example/repo/sub"));
+    try std.testing.expect(pathing.pathInside("/Users/example/repo/", "/Users/example/repo/sub"));
+    try std.testing.expect(!pathing.pathInside("/Users/example/repo", "/Users/example/repo2"));
+    try std.testing.expect(!pathing.pathInside("/Users/example/repo", "/Users/example"));
+    try std.testing.expect(pathing.pathInside("/", "/anywhere"));
+}
+
+test "a built-in remote run with no config is admitted, and gets no provider refusal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, false);
+    const policy = try sandbox_policy.load(std.testing.allocator, fx_home, "/Users/example", null);
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.sandbox_policy = policy;
+    // The cwd check resolves the workspace, so it must exist.
+    input.workspace_root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
+
+    try expectRunRefusal(input, arena, ",\"runner\":\"remote\"", null);
+    const remote = try runCommandContext(input, arena, try runnerRunCall(arena, "ls", ",\"runner\":\"remote\""));
+    try std.testing.expectEqual(command_environment.Placement.remote, remote.placement);
+    try std.testing.expect(launchlessRemote(remote));
+    const local = try runCommandContext(input, arena, try runnerRunCall(arena, "ls", ",\"runner\":\"local\""));
+    try std.testing.expect(!launchlessRemote(local));
+}
+
+test "a refused shell run leaves one trace line that names the reason, and never the command (LOG-01)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, false);
+    const policy = try sandbox_policy.load(std.testing.allocator, fx_home, "/Users/example", null);
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.sandbox_policy = policy;
+    const root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(root);
+    const trace_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, "admission.log" });
+    defer std.testing.allocator.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(std.testing.allocator, trace_path, "permission");
+
+    const refusal = try commandCallRefusal(input, arena, try runnerRunCall(arena, "secret-marker-command", ",\"runner\":\"remote\",\"tty\":true"));
+    try std.testing.expectEqualStrings(refusal_prefix ++ tty_sandbox_reason, refusal orelse return error.TestExpectedEqual);
+
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    const text = try io_mod.readFileToEnd(std.testing.allocator, &file, 8192);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "event=shell_refused site=admission") != null);
+    try std.testing.expect(std.mem.find(u8, text, "secret-marker-command") == null);
+}
+
+test "a built-in remote tty run with no config is refused as a tty run, not as a missing provider" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, false);
+    const policy = try sandbox_policy.load(std.testing.allocator, fx_home, "/Users/example", null);
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.sandbox_policy = policy;
+
+    try expectRunRefusal(input, arena, ",\"runner\":\"remote\",\"tty\":true", refusal_prefix ++ tty_sandbox_reason);
+}
+
+test "a runner request places the run, and a remote run refuses the fields that apply only here" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, true);
+    const config = try arena.print("{{\"provider\":[\"{s}/fake-cli\"]}}", .{fx_home});
+    const policy = try loadSandboxTestPolicy(std.testing.allocator, tmp.dir, fx_home, config);
+    defer policy.destroy();
+    try tmp.dir.createDirPath(io_mod.getIo(), "repo/sub");
+    try tmp.dir.createDirPath(io_mod.getIo(), "repo2");
+    const repo = try io_mod.dirRealpathAlloc(arena, tmp.dir, "repo");
+    const sub = try arena.print("{s}/sub", .{repo});
+    const outside = try io_mod.dirRealpathAlloc(arena, tmp.dir, "repo2");
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = repo;
+    input.sandbox_policy = policy;
+
+    const remote = try runCommandContext(input, arena, try runnerRunCall(arena, "ls", ",\"runner\":\"remote\""));
+    try std.testing.expectEqual(command_environment.Placement.remote, remote.placement);
+    const local = try runCommandContext(input, arena, try runnerRunCall(arena, "ls", ",\"runner\":\"local\""));
+    try std.testing.expectEqual(command_environment.Placement.local, local.placement);
+
+    try expectRunRefusal(input, arena, ",\"runner\":\"remote\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\"},\"tty\":true,\"reload\":true", "shell applies only to local runs");
+    try expectRunRefusal(input, arena, ",\"runner\":\"remote\",\"reload\":true", "reload applies only to local runs");
+    try expectRunRefusal(input, arena, ",\"runner\":\"remote\",\"profile\":\"user\"", "profile applies only to local runs");
+    try expectRunRefusal(input, arena, ",\"runner\":\"remote\",\"tty\":true,\"reload\":true", "reload applies only to local runs");
+    try expectRunRefusal(input, arena, ",\"runner\":\"remote\",\"tty\":true", refusal_prefix ++ tty_sandbox_reason);
+    try expectRunRefusal(
+        input,
+        arena,
+        try arena.print(",\"runner\":\"remote\",\"cwd\":\"{s}\"", .{outside}),
+        try arena.print("{s}a remote run needs a cwd inside the workspace {s}.", .{ refusal_prefix, repo }),
+    );
+    try expectRunRefusal(input, arena, try arena.print(",\"runner\":\"remote\",\"cwd\":\"{s}\"", .{sub}), null);
+    try expectRunRefusal(input, arena, ",\"runner\":\"local\",\"reload\":true,\"profile\":\"user\"", null);
+}
+
+test "a remote runner on a host without native tools is refused with E11 before any permission step (A4, E11)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, true);
+    const config = try arena.print("{{\"provider\":[\"{s}/fake-cli\"]}}", .{fx_home});
+    const policy = try loadSandboxTestPolicy(std.testing.allocator, tmp.dir, fx_home, config);
+    defer policy.destroy();
+    try tmp.dir.createDirPath(io_mod.getIo(), "repo");
+    const repo = try io_mod.dirRealpathAlloc(arena, tmp.dir, "repo");
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = repo;
+    input.sandbox_policy = policy;
+    var clean_shell = test_builtin_tools.shell;
+    clean_shell.captured_command_host = .workspace_clean;
+    const clean_tools = [_]tool_dispatch.Tool{clean_shell};
+    input.tool_registry = .{ .tools = &clean_tools };
+
+    const refusal = try commandCallRefusal(input, arena, try runnerRunCall(arena, "ls", ",\"runner\":\"remote\""));
+    try std.testing.expectEqualStrings(
+        "fx did not run this command: remote runners are not available in this host.",
+        refusal orelse return error.TestExpectedEqual,
+    );
+}
+
+test "shell placement follows the sandbox rules and leaves other commands local" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, true);
+    const config = try arena.print(
+        "{{\"provider\":[\"{s}/fake-cli\"],\"profiles\":{{\"media\":[\"--gpu\"]}}," ++
+            "\"rules\":[{{\"command\":\"zig build*\",\"runner\":\"remote\"}}," ++
+            "{{\"command\":\"convert *\",\"runner\":\"isolated:media\"}}]}}",
+        .{fx_home},
+    );
+    const policy = try loadSandboxTestPolicy(std.testing.allocator, tmp.dir, fx_home, config);
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = "/Users/example/repo";
+    input.sandbox_policy = policy;
+
+    const build = try runCommandContext(input, arena, try shellRunCall(arena, "zig build test", false));
+    try std.testing.expectEqual(command_environment.Placement.remote, build.placement);
+    try std.testing.expectEqual(@as(?[]const u8, null), build.placement_profile);
+    const build_launch = build.sandbox orelse return error.TestExpectedLaunch;
+    try std.testing.expectEqualStrings("/Users/example/repo", build_launch.workspace_root);
+
+    const convert = try runCommandContext(input, arena, try shellRunCall(arena, "convert a.png b.jpg", false));
+    try std.testing.expectEqual(command_environment.Placement.isolated, convert.placement);
+    try std.testing.expectEqualStrings("media", convert.placement_profile.?);
+
+    const local = try runCommandContext(input, arena, try shellRunCall(arena, "ls", false));
+    try std.testing.expectEqual(command_environment.Placement.local, local.placement);
+    try std.testing.expectEqual(@as(?[]const u8, null), local.placement_profile);
+    try std.testing.expect(local.sandbox == null);
+}
+
+test "an invalid sandbox config refuses a local shell run with its diagnostic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, false);
+    const policy = try loadSandboxTestPolicy(
+        std.testing.allocator,
+        tmp.dir,
+        fx_home,
+        "{\"rules\":[{\"command\":\"ls\",\"runner\":\"sandbox\"}]}",
+    );
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.sandbox_policy = policy;
+
+    const outcome = try requestPermissionOutcome(input, arena, try shellRunCall(arena, "ls", false), .ask, &.{});
+    const text = outcome.tool_failure orelse return error.TestExpectedRefusal;
+    try std.testing.expect(std.mem.startsWith(u8, text, refusal_prefix));
+    try std.testing.expect(std.mem.find(u8, text, "rules[0].runner: unknown runner \"sandbox\"") != null);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        text,
+        " Fix ~/.fx/sandbox/config.json, or turn off experimental.sandbox_execution.",
+    ));
+    try std.testing.expect(outcome.execution_authority == null);
+}
+
+test "a placed shell run is refused when its provider cannot run, and a local run is not" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, false);
+    const config = try arena.print(
+        "{{\"provider\":[\"{s}/no-such-cli\"],\"rules\":[{{\"command\":\"zig build*\",\"runner\":\"remote\"}}]}}",
+        .{fx_home},
+    );
+    const policy = try loadSandboxTestPolicy(std.testing.allocator, tmp.dir, fx_home, config);
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.sandbox_policy = policy;
+
+    const placed = try requestPermissionOutcome(input, arena, try shellRunCall(arena, "zig build test", false), .ask, &.{});
+    const text = placed.tool_failure orelse return error.TestExpectedRefusal;
+    try std.testing.expect(std.mem.startsWith(u8, text, refusal_prefix ++ "the sandbox provider cannot be used: "));
+    try std.testing.expect(std.mem.find(u8, text, "is not an executable file") != null);
+
+    const local = try requestPermissionOutcome(input, arena, try shellRunCall(arena, "ls", false), .ask, &.{});
+    try std.testing.expectEqual(@as(?[]const u8, null), local.tool_failure);
+}
+
+test "a tty shell run that the rules place in a sandbox is refused before any prompt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, true);
+    const config = try arena.print(
+        "{{\"provider\":[\"{s}/fake-cli\"],\"rules\":[{{\"command\":\"zig build*\",\"runner\":\"remote\"}}]}}",
+        .{fx_home},
+    );
+    const policy = try loadSandboxTestPolicy(std.testing.allocator, tmp.dir, fx_home, config);
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.sandbox_policy = policy;
+
+    const outcome = try requestPermissionOutcome(input, arena, try shellRunCall(arena, "zig build test", true), .ask, &.{});
+    const text = outcome.tool_failure orelse return error.TestExpectedRefusal;
+    try std.testing.expectEqualStrings(
+        refusal_prefix ++ "a tty=true command cannot run in a sandbox. Run it without tty, or change the rule in ~/.fx/sandbox/config.json.",
+        text,
+    );
+    try std.testing.expect(outcome.execution_authority == null);
+}
+
+test "without a sandbox policy every shell run stays local, as before" {
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = "/Users/example/repo";
+    const call = try shellRunCall(arena, "zig build test", false);
+
+    const context = try runCommandContext(input, arena, call);
+    try std.testing.expectEqual(command_environment.Placement.local, context.placement);
+    try std.testing.expectEqual(@as(?[]const u8, null), context.placement_profile);
+    try std.testing.expect(context.sandbox == null);
+
+    const outcome = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(?[]const u8, null), outcome.tool_failure);
+}
+
+test "a shell run keeps its approved placement only while the policy still gives it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, true);
+    const config = try arena.print(
+        "{{\"provider\":[\"{s}/fake-cli\"],\"rules\":[{{\"command\":\"zig build*\",\"runner\":\"remote\"}}]}}",
+        .{fx_home},
+    );
+    const policy = try loadSandboxTestPolicy(std.testing.allocator, tmp.dir, fx_home, config);
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = "/Users/example/repo";
+    input.sandbox_policy = policy;
+
+    const approved = try runCommandContext(input, arena, try shellRunCall(arena, "zig build test", false));
+    const fingerprint = command_admission.AdmissionFingerprint.init(approved);
+    var unplaced = approved;
+    unplaced.placement = .local;
+    unplaced.placement_profile = null;
+    unplaced.sandbox = null;
+
+    const same = (try placementAsApproved(policy, arena, input.workspace_root, fingerprint, unplaced, true, null)) orelse
+        return error.TestExpectedPlacement;
+    try std.testing.expectEqual(command_environment.Placement.remote, same.placement);
+    try std.testing.expect(same.sandbox != null);
+
+    // Sandbox execution turned off after approval: the run is refused, not run here.
+    try std.testing.expect((try placementAsApproved(null, arena, input.workspace_root, fingerprint, unplaced, true, null)) == null);
+}
+
+test "a run keeps its approved placement when its cwd resolves to another path" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // On macOS /tmp resolves to /private/tmp, so the run's cwd can differ
+    // from the one admission saw; the router checks the rest of the context.
+    const approved: command_admission.CommandContext = .{
+        .command = "sleep 2; printf done",
+        .resolved_cwd = "/tmp",
+        .target_os = builtin.target.os.tag,
+    };
+    var run = approved;
+    run.resolved_cwd = "/private/tmp";
+
+    const kept = (try placementAsApproved(null, arena, "/tmp", .init(approved), run, true, null)) orelse
+        return error.TestExpectedPlacement;
+    try std.testing.expectEqual(command_environment.Placement.local, kept.placement);
+    try std.testing.expectEqualStrings("/private/tmp", kept.resolved_cwd);
+}
+
+test "runCommandPlacement returns the policy placement for shell runs and null for other calls" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, true);
+    const config = try arena.print(
+        "{{\"provider\":[\"{s}/fake-cli\"],\"rules\":[{{\"command\":\"uname*\",\"runner\":\"remote\"}},{{\"command\":\"convert*\",\"runner\":\"isolated\"}}]}}",
+        .{fx_home},
+    );
+    const policy = try loadSandboxTestPolicy(std.testing.allocator, tmp.dir, fx_home, config);
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.workspace_root = "/Users/example/repo";
+    input.sandbox_policy = policy;
+
+    const remote_call = try shellRunCall(arena, "uname -a", false);
+    const isolated_call = try shellRunCall(arena, "convert a.png b.jpg", false);
+    const local_call = try shellRunCall(arena, "echo ok", false);
+    const interact_call = ToolCall{ .id = "interact", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"s1\"}" };
+
+    try std.testing.expectEqual(@as(?types.CommandPlacement, .remote), try runCommandPlacement(input, arena, remote_call));
+    try std.testing.expectEqual(@as(?types.CommandPlacement, .isolated), try runCommandPlacement(input, arena, isolated_call));
+    try std.testing.expectEqual(@as(?types.CommandPlacement, .local), try runCommandPlacement(input, arena, local_call));
+    try std.testing.expectEqual(@as(?types.CommandPlacement, null), try runCommandPlacement(input, arena, interact_call));
+    input.sandbox_policy = null;
+    try std.testing.expectEqual(@as(?types.CommandPlacement, .local), try runCommandPlacement(input, arena, remote_call));
+}
+
+test "a review gets a reader for stored answers only when a result store exists" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    try std.testing.expect((try storedResultsFor(input, arena_state.allocator())) == null);
+    input.review_result_store = .{ .result_dir = "/tmp/fx-review-result-store" };
+    try std.testing.expect((try storedResultsFor(input, arena_state.allocator())) != null);
 }

@@ -40,6 +40,11 @@ const rawListReply = process.env.FX_MCP_LIST_REPLY;
 // id after a part fx cannot read, so that the line names no request.
 const rawListLine = process.env.FX_MCP_LIST_LINE;
 const rawFormSchemaMark = "raw-form-schema-mark";
+// FX_MCP_MRTR_RAW is JSON: the rounds of mode mrtr_raw, `[{ "requests": "<raw JSON text>", "state": "<raw JSON text>" }]`.
+// FX_MCP_RAW_LINES is a file that gets every tools/call line exactly as it arrived, before anything reads it.
+const mrtrRawRounds = process.env.FX_MCP_MRTR_RAW ? JSON.parse(process.env.FX_MCP_MRTR_RAW) : [];
+const rawLinesPath = process.env.FX_MCP_RAW_LINES;
+let mrtrRawCalls = 0;
 const compactField = process.env.FX_MCP_COMPACT_FIELD ? JSON.parse(process.env.FX_MCP_COMPACT_FIELD) : null;
 // FX_MCP_CALL_DELAY_MS holds each tools/call that long before answering it,
 // so a test with a short operation_timeout_ms can land just before or just
@@ -837,6 +842,33 @@ function handle(message) {
       }, 1500);
       return;
     }
+    if (mode === "mrtr_raw") {
+      // The k-th tools/call this process gets is answered with rounds[k]: an input_required whose inputRequests and
+      // requestState go out as the raw JSON text a test wrote, or, past the list, a complete result. A new process
+      // (a restarted server) starts again at rounds[0]. FX_MCP_MRTR_CRASH_FIRST_CALL=1 makes the first process exit on its
+      // first tools/call, before any round.
+      if (process.env.FX_MCP_MRTR_CRASH_FIRST_CALL === "1" && crashMarkerPath && !existsSync(crashMarkerPath)) {
+        writeFileSync(crashMarkerPath, String(process.pid));
+        process.exit(42);
+      }
+      const round = mrtrRawRounds[mrtrRawCalls];
+      mrtrRawCalls += 1;
+      if (round === undefined) {
+        send({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: { resultType: "complete", content: [{ type: "text", text: "continued after raw rounds" }] },
+        });
+        return;
+      }
+      const result = { resultType: "input_required", inputRequests: "@@requests@@" };
+      if (round.state !== undefined) result.requestState = "@@state@@";
+      let line = JSON.stringify({ jsonrpc: "2.0", id: message.id, result });
+      line = line.replace('"@@requests@@"', () => round.requests);
+      if (round.state !== undefined) line = line.replace('"@@state@@"', () => round.state);
+      process.stdout.write(`${line}\n`);
+      return;
+    }
     if (
       mode === "mrtr_input_required" ||
       mode === "mrtr_url_required" ||
@@ -1023,6 +1055,7 @@ process.stdin.on("data", (chunk) => {
     buffer = buffer.subarray(lineEnd + 1);
     if (line.length === 0) continue;
     const message = JSON.parse(line);
+    if (rawLinesPath && message.method === "tools/call") appendFileSync(rawLinesPath, `${line}\n`);
     if (callReleasePath && message.method === "tools/call") {
       if (callStartedPath) appendFileSync(callStartedPath, `${process.pid}\n`);
       const timer = setInterval(() => {

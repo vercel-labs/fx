@@ -17,6 +17,7 @@ const config_runtime = @import("../config/config_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
+const sandbox_policy = @import("../runner/runner.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const statusline_identity = @import("../workspace/statusline_identity.zig");
@@ -587,6 +588,7 @@ pub fn Runtime(comptime App: type) type {
             app_permission_runtime.Runtime(App).initMode(app, agent, permission_mode);
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
             app.agent_step_limit = startup.agent_step_limit;
+            if (comptime @hasField(App, "personal_shortcuts")) app.personal_shortcuts.map = startup.personal_shortcuts;
             agent.worker.agent_turn_settings.max_tool_result_bytes = startup.max_tool_result_bytes;
             agent.worker.agent_turn_settings.auto_compact_percent = startup.auto_compact_percent;
             if (comptime @hasField(App, "context_limits")) app.context_limits = startup.context_limits;
@@ -604,6 +606,9 @@ pub fn Runtime(comptime App: type) type {
             // Worker-owned memory uses the C allocator, matching worker deinit.
             try agent.worker.setProviderRouting(std.heap.c_allocator, startup.provider_order, startup.provider_strict);
             app.context_enabled = startup.context_enabled;
+            if (comptime !host_target.is_wasm and @hasField(App, "sandbox_policy")) {
+                if (startup.sandbox_execution) app.sandbox_policy = sandbox_policy.loadForProcess(app.alloc);
+            }
             app.fast_mode = startup.fast_mode;
             app.input_runtime.slash_menu_categories = startup.slash_menu_categories;
             app.shell.collapse_tool_calls = startup.collapse_tool_calls;
