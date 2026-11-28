@@ -359,6 +359,12 @@ print(json.dumps({"exitCode": rc, "signal": sig}))
   };
 }
 
+// macOS 15 revokes a terminal so that it polls readable and every read fails
+// with EIO. Linux cannot revoke a PTY, so this state runs only on macOS: the
+// paste-wait case is in tests/e2e/mcp-auth.test.ts, and the rule is pinned by
+// the goneFromEvidence tests in src/ui/terminal/terminal.zig.
+const READABLE_REVOKED_REASON = "macOS 15 readable-only revoke cannot be forced on a Linux PTY; covered by the macOS e2e test and goneFromEvidence unit tests";
+
 // Explicit reason for model states that require an unimplemented FX_TEST_*
 // fault hook or a kernel-internal scheduling race that cannot be forced from
 // outside the process on a standard PTY.
@@ -420,6 +426,20 @@ const OUT_OF_REACH: Record<string, string> = {
   "EnterOrLeaveAltScreen|turn_running|orphaned|turn=true|hup=true|openEio=false": "orphaned-pgrp write EIO on alt-screen write is covered by terminalGone unit test",
   "HandleSighup|frame_write|open|turn=false|hup=true|openEio=false": "direct SIGHUP during an unblocked idle frame write cannot be synchronized externally without a block hook",
   "HandleSighup|frame_write|open|turn=true|hup=true|openEio=false": "direct SIGHUP during a frame write gives no sync signal without a block hook; covered by HandleSighup on turn_running",
+  "StartupLifecycleWrite|startup|readable_revoked|turn=false|hup=false|openEio=false": READABLE_REVOKED_REASON,
+  "StartupLifecycleWrite|startup|readable_revoked|turn=false|hup=true|openEio=false": READABLE_REVOKED_REASON,
+  "PollAndReadInput|idle|readable_revoked|turn=false|hup=false|openEio=false": READABLE_REVOKED_REASON,
+  "PollAndReadInput|idle|readable_revoked|turn=false|hup=true|openEio=false": READABLE_REVOKED_REASON,
+  "PollAndReadInput|turn_running|readable_revoked|turn=true|hup=false|openEio=false": READABLE_REVOKED_REASON,
+  "PollAndReadInput|turn_running|readable_revoked|turn=true|hup=true|openEio=false": READABLE_REVOKED_REASON,
+  "FinishFrameWrite|frame_write|readable_revoked|turn=false|hup=false|openEio=false": READABLE_REVOKED_REASON,
+  "FinishFrameWrite|frame_write|readable_revoked|turn=false|hup=true|openEio=false": READABLE_REVOKED_REASON,
+  "FinishFrameWrite|frame_write|readable_revoked|turn=true|hup=false|openEio=false": READABLE_REVOKED_REASON,
+  "FinishFrameWrite|frame_write|readable_revoked|turn=true|hup=true|openEio=false": READABLE_REVOKED_REASON,
+  "EnterOrLeaveAltScreen|idle|readable_revoked|turn=false|hup=false|openEio=false": READABLE_REVOKED_REASON,
+  "EnterOrLeaveAltScreen|idle|readable_revoked|turn=false|hup=true|openEio=false": READABLE_REVOKED_REASON,
+  "EnterOrLeaveAltScreen|turn_running|readable_revoked|turn=true|hup=false|openEio=false": READABLE_REVOKED_REASON,
+  "EnterOrLeaveAltScreen|turn_running|readable_revoked|turn=true|hup=true|openEio=false": READABLE_REVOKED_REASON,
 };
 
 const SCENARIO_FOR_KEY: Record<string, { name: string; mode: PtyMode; needsTurn?: boolean }> = {

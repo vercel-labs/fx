@@ -18,6 +18,7 @@ TerminalHangup mutant-a-no-init-hangup GoneIsQuiet
 TerminalHangup mutant-a-no-pollnval NoSpin
 TerminalHangup mutant-a-no-orphan GoneIsQuiet
 TerminalHangup mutant-a-blind-eio OpenEioIsReported
+TerminalHangup mutant-a-no-still-terminal GoneIsQuiet
 TerminalHangup mutant-b-no-pollnval NoSpin
 TerminalHangup mutant-b-no-exit-check GoneIsQuiet
 TerminalHangup mutant-b-blind-eio OpenEioIsReported
