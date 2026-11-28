@@ -110,6 +110,8 @@ pub const Host = struct {
     trace: vercel.Trace,
     clock: Clock = .{},
     user_check: UserCheck,
+    /// Optional running binary path override for tests; null resolves `runningBinaryPath`.
+    fx_bin: ?[]const u8 = null,
 };
 
 pub const Call = struct {
@@ -143,6 +145,14 @@ pub fn callFor(
         .responder = responder,
         .cancel = cancel,
     };
+}
+
+pub fn runningBinaryPath(arena: std.mem.Allocator) []const u8 {
+    return std.process.executablePathAlloc(io_mod.getIo(), arena) catch "fx";
+}
+
+fn binaryOf(host: *const Host, arena: std.mem.Allocator) []const u8 {
+    return host.fx_bin orelse runningBinaryPath(arena);
 }
 
 pub const Result = union(enum) {
@@ -239,9 +249,9 @@ fn resolveUser(host: *Host, call: Call, token: vercel.Token) std.mem.Allocator.E
             return .{ .login = .{ .user = user.id } };
         },
         .rejected => return .{ .login = .rejected },
-        .not_found => return .{ .done = try apiFailure(call.arena, .{ .step = user_step, .reason = .bad_reply }) },
+        .not_found => return .{ .done = try apiFailure(host, call.arena, .{ .step = user_step, .reason = .bad_reply }) },
         .canceled => return .{ .done = .canceled },
-        .failed => |failure| return .{ .done = try apiFailure(call.arena, failure) },
+        .failed => |failure| return .{ .done = try apiFailure(host, call.arena, failure) },
     }
 }
 
@@ -386,7 +396,7 @@ fn finish(host: *Host, call: Call, transition: setup.Transition) std.mem.Allocat
     try recordMark(host, call, transition.state);
     return switch (transition.decision) {
         .ready => .{ .ready = (try host.slot.currentDestination(call.arena)) orelse unreachable },
-        .refuse => |refusal| .{ .refused = try refusalText(call.arena, refusal) },
+        .refuse => |refusal| .{ .refused = try refusalText(call.arena, binaryOf(host, call.arena), refusal) },
         .canceled => .canceled,
         .none, .wait, .need_user, .discover, .ask_copy, .create_project, .write => unreachable,
     };
@@ -686,7 +696,8 @@ fn copySchema(arena: std.mem.Allocator) std.mem.Allocator.Error!std.json.Value {
     });
 }
 
-fn refusalText(arena: std.mem.Allocator, refusal: setup.Refusal) std.mem.Allocator.Error![]const u8 {
+fn refusalText(arena: std.mem.Allocator, fx_bin: []const u8, refusal: setup.Refusal) std.mem.Allocator.Error![]const u8 {
+    const bin = text_utils.terminalSafe(if (fx_bin.len > 0) fx_bin else "fx");
     return switch (refusal) {
         .no_login => e5_text,
         .login_expired => e6_text,
@@ -697,17 +708,18 @@ fn refusalText(arena: std.mem.Allocator, refusal: setup.Refusal) std.mem.Allocat
         .config_changed => e14_text,
         .config_invalid => |text| arena.print("{s}{s}{s}", .{ e4_prefix, text, e4_suffix }),
         .workspace_unresolved => |text| text,
-        .no_team => |missing| noTeamText(arena, missing),
+        .no_team => |missing| noTeamText(arena, fx_bin, missing),
         .project_not_found => |missing| arena.print(
-            "fx did not run this command: Vercel project `{f}` (from `{s}`) was not found on team `{f}`. Ask the person for a project name and run `fx config set {s} <name>`.",
-            .{ text_utils.terminalSafe(missing.name), project_setting_key, text_utils.terminalSafe(missing.team.slug), project_setting_key },
+            "fx did not run this command: Vercel project `{f}` (from `{s}`) was not found on team `{f}`. Ask the person for a project name and run `{f} config set {s} <name>`.",
+            .{ text_utils.terminalSafe(missing.name), project_setting_key, text_utils.terminalSafe(missing.team.slug), bin, project_setting_key },
         ),
-        .project_create_failed => |failure| projectCreateFailedText(arena, failure),
+        .project_create_failed => |failure| projectCreateFailedText(arena, fx_bin, failure),
         .setup_failed => |failure| failureText(arena, failure),
     };
 }
 
-fn noTeamText(arena: std.mem.Allocator, missing: setup.TeamMissing) std.mem.Allocator.Error![]const u8 {
+fn noTeamText(arena: std.mem.Allocator, fx_bin: []const u8, missing: setup.TeamMissing) std.mem.Allocator.Error![]const u8 {
+    const bin = text_utils.terminalSafe(if (fx_bin.len > 0) fx_bin else "fx");
     var slugs: std.Io.Writer.Allocating = .init(arena);
     const limit = @min(missing.available.len, vercel.max_team_hints);
     for (missing.available[0..limit], 0..) |team, index| {
@@ -717,36 +729,37 @@ fn noTeamText(arena: std.mem.Allocator, missing: setup.TeamMissing) std.mem.Allo
     if (missing.setting_slug) |slug| {
         if (limit > 0) {
             return arena.print(
-                "fx did not run this command: Vercel team `{f}` (from `{s}`) was not found. Available teams: {s}. Ask the person which one to use and run `fx config set {s} <slug>`.",
-                .{ text_utils.terminalSafe(slug), team_setting_key, slugs.written(), team_setting_key },
+                "fx did not run this command: Vercel team `{f}` (from `{s}`) was not found. Available teams: {s}. Ask the person which one to use and run `{f} config set {s} <slug>`.",
+                .{ text_utils.terminalSafe(slug), team_setting_key, slugs.written(), bin, team_setting_key },
             );
         }
         return arena.print(
-            "fx did not run this command: Vercel team `{f}` (from `{s}`) was not found, and no teams were listed for this login. Ask the person which team slug to use and run `fx config set {s} <slug>`.",
-            .{ text_utils.terminalSafe(slug), team_setting_key, team_setting_key },
+            "fx did not run this command: Vercel team `{f}` (from `{s}`) was not found, and no teams were listed for this login. Ask the person which team slug to use and run `{f} config set {s} <slug>`.",
+            .{ text_utils.terminalSafe(slug), team_setting_key, bin, team_setting_key },
         );
     }
     if (limit > 0) {
         return arena.print(
-            "fx did not run this command: no Vercel team is selected. Available teams: {s}. Ask the person which one to use and run `fx config set {s} <slug>`.",
-            .{ slugs.written(), team_setting_key },
+            "fx did not run this command: no Vercel team is selected. Available teams: {s}. Ask the person which one to use and run `{f} config set {s} <slug>`.",
+            .{ slugs.written(), bin, team_setting_key },
         );
     }
     return arena.print(
-        "fx did not run this command: no Vercel team was found for this login. Ask the person which team slug to use and run `fx config set {s} <slug>`.",
-        .{team_setting_key},
+        "fx did not run this command: no Vercel team was found for this login. Ask the person which team slug to use and run `{f} config set {s} <slug>`.",
+        .{ bin, team_setting_key },
     );
 }
 
-fn projectCreateFailedText(arena: std.mem.Allocator, failure: vercel.Failure) std.mem.Allocator.Error![]const u8 {
+fn projectCreateFailedText(arena: std.mem.Allocator, fx_bin: []const u8, failure: vercel.Failure) std.mem.Allocator.Error![]const u8 {
+    const bin = text_utils.terminalSafe(if (fx_bin.len > 0) fx_bin else "fx");
     var buffer: [256]u8 = undefined;
     const detail: []const u8 = switch (failure.reason) {
         .status => |code| std.mem.print(&buffer, "HTTP {d}", .{code}) catch "HTTP error",
         else => vercel.describe(&buffer, failure),
     };
     return arena.print(
-        "fx did not run this command: could not create project `{s}` ({s}). Ask the person for a project name and run `fx config set {s} <name>`.",
-        .{ vercel.sandbox_project_name, detail, project_setting_key },
+        "fx did not run this command: could not create project `{s}` ({s}). Ask the person for a project name and run `{f} config set {s} <name>`.",
+        .{ vercel.sandbox_project_name, detail, bin, project_setting_key },
     );
 }
 
@@ -777,8 +790,8 @@ fn failureText(arena: std.mem.Allocator, failure: setup.StepFailure) std.mem.All
     return arena.print("{s}{s}", .{ e9_prefix, detail });
 }
 
-fn apiFailure(arena: std.mem.Allocator, failure: vercel.Failure) std.mem.Allocator.Error!Result {
-    return .{ .refused = try refusalText(arena, .{ .setup_failed = .{ .step = failure.step, .reason = .{ .api = failure.reason } } }) };
+fn apiFailure(host: *const Host, arena: std.mem.Allocator, failure: vercel.Failure) std.mem.Allocator.Error!Result {
+    return .{ .refused = try refusalText(arena, binaryOf(host, arena), .{ .setup_failed = .{ .step = failure.step, .reason = .{ .api = failure.reason } } }) };
 }
 
 fn trace(host: *const Host, comptime format: []const u8, args: anytype) void {
@@ -1121,12 +1134,14 @@ test "no team found refuses with up to 10 team slugs and fx config set fix" {
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const res = try env.run(arena.allocator(), env.repo_a, "session-a", 5);
+    const a = arena.allocator();
+    const res = try env.run(a, env.repo_a, "session-a", 5);
+    const bin_cmd = try a.print("{s} config set " ++ team_setting_key ++ " <slug>", .{runningBinaryPath(a)});
     switch (res) {
         .refused => |text| {
             try testing.expect(std.mem.find(u8, text, "acme") != null);
             try testing.expect(std.mem.find(u8, text, "beta") != null);
-            try testing.expect(std.mem.find(u8, text, "fx config set " ++ team_setting_key ++ " <slug>") != null);
+            try testing.expect(std.mem.find(u8, text, bin_cmd) != null);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1146,11 +1161,13 @@ test "explicit project exists uses it; missing explicit project refuses with pro
 
     const env_missing = try TestEnv.create(alloc, &.{ user_default_team_reply, team_def_reply, not_found_reply }, &.{});
     defer env_missing.destroy();
-    const missing = try env_missing.runWithIntent(arena.allocator(), env_missing.repo_a, .{ .project = "missing-proj" }, "session-a", 5);
+    const a = arena.allocator();
+    const missing = try env_missing.runWithIntent(a, env_missing.repo_a, .{ .project = "missing-proj" }, "session-a", 5);
+    const bin_cmd = try a.print("{s} config set " ++ project_setting_key ++ " <name>", .{runningBinaryPath(a)});
     switch (missing) {
         .refused => |text| {
             try testing.expect(std.mem.find(u8, text, "missing-proj") != null);
-            try testing.expect(std.mem.find(u8, text, "fx config set " ++ project_setting_key ++ " <name>") != null);
+            try testing.expect(std.mem.find(u8, text, bin_cmd) != null);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1179,11 +1196,13 @@ test "fx-sandbox create failure refuses with HTTP status and project fix, writes
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const res = try env.run(arena.allocator(), env.repo_a, "session-a", 5);
+    const a = arena.allocator();
+    const res = try env.run(a, env.repo_a, "session-a", 5);
+    const bin_cmd = try a.print("{s} config set " ++ project_setting_key ++ " <name>", .{runningBinaryPath(a)});
     switch (res) {
         .refused => |text| {
             try testing.expect(std.mem.find(u8, text, "HTTP 500") != null);
-            try testing.expect(std.mem.find(u8, text, "fx config set " ++ project_setting_key ++ " <name>") != null);
+            try testing.expect(std.mem.find(u8, text, bin_cmd) != null);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1447,4 +1466,26 @@ test "a Vercel CLI currentTeam change asks again for the new team" {
     try expectReady(try env.run(a, env.repo_a, "session-a", 6), "team_exp", "prj_sandbox");
     try testing.expectEqual(@as(usize, 2), env.scripted.prompts);
     try testing.expect(std.mem.find(u8, env.scripted.lastMessage(), "Vercel team Explicit Team, project fx-sandbox?") != null);
+}
+
+test "refusal text builders use the provided fx binary path and runningBinaryPath is absolute" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const running = runningBinaryPath(a);
+    try testing.expect(std.Io.Dir.path.isAbsolute(running));
+
+    const custom = "/opt/custom/bin/fx";
+    const team_msg = try noTeamText(a, custom, .{});
+    try testing.expect(std.mem.find(u8, team_msg, "/opt/custom/bin/fx config set " ++ team_setting_key ++ " <slug>") != null);
+
+    const proj_msg = try refusalText(a, custom, .{ .project_not_found = .{
+        .team = .{ .id = "team_1", .slug = "acme", .name = "Acme" },
+        .name = "web",
+    } });
+    try testing.expect(std.mem.find(u8, proj_msg, "/opt/custom/bin/fx config set " ++ project_setting_key ++ " <name>") != null);
+
+    const create_msg = try projectCreateFailedText(a, custom, .{ .step = "create project", .reason = .{ .status = 403 } });
+    try testing.expect(std.mem.find(u8, create_msg, "/opt/custom/bin/fx config set " ++ project_setting_key ++ " <name>") != null);
 }

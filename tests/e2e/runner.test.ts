@@ -1351,7 +1351,7 @@ describe("remote setup over ACP: destination defaults, copy question, and consen
           expect(run.elicitations).toEqual([]);
           const texts = toolTexts(fixture.gateway);
           expect(texts).toContain("does-not-exist");
-          expect(texts).toContain("fx config set sandbox_project <name>");
+          expect(texts).toContain(`${realpathSync(FX_BIN)} config set sandbox_project <name>`);
           expect(setup.api.log.filter((entry) => entry.route === "createProject")).toEqual([]);
           expect(execEvents(fixture)).toEqual([]);
         },

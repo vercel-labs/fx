@@ -65,6 +65,7 @@ pub const ensureRemoteReady = setup_host.ensureReady;
 pub const remote_trace = setup_host.debug_trace_sink;
 pub const remoteCall = setup_host.callFor;
 pub const settingsErrorText = setup_host.settingsErrorText;
+pub const runningBinaryPath = setup_host.runningBinaryPath;
 
 const consent = @import("consent.zig");
 pub const writeConsentForTest = consent.write;
