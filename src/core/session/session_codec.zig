@@ -597,9 +597,10 @@ pub fn namesImages(user: session.UserTurn, stored: ?*const StoredImages) bool {
     return false;
 }
 
-/// Whether `execution` is written as schema 11, 12 or 13, with context notes
-/// (D93), a saved runtime context (D94), a toolbox record (D103) or a saved
-/// turn effort (D104), which an fx from before them rejects. A journal event, checkpoint, or snapshot that holds one says so
+/// Whether `execution` is written as schema 11, 12, 13 or 14, with context
+/// notes (D93), a saved runtime context (D94), a toolbox record (D103) or a
+/// saved turn effort (D104), which an fx from before them rejects. A journal
+/// event, checkpoint, or snapshot that holds one says so
 /// in its own version, so an older reader reports a newer format instead of
 /// a corrupt one. Matches the choice in `writeExecutionMemoryJsonFrom`.
 pub fn executionUsesNotesSchema(execution: session.ExecutionMemory) bool {
