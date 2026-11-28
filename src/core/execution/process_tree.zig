@@ -1494,6 +1494,51 @@ fn captureSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
     };
 }
 
+const ParsedLinuxStat = struct {
+    parent_pid: std.posix.pid_t,
+    start_ticks: u64,
+    zombie: bool,
+    utime_ticks: u64,
+    stime_ticks: u64,
+};
+
+fn parseLinuxStat(stat: []const u8) error{ProcessIdentityUnavailable}!ParsedLinuxStat {
+    const close_paren = std.mem.findScalarLast(u8, stat, ')') orelse
+        return error.ProcessIdentityUnavailable;
+    var fields = std.mem.tokenizeScalar(u8, stat[close_paren + 1 ..], ' ');
+    var field_number: usize = 3;
+    var parent_pid: ?std.posix.pid_t = null;
+    var zombie = false;
+    var utime_ticks: u64 = 0;
+    var stime_ticks: u64 = 0;
+    while (fields.next()) |field| : (field_number += 1) {
+        if (field_number == 3) zombie = field.len == 1 and field[0] == 'Z';
+        if (field_number == 4) {
+            parent_pid = std.fmt.parseInt(std.posix.pid_t, field, 10) catch
+                return error.ProcessIdentityUnavailable;
+        }
+        if (field_number == 14) {
+            utime_ticks = std.fmt.parseUnsigned(u64, field, 10) catch 0;
+        }
+        if (field_number == 15) {
+            stime_ticks = std.fmt.parseUnsigned(u64, field, 10) catch 0;
+        }
+        if (field_number == 22) {
+            const start_ticks = std.fmt.parseUnsigned(u64, field, 10) catch
+                return error.ProcessIdentityUnavailable;
+            return .{
+                .parent_pid = parent_pid orelse
+                    return error.ProcessIdentityUnavailable,
+                .start_ticks = start_ticks,
+                .zombie = zombie,
+                .utime_ticks = utime_ticks,
+                .stime_ticks = stime_ticks,
+            };
+        }
+    }
+    return error.ProcessIdentityUnavailable;
+}
+
 fn captureLinuxSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
     if (comptime builtin.target.os.tag != .linux) return error.ProcessTreeUnsupported;
     const path = try alloc.print("/proc/{d}/stat", .{pid});
@@ -1502,40 +1547,13 @@ fn captureLinuxSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot
     defer file.close(io_mod.getIo());
     var buffer: [4096]u8 = undefined;
     const read_len = try readLinuxProcFile(file, &buffer);
-    const stat = buffer[0..read_len];
-    const close_paren = std.mem.findScalarLast(u8, stat, ')') orelse
-        return error.ProcessIdentityUnavailable;
-    var fields = std.mem.tokenizeScalar(u8, stat[close_paren + 1 ..], ' ');
-    var field_number: usize = 3;
-    var parent_pid: ?std.posix.pid_t = null;
-    var zombie = false;
-    var utime: u64 = 0;
-    var stime: u64 = 0;
-    while (fields.next()) |field| : (field_number += 1) {
-        if (field_number == 3) zombie = field.len == 1 and field[0] == 'Z';
-        if (field_number == 4) {
-            parent_pid = std.fmt.parseInt(std.posix.pid_t, field, 10) catch
-                return error.ProcessIdentityUnavailable;
-        }
-        if (field_number == 14) {
-            utime = std.fmt.parseUnsigned(u64, field, 10) catch 0;
-        }
-        if (field_number == 15) {
-            stime = std.fmt.parseUnsigned(u64, field, 10) catch 0;
-        }
-        if (field_number == 22) {
-            const start_ticks = std.fmt.parseUnsigned(u64, field, 10) catch
-                return error.ProcessIdentityUnavailable;
-            return .{
-                .identity = .{ .linux_start_ticks = start_ticks },
-                .parent_pid = parent_pid orelse
-                    return error.ProcessIdentityUnavailable,
-                .zombie = zombie,
-                .cpu_time = linuxClockTicksToNs(utime +| stime, linuxTicksPerSecond()),
-            };
-        }
-    }
-    return error.ProcessIdentityUnavailable;
+    const parsed = try parseLinuxStat(buffer[0..read_len]);
+    return .{
+        .identity = .{ .linux_start_ticks = parsed.start_ticks },
+        .parent_pid = parsed.parent_pid,
+        .zombie = parsed.zombie,
+        .cpu_time = linuxClockTicksToNs(parsed.utime_ticks +| parsed.stime_ticks, linuxTicksPerSecond()),
+    };
 }
 
 fn sampleProcessActivity(
@@ -2121,4 +2139,79 @@ test "activity sample grows for a busy or writing child and stays flat for a sle
         const after = tracker.sampleActivity(writer_child.id.?, true);
         try std.testing.expect(compareActivity(before, after).writes);
     }
+}
+
+test "parseLinuxStat handles process names with closing parens and spaces" {
+    const stat = "42 ((a) b c)) S 7 42 42 0 -1 4194304 1 0 0 0 11 22 0 0 20 0 1 0 98765 0 0";
+    const parsed = try parseLinuxStat(stat);
+    try std.testing.expectEqual(@as(std.posix.pid_t, 7), parsed.parent_pid);
+    try std.testing.expectEqual(false, parsed.zombie);
+    try std.testing.expectEqual(@as(u64, 11), parsed.utime_ticks);
+    try std.testing.expectEqual(@as(u64, 22), parsed.stime_ticks);
+    try std.testing.expectEqual(@as(u64, 98765), parsed.start_ticks);
+
+    const zombie_stat = "9 (a ) b) Z 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 555";
+    const zombie_parsed = try parseLinuxStat(zombie_stat);
+    try std.testing.expectEqual(true, zombie_parsed.zombie);
+    try std.testing.expectEqual(@as(std.posix.pid_t, 1), zombie_parsed.parent_pid);
+    try std.testing.expectEqual(@as(u64, 555), zombie_parsed.start_ticks);
+}
+
+test "parseLinuxStat rejects short lines and missing close paren" {
+    try std.testing.expectError(error.ProcessIdentityUnavailable, parseLinuxStat(""));
+    try std.testing.expectError(error.ProcessIdentityUnavailable, parseLinuxStat("42 (proc S 7 42"));
+    try std.testing.expectError(
+        error.ProcessIdentityUnavailable,
+        parseLinuxStat("42 (proc) S 7 42 42 0 -1 0 0 0 0 0 11 22 0 0 20 0 1 0"),
+    );
+}
+
+test "parseLinuxStat rejects invalid required numbers and zeros invalid cpu ticks" {
+    try std.testing.expectError(
+        error.ProcessIdentityUnavailable,
+        parseLinuxStat("42 (proc) S not_a_pid 42 42 0 -1 0 0 0 0 0 11 22 0 0 20 0 1 0 98765"),
+    );
+    try std.testing.expectError(
+        error.ProcessIdentityUnavailable,
+        parseLinuxStat("42 (proc) S 7 42 42 0 -1 0 0 0 0 0 11 22 0 0 20 0 1 0 bad_start"),
+    );
+    const bad_ticks = try parseLinuxStat("42 (proc) S 7 42 42 0 -1 0 0 0 0 0 nope bad 0 0 20 0 1 0 98765");
+    try std.testing.expectEqual(@as(std.posix.pid_t, 7), bad_ticks.parent_pid);
+    try std.testing.expectEqual(@as(u64, 0), bad_ticks.utime_ticks);
+    try std.testing.expectEqual(@as(u64, 0), bad_ticks.stime_ticks);
+    try std.testing.expectEqual(@as(u64, 98765), bad_ticks.start_ticks);
+}
+
+fn fuzzLinuxProcParsers(_: void, smith: *std.testing.Smith) !void {
+    var buf: [4096]u8 = undefined;
+    const input = buf[0..smith.slice(&buf)];
+
+    if (parseLinuxStat(input)) |parsed| {
+        const close_paren = std.mem.findScalarLast(u8, input, ')') orelse
+            return error.TestExpectedEqual;
+        var fields = std.mem.tokenizeScalar(u8, input[close_paren + 1 ..], ' ');
+        const f3 = fields.next() orelse return error.TestExpectedEqual;
+        const f4 = fields.next() orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(f3.len == 1 and f3[0] == 'Z', parsed.zombie);
+        try std.testing.expectEqual(try std.fmt.parseInt(std.posix.pid_t, f4, 10), parsed.parent_pid);
+    } else |err| {
+        try std.testing.expectEqual(error.ProcessIdentityUnavailable, err);
+    }
+
+    const write_bytes = parseLinuxProcIoWriteBytes(input);
+    if (std.mem.find(u8, input, "write_bytes:") == null) {
+        try std.testing.expectEqual(@as(u64, 0), write_bytes);
+    }
+}
+
+test "Linux /proc stat and io write_bytes parsers stay bounded and valid on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzLinuxProcParsers, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "42 ((a) b c)) S 7 42 42 0 -1 4194304 1 0 0 0 11 22 0 0 20 0 1 0 98765 0 0",
+            "9 (a ) b) Z 1 9 9 0 -1 0 0 0 0 0 nope bad 0 0 20 0 1 0 555",
+            "rchar: 100\nwrite_bytes: 4096\n",
+            "write_bytes: not_a_number\n",
+        }) ++ @import("fuzz_corpus").linux_proc_parse.*),
+    });
 }
