@@ -635,16 +635,26 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         self,
     ) -> None:
         publish_libfx = PUBLISH_LIBFX_WORKFLOW_PATH.read_text(encoding="utf-8")
-        publish_step = publish_libfx.split(
+        publish_job = re.split(
+            r"\n  [A-Za-z0-9_-]+:\n", publish_libfx.split("\n  publish:\n", 1)[1], maxsplit=1
+        )[0]
+        publish_step = publish_job.split(
             "      - name: Publish the verified archive with npm trusted publishing\n", 1
         )[1].split("\n      - name: ", 1)[0]
+        step_header, step_script = publish_step.split("        run: |\n", 1)
 
-        self.assertIn("NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}", publish_step)
-        self.assertIn("CHANNEL: ${{ needs.metadata.outputs.channel }}", publish_step)
+        header_lines = step_header.splitlines()
+        for name, value in (
+            ("NPM_TAG", "${{ needs.metadata.outputs.npm_tag }}"),
+            ("CHANNEL", "${{ needs.metadata.outputs.channel }}"),
+        ):
+            with self.subTest(env=name):
+                self.assertIn(f"          {name}: {value}", header_lines)
+                self.assertEqual(
+                    1, sum(line.strip().startswith(f"{name}:") for line in header_lines)
+                )
 
-        script_lines = [
-            line.strip() for line in publish_step.split("        run: |\n", 1)[1].splitlines()
-        ]
+        script_lines = [line.strip() for line in step_script.splitlines()]
         # The guard must run before anything else in the step, so nothing can
         # publish or change CHANNEL or NPM_TAG before it decides.
         self.assertEqual("set -euo pipefail", script_lines[0])
