@@ -3,8 +3,10 @@
 //! asks the credits endpoint in the background, as `/credits` does, and
 //! saves the new answer. A team with Token Pass starts a new session on the
 //! Token Pass default model when nothing else chose the model. Without a
-//! saved answer, the first prompt of a session waits up to
-//! `first_prompt_wait_ms` for the check.
+//! saved answer, what depends on the answer waits up to
+//! `first_prompt_wait_ms` after the check starts: the app's first prompt,
+//! `fx ask`'s prompt, and in ACP a new session that nothing chose a model
+//! for, and a prompt.
 const std = @import("std");
 const builtin = @import("builtin");
 const agents = @import("../agents/agents.zig");
@@ -99,6 +101,10 @@ pub fn answerOf(snapshot: output_contracts.CreditsSnapshot) ?token_pass.Answer {
     return null;
 }
 
+/// How often a prompt's wait looks at its cancel flag. The lookup wakes the
+/// wait at once when it finishes.
+const cancel_check_ms: i64 = 10;
+
 /// For `fx ask` and ACP: the answer saved for the team, refreshed by a
 /// credits check that runs while the session works. Without a saved answer,
 /// what depends on it waits for the check with `awaitAnswer`, as the first
@@ -114,9 +120,16 @@ pub const Check = struct {
     had_saved: bool = false,
     /// When the credits check started, on the awake clock.
     started_ms: ?i64 = null,
+    /// Guards the lookup and the answer after `begin`: ACP's prompt thread
+    /// waits for the answer while its reader takes it for other requests.
+    mutex: std.Io.Mutex = .init,
+    /// The threads that wait on the lookup without the lock
+    /// (`awaitFinishUnlocked`).
+    waiters: u32 = 0,
 
     /// Starts the check with the saved answer, and never waits for it.
-    /// Publishes whether the team has Token Pass to `token_pass_team`.
+    /// Publishes whether the team has Token Pass to `token_pass_team`. Runs
+    /// before any other thread uses the check.
     pub fn begin(
         self: *Check,
         alloc: Allocator,
@@ -144,24 +157,65 @@ pub const Check = struct {
 
     /// For what depends on the answer, such as a new session's model: waits
     /// for the check while fx knows nothing of the team, until
-    /// `first_prompt_wait_ms` after the check started (`requestWaitMs`). The
-    /// lookup wakes the wait when it finishes.
-    pub fn awaitAnswer(self: *Check, alloc: Allocator) void {
-        self.poll(alloc);
-        var wait_ms = self.requestWaitMs(self.lookup.task != null, io_mod.awakeMilliTimestamp());
+    /// `first_prompt_wait_ms` after the check started (`requestWaitMs`), or
+    /// until `cancel` is set. The lookup wakes the wait when it finishes.
+    pub fn awaitAnswer(self: *Check, alloc: Allocator, cancel: ?*const std.atomic.Value(bool)) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var wait_ms = self.takeAnswerLocked(alloc);
         if (wait_ms == 0) return;
         debug_trace.logf("token_pass", "check wait started", .{});
         while (wait_ms > 0) {
-            self.lookup.awaitFinish(wait_ms) catch |err| switch (err) {
+            if (cancel) |flag| if (flag.load(.seq_cst)) {
+                debug_trace.logf("token_pass", "check wait stopped reason=cancelled", .{});
+                return;
+            };
+            const slice_ms = if (cancel != null) @min(wait_ms, cancel_check_ms) else wait_ms;
+            self.awaitFinishUnlocked(slice_ms) catch |err| switch (err) {
                 error.Canceled => {
                     debug_trace.logf("token_pass", "check wait stopped reason=cancelled", .{});
                     return;
                 },
             };
-            self.poll(alloc);
-            wait_ms = self.requestWaitMs(self.lookup.task != null, io_mod.awakeMilliTimestamp());
+            wait_ms = self.takeAnswerLocked(alloc);
         }
         if (self.lookup.task != null) debug_trace.logf("token_pass", "check wait ended without an answer wait_ms={d}", .{first_prompt_wait_ms});
+    }
+
+    /// Waits up to `wait_ms` for the lookup without the lock, so another
+    /// thread takes the answer meanwhile. The lookup's task, whose event
+    /// this waits on, stays until the wait ends (`waiters`).
+    fn awaitFinishUnlocked(self: *Check, wait_ms: i64) std.Io.Cancelable!void {
+        self.waiters += 1;
+        self.mutex.unlock(io_mod.getIo());
+        defer {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            self.waiters -= 1;
+        }
+        try self.lookup.awaitFinish(wait_ms);
+    }
+
+    /// Takes the answer if it has arrived, and the catalog's marks, then
+    /// returns how long a request still waits (`requestWaitMs`).
+    fn takeAnswerLocked(self: *Check, alloc: Allocator) i64 {
+        self.pollLocked(alloc);
+        _ = self.observeCatalogLocked(alloc);
+        return self.requestWaitMs(self.lookup.task != null, io_mod.awakeMilliTimestamp());
+    }
+
+    /// Takes the answer if it has arrived, and the catalog's marks, without
+    /// waiting.
+    pub fn takeAnswer(self: *Check, alloc: Allocator) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        _ = self.takeAnswerLocked(alloc);
+    }
+
+    /// Whether the team has Token Pass, as fx knows it now.
+    pub fn hasPass(self: *Check) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.has_pass;
     }
 
     /// How long a request that depends on the answer still waits at
@@ -174,8 +228,10 @@ pub const Check = struct {
         return @max(0, started + first_prompt_wait_ms - now_ms);
     }
 
-    /// Takes the answer if it has arrived, without waiting.
-    pub fn poll(self: *Check, alloc: Allocator) void {
+    fn pollLocked(self: *Check, alloc: Allocator) void {
+        // A waiter takes the answer once it wakes; taking it frees the task
+        // it waits on.
+        if (self.waiters > 0) return;
         var result = self.lookup.take() orelse return;
         defer result.deinit();
         const answer = answerOf(result.snapshot);
@@ -194,6 +250,12 @@ pub const Check = struct {
     /// Gateway has given none in this run (`token_pass_team.catalogAnswers`),
     /// and saves it. Returns true when it changed what fx knows.
     pub fn observeCatalog(self: *Check, alloc: Allocator) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.observeCatalogLocked(alloc);
+    }
+
+    fn observeCatalogLocked(self: *Check, alloc: Allocator) bool {
         if (self.has_pass or !token_pass_team.catalogAnswers()) return false;
         self.has_pass = true;
         token_pass_team.publishAnswer(.has_pass, false);
@@ -205,8 +267,12 @@ pub const Check = struct {
     /// Takes an answer that has arrived, then stops the check. `reason`
     /// names why, for the trace, when the check had not answered.
     pub fn finish(self: *Check, alloc: Allocator, reason: []const u8) void {
-        self.poll(alloc);
-        _ = self.observeCatalog(alloc);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        // The caller ends every thread that waits on the check first.
+        std.debug.assert(self.waiters == 0);
+        self.pollLocked(alloc);
+        _ = self.observeCatalogLocked(alloc);
         if (self.lookup.task != null) debug_trace.logf("token_pass", "check dropped reason={s}", .{reason});
         self.lookup.deinit();
     }

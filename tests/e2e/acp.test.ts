@@ -1974,6 +1974,62 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP reads session/cancel and EOF at once while a prompt waits for the Token Pass check",
+    async () => {
+      for (const way of ["session/cancel", "EOF"] as const) {
+        const root = createIsolatedRoot("fx-acp-token-pass-prompt-wait-");
+        const tracePath = join(root.root, "trace.log");
+        const trace = () => existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+        let releaseCredits = () => {};
+        const creditsReleased = new Promise<void>((resolve) => { releaseCredits = resolve; });
+        // The model never answers, so only the cancel ends the turn.
+        const gateway = startDynamicFakeGateway(() => new Promise<Response>(() => {}), {
+          titleResponses: [() => new Promise<Response>(() => {})],
+          models: tokenPassCatalog(false),
+          usage: (url) => url.pathname === "/coding-agent/v1/credits"
+            ? creditsReleased.then(() => Response.json({ balance: "5.00", token_pass: { remaining: "79.92906" } }))
+            : null,
+        });
+        try {
+          // FX_MODEL chose the model, so session/new does not wait for the check.
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0", FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "token_pass" },
+          });
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          await client.request("session/new", { mcpServers: [] }, 2);
+          await client.readLine();
+          expect(trace()).not.toContain("check wait started");
+          sendPrompt(client, 3, "Which model answers?");
+          await waitForCondition("the prompt to wait for the Token Pass check", () => trace().includes("check wait started"));
+          const sentAt = Date.now();
+          if (way === "session/cancel") {
+            client.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
+            const reply = await readResponse(client, 3, 8_000);
+            expect(reply.result.stopReason).toBe("cancelled");
+          } else {
+            client.endStdin();
+            await client.waitForExit(8_000);
+          }
+          // A reader blocked by the wait reads the cancel only once the
+          // wait runs out, 2 s after the check started.
+          expect(Date.now() - sentAt).toBeLessThan(1_000);
+          expect(trace()).toContain("check wait stopped reason=cancelled");
+          expect(trace()).not.toContain("check wait ended");
+          expect(client.stderr).toBe("");
+        } finally {
+          releaseCredits();
+          await client?.close();
+          client = undefined;
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP titles a session with the login another fx refreshed after session/new",
     async () => {
       const root = createIsolatedRoot("fx-acp-title-rotated-login-");

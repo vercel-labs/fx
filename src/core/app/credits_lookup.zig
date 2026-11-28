@@ -204,41 +204,7 @@ const Task = struct {
     }
 };
 
-const TestProvider = struct {
-    release: std.atomic.Value(bool) = .init(false),
-    calls: std.atomic.Value(usize) = .init(0),
-    saw_input: std.atomic.Value(bool) = .init(false),
-    /// Runs until released however it is cancelled, as a sign-in renewal does.
-    ignores_cancel: bool = false,
-
-    fn provider(self: *TestProvider) gateway_provider.CreditsProvider {
-        return .{ .context = self, .fetch_fn = fetch };
-    }
-
-    fn fetch(
-        raw: ?*anyopaque,
-        alloc: std.mem.Allocator,
-        input: gateway_provider.CreditsLookupInput,
-    ) output_contracts.CreditsSnapshot {
-        const self: *TestProvider = @ptrCast(@alignCast(raw.?));
-        _ = self.calls.fetchAdd(1, .seq_cst);
-        self.saw_input.store(
-            std.mem.eql(u8, input.credential orelse "", "credential") and
-                std.mem.eql(u8, input.tenant orelse "", "tenant") and
-                input.cancel_flag != null,
-            .seq_cst,
-        );
-        // Stands in for a slow endpoint until the test releases it or the
-        // lookup is cancelled.
-        while (!self.release.load(.seq_cst) and (self.ignores_cancel or !input.cancel_flag.?.load(.seq_cst))) {
-            std.Thread.yield() catch {};
-        }
-        if (input.cancel_flag.?.load(.seq_cst)) {
-            return .{ .err_message = alloc.dupe(u8, "cancelled") catch null };
-        }
-        return .{ .balance = alloc.dupe(u8, "42") catch null };
-    }
-};
+const HeldCredits = @import("credits_lookup_testing.zig").HeldCredits;
 
 fn takeWhenDone(lookup: *Lookup) Result {
     while (true) {
@@ -249,7 +215,7 @@ fn takeWhenDone(lookup: *Lookup) Result {
 
 test "credits lookup hands over its finished snapshot once" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var fake: TestProvider = .{};
+    var fake: HeldCredits = .{};
     var lookup: Lookup = .{};
     defer lookup.deinit();
 
@@ -262,7 +228,7 @@ test "credits lookup hands over its finished snapshot once" {
     @memset(&credential, 'x');
     try std.testing.expect(lookup.take() == null);
 
-    fake.release.store(true, .seq_cst);
+    fake.release();
     var result = takeWhenDone(&lookup);
     defer result.deinit();
     try std.testing.expectEqualStrings("42", result.snapshot.balance.?);
@@ -273,32 +239,24 @@ test "credits lookup hands over its finished snapshot once" {
 
 test "credits lookup reports busy while one runs" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var fake: TestProvider = .{};
+    var fake: HeldCredits = .{};
     var lookup: Lookup = .{};
     defer lookup.deinit();
 
     try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 0));
     try std.testing.expectEqual(Start.busy, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 0));
 
-    fake.release.store(true, .seq_cst);
+    fake.release();
     var result = takeWhenDone(&lookup);
     result.deinit();
     try std.testing.expectEqual(@as(usize, 1), fake.calls.load(.seq_cst));
     try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 0));
 }
 
-/// Releases `fake` once a waiter parks on the lookup, or after `give_up_ms`.
-fn releaseOnceWaiting(fake: *TestProvider, done: *const std.Io.Event, give_up_ms: i64) void {
-    const deadline_ms = io_mod.awakeMilliTimestamp() + give_up_ms;
-    // A failed yield only spins once more.
-    while (@atomicLoad(std.Io.Event, done, .acquire) != .waiting and io_mod.awakeMilliTimestamp() < deadline_ms) std.Thread.yield() catch {};
-    fake.release.store(true, .seq_cst);
-}
-
 test "credits lookup wakes a waiter when it finishes, and a wait with none running returns at once" {
     if (builtin.single_threaded) return error.SkipZigTest;
     const wait_ms: i64 = 5_000;
-    var fake: TestProvider = .{};
+    var fake: HeldCredits = .{};
     var lookup: Lookup = .{};
     defer lookup.deinit();
 
@@ -307,7 +265,7 @@ test "credits lookup wakes a waiter when it finishes, and a wait with none runni
     try std.testing.expect(io_mod.awakeMilliTimestamp() - started_ms < @divTrunc(wait_ms, 2));
 
     _ = try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 0);
-    const releaser = try std.Thread.spawn(.{}, releaseOnceWaiting, .{ &fake, &lookup.task.?.done, 2 * wait_ms });
+    const releaser = try std.Thread.spawn(.{}, HeldCredits.releaseOnceWaiting, .{ &fake, &lookup.task.?.done, 2 * wait_ms });
     started_ms = io_mod.awakeMilliTimestamp();
     try lookup.awaitFinish(wait_ms);
     const waited_ms = io_mod.awakeMilliTimestamp() - started_ms;
@@ -320,7 +278,7 @@ test "credits lookup wakes a waiter when it finishes, and a wait with none runni
 
 test "credits lookup at exit is cancelled and left running instead of waited for" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var fake: TestProvider = .{ .ignores_cancel = true };
+    var fake: HeldCredits = .{ .ignores_cancel = true };
     var lookup: Lookup = .{};
 
     try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 0));
@@ -332,14 +290,14 @@ test "credits lookup at exit is cancelled and left running instead of waited for
     try std.testing.expect(!task.done.isSet());
 
     // The process would end here; the test lets the task finish and frees it.
-    fake.release.store(true, .seq_cst);
+    fake.release();
     var result = task.finish();
     result.deinit();
 }
 
 test "credits lookup shutdown cancels a stalled fetch and waits for it" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var fake: TestProvider = .{};
+    var fake: HeldCredits = .{};
     var lookup: Lookup = .{};
 
     try std.testing.expectEqual(Start.started, try lookup.start(fake.provider(), .{ .credential = null, .tenant = null }, null, 0));
@@ -347,5 +305,5 @@ test "credits lookup shutdown cancels a stalled fetch and waits for it" {
     lookup.deinit();
 
     try std.testing.expect(lookup.task == null);
-    try std.testing.expect(!fake.release.load(.seq_cst));
+    try std.testing.expect(!fake.released.load(.seq_cst));
 }
