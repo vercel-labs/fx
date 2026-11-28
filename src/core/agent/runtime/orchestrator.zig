@@ -4331,6 +4331,7 @@ fn persistPromptBeforeCapture(
             .execution = projected,
             .saved_execution = finalization.savedExecution(execution),
         }) catch |err| break :saved err;
+        finalization.flushed_piece_steps = execution.tool_steps.len;
         return;
     };
     debug_trace.logf("session", "event=prompt_before_capture_unsaved err={s}", .{@errorName(saved)});
@@ -4364,6 +4365,7 @@ fn appendRunningToolCalls(
         .running_calls = running,
         .running_assistant = issuing.content,
     });
+    finalization.flushed_piece_steps = execution.tool_steps.len;
 }
 
 /// Streams one main-model completion, then has the host confirm it still
@@ -4518,7 +4520,10 @@ fn persistRecoveryCheckpointWithAction(
     const projected = try finalization.persistedExecution(arena, execution);
     const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id };
     // Every completed piece reaches the session before the next request.
-    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected, .saved_execution = finalization.savedExecution(execution), .recovery_record = record });
+    if (deps.append_turn_piece) |append| {
+        try append(deps.ctx, .{ .user = user, .execution = projected, .saved_execution = finalization.savedExecution(execution), .recovery_record = record });
+        finalization.flushed_piece_steps = execution.tool_steps.len;
+    }
     const effect = deps.recovery_checkpoint orelse return;
     try effect.set(deps.ctx, .{
         .turn_id = job.turn_id,
@@ -4708,12 +4713,17 @@ const CompactionSource = struct {
         const execution = try runtime_execution_memory.buildExecutionMemory(self.arena, self.current_turn_messages);
         const projected = try self.finalization.persistedExecution(self.arena, execution);
         const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id };
-        if (deps.append_turn_piece) |append| try append(deps.ctx, .{
-            .user = user,
-            .execution = projected,
-            .saved_execution = self.finalization.savedExecution(execution),
-            .recovery_record = .keep,
-        });
+        if (execution.tool_steps.len > (self.finalization.flushed_piece_steps orelse 0)) {
+            if (deps.append_turn_piece) |append| {
+                try append(deps.ctx, .{
+                    .user = user,
+                    .execution = projected,
+                    .saved_execution = self.finalization.savedExecution(execution),
+                    .recovery_record = .keep,
+                });
+                self.finalization.flushed_piece_steps = execution.tool_steps.len;
+            }
+        }
         const effect = deps.recovery_checkpoint orelse return;
         try effect.set(deps.ctx, .{
             .turn_id = job.turn_id,
@@ -4989,6 +4999,45 @@ test "mid-turn compaction writes finished turn pieces to append_turn_piece befor
         const result = processAgentPrompt(&agent, &deps, null, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, fixture.config().workspace_root), fixture.config(), job);
         try std.testing.expectError(error.TestPersistenceFailure, result);
         try std.testing.expectEqual(@as(usize, 0), host.compaction_calls);
+    }
+
+    // 3. No redundant append_turn_piece when persistRecoveryCheckpoint already flushed the finished step.
+    {
+        var fixture: support.PromptFixture = .{};
+        var host: Host = .{ .fake = support.FakeAgentRuntimeDeps.init(alloc) };
+        defer host.fake.deinit();
+        defer host.deinit();
+        var deps = host.fake.deps();
+        deps.ctx = &host;
+        deps.append_turn_piece = Host.appendPiece;
+        var guard = TurnFinalizationGuard.init(&deps, 42, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, "/tmp"));
+        defer guard.deinit();
+        const call = ToolCall{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"step1.txt\"}" };
+        const msgs = [_]ChatMessage{
+            .{ .role = .assistant, .content = "step 1", .tool_calls = &.{call} },
+            .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .tool_result_status = .success, .content = "ok" },
+        };
+        const job = fixture.job();
+        try persistRecoveryCheckpointWithAction(&deps, &guard, job, &msgs, "", "gateway/model", false, false, 0, false, .network_interrupted, .retrying_request, .none, .{}, .keep);
+        try std.testing.expectEqual(@as(usize, 1), host.events.items.len);
+
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        var compaction_source: CompactionSource = .{
+            .deps = &deps,
+            .finalization = &guard,
+            .arena = arena_state.allocator(),
+            .job = job,
+            .current_turn_messages = &msgs,
+            .route_model = "gateway/model",
+            .requested_fast_mode = false,
+            .fast_mode = false,
+            .consumed_attempts = 0,
+            .tool_evidence = .none,
+            .trace_ctx = .{},
+        };
+        try CompactionSource.persist(&compaction_source);
+        try std.testing.expectEqual(@as(usize, 1), host.events.items.len);
     }
 }
 

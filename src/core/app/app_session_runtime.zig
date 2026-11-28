@@ -6180,7 +6180,10 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "shell")) {
                 if (comptime @hasDecl(@TypeOf(app.shell), "transcriptWindowCompacted")) {
                     const pre_compaction_saved = if (comptime agents.hasAgentField(App, "session_persistence"))
-                        agent.session_persistence.v2 != null and !agent.session_persistence.turn_piece_save_failed
+                        if (agent.session_persistence.v2) |v2|
+                            !agent.session_persistence.turn_piece_save_failed and (active_prefix == null or v2.turn_open)
+                        else
+                            false
                     else
                         false;
                     if (transcriptInContext(app, agent)) try app.shell.transcriptWindowCompacted(app.alloc, pre_compaction_saved);

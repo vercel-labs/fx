@@ -42,6 +42,10 @@ pub const TurnFinalizationGuard = struct {
     state: State = .open,
     outcome: ?types.TurnPresentationOutcome = null,
     compacted_execution: execution_memory.CompactedExecutionBoundary = .{},
+    /// Tool steps already flushed to `append_turn_piece` during this turn,
+    /// so pre-compaction persistence skips redundant writes when no new step
+    /// finished since the last append.
+    flushed_piece_steps: ?usize = null,
     /// The runtime context this turn captured for the session, if it did.
     /// Every save of the turn carries it, so a streamed turn keeps one prefix
     /// (D94). Borrowed from the turn's arena.
