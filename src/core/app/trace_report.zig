@@ -60,14 +60,16 @@
 //!   taken during a turn, so it may be partial; `interrupted_turn`
 //!   {`in_flight_tool`, `completed_tools`, a count}; `session_title`
 //!   {`status`, `reason`, `detail`}; `network_call`, for the newest 3 failed
-//!   calls, with `call` holding the `network_call` fields; `tool_call`, for
+//!   calls, with `call` holding the `network_call` fields; `os_error`, for
+//!   the newest 3, with the `os_error` fields; `tool_call`, for
 //!   the newest 5 calls that did not succeed, with `call` {`at`, `name`,
 //!   `outcome`, `duration_ms`, `source`, `cause`, `call_id`}, from the kept
 //!   failures that later successful calls do not remove; `compaction` {`event`,
 //!   `turn_id`, `detail`}, for the newest 3 failures; `mcp_server` {`issue`
 //!   (`failed`, `retrying`, `missing_env`, `invalid_env`, or `needs_login`),
 //!   `name`, `variable`, `error` (masked)}; `model_catalog` {`event`,
-//!   `detail`}, for the newest 3 failures.
+//!   `detail`}, for the newest 3 failures; `sign_in` {`at`, `event`,
+//!   `detail`}, for the newest 3 failed `sign_in_event` records.
 //! - `last_shutdown`: `status` (`recorded`, `none`, or `unreadable`),
 //!   `total_ms`, `recorded_at`, and `stages`, a list of {`name`, `step_ms`}.
 //! - `last_crash`: `status` (`recorded`, `none`, `too_large`, `unreadable`, `stale`, `future`, or `undated`), the crash
@@ -153,6 +155,14 @@
 //!   push out (0 when none failed); `session.errors` counts every failed
 //!   call. Then a `failed_network_call` per kept failure, oldest first, with
 //!   the `network_call` fields; the `network_call` problems come from these.
+//!   The `network` record also has `os_errors`, the network calls this
+//!   session that failed with an OS error code that Zig has no name for and
+//!   reports as `Unexpected`. Then an `os_error` per kept one, at most 16,
+//!   oldest first: `at`, `call` (`lookup`, `connect`, `read`, `write`,
+//!   `receive`, or `send`), and the code as `errno` and `errno_name`, such as
+//!   `EINVAL`, when the call left one; a `lookup` has none. A request that
+//!   failed with the error `Unexpected` in one of those calls has an
+//!   `os_error` near the time it ended.
 //! - `model_catalog`: `cache` {`state`, `entries`, `last_attempt_age_ms`, and
 //!   after a failure `failure`, `retryable`, `http_status`,
 //!   `anonymous_fallback`}; `selected_model` {`model`, `image_input`,
@@ -166,6 +176,29 @@
 //!   session. Then a `failed_model_catalog_event` per kept failure, oldest
 //!   first, with the `model_catalog_event` fields and the same `sequence`;
 //!   the `model_catalog` problems come from these.
+//! - `sign_in`: `events`, the events the bounded ring holds, at most 32;
+//!   `session_events`, every event this session; `kept_failures`, the failed
+//!   events kept apart from the ring, at most 32, which later successful
+//!   events never push out (a newer failure replaces the oldest);
+//!   `session_failures`, every failed event this session. Then a
+//!   `sign_in_event` per retained event, oldest first: `at`, `sequence`,
+//!   `event`, `failed`, `detail`, and `truncated`, whether the detail was cut
+//!   when recorded. Then a `failed_sign_in_event` per kept failure, oldest
+//!   first, with the same fields and `sequence`. `event` is `lock_wait`, a
+//!   wait for the fx login's `auth.lock` that every fx process sharing the
+//!   login takes (`outcome` `taken`, `given_up`, or the name of another lock
+//!   error, `waited_ms`, and for a failure `limit_ms`);
+//!   `refresh`, one refresh of the saved fx login (`mode`, `outcome`
+//!   `rotated`, `saved_login_used`, `no_saved_login`, or `failed` with the
+//!   `step` and `err` where it stopped, `ms`); `issuer`, its request to the
+//!   issuer (`outcome`, `step`, `err`, `ms`, `login_deleted`, whether fx
+//!   deleted the saved login after the issuer refused it); or `prompt`, a
+//!   prompt that stopped for its credential or went on after a sign-in
+//!   (`outcome`, `screen` `main` or `subagent`, `turn_id`, and for a failure
+//!   `source`, `reason`, `retryable`, `err`, and `notice` `shown` or
+//!   `not_shown`). A `detail` holds only these names, counts, and
+//!   durations, never a token or an account. Sign-in events are recorded
+//!   even when `FX_TRACE` is off.
 //! - `tool_calls`: `retained`, `outcomes` {`succeeded`, `rejected`,
 //!   `command_failed`, `tool_failed`, `runtime_failed`}, `total_ms`, `session`
 //!   {`calls`, `outcomes`, `total_ms`}, `complete`, `web_search_retained`,
@@ -348,9 +381,11 @@ const tool_args_max_bytes: usize = 1200;
 const result_preview_max_bytes: usize = 180;
 const pending_items_shown: usize = 3;
 const network_problems_shown: usize = 3;
+const os_error_problems_shown: usize = 3;
 const tool_problems_shown: usize = 5;
 const compaction_problems_shown: usize = 3;
 const model_catalog_problems_shown: usize = 3;
+const sign_in_problems_shown: usize = 3;
 const output_limit_problems_shown: usize = 5;
 const trace_tail_bytes: usize = 6 * 1024;
 const trace_max_lines: usize = 80;
@@ -586,6 +621,7 @@ fn buildReport(app: anytype, fatal: ?anyerror) !BuiltTrace {
     try writeSubagents(r, app);
     try writeNetwork(r);
     try writeModelCatalog(r, app);
+    try writeSignIn(r);
     try writeToolCalls(r, history, shell_view);
     try writePermissions(r, permission_grants);
     try writeAutoReviews(r);
@@ -895,10 +931,12 @@ noinline fn writeProblems(r: *Records, app: anytype) !void {
     try writeInterruptedTurnProblem(p, agents.screenAgentOf(app).session.agent.history.items);
     try writeSessionTitleProblem(p, app);
     try writeNetworkProblems(p);
+    try writeOsErrorProblems(p);
     try writeToolProblems(p);
     try writeCompactionProblems(p);
     try writeMcpHostProblems(p, app);
     try writeModelCatalogProblems(p);
+    try writeSignInProblems(p);
     try writeOutputLimitProblems(p);
 
     try r.begin("problems");
@@ -965,6 +1003,27 @@ fn writeNetworkProblems(p: *Records) !void {
         try p.endObject();
         try p.end();
     }
+}
+
+/// The newest OS errors behind network calls that failed as `Unexpected`.
+fn writeOsErrorProblems(p: *Records) !void {
+    if (comptime !diagnostics.os_errors_kept) return;
+    var notes: [diagnostics.os_error_capacity]diagnostics.OsError = undefined;
+    const count = diagnostics.snapshotOsErrors(&notes);
+    var index = count;
+    while (index > count -| os_error_problems_shown) {
+        index -= 1;
+        try beginProblem(p, "os_error");
+        try writeOsErrorFields(p, notes[index]);
+        try p.end();
+    }
+}
+
+fn writeOsErrorFields(r: *Records, note: diagnostics.OsError) !void {
+    try r.time("at", note.at_ms);
+    try r.text("call", @tagName(note.call));
+    if (note.errno != 0) try r.number("errno", note.errno);
+    if (note.errnoName()) |name| try r.text("errno_name", try r.arena.print("E{s}", .{name}));
 }
 
 /// The newest failed calls come from the kept failures, not the window, so
@@ -1038,6 +1097,24 @@ fn writeModelCatalogProblems(p: *Records) !void {
         const event = &events[index];
         reported += 1;
         try beginProblem(p, "model_catalog");
+        try p.text("event", event.name());
+        try p.optionalText("detail", event.detail());
+        try p.end();
+    }
+}
+
+/// The newest failed sign-in events: a refresh, an issuer request, or an
+/// `auth.lock` wait that failed, or a prompt that waits for a sign-in. They
+/// come from the kept failures, so later sign-in events never remove them.
+fn writeSignInProblems(p: *Records) !void {
+    var events: [diagnostics.failed_sign_in_event_capacity]diagnostics.SignInEvent = undefined;
+    const count = diagnostics.snapshotFailedSignInEvents(&events);
+    var index = count;
+    while (index > count -| sign_in_problems_shown) {
+        index -= 1;
+        const event = &events[index];
+        try beginProblem(p, "sign_in");
+        try p.time("at", event.timestamp_ms);
         try p.text("event", event.name());
         try p.optionalText("detail", event.detail());
         try p.end();
@@ -1680,6 +1757,7 @@ noinline fn writeNetwork(r: *Records) !void {
     try r.number("turns_retained", rollup_count);
     try r.number("turns_evicted", lifetime.evicted_turns);
     try r.number("kept_failures", kept_count);
+    try r.number("os_errors", diagnostics.osErrorCount());
     try r.end();
 
     for (rollups[0..rollup_count]) |*rollup| {
@@ -1700,6 +1778,13 @@ noinline fn writeNetwork(r: *Records) !void {
     for (kept[0..kept_count]) |*call| {
         try r.begin("failed_network_call");
         try writeNetworkCallFields(r, call);
+        try r.end();
+    }
+    if (comptime !diagnostics.os_errors_kept) return;
+    var notes: [diagnostics.os_error_capacity]diagnostics.OsError = undefined;
+    for (notes[0..diagnostics.snapshotOsErrors(&notes)]) |note| {
+        try r.begin("os_error");
+        try writeOsErrorFields(r, note);
         try r.end();
     }
 }
@@ -1757,6 +1842,43 @@ fn writeModelCatalog(r: *Records, app: anytype) !void {
         try writeModelCatalogEventFields(r, event);
         try r.end();
     }
+}
+
+/// The always-on sign-in events and the failed ones kept apart from them, so
+/// a shared trace shows why a prompt waited for a sign-in without FX_TRACE.
+fn writeSignIn(r: *Records) !void {
+    var events: [diagnostics.sign_in_ring_capacity]diagnostics.SignInEvent = undefined;
+    const count = diagnostics.snapshotSignInEvents(&events);
+    const kept = try r.arena.alloc(diagnostics.SignInEvent, diagnostics.failed_sign_in_event_capacity);
+    const kept_count = diagnostics.snapshotFailedSignInEvents(kept);
+
+    try r.begin("sign_in");
+    try r.number("events", count);
+    // Read after the snapshots, so neither is ever less than what they hold.
+    try r.number("session_events", diagnostics.signInEventCount());
+    try r.number("kept_failures", kept_count);
+    try r.number("session_failures", diagnostics.signInFailureCount());
+    try r.end();
+
+    for (events[0..count]) |*event| {
+        try r.begin("sign_in_event");
+        try writeSignInEventFields(r, event);
+        try r.end();
+    }
+    for (kept[0..kept_count]) |*event| {
+        try r.begin("failed_sign_in_event");
+        try writeSignInEventFields(r, event);
+        try r.end();
+    }
+}
+
+fn writeSignInEventFields(r: *Records, event: *const diagnostics.SignInEvent) !void {
+    try r.time("at", event.timestamp_ms);
+    try r.number("sequence", event.sequence);
+    try r.text("event", event.name());
+    try r.boolean("failed", event.failed);
+    try r.optionalText("detail", event.detail());
+    try r.boolean("truncated", event.truncated);
 }
 
 fn writeModelCatalogEventFields(r: *Records, event: *const diagnostics.ModelCatalogEvent) !void {
@@ -4308,6 +4430,56 @@ test "trace failed compaction details keep whole characters past the ring's boun
     }
 }
 
+test "trace sign-in records each lock wait and refresh, and keeps the failures as problems" {
+    const sign_in_trace = @import("../auth/sign_in_trace.zig");
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    const empty = try TestWriter.create();
+    defer empty.destroy();
+    try writeSignIn(&empty.records);
+    var empty_trace = try empty.trace();
+    defer empty_trace.deinit();
+    const none = try empty_trace.one("sign_in");
+    try std.testing.expectEqual(@as(i64, 0), try testInt(none, "events"));
+    try std.testing.expectEqual(@as(i64, 0), try testInt(none, "kept_failures"));
+
+    sign_in_trace.record(.lock_wait, false, "outcome=taken waited_ms={d}", .{4_200});
+    sign_in_trace.record(.issuer, true, "outcome=failed step=token err={s} ms={d} login_deleted=false", .{ "Timeout", 15_000 });
+    sign_in_trace.record(.refresh, true, "mode=if_needed outcome=failed step=issuer err={s} ms={d}", .{ "Timeout", 19_200 });
+    sign_in_trace.record(.prompt, true, "outcome=waits_for_sign_in screen=subagent turn_id={d}", .{5});
+    // Later events that succeed never push the failures out.
+    for (0..diagnostics.sign_in_ring_capacity) |_| sign_in_trace.record(.lock_wait, false, "outcome=taken waited_ms={d}", .{0});
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeSignIn(&w.records);
+    try writeSignInProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const summary = try trace.one("sign_in");
+    try std.testing.expectEqual(@as(i64, diagnostics.sign_in_ring_capacity), try testInt(summary, "events"));
+    try std.testing.expectEqual(@as(i64, diagnostics.sign_in_ring_capacity + 4), try testInt(summary, "session_events"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(summary, "kept_failures"));
+    try std.testing.expectEqual(@as(i64, 3), try testInt(summary, "session_failures"));
+    try std.testing.expectEqual(diagnostics.sign_in_ring_capacity, trace.count("sign_in_event"));
+
+    try std.testing.expectEqual(@as(usize, 3), trace.count("failed_sign_in_event"));
+    const issuer = try trace.nth("failed_sign_in_event", 0);
+    try std.testing.expectEqualStrings("issuer", try testString(issuer, "event"));
+    try std.testing.expect(try testBool(issuer, "failed"));
+    try std.testing.expectEqual(@as(i64, 2), try testInt(issuer, "sequence"));
+    try std.testing.expectEqualStrings("outcome=failed step=token err=Timeout ms=15000 login_deleted=false", try testString(issuer, "detail"));
+
+    // Problems list the newest failure first.
+    try std.testing.expectEqual(@as(usize, sign_in_problems_shown), trace.count("problem"));
+    const newest = try trace.nth("problem", 0);
+    try std.testing.expectEqualStrings("sign_in", try testString(newest, "kind"));
+    try std.testing.expectEqualStrings("prompt", try testString(newest, "event"));
+    try std.testing.expectEqualStrings("outcome=waits_for_sign_in screen=subagent turn_id=5", try testString(newest, "detail"));
+    try std.testing.expectEqualStrings("issuer", try testString(try trace.nth("problem", 2), "event"));
+}
+
 test "trace model catalog records events and its problems" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
@@ -5478,6 +5650,44 @@ test "trace network calls keep web search counts, stop reasons, and schema diagn
     try std.testing.expectEqual(@as(i64, 400), try testInt(problem_call, "status"));
     try std.testing.expectEqualStrings("zai/glm-5.2-fast", try testString(problem_call, "model"));
     try std.testing.expectEqualStrings("gateway", try testString(problem_call, "kind"));
+}
+
+test "trace network names the OS error behind a call that failed as Unexpected" {
+    const os_errors = @import("../shared/os_errors.zig");
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var failed: diagnostics.NetworkCall = .{ .started_at_ms = 1_000, .duration_ms = 20, .turn_id = 2, .step_id = 73 };
+    failed.setModel("provider/model-a");
+    failed.setError("Unexpected");
+    diagnostics.recordNetworkCall(failed);
+    os_errors.note(io_mod.getIo(), .read, @backingInt(std.posix.E.INVAL));
+    os_errors.note(io_mod.getIo(), .lookup, 0);
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeNetwork(&w.records);
+    try writeOsErrorProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    try std.testing.expectEqual(@as(i64, 2), try testInt(try trace.one("network"), "os_errors"));
+    try std.testing.expectEqual(@as(usize, 2), trace.count("os_error"));
+    const read = try trace.nth("os_error", 0);
+    try std.testing.expectEqualStrings("read", try testString(read, "call"));
+    try std.testing.expectEqual(@as(i64, @backingInt(std.posix.E.INVAL)), try testInt(read, "errno"));
+    try std.testing.expectEqualStrings("EINVAL", try testString(read, "errno_name"));
+    const lookup = try trace.nth("os_error", 1);
+    try std.testing.expectEqualStrings("lookup", try testString(lookup, "call"));
+    try expectAbsent(lookup, "errno");
+    try expectAbsent(lookup, "errno_name");
+
+    // Newest first, like the other problems.
+    try std.testing.expectEqual(@as(usize, 2), trace.count("problem"));
+    const newest = try trace.nth("problem", 0);
+    try std.testing.expectEqualStrings("os_error", try testString(newest, "kind"));
+    try std.testing.expectEqualStrings("lookup", try testString(newest, "call"));
+    try std.testing.expectEqualStrings("EINVAL", try testString(try trace.nth("problem", 1), "errno_name"));
 }
 
 test "trace network keeps a failed call after later calls fill the window" {
