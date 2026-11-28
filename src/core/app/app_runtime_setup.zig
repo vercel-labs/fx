@@ -12,11 +12,14 @@ pub const LoadedSkills = struct {
     dir: []u8 = &.{},
     skills: []skill_runtime.Skill = &.{},
     diagnostics: []skill_runtime.SkillDiagnostic = &.{},
+    /// The mod pins `skills` were read through. Adopting the loaded skills moves them into the catalog.
+    mod_pins: ?skill_runtime.ModPinsSet = null,
 
     pub fn deinit(self: *LoadedSkills, alloc: Allocator) void {
         if (self.dir.len > 0) alloc.free(self.dir);
         skill_runtime.freeSkills(alloc, self.skills);
         skill_runtime.freeSkillDiagnostics(alloc, self.diagnostics);
+        skill_runtime.deinitModPins(alloc, &self.mod_pins);
         self.* = .{};
     }
 };
@@ -60,12 +63,14 @@ pub fn loadSkills(
     defer alloc.free(home);
     const dir = try managedSkillsDirFor(alloc, home, profile_paths.fxHomeParent());
     errdefer alloc.free(dir);
-    const discovery = try skill_runtime.loadVisibleSkills(alloc, workspace_root, home, dir, root_policy);
+    var discovery = try skill_runtime.loadDiscoveryWithMods(alloc, workspace_root, home, dir, root_policy);
+    errdefer discovery.deinit(alloc);
 
     return .{
         .dir = dir,
         .skills = discovery.skills,
         .diagnostics = discovery.diagnostics,
+        .mod_pins = discovery.mod_pins,
     };
 }
 

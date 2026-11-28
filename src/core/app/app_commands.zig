@@ -1145,7 +1145,7 @@ pub fn Handlers(comptime App: type) type {
         fn skillInfoForProvider(skill: skill_runtime.Skill) skill_commands.SkillInfo {
             return .{
                 .path = skill.path,
-                .source_label = skill_runtime.skillSourceLabel(skill.source),
+                .source_label = skill.mod_label orelse skill_runtime.skillSourceLabel(skill.source),
                 .managed_install = skill_runtime.isManagedInstallSkill(skill),
             };
         }

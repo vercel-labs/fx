@@ -37,6 +37,8 @@ pub const Skill = struct {
     source: SkillSource,
     /// Owned with discovered entries. Null keeps managed skills strict.
     read_authority: ?[]const u8 = null,
+    /// Owned with discovered entries: "mod <name>" for a skill a mod ships.
+    mod_label: ?[]const u8 = null,
     metadata_inode: std.Io.File.INode = 0,
     metadata_size: u64 = 0,
     metadata_mtime: std.Io.Timestamp = .zero,
@@ -137,6 +139,8 @@ pub const SkillSource = enum {
     global_claude,
     global_agents,
     global_claw,
+    /// A skill a mod ships. Its `Skill.mod_label` names the mod.
+    mod,
 };
 
 test "a skill's location resolves back to its path" {

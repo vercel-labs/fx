@@ -621,3 +621,39 @@ describe("mod threats", () => {
     } finally { f.close(); }
   }, 60000);
 });
+
+describe("mods as skill roots", () => {
+  test.skipIf(!tmuxAvailable())("a mod's skill is listed with its mod in /skills, and leaves the list after fx mod rm", async () => {
+    const f = fixture(() => completion("glm-model", "unused"));
+    let session: TmuxSession | null = null;
+    const openSkills = async (): Promise<TmuxSession> => {
+      const opened = await TmuxSession.create({ cwd: f.workspace, env: f.env, width: 120, height: 40 });
+      await opened.waitForComposer(TIMEOUT_MS);
+      await opened.sendText("/skills list");
+      return opened;
+    };
+    try {
+      const folder = makeModFolder(f, "alpha", { name: "alpha", version: "1.0.0", description: "Skill pack" }, {
+        "skills/alpha-review/SKILL.md": "---\nname: alpha-review\ndescription: Review helper\n---\nBody\n",
+      });
+      const added = await fxMod(f, ["add", folder, "--yes"]);
+      expect(added.code, added.stderr).toBe(0);
+
+      session = await openSkills();
+      await session.waitForText("alpha-review", TIMEOUT_MS);
+      expect(await session.capturePane()).toContain("mod alpha");
+      await session.kill();
+      session = null;
+
+      const removed = await fxMod(f, ["rm", "alpha"]);
+      expect(removed.code, removed.stderr).toBe(0);
+
+      session = await openSkills();
+      await session.waitForText("Workspace", TIMEOUT_MS);
+      expect(await session.capturePane()).not.toContain("alpha-review");
+    } finally {
+      if (session) await session.kill();
+      f.close();
+    }
+  }, 90000);
+});

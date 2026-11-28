@@ -19,6 +19,7 @@ const model_provider = @import("../config/model_provider.zig");
 const safe_git = @import("../shell_command/safe_git.zig");
 const command_lex = @import("../shell_command/command_lex.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
+const skill_runtime = @import("../skills/skill_runtime.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 
 const Allocator = std.mem.Allocator;
@@ -786,8 +787,21 @@ fn appendSkillChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_
                 .oversized => .{ "was skipped: its frontmatter is too large", "shorten its name and description" },
             },
         };
-        try appendCheckOwnedFix(checks, alloc, "skills", .warn, try alloc.print("{s} {s}", .{ diagnostic.path, why[0] }), try alloc.dupe(u8, why[1]));
+        const place = try skillDiagnosticPlace(alloc, diagnostic);
+        defer alloc.free(place);
+        try appendCheckOwnedFix(checks, alloc, "skills", .warn, try alloc.print("{s} {s}", .{ place, why[0] }), try alloc.dupe(u8, why[1]));
     }
+}
+
+/// The place a skill diagnostic names. A mod's skill names its mod, so the
+/// person knows which install to fix. The caller owns the result.
+fn skillDiagnosticPlace(alloc: Allocator, diagnostic: skill_runtime.SkillDiagnostic) ![]u8 {
+    if (diagnostic.source == .mod) {
+        if (skill_runtime.modNameOfVersionPath(diagnostic.path)) |name| {
+            return alloc.print("mod {s}: {s}", .{ name, diagnostic.path });
+        }
+    }
+    return alloc.dupe(u8, diagnostic.path);
 }
 
 fn resolvePermissionMode(configured: ?types.PermissionMode) !types.PermissionMode {
@@ -1308,4 +1322,17 @@ test "doctor reports command auth program resolution without running it" {
 
     // Doctor never executed the helper script.
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "bin/ran.marker", .{}));
+}
+
+test "a mod skill diagnostic names its mod in doctor" {
+    const alloc = std.testing.allocator;
+    const diagnostic = skill_runtime.SkillDiagnostic{
+        .path = "/h/.fx/mods/.store/glm-0123456789abcdef/skills/bad",
+        .source = .mod,
+        .scope = .candidate,
+        .cause = .unreadable,
+    };
+    const place = try skillDiagnosticPlace(alloc, diagnostic);
+    defer alloc.free(place);
+    try std.testing.expectEqualStrings("mod glm: /h/.fx/mods/.store/glm-0123456789abcdef/skills/bad", place);
 }

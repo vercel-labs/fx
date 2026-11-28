@@ -654,7 +654,7 @@ pub fn Runtime(comptime App: type) type {
                 );
                 errdefer loaded.deinit(std.heap.c_allocator);
                 skill_runtime.traceDiagnostics("interactive_startup", loaded.diagnostics);
-                try app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
+                try app.skills.replaceLoadedWithMods(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics, loaded.mod_pins);
                 loaded = .{};
             }
             if (comptime @hasField(App, "trust")) {

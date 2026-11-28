@@ -14,7 +14,6 @@ const pins = @import("pins.zig");
 const store = @import("store.zig");
 
 const off_suffix = ".off";
-const max_stamp_hashes = 128;
 
 pub const RootKind = enum {
     skills,
@@ -189,30 +188,51 @@ pub const ModPins = struct {
     /// still belongs to the caller; on success it belongs to this set.
     pub fn replaceWith(self: *ModPins, alloc: std.mem.Allocator, root_path: []const u8, ops: Ops, next: ModPins) !void {
         var collect_names: std.ArrayList([]u8) = .empty;
-        defer {
-            for (collect_names.items) |name| alloc.free(name);
-            collect_names.deinit(alloc);
-        }
-
-        for (self.pins) |old_pin| {
-            const unchanged = findPinToken(next.pins, old_pin.name, &old_pin.token);
-            if (!unchanged) {
-                try collect_names.append(alloc, try alloc.dupe(u8, old_pin.name));
-            }
-        }
+        defer freeNames(alloc, &collect_names);
+        try self.appendNamesNotPinnedBy(alloc, &collect_names, &next);
 
         var old = self.*;
         self.* = next;
         old.deinit(alloc);
+        collectEach(self.resolved_root orelse root_path, ops, collect_names.items);
+    }
 
-        const collect_root: []const u8 = self.resolved_root orelse root_path;
-        for (collect_names.items) |mod_name| {
-            // Cleanup after reload is best-effort: another reader or lock holder
-            // may keep a version busy, and the next change/collect sweeps it.
-            _ = store.collect(.{
-                .root_path = collect_root,
-                .ops = ops.store_ops,
-            }, mod_name) catch {};
+    /// Releases every pin, then runs a best-effort cleanup for each mod whose
+    /// version `current` does not pin; with `current` null, for every mod. A
+    /// loader that keeps each pin set with the index it built calls this when
+    /// it frees that index, so an old version goes once nothing reads it
+    /// (`tests/tla/mods/ModUse.tla` UnusedVersionsGo). It cannot fail: without
+    /// memory for the names it skips the cleanup, and the next change collects.
+    pub fn releaseAndCollect(self: *ModPins, alloc: std.mem.Allocator, root_path: []const u8, ops: Ops, current: ?*const ModPins) void {
+        const names = self.releaseForCleanup(alloc, current);
+        defer freeCleanupNames(alloc, names);
+        collectEach(root_path, ops, names);
+    }
+
+    /// The first half of `releaseAndCollect`, for a loader on the input or
+    /// render path (`RULES.md` R2.1): releases every pin, which never waits,
+    /// and returns the names of the mods whose version `current` does not pin
+    /// (with `current` null, every mod). The caller runs `collectNames` with
+    /// them on another thread, then frees them with `freeCleanupNames`.
+    /// Without memory for the names it returns none, and the next change
+    /// collects.
+    pub fn releaseForCleanup(self: *ModPins, alloc: std.mem.Allocator, current: ?*const ModPins) [][]u8 {
+        var names: std.ArrayList([]u8) = .empty;
+        self.appendNamesNotPinnedBy(alloc, &names, current) catch {};
+        self.deinit(alloc);
+        return names.toOwnedSlice(alloc) catch {
+            freeNames(alloc, &names);
+            return &.{};
+        };
+    }
+
+    /// Appends a copy of each name this set pins at a version `other` does not pin.
+    fn appendNamesNotPinnedBy(self: *const ModPins, alloc: std.mem.Allocator, names: *std.ArrayList([]u8), other: ?*const ModPins) !void {
+        for (self.pins) |p| {
+            if (other) |o| if (findPinToken(o.pins, p.name, &p.token)) continue;
+            const copy = try alloc.dupe(u8, p.name);
+            errdefer alloc.free(copy);
+            try names.append(alloc, copy);
         }
     }
 
@@ -286,9 +306,11 @@ pub fn computeStamp(io: std.Io, root_path: []const u8) u64 {
     };
     defer dir.close(io);
 
-    var entry_hashes: [max_stamp_hashes]u64 = undefined;
-    var count: usize = 0;
-    var overflow_xor: u64 = 0;
+    // Names are unique in a folder, so a wrapping sum and an xor of the entry
+    // hashes describe the set in any listing order without a sort.
+    var count: u64 = 0;
+    var sum: u64 = 0;
+    var xor: u64 = 0;
 
     var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var it = dir.iterate();
@@ -312,23 +334,17 @@ pub fn computeStamp(io: std.Io, root_path: []const u8) u64 {
         }
 
         const entry_hash = h.final();
-        if (count < max_stamp_hashes) {
-            entry_hashes[count] = entry_hash;
-        } else {
-            overflow_xor ^= entry_hash;
-        }
+        sum +%= entry_hash;
+        xor ^= entry_hash;
         count += 1;
     }
 
     if (count == 0) return emptyOrMissingStamp(0);
 
-    const n = @min(count, max_stamp_hashes);
-    std.mem.sort(u64, entry_hashes[0..n], {}, std.sort.asc(u64));
-
     var total = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
     total.update(std.mem.asBytes(&count));
-    total.update(std.mem.sliceAsBytes(entry_hashes[0..n]));
-    total.update(std.mem.asBytes(&overflow_xor));
+    total.update(std.mem.asBytes(&sum));
+    total.update(std.mem.asBytes(&xor));
     return total.final();
 }
 
@@ -342,6 +358,32 @@ fn errorStamp(name: []const u8) u64 {
     var h = std.hash.Wyhash.init(0x94d049bb133111eb);
     h.update(name);
     return h.final();
+}
+
+fn freeNames(alloc: std.mem.Allocator, names: *std.ArrayList([]u8)) void {
+    for (names.items) |name| alloc.free(name);
+    names.deinit(alloc);
+}
+
+/// The second half of `releaseAndCollect`: a best-effort store cleanup of each
+/// named mod. It can wait on another fx's store lock, up to the lock deadline
+/// in `ops`, so a loader on the input or render path runs it on another thread.
+pub fn collectNames(root_path: []const u8, ops: ModPins.Ops, names: []const []u8) void {
+    collectEach(root_path, ops, names);
+}
+
+/// Frees the names `releaseForCleanup` returned.
+pub fn freeCleanupNames(alloc: std.mem.Allocator, names: [][]u8) void {
+    for (names) |name| alloc.free(name);
+    if (names.len > 0) alloc.free(names);
+}
+
+/// Cleanup after a set's pins go is best-effort: another reader or a lock
+/// holder may keep a version busy, and the next change or collect sweeps it.
+fn collectEach(root_path: []const u8, ops: ModPins.Ops, names: []const []u8) void {
+    for (names) |mod_name| {
+        _ = store.collect(.{ .root_path = root_path, .ops = ops.store_ops }, mod_name) catch {};
+    }
 }
 
 fn findPinToken(items: []const pins.Pin, name: []const u8, token: *const [pins.token_hex_bytes]u8) bool {
@@ -653,6 +695,90 @@ test "ModPins replaceWith keeps the old version until a loader installs the new 
     try std.testing.expectEqual(@as(usize, 1), try countEntries(store_sub));
     try std.testing.expect(!std.mem.eql(u8, &old_token, &set.pins[0].token));
     try std.testing.expect(!set.changed(root));
+}
+
+test "ModPins releaseAndCollect frees an old index's pins and deletes only versions the current set does not pin" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "mods");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "mods", alloc);
+    defer alloc.free(root);
+    const src_v1 = try writeTestMod(alloc, &tmp, "src_v1", "alpha", "1.0.0", &.{});
+    defer alloc.free(src_v1);
+    const src_v2 = try writeTestMod(alloc, &tmp, "src_v2", "alpha", "2.0.0", &.{});
+    defer alloc.free(src_v2);
+    const src_b = try writeTestMod(alloc, &tmp, "src_b", "beta", "1.0.0", &.{});
+    defer alloc.free(src_b);
+
+    var lock_state: TestLockState = .{};
+    const s = testStore(root, &lock_state);
+    try std.testing.expectEqual(store.Outcome.ok, try store.add(alloc, s, "alpha", src_v1, null));
+    try std.testing.expectEqual(store.Outcome.ok, try store.add(alloc, s, "beta", src_b, null));
+    const ops: ModPins.Ops = .{
+        .store_ops = s.ops,
+        .pin_ops = .{ .io = std.testing.io, .lock_deadline_ms = 20 },
+    };
+    const store_sub = try std.Io.Dir.path.join(alloc, &.{ root, ".store" });
+    defer alloc.free(store_sub);
+
+    // An old index pins alpha v1; after the update the active index pins alpha v2.
+    var old_index = try ModPins.load(alloc, root, ops);
+    try std.testing.expectEqual(store.Outcome.ok, try store.update(alloc, s, "alpha", src_v2, null));
+    var active_index = try ModPins.load(alloc, root, ops);
+    defer active_index.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), try countEntries(store_sub));
+
+    // Freeing the old index deletes alpha v1 and keeps what the active index pins.
+    const acquires_before = lock_state.acquires;
+    old_index.releaseAndCollect(alloc, root, ops, &active_index);
+    try std.testing.expectEqual(@as(usize, 2), try countEntries(store_sub));
+    // Only alpha changed, so only alpha was collected.
+    try std.testing.expectEqual(acquires_before + 1, lock_state.acquires);
+    try std.testing.expectEqual(@as(usize, 0), old_index.pins.len);
+}
+
+test "ModPins releaseForCleanup releases at once and leaves the cleanup to collectNames" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "mods");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "mods", alloc);
+    defer alloc.free(root);
+    const src_v1 = try writeTestMod(alloc, &tmp, "src_v1", "alpha", "1.0.0", &.{});
+    defer alloc.free(src_v1);
+    const src_v2 = try writeTestMod(alloc, &tmp, "src_v2", "alpha", "2.0.0", &.{});
+    defer alloc.free(src_v2);
+
+    var lock_state: TestLockState = .{};
+    const s = testStore(root, &lock_state);
+    try std.testing.expectEqual(store.Outcome.ok, try store.add(alloc, s, "alpha", src_v1, null));
+    const ops: ModPins.Ops = .{
+        .store_ops = s.ops,
+        .pin_ops = .{ .io = std.testing.io, .lock_deadline_ms = 20 },
+    };
+    const store_sub = try std.Io.Dir.path.join(alloc, &.{ root, ".store" });
+    defer alloc.free(store_sub);
+
+    var old_index = try ModPins.load(alloc, root, ops);
+    try std.testing.expectEqual(store.Outcome.ok, try store.update(alloc, s, "alpha", src_v2, null));
+    var active_index = try ModPins.load(alloc, root, ops);
+    defer active_index.deinit(alloc);
+
+    // The owner's thread only releases; no lock is taken and nothing is deleted yet.
+    const acquires_before = lock_state.acquires;
+    const names = old_index.releaseForCleanup(alloc, &active_index);
+    defer freeCleanupNames(alloc, names);
+    try std.testing.expectEqual(acquires_before, lock_state.acquires);
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("alpha", names[0]);
+    try std.testing.expectEqual(@as(usize, 2), try countEntries(store_sub));
+
+    // The cleanup, run elsewhere, deletes the version nothing pins any more.
+    collectNames(root, ops, names);
+    try std.testing.expectEqual(@as(usize, 1), try countEntries(store_sub));
 }
 
 test "ModPins roots returns only real subfolders and withPinnedMods releases on return and error" {

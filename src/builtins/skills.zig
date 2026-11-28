@@ -53,7 +53,7 @@ pub fn loadVisibleSkillsForTool(
     skills_dir: []const u8,
 ) !skill_runtime.SkillDiscovery {
     const home = io_mod.homeDir() orelse homeFromSkillsDir(skills_dir);
-    return skill_runtime.loadVisibleSkills(
+    return skill_runtime.loadDiscoveryWithMods(
         alloc,
         workspace_root,
         home,
@@ -2218,4 +2218,8 @@ test "built-in skills command refuses to remove compatibility roots" {
         },
         else => return error.TestExpectedEqual,
     }
+}
+
+test "a mod skill root is not a workspace root" {
+    try std.testing.expect(workspaceRootPath(.mod) == null);
 }

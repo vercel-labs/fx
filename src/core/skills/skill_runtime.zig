@@ -10,6 +10,22 @@ const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const pathing = @import("../workspace/pathing.zig");
 const skill_contract = @import("skill_contract.zig");
 const context_limits = @import("../config/context_limits.zig");
+const build_options = @import("build_options");
+const mods = if (build_options.libfx) struct {} else @import("../mods/mods.zig");
+
+/// The pins one loader holds (`mods/mod_pins.zig`). Empty in libfx, which has no mods.
+pub const ModPinsSet = if (build_options.libfx) struct {} else mods.ModPins;
+/// One mod's skill folder: a pinned version's `skills/`, named after the mod.
+pub const ModSkillRoot = if (build_options.libfx) struct { mod_name: []const u8, path: []const u8 } else mods.ModRoot;
+/// The mod roots of one pin set, owned by the caller.
+pub const ModSkillRoots = if (build_options.libfx) struct {
+    items: []const ModSkillRoot = &.{},
+
+    pub fn deinit(self: *ModSkillRoots, alloc: Allocator) void {
+        _ = alloc;
+        self.* = .{};
+    }
+} else mods.ModRoots;
 const sort_utils = @import("../shared/sort_utils.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -198,10 +214,13 @@ pub fn traceDiagnostics(surface: []const u8, diagnostics: []const SkillDiagnosti
 pub const SkillDiscovery = struct {
     skills: []Skill = &.{},
     diagnostics: []SkillDiagnostic = &.{},
+    /// Pins the skills were read through, when the discovery came from `loadDiscoveryWithMods`.
+    mod_pins: ?ModPinsSet = null,
 
     pub fn deinit(self: *SkillDiscovery, alloc: Allocator) void {
         freeSkills(alloc, self.skills);
         freeSkillDiagnostics(alloc, self.diagnostics);
+        deinitModPins(alloc, &self.mod_pins);
         self.* = .{};
     }
 };
@@ -272,7 +291,16 @@ const SkillRoot = struct {
     path: []const u8,
     source: SkillSource,
     read_authority: ?[]const u8,
+    /// Owned "mod <name>" for a mod root, null otherwise.
+    mod_label: ?[]const u8 = null,
 };
+
+fn freeSkillRoots(alloc: Allocator, roots: []const SkillRoot) void {
+    for (roots) |root| {
+        alloc.free(root.path);
+        if (root.mod_label) |label| alloc.free(label);
+    }
+}
 
 const SkillEntry = struct {
     name: []u8,
@@ -337,12 +365,80 @@ const CanonicalSkillPaths = struct {
     }
 };
 
+/// Pins every enabled mod beside `skills_dir`'s fx folder. Null in libfx and
+/// when the path has no parent. A mods folder that cannot be read is logged
+/// and skipped, so the other skills still load. The caller frees the set with
+/// `deinitModPins`.
+pub fn loadModPinsBeside(alloc: Allocator, skills_dir: []const u8) Allocator.Error!?ModPinsSet {
+    if (comptime build_options.libfx) return null;
+    const mods_dir = (try profile_paths.modsDirBesideSkills(alloc, skills_dir)) orelse return null;
+    defer alloc.free(mods_dir);
+    return mods.loadModPins(alloc, mods_dir) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("skills", "mods could not be read, so mod skills are skipped: {s}", .{@errorName(err)});
+            return null;
+        },
+    };
+}
+
+pub fn deinitModPins(alloc: Allocator, pins: *?ModPinsSet) void {
+    if (comptime build_options.libfx) return;
+    if (pins.*) |*set| set.deinit(alloc);
+    pins.* = null;
+}
+
+fn loadModRoots(alloc: Allocator, pins: *const ?ModPinsSet) !ModSkillRoots {
+    if (comptime build_options.libfx) return .{};
+    if (pins.*) |*set| return try set.roots(alloc, .skills);
+    return .{};
+}
+
+fn modPinsStamp(pins: *const ?ModPinsSet) ?u64 {
+    if (comptime build_options.libfx) return null;
+    if (pins.*) |set| return set.stamp;
+    return null;
+}
+
+/// Loads every root and every enabled mod's skill folder. The discovery holds
+/// the pins it was read through, so it must outlive any read of its skill files.
+pub fn loadDiscoveryWithMods(
+    alloc: Allocator,
+    workspace_root: ?[]const u8,
+    home: ?[]const u8,
+    skills_dir: []const u8,
+    root_policy: skill_contract.RootPolicy,
+) !SkillDiscovery {
+    var pins = try loadModPinsBeside(alloc, skills_dir);
+    errdefer deinitModPins(alloc, &pins);
+    var mod_roots = try loadModRoots(alloc, &pins);
+    defer mod_roots.deinit(alloc);
+    var discovery = try loadVisibleSkillsWithMods(alloc, workspace_root, home, skills_dir, root_policy, mod_roots.items);
+    discovery.mod_pins = pins;
+    pins = null;
+    return discovery;
+}
+
 pub fn loadVisibleSkills(
     alloc: Allocator,
     workspace_root: ?[]const u8,
     home: ?[]const u8,
     skills_dir: []const u8,
     root_policy: skill_contract.RootPolicy,
+) !SkillDiscovery {
+    return loadVisibleSkillsWithMods(alloc, workspace_root, home, skills_dir, root_policy, &.{});
+}
+
+/// Like `loadVisibleSkills`, plus one root per mod in `mod_roots`. Mod roots
+/// follow the managed root and come before the compatibility roots. The
+/// borrowed `mod_roots` are read only during the call.
+pub fn loadVisibleSkillsWithMods(
+    alloc: Allocator,
+    workspace_root: ?[]const u8,
+    home: ?[]const u8,
+    skills_dir: []const u8,
+    root_policy: skill_contract.RootPolicy,
+    mod_roots: []const ModSkillRoot,
 ) !SkillDiscovery {
     var skills: std.ArrayList(Skill) = .empty;
     errdefer {
@@ -359,7 +455,7 @@ pub fn loadVisibleSkills(
 
     var roots: std.ArrayList(SkillRoot) = .empty;
     defer {
-        for (roots.items) |root| alloc.free(root.path);
+        freeSkillRoots(alloc, roots.items);
         roots.deinit(alloc);
     }
 
@@ -370,6 +466,7 @@ pub fn loadVisibleSkills(
         home,
         skills_dir,
         root_policy,
+        mod_roots,
     );
 
     for (roots.items) |root| {
@@ -392,6 +489,7 @@ fn appendConfiguredSkillRoots(
     home: ?[]const u8,
     skills_dir: []const u8,
     root_policy: skill_contract.RootPolicy,
+    mod_roots: []const ModSkillRoot,
 ) !void {
     if (workspace_root) |root| {
         try appendWorkspaceRoots(
@@ -404,6 +502,11 @@ fn appendConfiguredSkillRoots(
     }
     if (root_policy.managed_root_source) |source| {
         try appendDupeRoot(alloc, roots, source, skills_dir);
+    }
+    if (comptime !build_options.libfx) {
+        for (mod_roots) |mod_root| {
+            try appendModRoot(alloc, roots, mod_root);
+        }
     }
     if (home) |home_root| {
         for (root_policy.global_roots) |spec| {
@@ -418,10 +521,12 @@ fn collectRootFingerprints(
     home: ?[]const u8,
     skills_dir: []const u8,
     root_policy: skill_contract.RootPolicy,
+    mod_roots: []const ModSkillRoot,
+    mod_stamp: ?u64,
 ) ![]RootFingerprint {
     var roots: std.ArrayList(SkillRoot) = .empty;
     defer {
-        for (roots.items) |root| alloc.free(root.path);
+        freeSkillRoots(alloc, roots.items);
         roots.deinit(alloc);
     }
     try appendConfiguredSkillRoots(
@@ -431,8 +536,9 @@ fn collectRootFingerprints(
         home,
         skills_dir,
         root_policy,
+        mod_roots,
     );
-    const fingerprints = try alloc.alloc(RootFingerprint, roots.items.len);
+    const fingerprints = try alloc.alloc(RootFingerprint, roots.items.len + mod_fingerprint_slots);
     var filled: usize = 0;
     errdefer {
         for (fingerprints[0..filled]) |*root| root.deinit(alloc);
@@ -463,6 +569,13 @@ fn collectRootFingerprints(
             .inode = stat.inode,
             .mtime = stat.mtime,
             .candidate_digest = candidate_digest,
+        };
+    }
+    if (comptime !build_options.libfx) {
+        fingerprints[filled] = .{
+            .path = try alloc.dupe(u8, "mod pins"),
+            .exists = mod_stamp != null,
+            .stamp = mod_stamp orelse 0,
         };
     }
     return fingerprints;
@@ -537,6 +650,21 @@ fn appendSpecRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), base: []co
 
 fn appendDupeRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), source: SkillSource, path: []const u8) !void {
     try appendOwnedRoot(alloc, roots, try alloc.dupe(u8, path), source, null);
+}
+
+/// A mod's skills folder is strict like the managed root: no linked skill is followed.
+fn appendModRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), mod_root: ModSkillRoot) !void {
+    if (containsRootPath(roots.items, mod_root.path)) return;
+    const path = try alloc.dupe(u8, mod_root.path);
+    errdefer alloc.free(path);
+    const label = try alloc.print("mod {s}", .{mod_root.mod_name});
+    errdefer alloc.free(label);
+    try roots.append(alloc, .{
+        .path = path,
+        .source = .mod,
+        .read_authority = null,
+        .mod_label = label,
+    });
 }
 
 fn appendOwnedRoot(
@@ -931,6 +1059,8 @@ fn appendSkillCandidate(
     else
         null;
     errdefer if (read_authority) |authority| alloc.free(authority);
+    const mod_label = if (root.mod_label) |label| try alloc.dupe(u8, label) else null;
+    errdefer if (mod_label) |label| alloc.free(label);
 
     try skills.append(alloc, .{
         .name = skill_name,
@@ -938,6 +1068,7 @@ fn appendSkillCandidate(
         .path = path,
         .source = root.source,
         .read_authority = read_authority,
+        .mod_label = mod_label,
         .metadata_inode = file_stat.inode,
         .metadata_size = file_stat.size,
         .metadata_mtime = file_stat.mtime,
@@ -1102,6 +1233,7 @@ pub fn isManagedInstallSkill(skill: Skill) bool {
 pub fn skillGroupLabel(source: SkillSource) []const u8 {
     return switch (source) {
         .global_fx => "Managed installs",
+        .mod => "Mod skills",
         .workspace_fx => "Workspace skills",
         .workspace_shared => "Workspace skills",
         .workspace_opencode,
@@ -1123,6 +1255,7 @@ pub fn skillGroupRank(source: SkillSource) usize {
         .global_fx => 0,
         .workspace_fx => 1,
         .workspace_shared => 1,
+        .mod => 2,
         .workspace_opencode,
         .workspace_codex,
         .workspace_claude,
@@ -1133,11 +1266,11 @@ pub fn skillGroupRank(source: SkillSource) usize {
         .global_claude,
         .global_agents,
         .global_claw,
-        => 2,
+        => 3,
     };
 }
 
-const skill_group_count: usize = 3;
+const skill_group_count: usize = 4;
 
 pub fn skillSourceLabel(source: SkillSource) []const u8 {
     return switch (source) {
@@ -1154,6 +1287,7 @@ pub fn skillSourceLabel(source: SkillSource) []const u8 {
         .global_claude => "global ~/.claude/skills",
         .global_agents => "global ~/.agents/skills",
         .global_claw => "global ~/.claw/skills",
+        .mod => "mod",
     };
 }
 
@@ -1172,7 +1306,29 @@ pub fn skillSourceShortLabel(source: SkillSource) []const u8 {
         .global_claude => "global .claude",
         .global_agents => "global .agents",
         .global_claw => "global .claw",
+        .mod => "mod",
     };
+}
+
+/// The short source of one skill: its mod's name for a mod skill ("mod glm"),
+/// else the source's short label.
+pub fn skillShortLabel(skill: Skill) []const u8 {
+    return skill.mod_label orelse skillSourceShortLabel(skill.source);
+}
+
+const version_token_bytes: usize = 16;
+
+/// The mod named by a path under `<mods>/.store/<name>-<token>/`, or null.
+/// Diagnostics carry only the path, so doctor reads the name from it.
+pub fn modNameOfVersionPath(path: []const u8) ?[]const u8 {
+    const marker = "/.store/";
+    const at = std.mem.find(u8, path, marker) orelse return null;
+    const rest = path[at + marker.len ..];
+    const folder = rest[0 .. std.mem.findScalar(u8, rest, '/') orelse rest.len];
+    if (folder.len < version_token_bytes + 2) return null;
+    const dash = folder.len - version_token_bytes - 1;
+    if (folder[dash] != '-') return null;
+    return folder[0..dash];
 }
 
 pub fn skillMenuFilterLabel(filter: SkillMenuSourceFilter) []const u8 {
@@ -1198,6 +1354,7 @@ pub fn skillMenuFilterForSource(source: SkillSource) SkillMenuSourceFilter {
         .workspace_claude, .global_claude => .claude,
         .workspace_agents, .global_agents => .agents,
         .workspace_claw, .global_claw => .claw,
+        .mod => .all,
     };
 }
 
@@ -1540,6 +1697,9 @@ pub const SkillMenu = struct {
     }
 };
 
+/// The fingerprint slot for the mod pins. libfx has no mods, so it has none.
+const mod_fingerprint_slots: usize = if (build_options.libfx) 0 else 1;
+
 const RootFingerprint = struct {
     path: []u8,
     exists: bool,
@@ -1547,6 +1707,8 @@ const RootFingerprint = struct {
     mtime: std.Io.Timestamp = .zero,
     candidate_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
         @splat(0),
+    /// The pin set's directory stamp, on the one entry that stands for the mods.
+    stamp: u64 = 0,
 
     fn deinit(self: *RootFingerprint, alloc: Allocator) void {
         alloc.free(self.path);
@@ -1565,8 +1727,12 @@ pub const LoadedCatalog = struct {
     skill_backing: ?[]u8 = null,
     diagnostics: []SkillDiagnostic = &.{},
     root_fingerprints: []RootFingerprint = &.{},
+    /// The pins this catalog's skill paths read through. The generation that
+    /// owns the catalog releases them when no lease reads it (`releaseGeneration`).
+    mod_pins: ?ModPinsSet = null,
 
     pub fn deinit(self: *LoadedCatalog, alloc: Allocator) void {
+        deinitModPins(alloc, &self.mod_pins);
         if (self.dir.len > 0) alloc.free(self.dir);
         if (self.skill_backing) |backing| {
             alloc.free(backing);
@@ -1661,6 +1827,8 @@ fn refreshKnownCatalog(
     skills_dir: []const u8,
     root_policy: skill_contract.RootPolicy,
     base: CatalogLease,
+    mod_roots: []const ModSkillRoot,
+    mod_stamp: ?u64,
 ) !KnownCatalogRefresh {
     const generation = base.generation orelse return .full_discovery;
     if (base.diagnostics.len > 0 or
@@ -1674,6 +1842,8 @@ fn refreshKnownCatalog(
         home,
         skills_dir,
         root_policy,
+        mod_roots,
+        mod_stamp,
     );
     defer freeRootFingerprints(alloc, current_roots);
     if (!rootFingerprintsEqual(
@@ -1778,12 +1948,16 @@ fn loadKnownSkill(alloc: Allocator, previous: Skill) !?Skill {
         try alloc.dupe(u8, value)
     else
         null;
+    errdefer if (authority) |value| alloc.free(value);
+    const mod_label = if (previous.mod_label) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (mod_label) |value| alloc.free(value);
     return .{
         .name = name,
         .description = description,
         .path = path,
         .source = previous.source,
         .read_authority = authority,
+        .mod_label = mod_label,
         .metadata_inode = stat.inode,
         .metadata_size = stat.size,
         .metadata_mtime = stat.mtime,
@@ -1819,6 +1993,10 @@ fn compactCloneSkills(
             byte_count = std.math.add(usize, byte_count, authority.len) catch
                 return error.OutOfMemory;
         }
+        if (skill.mod_label) |label| {
+            byte_count = std.math.add(usize, byte_count, label.len) catch
+                return error.OutOfMemory;
+        }
     }
     const skills = try alloc.alloc(Skill, source.len);
     errdefer if (skills.len > 0) alloc.free(skills);
@@ -1834,12 +2012,17 @@ fn compactCloneSkills(
             copyCompactString(backing, &cursor, value)
         else
             null;
+        const mod_label = if (skill.mod_label) |value|
+            copyCompactString(backing, &cursor, value)
+        else
+            null;
         skills[index] = .{
             .name = name,
             .description = description,
             .path = path,
             .source = skill.source,
             .read_authority = authority,
+            .mod_label = mod_label,
             .metadata_inode = skill.metadata_inode,
             .metadata_size = skill.metadata_size,
             .metadata_mtime = skill.metadata_mtime,
@@ -1936,6 +2119,8 @@ const CatalogRefreshTask = struct {
     catalog: ?LoadedCatalog = null,
     unchanged: bool = false,
     failure: ?anyerror = null,
+    /// The pins this task loaded, until they move into its catalog.
+    pins: ?ModPinsSet = null,
 
     fn create(
         alloc: Allocator,
@@ -1975,79 +2160,78 @@ const CatalogRefreshTask = struct {
     }
 
     fn run(self: *CatalogRefreshTask) void {
-        if (self.cancel_requested.load(.acquire)) {
-            self.done.store(true, .release);
-            return;
-        }
-        const known_refresh = refreshKnownCatalog(
+        self.refresh() catch |err| {
+            self.failure = err;
+        };
+        deinitModPins(self.alloc, &self.pins);
+        self.done.store(true, .release);
+    }
+
+    /// Builds the catalog this refresh produces. The task pins the enabled mods
+    /// itself. The pins move into the catalog it produces; otherwise `run`
+    /// releases them, while the base catalog still pins the same versions.
+    fn refresh(self: *CatalogRefreshTask) !void {
+        if (self.cancel_requested.load(.acquire)) return;
+        self.pins = try loadModPinsBeside(self.alloc, self.skills_dir);
+        var mod_roots = try loadModRoots(self.alloc, &self.pins);
+        defer mod_roots.deinit(self.alloc);
+        const stamp = modPinsStamp(&self.pins);
+        switch (try refreshKnownCatalog(
             self.alloc,
             self.workspace_root,
             self.home,
             self.skills_dir,
             self.root_policy,
             self.base_catalog,
-        ) catch |err| {
-            self.failure = err;
-            self.done.store(true, .release);
-            return;
-        };
-        switch (known_refresh) {
-            .unchanged => {
-                self.unchanged = true;
-                self.done.store(true, .release);
-                return;
-            },
+            mod_roots.items,
+            stamp,
+        )) {
+            .unchanged => self.unchanged = true,
             .catalog => |catalog| {
-                self.catalog = catalog;
-                self.done.store(true, .release);
-                return;
+                var owned = catalog;
+                owned.mod_pins = self.pins;
+                self.pins = null;
+                self.catalog = owned;
             },
-            .full_discovery => {},
+            .full_discovery => try self.discover(mod_roots.items, stamp),
         }
-        const discovery = loadVisibleSkills(
+    }
+
+    fn discover(self: *CatalogRefreshTask, mod_roots: []const ModSkillRoot, stamp: ?u64) !void {
+        var discovery = try loadVisibleSkillsWithMods(
             self.alloc,
             self.workspace_root,
             self.home,
             self.skills_dir,
             self.root_policy,
-        ) catch |err| {
-            self.failure = err;
-            self.done.store(true, .release);
-            return;
-        };
-        const roots = collectRootFingerprints(
+            mod_roots,
+        );
+        errdefer discovery.deinit(self.alloc);
+        const roots = try collectRootFingerprints(
             self.alloc,
             self.workspace_root,
             self.home,
             self.skills_dir,
             self.root_policy,
-        ) catch |err| {
-            var owned = discovery;
-            owned.deinit(self.alloc);
-            self.failure = err;
-            self.done.store(true, .release);
-            return;
-        };
-        const dir = self.alloc.dupe(u8, self.skills_dir) catch |err| {
-            freeRootFingerprints(self.alloc, roots);
-            var owned = discovery;
-            owned.deinit(self.alloc);
-            self.failure = err;
-            self.done.store(true, .release);
-            return;
-        };
+            mod_roots,
+            stamp,
+        );
+        errdefer freeRootFingerprints(self.alloc, roots);
+        const dir = try self.alloc.dupe(u8, self.skills_dir);
+        errdefer self.alloc.free(dir);
         var catalog = LoadedCatalog{
             .dir = dir,
             .skills = discovery.skills,
             .diagnostics = discovery.diagnostics,
             .root_fingerprints = roots,
+            .mod_pins = self.pins,
         };
+        self.pins = null;
         if (self.cancel_requested.load(.acquire)) {
             catalog.deinit(self.alloc);
         } else {
             self.catalog = catalog;
         }
-        self.done.store(true, .release);
     }
 
     fn takeCatalog(self: *CatalogRefreshTask) ?LoadedCatalog {
@@ -2059,6 +2243,7 @@ const CatalogRefreshTask = struct {
     fn deinit(self: *CatalogRefreshTask) void {
         self.cancel_requested.store(true, .release);
         if (self.thread) |thread| thread.join();
+        deinitModPins(self.alloc, &self.pins);
         if (self.catalog) |*catalog| catalog.deinit(self.alloc);
         self.alloc.free(self.workspace_root);
         self.alloc.free(self.home);
@@ -2118,6 +2303,7 @@ fn rootFingerprintsEqual(
     for (left, right) |a, b| {
         if (!std.mem.eql(u8, a.path, b.path) or
             a.exists != b.exists or
+            a.stamp != b.stamp or
             a.inode != b.inode or
             !std.meta.eql(a.mtime, b.mtime) or
             !std.mem.eql(u8, &a.candidate_digest, &b.candidate_digest)) return false;
@@ -2135,6 +2321,90 @@ fn skillMenuSourceFilterIndex(filter: SkillMenuSourceFilter) usize {
         if (candidate == filter) return index;
     }
     return 0;
+}
+
+/// The pins a generation's skill paths read through, or null when it has none.
+fn pinsOf(generation: *const CatalogGeneration) ?*const ModPinsSet {
+    if (comptime build_options.libfx) return null;
+    if (generation.catalog.mod_pins) |*set| return set;
+    return null;
+}
+
+/// Frees a generation that no lease reads, on the owner thread. Its pins are
+/// released here without waiting on any lock. The store cleanup of the versions
+/// that `current` does not pin runs on a detached thread, because it may wait
+/// on another fx's lock. Plain `deinit` covers shutdown, where no cleanup runs.
+fn releaseGeneration(generation: *CatalogGeneration, current: ?*const ModPinsSet) void {
+    if (comptime !build_options.libfx) {
+        if (generation.catalog.mod_pins) |pins| {
+            generation.catalog.mod_pins = null;
+            var set = pins;
+            handOffCleanup(generation.alloc, &set, current);
+        }
+    }
+    generation.release();
+}
+
+/// Releases `set` and starts its store cleanup. A cleanup that cannot start is
+/// dropped; the next change of that mod collects its old versions.
+fn handOffCleanup(alloc: Allocator, set: *ModPinsSet, current: ?*const ModPinsSet) void {
+    const root = alloc.dupe(u8, set.resolved_root orelse "") catch {
+        set.deinit(alloc);
+        debug_trace.logf("skills", "mod cleanup not started: out of memory; the next change of the mod collects", .{});
+        return;
+    };
+    const names = set.releaseForCleanup(alloc, current);
+    if (names.len == 0) {
+        alloc.free(root);
+        mods.mod_pins.freeCleanupNames(alloc, names);
+        return;
+    }
+    startCleanup(alloc, root, names);
+}
+
+const CleanupJob = struct {
+    alloc: Allocator,
+    root: []u8,
+    names: [][]u8,
+    ops: mods.ModPins.Ops,
+
+    fn release(job: *CleanupJob) void {
+        mods.mod_pins.freeCleanupNames(job.alloc, job.names);
+        job.alloc.free(job.root);
+        job.alloc.destroy(job);
+    }
+
+    fn run(job: *CleanupJob) void {
+        mods.mod_pins.collectNames(job.root, job.ops, job.names);
+        job.release();
+    }
+};
+
+/// Takes ownership of `root` and `names`. Runs the cleanup on a detached
+/// thread, which frees them when it ends (`app_mods_runtime.zig` VerbJob).
+fn startCleanup(alloc: Allocator, root: []u8, names: [][]u8) void {
+    const job = alloc.create(CleanupJob) catch {
+        dropCleanup(alloc, root, names, "out of memory");
+        return;
+    };
+    job.* = .{ .alloc = alloc, .root = root, .names = names, .ops = mods.realModPinsOps() };
+    if (comptime @import("builtin").single_threaded) {
+        alloc.destroy(job);
+        dropCleanup(alloc, root, names, "threads are unavailable");
+        return;
+    }
+    const thread = std.Thread.spawn(.{}, CleanupJob.run, .{job}) catch {
+        job.release();
+        debug_trace.logf("skills", "mod cleanup not started: thread unavailable; the next change of the mod collects", .{});
+        return;
+    };
+    thread.detach();
+}
+
+fn dropCleanup(alloc: Allocator, root: []u8, names: [][]u8, reason: []const u8) void {
+    mods.mod_pins.freeCleanupNames(alloc, names);
+    alloc.free(root);
+    debug_trace.logf("skills", "mod cleanup not started: {s}; the next change of the mod collects", .{reason});
 }
 
 pub const Runtime = struct {
@@ -2414,7 +2684,7 @@ pub const Runtime = struct {
         const retired = self.retired_catalog orelse return;
         if (retired.referenceCount() != 1) return;
         self.retired_catalog = null;
-        retired.release();
+        releaseGeneration(retired, if (self.active_catalog) |active| pinsOf(active) else null);
     }
 
     fn freeLoaded(self: *Runtime, alloc: Allocator) void {
@@ -2441,12 +2711,27 @@ pub const Runtime = struct {
         skills: []Skill,
         diagnostics: []SkillDiagnostic,
     ) Allocator.Error!void {
+        try self.replaceLoadedWithMods(alloc, dir, skills, diagnostics, null);
+    }
+
+    /// Like `replaceLoaded`, and the catalog takes `mod_pins`, the pins that
+    /// `skills` were read through. On failure the caller keeps every input,
+    /// pins included.
+    pub fn replaceLoadedWithMods(
+        self: *Runtime,
+        alloc: Allocator,
+        dir: []u8,
+        skills: []Skill,
+        diagnostics: []SkillDiagnostic,
+        mod_pins: ?ModPinsSet,
+    ) Allocator.Error!void {
         try self.menu_index.actual_indices.ensureTotalCapacity(alloc, skills.len);
         const generation = self.nextGeneration();
         var catalog = LoadedCatalog{
             .dir = dir,
             .skills = skills,
             .diagnostics = diagnostics,
+            .mod_pins = mod_pins,
         };
         const adopted = try self.adoptCatalog(alloc, generation, &catalog);
         std.debug.assert(adopted);
@@ -2463,6 +2748,11 @@ pub const Runtime = struct {
             catalog.skills.len,
         );
         self.reapRetiredCatalog();
+        // Registered before the lock, so it runs after the unlock: a cleanup
+        // that walks the store never holds the catalog lock.
+        var stale: ?*CatalogGeneration = null;
+        var stale_next: ?*CatalogGeneration = null;
+        defer if (stale) |gone| releaseGeneration(gone, if (stale_next) |next| pinsOf(next) else null);
         self.catalog_mutex.lockUncancelable(io_mod.getIo());
         defer self.catalog_mutex.unlock(io_mod.getIo());
         if (self.active_catalog) |active| {
@@ -2472,11 +2762,12 @@ pub const Runtime = struct {
         }
         const next = try CatalogGeneration.create(alloc, generation, catalog.*);
         catalog.* = .{};
+        stale_next = next;
         if (self.active_catalog) |active| {
             if (active.referenceCount() > 1) {
                 self.retired_catalog = active;
             } else {
-                active.release();
+                stale = active;
             }
         } else {
             if (self.dir.len > 0) alloc.free(self.dir);
@@ -2974,6 +3265,7 @@ pub fn listSkillsSummaryStyled(alloc: Allocator, skills: []const Skill, styles: 
     const group_order = [_][]const u8{
         "Managed installs",
         "Workspace skills",
+        "Mod skills",
         "Compatibility roots",
     };
 
@@ -2993,7 +3285,7 @@ pub fn listSkillsSummaryStyled(alloc: Allocator, skills: []const Skill, styles: 
             } else {
                 try out.writer.print("  - {s} ", .{skill.name});
             }
-            try writeStyledSourceLabel(&out.writer, styles, skillSourceLabel(skill.source));
+            try writeStyledSourceLabel(&out.writer, styles, skill.mod_label orelse skillSourceLabel(skill.source));
             try out.writer.writeByte('\n');
         }
     }
@@ -3534,6 +3826,7 @@ pub fn freeSkill(alloc: Allocator, skill: Skill) void {
     alloc.free(skill.description);
     alloc.free(skill.path);
     if (skill.read_authority) |read_authority| alloc.free(read_authority);
+    if (skill.mod_label) |label| alloc.free(label);
 }
 
 pub fn freeSkills(alloc: Allocator, skills: []Skill) void {
@@ -6355,4 +6648,199 @@ test "loadVisibleSkills still rejects external symlinks without an authority" {
     try std.testing.expectEqualStrings(logical_path, discovery.diagnostics[0].path);
     try std.testing.expectEqual(SkillDiagnosticScope.candidate, discovery.diagnostics[0].scope);
     try std.testing.expectEqual(SkillDiagnosticCause.linked_candidate_unavailable, discovery.diagnostics[0].cause);
+}
+
+fn dirExistsForTest(path: []const u8) bool {
+    var dir = std.Io.Dir.cwd().openDir(io_mod.getIo(), path, .{}) catch return false;
+    dir.close(io_mod.getIo());
+    return true;
+}
+
+test "a mod name is read from its version folder path" {
+    try std.testing.expectEqualStrings("glm", modNameOfVersionPath("/h/.fx/mods/.store/glm-0123456789abcdef/skills/x/SKILL.md").?);
+    try std.testing.expect(modNameOfVersionPath("/h/.fx/skills/x/SKILL.md") == null);
+    try std.testing.expect(modNameOfVersionPath("/h/.fx/mods/.store/glm-short/x") == null);
+}
+
+test "mod skill roots follow the managed root and come before the compatibility roots" {
+    if (comptime build_options.libfx) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "home/.fx/skills/managed-one/SKILL.md", "---\nname: managed-one\ndescription: managed\n---\nbody\n");
+    try writeTempFile(&tmp, "home/.fx/mods/glm/skills/mod-one/SKILL.md", "---\nname: mod-one\ndescription: mod\n---\nbody\n");
+    try writeTempFile(&tmp, "home/.claude/skills/claude-one/SKILL.md", "---\nname: claude-one\ndescription: claude\n---\nbody\n");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+    const mod_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/mods/glm/skills");
+    defer alloc.free(mod_root);
+
+    const mod_roots = [_]ModSkillRoot{.{ .mod_name = "glm", .path = mod_root }};
+    const global_roots = [_]skill_contract.RootSpec{.{ .source = .global_claude, .path = ".claude/skills" }};
+    const policy: skill_contract.RootPolicy = .{
+        .managed_root_source = .global_fx,
+        .global_roots = &global_roots,
+    };
+    var discovery = try loadVisibleSkillsWithMods(alloc, null, home_root, managed_root, policy, &mod_roots);
+    defer discovery.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), discovery.skills.len);
+    try std.testing.expectEqualStrings("managed-one", discovery.skills[0].name);
+    try std.testing.expect(discovery.skills[0].mod_label == null);
+    try std.testing.expectEqualStrings("mod-one", discovery.skills[1].name);
+    try std.testing.expectEqual(SkillSource.mod, discovery.skills[1].source);
+    try std.testing.expectEqualStrings("mod glm", discovery.skills[1].mod_label.?);
+    try std.testing.expectEqualStrings("claude-one", discovery.skills[2].name);
+
+    const summary = try listSkillsSummary(alloc, discovery.skills);
+    defer alloc.free(summary);
+    try std.testing.expect(std.mem.find(u8, summary, "Mod skills (1):") != null);
+    try std.testing.expect(std.mem.find(u8, summary, "mod-one: mod [mod glm]") != null);
+    try std.testing.expectEqualStrings("mod glm", skillShortLabel(discovery.skills[1]));
+    try std.testing.expectEqualStrings("global .claude", skillShortLabel(discovery.skills[2]));
+    try std.testing.expect(skillMenuFilterForSource(.mod) == .all);
+}
+
+test "a mod label survives the compact copy of a known catalog" {
+    const alloc = std.testing.allocator;
+    const source = [_]Skill{.{
+        .name = "mod-one",
+        .description = "",
+        .path = "/h/.fx/mods/.store/glm-0123456789abcdef/skills/mod-one",
+        .source = .mod,
+        .mod_label = "mod glm",
+    }};
+    const replacements = [_]?Skill{null};
+    const compact = try compactCloneSkills(alloc, &source, &replacements);
+    defer compact.deinit(alloc);
+    try std.testing.expectEqualStrings("mod glm", compact.skills[0].mod_label.?);
+    try std.testing.expectEqual(SkillSource.mod, compact.skills[0].source);
+}
+
+test "a lease on an old catalog keeps its mod version on disk until the lease ends" {
+    if (comptime build_options.libfx) return error.SkipZigTest;
+    // page_allocator: the detached cleanup frees with this allocator after pollRefresh returns.
+    const alloc = std.heap.page_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/mods");
+    try writeTempFile(&tmp, "src/v1/mod.json", "{\"name\":\"alpha\",\"version\":\"1.0.0\"}");
+    try writeTempFile(&tmp, "src/v1/skills/alpha-skill/SKILL.md", "---\nname: alpha-skill\ndescription: one\n---\nbody\n");
+    try writeTempFile(&tmp, "src/v2/mod.json", "{\"name\":\"alpha\",\"version\":\"2.0.0\"}");
+    try writeTempFile(&tmp, "src/v2/skills/alpha-skill/SKILL.md", "---\nname: alpha-skill\ndescription: two\n---\nbody\n");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+    const mods_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/mods");
+    defer alloc.free(mods_root);
+    const v1 = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src/v1");
+    defer alloc.free(v1);
+    const v2 = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src/v2");
+    defer alloc.free(v2);
+    const policy: skill_contract.RootPolicy = .{ .managed_root_source = .global_fx };
+
+    try std.testing.expectEqual(mods.store.Outcome.ok, try mods.add(alloc, mods_root, "alpha", v1));
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    try runtime.replaceLoaded(alloc, try alloc.dupe(u8, managed_root), &.{}, &.{});
+    _ = try runtime.requestRefresh(alloc, home_root, home_root, policy);
+    try std.testing.expect(try waitForAdoptedRefreshForTest(&runtime, alloc, home_root, policy));
+    try std.testing.expectEqual(@as(usize, 1), runtime.items.len);
+    try std.testing.expectEqualStrings("one", runtime.items[0].description);
+    const old_path = try alloc.dupe(u8, runtime.items[0].path);
+    defer alloc.free(old_path);
+
+    var lease = runtime.acquireCatalog();
+    var lease_held = true;
+    defer if (lease_held) lease.deinit();
+
+    try std.testing.expectEqual(mods.store.Outcome.ok, try mods.update(alloc, mods_root, "alpha", v2));
+    _ = try runtime.requestRefresh(alloc, home_root, home_root, policy);
+    try std.testing.expect(try waitForAdoptedRefreshForTest(&runtime, alloc, home_root, policy));
+    try std.testing.expectEqualStrings("two", runtime.items[0].description);
+    try std.testing.expect(dirExistsForTest(old_path));
+    try std.testing.expectEqualStrings("one", lease.items[0].description);
+
+    lease_held = false;
+    lease.deinit();
+    _ = try runtime.pollRefresh(alloc, home_root, policy);
+    try std.testing.expect(waitForAbsentForTest(old_path));
+    try std.testing.expect(dirExistsForTest(runtime.items[0].path));
+}
+
+fn waitForAbsentForTest(path: []const u8) bool {
+    const deadline_ms = io_mod.milliTimestamp() + test_refresh_wait_ms;
+    while (dirExistsForTest(path)) {
+        if (io_mod.milliTimestamp() >= deadline_ms) return false;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return true;
+}
+
+test "a generation free on the owner thread takes no store lock, and the background cleanup deletes the old version" {
+    if (comptime build_options.libfx) return error.SkipZigTest;
+    // page_allocator: the detached cleanup frees with this allocator after the test body returns.
+    const alloc = std.heap.page_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/mods");
+    try writeTempFile(&tmp, "src/v1/mod.json", "{\"name\":\"alpha\",\"version\":\"1.0.0\"}");
+    try writeTempFile(&tmp, "src/v1/skills/alpha-skill/SKILL.md", "---\nname: alpha-skill\ndescription: one\n---\nbody\n");
+    try writeTempFile(&tmp, "src/v2/mod.json", "{\"name\":\"alpha\",\"version\":\"2.0.0\"}");
+    try writeTempFile(&tmp, "src/v2/skills/alpha-skill/SKILL.md", "---\nname: alpha-skill\ndescription: two\n---\nbody\n");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+    const mods_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/mods");
+    defer alloc.free(mods_root);
+    const v1 = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src/v1");
+    defer alloc.free(v1);
+    const v2 = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "src/v2");
+    defer alloc.free(v2);
+    const policy: skill_contract.RootPolicy = .{ .managed_root_source = .global_fx };
+
+    try std.testing.expectEqual(mods.store.Outcome.ok, try mods.add(alloc, mods_root, "alpha", v1));
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    try runtime.replaceLoaded(alloc, try alloc.dupe(u8, managed_root), &.{}, &.{});
+    _ = try runtime.requestRefresh(alloc, home_root, home_root, policy);
+    try std.testing.expect(try waitForAdoptedRefreshForTest(&runtime, alloc, home_root, policy));
+    const old_path = try alloc.dupe(u8, runtime.items[0].path);
+    defer alloc.free(old_path);
+
+    var lease = runtime.acquireCatalog();
+    var lease_held = true;
+    defer if (lease_held) lease.deinit();
+
+    try std.testing.expectEqual(mods.store.Outcome.ok, try mods.update(alloc, mods_root, "alpha", v2));
+    _ = try runtime.requestRefresh(alloc, home_root, home_root, policy);
+    try std.testing.expect(try waitForAdoptedRefreshForTest(&runtime, alloc, home_root, policy));
+
+    // Another fx holds the mod's store lock, so a cleanup that waited for it would stall.
+    const ops = mods.realOps();
+    var store_lock = switch (try ops.acquire_lock(ops.ctx, ops.io, mods_root, "alpha", ops.lock_deadline_ms)) {
+        .acquired => |lock| lock,
+        .busy => return error.TestUnexpectedResult,
+    };
+    var store_lock_held = true;
+    defer if (store_lock_held) store_lock.release(ops.io);
+
+    lease_held = false;
+    lease.deinit();
+    const started_ms = io_mod.milliTimestamp();
+    _ = try runtime.pollRefresh(alloc, home_root, policy);
+    // The store waits up to its lock deadline (2 s) before it gives up, so a free that waited would take longer.
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1000);
+    try std.testing.expect(dirExistsForTest(old_path));
+
+    store_lock_held = false;
+    store_lock.release(ops.io);
+    try std.testing.expect(waitForAbsentForTest(old_path));
+    try std.testing.expect(dirExistsForTest(runtime.items[0].path));
 }

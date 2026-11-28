@@ -124,7 +124,7 @@ fn loadAccess(state: *const server.ServerState, alloc: Allocator, root: []const 
 /// because it borrows the server's workspace root.
 pub fn commit(state: *server.ServerState, binding: *Binding) Allocator.Error!void {
     std.debug.assert(state.active_session == null);
-    try state.skills.replaceLoaded(state.alloc, binding.skills.dir, binding.skills.skills, binding.skills.diagnostics);
+    try state.skills.replaceLoadedWithMods(state.alloc, binding.skills.dir, binding.skills.skills, binding.skills.diagnostics, binding.skills.mod_pins);
     binding.skills = .{};
     debug_trace.logf("acp", "session workspace rebound bytes={d}", .{binding.root.len});
     if (state.workspace_root.len > 0) state.alloc.free(state.workspace_root);
