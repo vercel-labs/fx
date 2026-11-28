@@ -23,7 +23,6 @@ const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const diagnostics = @import("../../workspace/diagnostics.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
-const model_context_encoding = @import("../../shared/model_context_encoding.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const io_mod = @import("../../shared/io.zig");
 const quiesce = @import("../../quiesce/quiesce.zig");
@@ -3210,15 +3209,13 @@ fn prepareDeferredDynamicCandidate(
 
 fn preparedTerminalModelOutput(
     alloc: Allocator,
+    tool_registry: tool_dispatch.Registry,
     call: ToolCall,
     terminal: tool_preparation.Terminal,
 ) Allocator.Error![]const u8 {
     if (terminal.model_output) |model_output| return model_output;
     return switch (terminal.kind) {
-        .unsupported => try alloc.print(
-            "Unsupported tool: {f}",
-            .{model_context_encoding.scalar(call.name)},
-        ),
+        .unsupported => try tool_dispatch.unsupportedToolOutput(alloc, tool_registry, call.name),
         else => unreachable,
     };
 }
@@ -3227,6 +3224,7 @@ test "a prepared call of a tool fx does not know names it as visible text" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    const empty_registry = tool_dispatch.Registry{};
 
     const cases = [_]struct { name: []const u8, shown: []const u8 }{
         .{ .name = "missing_tool", .shown = "Unsupported tool: missing_tool" },
@@ -3237,6 +3235,7 @@ test "a prepared call of a tool fx does not know names it as visible text" {
     for (cases) |case| {
         const shown = try preparedTerminalModelOutput(
             arena,
+            empty_registry,
             .{ .id = "odd-tool", .name = case.name, .arguments_json = "{}" },
             .{ .kind = .unsupported },
         );
@@ -3246,6 +3245,7 @@ test "a prepared call of a tool fx does not know names it as visible text" {
     const kept = try arena.dupe(u8, "Tool arguments are invalid.");
     try std.testing.expectEqualStrings("Tool arguments are invalid.", try preparedTerminalModelOutput(
         arena,
+        empty_registry,
         .{ .id = "x", .name = "read_file", .arguments_json = "{}" },
         .{ .kind = .validation_failure, .model_output = kept },
     ));
@@ -4103,6 +4103,7 @@ fn finishPreparedCallsOnCancellation(
                             },
                             .model_output = try preparedTerminalModelOutput(
                                 arena,
+                                deps.tool_registry,
                                 call,
                                 terminal,
                             ),
@@ -12063,6 +12064,7 @@ fn processQueuedPromptLoop(
                             .terminal => |terminal| {
                                 const model_output = try preparedTerminalModelOutput(
                                     arena,
+                                    deps.tool_registry,
                                     parallel_call,
                                     terminal,
                                 );
@@ -12590,6 +12592,7 @@ fn processQueuedPromptLoop(
                     .terminal => |terminal| {
                         const model_output = try preparedTerminalModelOutput(
                             arena,
+                            deps.tool_registry,
                             tool_call,
                             terminal,
                         );
