@@ -206,6 +206,9 @@ RequestReachesAll ==
 \* others sent while it had the session open.
 EchoComplete == \A c \in Conns : (open[c] /\ ~Pending(c, "echo")) => due[c] \subseteq got[c]
 
+\* A client holds only the prompts that others took while it had the session open.
+EchoOnlyWhileOpen == \A c \in Conns : got[c] \subseteq due[c]
+
 \* No client gets its own prompt back.
 NoSelfEcho == \A c \in Conns : \A k \in got[c] : sentBy[k] # c
 
@@ -215,4 +218,10 @@ RosterCurrent ==
 
 \* Any client that has the session open can stop the running turn.
 CancelStops == ~cancelIgnored
+
+\* A request goes only to clients that have the session open.
+RequestOnlyOpen == \A d \in sentTo : open[d]
+
+\* A session/cancel that comes from a client with the session open stops the turn.
+StopEffect == [][ (\E c \in Conns : open[c] /\ turn # None /\ Cancel(c)) => turn' = None ]_vars
 =============================================================================
